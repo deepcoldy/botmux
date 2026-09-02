@@ -11,7 +11,7 @@ let home: string;
 let dataDir: string;
 
 beforeAll(() => {
-  if (!existsSync(CLI_PATH)) throw new Error('dist/cli.js missing — run `pnpm build` first');
+  if (!existsSync(CLI_PATH)) throw new Error('dist/cli.js missing — run `bun run build` first');
   home = mkdtempSync(join(tmpdir(), 'botmux-whiteboard-cli-'));
   dataDir = join(home, '.botmux', 'data');
   mkdirSync(dataDir, { recursive: true });

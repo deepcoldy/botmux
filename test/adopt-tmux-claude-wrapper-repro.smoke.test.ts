@@ -31,6 +31,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { join } from 'node:path';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { isProcessAlive } from '../src/core/session-liveness.js';
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
 
 const SID_WRAPPED = 'adoptwr1-pr02-93aa-bbbb-ccccddddeeee';
 const SID_DIRECT = 'adoptdi1-pr02-93aa-bbbb-ccccddddeeee';
@@ -44,7 +45,7 @@ function tmuxAvailable(): boolean {
 }
 
 const hasTmux = tmuxAvailable();
-const nodeBin = process.execPath;
+const nodeBin = resolveNodeExecutable() ?? process.execPath;
 
 let dir: string;
 let fakeClaude: string;

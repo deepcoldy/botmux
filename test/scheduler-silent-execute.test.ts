@@ -679,10 +679,8 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, input, options] = forkWorkerMock.mock.calls[0];
     expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
-    expect(options).toMatchObject({
-      resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
-    });
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 
@@ -703,10 +701,8 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(store.size).toBe(1);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, , options] = forkWorkerMock.mock.calls[0];
-    expect(options).toMatchObject({
-      resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
-    });
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 

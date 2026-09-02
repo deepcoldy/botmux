@@ -12,7 +12,7 @@
  *
  * Parsing the wrapper's `dist/cli.js` path (and walking up two levels) is the
  * most reliable way to find the checkout the user actually runs — more reliable
- * than the running process's own root, which under `pnpm daemon:restart` /
+ * than the running process's own root, which under `bun run daemon:restart` /
  * `switch:here` can be a different worktree than the one the wrapper points at.
  *
  * The pure helpers (string in, string out) resolve the checkout without
@@ -180,14 +180,30 @@ export function gitHeadSha(dir: string): string {
 /**
  * The ordered commands that make up a local-dev update, each in `dir`:
  *   1. git pull --ff-only  (fail closed on divergence/conflict — never merges)
- *   2. pnpm build          (dist/ is gitignored: a pull alone leaves stale code)
+ *   2. bun run build       (dist/ is gitignored: a pull alone leaves stale code)
+ *
+ * MUST stay `bun run build`, and MUST NOT go back to pnpm. Since the repo
+ * declares `packageManager: bun@1.4.0`, a corepack-shimmed `pnpm` REFUSES to run
+ * here at all — even `pnpm --version` exits 1 with `Unsupported package manager
+ * specification (bun@1.4.0)`, so the whole update aborted before building.
+ *
+ * `run` is not optional either: bare `bun build` is Bun's BUNDLER subcommand,
+ * which exits 1 with "Missing entrypoints" instead of running the `build`
+ * script. Only `bun run <script>` reaches package.json.
+ *
+ * Bun (not npm) is the right runner even though npm ships with Node: the `build`
+ * script itself shells out to `bun run audit:domains` / `typecheck:scripts` /
+ * `dashboard:bundle`, so bun is required regardless — going through npm would
+ * only add a hop while hiding that requirement. This also matches CI and the
+ * `bun run build` documented in CLAUDE.md.
+ *
  * The restart is intentionally NOT here — the CLI and dashboard each apply it
  * through their own restart path (the dashboard reuses its lease + intent).
  */
 export function localDevUpdateSteps(): Array<{ command: string; args: string[] }> {
   return [
     { command: 'git', args: ['pull', '--ff-only'] },
-    { command: 'pnpm', args: ['build'] },
+    { command: 'bun', args: ['run', 'build'] },
   ];
 }
 

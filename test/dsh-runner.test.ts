@@ -157,33 +157,37 @@ describe('dsh-runner', () => {
     // Tool calls render as progress lines.
     expect(h.stdout).toContain('🔧 bash');
     expect(h.stdout).toContain('✓ bash');
-    // The vendored fallback composition was materialized under the native dsh home.
-    expect(existsSync(join(h.home, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+    // The profile directory is created under the native dsh home.
+    expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // The legacy ~/.botmux/dsh path must not be created anymore.
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
   });
 
-  it('fails fast when DSH_CORDIS_CONFIG points to a missing file', async () => {
-    const missingConfig = join(tmpdir(), `botmux-dsh-missing-config-${process.pid}-${Date.now()}.yml`);
-    h = spawnRunner('happy', [], { DSH_CORDIS_CONFIG: missingConfig });
+  it('fails fast when the dsh binary is missing', async () => {
+    h = spawnRunner('happy', ['--dsh-bin', '/nonexistent/dsh']);
     const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
     const code = await exitPromise;
 
     expect(code).toBe(1);
-    expect(h.stderr).toContain(`DSH_CORDIS_CONFIG does not exist: ${missingConfig}`);
     expect(h.stdout).not.toContain('dsh connected');
     expect(h.stdout).not.toContain('›');
-    expect(existsSync(join(h.home, '.dsh', 'botmux', 'cordis.yml'))).toBe(false);
   });
 
-  it('uses an existing DSH_CORDIS_CONFIG without materializing the vendored config', async () => {
-    h = spawnRunner('happy', [], { DSH_CORDIS_CONFIG: FAKE_SERVER });
+  it('boots with a profile name and reads provider/model from settings.yaml', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', ['--dsh-profile', 'botmux'], {}, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    h.child.stdin.write(makeFrame('使用显式配置'));
-    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+    // The profile directory is created and seeded with package.json + cordis.yml
+    // so `dsh --profile botmux` can start on a clean HOME.
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
 
-    expect(existsSync(join(h.home, '.dsh', 'botmux', 'cordis.yml'))).toBe(false);
+    // initialize carries the provider + model from settings.yaml.
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('model_hub/es1_orange_o48');
   });
 
   it('injects the identity preamble only on the first turn (multi-turn)', async () => {
@@ -357,18 +361,14 @@ describe('dsh-runner', () => {
   // Native ~/.dsh config (settings.yaml + .credentials.yaml)
   // -------------------------------------------------------------------------
 
-  it('generates a pi-ai composition from ~/.dsh/settings.yaml and uses its provider/model', async () => {
+  it('reads pi-ai provider/model from ~/.dsh/settings.yaml for the initialize RPC', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: test-key-123\n');
     h = spawnRunner('happy', [], {}, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    // The generated composition mounts llm-pi-ai with the translated providers.
-    const composition = readFileSync(join(home, '.dsh', 'botmux', 'cordis.yml'), 'utf8');
-    expect(composition).toContain("name: '@deepseek-ai/dsh-llm-pi-ai'");
-    expect(composition).toContain('super-relay:');
-    expect(composition).toContain('apiKeyEnv: SUPER_RELAY_API_KEY');
-    expect(composition).toContain('https://super-relay.example.com/v1');
+    // The profile directory is created under the native dsh home.
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // No legacy ~/.botmux/dsh.
     expect(existsSync(join(home, '.botmux', 'dsh'))).toBe(false);
 
@@ -401,7 +401,7 @@ records:
     }, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    expect(existsSync(join(home, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
   });
 
   it('retains support for pre-release flat credential files', async () => {
@@ -442,7 +442,7 @@ refs:
     expect(initEntry.initialize.provider).toBe('super-relay');
   });
 
-  it('fails loud when settings.yaml is missing agent-default-model', async () => {
+  it('falls back to deepseek-official provider when settings.yaml is missing agent-default-model', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, `
 llm-pi-ai:
@@ -451,13 +451,15 @@ llm-pi-ai:
       apiKeyEnv: SUPER_RELAY_API_KEY
 `);
     h = spawnRunner('happy', [], {}, home);
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
-    const code = await exitPromise;
-    expect(code).toBe(1);
-    expect(h.stderr).toContain('agent-default-model');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('deepseek-official');
+    expect(initEntry.initialize.model).toBe('deepseek-v4-flash');
   });
 
-  it('fails loud when the default provider is not in llm-pi-ai.providers', async () => {
+  it('passes the provider from settings.yaml to the initialize RPC even when it is not in llm-pi-ai.providers', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, `
 llm-pi-ai:
@@ -469,13 +471,17 @@ agent-default-model:
   model: some-model
 `);
     h = spawnRunner('happy', [], {}, home);
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
-    const code = await exitPromise;
-    expect(code).toBe(1);
-    expect(h.stderr).toContain('not found in ~/.dsh/settings.yaml');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    // The runner no longer validates provider against llm-pi-ai.providers —
+    // the dsh --profile CLI handles plugin composition independently.
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('some-model');
   });
 
-  it('uses the vendored composition when settings.yaml has provider deepseek-official', async () => {
+  it('passes deepseek-official provider/model from settings.yaml to the initialize RPC', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, `
 agent-default-model:
@@ -484,10 +490,6 @@ agent-default-model:
 `);
     h = spawnRunner('happy', [], {}, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
-
-    const composition = readFileSync(join(home, '.dsh', 'botmux', 'cordis.yml'), 'utf8');
-    expect(composition).toContain("name: '@deepseek-ai/dsh-llm-deepseek'");
-    expect(composition).not.toContain('llm-pi-ai');
 
     const entries = readLog(h);
     const initEntry = entries.find((r: any) => r.initialize);

@@ -24,8 +24,8 @@
  * Each was checked by reverting the corresponding fix and confirming it goes red
  * (see the mutation notes on the individual cases).
  */
-import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { describe, expect, it, afterEach, beforeEach } from 'vitest';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -73,6 +73,92 @@ describe('classifyBinaryInstall — where the binary lives decides who updates i
     expect(classifyBinaryInstall('/opt/bm/botmux', { BOTMUX_INSTALL_DIR: '/opt/bm' }, '/home/u')).toBe('curl-binary');
     // A trailing slash names the same directory.
     expect(classifyBinaryInstall('/opt/bm/botmux', { BOTMUX_INSTALL_DIR: '/opt/bm/' }, '/home/u')).toBe('curl-binary');
+  });
+
+  // ── Symlinked home (a REAL box, not a hypothetical) ──────────────────────────
+  // Reported from a devbox where `botmux update` refused with "无法安全识别当前安装
+  // 方式（unknown）" on a binary sitting in the expected `~/.botmux/bin`. Cause: the
+  // kernel hands a compiled binary a FULLY RESOLVED execPath, while `homedir()`
+  // returns what /etc/passwd says. There, `/home/<u>` is a symlink to
+  // `/data00/home/<u>`, so the two disagree and the old string equality never met:
+  //   execPath  /data00/home/u/.botmux/bin/botmux   (realpath, kernel)
+  //   homedir() /home/u/.botmux/bin/botmux          (symlink path)
+  // These use a real on-disk symlink rather than a stubbed resolver, because the
+  // defect lived in the gap between "what the FS says" and "what we compared".
+  describe('a symlinked home still classifies as the install.sh location', () => {
+    let fx: string;
+    let realHome: string;
+    let symHome: string;
+
+    beforeEach(() => {
+      fx = mkdtempSync(join(tmpdir(), 'botmux-symhome-'));
+      realHome = join(fx, 'data', 'u');
+      mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
+      writeFileSync(join(realHome, '.botmux', 'bin', 'botmux'), '#!/bin/sh\n');
+      mkdirSync(join(fx, 'home'), { recursive: true });
+      symHome = join(fx, 'home', 'u');
+      symlinkSync(realHome, symHome);
+    });
+    afterEach(() => rmSync(fx, { recursive: true, force: true }));
+
+    // THE reported failure. Mutation: drop the canonicalized comparison and this
+    // goes red with 'unknown' — the exact string the user saw.
+    it('resolved execPath vs symlinked homedir() → curl-binary', () => {
+      expect(classifyBinaryInstall(join(realHome, '.botmux', 'bin', 'botmux'), {}, symHome))
+        .toBe('curl-binary');
+    });
+
+    it('and the strategy is self-replace, targeting the path we were invoked as', () => {
+      const exec = join(realHome, '.botmux', 'bin', 'botmux');
+      expect(resolveUpdateStrategy(true, exec, '/irrelevant', {}, symHome))
+        .toEqual({ kind: 'self-replace', target: exec });
+    });
+
+    // The symmetric direction: invoked THROUGH the symlink. Both must work, since
+    // which one you get depends on how the process was launched.
+    it('symlinked execPath vs symlinked homedir() → curl-binary', () => {
+      expect(classifyBinaryInstall(join(symHome, '.botmux', 'bin', 'botmux'), {}, symHome))
+        .toBe('curl-binary');
+    });
+
+    // Canonicalization must only ever equate paths naming the SAME file — it must
+    // never widen what counts as our install location. Without these, a fix that
+    // resolved too eagerly (or compared only parents) would pass the cases above.
+    it('does NOT widen: a different dir, a different user, or a sibling file', () => {
+      for (const p of [
+        join(realHome, 'elsewhere', 'botmux'),          // right home, wrong dir
+        join(realHome, '.botmux', 'bin', 'other'),      // right dir, wrong file
+        join(fx, 'data', 'OTHER', '.botmux', 'bin', 'botmux'), // another user
+        '/opt/botmux',                                   // right name, wrong parent
+      ]) {
+        expect(classifyBinaryInstall(p, {}, symHome), p).toBe('unknown');
+      }
+    });
+
+    // An unresolvable path must degrade to the plain string compare, not throw and
+    // not silently classify as ours.
+    it('a nonexistent path neither throws nor becomes curl-binary', () => {
+      expect(classifyBinaryInstall(join(fx, 'gone', 'botmux'), {}, symHome)).toBe('unknown');
+    });
+
+    // ⚠️ THE CASE THAT PINS THE EXEC SIDE. Resolving only the install DIR is
+    // already enough for the devbox above (there, execPath arrives pre-resolved by
+    // the kernel), so every test before this one stays green if you resolve the dir
+    // and leave execPath raw — found by mutation, not by reading. This is the shape
+    // that separates them: HOME is a REAL path while execPath is reached through a
+    // DIFFERENT symlink (a symlinked bin dir, or a launcher invoked via an aliased
+    // mount). Only canonicalizing BOTH sides matches.
+    it('execPath reached via a different symlink than home → still curl-binary', () => {
+      const real = join(fx, 'real');
+      mkdirSync(join(real, '.botmux', 'bin'), { recursive: true });
+      writeFileSync(join(real, '.botmux', 'bin', 'botmux'), '#!/bin/sh\n');
+      const altParent = join(fx, 'alt');
+      mkdirSync(altParent, { recursive: true });
+      symlinkSync(real, join(altParent, 'u'));
+      // home = the real dir; execPath = the same file via the alt symlink.
+      expect(classifyBinaryInstall(join(altParent, 'u', '.botmux', 'bin', 'botmux'), {}, real))
+        .toBe('curl-binary');
+    });
   });
 
   it('a custom-dir install without the env var at runtime fails CLOSED, not wrong', () => {

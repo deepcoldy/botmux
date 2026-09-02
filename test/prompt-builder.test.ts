@@ -13,14 +13,18 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
-vi.mock('node:child_process', () => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
-    if (typeof cb === 'function') cb(null, '', '');
-    return {} as any;
-  }),
-  execSync: vi.fn(() => ''),
-  execFileSync: vi.fn(() => ''),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
+      if (typeof cb === 'function') cb(null, '', '');
+      return {} as any;
+    }),
+    execSync: vi.fn(() => ''),
+    execFileSync: vi.fn(() => ''),
+  };
+});
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({

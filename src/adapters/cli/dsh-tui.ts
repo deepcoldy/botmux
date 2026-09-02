@@ -10,7 +10,7 @@ import { join } from 'node:path';
  * dsh-tui adapter — PTY-driven full-screen TUI for DeepSeek Harness.
  *
  * Unlike the headless `dsh` adapter (which spawns a JSON-RPC runner bridging
- * `dsh-jsonrpc-agent`), this adapter drives the interactive `dsh-tui` Ink TUI
+ * `dsh --profile <name>`), this adapter drives the interactive `dsh-tui` Ink TUI
  * directly through a PTY — the same interaction model as claude-code / hermes.
  *
  * The `dsh-tui` binary is a launcher that boots `dsh --profile dsh-tui`:
@@ -31,7 +31,7 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   // The launcher spawns `dsh` as a second-stage child. Inside the file sandbox
   // /run is masked, so an nvm/fnm-installed dsh would vanish — re-expose it
-  // (same pattern as the dsh adapter's dsh-jsonrpc-agent).
+  // (same pattern as the dsh adapter's dsh binary).
   let cachedDshBin: string | undefined;
   return {
     id: 'dsh-tui',

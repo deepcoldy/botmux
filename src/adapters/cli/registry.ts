@@ -75,9 +75,9 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // API-backed; no local executable is required.
   riff: undefined,
   reasonix: 'reasonix',
-  // The adapter itself launches a bundled Node runner; dsh-jsonrpc-agent is
+  // The adapter itself launches a bundled Node runner; `dsh` (the CLI) is
   // its real second-stage dependency.
-  dsh: 'dsh-jsonrpc-agent',
+  dsh: 'dsh',
   // PTY-driven TUI variant of dsh. Selected via the bot's dshRuntime='tui'
   // toggle, not directly from the CLI dropdown (absent from CLI_ID_CHOICES).
   'dsh-tui': 'dsh-tui',

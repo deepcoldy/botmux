@@ -326,9 +326,11 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       type: 'remote_shutdown_result', requestId: secondAbortRequestId,
       phase: 'abort', ok: true, taskId: 'task-second',
     });
-    await expect(aborting).resolves.toSatisfy(
-      (results: Array<{ result: { ok: boolean } }>) => results.every(entry => entry.result.ok),
-    );
+    // Bun's `resolves.toSatisfy` calls the predicate with `{}` instead of the
+    // resolved value (see test/bun-test-shim.ts). Await + a sync assertion is
+    // the same contract under both runners.
+    const abortResults = await aborting;
+    expect(abortResults.every(entry => entry.result.ok)).toBe(true);
     expect(first.ds.remoteShutdownState).toBeUndefined();
     expect(second.ds.remoteShutdownState).toBeUndefined();
 

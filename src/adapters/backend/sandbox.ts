@@ -31,6 +31,7 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { isValidPluginId } from '../../core/plugins/ids.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -981,13 +982,20 @@ export interface RelayRequest {
   originDispatchAttempt?: unknown;
   originCapability?: unknown;
 }
-// Presentation-only flags the sandbox may pass through. Path-bearing flags
+// Presentation flags plus the plugin id required to authorize a callback card.
+// Path-bearing flags
 // (--content-file/--file(s)/--image(s)/--video(s)), routing flags
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--layout']);
+const RELAY_FLAGS_VAL = new Set([
+  '--mention',
+  '--quote',
+  '--response-kind',
+  '--layout',
+  '--plugin-card-action',
+]);
 
 export interface ValidatedRelay {
   command: 'send' | 'dispatch';
@@ -1097,9 +1105,15 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
         return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
       }
+      if (f === '--plugin-card-action' && !isValidPluginId(v)) {
+        return { ok: false, error: 'flag --plugin-card-action must be a valid plugin id' };
+      }
       flags.push(f, v); i++; continue;
     }
     return { ok: false, error: `flag not allowed: ${f}` };
+  }
+  if (flags.includes('--plugin-card-action') && cardName === undefined) {
+    return { ok: false, error: 'flag --plugin-card-action requires a card file' };
   }
   const originTurnId = req.originTurnId === undefined
     ? undefined

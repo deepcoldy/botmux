@@ -945,33 +945,48 @@ export async function deleteMessage(larkAppId: string, messageId: string): Promi
   });
 }
 
-/**
- * Pin a message in a chat (best-effort QoL). Returns `true` only when Lark
- * explicitly confirms success (`code === 0`); any other outcome returns `false`
- * and must not affect session behavior.
- */
-export async function pinMessage(larkAppId: string, messageId: string): Promise<boolean> {
-  assertLarkTransport(larkAppId, 'pinMessage');
-  const c = getBotClient(larkAppId);
-  try {
-    const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
-    if (res?.code !== 0) {
-      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    logger.debug(`[pin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
-    return false;
-  }
-}
-
 export interface LarkPinRecord {
   messageId: string;
   chatId?: string;
   operatorId?: string;
   operatorIdType?: string;
   createTime?: string;
+}
+
+function normalizeLarkPinRecord(pin: any): LarkPinRecord {
+  return {
+    messageId: typeof pin?.message_id === 'string' ? pin.message_id : '',
+    chatId: typeof pin?.chat_id === 'string' ? pin.chat_id : undefined,
+    operatorId: typeof pin?.operator_id === 'string' ? pin.operator_id : undefined,
+    operatorIdType: typeof pin?.operator_id_type === 'string' ? pin.operator_id_type : undefined,
+    createTime: typeof pin?.create_time === 'string' ? pin.create_time : undefined,
+  };
+}
+
+/**
+ * Pin a message in a chat (best-effort QoL). Returns the exact Pin record only
+ * when Lark explicitly confirms success (`code === 0`) and includes `data.pin`;
+ * any other outcome returns `null` and must not affect session behavior.
+ */
+export async function pinMessage(larkAppId: string, messageId: string): Promise<LarkPinRecord | null> {
+  assertLarkTransport(larkAppId, 'pinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return null;
+    }
+    const rawPin = res.data?.pin;
+    if (!rawPin || typeof rawPin !== 'object') {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=0 missing=data.pin`);
+      return null;
+    }
+    return normalizeLarkPinRecord(rawPin);
+  } catch (err) {
+    logger.debug(`[pin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return null;
+  }
 }
 
 const LARK_PIN_LIST_MAX_PAGE = 50;
@@ -1005,13 +1020,7 @@ export async function listChatPins(larkAppId: string, chatId: string): Promise<L
     }
 
     for (const item of res.data?.items ?? []) {
-      out.push({
-        messageId: typeof item?.message_id === 'string' ? item.message_id : '',
-        chatId: typeof item?.chat_id === 'string' ? item.chat_id : undefined,
-        operatorId: typeof item?.operator_id === 'string' ? item.operator_id : undefined,
-        operatorIdType: typeof item?.operator_id_type === 'string' ? item.operator_id_type : undefined,
-        createTime: typeof item?.create_time === 'string' ? item.create_time : undefined,
-      });
+      out.push(normalizeLarkPinRecord(item));
     }
 
     if (res.data?.has_more !== true) break;

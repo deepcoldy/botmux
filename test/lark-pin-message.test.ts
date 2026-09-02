@@ -1,6 +1,6 @@
 /**
- * pinMessage / unpinMessage 的 boolean 契约：只有 Lark 明确 code===0 才返回 true；
- * SDK 抛错或非 0 / missing code 返回 false（Pin 是 QoL，必须 fail-open）。
+ * pinMessage 返回 Lark 确认的 Pin 记录，unpinMessage 返回 boolean；
+ * SDK 抛错或非 0 / missing code 都按失败值返回（Pin 是 QoL，必须 fail-open）。
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { logger } from '../src/utils/logger.js';
@@ -30,7 +30,7 @@ function setListPinsImpl(appId: string, impl: (req: any) => Promise<any>) {
 
 afterEach(() => vi.restoreAllMocks());
 
-describe('pinMessage/unpinMessage boolean contract', () => {
+describe('pinMessage provenance and unpinMessage boolean contracts', () => {
   it('pin calls SDK with exact create payload', async () => {
     const create = vi.fn(async () => ({ code: 0 }));
     setPinImpl('p_payload', create);
@@ -47,34 +47,77 @@ describe('pinMessage/unpinMessage boolean contract', () => {
     expect(del).toHaveBeenCalledWith({ path: { message_id: 'om_pin' } });
   });
 
-  it('returns true only when Lark confirms (code 0)', async () => {
-    setPinImpl('p_ok', async () => ({ code: 0, msg: 'success' }));
+  it('returns a Pin record only when Lark confirms (code 0)', async () => {
+    setPinImpl('p_ok', async () => ({
+      code: 0,
+      msg: 'success',
+      data: {
+        pin: {
+          message_id: 'om_pin',
+          operator_id: 'p_ok',
+          operator_id_type: 'app_id',
+        },
+      },
+    }));
     setUnpinImpl('u_ok', async () => ({ code: 0, msg: 'success' }));
-    await expect(pinMessage('p_ok', 'om_pin')).resolves.toBe(true);
+    await expect(pinMessage('p_ok', 'om_pin')).resolves.toMatchObject({
+      messageId: 'om_pin',
+      operatorId: 'p_ok',
+      operatorIdType: 'app_id',
+    });
     await expect(unpinMessage('u_ok', 'om_pin')).resolves.toBe(true);
   });
 
-  it('returns false on non-zero code', async () => {
+  it('returns the exact Pin provenance confirmed by a successful create response', async () => {
+    setPinImpl('p_provenance', async () => ({
+      code: 0,
+      data: {
+        pin: {
+          message_id: 'om_pin',
+          chat_id: 'oc_chat',
+          operator_id: 'p_provenance',
+          operator_id_type: 'app_id',
+          create_time: '1700000000000',
+        },
+      },
+    }));
+
+    await expect(pinMessage('p_provenance', 'om_pin')).resolves.toEqual({
+      messageId: 'om_pin',
+      chatId: 'oc_chat',
+      operatorId: 'p_provenance',
+      operatorIdType: 'app_id',
+      createTime: '1700000000000',
+    });
+  });
+
+  it('does not report ownership when create succeeds without a Pin record', async () => {
+    setPinImpl('p_missing_pin', async () => ({ code: 0, data: {} }));
+
+    await expect(pinMessage('p_missing_pin', 'om_pin')).resolves.toBeNull();
+  });
+
+  it('returns null/false failure values on non-zero code', async () => {
     setPinImpl('p_bad', async () => ({ code: 230001, msg: 'fail' }));
     setUnpinImpl('u_bad', async () => ({ code: 230001, msg: 'fail' }));
-    await expect(pinMessage('p_bad', 'om_pin')).resolves.toBe(false);
+    await expect(pinMessage('p_bad', 'om_pin')).resolves.toBeNull();
     await expect(unpinMessage('u_bad', 'om_pin')).resolves.toBe(false);
   });
 
-  it('returns false when response has no code field (treated as failure)', async () => {
+  it('returns null/false failure values when the response has no code field', async () => {
     setPinImpl('p_missing', async () => ({}));
     setUnpinImpl('u_missing', async () => ({}));
-    await expect(pinMessage('p_missing', 'om_pin')).resolves.toBe(false);
+    await expect(pinMessage('p_missing', 'om_pin')).resolves.toBeNull();
     await expect(unpinMessage('u_missing', 'om_pin')).resolves.toBe(false);
   });
 
-  it('returns false when the SDK throws and logs only at debug without leaking auth tokens', async () => {
+  it('returns null when create throws and logs only at debug without leaking auth tokens', async () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
     const err: any = new Error('sdk failed');
     err.config = { headers: { Authorization: 'Bearer fake_authorization_token' } };
     setPinImpl('p_throw', async () => { throw err; });
-    await expect(pinMessage('p_throw', 'om_pin')).resolves.toBe(false);
+    await expect(pinMessage('p_throw', 'om_pin')).resolves.toBeNull();
     expect(warn).not.toHaveBeenCalled();
     expect(debug).toHaveBeenCalled();
     const joined = debug.mock.calls.map((c) => c.join(' ')).join(' ');

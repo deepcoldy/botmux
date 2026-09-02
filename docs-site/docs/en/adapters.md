@@ -36,18 +36,21 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
-| `dsh` | DeepSeek Harness (dsh-jsonrpc-agent) | local process (SDK JSON-RPC) | ✅ |
+| `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 
 ## DeepSeek Harness (dsh)
 
-`cliId: "dsh"` drives a local `dsh-jsonrpc-agent` (the packaged runtime of [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner over the SDK JSON-RPC protocol. Prerequisites:
+`cliId: "dsh"` drives a local `dsh` CLI (the [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner via `dsh --profile <name>` over the SDK JSON-RPC protocol. Prerequisites:
 
-1. `dsh-jsonrpc-agent` on PATH (or point `cliPathOverride` at it).
+1. `dsh` on PATH (or point `cliPathOverride` at it). **Upgrade note**: this is the `dsh` command from the npm package `@deepseek-ai/dsh`. Earlier versions relied on `dsh-jsonrpc-agent` from the Python wheel — if only that older command is on PATH, the adapter will fail with "command not found" after upgrading.
 2. Native `dsh` CLI configured (`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`).
+3. The target profile (default `botmux`, overridable per bot via `dshProfile`) lives at `~/.dsh/profiles/<name>/`. **No manual setup is needed for first use**: when the profile is absent, botmux writes the skeleton (`package.json` + empty `cordis.yml` + `cordis.patch.yml`) and runs `dsh plugin add` to install its dependencies. To add community plugins or switch LLM providers, edit that profile's `cordis.patch.yml` — botmux only creates these files when missing and never overwrites existing content.
 
-The runner reads `agent-default-model` (provider + model) and `llm-pi-ai.providers` from `~/.dsh/settings.yaml`, generates a matching cordis composition, and injects credentials from `~/.dsh/.credentials.yaml` — no `env` config needed in `bots.json`. If `~/.dsh/settings.yaml` is absent, it falls back to the vendored deepseek-official composition (which still needs `DEEPSEEK_API_KEY` in env). You can also set `DSH_CORDIS_CONFIG` to explicitly specify a composition path and skip native config resolution.
+The runner reads `agent-default-model` (provider + model) from `~/.dsh/settings.yaml` for the initialize RPC; the plugin composition is entirely controlled by the profile's `cordis.patch.yml` — the runner no longer generates cordis.yml.
+
+When editing `cordis.patch.yml`, note that the two entry forms mean different things: `- insert: [...]` **inserts** new plugins, while a bare `- id: X` (no `insert`) **overrides the config of an existing** plugin and is silently skipped when that id is not present. The default patch botmux generates inserts only `sdk-jsonrpc-server` (the one plugin `dsh-base` lacks), inherits everything else from `dsh-base`, and disables the Web GUI plugins that would block startup in headless mode.
 
 Session JSONL lives under `~/.dsh/sessions/botmux/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
 

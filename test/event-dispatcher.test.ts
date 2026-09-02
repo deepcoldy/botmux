@@ -160,6 +160,9 @@ import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
+import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -814,12 +817,14 @@ function setupBotState(opts?: {
 	  autoGrantRequestCards?: boolean;
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
+	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
 	  summaryMemoryPath?: string;
+	  cardActionAckTimeoutMs?: number;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -848,12 +853,14 @@ function setupBotState(opts?: {
       autoGrantRequestCards: opts?.autoGrantRequestCards,
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
+	      commandTriggers: opts?.commandTriggers,
 	      chatReplyModes: opts?.chatReplyModes,
 	      chatMentionModes: opts?.chatMentionModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
 	      summaryMemoryPath: opts?.summaryMemoryPath,
+	      cardActionAckTimeoutMs: opts?.cardActionAckTimeoutMs,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -7278,6 +7285,25 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
+  it('保持既有 Botmux 卡片动作行为不变', async () => {
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'builtin accepted' },
+    });
+    const data = {
+      event_id: 'evt-builtin',
+      action: { name: 'botmux_builtin_action', value: { action: 'botmux_builtin_action' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_builtin' },
+    };
+    const result = await capturedHandlers['card.action.trigger']({
+      ...data,
+    });
+
+    expect(result).toEqual({ toast: { type: 'success', content: 'builtin accepted' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledOnce();
+    expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
+  });
+
   it('returns a valid empty ACK when a fast card handler has no payload', async () => {
     handlers.handleCardAction.mockResolvedValue(undefined);
 
@@ -7321,25 +7347,112 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('returns a toast before a slow handler settles, then patches the card in background', async () => {
+  it('hot-applies the bot-level card action ACK cutoff without reconnecting', async () => {
+    setupBotState({ cardActionAckTimeoutMs: 1_000 });
     let release!: () => void;
-    const slow = new Promise(resolve => { release = () => resolve({ type: 'late-card' }); });
-    handlers.handleCardAction.mockReturnValue(slow as any);
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => {
+      release = () => resolve(undefined);
+    }) as any);
 
     vi.useFakeTimers();
-    const call = capturedHandlers['card.action.trigger']({
-      action: { value: { action: 'toggle_stream', root_id: 'root-slow' } },
-      operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_slow_card' },
-    });
-    await vi.advanceTimersByTimeAsync(2500);
-    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        action: { value: { action: 'custom_ack_cutoff' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_custom_ack_cutoff' },
+      });
+      let settled = false;
+      void call.then(() => { settled = true; });
 
-    release();
-    await vi.runAllTimersAsync();
-    vi.useRealTimers();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
 
-    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_slow_card', JSON.stringify({ type: 'late-card' }));
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(call).resolves.toEqual({
+        toast: { type: 'info', content: '操作已收到，后台处理中' },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('handler exceeded 1000ms'));
+
+      release();
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('为慢插件先 ACK 再更新原卡片', async () => {
+    const token = 'slow-fixture-token';
+    const logPath = `/tmp/botmux-card-action-slow-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'card', logPath, '2700',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`slow_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'slow-actions',
+        packageName: '@botmux-ai/plugin-slow-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/slow-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'slow-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.slow.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
+
+      const startedAt = Date.now();
+      const result = await capturedHandlers['card.action.trigger']({
+        event_id: 'evt-slow-plugin',
+        action: { name: 'submit', value: { action: 'example.slow.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_slow_card' },
+      });
+      expect(result).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+
+      await vi.waitFor(() => {
+        expect(mockUpdateMessage).toHaveBeenCalledWith(
+          MY_APP_ID,
+          'om_slow_card',
+          JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+        );
+      }, { timeout: 2_000 });
+      expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
   });
 
   // Regression: browser-restart slow-fail visibility.
@@ -7410,23 +7523,96 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await first;
   });
 
-  it('dedupes a same-event_id redelivery that arrives AFTER the first copy completed', async () => {
-    handlers.handleCardAction.mockResolvedValue({ type: 'done-card' });
-    const event = {
-      event_id: 'evt-card-claim',
-      action: { value: { action: 'restart', root_id: 'root-claim' } },
+  it('按稳定 eventId 抑制重复业务投递', async () => {
+    const token = 'dedupe-fixture-token';
+    const logPath = `/tmp/botmux-card-action-dedupe-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'success', logPath, '0',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`dedupe_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'dedupe-actions',
+        packageName: '@botmux-ai/plugin-dedupe-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/dedupe-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'dedupe-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.dedupe.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
+      const event = {
+        event_id: 'evt-card-claim',
+        action: { value: { action: 'example.dedupe.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_claim_card' },
+      };
+
+      const first = await capturedHandlers['card.action.trigger'](event);
+      expect(first).toEqual({ toast: { type: 'success', content: 'accepted' } });
+      const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
+      expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const requests = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+      expect(requests).toHaveLength(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
+  });
+
+  it('服务与长连接恢复后无需重新注册业务 Handler', async () => {
+    vi.useFakeTimers();
+    const reconnectHandlers = makeHandlers();
+    reconnectHandlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', reconnectHandlers) as any;
+    expect(ws.start).toHaveBeenCalledTimes(1);
+    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ws.start).toHaveBeenCalledTimes(2);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-after-reconnect',
+      action: { value: { action: 'example.submit' } },
       operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_claim_card' },
-    };
-
-    const first = await capturedHandlers['card.action.trigger'](event);
-    expect(first).toEqual({ card: { type: 'raw', data: { type: 'done-card' } } });
-
-    // In-flight Set has already cleared in finally(); only the durable claim can
-    // still stop a redelivery from re-firing a non-idempotent action (restart).
-    const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
-    expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
-    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+      context: { open_message_id: 'om-reconnect' },
+    });
+    expect(result).toEqual({ toast: { type: 'success', content: 'accepted' } });
+    expect(reconnectHandlers.handleCardAction).toHaveBeenCalledOnce();
+    vi.useRealTimers();
   });
 
   it('does NOT durably dedupe distinct clicks without an event_id (legitimate repeat)', async () => {
@@ -8500,5 +8686,228 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
     // 本群缓存命中(没有多余重查),仍按 1v1 放行。
     expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
     expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── 免@ 斜杠命令（commandTriggers） ────────────────────────────────────────
+// 普通群里旁人直接发一条配置内的命令（未 @ 任何 bot）→ 落进该群已有的 chat-scope
+// 会话续聊。默认 mentionMode 保持 'always'：本特性与「群聊 @ 策略」正交，不靠
+// 把整个群改成免@ 来实现。
+describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  function setup(commandTriggers: any, opts?: { allowedUsers?: string[] }) {
+    setupBotState({
+      allowedUsers: opts?.allowedUsers ?? [USER_OPEN_ID],
+      commandTriggers,
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    // 多人多 bot 群：末条 solo 放行不成立，只有命令闸能放行。
+    mockGetChatInfo.mockResolvedValue({ userCount: 5, botCount: 2 });
+  });
+
+  let fireSeq = 0;
+  function fire(text: string, extra?: { chatId?: string; mentions?: TestMention[]; sender?: string }) {
+    // 每条消息一个独立 message_id：事件去重按 message_id 认领，同 id 的第二条会被
+    // 静默丢掉（本 describe 里有单测连发两条）。
+    return makeUserMessageEvent({
+      senderOpenId: extra?.sender ?? USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: `msg-cmd-trigger-${++fireSeq}`,
+      chatId: extra?.chatId ?? 'chat-cmd',
+      chatType: 'group',
+      mentions: extra?.mentions,
+    });
+  }
+
+  it('routes a bare configured command into the group chat-scope session', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // 模板是命令的行为定义；dispatcher 只负责把「命中的条目 + 本条消息的参数」下发，
+  // 真正的渲染在 daemon 侧（renderCommandTriggerPrompt）。
+  it('carries the configured template and the parsed args on the routing context', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下登录超时'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下登录超时' },
+    }));
+  });
+
+  // 核心需求：群里已经有会话时，裸命令要**续聊**，不是另起一个。
+  it('continues the existing group session instead of forking a new one', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-cmd');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ignores a command that is not on the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/deploy prod'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ignores ordinary chatter while the trigger is configured', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('今天这个登录问题谁看一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 危险命令必须 @：白名单被手改塞进 /close 也不生效（运行期 fail-closed）。
+  it('fails closed on a reserved daemon command smuggled into the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/close' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/close'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on a reserved passthrough command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/clear' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/clear'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('honours the chat allow-list and block-list', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }], chats: ['chat-in'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve a', { chatId: 'chat-out' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve b', { chatId: 'chat-in' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-in',
+    }));
+  });
+
+  it('stays quiet when the sender cannot talk to the bot', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] }, { allowedUsers: ['ou_someone_else'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // `@张三 /solve` 是指给张三的 —— 命令形态不改变「点名了别人就让路」这条群礼仪。
+  it('yields when the command message @mentions another member', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not fire in a topic group (话题群另有续话规则)', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    mockGetChatMode.mockResolvedValue('topic');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('stays off until enabled', async () => {
+    setup({ enabled: false, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 命令的含义不该取决于有没有 @：@ 了 bot 再发同一条命令，模板同样生效。
+  // 这是刻意的（否则「@ 了就变成另一种行为」才是特例），在此显式钉住。
+  it('@ 路径同样应用模板 —— 命令含义与是否 @ 无关', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下' },
+    }));
+  });
+
+  // @ 路径的**路由**不受影响（正文侧见上一条：模板同样生效）。
+  it('leaves the @mention path routing untouched', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
   });
 });

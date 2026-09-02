@@ -3,7 +3,26 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
 import { detectGlobalInstallManager } from '../src/utils/global-install.js';
+
+const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
+
+function runNodeScript(script: string, env: NodeJS.ProcessEnv) {
+  const r = spawnSync(NODE_BIN, [script], { encoding: 'utf-8', env });
+  const decode = (v: unknown): string => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (Buffer.isBuffer(v)) return v.toString('utf-8');
+    return String(v);
+  };
+  return {
+    ...r,
+    status: r.status ?? (r.error ? 1 : 0),
+    stdout: decode(r.stdout),
+    stderr: `${decode(r.stderr)}${r.error ? `\n${String(r.error)}` : ''}`,
+  };
+}
 
 /**
  * Pins the npm single-version binary distribution (PR #873).
@@ -155,7 +174,7 @@ describe('inject-optional-binaries — release-time version wiring', () => {
       join(dir, 'package.json'),
       `${JSON.stringify({ name: 'botmux', version: manifestVersion }, null, 2)}\n`,
     );
-    const r = spawnSync(process.execPath, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
+    const r = spawnSync(NODE_BIN, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
       encoding: 'utf-8',
     });
     const after = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
@@ -206,9 +225,9 @@ describe('inject-optional-binaries — release-time version wiring', () => {
     writeFileSync(join(dir, 'scripts', 'inject-optional-binaries.mjs'), readFileSync(INJECT));
     writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ name: 'botmux', version: '3.20.0' }, null, 2)}\n`);
     const script = join(dir, 'scripts', 'inject-optional-binaries.mjs');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE_BIN, [script, '3.20.0'], { encoding: 'utf-8' });
     const first = readFileSync(join(dir, 'package.json'), 'utf-8');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE_BIN, [script, '3.20.0'], { encoding: 'utf-8' });
     expect(readFileSync(join(dir, 'package.json'), 'utf-8')).toBe(first);
   });
 });
@@ -311,10 +330,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     if (opts.binDirOnPath) env.PATH = `${join(home, '.botmux', 'bin')}:${process.env.PATH}`;
     if (opts.shell) env.SHELL = opts.shell;
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
-      encoding: 'utf-8',
-      env,
-    });
+    const r = runNodeScript(join(pkg, 'scripts', 'postinstall-bin.mjs'), env);
     return { ...r, launcher, binary, home, wrote: existsSync(launcher) };
   }
 
@@ -604,9 +620,10 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), src);
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'botmux', version: '3.20.0' }));
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
-      encoding: 'utf-8',
-      env: { PATH: process.env.PATH, HOME: home, npm_config_global: 'true' },
+    const r = runNodeScript(join(pkg, 'scripts', 'postinstall-bin.mjs'), {
+      PATH: process.env.PATH,
+      HOME: home,
+      npm_config_global: 'true',
     });
     return { ...r, wrote: existsSync(join(home, '.botmux', 'bin', 'botmux')) };
   }

@@ -1175,6 +1175,54 @@ describe('/botconfig set p2pOpen (私聊对话全开) via the real text command'
   });
 });
 
+describe('/botconfig set cardActionAckTimeoutMs via the real text command', () => {
+  it('sets, range-checks, and unsets the bot-level ACK cutoff', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-card-ack-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+    try {
+      await run('/botconfig set cardActionAckTimeoutMs 1200');
+      expect(stored().cardActionAckTimeoutMs).toBe(1_200);
+      expect((bot.config as any).cardActionAckTimeoutMs).toBe(1_200);
+
+      await run('/botconfig set cardActionAckTimeoutMs 2501');
+      expect(stored().cardActionAckTimeoutMs).toBe(1_200);
+      expect((bot.config as any).cardActionAckTimeoutMs).toBe(1_200);
+
+      await run('/botconfig unset cardActionAckTimeoutMs');
+      expect(stored().cardActionAckTimeoutMs).toBeUndefined();
+      expect((bot.config as any).cardActionAckTimeoutMs).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
   it('persists pinStreamingCard and returns promptly even when hot reconciliation throws or hangs', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-pinstreaming-'));
@@ -3192,10 +3240,13 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Agent 当前未运行');
     });
 
-    it('requests native rename from a live Codex worker without restarting it', async () => {
+    it.each([
+      ['codex', '/bin/codex'],
+      ['traex', '/bin/traex'],
+    ] as const)('requests native rename from a live %s worker without restarting it', async (cliId, cliPathOverride) => {
       const send = vi.fn();
       const ds = makeDaemonSession({
-        session: makeSession({ cliId: 'codex', cliPathOverride: '/bin/codex' }),
+        session: makeSession({ cliId, cliPathOverride }),
         worker: { killed: false, connected: true, send } as any,
       });
       const deps = makeDeps(ds);
@@ -3208,7 +3259,7 @@ describe('handleCommand', () => {
       expect(ds.session.nativeSessionTitle).toBe('Native 同步');
       expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('已向 codex 发送原生改名请求');
+      expect(replyContent).toContain(`已向 ${cliId} 发送原生改名请求`);
     });
   });
 

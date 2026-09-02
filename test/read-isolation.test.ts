@@ -831,7 +831,7 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
       capabilities: ['credential', 'read', 'write'],
     });
     expect(isolatedPaneReattachSafe(currentVersionNoState, ['credential', 'read', 'write'])).toBe(false);
-    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(11);
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(12);
   });
 });
 

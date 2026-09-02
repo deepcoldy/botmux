@@ -12,7 +12,7 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -95,7 +95,7 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-it-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -174,7 +174,7 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-sb-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -228,7 +228,9 @@ describe('dsh worker final_output integration', () => {
 
       // The generated composition and session JSONL must land in the REAL
       // HOME's native dsh dir, not in a throwaway tmpfs that dies with the sandbox.
-      expect(existsSync(join(root, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+      // The runner no longer generates cordis.yml — the dsh --profile CLI
+      // handles composition. It only creates the profile directory.
+      expect(existsSync(join(root, '.dsh', 'profiles', 'botmux'))).toBe(true);
       expect(existsSync(join(root, '.dsh', 'sessions', 'botmux', sessionId))).toBe(true);
     } finally {
       await stopChild(child);

@@ -15,8 +15,11 @@ import { runExistingPm2Command } from '../src/cli/pm2-existing.js';
 import { captureReadonlyPm2Jlist } from '../src/cli/pm2-readonly.js';
 import { inspectLinuxPm2GodOwnership } from '../src/core/pm2-lifecycle-owner.js';
 
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
+
 const PKG_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PM2_PATH = join(PKG_ROOT, 'node_modules', 'pm2', 'bin', 'pm2');
+const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
 
 describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary', () => {
   let root = '';
@@ -31,7 +34,7 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
     config = join(root, 'ecosystem.config.cjs');
     writeFileSync(script, 'setInterval(() => {}, 1000);\n');
     writeFileSync(config, `module.exports = { apps: [{ name: 'botmux-existing-fixture', script: ${JSON.stringify(script)} }] };\n`);
-    const boot = spawnSync(process.execPath, [PM2_PATH, 'status'], {
+    const boot = spawnSync(NODE_BIN, [PM2_PATH, 'status'], {
       env: { ...process.env, PM2_HOME: pm2Home },
       stdio: 'ignore',
       timeout: 10_000,
@@ -40,7 +43,7 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
   });
 
   afterAll(() => {
-    spawnSync(process.execPath, [PM2_PATH, 'kill'], {
+    spawnSync(NODE_BIN, [PM2_PATH, 'kill'], {
       env: { ...process.env, PM2_HOME: pm2Home },
       stdio: 'ignore',
       timeout: 10_000,
@@ -99,9 +102,10 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     });
-    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home }));
+    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home, nodePath: NODE_BIN }));
     expect(apps.some((app: any) => app.name === 'botmux-existing-fixture')).toBe(true);
     expect(Number.parseInt(readFileSync(pidFile, 'utf8'), 10)).toBe(originalPid);
 
@@ -110,9 +114,10 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['delete', 'botmux-existing-fixture'],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     });
-    const killed = spawnSync(process.execPath, [PM2_PATH, 'kill'], {
+    const killed = spawnSync(NODE_BIN, [PM2_PATH, 'kill'], {
       env: { ...process.env, PM2_HOME: pm2Home },
       stdio: 'ignore',
       timeout: 10_000,
@@ -124,13 +129,14 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     })).toThrow(/no replacement daemon was created/);
     expect(existsSync(pidFile)).toBe(false);
   });
 
   it('rejects a replacement generation before applying the mutation', () => {
-    const boot = spawnSync(process.execPath, [PM2_PATH, 'status'], {
+    const boot = spawnSync(NODE_BIN, [PM2_PATH, 'status'], {
       env: { ...process.env, PM2_HOME: pm2Home },
       stdio: 'ignore',
       timeout: 10_000,
@@ -145,9 +151,10 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: { ...god!, startIdentity: `${god!.startIdentity}-replaced` },
     })).toThrow(/generation changed before mutation/);
-    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home }));
+    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home, nodePath: NODE_BIN }));
     expect(apps.some((app: any) => app.name === 'botmux-existing-fixture')).toBe(false);
   });
 });

@@ -16,7 +16,9 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
-const pinMessageMock = vi.fn(async (_appId: string, _messageId: string) => true);
+const pinMessageMock = vi.fn(async (appId: string, messageId: string) => ({
+  messageId, operatorId: appId, operatorIdType: 'app_id',
+}));
 const unpinMessageMock = vi.fn(async (_appId: string, _messageId: string) => true);
 const saveFrozenCardsMock = vi.fn();
 const loadFrozenCardsMock = vi.fn(() => new Map<string, FrozenCard>());
@@ -186,7 +188,9 @@ beforeEach(() => {
   updateMessageMock.mockReset();
   updateMessageMock.mockResolvedValue(undefined);
   pinMessageMock.mockReset();
-  pinMessageMock.mockResolvedValue(true);
+  pinMessageMock.mockImplementation(async (appId: string, messageId: string) => ({
+    messageId, operatorId: appId, operatorIdType: 'app_id',
+  }));
   unpinMessageMock.mockReset();
   unpinMessageMock.mockResolvedValue(true);
   saveFrozenCardsMock.mockClear();
@@ -506,8 +510,8 @@ describe('meeting-agent streaming card (Plan B)', () => {
 
 describe('postFreshStreamingCard', () => {
   it('completes /card publication before its deferred Pin chain settles', async () => {
-    let resolvePin!: (value: boolean) => void;
-    pinMessageMock.mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+    let resolvePin!: (value: { messageId: string; operatorId: string; operatorIdType: string }) => void;
+    pinMessageMock.mockImplementationOnce(() => new Promise((resolve) => {
       resolvePin = resolve;
     }));
     getBotMock.mockReturnValue({
@@ -528,7 +532,7 @@ describe('postFreshStreamingCard', () => {
       return value;
     });
 
-    await drainPinQueue();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalledWith(APP_ID, 'om_fresh_card'));
 
     expect(typeof resolvePin).toBe('function');
     expect(settled).toBe(true);
@@ -536,7 +540,7 @@ describe('postFreshStreamingCard', () => {
     expect(ds.streamCardId).toBe('om_fresh_card');
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
 
-    resolvePin(true);
+    resolvePin({ messageId: 'om_fresh_card', operatorId: APP_ID, operatorIdType: 'app_id' });
     await expect(pending).resolves.toBe(true);
   });
 
@@ -988,8 +992,8 @@ describe('postTurnStartingCard', () => {
   });
 
   it('starts the successor turn before the older turn Pin chain settles', async () => {
-    let resolvePin!: (value: boolean) => void;
-    pinMessageMock.mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolvePin = resolve; }));
+    let resolvePin!: (value: { messageId: string; operatorId: string; operatorIdType: string }) => void;
+    pinMessageMock.mockImplementationOnce(() => new Promise((resolve) => { resolvePin = resolve; }));
     getBotMock.mockReturnValue({
       config: { larkAppId: APP_ID, cliId: 'claude-code', pinStreamingCard: true },
     } as any);
@@ -1015,7 +1019,7 @@ describe('postTurnStartingCard', () => {
     expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(ds.streamCardId).toBe('om_turn_card_successor');
 
-    resolvePin(true);
+    resolvePin({ messageId: 'om_turn_card_old', operatorId: APP_ID, operatorIdType: 'app_id' });
     await flush();
     await flush();
   });

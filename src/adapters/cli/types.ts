@@ -164,6 +164,9 @@ export interface CliAdapter {
      *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
+    /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
+     *  dsh runner; adapters without a dsh runner ignore the field. */
+    dshProfile?: string;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
      *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
      *  with an explicit reasoning control honor it; others ignore. */

@@ -134,12 +134,23 @@ function trustedCallerForTurn(
   larkAppId: string,
   senderOpenId?: string,
   senderUnionId?: string,
+  /** Three-state: true = provably a bot (platform `sender_type` app/bot, OR a
+   *  known peer via the cross-ref foreign-bot signal), false = provably human
+   *  (`sender_type === 'user'`), undefined = cannot tell. Pass
+   *  {@link senderIsBotTriState} rather than a bare `sender_type` comparison:
+   *  that check alone reads a cross-ref-identified peer bot as `'user'`, and
+   *  `'user'` is the value a consumer maps onto a real person's access — writing
+   *  it for a bot turn actively vouches for it, which is worse than absent.
+   *  undefined leaves the field off so a consumer treats the turn as unknown
+   *  rather than as "human". */
+  senderIsBot?: boolean,
 ): TrustedCaller | undefined {
   if (!senderOpenId && !senderUnionId) return undefined;
   return {
     ...(senderOpenId ? { requestUserOpenId: senderOpenId } : {}),
     ...(senderUnionId ? { requestUserUnionId: senderUnionId } : {}),
     requestLarkAppId: larkAppId,
+    ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
 }
 export type { DaemonSession } from './core/types.js';
@@ -296,6 +307,7 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -324,6 +336,7 @@ import {
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
@@ -675,7 +688,12 @@ let sessionsRestored = false;
 function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
   queueMicrotask(() => {
     try {
-      reconcileRestoredStreamingCardPins(larkAppId);
+      Promise.resolve(reconcileRestoredStreamingCardPins(larkAppId)).catch((err) => {
+        logger.warn(
+          `[card-pin] startup restore reconcile failed for ${larkAppId}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
     } catch (err) {
       logger.warn(
         `[card-pin] startup restore reconcile failed for ${larkAppId}: `
@@ -5586,6 +5604,17 @@ const cardDeps: CardHandlerDeps = {
       substitute: false,
     }),
 };
+
+// Plugin routing is resolved from the persistent registry and current Bot
+// bindings for every callback. A service restart or Lark reconnect therefore
+// requires no process-local handler registration and no second WS connection.
+const cardActionPluginGateway = createPluginCardActionGateway({
+  resolvePluginIds: (larkAppId) => resolveEffectivePluginIds(
+    getBot(larkAppId).config,
+    readGlobalConfig(),
+  ),
+  fallback: (data, larkAppId) => handleCardAction(data, cardDeps, larkAppId),
+});
 
 const LEGACY_WORKFLOW_API_RETIRED = {
   ok: false,
@@ -17854,10 +17883,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
 
+  // 免@ 斜杠命令：配了模板就用模板替换**注入 CLI 的正文**（未配则保留用户原文）。
+  //
+  // ⚠️ 命令解析（cmdContent）刻意**不**跟着改写：模板渲染结果里含用户自己敲的
+  // 参数（`{args}` 打头时参数就落在第一个 token），而免@ 的三道闸只校验过触发词
+  // 本身。若让解析器看渲染结果，用户发 `/solve /clear` 就能让 `/clear` 占住命令
+  // 位，绕过「保留命令必须 @」这条闸。cmdContent 因此始终取闸门校验过的触发词
+  // 原文——它必然不是保留命令，解析后会落到正常 spawn 路径。
+  const newTopicCommandPrompt = ctx.commandTrigger
+    ? renderCommandTriggerPrompt(ctx.commandTrigger)
+    : undefined;
+  // 改写前的原文 = 命令解析车道。没有模板时它与 followupContent 逐字相同，
+  // 所以这里不需要分支。
+  const newTopicCommandLane = parsed.content.trim();
+  if (newTopicCommandPrompt) parsed.content = newTopicCommandPrompt;
+
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
-  let cmdContent = stripLeadingMentions(followupContent, followupMentions);
+  let cmdContent = stripLeadingMentions(newTopicCommandLane, followupMentions);
 
   // `/t` / `/topic` — force the bot to reply in a thread, even in 普通群.
   // In 普通群 the inbound message is chat-scope by default; override to
@@ -17891,7 +17935,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
-  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId);
+  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId, senderIsBotTriState(parsed.senderType, isForeignBotSender));
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -19322,6 +19366,13 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同理由——模板渲染结果只进 CLI
+  // 正文，命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
+  const threadCommandPrompt = ctx.commandTrigger
+    ? renderCommandTriggerPrompt(ctx.commandTrigger)
+    : undefined;
+  const threadCommandLane = parsed.content.trim();
+  if (threadCommandPrompt) parsed.content = threadCommandPrompt;
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -19385,7 +19436,9 @@ async function handleThreadReplyAdmitted(
 
   const content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
-  const cmdContent = stripLeadingMentions(content, parsed.mentions);
+  // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
+  // 逐字相同（见上方 threadCommandPrompt 处的说明）。
+  const cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -19397,7 +19450,7 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
-  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId);
+  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -22564,7 +22617,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const botEventHandlers: EventHandlers = {
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
-        () => handleCardAction(data, cardDeps, appId),
+        () => cardActionPluginGateway.dispatch(data, appId),
       ),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),

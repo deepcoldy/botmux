@@ -66,6 +66,8 @@ export type BotDefaultsRow = {
   turnTimeoutMs?: number;
   /** dsh runtime variant: 'official' (JSON-RPC runner) or 'tui' (dsh-tui PTY). */
   dshRuntime?: 'official' | 'tui' | null;
+  /** dsh profile name; rendered as a dsh-only field. */
+  dshProfile?: string | null;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
@@ -158,7 +160,7 @@ export type LoadBotsResult = {
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
-  { id: 'traex', label: 'traex' },
+  { id: 'traex', label: 'TRAE CLI 2.0' },
 ];
 
 export const fallbackCliOptionsState: CliOptionsState = {
@@ -236,6 +238,40 @@ export async function fetchDetectedModels(
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
     const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
     return { models, source };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the list of available DSH profiles from the daemon.
+ * Returns an empty array on any error.
+ */
+export async function fetchDshProfiles(): Promise<string[]> {
+  try {
+    const r = await fetch('/api/dsh/profiles');
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !Array.isArray(body.profiles)) return [];
+    return body.profiles.filter((p: unknown): p is string => typeof p === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Create a new DSH profile with the botmux default base plugins.
+ * Returns the created profile name, or null on error.
+ */
+export async function createDshProfile(name: string): Promise<string | null> {
+  try {
+    const r = await fetch('/api/dsh/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || typeof body.name !== 'string') return null;
+    return body.name;
   } catch {
     return null;
   }

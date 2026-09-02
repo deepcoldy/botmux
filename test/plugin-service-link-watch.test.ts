@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,8 @@ vi.mock('../src/core/plugins/pm2.js', () => ({
 
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { startPluginServices } from '../src/core/plugins/service-manager.js';
+import { pluginCardActionTokenPath, pluginMaterializedPath, pluginRegistryPath } from '../src/core/plugins/paths.js';
+import { materializePlugin } from '../src/core/plugins/materializer.js';
 
 function pm2List(hash: string, status = 'online'): string {
   return JSON.stringify([{
@@ -30,6 +32,7 @@ function pm2List(hash: string, status = 'online'): string {
 
 function writePluginSource(root: string): void {
   mkdirSync(join(root, 'dist', 'service'), { recursive: true });
+  mkdirSync(join(root, 'dist', 'card-actions'), { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify({
     name: '@botmux-ai/plugin-linked-service',
     version: '0.1.0',
@@ -47,14 +50,84 @@ function writePluginSource(root: string): void {
   writeFileSync(join(root, 'dist', 'service', 'index.js'), `
     module.exports = {
       mode: 'manual',
+      port: 43210,
       pm2: {
         script: './service/server.js',
+        env: {
+          BOTMUX_PLUGIN_CARD_ACTION_TOKEN: 'forged-token',
+          BOTMUX_PLUGIN_CARD_ACTION_ENDPOINT: '/forged-endpoint'
+        },
         autorestart: true,
         killTimeoutMs: 9000,
         watchDelayMs: 2500
       }
     };
   `);
+  writeFileSync(join(root, 'dist', 'card-actions', 'index.json'), JSON.stringify({
+    schemaVersion: 1,
+    actions: ['example.linked.submit'],
+    endpoint: '/botmux/card-actions/v1',
+  }));
+}
+
+function writeSecondPluginSource(root: string): void {
+  mkdirSync(join(root, 'dist', 'service'), { recursive: true });
+  mkdirSync(join(root, 'dist', 'card-actions'), { recursive: true });
+  writeFileSync(join(root, 'package.json'), JSON.stringify({
+    name: '@botmux-ai/plugin-second-service',
+    version: '0.1.0',
+    keywords: ['botmux-plugin'],
+    botmux: {
+      schemaVersion: 1,
+      id: 'second-service',
+      service: { mode: 'manual' },
+    },
+  }));
+  writeFileSync(join(root, 'dist', 'package.json'), JSON.stringify({ type: 'commonjs' }));
+  writeFileSync(join(root, 'dist', 'service', 'server.js'), 'setInterval(() => {}, 1000);\n');
+  writeFileSync(join(root, 'dist', 'service', 'index.js'), `
+    module.exports = {
+      mode: 'manual',
+      port: 43211,
+      pm2: {
+        script: './service/server.js',
+        env: {
+          BOTMUX_PLUGIN_CARD_ACTION_TOKEN: 'another-forged-token',
+          BOTMUX_PLUGIN_CARD_ACTION_ENDPOINT: '/another-forged-endpoint'
+        }
+      }
+    };
+  `);
+  writeFileSync(join(root, 'dist', 'card-actions', 'index.json'), JSON.stringify({
+    schemaVersion: 1,
+    actionPrefixes: ['example.second.'],
+    endpoint: '/botmux/second-actions/v1',
+  }));
+}
+
+function writeInvalidPortPluginSource(root: string): void {
+  mkdirSync(join(root, 'dist', 'service'), { recursive: true });
+  mkdirSync(join(root, 'dist', 'card-actions'), { recursive: true });
+  writeFileSync(join(root, 'package.json'), JSON.stringify({
+    name: '@botmux-ai/plugin-invalid-port-service',
+    version: '0.1.0',
+    keywords: ['botmux-plugin'],
+    botmux: {
+      schemaVersion: 1,
+      id: 'invalid-port-service',
+      service: { mode: 'manual' },
+    },
+  }));
+  writeFileSync(join(root, 'dist', 'package.json'), JSON.stringify({ type: 'commonjs' }));
+  writeFileSync(join(root, 'dist', 'service', 'server.js'), 'setInterval(() => {}, 1000);\n');
+  writeFileSync(join(root, 'dist', 'service', 'index.js'), `
+    module.exports = { mode: 'manual', pm2: { script: './service/server.js' } };
+  `);
+  writeFileSync(join(root, 'dist', 'card-actions', 'index.json'), JSON.stringify({
+    schemaVersion: 1,
+    actions: ['example.invalid-port.submit'],
+    endpoint: '/botmux/card-actions/v1',
+  }));
 }
 
 describe('linked plugin service watcher', () => {
@@ -146,5 +219,67 @@ describe('linked plugin service watcher', () => {
     expect(config.apps[0].watch).toBe(false);
     expect(config.apps[0]).not.toHaveProperty('watch_delay');
     expect(startCall![1].env.BOTMUX_PLUGIN_LINKED).toBe('0');
+  });
+
+  it('为每个插件服务注入独立且不可覆盖的私有 token', async () => {
+    const secondSource = join(home, 'second-source');
+    writeSecondPluginSource(secondSource);
+    installLocalPlugin(secondSource, { link: true });
+    materializePlugin('linked-service');
+    materializePlugin('second-service');
+
+    const reports = await startPluginServices(['linked-service', 'second-service']);
+    const starts = pm2.run.mock.calls.filter(call => call[0][0] === 'start');
+    expect(starts).toHaveLength(2);
+    const envByPlugin = Object.fromEntries(starts.map(call => [call[1].env.BOTMUX_PLUGIN_ID, call[1].env]));
+    const firstToken = envByPlugin['linked-service'].BOTMUX_PLUGIN_CARD_ACTION_TOKEN;
+    const secondToken = envByPlugin['second-service'].BOTMUX_PLUGIN_CARD_ACTION_TOKEN;
+    expect(firstToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(secondToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(firstToken).not.toBe(secondToken);
+    expect(firstToken).not.toBe('forged-token');
+    expect(secondToken).not.toBe('another-forged-token');
+    expect(envByPlugin['linked-service']).toMatchObject({
+      BOTMUX_PLUGIN_CARD_ACTION_ENDPOINT: '/botmux/card-actions/v1',
+      PORT: '43210',
+    });
+    expect(envByPlugin['second-service']).toMatchObject({
+      BOTMUX_PLUGIN_CARD_ACTION_ENDPOINT: '/botmux/second-actions/v1',
+      PORT: '43211',
+    });
+
+    for (const pluginId of ['linked-service', 'second-service']) {
+      const stat = lstatSync(pluginCardActionTokenPath(pluginId));
+      expect(stat.isFile()).toBe(true);
+      expect(stat.isSymbolicLink()).toBe(false);
+      if (process.platform !== 'win32') expect(stat.mode & 0o777).toBe(0o600);
+    }
+    expect(JSON.stringify(reports)).not.toContain(firstToken);
+    expect(JSON.stringify(reports)).not.toContain(secondToken);
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).not.toContain(firstToken);
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).not.toContain(secondToken);
+    expect(readFileSync(pluginMaterializedPath('linked-service'), 'utf8')).not.toContain(firstToken);
+    expect(readFileSync(pluginMaterializedPath('second-service'), 'utf8')).not.toContain(secondToken);
+
+    const firstPath = pluginCardActionTokenPath('linked-service');
+    const firstBeforeRestart = readFileSync(firstPath, 'utf8');
+    pm2.capture.mockReturnValue('[]');
+    await startPluginServices(['linked-service']);
+    expect(readFileSync(firstPath, 'utf8')).toBe(firstBeforeRestart);
+  });
+
+  it('rejects a card action service definition without a fixed valid port before PM2 start', async () => {
+    const invalidSource = join(home, 'invalid-port-source');
+    writeInvalidPortPluginSource(invalidSource);
+    installLocalPlugin(invalidSource);
+    pm2.run.mockClear();
+
+    const reports = await startPluginServices(['invalid-port-service']);
+    expect(reports).toEqual([expect.objectContaining({
+      pluginId: 'invalid-port-service',
+      action: 'failed',
+      warning: 'plugin_card_actions_fixed_port_required:invalid-port-service',
+    })]);
+    expect(pm2.run).not.toHaveBeenCalled();
   });
 });

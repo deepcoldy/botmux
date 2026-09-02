@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -103,11 +103,43 @@ describe('checkoutDirFromWrapperText', () => {
 });
 
 describe('localDevUpdateSteps', () => {
-  it('is git pull --ff-only then pnpm build (restart applied separately)', () => {
+  it('is git pull --ff-only then bun run build (restart applied separately)', () => {
     expect(localDevUpdateSteps()).toEqual([
       { command: 'git', args: ['pull', '--ff-only'] },
-      { command: 'pnpm', args: ['build'] },
+      { command: 'bun', args: ['run', 'build'] },
     ]);
+  });
+
+  // Regression guard for the real breakage: the repo declares
+  // `packageManager: bun@1.4.0`, so a corepack-shimmed `pnpm` refuses to run in
+  // this repo AT ALL (`pnpm --version` itself exits 1 with "Unsupported package
+  // manager specification"). `botmux upgrade` therefore died right after
+  // `git pull` with `pnpm build 退出码 1`. A per-token check rather than only the
+  // toEqual above, because this dev machine HAS pnpm on PATH — a reintroduced
+  // `pnpm` would still be spawnable here and fail for a reason the local
+  // developer does not see, exactly as it did on the live daemon.
+  it('never shells out to pnpm', () => {
+    for (const { command, args } of localDevUpdateSteps()) {
+      expect([command, ...args]).not.toContain('pnpm');
+    }
+  });
+
+  // `bun build` is Bun's bundler subcommand — it exits 1 with "Missing
+  // entrypoints" and never reads package.json. Only `bun run <script>` does.
+  it('drives the package.json script via `bun run`, not the `bun build` bundler', () => {
+    const bun = localDevUpdateSteps().find((s) => s.command === 'bun');
+    expect(bun?.args[0]).toBe('run');
+  });
+
+  // The build step must name a script that actually exists in package.json;
+  // a renamed script would otherwise fail only at update time, on the live box.
+  it('builds a script that exists in package.json', () => {
+    const bun = localDevUpdateSteps().find((s) => s.command === 'bun');
+    const script = bun?.args[1];
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dirname ?? __dirname, '..', 'package.json'), 'utf-8'),
+    );
+    expect(Object.keys(pkg.scripts)).toContain(script);
   });
 });
 

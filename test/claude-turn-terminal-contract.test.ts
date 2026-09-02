@@ -330,6 +330,21 @@ describe('Claude durable turn terminal contract', () => {
       expect(h.emitted).toEqual([]);
     });
 
+    it('emits no terminal for a HEADLESS local turn that died with provider_server_error', () => {
+      // The other synthesis path: an assistant boundary arrives with no
+      // collecting context at all (a restart cut the stream and the user event
+      // was already absorbed), so the queue mints `local-headless-<uuid>`.
+      // Reviewed as logically covered by the same gate, but it had no sample of
+      // its own — and "covered by the same branch" is an argument, not a test.
+      const h = new ContractHarness();
+      h.ingest([
+        assistant('headless-a', 'partial work with no user event', 'tool_use'),
+        connectionLost('headless-err'),
+        turnDuration('headless-dur'),
+      ]);
+      expect(h.emitted).toEqual([]);
+    });
+
     it('still emits the failure for a REAL Lark turn — the card must not be lost', () => {
       // Positive control. Without this, the fix above could be "suppress
       // everything" and the suite would not notice.

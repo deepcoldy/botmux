@@ -176,7 +176,8 @@ loss.
 `reconcileBotStreamingCardPins` snapshots active sessions for the target bot;
 `reconcileChatStreamingCardPins` limits that snapshot to the target chat. Both
 enqueue ordered reconciliation work with per-session error isolation and a
-maximum of 20 concurrent sessions per batch. They are deliberately
+maximum of 20 sessions per batch. Actual Pin/Unpin transport mutations also
+share a process-wide 20-permit limiter across bots. They are deliberately
 fire-and-forget from configuration handlers so Feishu latency cannot delay a
 Dashboard, `/botconfig`, or `/card pin` response. Each queued change carries
 whether it represents an authoritative effective on → off transition, because

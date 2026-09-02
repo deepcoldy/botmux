@@ -354,6 +354,15 @@ function commonHomeBaseline(h: string): FsRule[] {
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
     ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`),
+    // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
+    // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
+    // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
+    // denied with the rest of `~/.botmux`. Without this hole a sandboxed bot cannot
+    // answer "which plugins am I running": `botmux plugin list` EPERMs before it reads
+    // anything, because the registry read serializes on a lock file next to the
+    // registry (`plugins-registry.json.lock`) under a deny-by-default `~/.botmux`.
+    // Read-only is the whole grant — install/enable stay host-side operations.
+    ro(`${h}/.botmux/plugins-registry.json`),
     // Crown jewels — most are already unreachable via deny-by-default; these
     // explicit denies guard the ones that could fall under an allowed tree
     // (workingDir = $HOME, a broad user readOnly, …). Defence-in-depth.

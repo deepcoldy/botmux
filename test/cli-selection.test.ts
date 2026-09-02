@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CLI_SELECT_OPTIONS,
   CLI_SELECT_TREE,
+  CLI_SELECTION_ALIASES,
   resolveCliSelection,
   lookupCliSelection,
   selectionKeyForBot,
@@ -62,15 +63,28 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
   });
 
-  it('cascades TRAE (CoCo) into one submenu of coco + traex (no top-level coco/traex)', () => {
+  it('cascades TRAE CLI into a current-first submenu without changing adapter ids', () => {
     const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
-    expect(trae?.label).toBe('TRAE (CoCo)');
-    expect(trae?.children?.map((c) => c.key)).toEqual(['coco', 'traex']);
+    expect(trae?.label).toBe('TRAE CLI');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['traex', 'coco']);
+    expect(trae?.children?.map((c) => c.label)).toEqual([
+      'TRAE CLI 2.0（推荐；traex / traecli）',
+      'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+    ]);
     expect(trae?.option).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
     expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
     expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(flatKeys.indexOf('traex')).toBe(flatKeys.indexOf('coco') - 1);
+  });
+
+  it('keeps traecli as an input-only alias of the TRAE CLI 2.0 adapter', () => {
+    expect(CLI_SELECTION_ALIASES).toMatchObject({ traecli: 'traex' });
+    expect(CLI_SELECT_OPTIONS.map((o) => o.key)).not.toContain('traecli');
+    expect(lookupCliSelection('traecli')).toBe(lookupCliSelection('traex'));
+    expect(resolveCliSelection('traecli')).toEqual({ cliId: 'traex' });
   });
 
   it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {

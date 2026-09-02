@@ -6707,6 +6707,26 @@ dialog.onboarding-dialog::backdrop {
   color: var(--muted);
 }
 .bd-section-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+/* 免@ 斜杠命令：命令表的逐条校验结果（服务端判定 botmux 保留命令）+ 「所有群」告警。 */
+.bd-command-trigger-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.bd-command-trigger-row { border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; }
+.bd-command-trigger-head { display: flex; gap: 6px; align-items: center; }
+.bd-command-trigger-cmd { flex: 1 1 auto; min-width: 0; font-family: var(--mono, monospace); font-size: 12px; }
+.bd-command-trigger-prompt { margin-top: 6px; width: 100%; }
+.bd-command-trigger-remove,
+.bd-command-trigger-add { flex: 0 0 auto; border: 1px solid var(--border-soft); background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; padding: 2px 9px; }
+.bd-command-trigger-add { align-self: flex-start; }
+.bd-command-trigger-checks { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; line-height: 1.7; }
+.bd-command-trigger-checks code { font-family: var(--mono, monospace); }
+.bd-command-trigger-checks .ok { color: var(--success); }
+.bd-command-trigger-checks .bad { color: var(--danger); }
+.bd-command-trigger-warn {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
+  border-radius: 9px;
+  padding: 7px 10px;
+}
 /* CLI-data-isolation capability line under the file-sandbox toggle: green when
    the CLI data root is redirected into this bot's private BOT_HOME, muted grey
    when only the base deny-by-default file sandbox applies. */

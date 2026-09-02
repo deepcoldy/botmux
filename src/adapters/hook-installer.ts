@@ -106,21 +106,60 @@ function botmuxHookSuffix(hookCommand: string): string {
 }
 
 /**
+ * 判断一条命令字符串是否是「botmux 自己发起的 hook 调用」。
+ *
+ * ⚠️ 旧实现用 `command.includes('cli.js')` 来识别 botmux hook——这在 Node 态成立
+ * （命令是 `"<node>" "<...>/dist/cli.js" <subcommand>`），但**编译态（单文件二进制）**
+ * 下 `renderShellCommand` 写的是打包二进制路径 `"<...>/botmux-linux-x64/botmux" <subcommand>`，
+ * 根本不含 `cli.js`。旧判据因此把已装 hook 误判为「未安装」。
+ *
+ * 后果分两种，别记成「三条一起失效」（实测口径）：
+ *   - `session-ready` / `user-prompt-hook`：**每次安装都追加一条**。而 installHook 在
+ *     read-isolation 路径下**每次冷 spawn 都会跑**（worker.ts `provisionIsolatedBotHome`），
+ *     所以编译态盒子每开一个会话就 +1、无上限；已堆坏的盒子再装一次只会继续涨。
+ *   - ask（`hook <cliId>`）：**通常不叠**——`isBotmuxAskHookGroup` 还有一条
+ *     `e.command === hookCommand` 精确匹配分支，命令字符串不变时由它兜住；只有命令
+ *     形态发生变化（如二进制↔Node 互切）时才会叠加。
+ *
+ * 稳定、与运行时形态无关的信号是 **子命令尾签名**（`hook <cliId>` / `session-ready` /
+ * `user-prompt-hook`），加上调用目标名：Node 态是脚本 `cli.js`，编译态是可执行文件
+ * `botmux`（`botmux-linux-x64/botmux` 的 basename 同为 `botmux`；Windows 上为 `botmux.exe`）。
+ * 两者取其一即视为同一条 botmux hook，无论它指向哪个安装路径、由 node 还是打包二进制执行。
+ *
+ * ⚠️ basename 白名单**故意只认这三个字面量**，不要放宽成 `botmux-*` 前缀匹配：那会把
+ * 第三方同前缀程序（`botmux-helper` / `botmux-wrapper` 等）也当成自己的 hook 删掉。
+ * 已知未覆盖形态：本地 `bun run use:here --binary` 指向的 `dist-bin/botmux-<plat>-<arch>`
+ * （basename 带平台后缀）。生产两条安装路径都落在 `botmux` 上（npm 平台子包
+ * `…/node_modules/botmux-<plat>-<arch>/botmux`、install.sh 的 `~/.botmux/bin/botmux`），
+ * 故仅影响开发机；真要覆盖须**枚举死平台后缀**而非放宽为任意后缀。
+ */
+function isBotmuxHookCommand(command: string, suffix: string): boolean {
+  const trimmed = command.trimEnd();
+  if (!trimmed.endsWith(suffix)) return false;
+  // 子命令之前紧邻的是调用目标（脚本/可执行名），去掉可能包裹它的尾部引号。
+  const target = trimmed.slice(0, trimmed.length - suffix.length).trimEnd().replace(/["']+$/, '');
+  if (!target) return false;
+  const slash = Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\'));
+  const basename = target.slice(slash + 1);
+  return basename === 'cli.js' || basename === 'botmux' || basename === 'botmux.exe';
+}
+
+/**
  * 判断某个 hook group 是否是 botmux ask hook（用于幂等替换）。
  *
  * 不能只按命令字符串完全相等比对：同一台机器上 dev 源码 checkout 与 npm global
  * 安装的 cli.js 绝对路径不同，命令字符串就不同，会导致两条 botmux hook 同时残留、
  * 同一次 AskUserQuestion 触发两次 → 飞书发出两张卡。
- * 因此结构化识别：命令引用了 botmux 的 `cli.js` 且尾部是相同的 `hook <cliId>` 签名，
- * 即视为 botmux hook，无论它指向哪个安装路径。
+ * 因此结构化识别：命令是 botmux 自己发起的调用（cli.js 脚本或打包二进制 `botmux`）、
+ * 且尾部是相同的 `hook <cliId>` 签名，即视为 botmux hook，无论它指向哪个安装路径、
+ * 由 node 还是打包二进制执行。
  */
 function isBotmuxAskHookGroup(group: ClaudeHookGroup, hookCommand: string): boolean {
   const suffix = botmuxHookSuffix(hookCommand); // e.g. "hook claude-code"
   return group.hooks.some(
     (e) =>
       e.type === 'command' &&
-      (e.command === hookCommand ||
-        (e.command.includes('cli.js') && e.command.trimEnd().endsWith(suffix))),
+      (e.command === hookCommand || isBotmuxHookCommand(e.command, suffix)),
   );
 }
 
@@ -143,8 +182,7 @@ function isBotmuxTraexAskHookEntry(entry: unknown): boolean {
     && typeof entry === 'object'
     && (entry as ClaudeHookEntry).type === 'command'
     && typeof (entry as ClaudeHookEntry).command === 'string'
-    && (entry as ClaudeHookEntry).command.includes('cli.js')
-    && (entry as ClaudeHookEntry).command.trimEnd().endsWith('hook traex');
+    && isBotmuxHookCommand((entry as ClaudeHookEntry).command, 'hook traex');
 }
 
 /**
@@ -192,7 +230,7 @@ export function cleanupTraexAskHooks(configPaths: readonly string[]): void {
 
 /**
  * 判断某 hook group 是否是 botmux SessionStart 就绪 hook（用于幂等替换）。
- * 同 ask hook：结构化识别（命令引用 botmux 的 cli.js 且尾部是 `session-ready`），
+ * 同 ask hook：结构化识别（命令是 botmux 自己发起的调用且尾部是 `session-ready`），
  * 不按完整字符串比对——dev checkout 与 npm global 的 cli.js 绝对路径不同。
  */
 function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
@@ -201,8 +239,7 @@ function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
       !!e &&
       e.type === 'command' &&
       typeof e.command === 'string' &&
-      e.command.includes('cli.js') &&
-      e.command.trimEnd().endsWith('session-ready'),
+      isBotmuxHookCommand(e.command, 'session-ready'),
   );
 }
 
@@ -215,7 +252,7 @@ function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, e
 
 /**
  * 判断某 hook group 是否是 botmux UserPromptSubmit 上下文 hook（用于幂等替换）。
- * 与 ready hook 同策略：结构化识别（命令引用 botmux 的 cli.js 且尾部是
+ * 与 ready hook 同策略：结构化识别（命令是 botmux 自己发起的调用且尾部是
  * `user-prompt-hook`），不按完整字符串比对。
  */
 function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
@@ -224,8 +261,7 @@ function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
       !!e &&
       e.type === 'command' &&
       typeof e.command === 'string' &&
-      e.command.includes('cli.js') &&
-      e.command.trimEnd().endsWith('user-prompt-hook'),
+      isBotmuxHookCommand(e.command, 'user-prompt-hook'),
   );
 }
 

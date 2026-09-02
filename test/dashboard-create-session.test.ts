@@ -282,26 +282,27 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     const restored = afterRestart.get(sessionKey(CHAT, APP))!;
     expect(restored.pendingCodexAppText).toBe('重启后仍保持纯净');
     expect(restored.pendingCodexAppMessageContext).toContain('<botmux_lead_dispatch>');
-    expect(mergeQueuedCodexAppTurn({
+    const merged = mergeQueuedCodexAppTurn({
       queued: true,
       queuedText: restored.session.queuedCodexAppText ?? restored.pendingCodexAppText,
       queuedMessageContext: restored.session.queuedCodexAppMessageContext ?? restored.pendingCodexAppMessageContext,
       currentText: '重启后的群消息',
       currentMessageContext: '<sender>晓雪</sender>',
-    })).toMatchObject({
-      text: '重启后仍保持纯净\n\n重启后的群消息',
-      messageContext: expect.stringContaining('<botmux_lead_dispatch>'),
     });
+    expect(merged.text).toBe('重启后仍保持纯净\n\n重启后的群消息');
+    expect(merged.messageContext).toContain('<botmux_lead_dispatch>');
 
     forkWorkerMock.mockClear();
     expect(await activateQueuedSession(restored)).toMatchObject({ ok: true });
     const [, prompt] = forkWorkerMock.mock.calls[0];
     expect(prompt.content).toContain('<botmux_lead_dispatch>');
     expect(prompt.codexAppInput.text).toBe('重启后仍保持纯净');
-    expect(Object.values(prompt.codexAppInput.additionalContext ?? {}))
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: 'untrusted', value: expect.stringContaining('<botmux_lead_dispatch>') }),
-      ]));
+    const extraContext = Object.values(prompt.codexAppInput.additionalContext ?? {});
+    expect(extraContext.some(entry =>
+      entry && typeof entry === 'object'
+      && (entry as { kind?: string }).kind === 'untrusted'
+      && String((entry as { value?: unknown }).value).includes('<botmux_lead_dispatch>'),
+    )).toBe(true);
     // Activation ownership is accepted, but the exact queued journal remains
     // until the real worker reports adapter-level submission.
     expect(restored.session.queuedCodexAppText).toBe('重启后仍保持纯净');
@@ -335,9 +336,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(restored.session.queued).toBe(false);
     expect(restored.session.queuedActivationPending).toBe(true);
     expect(restored.session.queuedActivationToken).toBe('activation-before-crash');
-    expect(restored.session.queuedActivationInput).toEqual({
-      content: expect.stringContaining('recover at least once'),
-    });
+    expect(restored.session.queuedActivationInput?.content).toContain('recover at least once');
     expect(restored.session.queuedPrompt).toContain('recover at least once');
     expect(restored.pendingPrompt).toBeUndefined();
     expect(restored.hasHistory).toBe(false);
@@ -755,7 +754,7 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     expect(r.ok).toBe(true);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [ds, prompt] = forkWorkerMock.mock.calls[0];
-    expect(prompt).toMatchObject({ content: expect.stringContaining('立刻开干') });
+    expect(typeof prompt === 'string' ? prompt : prompt.content).toContain('立刻开干');
     expect((ds as DaemonSession).session.queued).toBeFalsy();
   });
 
@@ -766,10 +765,9 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
       coworkers: [{ name: 'Sub1', openId: 'ou_s1' }],
     });
     const [, prompt] = forkWorkerMock.mock.calls[0];
-    expect(prompt).toMatchObject({
-      content: expect.stringContaining('<botmux_lead_dispatch>'),
-    });
-    expect(prompt.content).toContain('Sub1');
+    const leadContent = typeof prompt === 'string' ? prompt : prompt.content;
+    expect(leadContent).toContain('<botmux_lead_dispatch>');
+    expect(leadContent).toContain('Sub1');
   });
 
   it('unpublishes and closes only the new row when fork pre-accept throws', async () => {
@@ -831,7 +829,8 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     const ds = active.get(sessionKey(CHAT, APP))!;
     expect(ds.pendingRepo).toBe(true);
     expect(ds.repoCardMessageId).toBe('om_visible_picker');
-    expect(ds.session.pendingRepoSetup).toMatchObject({ mode: 'picker', prompt: expect.stringContaining('pick before start') });
+    expect(ds.session.pendingRepoSetup?.mode).toBe('picker');
+    expect(ds.session.pendingRepoSetup?.prompt).toContain('pick before start');
     expect(ds.session.pendingRepoSetup?.repoCardMessageId).toBeUndefined();
     expect(forkWorkerMock).not.toHaveBeenCalled();
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
@@ -859,15 +858,11 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     expect(ds).toBeDefined();
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingPrompt).toContain('retain exact opening');
-    expect(ds.session).toMatchObject({
-      status: 'active',
-      queued: true,
-      queuedPrompt: expect.stringContaining('retain exact opening'),
-      pendingRepoSetup: {
-        mode: 'picker',
-        prompt: expect.stringContaining('retain exact opening'),
-      },
-    });
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.queued).toBe(true);
+    expect(ds.session.queuedPrompt).toContain('retain exact opening');
+    expect(ds.session.pendingRepoSetup?.mode).toBe('picker');
+    expect(ds.session.pendingRepoSetup?.prompt).toContain('retain exact opening');
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
     expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.spawned',
@@ -985,8 +980,9 @@ describe('activateQueuedSession', () => {
     expect(r.ok).toBe(true);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, prompt] = forkWorkerMock.mock.calls[0];
-    expect(prompt).toMatchObject({ content: expect.stringContaining('排队的任务') });
-    expect(prompt.content).toContain('<botmux_lead_dispatch>'); // preamble survived park→activate
+    const queuedContent = typeof prompt === 'string' ? prompt : prompt.content;
+    expect(queuedContent).toContain('排队的任务');
+    expect(queuedContent).toContain('<botmux_lead_dispatch>'); // preamble survived park→activate
     expect(ds.session.queued).toBe(false);
     // The worker-pool ACK handler, not activation acceptance, clears this
     // exact replay source after adapter submission.
@@ -1075,12 +1071,10 @@ describe('activateQueuedSession', () => {
     expect(forkWorkerMock).not.toHaveBeenCalled();
     expect(runAutoWorktreeCommitMock).toHaveBeenCalledTimes(1);
     expect(ds.pendingRepo).toBe(true);
-    expect(ds.session).toMatchObject({
-      queued: true,
-      queuedPrompt: expect.stringContaining('survive pending worktree restart'),
-      queuedCodexAppText: 'survive pending worktree restart',
-      kanbanColumn: 'in_progress',
-    });
+    expect(ds.session.queued).toBe(true);
+    expect(ds.session.queuedPrompt).toContain('survive pending worktree restart');
+    expect(ds.session.queuedCodexAppText).toBe('survive pending worktree restart');
+    expect(ds.session.kanbanColumn).toBe('in_progress');
 
     // A repeated dashboard start is idempotent while the delayed commit owns
     // the attempt; it must not schedule a second worktree or picker.
@@ -1163,10 +1157,10 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     await executeScheduledTask(task(), active, vi.fn());
 
     expect(active.get(sessionKey(ROOT, APP))).toBe(ds);
-    expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), expect.objectContaining({
-      resume: true,
-      turnId: expect.stringMatching(/^schedule:schedule-owner-test:/),
-    }));
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    expect(forkWorkerMock.mock.calls[0][0]).toBe(ds);
+    expect(forkWorkerMock.mock.calls[0][2]).toMatchObject({ resume: true });
+    expect(forkWorkerMock.mock.calls[0][2].turnId).toMatch(/^schedule:schedule-owner-test:/);
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
   });
 

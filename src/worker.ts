@@ -150,6 +150,12 @@ import {
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import {
+  buildPluginCardActionCapabilitiesSnapshot,
+  PLUGIN_CARD_ACTION_CAPABILITIES_ENV,
+  serializePluginCardActionCapabilitiesSnapshot,
+} from './core/plugins/card-actions/capabilities.js';
 import {
   loadBotConfigs,
   resolveBrandLabel,
@@ -1047,6 +1053,34 @@ async function syncFreshCodexNativeSessionTitle(
   }
 }
 
+function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
+  const cfg = lastInitConfig;
+  const trimmed = title?.trim();
+  if (!cfg || cfg.adoptMode || !trimmed) return false;
+  if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
+  if (codexRpcEngine || remoteWsUrl) return false;
+  if (!cliAdapter?.buildSessionRenameCommand) return false;
+  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') return false;
+  nativeSessionTitleRevision += 1;
+  nativeSessionTitleAppliedThreadId = undefined;
+  cfg.nativeSessionTitle = trimmed;
+  cfg.nativeSessionTitlePrompt = undefined;
+  stopNativeSessionTitleSync();
+  pendingSessionRename = trimmed;
+  log(`Queued automatic native session rename after first user input (${cliName()}): ${trimmed}`);
+  const kick = setTimeout(() => void flushPending(), 0);
+  kick.unref?.();
+  return true;
+}
+
+function maybeQueuePostSubmitNativeSessionTitle(item: PendingCliInput): boolean {
+  if (!item.nativeSessionTitle) return false;
+  const queued = queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
+  item.nativeSessionTitle = undefined;
+  item.nativeSessionTitlePrompt = undefined;
+  return queued;
+}
+
 /** 在 resume 首条输入前记录 updatedAt，后续用其确认历史派生标题已完成回写。 */
 async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexRpcEngine): Promise<void> {
   const cfg = lastInitConfig;
@@ -1531,10 +1565,9 @@ function stopSessionMcpGatewayHost(): void {
   });
 }
 
-function refreshCliPluginGeneration(
+function resolvePluginGenerationBot(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  adapter: CliAdapter,
-): void {
+): Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> {
   let bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> = {
     larkAppId: cfg.larkAppId,
     plugins: cfg.pluginBindings,
@@ -1545,6 +1578,14 @@ function refreshCliPluginGeneration(
   } catch (err) {
     log(`Plugin generation: using init-time Bot config because bots.json could not be read: ${err instanceof Error ? err.message : err}`);
   }
+  return bot;
+}
+
+function refreshCliPluginGeneration(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): void {
+  const bot = resolvePluginGenerationBot(cfg);
 
   const generation = prepareCliPluginGeneration({
     sessionId: cfg.sessionId,
@@ -1578,6 +1619,28 @@ function refreshCliPluginGeneration(
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
+}
+
+function pluginCardActionCapabilitiesEnv(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): string {
+  try {
+    const bot = resolvePluginGenerationBot(cfg);
+    const pluginIds = resolveEffectivePluginIds(
+      bot,
+      readGlobalConfig(),
+    );
+    return serializePluginCardActionCapabilitiesSnapshot(
+      buildPluginCardActionCapabilitiesSnapshot(pluginIds),
+    );
+  } catch (error) {
+    log(
+      `Plugin card-action capabilities unavailable; using an empty fail-closed snapshot: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return '{"schemaVersion":1,"plugins":[]}';
+  }
 }
 
 /** Refresh the process-scoped Skill/MCP snapshot and bring up the trusted MCP
@@ -2118,6 +2181,10 @@ function cliName(): string {
     : undefined)
     ?? CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '']
     ?? 'CLI';
+}
+
+function supportsPostSubmitRenameSessionTitle(cliId: string | undefined): boolean {
+  return cliId === 'traex';
 }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -5893,20 +5960,32 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
     // `local-headless-*` ids are minted by the queue for transcript activity
     // that matched no pending mark (terminal-typed input, or — after a restart
-    // — replayed history whose original mark is long gone). Its FALLBACK is
-    // already suppressed unconditionally (shouldSuppressBridgeEmit returns true
-    // for isLocal in non-adopt), so letting its FAILURE terminal through means
-    // the daemon posts a 「本轮执行失败」card for a turn the user never sent —
-    // and, because the daemon stamps the card with `new Date()` and the
-    // session's *current* lastUserPrompt, that card names the wrong time and
-    // the wrong task. MEASURED: a provider_server_error from 10h earlier was
-    // re-surfaced as a fresh failure card on two consecutive daemon restarts.
+    // — replayed history whose original mark is long gone). Letting its FAILURE
+    // terminal through means the daemon posts a 「本轮执行失败」card for a turn
+    // the user never sent — and, because the daemon stamps the card with
+    // `new Date()` and the session's *current* lastUserPrompt, that card names
+    // the wrong time and the wrong task. MEASURED: a provider_server_error from
+    // 10h earlier was re-surfaced as a fresh failure card on two consecutive
+    // daemon restarts.
+    //
+    // Before this gate the FAILURE TERMINAL was the sole leak, in BOTH modes.
+    // The fallback loop above skips a failed turn at its very FIRST check
+    // (`terminalOutcome.status !== 'completed' → continue`), which is
+    // mode-independent and runs before `shouldSuppressBridgeEmit` — so a failed
+    // local turn never reaches that gate, in adopt or otherwise. (Note the
+    // fallback would have carried `final_output` answer text anyway, never a
+    // card; cards come only from the terminal side.)
+    //
+    // Applies in adopt mode too, deliberately: the cause is identical in both
+    // modes — a synthesised local turn has no Lark turn to notify — so the gate
+    // is not conditioned on adoptMode.
     //
     // Scoped deliberately to the failure arm: a local turn's `completed`
     // terminal stays, because that is what settles bookkeeping (dedupe claim,
     // durable-turn release, CoT finalize) without showing the user anything.
-    // Non-local turns are untouched — a real Lark turn that genuinely failed
-    // must still raise its card, which is the whole point of that path.
+    // Non-local turns are untouched — `isLocal` is set only by the two synthesis
+    // paths and never by `mark()` (journal-restored turns go through `mark()`
+    // too), so a real Lark turn that genuinely failed still raises its card.
     if (turn.isLocal && outcome && outcome.status !== 'completed') {
       log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
         + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — no Lark turn to notify`);
@@ -10709,7 +10788,7 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
-  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
 ): void {
@@ -10791,6 +10870,7 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
@@ -11686,6 +11766,9 @@ async function flushPending(): Promise<void> {
         && result?.submitted !== false) {
         rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
       }
+      const queuedPostSubmitNativeTitle = result?.submitted !== false
+        ? maybeQueuePostSubmitNativeSessionTitle(item)
+        : false;
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
@@ -11795,6 +11878,7 @@ async function flushPending(): Promise<void> {
           activationToken: item.queuedActivationToken,
         });
       }
+      if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
       // identically to `role:user`; CoCo parks queued submits in its TUI queue
@@ -11858,6 +11942,8 @@ function sendToPty(
     replyTurnId?: string;
     trustedCaller?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    nativeSessionTitle?: string;
+    nativeSessionTitlePrompt?: string;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
     mojoLivePatch?: MojoLivePatch;
     /** At-most-once (idempotency lease): tag this keyed input so a CLI exit never
@@ -11877,6 +11963,8 @@ function sendToPty(
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.nativeSessionTitle ? { nativeSessionTitle: opts.nativeSessionTitle } : {}),
+    ...(opts.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: opts.nativeSessionTitlePrompt } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
@@ -12666,6 +12754,7 @@ async function spawnCli(
     ? 'dsh-tui'
     : cfg.cliId as CliId;
   cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
+  const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
   // worker re-probes the requested persistent backend here. A requested
@@ -12862,6 +12951,7 @@ async function spawnCli(
     (riffBackendConfig as EffectiveMojoConfig).env = {
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
@@ -12889,6 +12979,7 @@ async function spawnCli(
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
     // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
@@ -12939,6 +13030,11 @@ async function spawnCli(
     // it again here to prevent a stale/forged remote value from desynchronising
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
+    // Public selector metadata is a host-resolved session snapshot. It is only
+    // a send-time validation hint (the daemon reauthorizes every callback), but
+    // still freeze it after raw riff env merges so stale config cannot desync
+    // the card a remote CLI is allowed to construct from this generation.
+    mergedEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
     // The workflow kill-switch is likewise a host-resolved snapshot. Re-freeze it
     // AFTER the merge: unlike per-bot `env` (sanitizePerBotEnv strips the BOTMUX*
     // prefix), `riffCfg.env` merges LAST and is NOT sanitized, so a stale or
@@ -14018,6 +14114,8 @@ async function spawnCli(
     model: ttadkGateway ? undefined : cfg.model,
     // dsh runner only; other adapters ignore the field.
     turnTimeoutMs: cfg.turnTimeoutMs,
+    // dsh runner only; other adapters ignore the field.
+    dshProfile: cfg.dshProfile,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
     codexBrowser: cfg.codexBrowser,
@@ -14119,6 +14217,7 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
@@ -18530,6 +18629,8 @@ process.on('message', async (raw: unknown) => {
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
           }));
+        const initialNativeSessionTitle = msg.nativeSessionTitle;
+        const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
@@ -18563,6 +18664,8 @@ process.on('message', async (raw: unknown) => {
             // group root — accepted[0] — to be steerable). Without this the first
             // turn of a codex-app session could never absorb a follow-up steer.
             ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+            ...(initialNativeSessionTitle ? { nativeSessionTitle: initialNativeSessionTitle } : {}),
+            ...(initialNativeSessionTitlePrompt ? { nativeSessionTitlePrompt: initialNativeSessionTitlePrompt } : {}),
             // At-most-once (idempotency lease): tag the KEYED init prompt so a CLI
             // exit never replays it onto the auto-restarted CLI — while leaving a
             // later plain follow-up turn on the same http_async_ session intact
@@ -18691,6 +18794,7 @@ process.on('message', async (raw: unknown) => {
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0 && !messageAdoptMode) exitTmuxScrollMode();
       let content = msg.content;
+      const postSubmitNativeSessionTitle = msg.nativeSessionTitle;
       let codexAppInput = msg.codexAppInput;
       if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
         content = `${content}\n\n${deferredPluginSkillCatalog}`;
@@ -18739,6 +18843,7 @@ process.on('message', async (raw: unknown) => {
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
           trustedCaller: msg.trustedCaller,
           codexAppInput,
+          nativeSessionTitle: postSubmitNativeSessionTitle,
         };
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
@@ -18770,6 +18875,8 @@ process.on('message', async (raw: unknown) => {
           trustedCaller: msg.trustedCaller,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
+          ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
         else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');

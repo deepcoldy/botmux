@@ -813,6 +813,33 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
+  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+    // A bot's turn carries a perfectly valid union_id (its own), so a consumer
+    // cannot tell "a person asked" from "a bot triggered itself" unless the host
+    // says which it was. Both inbound paths must therefore pass it — a missed
+    // one silently degrades to "unknown" exactly where a bot could slip through.
+    expect(daemonSource).toContain('senderIsBot?: boolean,');
+    expect(daemonSource).toContain("senderType: senderIsBot ? 'bot' as const : 'user' as const");
+    // Pin the SEMANTICS, not the argument's spelling: every call must pass a
+    // non-empty 4th argument, and it must be the tri-state helper rather than a
+    // bare `sender_type` comparison — that one reads a cross-ref-identified peer
+    // bot as `'user'`, i.e. it vouches for a bot turn as a person.
+    const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
+      .map(m => m[1].split(',').map(part => part.trim()));
+    expect(trustedCallerArgs.length).toBe(2);
+    for (const args of trustedCallerArgs) {
+      expect(args.length).toBeGreaterThanOrEqual(4);
+      const senderTypeArg = args.slice(3).join(', ');
+      expect(senderTypeArg).not.toBe('');
+      expect(senderTypeArg).toContain('senderIsBotTriState(');
+      expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
+      // ...and the cross-ref leg must actually be wired in: passing a literal
+      // `false` there keeps the helper name but drops peer-bot recognition,
+      // which is the exact case a bare `sender_type` check already missed.
+      expect(senderTypeArg).toContain('isForeignBot');
+    }
+  });
+
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
     // The parser ignores BOTS_CONFIG for identity, but the raw env is inherited by
     // forked workers — an agent could cat $BOTS_CONFIG. Delete it after dotenv,

@@ -8,7 +8,7 @@ const CLI_PATH = join(__dirname, '..', 'dist', 'cli.js');
 
 beforeAll(() => {
   if (!existsSync(CLI_PATH)) {
-    throw new Error(`dist/cli.js missing — run pnpm build first`);
+    throw new Error(`dist/cli.js missing — run bun run build first`);
   }
 });
 

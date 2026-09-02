@@ -12,7 +12,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -27,11 +27,27 @@ import {
 } from '../src/core/session-preview.js';
 import { resolveSessionPreviewForProxy } from '../src/dashboard/preview-contract.js';
 
+/**
+ * Self-exit when reparented (the parent process died). Covers the residual
+ * where vitest is Ctrl-C'd / crashes and afterEach never runs: the detached
+ * children are in their own process group, so the terminal's SIGINT does not
+ * reach them, and without this they would survive forever (one leaked
+ * listener per aborted run).
+ *
+ * The criterion is "ppid CHANGED", not "ppid === 1": an ancestor that set
+ * PR_SET_CHILD_SUBREAPER reparents orphans to itself instead of init, so
+ * ppid would never become 1 there and the watchdog would silently never
+ * fire. "Changed" fires for init, a subreaper, or any other reparenting
+ * target. (Verified: with a subreaper ancestor, the orphaned grandchild's
+ * ppid is the subreaper's pid, not 1.)
+ */
+const ORPHAN_WATCHDOG = 'const __parent = process.ppid; setInterval(() => { if (process.ppid !== __parent) process.exit(0); }, 1000);';
+
 const LISTEN_SCRIPT = `
 const net = require('net');
 const s = net.createServer();
 s.listen(0, '127.0.0.1', () => console.log('port ' + s.address().port));
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 /** 抢占一个指定端口号（模拟 dev server 退出后，别的本机进程拿到同一个号码）。 */
@@ -48,7 +64,7 @@ const attempt = () => {
   s.listen(port, '127.0.0.1', () => console.log('up'));
 };
 attempt();
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 /** 起一个孙子进程去监听：验证血缘是按 ppid 链向下走的，不是只看直接子进程。 */
@@ -56,17 +72,74 @@ const GRANDCHILD_SCRIPT = `
 const cp = require('child_process');
 const g = cp.spawn(process.execPath, ['-e', process.argv[1]], { stdio: ['ignore', 'pipe', 'ignore'] });
 g.stdout.on('data', d => process.stdout.write(d));
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 const children: ChildProcess[] = [];
 const tempRoots: string[] = [];
 let inProcessServer: Server | null = null;
 
-afterEach(async () => {
-  for (const child of children.splice(0)) {
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+/**
+ * Is `pid` its own process-group LEADER (pgid === pid)?
+ *
+ * This is the precondition that makes the group kill below safe, and it is NOT
+ * self-evident from the call site: `process.kill(-N)` signals "the group whose
+ * pgid is N", not "pid N and its descendants". A child spawned WITHOUT
+ * `detached` sits in the PARENT's group, so `-childPid` names whatever group
+ * happens to carry that number — usually nothing (ESRCH), but a recycled pid
+ * that some `setsid` process once led can still have a live orphaned group, and
+ * then the kill lands on unrelated processes.
+ *
+ * `process.getpgid` does not exist on Node 22 or Bun 1.4 (verified on both), so
+ * the check reads field 5 of `/proc/<pid>/stat` — the fields after the `comm`
+ * parenthesis are (state, ppid, pgrp, …), and `comm` itself may contain spaces
+ * or parentheses, hence slicing from the LAST `)`.
+ *
+ * Unknown ⇒ false ⇒ the caller falls back to a single-process kill. That is the
+ * safe direction: the grandchild case is Linux-only, and on any platform where
+ * this cannot be answered there is no grandchild to reap.
+ */
+function isOwnGroupLeader(pid: number): boolean {
+  try {
+    const getpgid = (process as unknown as { getpgid?: (p: number) => number }).getpgid;
+    if (typeof getpgid === 'function') return getpgid(pid) === pid;
+    if (process.platform !== 'linux') return false;
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return Number(afterComm[2]) === pid;
+  } catch {
+    return false; /* unreadable → treat as "not a leader" */
   }
+}
+
+/**
+ * Kill the child's whole PROCESS GROUP, not just the child.
+ *
+ * `GRANDCHILD_SCRIPT` deliberately spawns a grandchild (that is the point of the
+ * lineage test), and both scripts hold an idle `setInterval`. Killing only the
+ * direct child left every grandchild reparented to init and running forever:
+ * one leaked listener per run, each holding a port and ~40MB. On this host that
+ * had accumulated to 738 orphans / ~28GB PSS before it was noticed.
+ *
+ * `startChild` spawns detached so each child leads its own group — but that
+ * coupling lives in a different function, so it is asserted here rather than
+ * assumed: a group kill is only issued for a confirmed group leader. The
+ * negative pid needs `process.kill`; `child.kill()` only ever signals the one
+ * process.
+ */
+function killChildTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined && isOwnGroupLeader(pid)) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch { /* group already gone */ }
+  }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+}
+
+afterEach(async () => {
+  for (const child of children.splice(0)) killChildTree(child);
   for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
   if (inProcessServer) {
     await new Promise<void>(resolve => inProcessServer!.close(() => resolve()));
@@ -77,6 +150,10 @@ afterEach(async () => {
 function startChild(script: string, args: string[] = []): ChildProcess {
   const child = spawn(process.execPath, ['-e', script, ...args], {
     stdio: ['ignore', 'pipe', 'ignore'],
+    // Own process group, so afterEach can reap the grandchildren too
+    // (see killChildTree). Not unref'd: these children stay tracked in
+    // `children` and are killed explicitly.
+    detached: true,
   });
   children.push(child);
   return child;
@@ -231,6 +308,57 @@ describe.skipIf(process.platform !== 'linux')('P1-12 preview listener ownership 
       proof: { pid: 4242, procStart: '918273', inode: '556677' },
       procRoot: missingRoot,
     })).toBe('unverifiable');
+  });
+
+  it('orphan watchdog: a script self-exits when its parent dies', async () => {
+    // The watchdog criterion is "ppid CHANGED", not "ppid === 1" (see
+    // ORPHAN_WATCHDOG): a PR_SET_CHILD_SUBREAPER ancestor reparents orphans to
+    // itself, so ppid === 1 would never fire there. This test only asserts the
+    // change-triggered exit; the reparenting target (init or subreaper) is
+    // irrelevant to the criterion.
+    // Reuse the SHARED watchdog (the same one injected into LISTEN_SCRIPT /
+    // REBIND_SCRIPT / GRANDCHILD_SCRIPT), sped up 10x so the test doesn't wait
+    // a full second per tick. Reusing the constant is load-bearing: if someone
+    // hollows out ORPHAN_WATCHDOG, this positive control fails too — an inline
+    // copy would prove "a watchdog works" but not "the scripts have one".
+    const WATCHDOG = ORPHAN_WATCHDOG.replace('1000);', '100);');
+    const NO_WATCHDOG = 'setInterval(() => {}, 100);';
+    // Each grandparent spawns a grandchild and exits after the grandchild has
+    // started (1000ms, ~20x Node startup), so the grandchild records its
+    // ORIGINAL ppid before the reparenting.
+    const spawnAndExit = (grandchildScript: string) => startChild(`
+      const cp = require('child_process');
+      const g = cp.spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });
+      console.log(g.pid);
+      setTimeout(() => process.exit(0), 1000);
+    `);
+    const watchdogGrandparent = spawnAndExit(WATCHDOG);
+    const noWatchdogGrandparent = spawnAndExit(NO_WATCHDOG);
+    const watchdogPid = Number(await waitForLine(watchdogGrandparent, /^\d+$/));
+    const noWatchdogPid = Number(await waitForLine(noWatchdogGrandparent, /^\d+$/));
+
+    const isAlive = (pid: number): boolean => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+
+    // Watchdog grandchild: ppid changed → exits within ~100ms of the grandparent's exit.
+    const watchdogExited = await new Promise<boolean>((resolve) => {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (!isAlive(watchdogPid)) { clearInterval(timer); resolve(true); return; }
+        if (Date.now() - start > 5000) { clearInterval(timer); resolve(false); }
+      }, 50);
+      timer.unref?.();
+    });
+
+    // Negative control: without the watchdog, the grandchild survives the
+    // reparenting (proves the watchdog is load-bearing, not the OS cleaning up).
+    // Kill it before asserting so a failed assertion cannot leak it.
+    const noWatchdogSurvived = isAlive(noWatchdogPid);
+    try { process.kill(noWatchdogPid, 'SIGKILL'); } catch { /* already gone */ }
+
+    expect(watchdogExited).toBe(true);
+    expect(noWatchdogSurvived).toBe(true);
   });
 });
 

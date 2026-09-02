@@ -164,6 +164,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -195,6 +196,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -245,6 +247,7 @@ describe('Codex-compatible runtime editor', () => {
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -317,6 +320,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -350,6 +354,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -387,6 +392,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -426,6 +432,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -460,6 +467,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -488,6 +496,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -516,6 +525,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -753,6 +763,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -802,6 +813,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -865,6 +877,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -907,6 +920,7 @@ describe('Codex-compatible runtime editor', () => {
     };
     (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
       if (String(url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push({ url: String(url), body: JSON.parse(init?.body ?? '{}') });
       return {
         ok: true,
@@ -958,6 +972,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,

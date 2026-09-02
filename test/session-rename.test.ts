@@ -37,6 +37,7 @@ function liveWorker(send = vi.fn()): any {
 describe('requestAgentSessionRename', () => {
   it.each([
     ['codex', '/bin/codex'],
+    ['traex', '/bin/traex'],
     ['claude-code', '/bin/claude'],
   ] as const)('sends the dedicated IPC for live %s sessions', (cliId, cliPathOverride) => {
     const send = vi.fn();

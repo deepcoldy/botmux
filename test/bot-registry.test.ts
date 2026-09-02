@@ -2261,3 +2261,33 @@ describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
     expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
   });
 });
+
+describe('cardActionAckTimeoutMs bot config', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps 500–2500ms integers and drops invalid values', () => {
+    const parsed = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'min', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 500 },
+      { larkAppId: 'mid', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 1_500 },
+      { larkAppId: 'max', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 2_500 },
+      { larkAppId: 'low', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 499 },
+      { larkAppId: 'high', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 2_501 },
+      { larkAppId: 'fraction', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: 1_000.5 },
+      { larkAppId: 'string', larkAppSecret: 's', cliId: 'claude-code', cardActionAckTimeoutMs: '1500' },
+    ]));
+
+    expect(parsed.map(bot => bot.cardActionAckTimeoutMs)).toEqual([
+      500,
+      1_500,
+      2_500,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+});

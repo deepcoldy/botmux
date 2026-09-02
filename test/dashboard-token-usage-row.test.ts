@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({
@@ -16,6 +18,10 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 
 import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 function makeDs(): DaemonSession {
   return {
@@ -92,6 +98,160 @@ describe('dashboard SessionRow token usage', () => {
       turns: 3,
       model: 'test-model',
     });
+  });
+
+  it('can skip expensive token scans for bulk session list snapshots', () => {
+    const active = composeRowFromActive(makeDs(), { includeTokenUsage: false });
+    const persisted = composeRowFromPersistedActive({
+      ...makeDs().session,
+      status: 'active',
+    }, { includeTokenUsage: false });
+    const closed = composeRowFromClosed({
+      ...makeDs().session,
+      status: 'closed',
+    }, { includeTokenUsage: false });
+
+    expect(active.tokenUsage).toBeNull();
+    expect(persisted.tokenUsage).toBeNull();
+    expect(closed.tokenUsage).toBeNull();
+    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it('keeps closed token usage visible even when bulk scans are disabled', () => {
+    const tokenUsage = {
+      in: 12,
+      out: 3,
+      inputTokens: 10,
+      outputTokens: 3,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 1,
+      model: 'persisted-model',
+    };
+    const row = composeRowFromClosed({
+      ...makeDs().session,
+      status: 'closed',
+      tokenUsage,
+    }, { includeTokenUsage: false });
+
+    expect(row.tokenUsage).toEqual(tokenUsage);
+    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it('does not expose stale token usage for persisted active rows in bulk list mode', () => {
+    const row = composeRowFromPersistedActive({
+      ...makeDs().session,
+      status: 'active',
+      tokenUsage: {
+        in: 12,
+        out: 3,
+        inputTokens: 10,
+        outputTokens: 3,
+        cacheReadTokens: 2,
+        cacheCreateTokens: 0,
+        turns: 1,
+        model: 'stale-active-model',
+      },
+    }, { includeTokenUsage: false });
+
+    expect(row.tokenUsage).toBeNull();
+    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it('does not let a persisted active detail row short-circuit on a stale snapshot', () => {
+    const row = composeRowFromPersistedActive({
+      ...makeDs().session,
+      status: 'active',
+      workingDir: '/repo',
+      tokenUsage: {
+        in: 12,
+        out: 3,
+        inputTokens: 10,
+        outputTokens: 3,
+        cacheReadTokens: 2,
+        cacheCreateTokens: 0,
+        turns: 1,
+        model: 'stale-active-model',
+      },
+    });
+
+    expect(getSessionTokenUsage).toHaveBeenCalledWith({
+      cliId: 'claude-code',
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-sess-1',
+      cwd: '/repo',
+    });
+    expect(row.tokenUsage).toEqual({
+      in: 1234,
+      out: 567,
+      inputTokens: 1200,
+      outputTokens: 567,
+      cacheReadTokens: 30,
+      cacheCreateTokens: 4,
+      turns: 3,
+      model: 'test-model',
+    });
+  });
+
+  it('does not let an active runtime row short-circuit on a stale persisted snapshot', () => {
+    const staleTokenUsage = {
+      in: 12,
+      out: 3,
+      inputTokens: 10,
+      outputTokens: 3,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 1,
+      model: 'stale-closed-model',
+    };
+    const ds = makeDs();
+    ds.session.tokenUsage = staleTokenUsage;
+
+    const row = composeRowFromActive(ds);
+
+    expect(getSessionTokenUsage).toHaveBeenCalledWith({
+      cliId: 'claude-code',
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-sess-1',
+      cwd: '/repo',
+    });
+    expect(row.tokenUsage).toEqual({
+      in: 1234,
+      out: 567,
+      inputTokens: 1200,
+      outputTokens: 567,
+      cacheReadTokens: 30,
+      cacheCreateTokens: 4,
+      turns: 3,
+      model: 'test-model',
+    });
+  });
+
+  it('still skips active runtime token scans in bulk list mode even if a stale snapshot exists', () => {
+    const ds = makeDs();
+    ds.session.tokenUsage = {
+      in: 12,
+      out: 3,
+      inputTokens: 10,
+      outputTokens: 3,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 1,
+      model: 'stale-closed-model',
+    };
+
+    const row = composeRowFromActive(ds, { includeTokenUsage: false });
+
+    expect(row.tokenUsage).toBeNull();
+    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it('worker-pool close publishes the durable token usage snapshot directly', () => {
+    const source = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
+
+    expect(source).toContain('{ tokenUsage: after?.tokenUsage ?? null }');
+    expect(source).not.toContain("import { composeRowFromActive, composeRowFromClosed }");
+    expect(source).not.toContain('composeRowFromClosed(after).tokenUsage');
   });
 
   it('carries chatType for active and closed rows', () => {
