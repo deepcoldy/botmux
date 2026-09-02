@@ -1,6 +1,17 @@
 export type FeedbackSemantic = 'positive' | 'progress' | 'negative';
 export type FeedbackButtonStyle = 'primary' | 'default' | 'danger';
 
+/**
+ * Who may click the feedback buttons.
+ *  - `requester`: default, backward-compatible. Only the exact person the
+ *    answer was addressed to (session owner / turn recipient) can click.
+ *  - `reviewers`: an explicit allowlist of trusted human identities. Used for
+ *    bot-triggered auto-analysis (Oncall/alert listeners) where the requester
+ *    is another bot and no single human owner exists. Deliberately NOT
+ *    "anyone in the chat" — every entry must be a verifiable human identity.
+ */
+export type FeedbackAudience = 'requester' | 'reviewers';
+
 export interface FeedbackButton {
   key: string;
   label: string;
@@ -12,7 +23,15 @@ export interface FeedbackReason { key: string; label: string }
 
 export interface FeedbackPolicy {
   enabled: true;
-  audience: 'requester';
+  audience: FeedbackAudience;
+  /**
+   * Trusted human identities allowed to click when `audience === 'reviewers'`.
+   * Entries are `ou_` (app-scoped open_id) or `on_` (cross-app union_id) and are
+   * matched at callback time against the platform-verified operator with no
+   * network lookup, so a bot sender can never satisfy an entry. Absent/empty for
+   * `requester`.
+   */
+  reviewers: string[];
   visibleSemantics: FeedbackSemantic[];
   buttons: FeedbackButton[];
   negativeFollowup: {
@@ -25,6 +44,7 @@ export interface FeedbackPolicy {
 export interface FeedbackPolicyInput {
   enabled?: boolean;
   audience?: unknown;
+  reviewers?: unknown;
   visibleSemantics?: unknown;
   buttons?: unknown;
   negativeFollowup?: unknown;
@@ -63,10 +83,63 @@ function semantic(value: unknown, path: string): FeedbackSemantic {
   return value;
 }
 
+/**
+ * A reviewer entry must be a platform-verifiable human identity. The card
+ * callback only ever exposes the operator's `ou_` (app-scoped open_id) and,
+ * when present/resolvable, `on_` (cross-app union_id). Matching those directly
+ * needs no network call and can never be satisfied by a bot sender. We
+ * deliberately accept ONLY `ou_`/`on_`: an email/mobile could not be matched at
+ * callback time without a lookup and would ship as silently-dead config. Per
+ * the app-scoped-open_id boundary, cross-app reviewers should use `on_`.
+ */
+function reviewerIdentity(value: unknown, path: string): string {
+  if (typeof value !== 'string') throw new Error(`${path} must be a string`);
+  const entry = value.trim();
+  if (entry.startsWith('ou_') || entry.startsWith('on_')) {
+    if (entry.length < 4) throw new Error(`${path} is not a valid open_id/union_id`);
+    return entry;
+  }
+  throw new Error(`${path} must be an ou_ open_id or on_ union_id`);
+}
+
+/**
+ * Format-only validation of a `reviewers` allowlist for a partial config layer,
+ * WITHOUT the cross-field `audience`⟺`reviewers` coupling that only the merged
+ * effective policy can decide (a split team/bot/chat config may legitimately set
+ * `audience` in one layer and `reviewers` in another).
+ */
+export function validateReviewerEntries(value: unknown, path = 'feedback.reviewers'): string[] {
+  if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
+  if (value.length > 50) throw new Error(`${path} allows 0-50 entries`);
+  const reviewers = value.map((entry, index) => reviewerIdentity(entry, `${path}[${index}]`));
+  unique(reviewers, path);
+  return reviewers;
+}
+
 export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   const input = object(raw, 'feedback');
   if (input.enabled !== true) throw new Error('feedback.enabled must be true');
-  if (input.audience !== undefined && input.audience !== 'requester') throw new Error('feedback.audience must be requester');
+  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers') {
+    throw new Error('feedback.audience must be requester or reviewers');
+  }
+  const audience: FeedbackAudience = input.audience === 'reviewers' ? 'reviewers' : 'requester';
+
+  let reviewers: string[] = [];
+  if (input.reviewers !== undefined) {
+    reviewers = validateReviewerEntries(input.reviewers);
+  }
+  // `reviewers` audience is meaningless without at least one reviewer, and a
+  // silently-empty allowlist would render an un-clickable control. Fail closed
+  // at config time instead of shipping a dead button.
+  if (audience === 'reviewers' && reviewers.length === 0) {
+    throw new Error('feedback.audience "reviewers" requires a non-empty feedback.reviewers allowlist');
+  }
+  // A reviewers allowlist only has meaning under the reviewers audience; reject
+  // the combination rather than silently ignoring it (a requester-only card
+  // must never appear to have carried an allowlist).
+  if (audience === 'requester' && reviewers.length > 0) {
+    throw new Error('feedback.reviewers requires feedback.audience "reviewers"');
+  }
 
   let visibleSemantics = [...SEMANTICS];
   if (input.visibleSemantics !== undefined) {
@@ -114,7 +187,8 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   const placeholder = rawComment.placeholder === undefined ? '可以补充哪里需要改进' : text(rawComment.placeholder, 'feedback.negativeFollowup.comment.placeholder', 100);
   return {
     enabled: true,
-    audience: 'requester',
+    audience,
+    reviewers,
     allowReselect: input.allowReselect === true,
     visibleSemantics,
     buttons,

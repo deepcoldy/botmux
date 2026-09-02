@@ -142,3 +142,42 @@ describe('feedback callback state machine', () => {
     store.close();
   });
 });
+
+describe('feedback callback reviewers audience', () => {
+  async function reviewersSetup(reviewers: string[]) {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers });
+    const response = store.createResponse({ interactionId: 'int-reviewers', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    // Bot-triggered auto-analysis has no human requester, so the delivery is
+    // ownerless — the allowlist is the only identity gate.
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+    return { store, delivery };
+  }
+
+  it('lets a listed reviewer (by open_id) click even with no requester on the delivery', async () => {
+    const { store, delivery } = await reviewersSetup(['ou_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_reviewer'), 'app', { store });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_reviewer')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('lets a listed reviewer (by cross-app union_id) click regardless of open_id', async () => {
+    const { store, delivery } = await reviewersSetup(['on_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_whoever', undefined, 'on_reviewer'), 'app', { store });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'on_reviewer')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('rejects a non-listed operator with the reviewers toast and mutates nothing', async () => {
+    const { store, delivery } = await reviewersSetup(['ou_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_intruder'), 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '仅指定的反馈人可反馈' });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_intruder')).toHaveLength(0);
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_reviewer')).toHaveLength(0);
+    store.close();
+  });
+});

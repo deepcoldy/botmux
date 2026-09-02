@@ -14599,7 +14599,15 @@ function deliverFinalOutput(
       // worker/Riff environment received; live config applies on the next fork.
       const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
       const feedbackRequesterSubjectId = recipientOpenId;
-      const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
+      // `reviewers` audience is gated by its frozen allowlist, so the control is
+      // valid even for an ownerless bot-triggered session with no human
+      // recipient; `requester` audience still needs the recipient to be
+      // clickable. Never re-derive an owner here — the ownerless session stays
+      // ownerless (no @-loop back to the alerting bot).
+      const feedback = feedbackPolicy
+        && (feedbackPolicy.audience === 'reviewers' || feedbackRequesterSubjectId)
+        ? { policy: feedbackPolicy }
+        : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))

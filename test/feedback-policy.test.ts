@@ -11,6 +11,7 @@ describe('feedback policy', () => {
     expect(normalizeFeedbackPolicy({ enabled: true })).toEqual({
       enabled: true,
       audience: 'requester',
+      reviewers: [],
       allowReselect: false,
       visibleSemantics: ['positive', 'progress', 'negative'],
       buttons: [
@@ -105,5 +106,37 @@ describe('feedback policy', () => {
 
   it('never resolves feedback for api-only bots', () => {
     expect(resolveFeedbackPolicy({ enabled: true }, { apiOnly: true })).toBeUndefined();
+  });
+
+  describe('reviewers audience', () => {
+    it('normalizes a reviewers allowlist and emits it verbatim', () => {
+      const policy = normalizeFeedbackPolicy({
+        enabled: true,
+        audience: 'reviewers',
+        reviewers: ['ou_alice', 'on_bob'],
+      });
+      expect(policy.audience).toBe('reviewers');
+      expect(policy.reviewers).toEqual(['ou_alice', 'on_bob']);
+    });
+
+    it('fails closed when the reviewers audience has an empty allowlist', () => {
+      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' })).toThrow(/non-empty/);
+      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: [] })).toThrow(/non-empty/);
+    });
+
+    it('rejects a reviewers allowlist paired with the requester audience', () => {
+      expect(() => normalizeFeedbackPolicy({ enabled: true, reviewers: ['ou_alice'] })).toThrow(/reviewers/);
+      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'requester', reviewers: ['ou_alice'] })).toThrow(/reviewers/);
+    });
+
+    it.each([
+      [{ enabled: true, audience: 'reviewers', reviewers: ['alice@example.com'] }, /open_id or on_ union_id/],
+      [{ enabled: true, audience: 'reviewers', reviewers: ['+8613800000000'] }, /open_id or on_ union_id/],
+      [{ enabled: true, audience: 'reviewers', reviewers: [123] }, /must be a string/],
+      [{ enabled: true, audience: 'reviewers', reviewers: ['ou_alice', 'ou_alice'] }, /unique/],
+      [{ enabled: true, audience: 'reviewers', reviewers: 'ou_alice' }, /must be an array/],
+    ])('rejects an unverifiable or malformed reviewers allowlist %#', (input, error) => {
+      expect(() => normalizeFeedbackPolicy(input)).toThrow(error);
+    });
   });
 });

@@ -72,11 +72,12 @@ Core 只接受三种语义：
 
 - 总开关默认关闭。
 - `apiOnly` bot 不展示反馈。
-- audience 的鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
+- `audience` 默认 `requester`：鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
+- `audience: "reviewers"` 用于 bot 触发的自动分析场景（如 Oncall/告警监听，本次 turn 的发送者是另一个 bot、没有单一真人 owner）：改由发送时冻结的 `reviewers` 名单鉴权，名单里任一可信真人身份点击即放行，与是否存在真人 requester 无关。**刻意不是“群内所有成员可反馈”**——每个名单项都必须是可在回调侧核验的真人身份。
 - `allowReselect` 默认 `false`；只有显式设置 `true` 才允许改选。
 - 说明框默认开启、非必填，默认最大 1000 字。
 - 负向原因默认可为空，由业务配置。
-- 新配置立即影响后续新卡，旧卡继续使用发送时快照。
+- 新配置立即影响后续新卡，旧卡继续使用发送时快照（`reviewers` 名单同样随 delivery 快照冻结）。
 
 ### 3.4 约束
 
@@ -84,6 +85,8 @@ Core 只接受三种语义：
 - 按钮 2–4 个，key 唯一，只允许 `[a-z0-9_-]+`。
 - 负向原因最多 6 个。
 - 说明最大长度 1–2000。
+- `audience` 仅接受 `requester` / `reviewers`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）或 `on_`（跨 app union_id），最多 50 项且不重复；这两类身份可在回调侧直接与平台核验后的 operator 比对、无需网络查询，因此 bot 发送者永远无法满足名单（不接受邮箱/手机号，避免落地即失效的“死配置”）。跨 app 场景应使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
+- `audience: "reviewers"` 与 `reviewers` 名单必须同时成立：`reviewers` audience 缺名单、或 `requester` audience 却带名单，都会 fail closed（分层配置合并后仍按整体校验，任一层非法即不展示反馈）。
 - 不允许配置任意 Lark card JSON；配置仅包含受约束的领域字段。
 
 ## 4. 分层配置模型
@@ -145,6 +148,25 @@ built-in defaults
 }
 ```
 
+### 4.4 reviewers audience 示例
+
+用于 bot 触发的自动分析（本次 turn 发送者是另一个 bot、没有单一真人 owner），把可反馈人固定为一份可信名单：
+
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "audience": "reviewers",
+    "reviewers": ["ou_oncall_lead", "on_cross_app_reviewer"],
+    "allowReselect": true
+  }
+}
+```
+
+- 名单项为 `ou_`（app 内 open_id）或 `on_`（跨 app union_id）；跨 app 用 `on_`。
+- 名单随 delivery 快照冻结：后续改名单只影响新卡，旧卡仍按发送时名单鉴权。
+- `audience` 与 `reviewers` 可分散在不同层（team/bot/chat）提供，合并后按整体校验；`reviewers` audience 缺名单会 fail closed。
+
 ## 5. 最终卡交互协议
 
 ### 5.1 展示边界
@@ -155,7 +177,7 @@ built-in defaults
 - 自定义卡；
 - 通知、语音、纯视频；
 - doc-comment、VC receiver、HTTP wait/async 等特殊 sink；
-- 无法证明 requester 身份的卡；
+- 无法证明 requester 身份的卡（仅 `requester` audience 需要；`reviewers` audience 由冻结名单鉴权，允许无真人 requester 的 bot 触发会话展示反馈）；
 - `apiOnly` bot；
 - card-off 纯文本模式。
 
@@ -171,7 +193,7 @@ botmux send --response-kind final ...
 ### 5.2 提交流程
 
 1. 用户点击一级按钮。
-2. Core 校验平台消息、app、可信 operator、requester-only 权限和策略快照。
+2. Core 校验平台消息、app、可信 operator、身份鉴权（`requester` audience 走 requester-only，`reviewers` audience 走冻结名单）和策略快照。
 3. SQLite 事务写入 immutable feedback revision；重复 callback key 幂等返回已有记录。
 4. 积极/推进选择直接返回同卡状态。
 5. 负向选择先同步 ACK，再异步 `message.patch` 原消息，避免复杂 form 在 callback response 中触发 Lark 错误。

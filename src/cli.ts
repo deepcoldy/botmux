@@ -8987,7 +8987,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
-  if (feedbackPolicy && effectiveResponseKind === 'final' && !feedbackRequesterSubjectId) {
+  // `reviewers` audience gates clicks by its frozen allowlist, not by a human
+  // requester — this is the bot-triggered auto-analysis case (issue #1178) where
+  // the exact turn sender is another bot. Only the `requester` audience needs a
+  // resolvable human recipient to make its control clickable.
+  if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }

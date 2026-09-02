@@ -85,11 +85,24 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
   let baseCard = delivery.baseCard;
   try { baseCard = await deps.loadBaseCard?.(platformMessageId) ?? baseCard; }
   catch { /* platform fetch is best-effort; the content-free template remains usable */ }
-  const operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
-    ? operatorOpenId
-    : verifiedOperator.unionId ?? (data.operator?.union_id === undefined ? operatorOpenId : undefined);
-  if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
-  if (delivery.requesterSubjectId && delivery.requesterSubjectId !== operatorSubjectId && delivery.requesterSubjectId !== operatorOpenId) return { toast: { type: 'error', content: '仅本次提问者可反馈' } };
+  // Identity gate. `reviewers` audience matches the platform-verified operator
+  // against the delivery's frozen allowlist (a per-delivery snapshot, so later
+  // config changes never re-gate an old card); `requester` keeps the original
+  // "only the addressed human" contract. Both fail closed when no trusted
+  // identity can be established — a bot sender exposes no listed human id.
+  let operatorSubjectId: string | undefined;
+  if (delivery.policy.audience === 'reviewers') {
+    const reviewers = new Set(delivery.policy.reviewers);
+    operatorSubjectId = [operatorOpenId, verifiedOperator.unionId]
+      .find((id): id is string => !!id && reviewers.has(id));
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '仅指定的反馈人可反馈' } };
+  } else {
+    operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
+      ? operatorOpenId
+      : verifiedOperator.unionId ?? (data.operator?.union_id === undefined ? operatorOpenId : undefined);
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
+    if (delivery.requesterSubjectId && delivery.requesterSubjectId !== operatorSubjectId && delivery.requesterSubjectId !== operatorOpenId) return { toast: { type: 'error', content: '仅本次提问者可反馈' } };
+  }
 
   const previous = deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
