@@ -4472,6 +4472,8 @@ describe('GET /api/schedules/:id/logs', () => {
         finishedAt: '2026-08-31T01:00:00.025Z',
         durationMs: 25,
         additionalPrompt: false,
+        errorCode: 'non_zero_exit',
+        error: 'Scheduled task precondition failed with exit code 35',
         prompt: 'secret prompt',
         script: 'echo 1',
         filePath: '/tmp/private.sh',
@@ -4535,7 +4537,11 @@ describe('GET /api/schedules/:id/logs', () => {
         limit: 1,
         offset: 1,
         hasMore: false,
-        logs: [{ id: 'run-log-1' }],
+        logs: [{
+          id: 'run-log-1',
+          errorCode: 'non_zero_exit',
+          error: 'Scheduled task precondition failed with exit code 35',
+        }],
       });
     } finally {
       if (handle) await handle.close();
