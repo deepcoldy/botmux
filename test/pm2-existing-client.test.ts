@@ -65,9 +65,10 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     });
-    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home }));
+    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home, nodePath: NODE_BIN }));
     expect(apps.some((app: any) => app.name === 'botmux-existing-fixture')).toBe(true);
     expect(Number.parseInt(readFileSync(pidFile, 'utf8'), 10)).toBe(originalPid);
 
@@ -76,6 +77,7 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['delete', 'botmux-existing-fixture'],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     });
     const killed = spawnSync(NODE_BIN, [PM2_PATH, 'kill'], {
@@ -90,6 +92,7 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: originalGod!,
     })).toThrow(/no replacement daemon was created/);
     expect(existsSync(pidFile)).toBe(false);
@@ -111,9 +114,10 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
       home: pm2Home,
       args: ['start', config],
       inherit: false,
+      nodePath: NODE_BIN,
       expectedGod: { ...god!, startIdentity: `${god!.startIdentity}-replaced` },
     })).toThrow(/generation changed before mutation/);
-    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home }));
+    const apps = JSON.parse(captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home, nodePath: NODE_BIN }));
     expect(apps.some((app: any) => app.name === 'botmux-existing-fixture')).toBe(false);
   });
 });

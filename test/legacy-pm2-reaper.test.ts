@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'legacy-pm2-')); dirs.push(d); return d; }
@@ -176,15 +177,38 @@ function spawnBystander(): number {
 function spawnTagged(n: number, tag: string, script = 'setTimeout(()=>{},60_000)',
                     opts: { group?: boolean } = {}): number[] {
   const pids: number[] = [];
+  // bun test 下 process.execPath 是 bun，子进程起来比 Node 慢，reaper 同步读
+  // /proc/cmdline 会拿到空串 → looksLikeLegacyBotmuxDaemon 失败 → deleted=[]。
+  // 等 cmdline 真的带上 tag 再返回；解释器也钉成 Node，和 Linux daemon 一致。
+  const runner = resolveNodeExecutable() ?? process.execPath;
   for (let i = 0; i < n; i++) {
     // The trailing arg only shapes the visible cmdline; the file need not exist
     // since the script itself comes from -e.
-    const p = spawn(process.execPath, ['-e', script, tag], { stdio: 'ignore', detached: !!opts.group });
+    const p = spawn(runner, ['-e', script, tag], { stdio: 'ignore', detached: !!opts.group });
     if (opts.group) groupLeaders.push(p.pid!);
     spawned.push(p);
     pids.push(p.pid!);
+    waitForCmdline(p.pid!, tag);
   }
   return pids;
+}
+
+/** Block until /proc (or ps) shows `needle` in pid's argv. Empty cmdline is
+ *  how the reaper fail-closes; returning early is what flakes deleted=[]. */
+function waitForCmdline(pid: number, needle: string, ms = 2_000): void {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    let cmd = '';
+    if (process.platform === 'linux') {
+      try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' '); } catch { /* not yet */ }
+    } else {
+      const ps = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf-8' });
+      cmd = ps.stdout || '';
+    }
+    if (cmd.includes(needle) && alive(pid)) return;
+    spinMs(20);
+  }
+  throw new Error(`pid ${pid} cmdline never contained ${JSON.stringify(needle)}`);
 }
 
 /** Block for `ms` without an async boundary — these tests drive a synchronous
