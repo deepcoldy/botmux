@@ -915,6 +915,37 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a current footer carrying the non-link text marker', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('drops the current text marker after Lark simplifies the card to Format A', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Acme ·⁣ 上下文 12.3K · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
   it.each([
     { name: 'without text_size', textSize: undefined },
     { name: 'with Card 2.0 notation', textSize: 'notation' },

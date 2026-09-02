@@ -1,11 +1,9 @@
-/** Versioned identity shared by reply-card producers and the card parser.
- * The marker uses visible link text because Lark may discard zero-width links
- * while simplifying a card into Format A. */
+/** Identity shared by reply-card producers and the card parser. Current cards
+ * use an invisible text sentinel; the URL remains for parsing legacy cards. */
 export const REPLY_CARD_FOOTER_ELEMENT_ID = 'botmux_reply_footer';
 export const REPLY_CARD_FOOTER_MARKER_URL =
   'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1';
-export const REPLY_CARD_FOOTER_MARKER =
-  `[·](${REPLY_CARD_FOOTER_MARKER_URL})`;
+export const REPLY_CARD_FOOTER_MARKER = '\u2063';
 
 /** Promoted H1/H2 heading widgets encode their original ATX level in the
  * element id. Lark strips `text_size` when a message is read back, so the id

@@ -525,25 +525,27 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  // The marker is a visible, versioned link that lets the parser identify a
-  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
-  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
-  // common case now that usageDisplay defaults to the streaming card body and
-  // the reply-card footer is context-only) needs no marker: appending it renders
-  // a dangling "botmux ·". The default/repository brand is plain link text with
-  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
-  // ownership marker (the parser already treats a bare repo link as ordinary
-  // content, matching the long-standing "brand-only is undecidable, keep it"
-  // contract). Any footer carrying usage or a recipient is still signed.
+  // The marker lets the parser identify a card's footer (and strip it before a
+  // bot-to-bot relay). Keep it as invisible text beside the first ordinary
+  // separator: a Markdown-link marker makes Lark render the separator dot as a
+  // clickable Botmux website link. But a BRAND-ONLY footer (no usage or
+  // recipient — the common case now that usageDisplay defaults to the streaming
+  // card body and the reply-card footer is context-only) needs no marker:
+  // appending it renders a dangling "botmux ·". The default/repository brand is
+  // plain link text with no mention, so it cannot trigger bot-to-bot pollution
+  // and does not need the ownership marker (the parser already treats a bare
+  // repo link as ordinary content, matching the long-standing "brand-only is
+  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // is still signed.
   const signMarker = hasUsage || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
   } else if (parts.length > 1) {
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+    signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
     // usage-only / recipient-only (brand disabled) — still marked for parsing.
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+    signedContent = `${parts[0]}${REPLY_CARD_FOOTER_MARKER}`;
   }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {

@@ -1081,10 +1081,11 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      'Acme [·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+      'Acme ·⁣ '
       + '上下文 12.3K · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
     // Footer is context-only — the cumulative token line does not appear here.
     expect(footer?.content).not.toContain('Token');
     expect(footer?.content).not.toContain('\u200B');
@@ -1114,9 +1115,7 @@ describe('buildReplyCardFooter', () => {
       element_id: 'botmux_reply_footer',
     });
     expect(card.body.elements.at(-1).content).toContain('Sent to: <at id=ou_owner></at>');
-    expect(card.body.elements.at(-1).content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(card.body.elements.at(-1).content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
   it('rejects caller-supplied cards without schema-2 body elements', () => {
@@ -1199,35 +1198,32 @@ describe('buildReplyCardFooter', () => {
     );
   });
 
-  it('still signs a usage-only footer (brand disabled) with the versioned marker', () => {
+  it('signs a usage-only footer with non-link text', () => {
     const footer = buildReplyCardFooter({
       brand: '', // brand off
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
-  it('still signs a recipient-only footer (brand disabled) with the versioned marker', () => {
+  it('signs a recipient-only footer with non-link text', () => {
     const footer = buildReplyCardFooter({
       brand: '',
       recipientOpenIds: ['ou_abc'],
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
     expect(footer?.content).toContain('<at id=ou_abc></at>');
   });
 
-  it('signs a default-brand + usage footer (marker as the first separator)', () => {
+  it('signs a default-brand + usage footer with a plain separator', () => {
     const footer = buildReplyCardFooter({
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
     expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain(`${DEFAULT_BRAND_LABEL} ·⁣ 上下文 5K/200K (3%)`);
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 });
 

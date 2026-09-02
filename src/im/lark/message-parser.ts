@@ -3,6 +3,7 @@ import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
@@ -769,9 +770,10 @@ export function extractAudioMeta(rawContent: string): { fileKey: string; duratio
 }
 
 /**
- * botmux-generated reply-card footer signature. New cards carry both a visible
- * versioned link marker and an exact element id. The canonical repository URL
- * is NOT a signature: it is valid body content. For pre-signature cards we
+ * botmux-generated reply-card footer signature. New cards carry both an
+ * invisible text marker and an exact element id. Older signed cards used a
+ * versioned link, which remains recognized for compatibility. The canonical
+ * repository URL is NOT a signature: it is valid body content. For pre-signature cards we
  * recognize only the exact old default-brand + recipient chrome shape; a
  * default-brand-only old card is intentionally preserved because it is
  * indistinguishable from an ordinary repository link.
@@ -820,9 +822,13 @@ function hasExactMarkerMarkdown(value: string): boolean {
   return false;
 }
 
+function hasCurrentFooterMarker(value: unknown): value is string {
+  return typeof value === 'string' && value.includes(REPLY_CARD_FOOTER_MARKER);
+}
+
 function isSignedFormatBFooterLine(line: string): boolean {
   const inner = greyFontInner(line);
-  return inner !== null && hasExactMarkerMarkdown(inner);
+  return inner !== null && (hasCurrentFooterMarker(inner) || hasExactMarkerMarkdown(inner));
 }
 
 /** Strict compatibility recognizer for Format A cards emitted before the
@@ -961,7 +967,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           let inSignedFooter = false;
           for (const node of paragraph) {
             if (inSignedFooter) continue;
-            if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
+            if (node.tag === 'text') {
+              if (hasCurrentFooterMarker(node.text)) {
+                textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
+                inSignedFooter = true;
+                continue;
+              }
+              if (node.text) textNodes.push(node.text);
+            }
             else if (node.tag === 'a') {
               if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
                 inSignedFooter = true;
@@ -1468,8 +1481,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   const tag = el.tag;
 
   // The public element id alone is not ownership proof: third-party cards may
-  // collide with it. New botmux footers carry the id plus the exact reserved
-  // marker; unexpected large text stays visible rather than being stripped.
+  // collide with it. New botmux footers carry the id plus the reserved text
+  // marker; legacy cards carry the exact reserved link marker.
   const elementText = el.text?.content ?? el.content;
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
@@ -1480,7 +1493,7 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
       || el.text_size === 'notation_small_v2'
     )
     && typeof elementText === 'string'
-    && hasExactMarkerMarkdown(elementText)
+    && (hasCurrentFooterMarker(elementText) || hasExactMarkerMarkdown(elementText))
   ) {
     return;
   }
