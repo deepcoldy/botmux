@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
+import { spinMs, waitForPidCmdline } from './helpers/proc-ready.js';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
@@ -188,33 +189,9 @@ function spawnTagged(n: number, tag: string, script = 'setTimeout(()=>{},60_000)
     if (opts.group) groupLeaders.push(p.pid!);
     spawned.push(p);
     pids.push(p.pid!);
-    waitForCmdline(p.pid!, tag);
+    waitForPidCmdline(p.pid!, tag);
   }
   return pids;
-}
-
-/** Block until /proc (or ps) shows `needle` in pid's argv. Empty cmdline is
- *  how the reaper fail-closes; returning early is what flakes deleted=[]. */
-function waitForCmdline(pid: number, needle: string, ms = 2_000): void {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    let cmd = '';
-    if (process.platform === 'linux') {
-      try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' '); } catch { /* not yet */ }
-    } else {
-      const ps = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf-8' });
-      cmd = ps.stdout || '';
-    }
-    if (cmd.includes(needle) && alive(pid)) return;
-    spinMs(20);
-  }
-  throw new Error(`pid ${pid} cmdline never contained ${JSON.stringify(needle)}`);
-}
-
-/** Block for `ms` without an async boundary — these tests drive a synchronous
- *  reaper and need real elapsed time for signals/respawns to land. */
-function spinMs(ms: number): void {
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB */ }
 }
 
 /** pm2 records one pid file per app as `pids/<name>-<id>.pid`. */
@@ -735,6 +712,9 @@ describe('reapLegacyPm2', () => {
     while (Date.now() < deadline && !existsSync(pidFile)) spinMs(50);
     expect(existsSync(pidFile)).toBe(true);
     const firstChild = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    // pidfile is written at spawn(); cmdline can still be empty — same race as
+    // spawnTagged, and the reaper fail-closes the child if we reap too early.
+    waitForPidCmdline(firstChild, '/fake/dist/index-daemon.js');
     expect(alive(firstChild)).toBe(true);
     writeFileSync(join(home, 'pm2.pid'), String(god));
 
