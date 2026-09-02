@@ -117,6 +117,18 @@ vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   setSubstituteEnabledForChat: vi.fn(),
 }));
 
+const mockP2pForceTopicRoots = new Set<string>();
+const mockIsP2pForceTopicRoot = vi.fn((larkAppId: string, rootId: string, chatId: string) => (
+  mockP2pForceTopicRoots.has(`${larkAppId}:${chatId}:${rootId}`)
+));
+const mockRecordP2pForceTopicRoot = vi.fn((larkAppId: string, rootId: string, chatId: string) => {
+  mockP2pForceTopicRoots.add(`${larkAppId}:${chatId}:${rootId}`);
+});
+vi.mock('../src/services/p2p-force-topic-store.js', () => ({
+  isP2pForceTopicRoot: (...args: any[]) => mockIsP2pForceTopicRoot(...(args as [string, string, string])),
+  recordP2pForceTopicRoot: (...args: any[]) => mockRecordP2pForceTopicRoot(...(args as [string, string, string])),
+}));
+
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 let capturedWsClientOptions: Record<string, any> | undefined;
@@ -173,6 +185,9 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  mockP2pForceTopicRoots.clear();
+  mockIsP2pForceTopicRoot.mockClear();
+  mockRecordP2pForceTopicRoot.mockClear();
   __resetPeerCrossRefCacheForTest();
   mockCrossRefStatSync.mockReset().mockReturnValue({
     dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1,
@@ -820,7 +835,7 @@ function setupBotState(opts?: {
 	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
-	  p2pMode?: 'thread' | 'chat';
+	  p2pMode?: 'thread' | 'chat' | 'group';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
 	  summaryMemoryPath?: string;
@@ -1255,6 +1270,14 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
       .toEqual({ scope: 'thread', anchor: 'root-dm' });
   });
 
+  it('explicit group mode preserves per-message thread-shaped DM routing', async () => {
+    setupBotState({ p2pMode: 'group' });
+    expect(await decideRouting(MY_APP_ID, dm()))
+      .toEqual({ scope: 'thread', anchor: 'msg-dm' });
+    expect(await decideRouting(MY_APP_ID, dm({ root_id: 'root-dm', thread_id: 'root-dm' })))
+      .toEqual({ scope: 'thread', anchor: 'root-dm' });
+  });
+
   it('p2pMode=chat does NOT leak into group routing (gate is p2p-only): group real-thread stays thread-scope', async () => {
     setupBotState({ p2pMode: 'chat' });
     expect(await decideRouting(MY_APP_ID, { message_id: 'msg-g', chat_id: 'oc_g', chat_type: 'group', root_id: 'root-g', thread_id: 'root-g' }))
@@ -1305,6 +1328,545 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
       message_id: 'msg-nt-seed', chat_id: 'oc_group', chat_type: 'group',
       root_id: undefined, thread_id: 'omt_native_topic',
     })).toEqual({ scope: 'thread', anchor: 'msg-nt-seed' });
+  });
+});
+
+describe('im.message.receive_v1 — p2p chat-mode owned topic routing', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('continues a /t-created DM topic at its owned root instead of the existing chat session', async () => {
+    const chatId = 'oc_dm_with_topic';
+    const rootId = 'om_topic_root';
+    const ownedAnchors = new Set([chatId]);
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && ownedAnchors.has(anchor)
+    ));
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: { anchor: string }) => {
+      ownedAnchors.add(ctx.anchor);
+    });
+    mockP2pForceTopicRoots.add(`${MY_APP_ID}:${chatId}:${rootId}`);
+
+    const topicSeed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/t keep this separate' }),
+      messageId: rootId,
+      chatId,
+      chatType: 'p2p',
+    });
+    await capturedHandlers['im.message.receive_v1'](topicSeed);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(topicSeed, expect.objectContaining({
+      scope: 'thread',
+      anchor: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+
+    const followUp = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue inside the topic' }),
+      messageId: 'om_topic_follow_up',
+      rootId,
+      threadId: 'omt_dm_topic',
+      chatId,
+      chatType: 'p2p',
+    });
+    await capturedHandlers['im.message.receive_v1'](followUp);
+    await flushEventWork();
+
+    expect(mockIsP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(followUp, expect.objectContaining({
+      scope: 'thread',
+      anchor: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('records the /t root before dispatch so a back-to-back DM follow-up cannot race session registration', async () => {
+    const chatId = 'oc_dm_topic_race';
+    const rootId = 'om_topic_race_root';
+    let releaseSeed!: () => void;
+    const seedBlocked = new Promise<void>(resolve => { releaseSeed = resolve; });
+    let ownsRoot = false;
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && (anchor === chatId || (anchor === rootId && ownsRoot))
+    ));
+    handlers.handleNewTopic.mockImplementation(async () => {
+      await seedBlocked;
+      ownsRoot = true;
+    });
+
+    const topicSeed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/t keep this separate' }),
+      messageId: rootId,
+      chatId,
+      chatType: 'p2p',
+    });
+    const followUp = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'arrived before the seed registered' }),
+      messageId: 'om_topic_race_follow_up',
+      rootId,
+      threadId: 'omt_dm_topic_race',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](topicSeed);
+    await capturedHandlers['im.message.receive_v1'](followUp);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalledWith(followUp, expect.objectContaining({
+      scope: 'chat',
+      anchor: chatId,
+    }));
+
+    releaseSeed();
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(followUp, expect.objectContaining({
+      scope: 'thread',
+      anchor: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('keeps a materialized bare /t DM topic isolated even when no active session exists yet', async () => {
+    const chatId = 'oc_dm_bare_topic';
+    const rootId = 'om_bare_topic_root';
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && anchor === chatId
+    ));
+
+    const bareTopic = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/t' }),
+      messageId: rootId,
+      chatId,
+      chatType: 'p2p',
+    });
+    await capturedHandlers['im.message.receive_v1'](bareTopic);
+    await flushEventWork();
+
+    const firstTask = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'first actual task in this topic' }),
+      messageId: 'om_bare_topic_task',
+      rootId,
+      threadId: 'omt_bare_dm_topic',
+      chatId,
+      chatType: 'p2p',
+    });
+    await capturedHandlers['im.message.receive_v1'](firstTask);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(firstTask, expect.objectContaining({
+      scope: 'thread',
+      anchor: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('keeps an unowned DM topic reply folded into the flat chat session', async () => {
+    const chatId = 'oc_dm_flat';
+    const rootId = 'om_unowned_topic_root';
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'ordinary DM reply' }),
+      messageId: 'om_unowned_topic_reply',
+      rootId,
+      threadId: 'omt_unowned_dm_topic',
+      chatId,
+      chatType: 'p2p',
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && anchor === chatId
+    ));
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockIsP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: chatId,
+      replyRootId: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('migrates a pre-store /t root after verifying its immutable root message', async () => {
+    const chatId = 'oc_dm_legacy_force_topic';
+    const rootId = 'om_legacy_force_topic_root';
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && (anchor === chatId || anchor === rootId)
+    ));
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/t legacy task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue legacy /t topic' }),
+      messageId: 'om_legacy_force_topic_reply',
+      rootId,
+      threadId: 'omt_legacy_force_topic',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    await vi.waitFor(() => {
+      expect(mockGetMessageDetail).toHaveBeenCalledWith(MY_APP_ID, rootId, { userCardContent: false });
+    });
+    expect(mockRecordP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    await vi.waitFor(() => {
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: rootId,
+      }));
+    });
+  });
+
+  it('does not backfill a legacy /t marker for an unauthorized DM sender', async () => {
+    const chatId = 'oc_dm_legacy_unauthorized';
+    const rootId = 'om_legacy_unauthorized_root';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/t legacy task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: 'ou_not_allowed',
+      content: JSON.stringify({ text: 'unauthorized legacy follow-up' }),
+      messageId: 'om_legacy_unauthorized_reply',
+      rootId,
+      threadId: 'omt_legacy_unauthorized',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not migrate a legacy /t root whose immutable message belongs to another chat', async () => {
+    const chatId = 'oc_dm_legacy_expected_chat';
+    const rootId = 'om_legacy_cross_chat_root';
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && anchor === chatId
+    ));
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: 'oc_dm_legacy_other_chat',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/t legacy task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'cross-chat legacy follow-up' }),
+      messageId: 'om_legacy_cross_chat_reply',
+      rootId,
+      threadId: 'omt_legacy_cross_chat',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: rootId,
+      }));
+    });
+  });
+
+  it('does not consult legacy provenance for a DM quote bubble without thread_id', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'quoted reply, not a topic' }),
+      messageId: 'om_dm_quote_bubble_reply',
+      rootId: 'om_dm_quote_bubble_root',
+      threadId: null,
+      chatId: 'oc_dm_quote_bubble',
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+  });
+
+  it('retries legacy /t verification after a transient root-message lookup failure', async () => {
+    const chatId = 'oc_dm_legacy_retry';
+    const rootId = 'om_legacy_retry_root';
+    mockGetMessageDetail
+      .mockRejectedValueOnce(new Error('temporary Lark API failure'))
+      .mockResolvedValueOnce({
+        items: [{
+          chat_id: chatId,
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: '/t retryable legacy task' }) },
+          mentions: [],
+        }],
+      });
+
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'first follow-up during outage' }),
+      messageId: 'om_legacy_retry_first',
+      rootId,
+      threadId: 'omt_legacy_retry',
+      chatId,
+      chatType: 'p2p',
+    });
+    const second = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'second follow-up after recovery' }),
+      messageId: 'om_legacy_retry_second',
+      rootId,
+      threadId: 'omt_legacy_retry',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](first);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](second);
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
+    expect(mockRecordP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    await vi.waitFor(() => {
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(second, expect.objectContaining({
+        scope: 'thread',
+        anchor: rootId,
+      }));
+    });
+  });
+
+  it('lets an authorized bot sender continue a legacy /t DM topic', async () => {
+    setupBotState({ allowedUsers: [OTHER_BOT_OPEN_ID] });
+    const chatId = 'oc_dm_legacy_bot_sender';
+    const rootId = 'om_legacy_bot_sender_root';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/t delegated legacy task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA continue delegated task' }),
+      messageId: 'om_legacy_bot_sender_reply',
+      rootId,
+      threadId: 'omt_legacy_bot_sender',
+      chatId,
+      chatType: 'p2p',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: rootId,
+    }));
+  });
+
+  it('does not backfill a legacy /t marker for an unauthorized bot sender', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockResolveSiblingBot.mockResolvedValueOnce({ ok: false, reason: 'not_a_sibling' });
+    const chatId = 'oc_dm_legacy_bot_unauthorized';
+    const rootId = 'om_legacy_bot_unauthorized_root';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/t delegated legacy task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA continue delegated task' }),
+      messageId: 'om_legacy_bot_unauthorized_reply',
+      rootId,
+      threadId: 'omt_legacy_bot_unauthorized',
+      chatId,
+      chatType: 'p2p',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps an old thread-mode session flat after switching the DM to chat mode', async () => {
+    const chatId = 'oc_dm_old_thread_mode';
+    const rootId = 'om_old_thread_mode_root';
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && (anchor === chatId || anchor === rootId)
+    ));
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'ordinary old thread seed' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'must join the flat DM after mode switch' }),
+      messageId: 'om_old_thread_mode_reply',
+      rootId,
+      threadId: 'omt_old_thread_mode',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: chatId,
+      replyRootId: rootId,
+    }));
+  });
+
+  it('does not record a rejected DM /t as a topic root', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: 'ou_not_allowed',
+      content: JSON.stringify({ text: '/t should not reserve a root' }),
+      messageId: 'om_rejected_topic_root',
+      chatId: 'oc_dm_rejected_topic',
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not record a DM /t blocked by beforeSessionTurn', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/t blocked by hook' }),
+      messageId: 'om_hook_blocked_topic_root',
+      chatId: 'oc_dm_hook_blocked_topic',
+      chatType: 'p2p',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.beforeSessionTurn = vi.fn(async () => ({ block: true }));
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not capture a DM topic owned only under another Lark app', async () => {
+    const chatId = 'oc_dm_cross_app';
+    const rootId = 'om_cross_app_topic_root';
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'reply to another app topic' }),
+      messageId: 'om_cross_app_topic_reply',
+      rootId,
+      threadId: 'omt_cross_app_dm_topic',
+      chatId,
+      chatType: 'p2p',
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      (anchor === rootId && appId === OTHER_BOT_APP_ID)
+      || (anchor === chatId && appId === MY_APP_ID)
+    ));
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockIsP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: chatId,
+      replyRootId: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it.each(['thread', 'group'] as const)('does not consult /t provenance in explicit p2pMode=%s', async p2pMode => {
+    setupBotState({ p2pMode, allowedUsers: [USER_OPEN_ID] });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'explicit mode reply' }),
+      messageId: `om_${p2pMode}_reply`,
+      rootId: `om_${p2pMode}_root`,
+      threadId: `omt_${p2pMode}_topic`,
+      chatId: `oc_dm_${p2pMode}`,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockIsP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: `om_${p2pMode}_root`,
+    }));
   });
 });
 
