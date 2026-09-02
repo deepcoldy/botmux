@@ -1207,14 +1207,18 @@ describe('buildReplyCardFooter', () => {
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
-  it('signs a recipient-only footer with non-link text', () => {
+  it('does not render a separator or link when brand is disabled and only recipient remains', () => {
     const footer = buildReplyCardFooter({
       brand: '',
       recipientOpenIds: ['ou_abc'],
     });
     expect(footer?.content).toContain('⁣');
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+    expect(footer?.content).not.toContain('·');
     expect(footer?.content).toContain('<at id=ou_abc></at>');
+    expect(footer?.content.replace('⁣', '')).toBe(
+      "<font color='grey'>发送给：<at id=ou_abc></at></font>",
+    );
   });
 
   it('signs a default-brand + usage footer with a plain separator', () => {

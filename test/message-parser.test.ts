@@ -946,6 +946,23 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
     expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
   });
 
+  it('drops a brand-disabled recipient-only footer without requiring a visible separator', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('·');
+
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
   it.each([
     { name: 'without text_size', textSize: undefined },
     { name: 'with Card 2.0 notation', textSize: 'notation' },
