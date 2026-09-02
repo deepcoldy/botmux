@@ -2,7 +2,6 @@
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
-import { spawnSync } from 'node:child_process';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
@@ -214,7 +213,7 @@ import { withFileLock } from './utils/file-lock.js';
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
-import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
+import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -902,17 +901,12 @@ function createDshProfile(name: string): string {
     writeFileSync(cordisPatchYml, patch, 'utf8');
   }
 
-  // Install profile dependencies. dsh plugin add uses the profile's package
-  // manager (pnpm) to install the declared dependencies into node_modules.
-  // We only need to trigger this once on new profiles; existing profiles
-  // already have their node_modules. dsh-sdk-jsonrpc-server has no dsh.bundle
-  // so this won't touch cordis.patch.yml.
+  // Install profile dependencies via managed-spawn (redacted env — no Feishu
+  // H5 credentials for the child). Only on new profiles; existing ones already
+  // have their node_modules.
   if (isNew) {
     const dshBin = resolveCommandReal('dsh');
-    spawnSync(dshBin, ['plugin', '--profile', name, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
-      stdio: 'pipe',
-      timeout: 120_000,
-    });
+    installDshProfileDeps(name, dshBin);
   }
 
   return name;
