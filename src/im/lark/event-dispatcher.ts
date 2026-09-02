@@ -76,6 +76,11 @@ import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agen
 import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
+import {
+  addAutoOncallChat,
+  isAutoOncallOperator,
+  removeAutoOncallChat,
+} from '../../services/auto-oncall-store.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1858,10 +1863,13 @@ function grantNotExpired(
   return false;
 }
 
-/** 整群 talk 授权命中判断（裸 `/grant` 写入的 allowedChatGroups）。chat 维度、sender 无关，
+/** 整群 talk 授权命中判断（手动 `/grant` 或可信拉群事件）。chat 维度、sender 无关，
  *  与 oncall 同一个安全模型：只放行 canTalk / bot 路由闸，canOperate 绝不读它。 */
 function hasAllowedChatGroup(larkAppId: string, chatId: string | undefined): boolean {
-  return !!chatId && !!getBot(larkAppId).config.allowedChatGroups?.includes(chatId);
+  if (!chatId) return false;
+  const cfg = getBot(larkAppId).config;
+  return cfg.allowedChatGroups?.includes(chatId) === true
+    || cfg.autoOncallChats?.includes(chatId) === true;
 }
 
 /**
@@ -4317,6 +4325,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        if (isAutoOncallOperator(larkAppId, operatorOpenId)) {
+          const result = await addAutoOncallChat(larkAppId, chatId);
+          if (!result.ok) {
+            logger.warn(`[auto-oncall:${larkAppId}] failed to add chat=${chatId}: ${result.reason}`);
+          }
+        }
         // 进群先自动拉 owner（不受任何开工开关影响，失败仅日志）：bot 应始终
         // 处于 owner 可见的群里。放在 handleBotAdded 之前，让 autoStart 的
         // D7「群内需有 allowedUser」闸能吃到刚拉进来的 owner。
@@ -4331,11 +4345,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     // bot.deleted 同样只推给被移出的 bot 自己的 app——清自己的 key 即可(语义
     // 同 bot.added:进程边界上够不到兄弟 daemon;「别的 bot 离群→存量 bot
     // 陈旧」靠①守卫+TTL)。user.added/deleted_v1 推给群内已订阅的所有 bot
-    // app,每个 bot 自己的 WS 都收到,各自清自己那条。纯本地 map 删除,同步
-    // 处理、即时 ACK,不进 work 队列;去重也不必要——失效是幂等的。
+    // app,每个 bot 自己的 WS 都收到,各自清自己那条。统计缓存同步
+    // 失效，配置授权的撤销进 ACK-safe 异步队列。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
-      if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (!chatId) return;
+      invalidateChatStats(larkAppId, chatId);
+      const eventKey = `im.chat.member.bot.deleted_v1:${larkAppId}:${eventIdForKey(data) ?? chatId}`;
+      scheduleAckSafeEvent(eventKey, async () => {
+        try {
+          const result = await removeAutoOncallChat(larkAppId, chatId);
+          if (!result.ok) {
+            logger.warn(`[auto-oncall:${larkAppId}] failed to remove chat=${chatId}: ${result.reason}`);
+          }
+        } catch (err) {
+          logger.warn(`[auto-oncall:${larkAppId}] failed to remove chat=${chatId}: ${err}`);
+        }
+      }, 'bot-deleted event');
     },
     'im.chat.member.user.added_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;

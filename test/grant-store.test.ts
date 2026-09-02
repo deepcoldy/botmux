@@ -138,15 +138,30 @@ describe('grant-store', () => {
     expect(readConfig().allowedChatGroups).toEqual(['oc_team']);
   });
 
-  it('removeAllowedChatGroup removes the chat_id from disk & memory', async () => {
-    writeConfig({ allowedUsers: ['ou_owner'], allowedChatGroups: ['oc_team', 'oc_other'] });
+  it('removeAllowedChatGroup atomically revokes manual and automatic whole-chat access', async () => {
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      allowedChatGroups: ['oc_team', 'oc_other'],
+      autoOncallChats: ['oc_team', 'oc_auto_other'],
+    });
     const { registry, store } = await freshModules();
     const r = await store.removeAllowedChatGroup('a1', 'oc_team');
     expect(r).toEqual({ ok: true, removed: true });
     expect(readConfig().allowedChatGroups).toEqual(['oc_other']);
+    expect(readConfig().autoOncallChats).toEqual(['oc_auto_other']);
     expect(registry.getBot('a1').config.allowedChatGroups).toEqual(['oc_other']);
+    expect(registry.getBot('a1').config.autoOncallChats).toEqual(['oc_auto_other']);
     // removing one that isn't there
     expect(await store.removeAllowedChatGroup('a1', 'oc_team')).toEqual({ ok: true, removed: false });
+  });
+
+  it('removeAllowedChatGroup reports an automatic-only revoke as removed', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'], autoOncallChats: ['oc_team'] });
+    const { registry, store } = await freshModules();
+
+    expect(await store.removeAllowedChatGroup('a1', 'oc_team')).toEqual({ ok: true, removed: true });
+    expect(readConfig().autoOncallChats).toBeUndefined();
+    expect(registry.getBot('a1').config.autoOncallChats).toBeUndefined();
   });
 
 });
