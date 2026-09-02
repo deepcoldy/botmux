@@ -94,6 +94,7 @@ import {
   projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  stripSchedulePreconditionMaterial,
   redactSettingsForPublic,
   sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
@@ -4117,9 +4118,10 @@ const server = createServer(async (req, res) => {
       // instructions) and a bound `workingDir` (repo/customer path) — strip
       // both for anonymous visitors. The schedules page only renders
       // name/timing/status, so nothing degrades.
+      const rawSchedules = aggregator.getSchedules();
       const schedules = authed
-        ? aggregator.getSchedules()
-        : redactSchedulesForPublic(aggregator.getSchedules());
+        ? rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))
+        : redactSchedulesForPublic(rawSchedules);
       // Effective schedule timezone: nextRunAt/lastRunAt instants must be
       // rendered in the zone the scheduler fires in (not the viewer's browser
       // zone), so the web schedule/overview lists match cron/card/CLI displays.
@@ -5615,6 +5617,20 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/spawn-command`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/logs$/))) {
+      const id = decodeURIComponent(m[1]);
+      const owner = resolveScheduleOwner(id);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+      const upstream = await proxyToDaemon(
+        owner,
+        `/api/schedules/${encodeURIComponent(id)}/logs${url.search}`,
+        { method: 'GET' },
+      );
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -7330,6 +7346,20 @@ const server = createServer(async (req, res) => {
           projectedBody,
           sessionBoardAudience,
         ) as typeof ev.body;
+        // Authenticated management browsers may edit the flat source value,
+        // but daemon-side references/hashes/nested records must never leave the
+        // dashboard. Patch nulls are retained so merge-based clients clear the
+        // prior source after inline↔file replacement or removal.
+        if (ev.type === 'schedule.created' || ev.type === 'schedule.updated') {
+          const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
+          body = {
+            ...b,
+            ...(b.schedule ? { schedule: stripSchedulePreconditionMaterial(b.schedule) } : {}),
+            ...(b.patch ? {
+              patch: stripSchedulePreconditionMaterial(b.patch, { preserveClearMarkers: true }),
+            } : {}),
+          } as typeof ev.body;
+        }
         // Schedules stay on the MANAGEMENT gate, mirroring the GET
         // /api/schedules carve-out: schedule events carry the full task object
         // (prompt = business instructions, workingDir = repo/customer path) and
@@ -7344,8 +7374,8 @@ const server = createServer(async (req, res) => {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
             ...b,
-            ...(b.schedule ? { schedule: { ...b.schedule, prompt: undefined, workingDir: undefined } } : {}),
-            ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
+            ...(b.schedule ? { schedule: redactSchedulesForPublic([b.schedule])[0] } : {}),
+            ...(b.patch ? { patch: redactSchedulesForPublic([b.patch])[0] } : {}),
           } as typeof ev.body;
         }
         stream.write(ev.type, { larkAppId: ev.larkAppId, body });

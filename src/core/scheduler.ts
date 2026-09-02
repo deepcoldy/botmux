@@ -1,13 +1,22 @@
 import { Cron } from 'croner';
+import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
+import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
+import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+export interface ScheduleExecutionContext {
+  runId: string;
+  trigger: 'scheduler' | 'dashboard';
+  startedAt: string;
+}
+
 // Callback set by daemon to execute a scheduled task
-let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
+let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -42,8 +51,52 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
   });
 }
 
-export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
+export function setExecuteCallback(
+  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<void>,
+): void {
   executeCallback = cb;
+}
+
+function createExecutionContext(
+  trigger: ScheduleExecutionContext['trigger'],
+  startedAt = new Date().toISOString(),
+): ScheduleExecutionContext {
+  return { runId: randomUUID(), trigger, startedAt };
+}
+
+function cleanupRemovedTaskPrecondition(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeSchedulePrecondition(appId, task.id);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove protected precondition for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskRunLogs(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeScheduleRunLogs(task.id, appId);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove execution logs for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
+  cleanupRemovedTaskPrecondition(task);
+  cleanupRemovedTaskRunLogs(task);
+}
+
+function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
+  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
 }
 
 /**
@@ -456,13 +509,15 @@ async function tick(): Promise<void> {
 
     // Execute
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
-    scheduleStore.updateTask(task.id, { lastRunAt: new Date().toISOString() });
+    const executionContext = createExecutionContext('scheduler');
+    scheduleStore.updateTask(task.id, { lastRunAt: executionContext.startedAt });
 
     if (executeCallback) {
       const taskId = task.id;
-      executeCallback(task)
+      executeCallback(task, executionContext)
         .then(() => {
           scheduleStore.markRun(taskId, true);
+          cleanupIfTaskWasAutoRemoved(task);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: { id: taskId, runAt: Date.now(), status: 'ok' },
@@ -472,6 +527,7 @@ async function tick(): Promise<void> {
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
           scheduleStore.markRun(taskId, false, err.message);
+          cleanupIfTaskWasAutoRemoved(task);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -561,6 +617,8 @@ export function stopScheduler(): void {
 }
 
 export function addTask(params: {
+  id?: string;
+  preconditionRef?: string;
   name: string;
   schedule: string;
   prompt: string;
@@ -609,6 +667,8 @@ export function addTask(params: {
   const topicTitle = normalizeTopicTitle(params.topicTitle);
   const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
+    id: params.id,
+    preconditionRef: params.preconditionRef,
     name: params.name,
     schedule: params.schedule,
     parsed,
@@ -658,7 +718,11 @@ export function resolveTaskExecutionPosition(
 }
 
 export function removeTask(id: string): boolean {
-  return scheduleStore.removeTask(id);
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  const removed = scheduleStore.removeTask(id);
+  if (removed) cleanupRemovedTaskSidecars(task);
+  return removed;
 }
 
 export function enableTask(id: string): boolean {
@@ -710,18 +774,19 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
-  const nowIso = new Date().toISOString();
-  const next = computeNextRun(task.parsed, nowIso);
+  const executionContext = createExecutionContext('dashboard');
+  const next = computeNextRun(task.parsed, executionContext.startedAt);
   scheduleStore.updateTask(id, {
-    lastRunAt: nowIso,
+    lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
   });
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task)).then(
+  void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
     () => {
       scheduleStore.markRun(task.id, true);
+      cleanupIfTaskWasAutoRemoved(task);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'ok' },
@@ -731,6 +796,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     err => {
       const msg = err instanceof Error ? err.message : String(err);
       scheduleStore.markRun(task.id, false, msg);
+      cleanupIfTaskWasAutoRemoved(task);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
@@ -910,9 +976,7 @@ export function updateTask(
  * drops the row immediately without waiting for the next poll.
  */
 export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
-  const task = scheduleStore.getTask(id);
-  if (!task) return { ok: false, error: 'not_found' };
-  scheduleStore.removeTask(id);
+  if (!removeTask(id)) return { ok: false, error: 'not_found' };
   dashboardEventBus.publish({
     type: 'schedule.deleted',
     body: { id },

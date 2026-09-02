@@ -14282,6 +14282,20 @@ tbody tr[data-chat]:hover {
   text-align: left;
 }
 
+.schedule-chip-strip span.schedule-precondition-chip {
+  gap: 5px;
+}
+
+.schedule-precondition-chip-icon {
+  font-style: normal;
+}
+
+.schedule-chip-strip span.schedule-precondition-chip.is-paused {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  color: var(--warning);
+}
+
 .schedule-row-head .schedule-state {
   align-self: center;
   min-width: 42px;
@@ -27370,6 +27384,891 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .schedule-form-field textarea {
   resize: vertical;
   min-height: 80px;
+}
+
+.schedule-form-field textarea.schedule-precondition-editor {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.schedule-precondition-field {
+  gap: 7px;
+}
+
+.schedule-precondition-toggle {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-muted) 42%, transparent);
+}
+
+.schedule-precondition-toggle input:focus-visible + .switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-precondition-panel input:focus-visible,
+.schedule-precondition-panel textarea:focus-visible,
+.schedule-precondition-remove input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-precondition-toggle .toggle-tx small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.schedule-precondition-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-muted) 34%, transparent);
+}
+
+.schedule-precondition-source {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.schedule-precondition-source legend {
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.schedule-precondition-source-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.schedule-precondition-help-trigger {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border-soft));
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.schedule-precondition-help-trigger:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+
+.schedule-precondition-help-trigger:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-precondition-status {
+  margin: 0;
+  padding: 7px 9px;
+  border-left: 3px solid var(--success);
+  background: color-mix(in srgb, var(--success) 7%, transparent);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.schedule-precondition-status.is-paused {
+  border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+}
+
+.schedule-precondition-source-help {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-soft));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+.schedule-precondition-source-help h3,
+.schedule-precondition-source-help p {
+  margin: 0;
+}
+
+.schedule-precondition-source-help h3 {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.schedule-precondition-source-help p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.schedule-precondition-path-context {
+  display: grid;
+  gap: 0;
+  margin: 2px 0;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+}
+
+.schedule-precondition-path-context > div {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.38fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 9px;
+}
+
+.schedule-precondition-path-context > div + div {
+  border-top: 1px solid var(--border-soft);
+}
+
+.schedule-precondition-path-context dt,
+.schedule-precondition-path-context dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.schedule-precondition-path-context dt {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.schedule-precondition-path-context dd {
+  color: var(--muted);
+}
+
+.schedule-precondition-path-context code {
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.schedule-precondition-example-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.schedule-precondition-example-header span {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.schedule-precondition-example-header button {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-soft));
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.schedule-precondition-example-header button:hover,
+.schedule-precondition-example-header button:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.schedule-precondition-example-header button:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.schedule-precondition-help-body pre {
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.schedule-precondition-help-dialog {
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(760px, calc(100dvh - 32px));
+  overflow: hidden;
+  border-color: var(--border-soft);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.schedule-precondition-help-dialog::backdrop {
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.schedule-precondition-help-dialog > article {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0;
+  max-height: min(760px, calc(100dvh - 32px));
+  padding: 0;
+}
+
+.schedule-precondition-help-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 48%, var(--surface));
+}
+
+.schedule-precondition-help-dialog header > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.schedule-precondition-help-dialog h2,
+.schedule-precondition-help-dialog header p {
+  margin: 0;
+}
+
+.schedule-precondition-help-dialog h2 {
+  color: var(--text);
+  font-size: var(--fs-17);
+  line-height: 1.3;
+}
+
+.schedule-precondition-help-dialog header p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.schedule-precondition-help-close {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.schedule-precondition-help-close:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.schedule-precondition-help-close:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-precondition-help-body {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+}
+
+.schedule-precondition-help-body > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.schedule-precondition-help-body strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.schedule-precondition-help-body .schedule-precondition-help-apply-note,
+.schedule-precondition-help-body .schedule-precondition-help-view-only {
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: 2px var(--radius-sm) var(--radius-sm) 2px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--text);
+}
+
+.schedule-precondition-help-body .schedule-precondition-help-view-only {
+  border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, var(--surface));
+}
+
+/* ── Task-scoped scheduler run logs ─────────────────────────────────────── */
+.schedule-run-log-dialog {
+  width: min(920px, calc(100vw - 32px));
+  max-height: min(760px, calc(100dvh - 32px));
+  overflow: hidden;
+  border-color: var(--border-soft);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.schedule-run-log-dialog::backdrop {
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.schedule-run-log-dialog > article {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0;
+  max-height: min(760px, calc(100dvh - 32px));
+  padding: 0;
+}
+
+.schedule-run-log-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 18px;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 48%, var(--surface));
+}
+
+.schedule-run-log-header > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.schedule-run-log-header .eyebrow,
+.schedule-run-log-header h2,
+.schedule-run-log-header p {
+  margin: 0;
+}
+
+.schedule-run-log-header h2 {
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-17);
+  line-height: 1.3;
+}
+
+.schedule-run-log-header h2 span {
+  overflow-wrap: anywhere;
+}
+
+.schedule-run-log-header #schedule-run-log-intro {
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.schedule-run-log-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+button.schedule-run-log-refresh,
+.schedule-run-log-close {
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+button.schedule-run-log-refresh:hover:not(:disabled),
+.schedule-run-log-close:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--accent-strong);
+}
+
+button.schedule-run-log-refresh:focus-visible,
+.schedule-run-log-close:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button.schedule-run-log-refresh:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.schedule-run-log-close {
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.schedule-run-log-body {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 360px;
+  overflow: hidden;
+}
+
+.schedule-run-log-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 14px 16px 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border-soft));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--danger);
+}
+
+.schedule-run-log-alert > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.schedule-run-log-alert strong {
+  font-size: 12px;
+}
+
+.schedule-run-log-alert span {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.schedule-run-log-alert button,
+.schedule-run-log-more {
+  flex: none;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.schedule-run-log-alert button:hover,
+.schedule-run-log-more:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.schedule-run-log-empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  min-height: 360px;
+  padding: 38px 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.schedule-run-log-empty > span {
+  color: var(--accent);
+  font-size: 30px;
+}
+
+.schedule-run-log-empty strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.schedule-run-log-empty p {
+  max-width: 440px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.schedule-run-log-workspace {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.84fr) minmax(0, 1.5fr);
+  min-height: 0;
+  height: min(560px, calc(100dvh - 150px));
+}
+
+.schedule-run-log-list-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 32%, var(--surface));
+}
+
+.schedule-run-log-list-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px 10px;
+}
+
+.schedule-run-log-list-panel h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.schedule-run-log-list-panel > header > span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.schedule-run-log-list {
+  min-height: 0;
+  margin: 0;
+  padding: 0 8px 8px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.schedule-run-log-list li + li {
+  margin-top: 5px;
+}
+
+button.schedule-run-log-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 62px;
+  padding: 10px 11px 10px 15px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+button.schedule-run-log-row::before {
+  content: "";
+  position: absolute;
+  top: 13px;
+  bottom: 13px;
+  left: 5px;
+  width: 3px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+button.schedule-run-log-row.outcome-precondition_skipped::before {
+  background: var(--warning);
+}
+
+button.schedule-run-log-row.outcome-error::before {
+  background: var(--danger);
+}
+
+button.schedule-run-log-row:hover,
+button.schedule-run-log-row.is-active {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border-soft));
+  background: var(--surface);
+}
+
+button.schedule-run-log-row.is-active {
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--bg) 8%, transparent);
+}
+
+button.schedule-run-log-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.schedule-run-log-row-main {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.schedule-run-log-row-main strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-run-log-row-main time,
+.schedule-run-log-row-duration {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-run-log-row-duration {
+  white-space: nowrap;
+}
+
+.schedule-run-log-more {
+  justify-self: center;
+  margin: 8px 10px 12px;
+}
+
+.schedule-run-log-more:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.schedule-run-log-detail-panel {
+  min-width: 0;
+  min-height: 0;
+  padding: 18px 20px 20px;
+  overflow-y: auto;
+}
+
+.schedule-run-log-detail-panel > header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.schedule-run-log-detail-panel > header > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.schedule-run-log-detail-panel > header p,
+.schedule-run-log-detail-panel > header time {
+  margin: 0;
+}
+
+.schedule-run-log-detail-panel > header p {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.schedule-run-log-detail-panel > header time {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.schedule-run-log-outcome {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--success) 10%, var(--surface));
+  color: var(--success);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.schedule-run-log-outcome.outcome-precondition_skipped {
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+  color: var(--warning);
+}
+
+.schedule-run-log-outcome.outcome-error {
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
+  color: var(--danger);
+}
+
+.schedule-run-log-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.schedule-run-log-facts > div {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  min-height: 62px;
+  padding: 10px 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-muted) 27%, var(--surface));
+}
+
+.schedule-run-log-facts dt {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-run-log-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.schedule-run-log-error-detail {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-left: 3px solid var(--danger);
+  border-radius: 2px var(--radius-sm) var(--radius-sm) 2px;
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+}
+
+.schedule-run-log-error-detail p {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.schedule-run-log-error-detail span {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-run-log-error-detail code,
+.schedule-run-log-error-detail strong {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.schedule-run-log-boundary {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-soft));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+@media (max-width: 720px) {
+  .schedule-run-log-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+  }
+
+  .schedule-run-log-dialog > article {
+    max-height: calc(100dvh - 16px);
+  }
+
+  .schedule-run-log-header {
+    gap: 10px;
+    padding: 14px;
+  }
+
+  button.schedule-run-log-refresh,
+  .schedule-run-log-close {
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+    min-height: 40px;
+  }
+
+  .schedule-run-log-body {
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .schedule-run-log-alert {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .schedule-run-log-alert button {
+    align-self: flex-start;
+  }
+
+  .schedule-run-log-empty {
+    min-height: 300px;
+  }
+
+  .schedule-run-log-workspace {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .schedule-run-log-list-panel {
+    max-height: 35dvh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .schedule-run-log-detail-panel {
+    min-height: 330px;
+    overflow: visible;
+  }
+
+  .schedule-run-log-facts {
+    grid-template-columns: 1fr;
+  }
+}
+
+.schedule-precondition-remove {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  color: var(--danger);
+  font-size: 11px;
+  cursor: pointer;
 }
 
 .schedule-form-help {

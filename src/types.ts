@@ -938,6 +938,10 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
+   *  never stored in this sandbox-writable task row. Absence does not prove
+   *  that no condition exists: runtime always checks the sidecar by task id. */
+  preconditionRef?: string;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;

@@ -37,6 +37,7 @@ import {
   type HandlerResult,
 } from './groups-action-helpers.js';
 import { roleWriteShouldInvalidate } from './groups-matrix-snapshot.js';
+import { stripAllSchedulePreconditionMaterial } from './public-redact.js';
 import {
   applySettingsWrite,
   type ResolvedDashboardSettingsView,
@@ -175,6 +176,23 @@ function scopeByCaller(
 }
 
 /**
+ * Keep the bot-facing Route B schedule projection narrower than the
+ * authenticated management projection held by the aggregator. Scope first so
+ * another bot's row is never processed into the caller's result, then clone
+ * each retained row while removing every executable/protected precondition
+ * representation. `prompt`, `workingDir`, and summary flags remain available
+ * to the bot dashboard; the input rows are never mutated.
+ */
+function scopeAndRedactSchedules(
+  rows: ReadonlyArray<unknown>,
+  callerAppId: string | undefined,
+  isGlobal: boolean,
+): unknown[] {
+  const scoped = isGlobal ? rows : scopeByCaller(rows, callerAppId);
+  return scoped.map(row => stripAllSchedulePreconditionMaterial(row));
+}
+
+/**
  * Per-bot scoping for the `groups-matrix` endpoint.
  *
  * The groups matrix returns `{ chats, bots }` where neither container has a
@@ -269,9 +287,11 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/schedules-list$/,
     handle: async (_m, ctx, deps) => {
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
-      const schedules = isGlobal
-        ? deps.getSchedules()
-        : scopeByCaller(deps.getSchedules(), ctx.callerAppId);
+      const schedules = scopeAndRedactSchedules(
+        deps.getSchedules(),
+        ctx.callerAppId,
+        isGlobal,
+      );
       return { status: 200, body: { schedules } };
     },
   },
@@ -311,15 +331,18 @@ const ROUTES: RouteDef[] = [
       // remains per-calling-bot until it has an explicit global write model.
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       const groups = await deps.buildGroupsMatrix();
+      const schedules = scopeAndRedactSchedules(
+        deps.getSchedules(),
+        ctx.callerAppId,
+        isGlobal,
+      );
       return {
         status: 200,
         body: {
           sessions: isGlobal
             ? deps.getSessions()
             : scopeByCaller(deps.getSessions(), ctx.callerAppId),
-          schedules: isGlobal
-            ? deps.getSchedules()
-            : scopeByCaller(deps.getSchedules(), ctx.callerAppId),
+          schedules,
           settings: deps.resolveDashboardSettings(),
           groups,
         },

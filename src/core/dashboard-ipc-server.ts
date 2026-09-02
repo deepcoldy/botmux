@@ -29,6 +29,13 @@ import {
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import {
+  resolveSchedulePrecondition,
+  validateSchedulePreconditionSource,
+  type SchedulePreconditionDefinition,
+  type SchedulePreconditionSource,
+} from '../services/schedule-precondition-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
@@ -99,6 +106,13 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
+import {
+  createTaskWithOptionalPrecondition,
+  removeTaskWithPrecondition,
+  toggleTaskDeliveryWithPrecondition,
+  updateTaskWithOptionalPrecondition,
+  type SchedulePreconditionMutation,
+} from './schedule-precondition-config.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
@@ -3093,6 +3107,97 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
 
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
+type SchedulePreconditionWriteParseResult =
+  | {
+      ok: true;
+      supplied: boolean;
+      create?: SchedulePreconditionDefinition;
+      update?: SchedulePreconditionMutation;
+    }
+  | { ok: false; field: 'preconditionEnabled' | 'preconditionScript' | 'preconditionFilePath' };
+
+/** Parse the authenticated schedule precondition write DTO. Source values go
+ * directly to protected storage; authenticated management reads receive a
+ * validated flat projection from that sidecar rather than from the task row. */
+function parseSchedulePreconditionWrite(
+  body: Record<string, unknown>,
+  operation: 'create' | 'update',
+): SchedulePreconditionWriteParseResult {
+  const enabledPresent = Object.hasOwn(body, 'preconditionEnabled');
+  const scriptPresent = Object.hasOwn(body, 'preconditionScript');
+  const filePresent = Object.hasOwn(body, 'preconditionFilePath');
+  const supplied = enabledPresent || scriptPresent || filePresent;
+
+  if (enabledPresent && typeof body.preconditionEnabled !== 'boolean') {
+    return { ok: false, field: 'preconditionEnabled' };
+  }
+  if (scriptPresent && filePresent) {
+    return { ok: false, field: 'preconditionFilePath' };
+  }
+
+  const enabled = enabledPresent ? body.preconditionEnabled as boolean : undefined;
+  let source: SchedulePreconditionSource | undefined;
+  if (scriptPresent) {
+    if (body.preconditionScript === null) {
+      if (operation === 'create' || enabledPresent) {
+        return { ok: false, field: 'preconditionScript' };
+      }
+      return { ok: true, supplied, update: { action: 'clear' } };
+    }
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'inline',
+        script: body.preconditionScript,
+      });
+    } catch {
+      return { ok: false, field: 'preconditionScript' };
+    }
+  } else if (filePresent) {
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'file',
+        path: body.preconditionFilePath,
+      });
+    } catch {
+      return { ok: false, field: 'preconditionFilePath' };
+    }
+  }
+
+  if (source) {
+    if (operation === 'create') {
+      return {
+        ok: true,
+        supplied,
+        create: { enabled: enabled ?? true, source },
+      };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: enabled === undefined
+        ? { action: 'replace', source }
+        : { action: 'replace', source, enabled },
+    };
+  }
+
+  if (enabled !== undefined) {
+    if (operation === 'create') {
+      // The create form defaults off. With no source, false is a no-op and
+      // true is incomplete rather than a phantom configured condition.
+      return enabled
+        ? { ok: false, field: 'preconditionEnabled' }
+        : { ok: true, supplied };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: { action: 'set-enabled', enabled },
+    };
+  }
+
+  return { ok: true, supplied };
+}
+
 export interface ScheduleRow {
   id: string;
   name: string;
@@ -3117,7 +3222,57 @@ export interface ScheduleRow {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  hasPrecondition: boolean;
+  preconditionEnabled?: boolean;
+  /** Authenticated management projection of the protected source. Internal
+   * sidecar references and hashes are never exposed. */
+  preconditionSource?: SchedulePreconditionSource['kind'];
+  preconditionScript?: string;
+  preconditionFilePath?: string;
   feishuChatLink: string;
+}
+
+function schedulePreconditionProjection(
+  task: ScheduledTask,
+): Pick<
+  ScheduleRow,
+  | 'hasPrecondition'
+  | 'preconditionEnabled'
+  | 'preconditionSource'
+  | 'preconditionScript'
+  | 'preconditionFilePath'
+> {
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) {
+    return task.preconditionRef === undefined
+      ? { hasPrecondition: false }
+      : { hasPrecondition: true, preconditionEnabled: true };
+  }
+  try {
+    const resolved = resolveSchedulePrecondition(task, effectiveAppId);
+    if (resolved.kind === 'none') return { hasPrecondition: false };
+    return resolved.source.kind === 'inline'
+      ? {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'inline',
+          preconditionScript: resolved.source.script,
+        }
+      : {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'file',
+          preconditionFilePath: resolved.source.path,
+        };
+  } catch {
+    // A damaged/mismatched protected record blocks execution. Keep the list
+    // usable without leaking storage details, and represent that state as an
+    // active gate rather than incorrectly claiming no condition exists.
+    logger.error(
+      `[schedule-precondition] management projection unavailable for task ${task.id}; projecting fail-closed gate`,
+    );
+    return { hasPrecondition: true, preconditionEnabled: true };
+  }
 }
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
@@ -3145,6 +3300,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
+    ...schedulePreconditionProjection(t),
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -3157,6 +3313,31 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
 });
 
+ipcRoute('GET', '/api/schedules/:id/logs', (req, res, p) => {
+  const task = scheduleStore.getTask(p.id);
+  if (!task || !scheduler.belongsToOwner(task)) {
+    return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+  }
+  const appId = task.larkAppId ?? cachedLarkAppId;
+  if (!appId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+
+  const searchParams = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const rawLimit = Number.parseInt(searchParams.get('limit') ?? '', 10);
+  const rawOffset = Number.parseInt(searchParams.get('offset') ?? '', 10);
+  try {
+    const result = queryScheduleRunLogs(p.id, {
+      limit: Number.isFinite(rawLimit) ? rawLimit : 50,
+      offset: Number.isFinite(rawOffset) ? rawOffset : 0,
+    }, appId);
+    return jsonRes(res, 200, result);
+  } catch (err) {
+    logger.error(
+      `[schedule-run-log] query failed for task ${p.id}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return jsonRes(res, 500, { ok: false, error: 'schedule_run_logs_query_failed' });
+  }
+});
+
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
@@ -3166,6 +3347,10 @@ ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200
 ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const task = scheduleStore.getTask(p.id);
+  if (!task) return jsonRes(res, 200, { ok: false, error: 'not_found' });
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   const requested = body && typeof body === 'object'
     ? (body as Record<string, unknown>).executionPosition
     : undefined;
@@ -3173,10 +3358,14 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
     if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
-    const result = scheduler.updateTask(p.id, { executionPosition: requested });
+    const result = updateTaskWithOptionalPrecondition(
+      p.id,
+      { executionPosition: requested },
+      effectiveAppId,
+    );
     return jsonRes(res, 200, result.ok ? { ...result, executionPosition: requested } : result);
   }
-  return jsonRes(res, 200, scheduler.toggleDelivery(p.id));
+  return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
 // Create a new scheduled task from the dashboard. chatId selects which chat
@@ -3195,6 +3384,10 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
   const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
   const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
+  const precondition = parseSchedulePreconditionWrite(b, 'create');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // Validate silent type — if present, must be boolean (no silent degradation).
   let silent = false;
   if (b.silent !== undefined) {
@@ -3252,7 +3445,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
-    const task = scheduler.addTask({
+    const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
       prompt,
@@ -3274,7 +3467,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       deliver,
       silent,
       followActive: followActive || undefined,
-    });
+    }, cachedLarkAppId, precondition.create);
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
   } catch (err) {
@@ -3297,6 +3490,10 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
   } = {};
+  const precondition = parseSchedulePreconditionWrite(b, 'update');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // If a field is present, it must be the correct type and (for strings)
   // non-empty after trim — otherwise 400, never silently ignore.
   if (b.name !== undefined) {
@@ -3351,15 +3548,62 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     updates.silent = b.silent;
   }
-  const result = scheduler.updateTask(p.id, updates);
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let result;
+  try {
+    result = updateTaskWithOptionalPrecondition(
+      p.id,
+      updates,
+      cachedLarkAppId,
+      precondition.update,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message === 'schedule_precondition_not_configured') {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionEnabled',
+      });
+    }
+    logger.error(`[schedule-precondition] authenticated update failed for task ${p.id}`);
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'schedule_precondition_update_failed',
+    });
+  }
   if (!result.ok) return jsonRes(res, 400, result);
-  const task = scheduleStore.getTask(p.id);
+  const task = result.task ?? scheduleStore.getTask(p.id);
+  if (precondition.supplied) {
+    const projection: ReturnType<typeof schedulePreconditionProjection> = task
+      ? schedulePreconditionProjection(task)
+      : { hasPrecondition: false as const };
+    dashboardEventBus.publish({
+      type: 'schedule.updated',
+      body: {
+        id: p.id,
+        // JSON `null` clear markers are event-only: merge-based consumers must
+        // drop the previous source when a condition is cleared or changes kind.
+        // Snapshot rows omit fields that do not apply.
+        patch: {
+          ...projection,
+          preconditionSource: projection.preconditionSource ?? null,
+          preconditionScript: projection.preconditionScript ?? null,
+          preconditionFilePath: projection.preconditionFilePath ?? null,
+        },
+      },
+    });
+  }
   jsonRes(res, 200, { ok: true, task: task ? composeScheduleRow(task) : undefined });
 });
 
 // Delete a scheduled task.
 ipcRoute('DELETE', '/api/schedules/:id', (_req, res, p) => {
-  jsonRes(res, 200, scheduler.removeTaskForDashboard(p.id));
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    jsonRes(res, 200, removeTaskWithPrecondition(p.id, cachedLarkAppId));
+  } catch (err) {
+    jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
@@ -4369,6 +4613,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    // Dashboard-created schedules default to this daemon process directory.
+    // Expose it read-only so the file-precondition UI can resolve relative
+    // paths accurately without changing schedule creation or persistence.
+    scheduleWorkingDir: process.cwd(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,
