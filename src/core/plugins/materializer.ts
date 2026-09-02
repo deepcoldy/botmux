@@ -71,6 +71,9 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
       : {}),
     ...(record.contributions?.service ? { service: [{ name: record.id }] } : {}),
   };
+  if (record.contributions?.cardActions) {
+    materialized.cardActions = record.contributions.cardActions;
+  }
   writeMaterialized(materialized);
   return materialized;
 }

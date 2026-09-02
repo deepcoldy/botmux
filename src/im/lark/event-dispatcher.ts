@@ -978,7 +978,7 @@ function cardActionKey(larkAppId: string, data: any): string {
   return `card.action.trigger:${larkAppId}:${JSON.stringify({
     messageId: cardActionMessageId(data),
     operator: data?.operator?.open_id,
-    action: value?.action ?? action?.option ?? action?.tag,
+    action: value?.action ?? action?.name ?? action?.option ?? action?.tag,
     // Feedback primary/reason buttons share an action name. Include their
     // semantic target so a rapid change of choice is not mistaken for a
     // duplicate in-flight click on the previous button.
@@ -1058,12 +1058,12 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   // fallback key: distinct clicks of the same button (e.g. toggling stream
   // on/off) legitimately repeat and must not be pinned for the whole TTL.
   if (eventId && !claimEventOnce(key)) {
-    logger.info(`[event-dedupe] duplicate card action ignored (claimed): ${key}`);
+    logger.info(`[event-dedupe] duplicate card action ignored (claimed): app=${larkAppId}`);
     return { toast: { type: 'info', content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)) } };
   }
 
   if (cardActionInFlight.has(key)) {
-    logger.info(`[event-dedupe] duplicate card action ignored while in-flight: ${key}`);
+    logger.info(`[event-dedupe] duplicate card action ignored while in-flight: app=${larkAppId}`);
     return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
@@ -1093,7 +1093,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       // A toast-only result can't be re-surfaced after we already ACKed with the
       // generic "后台处理中" toast: toasts ride the synchronous callback response,
       // and the message-update API only patches the card. Log rather than drop.
-      logger.warn(`[card-action] slow handler resolved to a toast-only result after ACK; not shown to user: ${JSON.stringify(result.toast)}`);
+      logger.warn('[card-action] slow handler resolved to a toast-only result after ACK; not shown to user');
       return;
     }
     return patchTimedOutCardActionResult(larkAppId, data, result)
@@ -1106,7 +1106,10 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const result = await Promise.race([work, timeout]);
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
-    logger.warn(`[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; ACKing first and continuing in background: ${key}`);
+    logger.warn(
+      `[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; `
+      + `ACKing first and continuing in background: app=${larkAppId}`,
+    );
     return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)) } };
   }
   return result;

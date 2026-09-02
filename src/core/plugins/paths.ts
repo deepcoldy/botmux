@@ -31,6 +31,10 @@ export function pluginMcpPrivatePath(pluginId: string): string {
   return join(pluginPrivateDir(pluginId), 'mcp.json');
 }
 
+export function pluginCardActionTokenPath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'card-actions.token');
+}
+
 export function pluginConfigPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'config.json');
 }

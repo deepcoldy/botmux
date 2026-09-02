@@ -179,20 +179,28 @@ export interface CardHandlerDeps {
  *     `user_id`, …) from `action.value`.
  */
 export interface CardActionData {
+  event_id?: string;
+  uuid?: string;
+  header?: { event_id?: string };
+  event?: { event_id?: string };
   operator?: {
     open_id?: string;
     /** Lark-verified union_id, present on card v2 callbacks where the tenant
      *  enables `with_union_id`. Absent when Lark doesn't carry it; callers
      *  fall back to `resolveUserUnionId` via `resolveCardOperatorUnionId`. */
     union_id?: string;
+    [key: string]: unknown;
   };
   action?: {
+    name?: string;
+    tag?: string;
     value?: Record<string, string>;
     option?: unknown;
     options?: unknown;
+    input_value?: unknown;
     form_value?: Record<string, unknown>;  // V2 form input values
   };
-  context?: { open_message_id?: string };
+  context?: { open_message_id?: string; [key: string]: unknown };
   open_message_id?: string;
 }
 

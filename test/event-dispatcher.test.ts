@@ -160,6 +160,9 @@ import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
+import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -7278,6 +7281,25 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
+  it('保持既有 Botmux 卡片动作行为不变', async () => {
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'builtin accepted' },
+    });
+    const data = {
+      event_id: 'evt-builtin',
+      action: { name: 'botmux_builtin_action', value: { action: 'botmux_builtin_action' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_builtin' },
+    };
+    const result = await capturedHandlers['card.action.trigger']({
+      ...data,
+    });
+
+    expect(result).toEqual({ toast: { type: 'success', content: 'builtin accepted' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledOnce();
+    expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
+  });
+
   it('returns a valid empty ACK when a fast card handler has no payload', async () => {
     handlers.handleCardAction.mockResolvedValue(undefined);
 
@@ -7321,25 +7343,79 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('returns a toast before a slow handler settles, then patches the card in background', async () => {
-    let release!: () => void;
-    const slow = new Promise(resolve => { release = () => resolve({ type: 'late-card' }); });
-    handlers.handleCardAction.mockReturnValue(slow as any);
+  it('为慢插件先 ACK 再更新原卡片', async () => {
+    const token = 'slow-fixture-token';
+    const logPath = `/tmp/botmux-card-action-slow-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'card', logPath, '2700',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`slow_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'slow-actions',
+        packageName: '@botmux-ai/plugin-slow-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/slow-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'slow-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.slow.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
 
-    vi.useFakeTimers();
-    const call = capturedHandlers['card.action.trigger']({
-      action: { value: { action: 'toggle_stream', root_id: 'root-slow' } },
-      operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_slow_card' },
-    });
-    await vi.advanceTimersByTimeAsync(2500);
-    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      const startedAt = Date.now();
+      const result = await capturedHandlers['card.action.trigger']({
+        event_id: 'evt-slow-plugin',
+        action: { name: 'submit', value: { action: 'example.slow.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_slow_card' },
+      });
+      expect(result).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
 
-    release();
-    await vi.runAllTimersAsync();
-    vi.useRealTimers();
-
-    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_slow_card', JSON.stringify({ type: 'late-card' }));
+      await vi.waitFor(() => {
+        expect(mockUpdateMessage).toHaveBeenCalledWith(
+          MY_APP_ID,
+          'om_slow_card',
+          JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+        );
+      }, { timeout: 2_000 });
+      expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
   });
 
   // Regression: browser-restart slow-fail visibility.
@@ -7410,23 +7486,96 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await first;
   });
 
-  it('dedupes a same-event_id redelivery that arrives AFTER the first copy completed', async () => {
-    handlers.handleCardAction.mockResolvedValue({ type: 'done-card' });
-    const event = {
-      event_id: 'evt-card-claim',
-      action: { value: { action: 'restart', root_id: 'root-claim' } },
+  it('按稳定 eventId 抑制重复业务投递', async () => {
+    const token = 'dedupe-fixture-token';
+    const logPath = `/tmp/botmux-card-action-dedupe-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'success', logPath, '0',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`dedupe_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'dedupe-actions',
+        packageName: '@botmux-ai/plugin-dedupe-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/dedupe-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'dedupe-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.dedupe.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
+      const event = {
+        event_id: 'evt-card-claim',
+        action: { value: { action: 'example.dedupe.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_claim_card' },
+      };
+
+      const first = await capturedHandlers['card.action.trigger'](event);
+      expect(first).toEqual({ toast: { type: 'success', content: 'accepted' } });
+      const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
+      expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const requests = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+      expect(requests).toHaveLength(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
+  });
+
+  it('服务与长连接恢复后无需重新注册业务 Handler', async () => {
+    vi.useFakeTimers();
+    const reconnectHandlers = makeHandlers();
+    reconnectHandlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', reconnectHandlers) as any;
+    expect(ws.start).toHaveBeenCalledTimes(1);
+    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ws.start).toHaveBeenCalledTimes(2);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-after-reconnect',
+      action: { value: { action: 'example.submit' } },
       operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_claim_card' },
-    };
-
-    const first = await capturedHandlers['card.action.trigger'](event);
-    expect(first).toEqual({ card: { type: 'raw', data: { type: 'done-card' } } });
-
-    // In-flight Set has already cleared in finally(); only the durable claim can
-    // still stop a redelivery from re-firing a non-idempotent action (restart).
-    const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
-    expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
-    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+      context: { open_message_id: 'om-reconnect' },
+    });
+    expect(result).toEqual({ toast: { type: 'success', content: 'accepted' } });
+    expect(reconnectHandlers.handleCardAction).toHaveBeenCalledOnce();
+    vi.useRealTimers();
   });
 
   it('does NOT durably dedupe distinct clicks without an event_id (legitimate repeat)', async () => {
