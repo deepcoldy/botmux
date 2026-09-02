@@ -58,5 +58,16 @@ describe('dispatch launch IPC signing contract', () => {
     expect(() => signDispatchLaunchIpcRequest({
       ...request, target: { ...target, ipcPort: 0 },
     })).toThrow('target descriptor');
+    expect(verifyDispatchLaunchIpcRequestSignature({
+      ...request, nonce: 'short', signature: 'X'.repeat(43),
+    })).toBe(false);
+    expect(verifyDispatchLaunchIpcRequestSignature({
+      ...request, target: { ...target, ipcPort: 0 }, signature: 'X'.repeat(43),
+    })).toBe(false);
+    expect(verifyDispatchLaunchIpcResponseSignature({
+      secret: request.secret, requestNonce: 'short', method: 'POST',
+      pathWithQuery: request.pathWithQuery, status: 99, body: '{}', target,
+      signature: 'X'.repeat(43),
+    })).toBe(false);
   });
 });

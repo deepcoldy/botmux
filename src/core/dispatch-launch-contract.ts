@@ -30,6 +30,16 @@ export const DISPATCH_LAUNCH_KICKOFF_LIMITS = {
   totalBytes: 72 * 1024,
 } as const;
 
+export const DISPATCH_LAUNCH_CONTROL_LIMITS = {
+  larkAppIdChars: 256,
+  identifierChars: 512,
+  callerUnionIdChars: 256,
+  modelChars: 512,
+  executableChars: 4096,
+  wrapperChars: 4096,
+  workingDirChars: 16 * 1024,
+} as const;
+
 export const DISPATCH_LAUNCH_ERROR_CODES = [
   'BAD_REQUEST',
   'PROTOCOL_UNSUPPORTED',
@@ -89,7 +99,6 @@ export interface DispatchLaunchKickoffPayloadV1 {
 
 export interface CanonicalDispatchLaunchKickoff {
   payload: DispatchLaunchKickoffPayloadV1;
-  canonicalJson: string;
   byteLength: number;
   digest: string;
 }
@@ -103,13 +112,13 @@ export interface DispatchLaunchPolicyV1 {
 }
 
 export interface DispatchLaunchIdentityV1 {
-  cliId: string;
+  cliId: 'codex';
   cliRuntimeDigest: string;
   executable: string;
   wrapperCli?: string;
-  backendType: string;
-  codexRpcInput: boolean;
-  existingAppServer: boolean;
+  backendType: 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx';
+  codexRpcInput: false;
+  existingAppServer: false;
   botConfigDigest: string;
   policyDigest: string;
 }
@@ -122,7 +131,8 @@ export interface DispatchLaunchPrepareRequestV1 {
     larkAppId: string;
     sessionId: string;
     turnId: string;
-    callerOpenId?: string;
+    /** Cross-app stable caller identity; source-app open_id is intentionally not transported. */
+    callerUnionId?: string;
   };
   targetLarkAppId: string;
   chatId: string;
@@ -159,8 +169,6 @@ export interface DispatchLaunchProofV1 {
   runtimeObserved: DispatchLaunchTurnFactV1 & {
     model: string;
     reasoningEffort?: CodexReasoningEffort;
-    /** Set only after the adapter's explicit alias/equivalence rules pass. */
-    equivalentToEffectiveOverride: true;
   };
 }
 
@@ -178,11 +186,10 @@ export const DISPATCH_LAUNCH_OPERATION_STATES = [
 
 export type DispatchLaunchOperationState = typeof DISPATCH_LAUNCH_OPERATION_STATES[number];
 
-export interface DispatchLaunchOperationV1 {
+interface DispatchLaunchOperationBaseV1 {
   schemaVersion: typeof DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION;
   dispatchId: string;
   owner: 'source' | 'target';
-  state: DispatchLaunchOperationState;
   sourceLarkAppId: string;
   sourceSessionId: string;
   sourceTurnId: string;
@@ -190,18 +197,67 @@ export interface DispatchLaunchOperationV1 {
   chatId: string;
   kickoff: CanonicalDispatchLaunchKickoff;
   requestedOverride: DispatchLaunchRequestedOverride;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+}
+
+type DispatchLaunchPreAdmissionOperationV1 = DispatchLaunchOperationBaseV1 & {
+  state: 'created' | 'preparing';
+};
+
+type DispatchLaunchPreparedOperationV1 = DispatchLaunchOperationBaseV1 & {
+  state: 'prepared';
+  effectiveOverride: DispatchLaunchEffectiveOverride;
+  launchIdentity: DispatchLaunchIdentityV1;
+};
+
+type DispatchLaunchStartingOperationV1 = DispatchLaunchOperationBaseV1 & {
+  state: 'starting';
+  effectiveOverride: DispatchLaunchEffectiveOverride;
+  launchIdentity: DispatchLaunchIdentityV1;
+  rootMessageId?: string;
+  targetSessionId?: string;
+  kickoffTurnId?: string;
+  workerGeneration?: number;
+};
+
+type DispatchLaunchLaunchedOperationV1 = DispatchLaunchOperationBaseV1 & {
+  effectiveOverride: DispatchLaunchEffectiveOverride;
+  launchIdentity: DispatchLaunchIdentityV1;
+  rootMessageId: string;
+  targetSessionId: string;
+  kickoffTurnId: string;
+  workerGeneration: number;
+};
+
+type DispatchLaunchAwaitingProofOperationV1 = DispatchLaunchLaunchedOperationV1 & {
+  state: 'awaiting_proof';
+};
+
+type DispatchLaunchSucceededOperationV1 = DispatchLaunchLaunchedOperationV1 & {
+  state: 'succeeded';
+  proof: DispatchLaunchProofV1;
+};
+
+type DispatchLaunchUnsuccessfulOperationV1 = DispatchLaunchOperationBaseV1 & {
+  state: 'failed' | 'cancelled' | 'delivery_unknown';
+  errorCode: DispatchLaunchErrorCode;
   effectiveOverride?: DispatchLaunchEffectiveOverride;
   launchIdentity?: DispatchLaunchIdentityV1;
   rootMessageId?: string;
   targetSessionId?: string;
   kickoffTurnId?: string;
   workerGeneration?: number;
-  proof?: DispatchLaunchProofV1;
-  errorCode?: DispatchLaunchErrorCode;
-  createdAt: string;
-  updatedAt: string;
-  expiresAt: string;
-}
+};
+
+export type DispatchLaunchOperationV1 =
+  | DispatchLaunchPreAdmissionOperationV1
+  | DispatchLaunchPreparedOperationV1
+  | DispatchLaunchStartingOperationV1
+  | DispatchLaunchAwaitingProofOperationV1
+  | DispatchLaunchSucceededOperationV1
+  | DispatchLaunchUnsuccessfulOperationV1;
 
 export interface DispatchLaunchAdmissionReceiptV1 {
   schemaVersion: typeof DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION;
@@ -210,7 +266,8 @@ export interface DispatchLaunchAdmissionReceiptV1 {
   sourceLarkAppId: string;
   sourceSessionId: string;
   sourceTurnId: string;
-  callerOpenId?: string;
+  /** Cross-app stable caller identity; never substitute an app-scoped open_id. */
+  callerUnionId?: string;
   chatId: string;
   targetLarkAppId: string;
   policyDigest: string;
@@ -234,19 +291,30 @@ export interface DispatchLaunchOverrideSnapshotV1 {
 }
 
 const nonEmptyString = z.string().trim().min(1);
-const larkAppIdSchema = nonEmptyString.regex(/^cli_[A-Za-z0-9]+$/);
+const identifierSchema = nonEmptyString
+  .max(DISPATCH_LAUNCH_CONTROL_LIMITS.identifierChars)
+  .regex(/^[A-Za-z0-9_.:-]+$/, 'must be a protocol-safe identifier');
+const controlledString = (max: number) => nonEmptyString.max(max)
+  .refine(value => !/[\u0000-\u001f\u007f]/.test(value), 'must not contain control characters');
+const larkAppIdSchema = nonEmptyString
+  .max(DISPATCH_LAUNCH_CONTROL_LIMITS.larkAppIdChars)
+  .regex(/^cli_[A-Za-z0-9]+$/);
 const dispatchIdSchema = z.string().regex(DISPATCH_LAUNCH_ID_RE);
 const digestSchema = z.string().regex(DISPATCH_LAUNCH_DIGEST_RE);
 const timestampSchema = z.string().datetime({ offset: true });
 const reasoningEffortSchema = z.enum(CODEX_REASONING_EFFORTS);
+const modelSchema = controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.modelChars);
 
 const requestedOverrideSchema = z.object({
-  model: nonEmptyString.optional(),
+  model: modelSchema.optional(),
   reasoningEffort: reasoningEffortSchema.optional(),
-}).strict();
+}).strict().refine(
+  value => value.model !== undefined || value.reasoningEffort !== undefined,
+  'at least one launch override is required',
+);
 
 const effectiveOverrideSchema = z.object({
-  model: nonEmptyString,
+  model: modelSchema,
   reasoningEffort: reasoningEffortSchema.optional(),
 }).strict();
 
@@ -262,36 +330,34 @@ const kickoffPayloadSchema = z.object({
 
 const canonicalKickoffSchema = z.object({
   payload: kickoffPayloadSchema,
-  canonicalJson: z.string(),
   byteLength: z.number().int().nonnegative().max(DISPATCH_LAUNCH_KICKOFF_LIMITS.totalBytes),
   digest: digestSchema,
 }).strict();
 
 const launchIdentitySchema = z.object({
-  cliId: nonEmptyString,
+  cliId: z.literal('codex'),
   cliRuntimeDigest: digestSchema,
-  executable: nonEmptyString,
-  wrapperCli: nonEmptyString.optional(),
-  backendType: nonEmptyString,
-  codexRpcInput: z.boolean(),
-  existingAppServer: z.boolean(),
+  executable: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.executableChars),
+  wrapperCli: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.wrapperChars).optional(),
+  backendType: z.enum(['pty', 'tmux', 'herdr', 'zellij', 'zmx']),
+  codexRpcInput: z.literal(false),
+  existingAppServer: z.literal(false),
   botConfigDigest: digestSchema,
   policyDigest: digestSchema,
 }).strict();
 
 const turnFactSchema = z.object({
-  sessionId: nonEmptyString,
-  kickoffTurnId: nonEmptyString,
-  workerGeneration: z.number().int().nonnegative(),
+  sessionId: identifierSchema,
+  kickoffTurnId: identifierSchema,
+  workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   observedAt: timestampSchema,
 }).strict();
 
 const proofSchema = z.object({
   inputCommitted: turnFactSchema,
   runtimeObserved: turnFactSchema.extend({
-    model: nonEmptyString,
+    model: modelSchema,
     reasoningEffort: reasoningEffortSchema.optional(),
-    equivalentToEffectiveOverride: z.literal(true),
   }).strict(),
 }).strict().superRefine((value, context) => {
   const left = value.inputCommitted;
@@ -312,12 +378,15 @@ export const DispatchLaunchPrepareRequestSchema = z.object({
   dispatchId: dispatchIdSchema,
   source: z.object({
     larkAppId: larkAppIdSchema,
-    sessionId: nonEmptyString,
-    turnId: nonEmptyString,
-    callerOpenId: nonEmptyString.optional(),
+    sessionId: identifierSchema,
+    turnId: identifierSchema,
+    callerUnionId: nonEmptyString
+      .max(DISPATCH_LAUNCH_CONTROL_LIMITS.callerUnionIdChars)
+      .regex(/^on_[A-Za-z0-9]+$/, 'must be a Lark union_id')
+      .optional(),
   }).strict(),
   targetLarkAppId: larkAppIdSchema,
-  chatId: nonEmptyString,
+  chatId: identifierSchema,
   kickoff: canonicalKickoffSchema,
   requestedOverride: requestedOverrideSchema,
   expiresAt: timestampSchema,
@@ -353,40 +422,95 @@ export const DispatchLaunchOperationSchema = z.object({
   owner: z.enum(['source', 'target']),
   state: z.enum(DISPATCH_LAUNCH_OPERATION_STATES),
   sourceLarkAppId: larkAppIdSchema,
-  sourceSessionId: nonEmptyString,
-  sourceTurnId: nonEmptyString,
+  sourceSessionId: identifierSchema,
+  sourceTurnId: identifierSchema,
   targetLarkAppId: larkAppIdSchema,
-  chatId: nonEmptyString,
+  chatId: identifierSchema,
   kickoff: canonicalKickoffSchema,
   requestedOverride: requestedOverrideSchema,
   effectiveOverride: effectiveOverrideSchema.optional(),
   launchIdentity: launchIdentitySchema.optional(),
-  rootMessageId: nonEmptyString.optional(),
-  targetSessionId: nonEmptyString.optional(),
-  kickoffTurnId: nonEmptyString.optional(),
-  workerGeneration: z.number().int().nonnegative().optional(),
+  rootMessageId: identifierSchema.optional(),
+  targetSessionId: identifierSchema.optional(),
+  kickoffTurnId: identifierSchema.optional(),
+  workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   proof: proofSchema.optional(),
   errorCode: z.enum(DISPATCH_LAUNCH_ERROR_CODES).optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
   expiresAt: timestampSchema,
-}).strict();
+}).strict().superRefine((value, context) => {
+  const requireField = (field: keyof typeof value): void => {
+    if (value[field] === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is required in ${value.state}` });
+    }
+  };
+  const forbidField = (field: keyof typeof value): void => {
+    if (value[field] !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is forbidden in ${value.state}` });
+    }
+  };
+  const launchFields = ['effectiveOverride', 'launchIdentity'] as const;
+  const runtimeFields = ['rootMessageId', 'targetSessionId', 'kickoffTurnId', 'workerGeneration'] as const;
+  if ((value.effectiveOverride === undefined) !== (value.launchIdentity === undefined)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'effectiveOverride and launchIdentity must be present or absent together',
+    });
+  }
+  if (value.targetSessionId !== undefined && value.rootMessageId === undefined) requireField('rootMessageId');
+  if (value.kickoffTurnId !== undefined && value.targetSessionId === undefined) requireField('targetSessionId');
+  if (value.workerGeneration !== undefined && value.kickoffTurnId === undefined) requireField('kickoffTurnId');
+
+  if (value.state === 'created' || value.state === 'preparing') {
+    for (const field of [...launchFields, ...runtimeFields, 'proof', 'errorCode'] as const) forbidField(field);
+  } else if (value.state === 'prepared') {
+    for (const field of launchFields) requireField(field);
+    for (const field of [...runtimeFields, 'proof', 'errorCode'] as const) forbidField(field);
+  } else if (value.state === 'starting') {
+    for (const field of launchFields) requireField(field);
+    forbidField('proof');
+    forbidField('errorCode');
+  } else if (value.state === 'awaiting_proof' || value.state === 'succeeded') {
+    for (const field of [...launchFields, ...runtimeFields] as const) requireField(field);
+    if (value.state === 'awaiting_proof') forbidField('proof');
+    else requireField('proof');
+    forbidField('errorCode');
+  } else {
+    forbidField('proof');
+    if (value.state === 'cancelled' && value.errorCode !== 'CANCELLED') {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'cancelled requires CANCELLED' });
+    }
+    if (value.state === 'delivery_unknown' && value.errorCode !== 'DELIVERY_UNKNOWN') {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'delivery_unknown requires DELIVERY_UNKNOWN' });
+    }
+    if (value.state === 'failed') {
+      requireField('errorCode');
+      if (value.errorCode === 'CANCELLED' || value.errorCode === 'DELIVERY_UNKNOWN') {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'failed has a contradictory terminal error code' });
+      }
+    }
+  }
+});
 
 export const DispatchLaunchAdmissionReceiptSchema = z.object({
   schemaVersion: z.literal(DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION),
   dispatchId: dispatchIdSchema,
   state: z.enum(['authorized', 'committed', 'released']),
   sourceLarkAppId: larkAppIdSchema,
-  sourceSessionId: nonEmptyString,
-  sourceTurnId: nonEmptyString,
-  callerOpenId: nonEmptyString.optional(),
-  chatId: nonEmptyString,
+  sourceSessionId: identifierSchema,
+  sourceTurnId: identifierSchema,
+  callerUnionId: nonEmptyString
+    .max(DISPATCH_LAUNCH_CONTROL_LIMITS.callerUnionIdChars)
+    .regex(/^on_[A-Za-z0-9]+$/, 'must be a Lark union_id')
+    .optional(),
+  chatId: identifierSchema,
   targetLarkAppId: larkAppIdSchema,
   policyDigest: digestSchema,
-  talkAuthorizationReceiptId: nonEmptyString,
-  quotaReceiptId: nonEmptyString,
-  workingDir: nonEmptyString,
-  capacityReservationId: nonEmptyString,
+  talkAuthorizationReceiptId: identifierSchema,
+  quotaReceiptId: identifierSchema,
+  workingDir: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.workingDirChars),
+  capacityReservationId: identifierSchema,
   createdAt: timestampSchema,
   committedAt: timestampSchema.optional(),
   releasedAt: timestampSchema.optional(),
@@ -467,7 +591,6 @@ export function canonicalizeDispatchLaunchKickoff(
   }
   return {
     payload,
-    canonicalJson: encoded,
     byteLength: encodedBytes,
     digest: `sha256:${createHash('sha256').update(encoded, 'utf8').digest('hex')}`,
   };
@@ -584,8 +707,7 @@ export function parseDispatchLaunchOperation(raw: unknown): DispatchLaunchOperat
     sourceDisplay: parsed.kickoff.payload.sourceDisplay,
     targetLarkAppId: parsed.kickoff.payload.targetLarkAppId,
   });
-  if (recomputed.canonicalJson !== parsed.kickoff.canonicalJson
-      || recomputed.byteLength !== parsed.kickoff.byteLength
+  if (recomputed.byteLength !== parsed.kickoff.byteLength
       || recomputed.digest !== parsed.kickoff.digest) {
     throw new Error('invalid dispatch launch operation: kickoff canonicalization mismatch');
   }
@@ -595,25 +717,20 @@ export function parseDispatchLaunchOperation(raw: unknown): DispatchLaunchOperat
   if (Date.parse(parsed.expiresAt) <= Date.parse(parsed.createdAt)) {
     throw new Error('invalid dispatch launch operation: expiresAt must follow createdAt');
   }
-  if (parsed.state === 'succeeded' && parsed.proof === undefined) {
-    throw new Error('invalid dispatch launch operation: succeeded operation requires turn-bound proof');
-  }
   if (parsed.state === 'succeeded') {
     const fact = parsed.proof!.inputCommitted;
-    if (parsed.targetSessionId === undefined
-        || parsed.kickoffTurnId === undefined
-        || parsed.workerGeneration === undefined
-        || parsed.effectiveOverride === undefined) {
-      throw new Error('invalid dispatch launch operation: succeeded operation requires launch identity fields');
-    }
     if (fact.sessionId !== parsed.targetSessionId
         || fact.kickoffTurnId !== parsed.kickoffTurnId
         || fact.workerGeneration !== parsed.workerGeneration) {
       throw new Error('invalid dispatch launch operation: proof does not match operation launch identity');
     }
+    if (!dispatchLaunchTupleEquivalent(parsed.proof!.runtimeObserved, parsed.effectiveOverride!)) {
+      throw new Error('invalid dispatch launch operation: runtime proof does not match effective override');
+    }
   }
-  if ((parsed.state === 'failed' || parsed.state === 'delivery_unknown') && parsed.errorCode === undefined) {
-    throw new Error('invalid dispatch launch operation: failed operation requires an error code');
+  if (parsed.effectiveOverride !== undefined
+      && !dispatchLaunchRequestedOverrideSatisfied(parsed.requestedOverride, parsed.effectiveOverride)) {
+    throw new Error('invalid dispatch launch operation: effective override does not satisfy requested override');
   }
   return parsed;
 }
@@ -628,7 +745,6 @@ export function parseDispatchLaunchPrepareRequest(raw: unknown): DispatchLaunchP
     targetLarkAppId: parsed.kickoff.payload.targetLarkAppId,
   });
   if (recomputed.digest !== parsed.kickoff.digest
-      || recomputed.canonicalJson !== parsed.kickoff.canonicalJson
       || recomputed.byteLength !== parsed.kickoff.byteLength) {
     throw new Error('invalid dispatch launch prepare request: kickoff canonicalization mismatch');
   }
@@ -666,4 +782,26 @@ export function parseDispatchLaunchOverrideSnapshot(raw: unknown): DispatchLaunc
     raw,
     'dispatch launch override snapshot',
   );
+}
+
+/**
+ * v1 recognizes no model aliases: equivalence is deliberately exact after
+ * trimming. An adapter may add an explicit canonical alias table in PR 3.
+ */
+export function dispatchLaunchTupleEquivalent(
+  observed: { model: string; reasoningEffort?: CodexReasoningEffort },
+  effective: DispatchLaunchEffectiveOverride,
+): boolean {
+  if (observed.model.trim() !== effective.model.trim()) return false;
+  return observed.reasoningEffort === effective.reasoningEffort;
+}
+
+export function dispatchLaunchRequestedOverrideSatisfied(
+  requested: DispatchLaunchRequestedOverride,
+  effective: DispatchLaunchEffectiveOverride,
+): boolean {
+  if (requested.model !== undefined && requested.model.trim() !== effective.model.trim()) return false;
+  if (requested.reasoningEffort !== undefined
+      && requested.reasoningEffort !== effective.reasoningEffort) return false;
+  return true;
 }

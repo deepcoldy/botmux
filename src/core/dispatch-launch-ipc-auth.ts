@@ -86,13 +86,21 @@ export function signDispatchLaunchIpcRequest(input: DispatchLaunchIpcSignInput):
     .digest('base64url');
 }
 
-/** Cryptographic check only; PR 2's route must additionally enforce time window and nonce replay state. */
+/**
+ * Total cryptographic guard: malformed wire input is a normal false result,
+ * never an exception. PR 2's route must additionally enforce timestamp window
+ * and nonce replay state.
+ */
 export function verifyDispatchLaunchIpcRequestSignature(input: DispatchLaunchIpcSignInput & {
   signature: string | undefined;
 }): boolean {
   if (!input.signature) return false;
-  const expected = signDispatchLaunchIpcRequest(input);
-  return wireEqual(input.signature, expected);
+  try {
+    const expected = signDispatchLaunchIpcRequest(input);
+    return wireEqual(input.signature, expected);
+  } catch {
+    return false;
+  }
 }
 
 export function canonicalDispatchLaunchIpcResponseMaterial(
@@ -128,6 +136,10 @@ export function verifyDispatchLaunchIpcResponseSignature(input: DispatchLaunchIp
   signature: string | undefined;
 }): boolean {
   if (!input.signature) return false;
-  const expected = signDispatchLaunchIpcResponse(input);
-  return wireEqual(input.signature, expected);
+  try {
+    const expected = signDispatchLaunchIpcResponse(input);
+    return wireEqual(input.signature, expected);
+  } catch {
+    return false;
+  }
 }

@@ -88,7 +88,10 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
     const repeatableKey = REPEATABLE_VALUE_FLAGS.get(flag);
     if (singletonKey || repeatableKey) {
       const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
-      if (optionValue === undefined || optionValue === '' || (equals < 0 && optionValue.startsWith('-'))) {
+      // Preserve argValue's historical treatment of dash-prefixed values. A
+      // quoted Markdown list (`--brief '- item'`) and values such as `-x` are
+      // data, not proof that this option was omitted.
+      if (optionValue === undefined || optionValue === '') {
         return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
       }
       if (equals < 0) index += 1;

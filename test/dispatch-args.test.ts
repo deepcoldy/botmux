@@ -42,6 +42,15 @@ describe('parseDispatchArgs', () => {
     expect(result).toMatchObject({ ok: true, value: { brief: '  keep me  ' } });
   });
 
+  it('preserves legacy dash-prefixed values in space-separated form', () => {
+    expect(parseDispatchArgs(['--brief', '- item one']))
+      .toMatchObject({ ok: true, value: { brief: '- item one' } });
+    expect(parseDispatchArgs(['--brief', '-x']))
+      .toMatchObject({ ok: true, value: { brief: '-x' } });
+    expect(parseDispatchArgs(['--title', '-x']))
+      .toMatchObject({ ok: true, value: { title: '-x' } });
+  });
+
   it.each([
     ['--model', ['--model', 'gpt-5']],
     ['--reasoning-effort', ['--reasoning-effort', 'high']],
