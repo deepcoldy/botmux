@@ -21758,7 +21758,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
-  sessionStore.init(cfg.larkAppId);
+  sessionStore.init(cfg.larkAppId, {
+    occupancy: { bootId: getDaemonBootId(), pid: process.pid },
+  });
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -22281,19 +22283,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /healthz AND the public control routes (trigger/result/insight) return 503,
   // so riff never triggers into a racing durable restore (codex P1).
 
-  // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-store load under the store's cross-process write exclusion
-  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
-  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
-  // either observes this descriptor and delegates, or it already holds the
-  // write exclusion; in the latter case this load waits and sees its atomic
-  // mutation. Never load a stale cache in an unadvertised startup window.
+  // Publish the IPC descriptor after bind, then first-load the session store
+  // under BEGIN IMMEDIATE (a plain SELECT would not wait for an in-flight
+  // offline writer). Occupancy is claimed in that same load transaction —
+  // the descriptor is discovery only. An offline writer either sees the
+  // lease and yields, or already holds the write exclusion; in the latter
+  // case this load waits and sees its atomic mutation.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   sessionStore.listSessions();
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    try {
+      sessionStore.renewOccupancyLease({ bootId: getDaemonBootId(), pid: process.pid });
+    } catch { /* best effort — next tick retries */ }
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -23202,6 +23206,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
@@ -23415,6 +23420,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and
