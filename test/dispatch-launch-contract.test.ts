@@ -209,7 +209,7 @@ describe('dispatch launch versioned codecs', () => {
   });
 
   it('requires same-turn, same-generation proof before success', () => {
-    expect(() => parseDispatchLaunchOperation({ ...operation(), state: 'succeeded' })).toThrow('required in succeeded');
+    expect(() => parseDispatchLaunchOperation({ ...operation(), state: 'succeeded' })).toThrow('Required');
     const mismatched = {
       ...operation(),
       state: 'succeeded',
@@ -328,19 +328,19 @@ describe('dispatch launch versioned codecs', () => {
     expect(parseDispatchLaunchOperation({ ...common, state: 'created' }).state).toBe('created');
     expect(() => parseDispatchLaunchOperation({
       ...common, state: 'created', effectiveOverride: prepared.effectiveOverride,
-    })).toThrow('forbidden in created');
+    })).toThrow('Unrecognized key');
     expect(() => parseDispatchLaunchOperation({ ...common, state: 'prepared' }))
-      .toThrow('required in prepared');
+      .toThrow('Required');
     expect(() => parseDispatchLaunchOperation({
       ...prepared, state: 'prepared', rootMessageId: 'root',
-    })).toThrow('forbidden in prepared');
+    })).toThrow('Unrecognized key');
     expect(() => parseDispatchLaunchOperation({ ...common, state: 'cancelled', errorCode: 'BAD_REQUEST' }))
-      .toThrow('cancelled requires CANCELLED');
+      .toThrow('expected \"CANCELLED\"');
     expect(parseDispatchLaunchOperation({ ...common, state: 'cancelled', errorCode: 'CANCELLED' }).state)
       .toBe('cancelled');
     expect(() => parseDispatchLaunchOperation({
       ...common, state: 'delivery_unknown', errorCode: 'INTERNAL_ERROR',
-    })).toThrow('delivery_unknown requires DELIVERY_UNKNOWN');
+    })).toThrow('expected \"DELIVERY_UNKNOWN\"');
     expect(() => parseDispatchLaunchOperation({ ...common, state: 'failed', errorCode: 'CANCELLED' }))
       .toThrow('contradictory terminal error code');
     expect(() => parseDispatchLaunchOperation({
@@ -363,6 +363,27 @@ describe('dispatch launch versioned codecs', () => {
     expect(() => parseDispatchLaunchPrepareRequest({
       ...request, source: { larkAppId: 'cli_source', sessionId: 's', turnId: 't', callerOpenId: 'ou_user' },
     })).toThrow('Unrecognized key');
+  });
+
+  it('rejects prepare payload tampering and target identity mismatch', () => {
+    const base = operation();
+    const request = {
+      schemaVersion: 1, protocol: 'v1', dispatchId: base.dispatchId,
+      source: { larkAppId: 'cli_source', sessionId: 's', turnId: 't' },
+      targetLarkAppId: 'cli_target', chatId: 'oc_chat', kickoff: base.kickoff,
+      requestedOverride: base.requestedOverride, expiresAt: LATER,
+    };
+    expect(() => parseDispatchLaunchPrepareRequest({
+      ...request,
+      kickoff: {
+        ...request.kickoff,
+        payload: { ...request.kickoff.payload, brief: 'EVIL INJECTED BRIEF' },
+      },
+    })).toThrow('kickoff canonicalization mismatch');
+    expect(() => parseDispatchLaunchPrepareRequest({
+      ...request,
+      targetLarkAppId: 'cli_other',
+    })).toThrow('target identity mismatch');
   });
 
   it('validates prepare target binding, admission settlement and fork provenance', () => {
@@ -388,6 +409,15 @@ describe('dispatch launch versioned codecs', () => {
       talkAuthorizationReceiptId: 'talk', quotaReceiptId: 'quota', workingDir: '/repo',
       capacityReservationId: 'slot', createdAt: NOW,
     })).toThrow('committedAt is required');
+    expect(() => parseDispatchLaunchAdmissionReceipt({
+      schemaVersion: DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION,
+      dispatchId: base.dispatchId,
+      state: 'authorized',
+      sourceLarkAppId: 'cli_source', sourceSessionId: 's', sourceTurnId: 't',
+      chatId: 'oc_chat', targetLarkAppId: 'cli_target', policyDigest: SHA,
+      talkAuthorizationReceiptId: 'talk', quotaReceiptId: 'quota', workingDir: '/repo',
+      capacityReservationId: 'slot', createdAt: NOW, committedAt: LATER,
+    })).toThrow('authorized receipt must be unsettled');
 
     expect(() => parseDispatchLaunchOverrideSnapshot({
       schemaVersion: DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION,

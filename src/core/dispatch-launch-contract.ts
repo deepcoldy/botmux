@@ -416,11 +416,10 @@ export const DispatchLaunchPolicySchema = z.object({
   allowedReasoningEfforts: z.array(reasoningEffortSchema).max(CODEX_REASONING_EFFORTS.length),
 }).strict();
 
-export const DispatchLaunchOperationSchema = z.object({
+const dispatchLaunchOperationBaseShape = {
   schemaVersion: z.literal(DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION),
   dispatchId: dispatchIdSchema,
   owner: z.enum(['source', 'target']),
-  state: z.enum(DISPATCH_LAUNCH_OPERATION_STATES),
   sourceLarkAppId: larkAppIdSchema,
   sourceSessionId: identifierSchema,
   sourceTurnId: identifierSchema,
@@ -428,68 +427,128 @@ export const DispatchLaunchOperationSchema = z.object({
   chatId: identifierSchema,
   kickoff: canonicalKickoffSchema,
   requestedOverride: requestedOverrideSchema,
+  createdAt: timestampSchema,
+  updatedAt: timestampSchema,
+  expiresAt: timestampSchema,
+} as const;
+
+const dispatchLaunchFieldsShape = {
+  effectiveOverride: effectiveOverrideSchema,
+  launchIdentity: launchIdentitySchema,
+} as const;
+
+const dispatchLaunchRuntimeFieldsShape = {
+  rootMessageId: identifierSchema,
+  targetSessionId: identifierSchema,
+  kickoffTurnId: identifierSchema,
+  workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+} as const;
+
+const dispatchLaunchOptionalTerminalFieldsShape = {
   effectiveOverride: effectiveOverrideSchema.optional(),
   launchIdentity: launchIdentitySchema.optional(),
   rootMessageId: identifierSchema.optional(),
   targetSessionId: identifierSchema.optional(),
   kickoffTurnId: identifierSchema.optional(),
   workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
-  proof: proofSchema.optional(),
-  errorCode: z.enum(DISPATCH_LAUNCH_ERROR_CODES).optional(),
-  createdAt: timestampSchema,
-  updatedAt: timestampSchema,
-  expiresAt: timestampSchema,
-}).strict().superRefine((value, context) => {
-  const requireField = (field: keyof typeof value): void => {
-    if (value[field] === undefined) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is required in ${value.state}` });
-    }
-  };
-  const forbidField = (field: keyof typeof value): void => {
-    if (value[field] !== undefined) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is forbidden in ${value.state}` });
-    }
-  };
-  const launchFields = ['effectiveOverride', 'launchIdentity'] as const;
-  const runtimeFields = ['rootMessageId', 'targetSessionId', 'kickoffTurnId', 'workerGeneration'] as const;
-  if ((value.effectiveOverride === undefined) !== (value.launchIdentity === undefined)) {
+} as const;
+
+const dispatchLaunchCreatedSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('created'),
+}).strict();
+
+const dispatchLaunchPreparingSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('preparing'),
+}).strict();
+
+const dispatchLaunchPreparedSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('prepared'),
+  ...dispatchLaunchFieldsShape,
+}).strict();
+
+const dispatchLaunchStartingSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('starting'),
+  ...dispatchLaunchFieldsShape,
+  rootMessageId: identifierSchema.optional(),
+  targetSessionId: identifierSchema.optional(),
+  kickoffTurnId: identifierSchema.optional(),
+  workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+}).strict();
+
+const dispatchLaunchAwaitingProofSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('awaiting_proof'),
+  ...dispatchLaunchFieldsShape,
+  ...dispatchLaunchRuntimeFieldsShape,
+}).strict();
+
+const dispatchLaunchSucceededSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('succeeded'),
+  ...dispatchLaunchFieldsShape,
+  ...dispatchLaunchRuntimeFieldsShape,
+  proof: proofSchema,
+}).strict();
+
+const dispatchLaunchFailedSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('failed'),
+  errorCode: z.enum(DISPATCH_LAUNCH_ERROR_CODES),
+  ...dispatchLaunchOptionalTerminalFieldsShape,
+}).strict();
+
+const dispatchLaunchCancelledSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('cancelled'),
+  errorCode: z.literal('CANCELLED'),
+  ...dispatchLaunchOptionalTerminalFieldsShape,
+}).strict();
+
+const dispatchLaunchDeliveryUnknownSchema = z.object({
+  ...dispatchLaunchOperationBaseShape,
+  state: z.literal('delivery_unknown'),
+  errorCode: z.literal('DELIVERY_UNKNOWN'),
+  ...dispatchLaunchOptionalTerminalFieldsShape,
+}).strict();
+
+export const DispatchLaunchOperationSchema = z.discriminatedUnion('state', [
+  dispatchLaunchCreatedSchema,
+  dispatchLaunchPreparingSchema,
+  dispatchLaunchPreparedSchema,
+  dispatchLaunchStartingSchema,
+  dispatchLaunchAwaitingProofSchema,
+  dispatchLaunchSucceededSchema,
+  dispatchLaunchFailedSchema,
+  dispatchLaunchCancelledSchema,
+  dispatchLaunchDeliveryUnknownSchema,
+]).superRefine((value, context) => {
+  const effectiveOverride = 'effectiveOverride' in value ? value.effectiveOverride : undefined;
+  const launchIdentity = 'launchIdentity' in value ? value.launchIdentity : undefined;
+  if ((effectiveOverride === undefined) !== (launchIdentity === undefined)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'effectiveOverride and launchIdentity must be present or absent together',
     });
   }
-  if (value.targetSessionId !== undefined && value.rootMessageId === undefined) requireField('rootMessageId');
-  if (value.kickoffTurnId !== undefined && value.targetSessionId === undefined) requireField('targetSessionId');
-  if (value.workerGeneration !== undefined && value.kickoffTurnId === undefined) requireField('kickoffTurnId');
-
-  if (value.state === 'created' || value.state === 'preparing') {
-    for (const field of [...launchFields, ...runtimeFields, 'proof', 'errorCode'] as const) forbidField(field);
-  } else if (value.state === 'prepared') {
-    for (const field of launchFields) requireField(field);
-    for (const field of [...runtimeFields, 'proof', 'errorCode'] as const) forbidField(field);
-  } else if (value.state === 'starting') {
-    for (const field of launchFields) requireField(field);
-    forbidField('proof');
-    forbidField('errorCode');
-  } else if (value.state === 'awaiting_proof' || value.state === 'succeeded') {
-    for (const field of [...launchFields, ...runtimeFields] as const) requireField(field);
-    if (value.state === 'awaiting_proof') forbidField('proof');
-    else requireField('proof');
-    forbidField('errorCode');
-  } else {
-    forbidField('proof');
-    if (value.state === 'cancelled' && value.errorCode !== 'CANCELLED') {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'cancelled requires CANCELLED' });
-    }
-    if (value.state === 'delivery_unknown' && value.errorCode !== 'DELIVERY_UNKNOWN') {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'delivery_unknown requires DELIVERY_UNKNOWN' });
-    }
-    if (value.state === 'failed') {
-      requireField('errorCode');
-      if (value.errorCode === 'CANCELLED' || value.errorCode === 'DELIVERY_UNKNOWN') {
-        context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'failed has a contradictory terminal error code' });
-      }
-    }
+  if ('targetSessionId' in value && value.targetSessionId !== undefined
+      && (!('rootMessageId' in value) || value.rootMessageId === undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['rootMessageId'], message: 'rootMessageId is required before targetSessionId' });
+  }
+  if ('kickoffTurnId' in value && value.kickoffTurnId !== undefined
+      && (!('targetSessionId' in value) || value.targetSessionId === undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['targetSessionId'], message: 'targetSessionId is required before kickoffTurnId' });
+  }
+  if ('workerGeneration' in value && value.workerGeneration !== undefined
+      && (!('kickoffTurnId' in value) || value.kickoffTurnId === undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['kickoffTurnId'], message: 'kickoffTurnId is required before workerGeneration' });
+  }
+  if (value.state === 'failed'
+      && (value.errorCode === 'CANCELLED' || value.errorCode === 'DELIVERY_UNKNOWN')) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['errorCode'], message: 'failed has a contradictory terminal error code' });
   }
 });
 
@@ -728,8 +787,9 @@ export function parseDispatchLaunchOperation(raw: unknown): DispatchLaunchOperat
       throw new Error('invalid dispatch launch operation: runtime proof does not match effective override');
     }
   }
-  if (parsed.effectiveOverride !== undefined
-      && !dispatchLaunchRequestedOverrideSatisfied(parsed.requestedOverride, parsed.effectiveOverride)) {
+  const effectiveOverride = 'effectiveOverride' in parsed ? parsed.effectiveOverride : undefined;
+  if (effectiveOverride !== undefined
+      && !dispatchLaunchRequestedOverrideSatisfied(parsed.requestedOverride, effectiveOverride)) {
     throw new Error('invalid dispatch launch operation: effective override does not satisfy requested override');
   }
   return parsed;
