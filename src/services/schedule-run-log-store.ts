@@ -27,6 +27,13 @@ export const MAX_SCHEDULE_RUN_LOG_ERROR_BYTES = 2 * 1024;
 export type ScheduleRunTrigger = 'scheduler' | 'dashboard';
 export type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
 export type ScheduleRunPrecondition = 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
+export type ScheduleRunTargetOutcome = 'model_dispatched' | 'error';
+
+export interface ScheduleRunTargetResult {
+  chatId: string;
+  outcome: ScheduleRunTargetOutcome;
+  error?: string;
+}
 
 export interface ScheduleRunLogEntry {
   id: string;
@@ -41,6 +48,8 @@ export interface ScheduleRunLogEntry {
   additionalPrompt: boolean;
   errorCode?: string;
   error?: string;
+  /** Per-chat dispatch results for multi-chat tasks. Absent on legacy records. */
+  targetResults?: ScheduleRunTargetResult[];
 }
 
 export interface ScheduleRunLogQueryOptions {
@@ -69,6 +78,7 @@ const PRECONDITIONS = new Set<ScheduleRunPrecondition>([
   'skipped',
   'error',
 ]);
+const TARGET_OUTCOMES = new Set<ScheduleRunTargetOutcome>(['model_dispatched', 'error']);
 
 function assertNonEmpty(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -105,6 +115,32 @@ function normalizeOffset(value: unknown): number {
   const number = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(number)) return 0;
   return Math.max(0, Math.floor(number));
+}
+
+function projectTargetResults(value: unknown): ScheduleRunTargetResult[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) return null;
+
+  const results: ScheduleRunTargetResult[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const raw = item as Record<string, unknown>;
+    if (
+      typeof raw.chatId !== 'string' || raw.chatId.length === 0 ||
+      !TARGET_OUTCOMES.has(raw.outcome as ScheduleRunTargetOutcome) ||
+      (raw.error !== undefined && typeof raw.error !== 'string')
+    ) {
+      return null;
+    }
+    results.push({
+      chatId: raw.chatId,
+      outcome: raw.outcome as ScheduleRunTargetOutcome,
+      ...(raw.error !== undefined
+        ? { error: truncateUtf8(raw.error, MAX_SCHEDULE_RUN_LOG_ERROR_BYTES) }
+        : {}),
+    });
+  }
+  return results;
 }
 
 /** `<BOT_HOME>/schedule-runs`, kept private to the owning bot. */
@@ -155,6 +191,7 @@ function assertRegularFile(path: string): boolean {
 function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEntry | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
+  const targetResults = projectTargetResults(raw.targetResults);
   if (
     typeof raw.id !== 'string' || raw.id.length === 0 ||
     typeof raw.taskId !== 'string' || raw.taskId.length === 0 ||
@@ -167,7 +204,8 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
     typeof raw.durationMs !== 'number' || !Number.isFinite(raw.durationMs) || raw.durationMs < 0 ||
     typeof raw.additionalPrompt !== 'boolean' ||
     (raw.errorCode !== undefined && typeof raw.errorCode !== 'string') ||
-    (raw.error !== undefined && typeof raw.error !== 'string')
+    (raw.error !== undefined && typeof raw.error !== 'string') ||
+    targetResults === null
   ) {
     return undefined;
   }
@@ -186,6 +224,7 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
     ...(raw.error !== undefined
       ? { error: truncateUtf8(raw.error, MAX_SCHEDULE_RUN_LOG_ERROR_BYTES) }
       : {}),
+    ...(targetResults !== undefined ? { targetResults } : {}),
   };
 }
 

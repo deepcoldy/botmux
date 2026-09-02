@@ -182,6 +182,29 @@ describe('createTask — id provided, task exists with identical canonical input
     createTask({ ...BASE_PARAMS, id, chatType: 'group' });
     expect(() => createTask({ ...BASE_PARAMS, id })).toThrow(IdempotencyConflictError);
   });
+
+  it('treats normalized multi-chat order as canonical while ignoring duplicates', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
+    const id = 'wf_multi_chat';
+    const first = createTask({
+      ...BASE_PARAMS,
+      id,
+      chatIds: ['oc_primary', 'oc_secondary', 'oc_primary'],
+    });
+    const identical = createTask({
+      ...BASE_PARAMS,
+      id,
+      chatId: 'oc_stale_compat',
+      chatIds: [' oc_primary ', 'oc_secondary'],
+    });
+    expect(identical.id).toBe(first.id);
+    expect(identical.chatIds).toEqual(['oc_primary', 'oc_secondary']);
+    expect(() => createTask({
+      ...BASE_PARAMS,
+      id,
+      chatIds: ['oc_secondary', 'oc_primary'],
+    })).toThrow(IdempotencyConflictError);
+  });
 });
 
 describe('createTask — id provided, task exists with DIFFERENT canonical input', () => {

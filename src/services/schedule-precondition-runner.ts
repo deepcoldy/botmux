@@ -144,6 +144,16 @@ export function runSchedulePrecondition(
       finishReject(error);
     };
 
+    child.once('error', (cause: Error) => {
+      if (settled) return;
+      terminateProcessGroup(child);
+      finishReject(new SchedulePreconditionError(
+        'spawn_failed',
+        'Scheduled task precondition could not start /bin/bash',
+        { cause },
+      ));
+    });
+
     const collect = (target: Buffer[] | undefined, chunk: Buffer | string): void => {
       if (terminalError || settled) return;
       const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -176,6 +186,17 @@ export function runSchedulePrecondition(
     const stderrStream = child.stderr;
     const promptStream = child.stdio[3];
     if (!stdoutStream || !stderrStream || !promptStream) {
+      // Bun may expose null stdio handles when spawn has already failed (for
+      // example, an absent cwd) and emit the process error just afterwards.
+      // A missing pid distinguishes that case from a started child whose pipes
+      // could not be initialized, so preserve the actionable spawn failure.
+      if (child.pid === undefined) {
+        finishReject(new SchedulePreconditionError(
+          'spawn_failed',
+          'Scheduled task precondition could not start /bin/bash',
+        ));
+        return;
+      }
       terminateProcessGroup(child);
       finishReject(new SchedulePreconditionError(
         'spawn_failed',
@@ -190,15 +211,6 @@ export function runSchedulePrecondition(
     // public read-only dashboard, and condition diagnostics may contain secrets.
     stderrStream.on('data', chunk => collect(undefined, chunk));
     promptStream.on('data', collectPrompt);
-
-    child.once('error', (cause: Error) => {
-      terminateProcessGroup(child);
-      finishReject(new SchedulePreconditionError(
-        'spawn_failed',
-        'Scheduled task precondition could not start /bin/bash',
-        { cause },
-      ));
-    });
 
     // If Bash exits while an ordinary background child still holds an output
     // pipe open, Node's `close` event would otherwise wait for that child.

@@ -949,7 +949,12 @@ export interface ScheduledTask {
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
+  /** Primary execution chat retained for backward compatibility. For a
+   *  multi-chat task this is always the first entry of `chatIds`. */
   chatId: string;
+  /** All execution chats in deterministic dispatch order. Persisted only
+   *  when more than one chat is configured; absent means `[chatId]`. */
+  chatIds?: string[];
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;

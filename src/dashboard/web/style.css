@@ -27394,7 +27394,41 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   color: var(--text);
 }
 
+.schedule-form-label .ui-field-title {
+  vertical-align: -2px;
+}
+
+.schedule-form-readonly {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-muted) 46%, transparent);
+}
+
+.schedule-form-readonly strong,
+.schedule-form-readonly code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-form-readonly strong {
+  font-size: 13px;
+}
+
+.schedule-form-readonly code {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
 .schedule-form-field input[type="text"],
+.schedule-form-field input[type="search"],
 .schedule-form-field textarea {
   width: 100%;
   padding: 8px 10px;
@@ -28184,6 +28218,84 @@ button.schedule-run-log-row:focus-visible {
   line-height: 1.45;
 }
 
+.schedule-run-log-targets {
+  margin-top: 12px;
+}
+
+.schedule-run-log-targets h3 {
+  margin: 0 0 7px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.schedule-run-log-targets ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.schedule-run-log-targets li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px 12px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+.schedule-run-log-targets li.outcome-error {
+  border-color: color-mix(in srgb, var(--danger) 26%, var(--border-soft));
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 5%, var(--surface));
+}
+
+.schedule-run-log-targets li > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.schedule-run-log-targets strong,
+.schedule-run-log-targets code,
+.schedule-run-log-targets p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.schedule-run-log-targets strong {
+  color: var(--text);
+  font-size: 11.5px;
+}
+
+.schedule-run-log-targets code {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.schedule-run-log-targets li > span {
+  color: var(--accent-strong);
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.schedule-run-log-targets li.outcome-error > span {
+  color: var(--danger);
+}
+
+.schedule-run-log-targets p {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  color: var(--danger);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
 .schedule-run-log-error-detail {
   display: grid;
   gap: 8px;
@@ -28409,6 +28521,103 @@ button.schedule-run-log-row:focus-visible {
   cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.schedule-chat-selector {
+  display: grid;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.schedule-chat-search:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-chat-selector[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.schedule-chat-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+
+.schedule-chat-option + .schedule-chat-option {
+  border-top: 1px solid var(--border-soft);
+}
+
+.schedule-chat-option:hover,
+.schedule-chat-option:has(input:checked) {
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+
+.schedule-chat-option.is-retained {
+  background: color-mix(in srgb, var(--warning) 7%, var(--surface));
+}
+
+.schedule-chat-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.schedule-chat-option input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.schedule-chat-option > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.schedule-chat-option strong,
+.schedule-chat-option code,
+.schedule-chat-option small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-chat-option strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.schedule-chat-option code {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.schedule-chat-option small {
+  color: var(--warning);
+  font-size: 10px;
+}
+
+.schedule-chat-selector-empty {
+  margin: 0;
+  padding: 14px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+textarea.schedule-chat-manual-input {
+  min-height: 72px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 
 /* select 与输入框同宽同风格 */

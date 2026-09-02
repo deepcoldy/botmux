@@ -3,10 +3,16 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
-import { setScheduleScope, getTask, listTasks } from '../src/services/schedule-store.js';
+import {
+  __setScheduleStoreBeforeRenameTestHook,
+  setScheduleScope,
+  getTask,
+  listTasks,
+} from '../src/services/schedule-store.js';
 import {
   hasSchedulePrecondition,
   resolveSchedulePrecondition,
+  schedulePreconditionPath,
   schedulePreconditionRoot,
 } from '../src/services/schedule-precondition-store.js';
 import {
@@ -16,6 +22,7 @@ import {
   updateTaskWithOptionalPrecondition,
 } from '../src/core/schedule-precondition-config.js';
 import { executeScheduledTaskWithPrecondition } from '../src/services/schedule-precondition-gate.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 
 const APP_ID = 'cli_precondition_config_test';
 let tempDir: string;
@@ -29,6 +36,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __setScheduleStoreBeforeRenameTestHook(undefined);
   config.session.dataDir = previousDataDir;
   setScheduleScope('cli_ipc_test_bot001');
   rmSync(tempDir, { recursive: true, force: true });
@@ -53,6 +61,26 @@ describe('trusted schedule precondition configuration', () => {
     expect(hasSchedulePrecondition(task, APP_ID)).toBe(false);
     expect(resolveSchedulePrecondition(task, APP_ID)).toEqual({ kind: 'none' });
     expect(existsSync(schedulePreconditionRoot())).toBe(false);
+  });
+
+  it('normalizes multi-chat create and rejects retained-topic fan-out', () => {
+    const task = createTaskWithOptionalPrecondition({
+      ...createParams('fan out'),
+      chatIds: ['oc_primary', 'oc_secondary', 'oc_primary'],
+      executionPosition: 'top-level',
+    }, APP_ID);
+    expect(task).toMatchObject({
+      chatId: 'oc_primary',
+      chatIds: ['oc_primary', 'oc_secondary'],
+    });
+
+    expect(() => createTaskWithOptionalPrecondition({
+      ...createParams('invalid topic fan out'),
+      chatIds: ['oc_primary', 'oc_secondary'],
+      executionPosition: 'topic',
+      rootMessageId: 'om_topic',
+    }, APP_ID)).toThrow('multiple_chats_topic_unsupported');
+    expect(listTasks(APP_ID)).toHaveLength(1);
   });
 
   it('creates, rebinds, replaces, and explicitly clears a protected script', () => {
@@ -197,6 +225,41 @@ describe('trusted schedule precondition configuration', () => {
     );
     expect(cleared).toMatchObject({ ok: true, hasPrecondition: false });
     expect(cleared.task?.preconditionRef).toBeUndefined();
+  });
+
+  it('rolls back chatId/chatIds and suppresses the deferred event when a compound update fails', () => {
+    const created = createTaskWithOptionalPrecondition(
+      {
+        ...createParams('rollback targets'),
+        chatIds: ['oc_before_primary', 'oc_before_secondary'],
+      },
+      APP_ID,
+      'printf 1',
+    );
+    const events: DashboardEvent[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+
+    __setScheduleStoreBeforeRenameTestHook(() => {
+      __setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(schedulePreconditionPath(APP_ID, created.id), { force: true });
+    });
+    try {
+      expect(() => updateTaskWithOptionalPrecondition(
+        created.id,
+        { chatIds: ['oc_after_primary', 'oc_after_secondary'] },
+        APP_ID,
+        { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
+      )).toThrow('staged protected record is missing');
+    } finally {
+      unsubscribe();
+      __setScheduleStoreBeforeRenameTestHook(undefined);
+    }
+
+    expect(getTask(created.id, APP_ID)).toMatchObject({
+      chatId: 'oc_before_primary',
+      chatIds: ['oc_before_primary', 'oc_before_secondary'],
+    });
+    expect(events.filter(event => event.type === 'schedule.updated')).toEqual([]);
   });
 
   it('rejects set-enabled without a condition before changing ordinary fields', () => {

@@ -36,6 +36,9 @@ const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
 
 function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+  const chatIds = task.chatIds
+    ? scheduleStore.effectiveScheduleChatIds(task)
+    : [task.chatId];
   emitHookEvent('schedule.fired', {
     id: task.id,
     name: task.name,
@@ -43,6 +46,9 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
     status,
     error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
     chatId: task.chatId,
+    // Preserve the exact legacy hook payload for single-chat tasks while
+    // exposing every independently dispatched target for multi-chat tasks.
+    ...(chatIds.length > 1 ? { chatIds } : {}),
     rootMessageId: task.rootMessageId,
     chatType: task.chatType,
     scope: task.scope,
@@ -624,6 +630,7 @@ export function addTask(params: {
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -648,6 +655,12 @@ export function addTask(params: {
   /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
   followActive?: boolean;
 }): ScheduledTask {
+  const targets = params.chatIds === undefined
+    ? { chatId: params.chatId }
+    : scheduleStore.normalizeScheduleChatTargets({
+        chatId: params.chatId,
+        chatIds: params.chatIds,
+      });
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
@@ -656,7 +669,10 @@ export function addTask(params: {
       : params.scope === 'chat'
         ? 'top-level'
         : params.rootMessageId ? 'topic' : 'top-level');
-  if (executionPosition === 'topic' && !params.rootMessageId) {
+  if (executionPosition === 'topic' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_topic_unsupported');
+  }
+  if (executionPosition === 'topic' && !params.rootMessageId?.trim()) {
     throw new Error('topic_root_required');
   }
   // Following the active topic only makes sense when the task lands in a
@@ -674,7 +690,8 @@ export function addTask(params: {
     parsed,
     prompt: params.prompt,
     workingDir: params.workingDir,
-    chatId: params.chatId,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
     rootMessageId: params.rootMessageId,
     scope,
     executionPosition,
@@ -873,7 +890,7 @@ export function toggleDelivery(id: string): {
 
 /**
  * Update editable fields of a scheduled task (name, prompt, schedule, silent,
- * execution position and retained topic root).
+ * execution targets, position and retained topic root).
  * Re-parses the schedule expression and recomputes nextRunAt when the schedule
  * string changes. A legacy `deliver` input is accepted and normalized to
  * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
@@ -892,8 +909,11 @@ export function updateTask(
     rootMessageId?: string;
     topicTitle?: string;
     followActive?: boolean;
+    chatId?: string;
+    chatIds?: readonly string[] | null;
   },
-): { ok: boolean; error?: string } {
+  options: { deferEvent?: boolean } = {},
+): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
@@ -910,8 +930,29 @@ export function updateTask(
     ? 'new-topic'
     : undefined;
   const executionPosition = updates.executionPosition ?? legacyPosition;
-  const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
-  if (executionPosition === 'topic' && !nextRootMessageId) {
+  const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+  let targets: scheduleStore.ScheduleChatTargets;
+  try {
+    targets = targetUpdate
+      ? scheduleStore.normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : { chatId: task.chatId, chatIds: task.chatIds };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const finalExecutionPosition = executionPosition ?? resolveTaskExecutionPosition(task);
+  const targetChatIds = targets.chatIds ?? [targets.chatId];
+  if (finalExecutionPosition === 'topic' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_topic_unsupported' };
+  }
+  const primaryChatChanged = targetUpdate && targets.chatId !== task.chatId;
+  const explicitRootMessageId = updates.rootMessageId?.trim();
+  const nextRootMessageId = primaryChatChanged
+    ? explicitRootMessageId
+    : updates.rootMessageId ?? task.rootMessageId;
+  if (finalExecutionPosition === 'topic' && !nextRootMessageId) {
     return { ok: false, error: 'topic_root_required' };
   }
   const nextPosition = executionPosition ?? resolveTaskExecutionPosition(task);
@@ -928,6 +969,14 @@ export function updateTask(
     // there is no topic to follow at top level / new-topic.
     patch.followActive = undefined;
     eventPatch.followActive = false;
+  }
+  if (targetUpdate) {
+    patch.chatId = targets.chatId;
+    patch.chatIds = targets.chatIds;
+    eventPatch.chatId = targets.chatId;
+    // JSON/SSE omit undefined, so null is required to clear a cached prior
+    // multi-chat array when an edit collapses back to one target.
+    eventPatch.chatIds = targets.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) {
     try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
@@ -948,6 +997,10 @@ export function updateTask(
   } else if (updates.deliver !== undefined) {
     patch.deliver = 'origin';
   }
+  if (primaryChatChanged && finalExecutionPosition !== 'topic' && task.rootMessageId !== undefined) {
+    patch.rootMessageId = undefined;
+    eventPatch.rootMessageId = null;
+  }
 
   // Re-parse + recompute next run when the schedule expression changes.
   if (updates.schedule !== undefined && updates.schedule !== task.schedule) {
@@ -964,11 +1017,23 @@ export function updateTask(
   }
 
   scheduleStore.updateTask(id, patch);
+  const publishedPatch = { ...patch, ...eventPatch };
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  publishScheduleTaskUpdated(id, publishedPatch);
+  return { ok: true };
+}
+
+/** Publish a task patch after a compound configuration operation has fully
+ * committed. Keeping this separate lets the protected-precondition wrapper
+ * roll back its task row without first exposing a transient target change. */
+export function publishScheduleTaskUpdated(
+  id: string,
+  patch: Record<string, unknown>,
+): void {
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch: { ...patch, ...eventPatch } },
+    body: { id, patch },
   });
-  return { ok: true };
 }
 
 /**

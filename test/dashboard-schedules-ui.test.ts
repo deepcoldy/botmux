@@ -11,10 +11,13 @@ import {
   formatScheduleRepeat,
   formatScheduleRunDuration,
   fmtScheduleDate,
+  parseScheduleChatIds,
+  scheduleRunTargetResults,
   scheduleRunHistoryForBackdrop,
   schedulePreconditionEditorInitialState,
   schedulePreconditionPathExample,
   scheduleExecutionPlacement,
+  scheduleTargetChatIds,
 } from '../src/dashboard/web/schedules-page.js';
 
 describe('dashboard schedules React page helpers', () => {
@@ -528,16 +531,87 @@ describe('dashboard schedules React page helpers', () => {
     );
   });
 
-  it('shows the target chat in both the schedule row and edit dialog', () => {
+  it('shows a multi-chat summary in the row and an editable Bot-scoped selector', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain("import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';");
-    // Row chip: dedicated class so a long (Chinese) chat name can be width-capped
-    // + ellipsised instead of overrunning into the action buttons.
     expect(page).toContain('className="schedule-chat-chip"');
-    expect(page).toContain("{tr('schedules.form.chat')}: {chatTitle ?? s.chatId}");
-    // Tooltip keeps the full name AND the raw chatId so truncation loses nothing.
-    expect(page).toContain('title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}');
-    expect(page).toContain("<code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>");
+    expect(page).toContain("{tr('schedules.form.chat')}: {chatPresentation.summary}");
+    expect(page).toContain('title={chatPresentation.title}');
+    expect(page).toContain('className="schedule-chat-selector"');
+    expect(page).toContain('checked={chatIds.includes(group.chatId)}');
+    expect(page).toContain('onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}');
+    expect(page).toContain('className="schedule-chat-search"');
+    expect(page).toContain('group.chatId.toLocaleLowerCase().includes(normalizedChatQuery)');
+    expect(page).toContain('groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))');
+    expect(page).toContain('if (editing || !larkAppId || !groupsHaveMembership');
+    expect(page).toContain('...selectedUnknownChatIds.map');
+    expect(page).toContain("tr('schedules.form.chatRetained')");
+    expect(page).toContain('chatIds: data.chatIds');
+    expect(page).not.toContain('When editing, chatId/larkAppId are immutable');
+  });
+
+  it('prefers chatIds, falls back to legacy chatId, and parses manual multi-chat input', () => {
+    expect(scheduleTargetChatIds({ chatId: ' oc_legacy ' })).toEqual(['oc_legacy']);
+    expect(scheduleTargetChatIds({ chatIds: [' oc_a ', 'oc_b', 'oc_a', '', 7] })).toEqual([
+      'oc_a',
+      'oc_b',
+    ]);
+    expect(scheduleTargetChatIds({ chatIds: [], chatId: 'oc_ignored' })).toEqual([]);
+    expect(parseScheduleChatIds('oc_a\noc_b, oc_a;oc_c')).toEqual(['oc_a', 'oc_b', 'oc_c']);
+  });
+
+  it('puts an accessible multi-chat execution explanation immediately after 绑定群聊', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(page).toMatch(
+      /<FieldTitle\s+help=\{tr\('schedules\.form\.chatBindingHelp'\)\}[\s\S]*?>\s*\{tr\('schedules\.form\.chatBinding'\)\}/,
+    );
+    expect(zh('schedules.form.chatBinding')).toBe('绑定群聊');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('每个群会独立调用模型');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('Bash 前置条件每次调度只执行一次');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('单个群执行失败不影响其他群');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('模型调用量会随绑定群数增加');
+    expect(en('schedules.form.chatBindingHelp')).toContain('Each group invokes the model independently');
+  });
+
+  it('keeps the Bot read-only while allowing target groups to change during edit', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="schedule-form-readonly"');
+    expect(page).toContain("tr('schedules.form.botImmutableHelp')");
+    expect(page).toContain('if (!open || localDelivery) return;');
+    expect(page).toContain('chatIds: data.chatIds');
+    expect(page).not.toContain('if (!open || editing) return;');
+  });
+
+  it('renders compatible per-group results without rejecting legacy or malformed logs', () => {
+    expect(scheduleRunTargetResults({})).toEqual([]);
+    expect(scheduleRunTargetResults({ targetResults: 'legacy' })).toEqual([]);
+    expect(scheduleRunTargetResults({
+      targetResults: [
+        { chatId: ' oc_ok ', outcome: 'model_dispatched' },
+        { chatId: 'oc_failed', outcome: 'error', error: 'dispatch failed' },
+        { chatId: '', outcome: 'error' },
+        { chatId: 'oc_unknown', outcome: 'skipped' },
+        null,
+      ],
+    })).toEqual([
+      { chatId: 'oc_ok', outcome: 'model_dispatched' },
+      { chatId: 'oc_failed', outcome: 'error', error: 'dispatch failed' },
+    ]);
+
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain('className="schedule-run-log-targets"');
+    expect(page).toContain("tr('schedules.logs.targetResults')");
+    expect(page).toContain("tr('schedules.logs.targetDispatched')");
+    expect(page).toContain("tr('schedules.logs.targetError')");
+    expect(page).toContain("tr('schedules.logs.modelInvocationTargets'");
+    expect(createDashboardTranslator('zh')('schedules.logs.modelInvocationTargets', {
+      submitted: 1,
+      total: 2,
+    })).toBe('1/2 个群');
   });
 
   it('caps the target-chat chip width so a long name cannot overrun the row', () => {
@@ -554,6 +628,29 @@ describe('dashboard schedules React page helpers', () => {
     );
   });
 
+  it('keeps the multi-chat selector compact, keyboard-visible, and scrollable', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(
+      /\.schedule-chat-selector \{[\s\S]*?max-height:\s*220px[\s\S]*?overflow-y:\s*auto/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-search:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option \{[\s\S]*?min-height:\s*44px/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option input:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option\.is-retained \{[\s\S]*?var\(--warning\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-run-log-targets li\.outcome-error \{[\s\S]*?var\(--danger\)/,
+    );
+  });
+
   it('offers three execution positions and allows lazy silent fresh topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
@@ -561,13 +658,15 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain("value=\"top-level\"");
     expect(page).toContain("value=\"topic\"");
     expect(page).toContain("value=\"new-topic\"");
-    expect(page).toContain("setExecutionPosition('new-topic')");
+    expect(page).toContain("updateExecutionPosition('new-topic')");
     expect(page).toContain("tr('schedules.form.topicTitle')");
     expect(page).toContain('maxLength={200}');
     expect(page).not.toContain("disabled={executionPosition === 'new-topic'}");
     expect(page).toContain("executionPosition === 'new-topic' && silent");
     expect(page).toContain("tr('schedules.form.topicRoot')");
-    expect(page).toContain("executionPosition === 'topic' && !rootMessageId.trim()");
+    expect(page).toContain("executionPosition === 'topic' && chatIds.length !== 1");
+    expect(page).toContain("nextChatIds[0] !== initialTopicChatId");
+    expect(page).toContain("setRootMessageId('')");
     expect(page).toContain("const localDelivery = editing?.deliver === 'local';");
     expect(page).toContain('updateExecutionPosition: !localDelivery');
     expect(page).toContain('...(data.updateExecutionPosition ? {');

@@ -3206,6 +3206,8 @@ export interface ScheduleRow {
   prompt: string;
   workingDir: string;
   chatId: string;
+  /** Effective target chats. Legacy single-chat tasks are projected as one item. */
+  chatIds: string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -3230,6 +3232,44 @@ export interface ScheduleRow {
   preconditionScript?: string;
   preconditionFilePath?: string;
   feishuChatLink: string;
+}
+
+type ScheduleChatTargetsParseResult =
+  | { ok: true; chatId: string; chatIds: string[] }
+  | { ok: false; field: 'chatId' | 'chatIds' };
+
+/** Accept the legacy singular target and the Dashboard's multi-target array.
+ * The array is authoritative when supplied; requiring an agreeing legacy field
+ * avoids two different "primary" targets in one request. */
+function parseScheduleChatTargets(
+  body: Record<string, unknown>,
+  required: boolean,
+): ScheduleChatTargetsParseResult | undefined {
+  const hasChatId = body.chatId !== undefined;
+  const hasChatIds = body.chatIds !== undefined;
+  if (!hasChatId && !hasChatIds) {
+    return required ? { ok: false, field: 'chatId' } : undefined;
+  }
+
+  const legacyChatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  if (hasChatId && !legacyChatId) return { ok: false, field: 'chatId' };
+
+  const rawTargets = hasChatIds ? body.chatIds : [legacyChatId];
+  if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+    return { ok: false, field: 'chatIds' };
+  }
+  const chatIds: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawTargets) {
+    if (typeof raw !== 'string' || !raw.trim()) return { ok: false, field: 'chatIds' };
+    const chatId = raw.trim();
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    chatIds.push(chatId);
+  }
+  if (chatIds.length === 0) return { ok: false, field: 'chatIds' };
+  if (hasChatId && legacyChatId !== chatIds[0]) return { ok: false, field: 'chatId' };
+  return { ok: true, chatId: chatIds[0], chatIds };
 }
 
 function schedulePreconditionProjection(
@@ -3284,6 +3324,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     prompt: t.prompt,
     workingDir: t.workingDir,
     chatId: t.chatId,
+    chatIds: scheduleStore.effectiveScheduleChatIds(t),
     rootMessageId: t.rootMessageId,
     scope: t.scope,
     executionPosition: scheduler.resolveTaskExecutionPosition(t),
@@ -3368,8 +3409,9 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
-// Create a new scheduled task from the dashboard. chatId selects which chat
-// the task fires into; workingDir defaults to the daemon's cwd.
+// Create a new scheduled task from the dashboard. chatIds selects one or more
+// chats owned by this bot; legacy clients may keep sending only chatId.
+// workingDir defaults to the daemon's cwd.
 ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   let body: unknown;
@@ -3382,7 +3424,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const name = typeof b.name === 'string' ? b.name.trim() : '';
   const schedule = typeof b.schedule === 'string' ? b.schedule.trim() : '';
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
-  const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
+  const chatTargets = parseScheduleChatTargets(b, true)!;
   const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
   const precondition = parseSchedulePreconditionWrite(b, 'create');
   if (!precondition.ok) {
@@ -3433,7 +3475,17 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!name) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
   if (!schedule) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
   if (!prompt.trim()) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
-  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'chatId' });
+  if (!chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  const { chatId, chatIds } = chatTargets;
+  if (executionPosition === 'topic' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_topic_unsupported',
+      field: 'chatIds',
+    });
+  }
   if (executionPosition === 'topic' && !rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
   }
@@ -3451,6 +3503,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
+      chatIds: chatIds.length > 1 ? chatIds : undefined,
       // Only topic execution retains a root anchor; at top-level/new-topic the
       // root is dropped so it can never pull execution back into the topic the
       // schedule was created from (e.g. an adopted one).
@@ -3489,7 +3542,16 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     name?: string; prompt?: string; schedule?: string;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
+    chatId?: string; chatIds?: readonly string[] | null;
   } = {};
+  const chatTargets = parseScheduleChatTargets(b, false);
+  if (chatTargets && !chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  if (chatTargets?.ok) {
+    updates.chatId = chatTargets.chatId;
+    updates.chatIds = chatTargets.chatIds.length > 1 ? chatTargets.chatIds : null;
+  }
   const precondition = parseSchedulePreconditionWrite(b, 'update');
   if (!precondition.ok) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });

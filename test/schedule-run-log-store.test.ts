@@ -2,6 +2,7 @@ import {
   chmodSync,
   lstatSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -169,6 +170,49 @@ describe('schedule-run-log-store', () => {
     expect(raw).not.toHaveProperty('stdout');
     expect(raw).not.toHaveProperty('modelOutput');
     expect(raw.additionalPrompt).toBe(false);
+  });
+
+  it('persists optional per-chat results while keeping legacy records compatible', () => {
+    appendScheduleRunLog(entry('legacy'), APP_ID, dataDir);
+    const stored = appendScheduleRunLog({
+      ...entry('multi-target-error', {
+        outcome: 'error',
+        errorCode: 'model_dispatch_error',
+        targetResults: [
+          { chatId: 'oc_one', outcome: 'model_dispatched' },
+          { chatId: 'oc_two', outcome: 'error', error: '错'.repeat(1_000) },
+        ],
+      }),
+      targetResults: [
+        { chatId: 'oc_one', outcome: 'model_dispatched', modelOutput: 'must not persist' },
+        { chatId: 'oc_two', outcome: 'error', error: '错'.repeat(1_000), stack: 'secret stack' },
+      ],
+    } as ScheduleRunLogEntry, APP_ID, dataDir);
+
+    expect(stored.targetResults?.[0]).toEqual({
+      chatId: 'oc_one',
+      outcome: 'model_dispatched',
+    });
+    expect(Buffer.byteLength(stored.targetResults?.[1]?.error ?? '', 'utf8'))
+      .toBeLessThanOrEqual(MAX_SCHEDULE_RUN_LOG_ERROR_BYTES);
+    expect(stored.targetResults?.[0]).not.toHaveProperty('modelOutput');
+    expect(stored.targetResults?.[1]).not.toHaveProperty('stack');
+
+    const page = queryScheduleRunLogs(TASK_ID, { limit: 20 }, APP_ID, dataDir);
+    expect(page.logs[0]?.targetResults).toEqual(stored.targetResults);
+    expect(page.logs[1]).not.toHaveProperty('targetResults');
+  });
+
+  it('ignores records with malformed per-chat results', () => {
+    const path = scheduleRunLogPath(TASK_ID, APP_ID, dataDir);
+    const malformed = entry('malformed-targets') as ScheduleRunLogEntry & {
+      targetResults: unknown;
+    };
+    malformed.targetResults = [{ chatId: 'oc_one', outcome: 'precondition_skipped' }];
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(malformed)}\n`, { mode: 0o600 });
+
+    expect(queryScheduleRunLogs(TASK_ID, { limit: 20 }, APP_ID, dataDir).logs).toEqual([]);
   });
 
   it('deletes only the selected task log and remains idempotent', () => {

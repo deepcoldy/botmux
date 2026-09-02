@@ -24,6 +24,7 @@ vi.mock('../src/services/schedule-store.js', () => ({
   removeTask: mocks.removeTask,
   createTask: mocks.createTask,
   getScheduleScope: mocks.getScheduleScope,
+  effectiveScheduleChatIds: (scheduled: ScheduledTask) => scheduled.chatIds ?? [scheduled.chatId],
 }));
 vi.mock('../src/services/schedule-precondition-store.js', () => ({
   removeSchedulePrecondition: mocks.removePrecondition,
@@ -95,6 +96,7 @@ describe('scheduler execution context', () => {
 
     expect(runNow(task.id)).toEqual({ ok: true });
     await vi.runAllTicks();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
 
     expect(received).toEqual({
       runId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
@@ -104,6 +106,8 @@ describe('scheduler execution context', () => {
     expect(mocks.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
       lastRunAt: received!.startedAt,
     }));
+    const firedPayload = mocks.emitHook.mock.calls.find(([name]) => name === 'schedule.fired')?.[1];
+    expect(firedPayload).not.toHaveProperty('chatIds');
   });
 
   it('marks a naturally due tick as scheduler-triggered', async () => {
@@ -122,6 +126,26 @@ describe('scheduler execution context', () => {
     expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
       lastRunAt: received!.startedAt,
     });
+  });
+
+  it('keeps chatId as the primary fired-hook target and adds chatIds only for fan-out', async () => {
+    const multiChatTask: ScheduledTask = {
+      ...task,
+      chatId: 'oc_primary',
+      chatIds: ['oc_primary', 'oc_secondary'],
+    };
+    mocks.getTask.mockReturnValue(multiChatTask);
+    setExecuteCallback(async () => undefined);
+
+    expect(runNow(multiChatTask.id)).toEqual({ ok: true });
+    await vi.runAllTicks();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    expect(mocks.emitHook).toHaveBeenCalledWith('schedule.fired', expect.objectContaining({
+      id: multiChatTask.id,
+      chatId: 'oc_primary',
+      chatIds: ['oc_primary', 'oc_secondary'],
+    }));
   });
 
   it('deletes both sidecars best-effort without changing task removal success', () => {

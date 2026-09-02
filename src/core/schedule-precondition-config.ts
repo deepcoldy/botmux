@@ -196,11 +196,17 @@ function restoreUpdatedTaskRow(
     updates.deliver !== undefined
     || updates.executionPosition !== undefined
     || updates.rootMessageId !== undefined
+    || updates.chatId !== undefined
+    || updates.chatIds !== undefined
   ) {
     patch.deliver = before.deliver;
     patch.scope = before.scope;
     patch.executionPosition = before.executionPosition;
     patch.rootMessageId = before.rootMessageId;
+  }
+  if (updates.chatId !== undefined || updates.chatIds !== undefined) {
+    patch.chatId = before.chatId;
+    patch.chatIds = before.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) patch.topicTitle = before.topicTitle;
   scheduleStore.updateTask(before.id, patch, appId);
@@ -245,7 +251,10 @@ export function updateTaskWithOptionalPrecondition(
     ? stageSchedulePrecondition(appId, id, mutation.definition)
     : undefined;
 
-  const updated = scheduler.updateTask(id, updates);
+  // Do not expose a task-row event until the protected sidecar transition has
+  // also committed. A later failure restores the row without Dashboard ever
+  // observing a transient chat target or other editable value.
+  const updated = scheduler.updateTask(id, updates, { deferEvent: true });
   if (!updated.ok) {
     if (staged) {
       try {
@@ -319,7 +328,9 @@ export function updateTaskWithOptionalPrecondition(
 
   task = scheduleStore.getTask(id, appId);
   if (!task) return { ok: false, error: 'not_found_after_update' };
-  return resultForTask(task, appId);
+  const result = resultForTask(task, appId);
+  scheduler.publishScheduleTaskUpdated(id, updated.deferredEventPatch ?? {});
+  return result;
 }
 
 export function removeTaskWithPrecondition(

@@ -27,6 +27,8 @@ import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 
 type ScheduleRow = Record<string, any> & {
   id: string;
+  chatId?: string;
+  chatIds?: string[];
   hasPrecondition?: boolean;
   preconditionEnabled?: boolean;
   preconditionSource?: 'inline' | 'file';
@@ -41,6 +43,11 @@ type ScheduleBotOption = {
 type ScheduleAction = 'run' | 'pause' | 'resume';
 type ActionFeedback = 'success' | 'error';
 type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
+type ScheduleTargetRunResult = {
+  chatId: string;
+  outcome: 'model_dispatched' | 'error';
+  error?: string;
+};
 type ScheduleRunLogEntry = {
   id: string;
   taskId: string;
@@ -53,6 +60,7 @@ type ScheduleRunLogEntry = {
   additionalPrompt: boolean;
   errorCode?: string;
   error?: string;
+  targetResults?: ScheduleTargetRunResult[];
 };
 type ScheduleRunHistoryPreview = {
   logs: ScheduleRunLogEntry[];
@@ -486,6 +494,48 @@ export function countScheduleRunHistory(
   return counts;
 }
 
+export function scheduleTargetChatIds(
+  schedule: { chatIds?: unknown; chatId?: unknown } | null | undefined,
+): string[] {
+  const source = Array.isArray(schedule?.chatIds)
+    ? schedule.chatIds
+    : [schedule?.chatId];
+  const seen = new Set<string>();
+  const chatIds: string[] = [];
+  for (const value of source) {
+    if (typeof value !== 'string') continue;
+    const chatId = value.trim();
+    if (!chatId || seen.has(chatId)) continue;
+    seen.add(chatId);
+    chatIds.push(chatId);
+  }
+  return chatIds;
+}
+
+export function parseScheduleChatIds(value: string): string[] {
+  return scheduleTargetChatIds({ chatIds: value.split(/[\s,;]+/) });
+}
+
+export function scheduleRunTargetResults(value: unknown): ScheduleTargetRunResult[] {
+  if (!value || typeof value !== 'object') return [];
+  const targetResults = (value as { targetResults?: unknown }).targetResults;
+  if (!Array.isArray(targetResults)) return [];
+  const parsed: ScheduleTargetRunResult[] = [];
+  for (const result of targetResults) {
+    if (!result || typeof result !== 'object') continue;
+    const chatId = typeof (result as { chatId?: unknown }).chatId === 'string'
+      ? (result as { chatId: string }).chatId.trim()
+      : '';
+    const outcome = (result as { outcome?: unknown }).outcome;
+    if (!chatId || (outcome !== 'model_dispatched' && outcome !== 'error')) continue;
+    const error = typeof (result as { error?: unknown }).error === 'string'
+      ? (result as { error: string }).error
+      : undefined;
+    parsed.push({ chatId, outcome, ...(error ? { error } : {}) });
+  }
+  return parsed;
+}
+
 function isScheduleRunOutcome(value: unknown): value is ScheduleRunOutcome {
   return value === 'model_dispatched' || value === 'precondition_skipped' || value === 'error';
 }
@@ -664,6 +714,10 @@ function ScheduleRunLogDialog(props: {
   }
 
   const selected = logs.find(entry => entry.id === selectedId) ?? logs[0] ?? null;
+  const selectedTargetResults = scheduleRunTargetResults(selected);
+  const dispatchedTargetCount = selectedTargetResults.filter(
+    result => result.outcome === 'model_dispatched',
+  ).length;
 
   function outcomeLabel(outcome: ScheduleRunLogEntry['outcome']): string {
     if (outcome === 'model_dispatched') return tr('schedules.logs.outcomeDispatched');
@@ -832,9 +886,14 @@ function ScheduleRunLogDialog(props: {
                             {tr('schedules.logs.modelInvocation')}
                           </FieldTitle>
                         </dt>
-                        <dd>{selected.outcome === 'model_dispatched'
-                          ? tr('schedules.logs.yes')
-                          : tr('schedules.logs.no')}</dd>
+                        <dd>{selectedTargetResults.length > 0
+                          ? tr('schedules.logs.modelInvocationTargets', {
+                              submitted: dispatchedTargetCount,
+                              total: selectedTargetResults.length,
+                            })
+                          : selected.outcome === 'model_dispatched'
+                            ? tr('schedules.logs.yes')
+                            : tr('schedules.logs.no')}</dd>
                       </div>
                       <div>
                         <dt>{tr('schedules.logs.additionalPrompt')}</dt>
@@ -843,6 +902,28 @@ function ScheduleRunLogDialog(props: {
                           : tr('schedules.logs.no')}</dd>
                       </div>
                     </dl>
+                    {selectedTargetResults.length > 0 ? (
+                      <section className="schedule-run-log-targets" aria-labelledby="schedule-run-log-targets-title">
+                        <h3 id="schedule-run-log-targets-title">{tr('schedules.logs.targetResults')}</h3>
+                        <ul>
+                          {selectedTargetResults.map((result, index) => {
+                            const targetTitle = chatDisplayTitle({ chatId: result.chatId });
+                            return (
+                              <li key={`${result.chatId}:${index}`} className={`outcome-${result.outcome}`}>
+                                <div>
+                                  <strong>{targetTitle ?? result.chatId}</strong>
+                                  {targetTitle ? <code>{result.chatId}</code> : null}
+                                </div>
+                                <span>{result.outcome === 'model_dispatched'
+                                  ? tr('schedules.logs.targetDispatched')
+                                  : tr('schedules.logs.targetError')}</span>
+                                {result.error ? <p>{result.error}</p> : null}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </section>
+                    ) : null}
                     {selected.errorCode || selected.error ? (
                       <div className="schedule-run-log-error-detail">
                         {selected.errorCode ? (
@@ -966,6 +1047,32 @@ function scheduleRunHistoryLabel(
   });
 }
 
+function scheduleChatPresentation(
+  schedule: ScheduleRow,
+  tr: ReturnType<typeof useT>,
+): { summary: string; title: string } | null {
+  const chatIds = scheduleTargetChatIds(schedule);
+  if (chatIds.length === 0) return null;
+  const labels = chatIds.map(chatId => chatDisplayTitle({
+    chatId,
+    chatDisplayName: schedule.chatId === chatId ? schedule.chatDisplayName : undefined,
+  }) ?? chatId);
+  const summary = labels.length === 1
+    ? labels[0]!
+    : labels.length === 2
+      ? tr('schedules.chatSummaryTwo', { first: labels[0]!, second: labels[1]! })
+      : tr('schedules.chatSummaryMany', {
+          first: labels[0]!,
+          second: labels[1]!,
+          count: labels.length,
+          remaining: labels.length - 2,
+        });
+  const title = chatIds.map((chatId, index) => (
+    labels[index] === chatId ? chatId : `${labels[index]} · ${chatId}`
+  )).join('\n');
+  return { summary, title };
+}
+
 function ScheduleRowCard(props: {
   schedule: ScheduleRow;
   scheduleTimeZone?: string;
@@ -978,7 +1085,7 @@ function ScheduleRowCard(props: {
   onDelete(schedule: ScheduleRow): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
-  const chatTitle = chatDisplayTitle(s);
+  const chatPresentation = scheduleChatPresentation(s, tr);
   const kind = String(s.parsed?.kind ?? 'unknown');
   const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
   const toggleKey = `${s.id}:${toggleOp}`;
@@ -1053,12 +1160,12 @@ function ScheduleRowCard(props: {
         </div>
         <div className="schedule-chip-strip">
           <span>{kind}</span>
-          {s.chatId ? (
+          {chatPresentation ? (
             <span
               className="schedule-chat-chip"
-              title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}
+              title={chatPresentation.title}
             >
-              {tr('schedules.form.chat')}: {chatTitle ?? s.chatId}
+              {tr('schedules.form.chat')}: {chatPresentation.summary}
             </span>
           ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
@@ -1257,14 +1364,15 @@ function SchedulesPage() {
     rootMessageId: string;
     topicTitle: string;
     updateExecutionPosition: boolean;
-    chatId: string; larkAppId: string;
+    chatIds: string[]; larkAppId: string;
   }): Promise<void> {
     setFormError(null);
     try {
       const url = editing ? `/api/schedules/${encodeURIComponent(editing.id)}` : '/api/schedules';
       const method = editing ? 'PATCH' : 'POST';
-      // When editing, chatId/larkAppId are immutable (PATCH ignores them);
-      // when creating, larkAppId selects the owning bot/daemon.
+      // The owning bot remains immutable after creation. Target groups are
+      // editable and are always submitted as an array, including single-group
+      // tasks, so the server can preserve one consistent update path.
       const payload = editing
         ? {
             name: data.name,
@@ -1284,6 +1392,7 @@ function SchedulesPage() {
               executionPosition: data.executionPosition,
               rootMessageId: data.rootMessageId,
               topicTitle: data.topicTitle,
+              chatIds: data.chatIds,
             } : {}),
           }
         : {
@@ -1303,7 +1412,7 @@ function SchedulesPage() {
             executionPosition: data.executionPosition,
             rootMessageId: data.rootMessageId,
             topicTitle: data.topicTitle,
-            chatId: data.chatId,
+            chatIds: data.chatIds,
             larkAppId: data.larkAppId,
           };
       const r = await fetch(url, {
@@ -1501,7 +1610,7 @@ interface ScheduleFormData {
   rootMessageId: string;
   topicTitle: string;
   updateExecutionPosition: boolean;
-  chatId: string;
+  chatIds: string[];
   larkAppId: string;
 }
 
@@ -1541,12 +1650,18 @@ function ScheduleFormModal(props: {
       ? 'topic'
       : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
   );
+  const initialChatIds = scheduleTargetChatIds(editing);
+  const initialTopicChatId = editing && scheduleExecutionPlacement(editing) === 'thread'
+    ? initialChatIds[0] ?? ''
+    : '';
   const [rootMessageId, setRootMessageId] = useState(editing?.rootMessageId ?? '');
   const [topicTitle, setTopicTitle] = useState(editing?.topicTitle ?? '');
-  const [chatId, setChatId] = useState(editing?.chatId ?? '');
+  const [chatIds, setChatIds] = useState(initialChatIds);
   const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
   const [groups, setGroups] = useState<GroupChat[]>([]);
   const [chatManual, setChatManual] = useState(false);
+  const [chatManualValue, setChatManualValue] = useState(initialChatIds.join('\n'));
+  const [chatQuery, setChatQuery] = useState('');
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
@@ -1563,15 +1678,16 @@ function ScheduleFormModal(props: {
     }
   }, [open]);
 
-  // 创建模式下拉取群列表（30s 缓存，与 Groups 等入口共享）
+  // 创建和编辑都拉取群列表（30s 缓存，与 Groups 等入口共享），这样编辑时
+  // 可以改选同一 Bot 已加入的其它群；Bot 本身仍保持不可变。
   useEffect(() => {
-    if (!open || editing) return;
+    if (!open || localDelivery) return;
     let cancelled = false;
     fetchGroupsSnapshot({ cacheMs: 30_000 })
       .then(snap => { if (!cancelled) setGroups(snap.chats); })
       .catch(() => undefined);
     return () => { cancelled = true; };
-  }, [open, editing]);
+  }, [open, localDelivery]);
 
   // If the modal opened before /api/bots resolved, default to the first bot
   // once it arrives so the submit button doesn't stay permanently disabled.
@@ -1586,13 +1702,12 @@ function ScheduleFormModal(props: {
     [schedule, tr, scheduleTimeZone],
   );
 
-  // 只列出选中 bot 已在群的群（memberBots 有 inChat 记录时才过滤；
-  // 成员信息缺失时 fail-open 显示全部，避免阻塞创建）
+  // 只列出选中 Bot 已加入的群；编辑任务里不在当前 roster 的既有目标会在
+  // selectorOptions 中单独补回，而不会把其它未加入的群误当作可选项。
   const groupOptions = useMemo(() => {
-    const hasMembership = groups.some(g => g.memberBots?.length > 0);
-    const filtered = hasMembership && larkAppId
+    const filtered = larkAppId
       ? groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))
-      : groups;
+      : [];
     // 有名群按名称排序，无名群（仅 oc_ ID）排最后
     return [...filtered].sort((a, b) => {
       const an = a.name ?? '';
@@ -1604,19 +1719,53 @@ function ScheduleFormModal(props: {
     });
   }, [groups, larkAppId]);
 
-  // bot 变更时，若当前 chatId 不在新 bot 的群列表中则清除，避免给不在群的 bot 投递
-  useEffect(() => {
-    if (!chatId || !larkAppId || groupOptions.length === 0) return;
-    if (!groupOptions.some(g => g.chatId === chatId)) setChatId('');
-  }, [larkAppId, groupOptions, chatId]);
+  const groupsHaveMembership = groups.some(g => g.memberBots?.length > 0);
 
-  const showGroupSelect = !editing && !localDelivery && !chatManual && groupOptions.length > 0;
+  // 创建时切换 Bot 后只保留新 Bot 已加入的群。编辑时 Bot 不可变，并且任务
+  // 的既有未知目标必须保留，避免 roster 暂时缺失导致一次普通保存意外删群。
+  useEffect(() => {
+    if (editing || !larkAppId || !groupsHaveMembership || chatIds.length === 0) return;
+    const allowed = new Set(groupOptions.map(group => group.chatId));
+    const nextChatIds = chatIds.filter(chatId => allowed.has(chatId));
+    if (nextChatIds.length !== chatIds.length) updateChatSelection(nextChatIds);
+  }, [editing, larkAppId, groupsHaveMembership, groupOptions, chatIds]);
+
+  const selectedUnknownChatIds = chatIds.filter(
+    chatId => !groupOptions.some(group => group.chatId === chatId),
+  );
+  const selectorOptions: Array<GroupChat & { retained?: boolean }> = [
+    ...groupOptions,
+    ...selectedUnknownChatIds.map(chatId => ({ chatId, memberBots: [], retained: true })),
+  ];
+  const normalizedChatQuery = chatQuery.trim().toLocaleLowerCase();
+  const visibleSelectorOptions = normalizedChatQuery
+    ? selectorOptions.filter(group => (
+        group.chatId.toLocaleLowerCase().includes(normalizedChatQuery)
+        || (group.name ?? chatDisplayTitle({
+          chatId: group.chatId,
+          chatDisplayName: editing?.chatId === group.chatId ? editing.chatDisplayName : undefined,
+        }) ?? '')
+          .toLocaleLowerCase()
+          .includes(normalizedChatQuery)
+      ))
+    : selectorOptions;
+
+  const showGroupSelect = !localDelivery
+    && !chatManual
+    && (selectorOptions.length > 0 || groups.length > 0);
   const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
   const schedulePreview = check?.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
-  const chatMissing = touched && !editing && !localDelivery && !chatId.trim();
-  const rootMissing = touched && !localDelivery && executionPosition === 'topic' && !rootMessageId.trim();
+  const chatMissing = touched && !localDelivery && chatIds.length === 0;
+  const topicChatCountInvalid = !localDelivery
+    && executionPosition === 'topic'
+    && chatIds.length > 1;
+  const rootMissing = touched
+    && !localDelivery
+    && executionPosition === 'topic'
+    && chatIds.length === 1
+    && !rootMessageId.trim();
   const selectedBot = bots.find(bot => bot.larkAppId === larkAppId);
   const rawPreconditionWorkingDir = editing
     ? editing.workingDir
@@ -1637,6 +1786,40 @@ function ScheduleFormModal(props: {
             ? tr('schedules.form.preconditionErrFileTilde')
             : null;
 
+  function updateChatSelection(nextValues: readonly string[], syncManualValue = true): void {
+    const nextChatIds = scheduleTargetChatIds({ chatIds: nextValues });
+    if (
+      initialTopicChatId
+      && (nextChatIds.length !== 1 || nextChatIds[0] !== initialTopicChatId)
+    ) {
+      setRootMessageId('');
+    }
+    setChatIds(nextChatIds);
+    if (syncManualValue) setChatManualValue(nextChatIds.join('\n'));
+  }
+
+  function toggleChat(chatId: string, checked: boolean): void {
+    if (checked && executionPosition === 'topic') {
+      updateChatSelection([chatId]);
+      return;
+    }
+    updateChatSelection(checked
+      ? [...chatIds, chatId]
+      : chatIds.filter(value => value !== chatId));
+  }
+
+  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic'): void {
+    setExecutionPosition(next);
+    if (
+      next === 'topic'
+      && rootMessageId
+      && (chatIds.length !== 1 || chatIds[0] !== initialTopicChatId)
+    ) {
+      setRootMessageId('');
+    }
+    if (next === 'new-topic') setSilent(false);
+  }
+
   function handleSubmit(e: React.FormEvent): void {
     e.preventDefault();
     setTouched(true);
@@ -1644,7 +1827,8 @@ function ScheduleFormModal(props: {
     // 必填内联校验：不静默 return，每个缺字段都有可见红提示
     if (!editing && !larkAppId) return;
     if (!name.trim() || !prompt.trim()) return;
-    if (!localDelivery && !chatId.trim()) return;
+    if (!localDelivery && chatIds.length === 0) return;
+    if (!localDelivery && executionPosition === 'topic' && chatIds.length !== 1) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
     if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     const precondition = buildSchedulePreconditionFormFields({
@@ -1674,7 +1858,7 @@ function ScheduleFormModal(props: {
       rootMessageId: rootMessageId.trim(),
       topicTitle: topicTitle.trim(),
       updateExecutionPosition: !localDelivery,
-      chatId: chatId.trim(),
+      chatIds,
       larkAppId,
     });
   }
@@ -1704,7 +1888,18 @@ function ScheduleFormModal(props: {
               ))}
             </select>
           </label>
-        ) : null}
+        ) : (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
+            <div className="schedule-form-readonly">
+              <strong>{bots.find(bot => bot.larkAppId === larkAppId)?.botName
+                ?? editing.botName
+                ?? larkAppId}</strong>
+              <code>{larkAppId}</code>
+            </div>
+            <small className="schedule-form-help">{tr('schedules.form.botImmutableHelp')}</small>
+          </div>
+        )}
         <label className="schedule-form-field">
           <span className="schedule-form-label">{tr('schedules.form.name')}</span>
           <input
@@ -1941,55 +2136,101 @@ function ScheduleFormModal(props: {
             </small>
           ) : null}
         </div>
-        {editing ? (
+        {!localDelivery ? (
           <div className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
-            <code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>
-          </div>
-        ) : !localDelivery ? (
-          <div className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.chat')} <i className="req" aria-hidden="true">*</i></span>
+            <span className="schedule-form-label">
+              <FieldTitle
+                help={tr('schedules.form.chatBindingHelp')}
+                helpLabel={tr('schedules.form.chatBindingHelp')}
+              >
+                {tr('schedules.form.chatBinding')}
+              </FieldTitle>{' '}
+              <i className="req" aria-hidden="true">*</i>
+            </span>
             {showGroupSelect ? (
               <>
-                <select
-                  value={chatId}
-                  onChange={e => setChatId(e.target.value)}
-                  required
-                  aria-invalid={chatMissing || undefined}
+                <input
+                  className="schedule-chat-search"
+                  type="search"
+                  value={chatQuery}
+                  onChange={event => setChatQuery(event.currentTarget.value)}
+                  placeholder={tr('schedules.form.chatSearchPlaceholder')}
+                  aria-label={tr('schedules.form.chatSearchLabel')}
+                />
+                <div
+                  className="schedule-chat-selector"
+                  role="group"
+                  aria-label={tr('schedules.form.chatBinding')}
+                  aria-invalid={chatMissing || topicChatCountInvalid || undefined}
                 >
-                  <option value="" disabled>{tr('schedules.form.chatPlaceholder')}</option>
-                  {groupOptions.map(g => {
-                    const inChat = g.memberBots?.filter(b => b.inChat).length ?? 0;
+                  {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
+                    const displayName = group.name ?? chatDisplayTitle({
+                      chatId: group.chatId,
+                      chatDisplayName: editing?.chatId === group.chatId
+                        ? editing.chatDisplayName
+                        : undefined,
+                    });
                     return (
-                      <option key={g.chatId} value={g.chatId}>
-                        {g.name ?? g.chatId}{inChat > 0 ? ` · ${inChat} bots` : ''}
-                      </option>
+                      <label
+                        key={group.chatId}
+                        className={`schedule-chat-option${group.retained ? ' is-retained' : ''}`}
+                        title={displayName ? `${displayName} · ${group.chatId}` : group.chatId}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={chatIds.includes(group.chatId)}
+                          onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}
+                        />
+                        <span>
+                          <strong>{displayName ?? group.chatId}</strong>
+                          {displayName ? <code>{group.chatId}</code> : null}
+                          {group.retained ? <small>{tr('schedules.form.chatRetained')}</small> : null}
+                        </span>
+                      </label>
                     );
-                  })}
-                </select>
+                  }) : (
+                    <p className="schedule-chat-selector-empty">
+                      {selectorOptions.length > 0
+                        ? tr('schedules.form.chatNoMatch')
+                        : tr('schedules.form.chatEmpty')}
+                    </p>
+                  )}
+                </div>
+                <small className="schedule-form-help">
+                  {tr('schedules.form.chatSelectedCount', { count: chatIds.length })}
+                </small>
                 <button
                   type="button"
                   className="schedule-form-link"
-                  onClick={() => setChatManual(true)}
+                  onClick={() => {
+                    setChatManualValue(chatIds.join('\n'));
+                    setChatManual(true);
+                  }}
                 >
                   {tr('schedules.form.chatManual')}
                 </button>
               </>
             ) : (
               <>
-                <input
-                  type="text"
-                  value={chatId}
-                  onChange={e => setChatId(e.target.value)}
-                  placeholder="oc_..."
+                <textarea
+                  className="schedule-chat-manual-input"
+                  value={chatManualValue}
+                  onChange={event => {
+                    const value = event.currentTarget.value;
+                    setChatManualValue(value);
+                    updateChatSelection(parseScheduleChatIds(value), false);
+                  }}
+                  rows={3}
+                  placeholder={tr('schedules.form.chatManualPlaceholder')}
                   required
-                  aria-invalid={chatMissing || undefined}
+                  aria-invalid={chatMissing || topicChatCountInvalid || undefined}
                 />
-                {groupOptions.length > 0 ? (
+                <small className="schedule-form-help">{tr('schedules.form.chatManualHelp')}</small>
+                {selectorOptions.length > 0 || groups.length > 0 ? (
                   <button
                     type="button"
                     className="schedule-form-link"
-                    onClick={() => { setChatManual(false); setChatId(''); }}
+                    onClick={() => setChatManual(false)}
                   >
                     {tr('schedules.form.chatBackToSelect')}
                   </button>
@@ -1998,6 +2239,8 @@ function ScheduleFormModal(props: {
             )}
             {chatMissing ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errChatRequired')}</small>
+            ) : topicChatCountInvalid ? (
+              <small className="schedule-form-error-inline">{tr('schedules.form.errTopicSingleChat')}</small>
             ) : null}
           </div>
         ) : null}
@@ -2019,7 +2262,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="top-level"
                   checked={executionPosition === 'top-level'}
-                  onChange={() => setExecutionPosition('top-level')}
+                  onChange={() => updateExecutionPosition('top-level')}
                 />
                 {tr('schedules.deliveryTopLevel')}
               </label>
@@ -2029,7 +2272,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="topic"
                   checked={executionPosition === 'topic'}
-                  onChange={() => setExecutionPosition('topic')}
+                  onChange={() => updateExecutionPosition('topic')}
                 />
                 {tr('schedules.deliveryThread')}
               </label>
@@ -2039,10 +2282,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="new-topic"
                   checked={executionPosition === 'new-topic'}
-                  onChange={() => {
-                    setExecutionPosition('new-topic');
-                    setSilent(false);
-                  }}
+                  onChange={() => updateExecutionPosition('new-topic')}
                 />
                 {tr('schedules.deliveryNewTopic')}
               </label>
