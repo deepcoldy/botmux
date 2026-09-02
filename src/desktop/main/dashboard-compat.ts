@@ -2,7 +2,7 @@ import type { DashboardLocateResult } from '../shared/types.js';
 
 const supportedDashboardProtocolVersion = 2;
 const defaultCompatTimeoutMs = 3000;
-const cliUpgradeHint = '请升级或切换全局 botmux CLI 后重启运行时；源码开发可执行 pnpm switch:here && botmux restart。也可以先在外部浏览器打开控制台。';
+const cliUpgradeHint = '请升级或切换全局 botmux CLI 后重启运行时；源码开发可执行 bun run switch:here && bun run daemon:restart。也可以先在外部浏览器打开控制台。';
 
 type DashboardCompatFailureReason = Extract<DashboardLocateResult, { ok: false }>['reason'];
 

@@ -3194,7 +3194,7 @@ function runInCheckout(cwd: string, command: string, args: string[]): void {
 }
 
 /**
- * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → pnpm build →
+ * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → bun run build →
  * 从本 checkout 的 dist/cli.js restart。dist/ 被 gitignore，只 pull 不 build
  * 重启后跑的还是旧代码，故 build 步不可省。定位/干净检查/命令定义与 dashboard
  * 共用 src/utils/local-dev-update.ts，避免两边逻辑漂移。
@@ -3209,7 +3209,7 @@ function cmdUpgradeLocalDev(): void {
 
   // git 干净检查 + pull + build 全程握同一把跨进程 update 锁（与 dashboard 的
   // /api/update/run 用的是同一个 target），避免 CLI 与 dashboard 同时对同一
-  // checkout 交错跑 pnpm build 而互相清理/覆盖 dist。restart 不在锁内——它有
+  // checkout 交错跑 bun run build 而互相清理/覆盖 dist。restart 不在锁内——它有
   // 自己的 restart lease。
   try {
     const lockTarget = globalInstallUpdateLockTarget();
@@ -3229,7 +3229,7 @@ function cmdUpgradeLocalDev(): void {
         err.dirtyStatus = status;
         throw err;
       }
-      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ pnpm build。
+      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ bun run build。
       for (const { command, args } of localDevUpdateSteps()) {
         console.log(`→ ${command} ${args.join(' ')}`);
         runInCheckout(dir, command, args);

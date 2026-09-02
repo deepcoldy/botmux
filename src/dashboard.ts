@@ -1608,7 +1608,7 @@ let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
 // Local-dev counterpart: the checkout a successful /api/update/run built, and
 // its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
-// build's target — not a wrapper that a concurrent `pnpm use:here` in another
+// build's target — not a wrapper that a concurrent `bun run use:here` in another
 // worktree may have re-pointed between the two requests (run builds B, wrapper
 // flips to C, restart would otherwise restart C or fall back to A). Cleared
 // once consumed by a restart. A plain "restart" (no preceding run) still
@@ -1694,7 +1694,7 @@ function currentInstalledVersion(): string {
 
 /**
  * Local-dev update: git-clean check (fail closed) → git pull --ff-only →
- * pnpm build, all in the checkout the global wrapper points at. Mirrors the CLI
+ * bun run build, all in the checkout the global wrapper points at. Mirrors the CLI
  * `cmdUpgradeLocalDev` via the shared local-dev-update helpers. Returns the
  * checkout dir, its version before/after, and whether HEAD advanced; the caller
  * applies the restart through the existing lease/intent path. A successful
@@ -4212,7 +4212,7 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
-      // 本地 checkout：走 git pull --ff-only + pnpm build（与 CLI cmdUpgradeLocalDev
+      // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
       if (isLocalDevInstall()) {
