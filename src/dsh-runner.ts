@@ -200,8 +200,8 @@ function ensureProfileDir(name: string, dshBin: string): string {
   mkdirSync(dir, { recursive: true });
 
   const pkgJson = join(dir, 'package.json');
-  const isNew = !existsSync(pkgJson);
-  if (isNew) {
+  const isNewSkeleton = !existsSync(pkgJson);
+  if (isNewSkeleton) {
     const pkg = {
       name: `dsh-profile-${name}`,
       private: true,
@@ -252,16 +252,26 @@ function ensureProfileDir(name: string, dshBin: string): string {
     writeFileSync(cordisPatchYml, patch, 'utf8');
   }
 
-  // Install profile dependencies. dsh plugin add uses the profile's package
-  // manager (pnpm) to install the declared dependencies into node_modules.
-  // We only need to trigger this once on new profiles; existing profiles
-  // already have their node_modules. dsh-sdk-jsonrpc-server has no dsh.bundle
-  // so this won't touch cordis.patch.yml.
-  if (isNew) {
-    spawnSync(dshBin, ['plugin', '--profile', name, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
+  // Install profile dependencies. Keyed on node_modules existence, not
+  // package.json — if the install fails (offline, registry down, etc.)
+  // the skeleton files are already on disk but node_modules is not, so
+  // the next run will retry the install. We warn but don't throw here:
+  // the runner is a subprocess — the worker will see the dsh startup fail
+  // with a clear "Cannot find package" error, which is more actionable
+  // than a silent runner crash.
+  const nodeModules = join(dir, 'node_modules');
+  if (!existsSync(nodeModules)) {
+    const result = spawnSync(dshBin, ['plugin', '--profile', name, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
       stdio: 'pipe',
       timeout: 120_000,
     });
+    if (result.status !== 0 || result.error) {
+      const stderr = result.stderr?.toString().trim() || '';
+      process.stderr.write(`[botmux:dsh] install deps failed for profile "${name}" (exit ${result.status ?? 'error'}): ${stderr || result.error?.message || 'unknown error'}\n`);
+      // Don't throw — the runner is a subprocess. The dsh binary will fail
+      // to start with a clear "Cannot find package" error, and the worker
+      // will surface that to the user.
+    }
   }
 
   return dir;

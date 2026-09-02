@@ -853,8 +853,8 @@ function createDshProfile(name: string): string {
   // dsh judges a profile's existence by its package.json (not the directory
   // or cordis.yml). Non-shipped profiles must include the dsh-base bundle.
   const pkgJson = join(profileDir, 'package.json');
-  const isNew = !existsSync(pkgJson);
-  if (isNew) {
+  const isNewSkeleton = !existsSync(pkgJson);
+  if (isNewSkeleton) {
     const pkg = {
       name: `dsh-profile-${name}`,
       private: true,
@@ -901,10 +901,12 @@ function createDshProfile(name: string): string {
     writeFileSync(cordisPatchYml, patch, 'utf8');
   }
 
-  // Install profile dependencies via managed-spawn (redacted env — no Feishu
-  // H5 credentials for the child). Only on new profiles; existing ones already
-  // have their node_modules.
-  if (isNew) {
+  // Install profile dependencies. Keyed on node_modules existence, not
+  // package.json — if the install fails the skeleton files are on disk but
+  // node_modules is not, so the next run retries. Fails loud on error so the
+  // dashboard POST handler can surface it to the caller.
+  const nodeModules = join(profileDir, 'node_modules');
+  if (!existsSync(nodeModules)) {
     const dshBin = resolveCommandReal('dsh');
     installDshProfileDeps(name, dshBin);
   }
