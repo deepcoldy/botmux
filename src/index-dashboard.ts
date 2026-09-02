@@ -14,7 +14,13 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import {
+  scrubClaudeSessionMarkerEnv,
+  scrubInvokerTerminalEnv,
+  scrubSessionCliHomeEnv,
+  scrubSessionTurnMarkerEnv,
+  scrubWorkflowWorkerEnv,
+} from './utils/child-env.js';
 import { loadDashboardEnvFile } from './utils/dashboard-env.js';
 
 // Same pipe topology as the daemon: under pm2 the dashboard's stdout/stderr are
@@ -55,9 +61,14 @@ loadDashboardEnvFile(existsSync(globalEnv) ? globalEnv : '.env');
 //    sets no app id.
 //  - BOTMUX_OWNER_OPEN_ID/__OWNER_OPEN_ID: app-scoped owner identity of the
 //    issuing session; stale by definition here.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_OWNER_OPEN_ID', '__OWNER_OPEN_ID']) {
-  delete process.env[k];
-}
+// Turn-scoped session identity and capabilities of the invoking bot session
+// (routing ids, MCP gateway socket, sandbox verdicts, ...) — same canonical
+// list index-daemon.ts scrubs. The hand-picked 7-key subset this used to be
+// had fallen behind that list (e.g. BOTMUX_MCP_GATEWAY_SOCKET, IS_SANDBOX
+// were never in it), silently letting a growing set of session-only values
+// ride into every child this process forks (debug terminals, start/stop-bot
+// CLI runs, the detached update/restart driver).
+scrubSessionTurnMarkerEnv(process.env);
 // CLAUDE_CONFIG_DIR / CODEX_HOME: per-session CLI data roots. No dashboard
 // consumer; inherited into a debug-terminal CLI they redirect it into the
 // leaking bot's home.
@@ -71,6 +82,11 @@ scrubClaudeSessionMarkerEnv(process.env);
 // dist/dashboard.js directly, bypassing this entry; doing it here as well keeps
 // the new boundary complete without relying on that legacy call.
 scrubWorkflowWorkerEnv(process.env);
+// Invoker-terminal fingerprints (NO_COLOR=1 / CODEX_CI=1 / PAGER=cat from a
+// non-interactive restart shell): inherited into a forked debug terminal they
+// render it colorless. Re-pin TERM after, same constant index-daemon.ts uses.
+scrubInvokerTerminalEnv(process.env);
+process.env.TERM = 'xterm-256color';
 // Deliberately NOT scrubbed, unlike index-daemon.ts: the Feishu H5 family
 // (BOTMUX_DASHBOARD_FEISHU_H5_*). The dashboard process is its single
 // legitimate consumer — delivering it is this entry point's purpose. The

@@ -259,6 +259,18 @@ describe('stripDashboardH5Env()', () => {
     expect(stripAt).toBeGreaterThan(dotenvAt);
   });
 
+  it('is also called by index-supervisor.ts after its own wholesale dotenv (source pin)', () => {
+    // index-supervisor.ts dotenv-loads the same ~/.botmux/.env wholesale as
+    // index-daemon.ts, and resolveFleetDaemonEnv() spreads this process's env
+    // into every supervised member — an unstripped secret would sit in this
+    // long-lived process and ride into every bot daemon and the dashboard.
+    const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
+    const dotenvAt = src.indexOf('dotenvConfig(');
+    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
+    expect(dotenvAt).toBeGreaterThan(-1);
+    expect(stripAt).toBeGreaterThan(dotenvAt);
+  });
+
   it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
     const src = readFileSync(new URL('../src/core/maintenance.ts', import.meta.url), 'utf-8');
     const fn = src.slice(src.indexOf('export function detachedRestartEnv('));
@@ -595,6 +607,22 @@ describe('session CLI home scrub call sites', () => {
     // TERM-less — the zmx backend's sessions inherit that env verbatim (no
     // node-pty `name` to force TERM) and their CLIs render colorless.
     expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
+  });
+
+  it('the fleet supervisor and dashboard entry also scrub invoker-terminal fingerprints and turn markers', () => {
+    // Same two key families as the daemon-boot pin above, at the two other
+    // long-lived boundaries: resolveFleetDaemonEnv() bakes the supervisor's
+    // own (post-scrub) process.env into every daemon child + the dashboard,
+    // and the dashboard entry forks debug terminals / start-stop-bot CLI runs
+    // straight from its own process.env. Both used to scrub only a hand-picked
+    // 7-key subset of session identity and never touched invoker-terminal
+    // fingerprints at all — the gap this test closes.
+    for (const rel of ['index-supervisor.ts', 'index-dashboard.ts']) {
+      const src = read(rel);
+      expect(src, rel).toContain('scrubInvokerTerminalEnv(process.env)');
+      expect(src, rel).toContain('scrubSessionTurnMarkerEnv(process.env)');
+      expect(src, rel).toContain("process.env.TERM = 'xterm-256color'");
+    }
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
