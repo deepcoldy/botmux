@@ -117,6 +117,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -10045,7 +10046,18 @@ async function postCurrentSessionDaemonRoute(input: {
 }
 
 async function cmdDispatch(rest: string[]): Promise<void> {
-  if (rest.includes('--help') || rest.includes('-h')) {
+  const parsedArgs = parseDispatchArgs(rest);
+  if (!parsedArgs.ok) {
+    console.error(JSON.stringify({
+      success: false,
+      errorCode: parsedArgs.errorCode,
+      detail: parsedArgs.error,
+      ...(parsedArgs.option ? { option: parsedArgs.option } : {}),
+    }));
+    process.exit(2);
+  }
+  const dispatchArgs = parsedArgs.value;
+  if (dispatchArgs.help) {
     console.log(`botmux dispatch — 开子项目话题、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
 
 用法:
@@ -10088,18 +10100,18 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   assertTurnTransportOrExit('dispatch');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const sessionIdArg = argValue(rest, '--session-id');
-  const title = argValue(rest, '--title') ?? '';
-  const briefFile = argValue(rest, '--brief-file');
-  const overrideChatId = argValue(rest, '--chat-id');
-  const repo = argValue(rest, '--repo');
-  const intoRoot = argValue(rest, '--into');
-  const standby = rest.includes('--standby');
-  const steer = rest.includes('--steer');
-  const botSpecs = argValues(rest, '--bot');
-  const botAppSpecs = argValues(rest, '--bot-app');
+  const sessionIdArg = dispatchArgs.sessionId;
+  const title = dispatchArgs.title ?? '';
+  const briefFile = dispatchArgs.briefFile;
+  const overrideChatId = dispatchArgs.chatId;
+  const repo = dispatchArgs.repo;
+  const intoRoot = dispatchArgs.into;
+  const standby = dispatchArgs.standby;
+  const steer = dispatchArgs.steer;
+  const botSpecs = dispatchArgs.bots;
+  const botAppSpecs = dispatchArgs.botApps;
 
-  let brief = argValue(rest, '--brief') ?? '';
+  let brief = dispatchArgs.brief ?? '';
   if (briefFile) {
     if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
     brief = readFileSync(briefFile, 'utf-8');
