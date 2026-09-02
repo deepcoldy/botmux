@@ -8,6 +8,21 @@ import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 
 const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
 
+/**
+ * `npm pack --dry-run --json` changed its top-level shape across npm majors:
+ * older npm (bundled with Node 22, what CI runs) prints a single-element
+ * ARRAY — `[{ name, files, ... }]`; npm 12+ prints an OBJECT keyed by package
+ * name — `{ "botmux": { files, ... } }` — MEASURED on npm 12.0.1. A probe that
+ * only reads `[0]` silently gets `undefined` on the newer shape instead of a
+ * loud parse error, which is exactly backwards for a test whose job is
+ * asserting an absence (see the tarball test below). Support both so this
+ * probe means the same thing on every npm major that ships it.
+ */
+function parseNpmPackReport(stdout: string, packageName: string): { files: Array<{ path: string }> } {
+  const parsed = JSON.parse(stdout);
+  return Array.isArray(parsed) ? parsed[0] : parsed[packageName];
+}
+
 function runNodeScript(script: string, env: NodeJS.ProcessEnv) {
   const r = spawnSync(NODE_BIN, [script], { encoding: 'utf-8', env });
   const decode = (v: unknown): string => {
@@ -106,7 +121,7 @@ describe('package.json — lockfile safety and packaging', () => {
     // vacuous-green direction for a test whose whole job is an absence claim.
     expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
     expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
-    const paths: string[] = JSON.parse(packed.stdout)[0].files.map((f: { path: string }) => f.path);
+    const paths: string[] = parseNpmPackReport(packed.stdout, manifest.name).files.map((f: { path: string }) => f.path);
     // Proof the probe saw a real file list, so the absence assertions below have
     // something to be absent FROM.
     expect(paths).toContain('package.json');
@@ -122,6 +137,14 @@ describe('package.json — lockfile safety and packaging', () => {
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.
     expect(paths).not.toContain('ecosystem.config.cjs');
+  });
+
+  it('parseNpmPackReport() reads both npm-major shapes of `npm pack --json`', () => {
+    const files = [{ path: 'package.json', size: 1, mode: 420 }];
+    // Array shape: older npm (Node 22's bundled npm, what CI runs).
+    expect(parseNpmPackReport(JSON.stringify([{ name: 'botmux', files }]), 'botmux').files).toEqual(files);
+    // Object-keyed-by-name shape: npm 12+ — MEASURED on npm 12.0.1.
+    expect(parseNpmPackReport(JSON.stringify({ botmux: { name: 'botmux', files } }), 'botmux').files).toEqual(files);
   });
 
   it('declares no entry point that the tarball does not contain', () => {
