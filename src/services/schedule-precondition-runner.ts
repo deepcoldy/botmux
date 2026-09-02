@@ -117,6 +117,10 @@ export function runSchedulePrecondition(
     let terminalError: SchedulePreconditionError | undefined;
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let closeResult: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
+    let stdoutEnded = false;
+    let stderrEnded = false;
+    let promptEnded = false;
 
     let child: ReturnType<typeof spawnBash>;
     try {
@@ -182,48 +186,15 @@ export function runSchedulePrecondition(
       }
     };
 
-    const stdoutStream = child.stdout;
-    const stderrStream = child.stderr;
-    const promptStream = child.stdio[3];
-    if (!stdoutStream || !stderrStream || !promptStream) {
-      // Bun may expose null stdio handles when spawn has already failed (for
-      // example, an absent cwd) and emit the process error just afterwards.
-      // A missing pid distinguishes that case from a started child whose pipes
-      // could not be initialized, so preserve the actionable spawn failure.
-      if (child.pid === undefined) {
-        finishReject(new SchedulePreconditionError(
-          'spawn_failed',
-          'Scheduled task precondition could not start /bin/bash',
-        ));
+    const finishAfterStreamsEnd = (): void => {
+      if (
+        settled || terminalError || !closeResult
+        || !stdoutEnded || !stderrEnded || !promptEnded
+      ) {
         return;
       }
-      terminateProcessGroup(child);
-      finishReject(new SchedulePreconditionError(
-        'spawn_failed',
-        'Scheduled task precondition could not initialize Bash output pipes',
-      ));
-      return;
-    }
-
-    stdoutStream.on('data', chunk => collect(stdout, chunk));
-    // stderr contributes to the resource limit but is deliberately not copied
-    // into the persisted scheduler error: schedule rows can be shown on a
-    // public read-only dashboard, and condition diagnostics may contain secrets.
-    stderrStream.on('data', chunk => collect(undefined, chunk));
-    promptStream.on('data', collectPrompt);
-
-    // If Bash exits while an ordinary background child still holds an output
-    // pipe open, Node's `close` event would otherwise wait for that child.
-    // Reap the remaining process group before evaluating the captured result.
-    child.once('exit', () => terminateProcessGroup(child));
-
-    child.once('close', (exitCode, signal) => {
-      if (settled) return;
       if (timer) clearTimeout(timer);
-      if (terminalError) {
-        finishReject(terminalError);
-        return;
-      }
+      const { exitCode, signal } = closeResult;
       if (exitCode !== 0) {
         const exitDescription = exitCode === null
           ? `signal ${signal ?? 'unknown'}`
@@ -257,6 +228,49 @@ export function runSchedulePrecondition(
       resolve(additionalPrompt.length > 0
         ? { decision: 'pass', additionalPrompt }
         : { decision: 'pass' });
+    };
+
+    const stdoutStream = child.stdout;
+    const stderrStream = child.stderr;
+    const promptStream = child.stdio[3];
+    if (!stdoutStream || !stderrStream || !promptStream) {
+      // Bun may expose null stdio handles when spawn has already failed (for
+      // example, an absent cwd) and emit the process error just afterwards.
+      // A missing pid distinguishes that case from a started child whose pipes
+      // could not be initialized, so preserve the actionable spawn failure.
+      if (child.pid === undefined) {
+        finishReject(new SchedulePreconditionError(
+          'spawn_failed',
+          'Scheduled task precondition could not start /bin/bash',
+        ));
+        return;
+      }
+      terminateProcessGroup(child);
+      finishReject(new SchedulePreconditionError(
+        'spawn_failed',
+        'Scheduled task precondition could not initialize Bash output pipes',
+      ));
+      return;
+    }
+
+    stdoutStream.on('data', chunk => collect(stdout, chunk));
+    // stderr contributes to the resource limit but is deliberately not copied
+    // into the persisted scheduler error: schedule rows can be shown on a
+    // public read-only dashboard, and condition diagnostics may contain secrets.
+    stderrStream.on('data', chunk => collect(undefined, chunk));
+    promptStream.on('data', collectPrompt);
+    stdoutStream.once('end', () => { stdoutEnded = true; finishAfterStreamsEnd(); });
+    stderrStream.once('end', () => { stderrEnded = true; finishAfterStreamsEnd(); });
+    promptStream.once('end', () => { promptEnded = true; finishAfterStreamsEnd(); });
+
+    // If Bash exits while an ordinary background child still holds an output
+    // pipe open, Node's `close` event would otherwise wait for that child.
+    // Reap the remaining process group before evaluating the captured result.
+    child.once('exit', () => terminateProcessGroup(child));
+
+    child.once('close', (exitCode, signal) => {
+      closeResult = { exitCode, signal };
+      finishAfterStreamsEnd();
     });
 
     timer = setTimeout(() => {
