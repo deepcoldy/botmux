@@ -12,7 +12,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -64,6 +64,39 @@ const tempRoots: string[] = [];
 let inProcessServer: Server | null = null;
 
 /**
+ * Is `pid` its own process-group LEADER (pgid === pid)?
+ *
+ * This is the precondition that makes the group kill below safe, and it is NOT
+ * self-evident from the call site: `process.kill(-N)` signals "the group whose
+ * pgid is N", not "pid N and its descendants". A child spawned WITHOUT
+ * `detached` sits in the PARENT's group, so `-childPid` names whatever group
+ * happens to carry that number — usually nothing (ESRCH), but a recycled pid
+ * that some `setsid` process once led can still have a live orphaned group, and
+ * then the kill lands on unrelated processes.
+ *
+ * `process.getpgid` does not exist on Node 22 or Bun 1.4 (verified on both), so
+ * the check reads field 5 of `/proc/<pid>/stat` — the fields after the `comm`
+ * parenthesis are (state, ppid, pgrp, …), and `comm` itself may contain spaces
+ * or parentheses, hence slicing from the LAST `)`.
+ *
+ * Unknown ⇒ false ⇒ the caller falls back to a single-process kill. That is the
+ * safe direction: the grandchild case is Linux-only, and on any platform where
+ * this cannot be answered there is no grandchild to reap.
+ */
+function isOwnGroupLeader(pid: number): boolean {
+  try {
+    const getpgid = (process as unknown as { getpgid?: (p: number) => number }).getpgid;
+    if (typeof getpgid === 'function') return getpgid(pid) === pid;
+    if (process.platform !== 'linux') return false;
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return Number(afterComm[2]) === pid;
+  } catch {
+    return false; /* unreadable → treat as "not a leader" */
+  }
+}
+
+/**
  * Kill the child's whole PROCESS GROUP, not just the child.
  *
  * `GRANDCHILD_SCRIPT` deliberately spawns a grandchild (that is the point of the
@@ -72,17 +105,19 @@ let inProcessServer: Server | null = null;
  * one leaked listener per run, each holding a port and ~40MB. On this host that
  * had accumulated to 738 orphans / ~28GB PSS before it was noticed.
  *
- * `startChild` spawns detached, so each child is its own group leader and
- * `kill(-pid)` reaches the grandchildren too. The negative pid needs
- * `process.kill`; `child.kill()` only ever signals the one process.
+ * `startChild` spawns detached so each child leads its own group — but that
+ * coupling lives in a different function, so it is asserted here rather than
+ * assumed: a group kill is only issued for a confirmed group leader. The
+ * negative pid needs `process.kill`; `child.kill()` only ever signals the one
+ * process.
  */
 function killChildTree(child: ChildProcess): void {
   const pid = child.pid;
-  if (pid !== undefined) {
+  if (pid !== undefined && isOwnGroupLeader(pid)) {
     try {
       process.kill(-pid, 'SIGKILL');
       return;
-    } catch { /* group already gone, or platform without process groups */ }
+    } catch { /* group already gone */ }
   }
   try { child.kill('SIGKILL'); } catch { /* already gone */ }
 }
