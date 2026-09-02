@@ -316,7 +316,12 @@ describe.skipIf(process.platform !== 'linux')('P1-12 preview listener ownership 
     // itself, so ppid === 1 would never fire there. This test only asserts the
     // change-triggered exit; the reparenting target (init or subreaper) is
     // irrelevant to the criterion.
-    const WATCHDOG = 'const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 100);';
+    // Reuse the SHARED watchdog (the same one injected into LISTEN_SCRIPT /
+    // REBIND_SCRIPT / GRANDCHILD_SCRIPT), sped up 10x so the test doesn't wait
+    // a full second per tick. Reusing the constant is load-bearing: if someone
+    // hollows out ORPHAN_WATCHDOG, this positive control fails too — an inline
+    // copy would prove "a watchdog works" but not "the scripts have one".
+    const WATCHDOG = ORPHAN_WATCHDOG.replace('1000);', '100);');
     const NO_WATCHDOG = 'setInterval(() => {}, 100);';
     // Each grandparent spawns a grandchild and exits after the grandchild has
     // started (1000ms, ~20x Node startup), so the grandchild records its
