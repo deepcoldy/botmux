@@ -540,7 +540,8 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).not.toContain('setInterval(');
   });
 
-  it('states the scheduler-log boundary and keeps the dialog usable on small screens', () => {
+  it('moves the scheduler-log boundary behind an accessible model-submission tooltip', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
     const zh = createDashboardTranslator('zh');
     const en = createDashboardTranslator('en');
@@ -552,6 +553,16 @@ describe('dashboard schedules React page helpers', () => {
     expect(zh('schedules.logs.boundary')).toContain('不代表模型已完成');
     expect(zh('schedules.logs.emptyHint')).toContain('仅展示升级后产生的记录');
     expect(en('schedules.logs.boundary')).toContain('does not mean the model finished');
+    expect(page).toMatch(
+      /<dt>\s*<FieldTitle\s+help=\{tr\('schedules\.logs\.boundary'\)\}\s+helpLabel=\{tr\('schedules\.logs\.boundary'\)\}\s*>\s*\{tr\('schedules\.logs\.modelInvocation'\)\}\s*<\/FieldTitle>\s*<\/dt>/,
+    );
+    expect(page).not.toContain('className="schedule-run-log-boundary"');
+    expect(css).not.toContain('.schedule-run-log-boundary');
+  });
+
+  it('keeps the run-log dialog usable on small screens', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
     expect(css).toMatch(/\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:/);
     expect(css).toMatch(/@media \(max-width: 720px\) \{[\s\S]*?\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:\s*1fr/);
     expect(css).toMatch(/\.schedule-run-log-list-panel \{[\s\S]*?min-height:\s*0/);

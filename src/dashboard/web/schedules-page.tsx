@@ -5,6 +5,7 @@ import { useStoreSelector, useT } from './react-hooks.js';
 import {
   CreateActionButton,
   DropdownMenu,
+  FieldTitle,
   LoadingState,
   OverviewList,
   OverviewListItem,
@@ -743,7 +744,14 @@ function ScheduleRunLogDialog(props: {
                         <dd>{preconditionLabel(selected.precondition)}</dd>
                       </div>
                       <div>
-                        <dt>{tr('schedules.logs.modelInvocation')}</dt>
+                        <dt>
+                          <FieldTitle
+                            help={tr('schedules.logs.boundary')}
+                            helpLabel={tr('schedules.logs.boundary')}
+                          >
+                            {tr('schedules.logs.modelInvocation')}
+                          </FieldTitle>
+                        </dt>
                         <dd>{selected.outcome === 'model_dispatched'
                           ? tr('schedules.logs.yes')
                           : tr('schedules.logs.no')}</dd>
@@ -765,9 +773,6 @@ function ScheduleRunLogDialog(props: {
                         ) : null}
                       </div>
                     ) : null}
-                    <p className="schedule-run-log-boundary" role="note">
-                      {tr('schedules.logs.boundary')}
-                    </p>
                   </>
                 ) : null}
               </section>

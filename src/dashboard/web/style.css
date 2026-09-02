@@ -28176,17 +28176,6 @@ button.schedule-run-log-row:focus-visible {
   font-weight: 500;
 }
 
-.schedule-run-log-boundary {
-  margin: 14px 0 0;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-soft));
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.55;
-}
-
 @media (max-width: 720px) {
   .schedule-run-log-dialog {
     width: calc(100vw - 16px);
