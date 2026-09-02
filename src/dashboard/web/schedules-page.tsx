@@ -917,14 +917,6 @@ function ScheduleRowCard(props: {
           ) : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
-          {s.lastStatus === 'error' ? (
-            <span
-              className="schedule-error-chip"
-              title={typeof s.lastError === 'string' ? s.lastError : undefined}
-            >
-              ⚠ {tr('schedules.error')}: {typeof s.lastError === 'string' && s.lastError.length > 60 ? s.lastError.slice(0, 60) + '…' : (s.lastError ?? tr('schedules.errorUnknown'))}
-            </span>
-          ) : null}
           <span>{tr('schedules.repeat')}: {repeatLabel(s)}</span>
         </div>
       </OverviewListMain>

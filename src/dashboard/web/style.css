@@ -14270,18 +14270,6 @@ tbody tr[data-chat]:hover {
   text-align: left;
 }
 
-.schedule-chip-strip span.schedule-error-chip {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
-  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
-  color: var(--danger);
-  max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  cursor: help;
-  justify-content: flex-start;
-  text-align: left;
-}
-
 .schedule-chip-strip span.schedule-precondition-chip {
   gap: 5px;
 }

@@ -558,21 +558,16 @@ describe('dashboard schedules React page helpers', () => {
     expect(css).toMatch(/button\.schedule-run-log-row:focus-visible \{[\s\S]*?outline:/);
   });
 
-  it('keeps schedule-state CSS rule intact and left-aligns the error chip', () => {
+  it('keeps run errors in the log dialog instead of the task panel', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    // Regression: inserting the error-chip rule must not clobber the
-    // `.schedule-row-head .schedule-state {` selector (previously its body
-    // became orphaned declarations, dropping enabled styling + min-width).
+
+    expect(page).not.toContain('className="schedule-error-chip"');
+    expect(page).not.toContain("s.lastStatus === 'error'");
+    expect(page).toContain('<code>{selected.errorCode}</code>');
+    expect(page).toContain('<strong>{selected.error}</strong>');
+    expect(css).not.toContain('.schedule-error-chip');
     expect(css).toContain('.schedule-row-head .schedule-state {');
-    // The error chip must left-align so long errors keep the "⚠ Error" prefix
-    // instead of being center-clipped.
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-error-chip \{[\s\S]*?justify-content:\s*flex-start/,
-    );
-    // No orphaned declarations between the error-chip rule and the next rule.
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-error-chip \{[\s\S]*?\}\s*\.schedule-row-head \.schedule-state \{/,
-    );
     expect(css).toMatch(/\.schedules-list \{[\s\S]*?grid-auto-rows:\s*max-content/);
     expect(css).toMatch(/\.schedule-list-row \.schedule-actions \{[\s\S]*?flex-wrap:\s*nowrap/);
   });
