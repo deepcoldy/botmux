@@ -154,6 +154,31 @@ describe('plugin card action gateway', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it('内置 action 始终先交给 Botmux，旧 registry 里的冲突声明也不能覆盖', async () => {
+    const record = makeRecord('hijack', { actions: ['close', 'generic_submit'], prefixes: ['dash_'] });
+    const request = vi.fn(async () => successResponse());
+    const fallbackResult = { toast: { type: 'info' as const, content: 'builtin' } };
+    const fallback = vi.fn(async () => fallbackResult);
+    const gateway = createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      fallback,
+    });
+
+    await expect(gateway.dispatch({ action: { value: { action: 'close' } } }, 'cli_current'))
+      .resolves.toBe(fallbackResult);
+    await expect(gateway.dispatch({ action: { value: { action: 'dash_overview_refresh' } } }, 'cli_current'))
+      .resolves.toBe(fallbackResult);
+    await expect(gateway.dispatch({
+      action: { name: 'generic_submit', value: { key: 'codex_app_thread_select' } },
+    }, 'cli_current')).resolves.toBe(fallbackResult);
+    expect(fallback).toHaveBeenCalledTimes(3);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('按确定性规则选择或熔断动作声明', async () => {
     const broad = makeRecord('broad', { prefixes: ['example.'] });
     const narrow = makeRecord('narrow', { prefixes: ['example.review.'] });
@@ -228,6 +253,53 @@ describe('plugin card action gateway', () => {
     request.mockResolvedValueOnce(successResponse());
     await expect(gateway.dispatch(data, 'cli_current')).resolves.toMatchObject({ toast: { type: 'success' } });
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('插件响应卡只能继续使用本插件 selector，且不能注入 Botmux 路由字段', async () => {
+    const record = makeRecord('response-actions', { prefixes: ['example.'] });
+    const shadowingRecord = makeRecord('exact-actions', { actions: ['example.other'] });
+    const log = testLog();
+    const response = (card: Record<string, unknown>) => new Response(JSON.stringify({
+      schemaVersion: 1,
+      ack: { card },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const request = vi.fn()
+      .mockResolvedValueOnce(response({
+        schema: '2.0',
+        body: { elements: [{ tag: 'button', value: { action: 'example.submit' } }] },
+      }))
+      .mockResolvedValueOnce(response({
+        schema: '2.0',
+        // This still matches response-actions' broad prefix, but the live
+        // routing table gives the exact selector to another enabled plugin.
+        body: { elements: [{ tag: 'button', value: { action: 'example.other' } }] },
+      }))
+      .mockResolvedValueOnce(response({
+        schema: '2.0',
+        body: { elements: [{ tag: 'button', value: { action: 'example.submit', key: 'close' } }] },
+      }))
+      .mockResolvedValueOnce(response({
+        schema: '2.0',
+        body: { elements: [{ tag: 'button', value: { action: 'close' } }] },
+      }));
+    const gateway = createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id, shadowingRecord.id],
+      readRegistry: () => registryOf(record, shadowingRecord),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      log,
+    });
+    const data = { action: { value: { action: 'example.submit' } } };
+
+    await expect(gateway.dispatch(data, 'cli_current')).resolves.toMatchObject({
+      card: { type: 'raw', data: { schema: '2.0' } },
+    });
+    await expect(gateway.dispatch(data, 'cli_current')).resolves.toBeUndefined();
+    await expect(gateway.dispatch(data, 'cli_current')).resolves.toBeUndefined();
+    await expect(gateway.dispatch(data, 'cli_current')).resolves.toBeUndefined();
+    expect(request).toHaveBeenCalledTimes(4);
+    expect(log.warn.mock.calls.flat().join('\n')).toContain('invalid_plugin_card_action_card_callback');
   });
 
   it('rejects oversized requests before dialing and never retries a failed delivery', async () => {

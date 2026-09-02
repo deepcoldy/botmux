@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { assertSafePluginRelativePath, resolvePluginPath } from './paths.js';
 import { loadSkillPackage } from '../skills/package.js';
+import { pluginCardActionSelectorOverlapsBotmux } from '../card-action-namespace.js';
 import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
@@ -183,6 +184,12 @@ const readCardActionSelectors = (raw: unknown, field: 'actions' | 'actionPrefixe
   const selectors = raw.map((value) => {
     if (!isCardActionSelector(value)) {
       throw new Error(`invalid_plugin_card_${field}_selector`);
+    }
+    if (pluginCardActionSelectorOverlapsBotmux(
+      value,
+      field === 'actions' ? 'action' : 'prefix',
+    )) {
+      throw new Error(`plugin_card_${field}_selector_reserved:${value}`);
     }
     return value;
   });

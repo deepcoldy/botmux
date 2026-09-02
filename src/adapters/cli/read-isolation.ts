@@ -352,8 +352,9 @@ export function buildSeatbeltProfile(
 //     rejected, so validators no longer need to tolerate `state===undefined`.)
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
-// cold-spawns under the current contract rather than bypassing a migration.
-export const ISOLATION_PANE_MARKER_VERSION = 11;
+// cold-spawns under the current contract rather than bypassing a migration. Version
+// 12 adds the session-scoped plugin-card selector snapshot to the pane contract.
+export const ISOLATION_PANE_MARKER_VERSION = 12;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

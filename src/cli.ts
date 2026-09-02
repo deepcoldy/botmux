@@ -264,6 +264,7 @@ import {
 import { recordVcMeetingListenerMessage } from './services/vc-meeting-listener-message-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import type { PluginCardActionRoutingRecord } from './core/plugins/card-actions/gateway.js';
 import {
   assertPluginBindingTransition,
   describePluginDependencyError,
@@ -7332,6 +7333,19 @@ async function relaySend(
   if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
+  if (flagPresentButValueMissing(rest, '--plugin-card-action')) {
+    console.error('relay: --plugin-card-action 需要 plugin id');
+    process.exit(2);
+  }
+  const pluginCardActionId = argValue(rest, '--plugin-card-action');
+  if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
+    console.error(`relay: 无效 plugin id: ${pluginCardActionId}`);
+    process.exit(2);
+  }
+  if (pluginCardActionId !== undefined && cardJsonArg === undefined && cardFile === undefined) {
+    console.error('relay: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
+    process.exit(2);
+  }
   let cardContent = '';
   if (cardJsonArg !== undefined && cardFile !== undefined) {
     console.error('relay: --card-json 与 --card-file 不能同时使用');
@@ -7413,11 +7427,12 @@ async function relaySend(
     copyOutboxAttachment(p, videoCovers);
   }
 
-  // Forward only presentation flags (must match the watcher's allowlist); path,
+  // Forward only presentation flags plus the bounded plugin-card selector
+  // identity (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -8597,40 +8612,60 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     let callbackPolicy: { allowsAction(action: string): boolean } | undefined;
     if (pluginCardActionId) {
-      const { loadBotConfigs: loadPluginTargetBotConfigs } = await import('./bot-registry.js');
-      const pluginTargetBot = loadPluginTargetBotConfigs()
-        .find(bot => bot.larkAppId === s.larkAppId);
-      if (!pluginTargetBot) {
-        console.error(`botmux send: 找不到当前 Bot 配置 (${s.larkAppId})`);
-        process.exit(2);
+      const {
+        parsePluginCardActionCapabilitiesSnapshot,
+        pluginCardActionCapabilityRecords,
+        PLUGIN_CARD_ACTION_CAPABILITIES_ENV,
+      } = await import('./core/plugins/card-actions/capabilities.js');
+      const capabilityRaw = process.env[PLUGIN_CARD_ACTION_CAPABILITIES_ENV];
+      let enabledRecords: PluginCardActionRoutingRecord[];
+      if (capabilityRaw !== undefined) {
+        const snapshot = parsePluginCardActionCapabilitiesSnapshot(capabilityRaw);
+        if (!snapshot) {
+          console.error('botmux send: 当前会话的插件卡片能力快照无效');
+          process.exit(2);
+        }
+        enabledRecords = pluginCardActionCapabilityRecords(snapshot);
+        if (!enabledRecords.some(record => record.id === pluginCardActionId)) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前会话启用或未声明 cardActions`);
+          process.exit(2);
+        }
+      } else {
+        // Standalone, non-managed CLI keeps the host-file fallback. Managed
+        // local-isolated and remote sessions receive the public snapshot above
+        // and therefore never need bots.json / registry / service state here.
+        const { loadBotConfigs: loadPluginTargetBotConfigs } = await import('./bot-registry.js');
+        const pluginTargetBot = loadPluginTargetBotConfigs()
+          .find(bot => bot.larkAppId === s.larkAppId);
+        if (!pluginTargetBot) {
+          console.error(`botmux send: 找不到当前 Bot 配置 (${s.larkAppId})`);
+          process.exit(2);
+        }
+        const enabledPluginIds = resolveEffectivePluginIds(
+          pluginTargetBot,
+          readGlobalConfig(),
+        );
+        if (!enabledPluginIds.includes(pluginCardActionId)) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前 Bot 启用`);
+          process.exit(2);
+        }
+        const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+        const registry = readPluginRegistry();
+        enabledRecords = enabledPluginIds
+          .map(id => registry.plugins[id])
+          .filter((record): record is NonNullable<typeof record> => record !== undefined);
+        if (!enabledRecords.some(record => (
+          record.id === pluginCardActionId && record.contributions?.cardActions
+        ))) {
+          console.error(`botmux send: 插件 ${pluginCardActionId} 未声明 cardActions`);
+          process.exit(2);
+        }
       }
-      const enabledPluginIds = resolveEffectivePluginIds(
-        pluginTargetBot,
-        readGlobalConfig(),
-      );
-      if (!enabledPluginIds.includes(pluginCardActionId)) {
-        console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前 Bot 启用`);
-        process.exit(2);
-      }
-      const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
-      const registry = readPluginRegistry();
-      const pluginRecord = registry.plugins[pluginCardActionId];
-      if (!pluginRecord?.contributions?.cardActions) {
-        console.error(`botmux send: 插件 ${pluginCardActionId} 未声明 cardActions`);
-        process.exit(2);
-      }
-      const { readPluginServiceState } = await import('./core/plugins/service-manager.js');
-      const serviceState = readPluginServiceState(pluginCardActionId);
-      if (serviceState?.status !== 'online') {
-        console.error(`botmux send: 插件 ${pluginCardActionId} 的 host service 未在线`);
-        process.exit(2);
-      }
-      const enabledRecords = enabledPluginIds
-        .map(id => registry.plugins[id])
-        .filter((record): record is NonNullable<typeof record> => record !== undefined);
       const { resolvePluginCardActionRoute } = await import('./core/plugins/card-actions/gateway.js');
+      const { isBotmuxCardAction } = await import('./core/card-action-namespace.js');
       callbackPolicy = {
         allowsAction(action: string): boolean {
+          if (isBotmuxCardAction(action)) return false;
           const route = resolvePluginCardActionRoute(enabledRecords, action);
           return route.kind === 'matched' && route.record.id === pluginCardActionId;
         },

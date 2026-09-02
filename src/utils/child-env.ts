@@ -343,6 +343,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // capability plus a fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  // Public per-session plugin action selectors. This lets isolated and remote
+  // CLIs validate interactive cards without reading host-only plugin files.
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
@@ -477,6 +480,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Session-scoped MCP gateway capability + fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
   // boot (daemon.ts), so an inherited copy is always a stale foreign port.
   'BOTMUX_DAEMON_IPC_PORT',

@@ -180,7 +180,7 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
 });
 
 
-// ── validateRelayRequest: pure schema + flag-allowlist boundary (UNCHANGED) ──
+// ── validateRelayRequest: pure schema + flag-allowlist boundary ─────────────
 // Regression for the "sandbox makes host read an arbitrary path" confused-deputy
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
@@ -275,6 +275,32 @@ describe('validateRelayRequest', () => {
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.cardName).toBe('card.json');
     expect(r.value.flags).toEqual(['--no-mention']);
+  });
+
+  it('allows only a valid plugin id with a relayed custom card', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--plugin-card-action', '../escape'],
+    })).toMatchObject({
+      ok: false,
+      error: 'flag --plugin-card-action must be a valid plugin id',
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'],
+    })).toMatchObject({
+      ok: false,
+      error: 'flag --plugin-card-action requires a card file',
+    });
   });
 
   it('validates and preserves a frozen relay origin', () => {

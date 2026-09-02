@@ -679,6 +679,8 @@ describe('plugin manifest and registry basics', () => {
       ['empty-selectors', { schemaVersion: 1, actions: [], actionPrefixes: [], endpoint: '/actions' }],
       ['empty-selector', { schemaVersion: 1, actions: [''], endpoint: '/actions' }],
       ['duplicate-selector', { schemaVersion: 1, actions: ['example.go', 'example.go'], endpoint: '/actions' }],
+      ['reserved-action', { schemaVersion: 1, actions: ['close'], endpoint: '/actions' }],
+      ['reserved-prefix', { schemaVersion: 1, actionPrefixes: ['dash_'], endpoint: '/actions' }],
       ['remote-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: 'https://example.test/actions' }],
       ['query-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions?next=remote' }],
       ['escape-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/safe/%2e%2e/escape' }],

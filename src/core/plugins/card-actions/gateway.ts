@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import type { CardActionData } from '../../../im/lark/card-handler.js';
 import { loopbackFetch, type LoopbackFetchInit } from '../../loopback-fetch.js';
 import { logger } from '../../../utils/logger.js';
+import { isBotmuxCardAction } from '../../card-action-namespace.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readPluginServiceState } from '../service-manager.js';
 import type {
@@ -42,9 +43,11 @@ export interface PluginCardActionGatewayOptions {
   now?: () => number;
 }
 
+export type PluginCardActionRoutingRecord = Pick<InstalledPluginRecord, 'id' | 'contributions'>;
+
 export type PluginCardActionRouteResolution =
   | { kind: 'unmatched' }
-  | { kind: 'matched'; record: InstalledPluginRecord; contribution: PluginCardActionsContribution }
+  | { kind: 'matched'; record: PluginCardActionRoutingRecord; contribution: PluginCardActionsContribution }
   | { kind: 'conflict'; pluginIds: string[]; selectorType: 'action' | 'prefix'; selector: string };
 
 const safeLogField = (value: unknown, fallback = '?'): string => {
@@ -64,7 +67,7 @@ const safeErrorCode = (error: unknown): string => {
   return 'plugin_card_action_internal_error';
 };
 
-const contributionFor = (record: InstalledPluginRecord): PluginCardActionsContribution | undefined => {
+const contributionFor = (record: PluginCardActionRoutingRecord): PluginCardActionsContribution | undefined => {
   const contribution = record.contributions?.cardActions;
   if (!contribution || contribution.schemaVersion !== PLUGIN_CARD_ACTION_SCHEMA_VERSION) return undefined;
   if (
@@ -93,12 +96,12 @@ const boundedLimit = (candidate: number | undefined, maximum: number): number =>
 };
 
 export const resolvePluginCardActionRoute = (
-  records: readonly InstalledPluginRecord[],
+  records: readonly PluginCardActionRoutingRecord[],
   actionName: string,
 ): PluginCardActionRouteResolution => {
   const candidates = records
     .map(record => ({ record, contribution: contributionFor(record) }))
-    .filter((entry): entry is { record: InstalledPluginRecord; contribution: PluginCardActionsContribution } => (
+    .filter((entry): entry is { record: PluginCardActionRoutingRecord; contribution: PluginCardActionsContribution } => (
       entry.contribution !== undefined
     ));
 
@@ -206,8 +209,9 @@ const resolveGatewayOptions = (
 
 const forwardPluginCardAction = async (
   options: ResolvedPluginCardActionGatewayOptions,
-  record: InstalledPluginRecord,
+  record: PluginCardActionRoutingRecord,
   contribution: PluginCardActionsContribution,
+  enabledRecords: readonly PluginCardActionRoutingRecord[],
   data: CardActionData,
   larkAppId: string,
   actionName: string,
@@ -249,7 +253,15 @@ const forwardPluginCardAction = async (
     } catch {
       throw new Error('invalid_plugin_card_action_response_json');
     }
-    return parsePluginCardActionResponse(parsed);
+    return parsePluginCardActionResponse(parsed, {
+      callbackPolicy: {
+        allowsAction(candidate) {
+          if (isBotmuxCardAction(candidate)) return false;
+          const callbackRoute = resolvePluginCardActionRoute(enabledRecords, candidate);
+          return callbackRoute.kind === 'matched' && callbackRoute.record.id === record.id;
+        },
+      },
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -260,13 +272,28 @@ const dispatchPluginCardAction = async (
   data: CardActionData,
   larkAppId: string,
 ): Promise<unknown> => {
+  // key/root_id are Botmux's legacy session-routing discriminators. Plugin
+  // cards are prohibited from emitting them, so their presence unambiguously
+  // belongs to the built-in handler even when action.name happens to collide
+  // with a plugin selector.
+  const actionValue = data.action?.value;
+  if (
+    typeof actionValue?.key === 'string'
+    || typeof actionValue?.root_id === 'string'
+  ) return options.fallback?.(data, larkAppId);
   const actionName = pluginCardActionName(data);
   if (!actionName) return options.fallback?.(data, larkAppId);
+  // Core owns these selectors even if an older/tampered registry contains a
+  // colliding plugin declaration. Keep this runtime fence in addition to the
+  // install-time scanner so upgrades cannot leave existing Botmux cards
+  // shadowed until every plugin is reinstalled.
+  if (isBotmuxCardAction(actionName)) return options.fallback?.(data, larkAppId);
 
   let route: PluginCardActionRouteResolution;
+  let records: PluginCardActionRoutingRecord[];
   try {
     const registry = options.readRegistry();
-    const records = [...new Set(options.resolvePluginIds(larkAppId))]
+    records = [...new Set(options.resolvePluginIds(larkAppId))]
       .map(pluginId => registry.plugins[pluginId])
       .filter((record): record is InstalledPluginRecord => record !== undefined);
     route = resolvePluginCardActionRoute(records, actionName);
@@ -290,7 +317,15 @@ const dispatchPluginCardAction = async (
 
   const startedAt = options.now();
   try {
-    const result = await forwardPluginCardAction(options, route.record, route.contribution, data, larkAppId, actionName);
+    const result = await forwardPluginCardAction(
+      options,
+      route.record,
+      route.contribution,
+      records,
+      data,
+      larkAppId,
+      actionName,
+    );
     options.log.info(
       `[plugin-card-action] app=${safeLogField(larkAppId)} action=${safeLogField(actionName)} `
       + `plugin=${safeLogField(route.record.id)} status=ok `

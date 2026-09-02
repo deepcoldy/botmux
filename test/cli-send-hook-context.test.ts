@@ -70,6 +70,13 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
   });
 
+  it('preserves plugin-card ownership across the sandbox host relay', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    expect(relaySend).toContain("'--plugin-card-action'");
+  });
+
   it('strips trailing memory citations before relay and direct-send rendering', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);

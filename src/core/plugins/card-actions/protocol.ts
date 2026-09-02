@@ -1,4 +1,8 @@
 import type { CardActionData } from '../../../im/lark/card-handler.js';
+import {
+  findDisallowedCardCallback,
+  type InteractiveCardCallbackPolicy,
+} from '../../card-callback-policy.js';
 
 export const PLUGIN_CARD_ACTION_SCHEMA_VERSION = 1 as const;
 export const PLUGIN_CARD_ACTION_REQUEST_MAX_BYTES = 256 * 1024;
@@ -108,7 +112,10 @@ const parseToast = (value: unknown): PluginCardActionToast => {
   return { type, content };
 };
 
-export const parsePluginCardActionResponse = (value: unknown): PluginCardActionAck | undefined => {
+export const parsePluginCardActionResponse = (
+  value: unknown,
+  options: { callbackPolicy?: InteractiveCardCallbackPolicy } = {},
+): PluginCardActionAck | undefined => {
   if (!isRecord(value) || value.schemaVersion !== PLUGIN_CARD_ACTION_SCHEMA_VERSION) {
     throw new Error('invalid_plugin_card_action_response_schema');
   }
@@ -120,6 +127,9 @@ export const parsePluginCardActionResponse = (value: unknown): PluginCardActionA
   const toast = hasToast ? parseToast(ack.toast) : undefined;
   if (hasCard && !isRecord(ack.card)) throw new Error('invalid_plugin_card_action_card');
   const card = hasCard ? ack.card as Record<string, unknown> : undefined;
+  if (card && findDisallowedCardCallback(card, 'card', options.callbackPolicy)) {
+    throw new Error('invalid_plugin_card_action_card_callback');
+  }
   if (!toast && !card) return undefined;
   const result: PluginCardActionAck = {};
   if (toast) result.toast = toast;

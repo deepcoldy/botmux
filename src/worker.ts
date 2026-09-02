@@ -150,6 +150,12 @@ import {
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import {
+  buildPluginCardActionCapabilitiesSnapshot,
+  PLUGIN_CARD_ACTION_CAPABILITIES_ENV,
+  serializePluginCardActionCapabilitiesSnapshot,
+} from './core/plugins/card-actions/capabilities.js';
 import {
   loadBotConfigs,
   resolveBrandLabel,
@@ -1531,10 +1537,9 @@ function stopSessionMcpGatewayHost(): void {
   });
 }
 
-function refreshCliPluginGeneration(
+function resolvePluginGenerationBot(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  adapter: CliAdapter,
-): void {
+): Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> {
   let bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> = {
     larkAppId: cfg.larkAppId,
     plugins: cfg.pluginBindings,
@@ -1545,6 +1550,14 @@ function refreshCliPluginGeneration(
   } catch (err) {
     log(`Plugin generation: using init-time Bot config because bots.json could not be read: ${err instanceof Error ? err.message : err}`);
   }
+  return bot;
+}
+
+function refreshCliPluginGeneration(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): void {
+  const bot = resolvePluginGenerationBot(cfg);
 
   const generation = prepareCliPluginGeneration({
     sessionId: cfg.sessionId,
@@ -1578,6 +1591,28 @@ function refreshCliPluginGeneration(
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
+}
+
+function pluginCardActionCapabilitiesEnv(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): string {
+  try {
+    const bot = resolvePluginGenerationBot(cfg);
+    const pluginIds = resolveEffectivePluginIds(
+      bot,
+      readGlobalConfig(),
+    );
+    return serializePluginCardActionCapabilitiesSnapshot(
+      buildPluginCardActionCapabilitiesSnapshot(pluginIds),
+    );
+  } catch (error) {
+    log(
+      `Plugin card-action capabilities unavailable; using an empty fail-closed snapshot: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return '{"schemaVersion":1,"plugins":[]}';
+  }
 }
 
 /** Refresh the process-scoped Skill/MCP snapshot and bring up the trusted MCP
@@ -12635,6 +12670,7 @@ async function spawnCli(
     ? 'dsh-tui'
     : cfg.cliId as CliId;
   cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
+  const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
   // worker re-probes the requested persistent backend here. A requested
@@ -12831,6 +12867,7 @@ async function spawnCli(
     (riffBackendConfig as EffectiveMojoConfig).env = {
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
@@ -12858,6 +12895,7 @@ async function spawnCli(
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
     // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
@@ -12908,6 +12946,11 @@ async function spawnCli(
     // it again here to prevent a stale/forged remote value from desynchronising
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
+    // Public selector metadata is a host-resolved session snapshot. It is only
+    // a send-time validation hint (the daemon reauthorizes every callback), but
+    // still freeze it after raw riff env merges so stale config cannot desync
+    // the card a remote CLI is allowed to construct from this generation.
+    mergedEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
     // The workflow kill-switch is likewise a host-resolved snapshot. Re-freeze it
     // AFTER the merge: unlike per-bot `env` (sanitizePerBotEnv strips the BOTMUX*
     // prefix), `riffCfg.env` merges LAST and is NOT sanitized, so a stale or
@@ -14088,6 +14131,7 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';

@@ -23,18 +23,18 @@ Botmux 统一持有每个飞书应用的长连接、回调 ACK、传输去重和
 }
 ```
 
-`actions` 和 `actionPrefixes` 都可省略，但至少一个数组必须非空。selector 必须是最长 256 字符的静态安全字符串，同一数组内不能重复。`endpoint` 只能是以 `/` 开头的相对 HTTP path，不能包含 scheme、host、query、hash、反斜杠或 `..` 路径段。
+`actions` 和 `actionPrefixes` 都可省略，但至少一个数组必须非空。selector 必须是最长 256 字符的静态安全字符串，同一数组内不能重复，也不能与 Botmux 内置 action 或其保留前缀重叠。`endpoint` 只能是以 `/` 开头的相对 HTTP path，不能包含 scheme、host、query、hash、反斜杠或 `..` 路径段。
 
 安装时 scanner 会拒绝缺少 service、schema 错误或路径不安全的声明。registry 和 materialized marker 只记录 `actions`、`actionPrefixes` 和 `endpoint`，不记录回调正文或鉴权信息。
 
 ### 路由优先级
 
-路由只查看当前 `larkAppId` 的 global + Bot 级有效插件，并在每次回调时重新读取持久化配置：
+路由只查看当前 `larkAppId` 的 global + Bot 级有效插件，并在每次回调时重新读取持久化配置。Botmux 内置 action 先于插件路由处理；即使旧版本写入或本机篡改的 registry 含有冲突 selector，也不能覆盖内置 handler。其余插件 action 按以下规则解析：
 
 1. 精确 `actions` 命中优先于所有 prefix；
 2. 没有精确命中时，选择最长的 `actionPrefixes`；
 3. 同一作用域内有多个插件声明相同精确 action，或者相同且最终命中的 prefix，当前动作 fail closed；
-4. 没有插件命中时，才调用 Botmux 既有卡片 handler；插件已经认领的动作即使服务不可用，也不会回退到内建 handler。
+4. 没有插件命中时，调用 Botmux 既有卡片 handler；插件已经认领的非内置动作即使服务不可用，也不会回退到内建 handler。
 
 因此，启用范围不会跨 Bot 泄漏，窄 namespace 可以确定性覆盖宽 namespace，安装顺序不能抢占动作。
 
@@ -116,7 +116,7 @@ Content-Type: application/json
 }
 ```
 
-`ack` 可以省略或为空。`toast.type` 仅接受 `success`、`info`、`warning`、`error`；`card` 必须是 JSON object。重定向、非 2xx、非法 JSON/schema、超限响应、连接失败、离线状态和超时都会被隔离为合法空 ACK，不会让共享长连接退出。
+`ack` 可以省略或为空。`toast.type` 仅接受 `success`、`info`、`warning`、`error`；`card` 必须是 JSON object。插件返回的新卡片若继续带 callback，只能使用该插件已经声明的 selector；`key`、`root_id` 等 Botmux 内部路由字段始终禁止。重定向、非 2xx、非法 JSON/schema、越权 callback、超限响应、连接失败、离线状态和超时都会被隔离为合法空 ACK，不会让共享长连接退出。
 
 ## ACK、慢响应与幂等
 
@@ -126,6 +126,7 @@ Botmux 会用稳定 `eventId` 阻止长连接重推造成的重复投递，并�
 
 ## 生命周期与观测
 
+- Worker 在每个真实 CLI generation 启动时注入一份只含 plugin id、selector 和相对 endpoint 的公开能力快照。`botmux send --plugin-card-action` 用它做发卡前校验，因此 macOS read isolation 和 Riff/Mojo 远程会话不需要读取宿主的 `bots.json`、plugin registry 或 service state；独立运行且不受管的 CLI 才保留宿主文件 fallback。能力快照不是回调权限，daemon 收到点击后仍按实时 Bot 绑定、registry、service state 和私有 token 重新校验；
 - enable/disable 在下一次回调时生效；disable 只停止能力路由，保持既有 service 生命周期语义；
 - service restart 保持 token，新的 state port 会被下一次回调读取，不需要重启 daemon；
 - Lark WebSocket reconnect 复用同一 dispatcher，不会注册重复 handler；
