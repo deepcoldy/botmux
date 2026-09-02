@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react';
 import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
@@ -13,7 +19,8 @@ import {
   OverviewListTail,
   RefreshIconButton,
 } from './dashboard-components.js';
-import { chatDisplayTitle, loadNameMaps } from './ui.js';
+import { store } from './store.js';
+import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
@@ -33,6 +40,7 @@ type ScheduleBotOption = {
 };
 type ScheduleAction = 'run' | 'pause' | 'resume';
 type ActionFeedback = 'success' | 'error';
+type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
 type ScheduleRunLogEntry = {
   id: string;
   taskId: string;
@@ -40,11 +48,15 @@ type ScheduleRunLogEntry = {
   startedAt: string;
   finishedAt: string;
   durationMs: number;
-  outcome: 'model_dispatched' | 'precondition_skipped' | 'error';
+  outcome: ScheduleRunOutcome;
   precondition: 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
   additionalPrompt: boolean;
   errorCode?: string;
   error?: string;
+};
+type ScheduleRunHistoryPreview = {
+  logs: ScheduleRunLogEntry[];
+  total: number;
 };
 type ScheduleRunLogPage = {
   logs: ScheduleRunLogEntry[];
@@ -57,6 +69,7 @@ export type PreconditionEditMode = 'keep' | 'inline' | 'file';
 type PreconditionHelpSource = 'inline' | 'file';
 const RUN_ACTION_MIN_PENDING_MS = 1000;
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
+const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f .ready; then
   printf '1\n'
 else
@@ -453,6 +466,71 @@ export function formatScheduleRepeat(
 ): string | null {
   if (!repeat) return null;
   return `${repeat.completed}/${repeat.times ?? '∞'}`;
+}
+
+export function scheduleRunHistoryForBackdrop<T extends { outcome: ScheduleRunOutcome }>(
+  newestFirst: readonly T[],
+): T[] {
+  return newestFirst.slice(0, SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT).reverse();
+}
+
+export function countScheduleRunHistory(
+  logs: readonly { outcome: ScheduleRunOutcome }[],
+): Record<ScheduleRunOutcome, number> {
+  const counts: Record<ScheduleRunOutcome, number> = {
+    model_dispatched: 0,
+    precondition_skipped: 0,
+    error: 0,
+  };
+  for (const log of logs) counts[log.outcome] += 1;
+  return counts;
+}
+
+function isScheduleRunOutcome(value: unknown): value is ScheduleRunOutcome {
+  return value === 'model_dispatched' || value === 'precondition_skipped' || value === 'error';
+}
+
+async function fetchScheduleRunHistoryPreview(
+  taskId: string,
+  signal: AbortSignal,
+): Promise<ScheduleRunHistoryPreview> {
+  const response = await fetch(
+    `/api/schedules/${encodeURIComponent(taskId)}/logs?limit=${SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT}&offset=0`,
+    { signal },
+  );
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`invalid_response: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!response.ok) {
+    const error = body && typeof body === 'object' && 'error' in body
+      ? String((body as { error?: unknown }).error ?? response.status)
+      : String(response.status);
+    throw new Error(error);
+  }
+  if (
+    !body
+    || typeof body !== 'object'
+    || !Array.isArray((body as { logs?: unknown }).logs)
+    || typeof (body as { total?: unknown }).total !== 'number'
+  ) {
+    throw new Error('invalid_response');
+  }
+  const rawLogs = (body as { logs: unknown[] }).logs;
+  if (rawLogs.some(log => (
+    !log
+    || typeof log !== 'object'
+    || typeof (log as { id?: unknown }).id !== 'string'
+    || !isScheduleRunOutcome((log as { outcome?: unknown }).outcome)
+  ))) {
+    throw new Error('invalid_response');
+  }
+  return {
+    logs: rawLogs as ScheduleRunLogEntry[],
+    total: Math.max(0, Math.floor((body as { total: number }).total)),
+  };
 }
 
 function delay(ms: number): Promise<void> {
@@ -871,6 +949,23 @@ export function canSubmitSchedule(
   return checkSchedule(normalized, tr, timeZone).ok;
 }
 
+function scheduleRunHistoryLabel(
+  preview: ScheduleRunHistoryPreview | null,
+  tr: ReturnType<typeof useT>,
+): string | undefined {
+  if (!preview) return undefined;
+  const displayed = scheduleRunHistoryForBackdrop(preview.logs);
+  if (displayed.length === 0) return tr('schedules.logs.emptyTitle');
+  const counts = countScheduleRunHistory(displayed);
+  return tr('schedules.logs.backgroundSummary', {
+    shown: displayed.length,
+    total: preview.total,
+    dispatched: counts.model_dispatched,
+    skipped: counts.precondition_skipped,
+    failed: counts.error,
+  });
+}
+
 function ScheduleRowCard(props: {
   schedule: ScheduleRow;
   scheduleTimeZone?: string;
@@ -889,8 +984,61 @@ function ScheduleRowCard(props: {
   const toggleKey = `${s.id}:${toggleOp}`;
   const runKey = `${s.id}:run`;
   const repeat = formatScheduleRepeat(s.repeat);
+  const [runHistory, setRunHistory] = useState<ScheduleRunHistoryPreview | null>(null);
+  const displayedRunHistory = runHistory
+    ? scheduleRunHistoryForBackdrop(runHistory.logs)
+    : [];
+  const runHistoryLabel = scheduleRunHistoryLabel(runHistory, tr);
+  const openLogsLabel = runHistoryLabel
+    ? `${tr('schedules.logs.open')} · ${runHistoryLabel}`
+    : tr('schedules.logs.open');
+
+  useEffect(() => {
+    if (!ui.authed) {
+      setRunHistory(null);
+      return;
+    }
+    let activeController: AbortController | null = null;
+    let disposed = false;
+    const loadHistory = async (): Promise<void> => {
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+      try {
+        const preview = await fetchScheduleRunHistoryPreview(s.id, controller.signal);
+        if (!disposed && !controller.signal.aborted) setRunHistory(preview);
+      } catch (error) {
+        if (disposed || controller.signal.aborted) return;
+        console.warn(
+          `[schedule-run-history] Failed to load task ${s.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    void loadHistory();
+    const unsubscribe = store.onScheduleRunLogsChanged(taskId => {
+      if (taskId === undefined || taskId === s.id) void loadHistory();
+    });
+    return () => {
+      disposed = true;
+      activeController?.abort();
+      unsubscribe();
+    };
+  }, [s.id]);
+
   return (
-    <OverviewListItem kind="schedule" className="schedule-list-row" data-id={s.id}>
+    <OverviewListItem
+      kind="schedule"
+      className="schedule-list-row"
+      data-id={s.id}
+      title={runHistoryLabel}
+    >
+      {displayedRunHistory.length > 0 ? (
+        <span className="schedule-run-log-fill" aria-hidden="true">
+          {displayedRunHistory.map(entry => (
+            <i key={entry.id} className={`outcome-${entry.outcome}`} />
+          ))}
+        </span>
+      ) : null}
       <OverviewListMain>
         <div className="schedule-row-head">
           <b>{s.name ?? s.id}</b>
@@ -943,7 +1091,8 @@ function ScheduleRowCard(props: {
             aria-haspopup="dialog"
             aria-controls="schedule-run-log-dialog"
             onClick={event => props.onOpenLogs(s, event.currentTarget)}
-            title={tr('schedules.logs.open')}
+            aria-label={openLogsLabel}
+            title={openLogsLabel}
           >
             <span className="schedule-action-label">{tr('schedules.logs.open')}</span>
           </button>

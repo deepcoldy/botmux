@@ -44,6 +44,9 @@ class Store {
   // /api/bots fetch), so relay them through a dedicated listener set instead of
   // bumping the snapshot version. Signature-deduped server-side.
   private botsListeners = new Set<() => void>();
+  // Run history is intentionally not part of Schedule rows. The schedules page
+  // uses this narrow signal to refresh its task-local, read-only log preview.
+  private scheduleRunLogListeners = new Set<(taskId?: string) => void>();
 
   setScheduleTimeZone(tz: string) {
     if (typeof tz === 'string' && tz && this.scheduleTimeZone !== tz) {
@@ -66,6 +69,9 @@ class Store {
     if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
     this.bootstrapped = true;
     this.emit();
+    if (schedules !== null) {
+      for (const fn of this.scheduleRunLogListeners) fn();
+    }
   }
   applySse(type: string, body: any) {
     if (type === 'session.spawned') {
@@ -83,6 +89,11 @@ class Store {
       if (cur) this.schedules.set(body.id, { ...cur, ...body.patch });
     } else if (type === 'schedule.deleted') {
       this.schedules.delete(body.id);
+    } else if (type === 'schedule.fired') {
+      if (typeof body?.id === 'string') {
+        for (const fn of this.scheduleRunLogListeners) fn(body.id);
+      }
+      return; // history lives behind the task-scoped log endpoint
     } else if (type === 'schedule.timezone') {
       // Effective schedule timezone changed (settings save → daemon realign) —
       // re-render all schedule times in the new zone without a page reload.
@@ -93,11 +104,15 @@ class Store {
       for (const fn of this.botsListeners) fn();
       return; // no snapshot mutation — bots aren't cached here
     } else {
-      return; // heartbeat / schedule.fired — no cache mutation
+      return; // heartbeat — no cache mutation
     }
     this.emit();
   }
   onBotsChanged(fn: () => void) { this.botsListeners.add(fn); return () => this.botsListeners.delete(fn); }
+  onScheduleRunLogsChanged(fn: (taskId?: string) => void) {
+    this.scheduleRunLogListeners.add(fn);
+    return () => this.scheduleRunLogListeners.delete(fn);
+  }
   setOnline(v: boolean) {
     if (this.online !== v) { this.online = v; this.emit(); }
   }

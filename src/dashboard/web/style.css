@@ -14179,6 +14179,8 @@ tbody tr[data-chat]:hover {
 }
 
 .schedule-list-row {
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   column-gap: 16px;
@@ -14187,6 +14189,41 @@ tbody tr[data-chat]:hover {
   height: auto;
   min-height: 84px;
   padding: 11px 12px;
+}
+
+.schedule-run-log-fill {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.schedule-run-log-fill > i {
+  display: block;
+  flex: 1 1 0;
+  min-width: 0;
+  box-shadow: inset -1px 0 color-mix(in srgb, var(--surface) 30%, transparent);
+}
+
+.schedule-run-log-fill > .outcome-model_dispatched {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.schedule-run-log-fill > .outcome-precondition_skipped {
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+
+.schedule-run-log-fill > .outcome-error {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.schedule-list-row > .overview-list-main,
+.schedule-list-row > .overview-list-tail {
+  position: relative;
+  z-index: 1;
 }
 
 .schedule-list-row .overview-list-main {

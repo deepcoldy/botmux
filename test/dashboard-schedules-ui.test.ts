@@ -6,10 +6,12 @@ import {
   buildSchedulePreconditionFormFields,
   canSubmitSchedule,
   checkSchedule,
+  countScheduleRunHistory,
   filterSchedules,
   formatScheduleRepeat,
   formatScheduleRunDuration,
   fmtScheduleDate,
+  scheduleRunHistoryForBackdrop,
   schedulePreconditionEditorInitialState,
   schedulePreconditionPathExample,
   scheduleExecutionPlacement,
@@ -125,6 +127,70 @@ describe('dashboard schedules React page helpers', () => {
     );
     expect(zh('schedules.repeat')).toBe('执行次数');
     expect(en('schedules.repeat')).toBe('Run count');
+  });
+
+  it('fills task backgrounds with the latest run outcomes from older to newer', () => {
+    const newestFirst = [
+      { id: 'newest', outcome: 'error' as const },
+      { id: 'middle', outcome: 'precondition_skipped' as const },
+      { id: 'oldest', outcome: 'model_dispatched' as const },
+    ];
+    const original = [...newestFirst];
+
+    expect(scheduleRunHistoryForBackdrop(newestFirst).map(entry => entry.id))
+      .toEqual(['oldest', 'middle', 'newest']);
+    expect(newestFirst).toEqual(original);
+    expect(countScheduleRunHistory(newestFirst)).toEqual({
+      model_dispatched: 1,
+      precondition_skipped: 1,
+      error: 1,
+    });
+
+    const moreThanOnePage = Array.from({ length: 51 }, (_, index) => ({
+      id: `run-${index}`,
+      outcome: 'model_dispatched' as const,
+    }));
+    const capped = scheduleRunHistoryForBackdrop(moreThanOnePage);
+    expect(capped).toHaveLength(50);
+    expect(capped[0]?.id).toBe('run-49');
+    expect(capped.at(-1)?.id).toBe('run-0');
+  });
+
+  it('renders the run history as a non-interactive semantic-color backdrop', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+
+    expect(page).toContain('if (!ui.authed)');
+    expect(page).toContain('store.onScheduleRunLogsChanged');
+    expect(page).toContain('className="schedule-run-log-fill" aria-hidden="true"');
+    expect(page).toContain('className={`outcome-${entry.outcome}`}');
+    expect(page).toContain('aria-label={openLogsLabel}');
+    expect(zh('schedules.logs.backgroundSummary', {
+      shown: 3,
+      total: 8,
+      dispatched: 1,
+      skipped: 1,
+      failed: 1,
+    })).toContain('最近 3/8 次执行');
+
+    expect(css).toMatch(/\.schedule-run-log-fill \{[\s\S]*?pointer-events:\s*none/);
+    expect(css).toMatch(/\.schedule-run-log-fill > i \{[\s\S]*?flex:\s*1 1 0/);
+    expect(css).toMatch(/\.outcome-model_dispatched \{[\s\S]*?var\(--accent\)/);
+    expect(css).toMatch(/\.outcome-precondition_skipped \{[\s\S]*?var\(--warning\)/);
+    expect(css).toMatch(/\.outcome-error \{[\s\S]*?var\(--danger\)/);
+    expect(css).toMatch(/\.schedule-list-row > \.overview-list-main,[\s\S]*?z-index:\s*1/);
+  });
+
+  it('invalidates only the fired task history and all histories after a snapshot refresh', () => {
+    const invalidated: Array<string | undefined> = [];
+    const unsubscribe = store.onScheduleRunLogsChanged(taskId => invalidated.push(taskId));
+
+    store.applySse('schedule.fired', { id: 'task-fired', status: 'ok' });
+    store.replaceSnapshot([], [{ id: 'task-snapshot' }]);
+    unsubscribe();
+
+    expect(invalidated).toEqual(['task-fired', undefined]);
   });
 
   it('prefills revealed preconditions and keeps a fail-safe for incomplete legacy projections', () => {
@@ -464,7 +530,7 @@ describe('dashboard schedules React page helpers', () => {
 
   it('shows the target chat in both the schedule row and edit dialog', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain("import { chatDisplayTitle, loadNameMaps } from './ui.js';");
+    expect(page).toContain("import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';");
     // Row chip: dedicated class so a long (Chinese) chat name can be width-capped
     // + ellipsised instead of overrunning into the action buttons.
     expect(page).toContain('className="schedule-chat-chip"');
