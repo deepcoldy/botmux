@@ -63,10 +63,32 @@ const children: ChildProcess[] = [];
 const tempRoots: string[] = [];
 let inProcessServer: Server | null = null;
 
-afterEach(async () => {
-  for (const child of children.splice(0)) {
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+/**
+ * Kill the child's whole PROCESS GROUP, not just the child.
+ *
+ * `GRANDCHILD_SCRIPT` deliberately spawns a grandchild (that is the point of the
+ * lineage test), and both scripts hold an idle `setInterval`. Killing only the
+ * direct child left every grandchild reparented to init and running forever:
+ * one leaked listener per run, each holding a port and ~40MB. On this host that
+ * had accumulated to 738 orphans / ~28GB PSS before it was noticed.
+ *
+ * `startChild` spawns detached, so each child is its own group leader and
+ * `kill(-pid)` reaches the grandchildren too. The negative pid needs
+ * `process.kill`; `child.kill()` only ever signals the one process.
+ */
+function killChildTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch { /* group already gone, or platform without process groups */ }
   }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+}
+
+afterEach(async () => {
+  for (const child of children.splice(0)) killChildTree(child);
   for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
   if (inProcessServer) {
     await new Promise<void>(resolve => inProcessServer!.close(() => resolve()));
@@ -77,6 +99,10 @@ afterEach(async () => {
 function startChild(script: string, args: string[] = []): ChildProcess {
   const child = spawn(process.execPath, ['-e', script, ...args], {
     stdio: ['ignore', 'pipe', 'ignore'],
+    // Own process group, so afterEach can reap the grandchildren too
+    // (see killChildTree). Not unref'd: these children stay tracked in
+    // `children` and are killed explicitly.
+    detached: true,
   });
   children.push(child);
   return child;
