@@ -91,7 +91,7 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
       // Preserve argValue's historical treatment of dash-prefixed values. A
       // quoted Markdown list (`--brief '- item'`) and values such as `-x` are
       // data, not proof that this option was omitted.
-      if (optionValue === undefined || optionValue === '') {
+      if (optionValue === undefined) {
         return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
       }
       if (equals < 0) index += 1;

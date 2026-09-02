@@ -42,6 +42,11 @@ describe('parseDispatchArgs', () => {
     expect(result).toMatchObject({ ok: true, value: { brief: '  keep me  ' } });
   });
 
+  it('preserves explicit empty values for downstream legacy validation and fallback', () => {
+    expect(parseDispatchArgs(['--title', '', '--brief=', '--repo=']))
+      .toMatchObject({ ok: true, value: { title: '', brief: '', repo: '' } });
+  });
+
   it('preserves legacy dash-prefixed values in space-separated form', () => {
     expect(parseDispatchArgs(['--brief', '- item one']))
       .toMatchObject({ ok: true, value: { brief: '- item one' } });
@@ -72,7 +77,7 @@ describe('parseDispatchArgs', () => {
     });
   });
 
-  it.each(['--title', '--bot-app', '--brief-file='])(
+  it.each(['--title', '--bot-app'])(
     'rejects missing value for %s',
     (option) => {
       const result = parseDispatchArgs([option]);
