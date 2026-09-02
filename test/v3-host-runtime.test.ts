@@ -701,7 +701,29 @@ describe('v3 host runtime', () => {
         },
         { baseDir: base, gateMode: 'blocking', resolvedWorkflowData: runtimeData },
       );
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Pump the fake clock INCREMENTALLY (50ms steps) rather than as one
+      // `advanceTimersByTimeAsync(20_000)` jump. Identical 20s of virtual time
+      // under both runners — the assertions below are unchanged — but the loop
+      // is what makes this case runnable under `bun test`:
+      //
+      // The runtime re-arms its retry sleep one at a time:
+      //   `if (!settled) await new Promise((resolve) => setTimeout(resolve, 1_000));`
+      // (src/workflows/v3/shared-node-runtime.ts), so sleep N+1 only EXISTS
+      // after sleep N's continuation has run. vitest's advanceTimersByTimeAsync
+      // walks the timer queue tick by tick and drains microtasks between ticks,
+      // so a single 20s call releases the whole chain of ten deferrals. Bun
+      // implements no async variant, and test/bun-test-shim.ts:137 fills it with
+      // `jest.advanceTimersByTime(ms)` + ONE microtask drain: the full 20s is
+      // consumed in a single step, so only the FIRST sleep is released and the
+      // nine that follow are armed on a clock that never advances again.
+      // runWorkflow then never settles, and bun's own `--timeout` cannot rescue
+      // it because the awaited promise is pending on a frozen fake clock
+      // (measured: --timeout of 8s/10s/60s/180s all failed to interrupt; the
+      // process sat idle at 0% CPU). Stepping hands every re-armed sleep a live
+      // clock edge to land on, so both runners see the same ten deferrals.
+      for (let advanced = 0; advanced < 20_000; advanced += 50) {
+        await vi.advanceTimersByTimeAsync(50);
+      }
       await expect(running).resolves.toMatchObject({ reason: 'terminal', runStatus: 'blocked' });
       const events = readJournal(join(base, 'host-retry-budget', 'journal.ndjson'));
       expect(events.filter((event) => event.type === 'hostEffectRetryDeferred')).toHaveLength(10);

@@ -5797,6 +5797,18 @@ describe('role profile IPC routes', () => {
 
       expect(res.status).toBe(200);
       const body = await res.json();
+      // bun:test 的 toMatchObject 会把传入的 asymmetric matcher 实例**写回** received
+      // 对象（vitest 不会）：跑完下面这个 toMatchObject 后，在 bun 下
+      // `typeof body.runId === 'object'`（值变成 ExpectStringMatching 实例），
+      // 且两处 runId 被换成**两个不同**的 matcher 实例。于是原先写在 toMatchObject
+      // 之后的 `expect(body.results[0].runId).toBe(body.runId)` 实际是在比
+      // matcher-vs-matcher，Object.is 恒为 false —— 报错信息两侧还会打印得一模一样
+      // （`Expected: StringMatching /^mlrp_/` / `Received: StringMatching /^mlrp_/`），
+      // 极难看出问题。产品行为是对的（runId 确实一致，vitest 下同一份断言全绿）。
+      // 所以这里必须**先把两个 runId 快照成字符串**，再跑 toMatchObject，最后比快照，
+      // 让同一性检查读到真实字符串而不是被写回的 matcher 实例。
+      const expectedRunId = body.runId;
+      const resultRunId = body.results[0].runId;
       expect(body).toMatchObject({
         ok: true,
         runId: expect.stringMatching(/^mlrp_/),
@@ -5810,7 +5822,7 @@ describe('role profile IPC routes', () => {
           triggerId: expect.stringMatching(/^mlrp_turn_/),
         }],
       });
-      expect(body.results[0].runId).toBe(body.runId);
+      expect(resultRunId).toBe(expectedRunId);
       expect(messageChatSpy).toHaveBeenCalledWith('cli_listener_run', 'om_match_run');
       expect(forkSpy).toHaveBeenCalledTimes(1);
       expect(forkSpy.mock.calls[0][2]).toMatch(/^mlrp_turn_/);

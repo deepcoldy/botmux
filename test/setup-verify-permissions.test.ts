@@ -7,9 +7,30 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
 // 占位 mock — 单测里不真实调 Lark.Client. checkRequiredScopes / applyScopesUnverified
 // 单测都需要 mock 这个.
+//
+// ⚠️ 这两个 mock 必须声明在**模块顶层**（而不是工厂体内），且**不能**再靠工厂多返回
+// `__scopeListMock` 这类自造导出名把它们「偷运」给用例。两个 runner 的限制正好相反，
+// 只有下面这一种写法能同时满足（两条都是实测，不是推测）：
+//
+//   | 工厂返回的名字            | bun test          | vitest                                  |
+//   |---------------------------|-------------------|-----------------------------------------|
+//   | 自造名 `__scopeListMock`  | 🔴 静默丢弃       | ✅ 存在                                 |
+//   | 漏掉的真实导出 `WSClient` | ✅ 从真模块透传   | 🔴 No "WSClient" export defined on mock |
+//
+// 原因：vitest 把工厂返回的对象**整体当成模块**，多出来的键照样能读到；而 bun 做的是
+// 真 ESM 命名导出**链接**——它拿真模块的导出清单（本包 39 个）去连线，清单外的名字无处
+// 可落，于是 `(sdk as any).__scopeListMock === undefined`（连属性都不存在），用例在
+// `beforeEach` 里 `.mockReset()` 就抛 TypeError，26 条全被同一个 beforeEach 带崩。
+//
+// 另一半限制来自 vitest：它把 `vi.mock` 提升到所有 import 之上，工厂执行时下面这两个
+// 顶层 const **还没初始化**。所以工厂体内只能**惰性**引用它们——返回的是类本身，
+// `application` / `request` 是类字段初始化器，只在用例里 `new FakeClient()` 时才求值。
+// 若改成立即体（`() => ({ list: scopeListMock })` 这种在工厂返回时就解引用的形态），
+// vitest 下会直接 `Cannot access 'scopeListMock' before initialization`。
+const scopeListMock = vi.fn();
+const scopeApplyMock = vi.fn();
+
 vi.mock('@larksuiteoapi/node-sdk', () => {
-  const scopeListMock = vi.fn();
-  const scopeApplyMock = vi.fn();
   class FakeClient {
     application = { scope: { list: scopeListMock, apply: scopeApplyMock } };
     // checkRequiredScopes now reads scopes via client.request() (GET empty-body
@@ -18,17 +39,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     request = (...args: unknown[]) => scopeListMock(...args);
     constructor(_: unknown) {}
   }
+  // 只返回**真实导出名**（verify-permissions.ts 只用到这三个）。
   return {
     Client: FakeClient,
     Domain: { Feishu: 0, Lark: 1 },
     LoggerLevel: { error: 0, fatal: 0 },
-    // 暴露 mock 函数给 test 直接拿到
-    __scopeListMock: scopeListMock,
-    __scopeApplyMock: scopeApplyMock,
   };
 });
 
-import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
   readCriticalScopesFromApplicationInfo,
@@ -45,9 +63,6 @@ import {
   VC_MEETING_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
 import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
-
-const scopeListMock = (sdk as any).__scopeListMock as ReturnType<typeof vi.fn>;
-const scopeApplyMock = (sdk as any).__scopeApplyMock as ReturnType<typeof vi.fn>;
 
 // fetch 在 verify-permissions.ts 里只在 validateCredentials 用. mock 掉.
 const fetchMock = vi.fn();

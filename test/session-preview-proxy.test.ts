@@ -1054,6 +1054,13 @@ describe('P1-2 preview 代理在客户端断开与非 101 拒绝路径上回收�
   const upstreamSockets = new Set<Socket>();
 
   afterEach(async () => {
+    // 假时钟的还原放在 afterEach 而**不是**用例内的 finally 里：bun test 在用例超时
+    // （timed out after Nms）时**不执行** finally，vitest 会执行。一旦某条用例将来又超时，
+    // finally 形态会把假时钟泄漏给同文件后续所有用例——它们各自 `await listen(...)`，而
+    // bun 假时钟下 listen 的回调永不触发（见下面那条用例的注释），于是「1 红」会连带成
+    // 「5 红」。两个 runner 的 afterEach 在超时后都仍会跑，所以这里是唯一可靠的还原点。
+    // 无条件调用是安全的：没装假时钟时 vitest 与 bun 都当 no-op（实测均不抛）。
+    vi.useRealTimers();
     for (const socket of probeClients) socket.destroy();
     probeClients.clear();
     // 泄漏用例失败时上游 socket 还挂着，server.close() 会一直等——先强拆再关。
@@ -1228,32 +1235,39 @@ describe('P1-2 preview 代理在客户端断开与非 101 拒绝路径上回收�
   });
 
   it('非 101 拒绝体超过总时限还没读完时，上游与浏览器两端一起销毁', async () => {
-    // 计时器必须在代理武装它**之前**换成假的，所以整段都跑在假 setTimeout 下；
-    // socket I/O 走的是真事件循环，不受影响。
+    // 建服务器/listen 必须留在**真时钟**下，只有「拨号 + 推进计时器」跑在假时钟下。
+    // 原因：bun 的假时钟下 `server.listen()` 的回调永不触发，`await new Promise(r =>
+    // server.listen(0, '127.0.0.1', r))` 就永不 settle，整条用例 60s 超时——实测同一文件
+    // 两条对照用例，真时钟 listen 拿到端口、假时钟下结果是 never。根因是 bun **忽略
+    // `toFake`**（实测：`setInterval` 明明被排除却照样被假掉），所以「socket I/O 走真事件
+    // 循环、不受影响」这个前提在 vitest 成立、在 bun 不成立。
+    //
+    // 这不违反下面那条原始约束：约束要的是「计时器必须在代理武装它**之前**换成假的」，
+    // 而代理武装 totalTimer 发生在 `upstream.on('response')`（preview-proxy.ts:576），也就是
+    // **拨号之后**；listen 早于拨号，把它移出假时钟窗口不影响该约束，用例要验的语义
+    // （超时后上游与浏览器两端一起销毁）一字未改。
+    const ctx = await startReclaimProbe();
+    // 计时器必须在代理武装它**之前**换成假的，所以拨号起整段都跑在假 setTimeout 下。
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const ctx = await startReclaimProbe();
-      const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
-      const clientClosed = new Promise<void>(resolve => client.socket.on('close', () => resolve()));
-      await ctx.dialed;
+    // 还原写在本 describe 的 afterEach 里，不用 finally——bun 超时时不跑 finally（见上）。
+    const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    const clientClosed = new Promise<void>(resolve => client.socket.on('close', () => resolve()));
+    await ctx.dialed;
 
-      const upstreamGone = ctx.upstreamClosed.then(() => true as const);
-      // 反复推进：上游 200 还在路上时推进是无害的，武装之后第一次推进就会触发。
-      for (let attempt = 0; attempt < 100; attempt++) {
-        vi.advanceTimersByTime(PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS + 1_000);
-        const fired = await Promise.race([
-          upstreamGone,
-          new Promise<false>(resolve => { setImmediate(() => resolve(false)); }),
-        ]);
-        if (fired) break;
-      }
-      await upstreamGone;
-      await clientClosed;
-      expect(ctx.liveUpstream()).toBe(0);
-      expect(client.raw()).toBe('');
-    } finally {
-      vi.useRealTimers();
+    const upstreamGone = ctx.upstreamClosed.then(() => true as const);
+    // 反复推进：上游 200 还在路上时推进是无害的，武装之后第一次推进就会触发。
+    for (let attempt = 0; attempt < 100; attempt++) {
+      vi.advanceTimersByTime(PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS + 1_000);
+      const fired = await Promise.race([
+        upstreamGone,
+        new Promise<false>(resolve => { setImmediate(() => resolve(false)); }),
+      ]);
+      if (fired) break;
     }
+    await upstreamGone;
+    await clientClosed;
+    expect(ctx.liveUpstream()).toBe(0);
+    expect(client.raw()).toBe('');
   });
 });
 

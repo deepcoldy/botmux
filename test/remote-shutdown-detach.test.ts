@@ -326,7 +326,21 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       type: 'remote_shutdown_result', requestId: secondAbortRequestId,
       phase: 'abort', ok: true, taskId: 'task-second',
     });
-    await expect(aborting).resolves.toSatisfy(
+    // Await BEFORE the matcher, not inside it: under `bun test` 1.4.0 the
+    // `.resolves` chain does not thread the awaited value into `toSatisfy`'s
+    // predicate — it hands it `{}` (measured: `keys=[]`), so the predicate died
+    // on `results.every is not a function`. The defect is in the `resolves`
+    // chain and not in `toSatisfy` itself: the SYNC form below receives the
+    // array correctly under both runners, and `resolves.toEqual` /
+    // `resolves.toHaveLength` thread their value fine under bun.
+    //
+    // This is NOT a cosmetic rewrite to silence a red. The old form had ZERO
+    // discriminating power under bun — it threw on GOOD data *and* on BAD data
+    // alike — and the same defect silently FALSE-GREENS any tolerant predicate
+    // (a `() => true` passes while receiving `{}`). The form below is measured
+    // to keep real teeth: it passes on all-ok and fails when any entry's
+    // `result.ok` is false. Do not restore `.resolves.toSatisfy` here.
+    expect(await aborting).toSatisfy(
       (results: Array<{ result: { ok: boolean } }>) => results.every(entry => entry.result.ok),
     );
     expect(first.ds.remoteShutdownState).toBeUndefined();

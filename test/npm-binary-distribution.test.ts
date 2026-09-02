@@ -1,8 +1,8 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 
 /**
@@ -31,6 +31,59 @@ import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 const POSTINSTALL = resolve('scripts/postinstall-bin.mjs');
 const INJECT = resolve('scripts/inject-optional-binaries.mjs');
 const PLATFORMS = ['botmux-darwin-arm64', 'botmux-darwin-x64', 'botmux-linux-arm64', 'botmux-linux-x64'];
+
+/**
+ * A real `node` to run the scripts under test — NOT `process.execPath`.
+ *
+ * FIDELITY, not a workaround. Both scripts exercised in this file are invoked by
+ * production as `node`, never as the runtime running the tests:
+ *   · package.json  "postinstall": "node scripts/postinstall-bin.mjs"
+ *   · release.yml    run: node scripts/inject-optional-binaries.mjs "$VERSION"
+ * Under `bun test`, `process.execPath` is the BUN binary (measured:
+ * .../node_modules/bun/bin/bun.exe), so every spawn below was running these
+ * scripts on a runtime npm never uses. Under vitest it happened to be node, which
+ * is why the infidelity stayed invisible for so long.
+ *
+ * This is the same lesson as test/helpers/ts-runner.ts, which exists precisely
+ * because `process.execPath` is bun-only-broken for child spawns — the difference
+ * is that ts-runner wants "whatever runtime the test uses", while these two
+ * scripts have a runtime pinned by production, so here the answer is always node.
+ *
+ * IT ALSO REMOVES A TIMEOUT FLAKE, as a side effect of the higher fidelity rather
+ * than by masking it. Bun's startup dominates these ~20 short-lived children:
+ * MEASURED on the real global-install fixture (n=10 each) bun 611 ms/child vs node
+ * 40 ms/child, ~15x. On a loaded box that cost pushed two cases (the two whose
+ * fixture spawns most) into the 60 s per-test timeout, and bun logged `killed 1
+ * dangling process` immediately before each failure with a perfect
+ * dangling==fails correlation over 9 runs. No assertion or timeout was touched.
+ *
+ * ⚠️ Resolved by EXECUTION, not by name: bun ships a `node` shim on PATH in some
+ * setups, and picking that would silently reintroduce the bun runtime this exists
+ * to avoid. Each candidate must report `process.versions.bun === undefined`.
+ * Falls back to process.execPath only when no real node exists at all, so the file
+ * degrades to today's behaviour instead of failing to run. CI's bun-test job runs
+ * actions/setup-node, so a real node is present there too.
+ */
+const NODE = (() => {
+  const names = process.platform === 'win32' ? ['node.exe', 'node.cmd', 'node'] : ['node'];
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      try {
+        accessSync(candidate, constants.X_OK);
+      } catch {
+        continue; // Keep scanning PATH.
+      }
+      const probe = spawnSync(candidate, ['-p', 'process.versions.bun ?? "node"'], {
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+      if (probe.status === 0 && probe.stdout.trim() === 'node') return candidate;
+    }
+  }
+  return process.execPath;
+})();
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -155,7 +208,7 @@ describe('inject-optional-binaries — release-time version wiring', () => {
       join(dir, 'package.json'),
       `${JSON.stringify({ name: 'botmux', version: manifestVersion }, null, 2)}\n`,
     );
-    const r = spawnSync(process.execPath, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
+    const r = spawnSync(NODE, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
       encoding: 'utf-8',
     });
     const after = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
@@ -206,9 +259,9 @@ describe('inject-optional-binaries — release-time version wiring', () => {
     writeFileSync(join(dir, 'scripts', 'inject-optional-binaries.mjs'), readFileSync(INJECT));
     writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ name: 'botmux', version: '3.20.0' }, null, 2)}\n`);
     const script = join(dir, 'scripts', 'inject-optional-binaries.mjs');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE, [script, '3.20.0'], { encoding: 'utf-8' });
     const first = readFileSync(join(dir, 'package.json'), 'utf-8');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE, [script, '3.20.0'], { encoding: 'utf-8' });
     expect(readFileSync(join(dir, 'package.json'), 'utf-8')).toBe(first);
   });
 });
@@ -311,7 +364,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     if (opts.binDirOnPath) env.PATH = `${join(home, '.botmux', 'bin')}:${process.env.PATH}`;
     if (opts.shell) env.SHELL = opts.shell;
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
+    const r = spawnSync(NODE, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
       encoding: 'utf-8',
       env,
     });
@@ -604,7 +657,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), src);
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'botmux', version: '3.20.0' }));
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
+    const r = spawnSync(NODE, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
       encoding: 'utf-8',
       env: { PATH: process.env.PATH, HOME: home, npm_config_global: 'true' },
     });

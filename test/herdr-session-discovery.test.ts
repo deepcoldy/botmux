@@ -36,6 +36,7 @@ vi.mock('node:os', () => ({
 }));
 
 import { execFileSync, execSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import {
   discoverAdoptableSessions,
   validateAdoptTarget,
@@ -89,6 +90,31 @@ function installHerdrFixture(fx: HerdrFixture) {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // Re-pin every node:fs factory default by hand. `vi.fn(impl)` defaults declared
+  // in the `vi.mock('node:fs', …)` factory above do NOT survive this reset under
+  // `bun test`: Bun follows jest semantics, where resetAllMocks/mockReset WIPES the
+  // implementation to an undefined-returning stub, while vitest RESTORES the impl
+  // the fn was created with. Measured on this repo's harness with one fresh
+  // `vi.fn(() => 'IMPL')` per question: vitest 4/4 pass, bun 2 fail with
+  // `Received: undefined` after both `vi.resetAllMocks()` and `.mockReset()`
+  // (`vi.clearAllMocks()` preserves the impl under bun — the divergence is
+  // specific to the reset family).
+  //
+  // Without the re-pin, `readdirSync()` returns undefined instead of `[]`, and
+  // findUniqueClaudeSessionByCwd() in src/core/session-discovery.ts crashes on
+  // `for (const name of names)` — real fs either yields string[] or throws into
+  // its try/catch, so only a wiped mock can produce undefined there.
+  //
+  // All five are re-pinned, not just readdirSync: the reset wipes every mock in
+  // the factory, and readdirSync is merely the one that currently reaches an
+  // iteration site. Do NOT "simplify" this to vi.clearAllMocks() — that would
+  // also stop clearing per-test mockImplementation overrides (installHerdrFixture
+  // sets one in nearly every case), letting them leak between cases under vitest.
+  vi.mocked(existsSync).mockReturnValue(false);
+  vi.mocked(readdirSync).mockReturnValue([] as any);
+  vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT'); });
+  vi.mocked(readlinkSync).mockImplementation(() => { throw new Error('ENOENT'); });
+  vi.mocked(realpathSync).mockImplementation(((p: string) => p) as any);
   // No tmux: `tmux list-panes` throws → discoverAdoptableSessions falls back
   // to herdr-only enumeration.
   mockedExecSync.mockImplementation(() => { throw new Error('no tmux'); });

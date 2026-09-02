@@ -1109,12 +1109,40 @@ describe('buildReplyCardFooter', () => {
 
     expect(card).not.toBe(original);
     expect(original.body.elements).toHaveLength(1);
+    // Read the footer string out BEFORE the `toMatchObject` below, and assert on
+    // this local rather than re-reading `.content` afterwards.
+    //
+    // WHY (bun 1.4.0 `expect().toMatchObject` limitation, measured — not a style
+    // preference): when the *expected* side holds an asymmetric matcher such as
+    // `expect.stringContaining(...)`, bun's `toMatchObject` **destructively
+    // overwrites the received object's own property** with the matcher, leaving
+    // `{}` behind. Measured on this exact element: before the matcher
+    // `typeof content === 'string'`; after it `typeof content === 'object'` and
+    // the value is `{}`, with the descriptor re-defined to
+    // `{value:{},writable:true,enumerable:true,configurable:true}` — a native
+    // low-level re-define that fires no Proxy set/defineProperty trap and
+    // silently defeats `Object.freeze` (the object even reports
+    // `Object.isFrozen === false` afterwards). So a *second* assertion reading
+    // the same property saw an object, not a string, and bun rejected it with
+    // the misleading "Received value must be an array type, or both received and
+    // expected values must be strings."
+    //
+    // vitest does NOT mutate the received object here (measured: the string is
+    // unchanged after the matcher), which is why this only ever failed on the
+    // bun leg. Hoisting the read keeps both runners green and, because the same
+    // string is still checked for the same substring, weakens nothing.
+    //
+    // Repo-wide caution for whoever touches a sibling test: any file that
+    // re-asserts on a property after passing it through `toMatchObject` with an
+    // asymmetric matcher hits this identically — and a truthiness/shape check on
+    // the clobbered `{}` can pass quietly instead of failing loudly.
+    const footerContent: string = card.body.elements.at(-1).content;
     expect(card.body.elements.at(-1)).toMatchObject({
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
       content: expect.stringContaining('Sent to: <at id=ou_owner></at>'),
     });
-    expect(card.body.elements.at(-1).content).toContain(
+    expect(footerContent).toContain(
       '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
     );
   });

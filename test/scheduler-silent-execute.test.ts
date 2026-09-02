@@ -678,12 +678,17 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(store.size).toBe(1);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, input, options] = forkWorkerMock.mock.calls[0];
+    // bun:test 的 toMatchObject 会**就地改写 received**：被非对称匹配器（这里的
+    // expect.stringMatching）命中的属性，断言后会变成 ExpectStringMatching 实例本身
+    // （vitest 不改写，所以同一份代码只在 bun 腿红）。turnId 随后要当 Map key 用，
+    // 所以必须在 toMatchObject 之前先取成局部 string，否则 has() 拿到的是对象、恒为 false。
+    const armedTurnId: string = options.turnId;
     expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
     expect(options).toMatchObject({
       resume: true,
       turnId: expect.stringMatching(/^schedule:task0001:/),
     });
-    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+    expect(existing.silentScheduledTurns?.has(armedTurnId)).toBe(true);
   });
 
   it('falls back from a rejected live injection by re-forking the same registered session', async () => {
@@ -703,11 +708,14 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(store.size).toBe(1);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, , options] = forkWorkerMock.mock.calls[0];
+    // 同上：bun:test 的 toMatchObject 会把被 expect.stringMatching 命中的 turnId
+    // 就地替换成匹配器实例，因此先取局部 string 再拿去查 Map。
+    const armedTurnId: string = options.turnId;
     expect(options).toMatchObject({
       resume: true,
       turnId: expect.stringMatching(/^schedule:task0001:/),
     });
-    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+    expect(existing.silentScheduledTurns?.has(armedTurnId)).toBe(true);
   });
 
   it('fails visibly instead of consuming a parked dashboard task', async () => {

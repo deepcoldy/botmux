@@ -1795,7 +1795,21 @@ describe('hermes buildArgs', () => {
     // Hermes must NOT arm the gate; its ❯ readyPattern (input box up in ~3.6s) is
     // the earliest reliable readiness signal.
     expect(adapter.injectsReadyHook).toBeFalsy();
-    expect(adapter.readyPattern?.source).toBe('❯');
+    // Compare against a regex *literal*'s .source, never a string literal: Bun's
+    // transpiler rewrites non-ASCII characters inside regex literals into \uXXXX
+    // escapes, so the production `/❯/` (hermes.ts) reports .source === '\\u276F'
+    // under `bun test` but '❯' under vitest/node+tsx. String literals and
+    // `new RegExp('❯')` are NOT rewritten, which is exactly why `toBe('❯')` was
+    // green in one runner and red in the other. Writing both sides as regex
+    // literals puts them through the same printer in whichever runner is active,
+    // so the assertion stays exact (verified: /❯|foo/, /›/ and /❯?/ each still
+    // fail under BOTH runners) without hard-coding either runner's escaping.
+    // Caveat for future refactors: this couples to *how* the pattern is built.
+    // If hermes.ts ever switches to the equivalent `new RegExp('❯')`, Bun stops
+    // escaping and this line goes red on the bun leg only — in that case compare
+    // behavior (`readyPattern.test('❯')`) instead of .source text. Same latent
+    // exposure applies to codex.ts's /›|\d+% left/ if anyone asserts its .source.
+    expect(adapter.readyPattern?.source).toBe(/❯/.source);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBeFalsy();
   });

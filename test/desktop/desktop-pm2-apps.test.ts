@@ -162,22 +162,46 @@ describe('desktop PM2 app listing', () => {
     await expect(promise).resolves.toEqual([]);
   });
 
+  // The next two tests must START the call, advance the fake timers, and only
+  // THEN build the `.rejects` assertion — never `expect(call).rejects` before the
+  // advance. Reason (bun-specific, measured on bun 1.4.0): bun's
+  // `expect(promise).rejects/.resolves` EAGERLY DRAINS THE EVENT LOOP while the
+  // assertion object is being CONSTRUCTED, so construction blocks until the
+  // promise settles (measured: `expect(p).resolves.toBe(...)` on a promise that
+  // settles in 300ms takes 301ms to construct, while `p.then(v => v)` takes 0ms).
+  // vitest's `.rejects` does not do this — it returns a thenable immediately
+  // (same probe under vitest: 1ms) — which is why the old shape was green there.
+  // Here the promise can only settle once `vi.advanceTimersByTimeAsync` fires the
+  // SUT's timeout timer, so constructing the assertion first deadlocks: the spin
+  // waits for a fake timer that only the not-yet-reached advance line can fire.
+  // And because it is a synchronous busy spin (bun at ~40-70% CPU, STAT=R), bun's
+  // own `--timeout` watchdog cannot interrupt it: the process is SIGKILLed with no
+  // summary line, which suppressed the OTHER 8 tests in this file too (bun
+  // reported 0 of 10 tests).
+  //
+  // The `void call.catch(() => undefined)` guard is required by the OTHER runner:
+  // once the assertion moves after the advance, the rejection is momentarily
+  // unobserved, and vitest then fails the run with "Vitest caught 2 unhandled
+  // errors ... might cause false positive tests" (measured with the guard deleted;
+  // bun alone did not complain). It attaches a no-op observer only — it asserts
+  // nothing, and every assertion below is unchanged and still awaited.
   it('rejects and kills PM2 discovery when it times out', async () => {
     vi.useFakeTimers();
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
-    const promise = expect(listPm2Apps(paths, runtime, {
+    const call = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
       env: {},
       timeoutMs: 25,
-    })).rejects.toThrow('timed out');
+    });
+    void call.catch(() => undefined);
 
     await vi.advanceTimersByTimeAsync(25);
 
-    await promise;
+    await expect(call).rejects.toThrow('timed out');
     expect(child.kill).toHaveBeenCalled();
     vi.useRealTimers();
   });
@@ -186,19 +210,23 @@ describe('desktop PM2 app listing', () => {
     vi.useFakeTimers();
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
-    const promise = expect(listPm2Apps(paths, runtime, {
+    // Same deferral as above (see the comment on the previous test). The
+    // `defaultPm2ListTimeoutMs - 1` / `+1` boundary check is unchanged: kill must
+    // still not have fired one tick BEFORE the deadline, only after it.
+    const call = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
       env: {},
-    })).rejects.toThrow(`PM2 jlist timed out after ${defaultPm2ListTimeoutMs}ms`);
+    });
+    void call.catch(() => undefined);
 
     await vi.advanceTimersByTimeAsync(defaultPm2ListTimeoutMs - 1);
     expect(child.kill).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
 
-    await promise;
+    await expect(call).rejects.toThrow(`PM2 jlist timed out after ${defaultPm2ListTimeoutMs}ms`);
     expect(child.kill).toHaveBeenCalled();
     vi.useRealTimers();
   });

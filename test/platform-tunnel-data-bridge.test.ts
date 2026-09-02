@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { createServer, type Server as NetServer } from 'node:net';
+import { createHash } from 'node:crypto';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
 
@@ -26,13 +27,20 @@ import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
  * and assert bytes make the round trip, against the PRODUCTION bridge imported from
  * `src/` (see the note above `startBridgingWsServer`).
  *
- * ⚠️ Scope, stated honestly: every test here runs on whatever runtime vitest uses,
- * which is Node — and `spawnSyncTsEvalWithRepoImports` children inherit that, so the
- * out-of-process test is Node too (MEASURED: the child reports `node v22.21.1`).
- * Nothing in this file executes under Bun. The Bun-specific facts that motivated the
- * fix (`createWebSocketStream` throws; `pause()`/`bufferedAmount`/`send()` callbacks
- * are all unusable; FIN-time `terminate()` truncates at volume) were measured by hand
- * and are guarded here by SOURCE-SHAPE assertions, not by behaviour.
+ * ⚠️ Scope, stated honestly: this file is run by BOTH runners — `bunx vitest run`
+ * (Node) and `bun test` (Bun) — and `spawnSyncTsEvalWithRepoImports` children inherit
+ * whichever parent runtime is in play (MEASURED under vitest: the child reports
+ * `node v22.21.1`). So the bridge here does get exercised on Bun, but only as far as
+ * Bun's BUILT-IN `ws` SHIM allows: `bun test` resolves `ws` to that shim rather than to
+ * `node_modules/ws` (MEASURED: `Bun.resolveSync('ws') === 'ws'`), and the shim differs
+ * from real `ws` in ways that silently defang harnesses built on ws-level controls —
+ * server sockets have no `pause`, and a paused raw socket keeps receiving frames and
+ * auto-ponging. The long note on the backpressure case documents one such trap and how
+ * that case is built to avoid it.
+ * The remaining Bun-specific facts that motivated the fix (`createWebSocketStream`
+ * throws; `bufferedAmount`/`pause()`/`send()` callbacks are all unusable; FIN-time
+ * `terminate()` truncates at volume) were measured by hand and are guarded here by
+ * SOURCE-SHAPE assertions, not by behaviour.
  */
 
 const servers: Array<NetServer | WebSocketServer> = [];
@@ -48,6 +56,13 @@ function toBuffer(data: RawData): Buffer {
   if (Array.isArray(data)) return Buffer.concat(data);
   return Buffer.from(data as ArrayBuffer);
 }
+
+/**
+ * RFC 6455 §1.3 handshake GUID. Needed because one case below completes a WebSocket
+ * upgrade by hand instead of using `ws` — see the long note on that case for why a
+ * `ws`-based stand-in cannot model a stalled peer under `bun test`.
+ */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 /**
  * The bridge under test is the PRODUCTION one, imported from src — not a copy.
@@ -268,7 +283,34 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     // reflects real delivery. Without a working gate the bridge drains the local
     // dashboard as fast as it can and queues everything in memory: measured 400MB
     // read and 575MB RSS on Bun. With the gate it stops after a few MB.
+    //
+    // ⚠️ WHY THE PLATFORM STAND-IN BELOW IS A RAW `net` SERVER AND NOT A
+    // `WebSocketServer` — do NOT "simplify" it back; that form is INERT under `bun test`.
+    //
+    // This case used to accept the upgrade with `ws` and then call `req.socket.pause()`
+    // to model a platform that never reads. That holds under Node, but bun resolves `ws`
+    // to its own BUILT-IN SHIM (MEASURED: `Bun.resolveSync('ws') === 'ws'`, not
+    // `<repo>/node_modules/ws/index.js`, even though ws@8.21.3 is on disk). The shim
+    // handles the upgrade internally, so pausing `req.socket` does NOT stop frame
+    // delivery: the shim keeps reading and AUTO-PONGS. Production's gate then re-opened
+    // on that pong — correctly, it is evidence the peer consumed — and read the whole
+    // offer. MEASURED: 4 consecutive fenced bun runs, `readFromDashboard` exactly
+    // 67108864 (= the entire 64MB) every time, byte-identical when `-t` isolates this
+    // single case. And `req.socket.isPaused()` returns true under BOTH runtimes, which
+    // is precisely why the old harness read as correct while proving nothing.
+    //
+    // So the stall is now built WITHOUT ws: hand-complete the handshake (the one thing
+    // the bridge needs to reach readyState OPEN), drain incoming frames into the void,
+    // and never write a byte back. A pong is then structurally impossible in EITHER
+    // runtime, so the only thing that can stop the bridge is production's own gate.
+    // MEASURED with this stand-in, pongs=0 on both: bun holds 24.3-30.3MB (9 runs),
+    // node holds 12.3-14.5MB (3 runs), flat from 500ms through 8s, and the platform
+    // receives ~4MB — one watermark's worth — on both.
     const OFFER = 64 * 1024 * 1024;
+    // Mirrors production's WS_BACKPRESSURE_BYTES (src/platform/tunnel-client.ts), which
+    // is module-private; kept as a local so the bound below reads as a multiple of the
+    // watermark the gate actually uses rather than as a bare magic number.
+    const WATERMARK = 4 * 1024 * 1024;
     const block = Buffer.alloc(256 * 1024, 0xab);
     let readFromDashboard = 0;
 
@@ -287,26 +329,57 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
     const tcpPort = (srv.address() as { port: number }).port;
 
-    // Platform stand-in that NEVER reads: accept the upgrade, then pause the raw
-    // socket so nothing is consumed. Note this holds under Node (the runtime this
-    // suite runs on) — Bun's ws server ignores the pause, which is why production
-    // parity is argued from the client side, not from here.
-    const wss = new WebSocketServer({ port: 0, perMessageDeflate: false });
-    servers.push(wss);
-    await new Promise<void>((r) => wss.on('listening', () => r()));
-    wss.on('connection', (sock, req) => { sockets.push(sock); req.socket.pause(); });
-    const platformPort = (wss.address() as { port: number }).port;
+    // Platform stand-in that NEVER reads and CANNOT pong: a raw TCP server that
+    // completes the WebSocket handshake by hand (RFC 6455 §4.2.2 — echo back
+    // sha1(key + GUID), base64, as `Sec-WebSocket-Accept` with a 101), then swallows
+    // every frame and writes nothing ever again. No `ws` on this side means no shim
+    // autopong under bun (see the note above), so the gate is the only brake.
+    const platform = createServer((sock) => {
+      sock.on('error', () => { /* peer teardown is normal */ });
+      let upgraded = false;
+      let head = Buffer.alloc(0);
+      sock.on('data', (chunk) => {
+        if (upgraded) return; // frames go into the void — never a reply, hence never a pong
+        head = Buffer.concat([head, chunk]);
+        const end = head.indexOf('\r\n\r\n');
+        if (end < 0) return; // request headers still arriving
+        const key = /sec-websocket-key:[ \t]*(\S+)/i.exec(head.subarray(0, end).toString('latin1'))?.[1];
+        upgraded = true;
+        const accept = createHash('sha1').update(`${key}${WS_GUID}`).digest('base64');
+        sock.write(
+          'HTTP/1.1 101 Switching Protocols\r\n'
+          + 'Upgrade: websocket\r\n'
+          + 'Connection: Upgrade\r\n'
+          + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        );
+      });
+    });
+    servers.push(platform);
+    await new Promise<void>((r) => platform.listen(0, '127.0.0.1', () => r()));
+    const platformPort = (platform.address() as { port: number }).port;
 
     // The bridge under test: production function, platform side stalled.
     const winner = new WebSocket(`ws://127.0.0.1:${platformPort}`, { perMessageDeflate: false });
     sockets.push(winner);
+    let pongs = 0;
+    winner.on('pong', () => { pongs += 1; });
     await new Promise<void>((r, rej) => { winner.on('open', () => r()); winner.on('error', rej); });
     bridgeDataChannel(winner, tcpPort);
 
     await new Promise<void>((r) => setTimeout(r, 3_000));
-    // A working gate stops within a few multiples of the 4MB watermark. Without one
-    // the bridge swallows the entire 64MB offer.
-    expect(readFromDashboard).toBeLessThan(OFFER / 2);
+    // The stall must be the real thing: if a pong ever arrives the gate is SUPPOSED to
+    // re-open, so a byte bound alone could not tell "gate works" from "peer consumed".
+    expect(pongs).toBe(0);
+    // A working gate stops within a few multiples of the 4MB watermark. Without one the
+    // bridge swallows the entire 64MB offer.
+    //
+    // The bound is stated against the watermark, not as OFFER/2: bun holds 24.3-30.3MB
+    // against a 32MB half-offer, and leaning on a 1.7MB margin would make this case
+    // read as a threshold flake the first time scheduling shifted. 12x the watermark
+    // (48MB) sits clear of every measured hold on both runtimes while still being far
+    // below the 64MB a gateless bridge reads — MEASURED: deleting the gate gives the
+    // full 67108864, so the mutation this case exists to catch stays red.
+    expect(readFromDashboard).toBeLessThan(12 * WATERMARK);
   }, 30_000);
 
   it('reassembles a fragmented ws payload instead of dropping all but the first piece', async () => {

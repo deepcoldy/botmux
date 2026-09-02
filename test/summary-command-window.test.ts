@@ -11,6 +11,37 @@ import { describe, it, expect, vi } from 'vitest';
 const BOT_OPEN_ID = 'ou_thisbot';
 
 const chatPages: { newestFirst: any[] } = { newestFirst: [] };
+
+// Why these factories list names the SUT never imports:
+//
+// Bun's test runner performs REAL whole-graph ESM named-export linking; vitest
+// does not. So a `vi.mock` factory must satisfy every importer of the mocked
+// module that is reachable from the SUT — not just the SUT's own imports.
+// Under vitest the short factory (only the two `listChat*` names) passes; under
+// bun the same file dies during linking, before any `it` body runs, with
+// `SyntaxError: Export named 'getMessageDetail' not found`.
+//
+// The three extra names below are demanded by SIBLING modules in the graph:
+//   getMessageDetail    <- src/im/lark/message-parser.ts:2   (summary-command imports message-parser)
+//   getBot              <- src/services/summary-range-store.ts:2 (summary-command imports it for DEFAULT_SUMMARY_PROMPT)
+//   getLoadedConfigPath <- src/services/config-store.ts:6    (reached transitively)
+// Each one is load-bearing for bun: dropping any single one turns the run red
+// with that exact name in the error. The other names those two modules export
+// are demanded only by the mocked modules themselves, so they never reach the
+// linker and are deliberately NOT stubbed here.
+//
+// These three are LINK-ONLY: none of the 6 tests below ever calls them
+// (verified by making each stub throw — still 6 pass). Their bodies therefore
+// mirror the REAL contract for this test's state, so that if a future refactor
+// does reach one, it behaves like production instead of silently returning a
+// wrong-shaped value.
+//
+// Do NOT "simplify" this by spreading the real module
+// (`const actual = await import(...)` at top level, then `...actual`): vitest
+// hoists `vi.mock` above the imports, so the factory would dereference the
+// const before initialization -> `ReferenceError: Cannot access 'actual'
+// before initialization`. That trades a bun red for a vitest red. Explicit
+// names are the only form both runners accept.
 vi.mock('../src/im/lark/client.js', () => ({
   listChatMessagesUntil: vi.fn(async (_app: string, _chat: string, opts: any) => {
     const out: any[] = [];
@@ -21,10 +52,21 @@ vi.mock('../src/im/lark/client.js', () => ({
     return out.reverse();
   }),
   listThreadMessages: vi.fn(async () => []),
+  // Real shape: resolves to the message detail, or null when not found.
+  getMessageDetail: vi.fn(async () => null),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: () => BOT_OPEN_ID,
+  // Real `getBot` THROWS for an unregistered bot, and callers rely on that
+  // (summary-range-store.ts:98 catches it to return `bot_not_registered`).
+  // No bot is registered in this test, so throwing IS the faithful answer —
+  // returning `undefined` here would turn that designed branch into a
+  // confusing downstream `reading 'config' of undefined`.
+  getBot: (larkAppId: string) => { throw new Error(`Bot not registered: ${larkAppId}`); },
+  // Real shape: `string | undefined`, undefined when no config has been loaded —
+  // which is this test's actual state.
+  getLoadedConfigPath: (): string | undefined => undefined,
 }));
 
 const { buildSummaryCommandPrompt } = await import('../src/im/lark/summary-command.js');

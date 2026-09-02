@@ -766,10 +766,22 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
       coworkers: [{ name: 'Sub1', openId: 'ou_s1' }],
     });
     const [, prompt] = forkWorkerMock.mock.calls[0];
+    // ⚠️ bun:test 缺陷（vitest 无此问题）：`toMatchObject` 里放非对称匹配器
+    // （`expect.stringContaining` / `expect.any` / `expect.objectContaining`）时，
+    // bun 会把 **received 对象上的那个属性原地覆盖成匹配器实例**：断言之后
+    // `typeof prompt.content` 由 `'string'` 变成 `'object'`
+    // （`String(prompt.content)` === `'[object ExpectStringContaining]'`），嵌套属性同样受影响。
+    // 于是「先 toMatchObject 再回读同一个属性当字符串用」的写法会报
+    // `Received value must be an array type, or both received and expected values must be strings.`
+    // —— 这是 runner 差异，不是被测代码的问题（生产值确实是含两段文本的原始字符串）。
+    // 无法用 shim 兜掉：覆写一个匹配器没法把另一个匹配器已经改写掉的值还原回来。
+    // 修法：在非对称断言把它污染之前先把原始值快照下来，后续断言读快照。
+    // 两条断言本身逐字不变、强度不变（对真的缺失子串仍然会红）；vitest 下快照是 no-op。
+    const promptContent: string = prompt.content;
     expect(prompt).toMatchObject({
       content: expect.stringContaining('<botmux_lead_dispatch>'),
     });
-    expect(prompt.content).toContain('Sub1');
+    expect(promptContent).toContain('Sub1');
   });
 
   it('unpublishes and closes only the new row when fork pre-accept throws', async () => {
@@ -985,8 +997,12 @@ describe('activateQueuedSession', () => {
     expect(r.ok).toBe(true);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [, prompt] = forkWorkerMock.mock.calls[0];
+    // 同上（见「lead in_progress wraps the prompt with the dispatch preamble」处的详细说明）：
+    // bun:test 的 `toMatchObject` 遇到非对称匹配器会把 received 的该属性原地改写成匹配器实例，
+    // 所以必须在那条断言之前把 `prompt.content` 的原始字符串快照下来再回读。
+    const promptContent: string = prompt.content;
     expect(prompt).toMatchObject({ content: expect.stringContaining('排队的任务') });
-    expect(prompt.content).toContain('<botmux_lead_dispatch>'); // preamble survived park→activate
+    expect(promptContent).toContain('<botmux_lead_dispatch>'); // preamble survived park→activate
     expect(ds.session.queued).toBe(false);
     // The worker-pool ACK handler, not activation acceptance, clears this
     // exact replay source after adapter submission.

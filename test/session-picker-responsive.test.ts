@@ -4,13 +4,17 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { createServer } from 'node:http';
 import {
   chmodSync,
+  closeSync,
   mkdirSync,
   mkdtempSync,
+  readSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
@@ -23,6 +27,129 @@ const tempDirs: string[] = [];
 const children: pty.IPty[] = [];
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// ---------------------------------------------------------------------------
+// Bun-only workaround: node-pty's PTY reader delivers nothing under `bun test`
+// ---------------------------------------------------------------------------
+// WHICH RUNNER, WHICH LIMITATION: `bun test` (measured on bun 1.4.0), NOT vitest.
+// node-pty 1.1.0 reads the pty master via `new tty.ReadStream(term.fd)`
+// (node_modules/node-pty/lib/unixTerminal.js:93). Under Bun that object is
+// constructed WITHOUT a libuv TTY handle, so it performs a single read of
+// whatever is ALREADY buffered on the fd and then never re-polls it:
+//   bun 1.4.0  -> { ctor: 'ReadStream', _handle: undefined, isTTY: true }
+//   node 22.21 -> { ctor: 'ReadStream', _handle: 'TTY',     isTTY: true }
+// Two modes that predict oppositely pin it down: when the child writes at t=0
+// and the reader attaches at t=1000ms, bun delivers the buffered bytes (3/3
+// runs); when the reader attaches first and the child writes at t=1000ms, bun
+// delivers 0 bytes (3/3) while node delivers all of them. node-pty deliberately
+// swallows EAGAIN (unixTerminal.js ~98), so this surfaces as no error, no exit,
+// just permanent silence.
+//
+// That makes this file a deterministic red rather than a flake (0/8 fresh bun
+// runs delivered data): `botmux list` must load SQLite and lay out the table
+// before painting frame 1, so its first output ALWAYS lands in the
+// "arrives after attach" class -> renderCount() stays 0 and waitForRender(1)
+// fails. The picker itself is fine (`bun src/cli.ts list` over a pipe prints
+// the table), and the spawn side is fine too (calling pty.fork directly, the
+// child execs and a raw readSync on the master fd returns its output) — only
+// node-pty's reader fails to deliver.
+//
+// FIX: swap in a Readable that polls fs.readSync and treats EAGAIN as "no data
+// yet, retry". Measured under bun 1.4.0 on a real pty master fd: 10/10 chunks
+// written 300ms apart are received, exit codes still propagate, destroy()
+// still emits 'close', and pause()/resume() still gate delivery.
+//
+// WHY IT IS SCOPED THE WAY IT IS:
+//   * `typeof Bun` guard — under Node the real tty.ReadStream works and this
+//     must be a no-op, so vitest behaviour is bit-for-bit unchanged.
+//   * The swap wraps only the synchronous pty.spawn() call and is reverted in a
+//     `finally`. node-pty resolves `tty.ReadStream` lazily INSIDE the
+//     UnixTerminal constructor (verified: patching after node-pty is already
+//     imported still takes effect, and node-pty's own require('tty') is the
+//     same module object we mutate), so the patch does not need to precede the
+//     import and leaves nothing installed for other files or for `tty` users.
+//   * tty.ReadStream must never be constructed on this fd: once Bun builds one
+//     over it, raw access to that same fd is invalidated (fs.readSync then
+//     returns EBADF), so a "poll it afterwards" workaround on the object
+//     returned by pty.spawn() cannot work — the substitution has to happen at
+//     construction time.
+// Blast radius note: 35 test files import node-pty and any that waits on pty
+// output is red for this same reason; the general fix belongs in
+// test/bun-test-shim.ts, but this task is scoped to this one file.
+const IS_BUN = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+const POLL_INTERVAL_MS = 2;
+const PTY_READ_CHUNK = 1 << 16;
+
+class PolledPtyReadStream extends Readable {
+  private readonly _ptyFd: number;
+  private readonly _scratch: Buffer;
+  private _timer: ReturnType<typeof setTimeout> | undefined;
+  // node-pty and xterm both probe this; the real tty.ReadStream reports true.
+  public isTTY = true;
+
+  constructor(fd: number) {
+    super({ highWaterMark: PTY_READ_CHUNK, autoDestroy: true, emitClose: true });
+    this._ptyFd = fd;
+    this._scratch = Buffer.allocUnsafe(PTY_READ_CHUNK);
+  }
+
+  _read(): void { this._drain(); }
+
+  private _drain(): void {
+    if (this._timer !== undefined) return;
+    for (;;) {
+      let n: number;
+      try {
+        n = readSync(this._ptyFd, this._scratch, 0, this._scratch.length, null);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'EAGAIN') {
+          // Nothing buffered yet — the whole point of the workaround: come back
+          // and look again instead of giving up like the handle-less ReadStream.
+          this._timer = setTimeout(() => { this._timer = undefined; this._drain(); }, POLL_INTERVAL_MS);
+          this._timer.unref?.();
+          return;
+        }
+        // EIO is the normal "child hung up the pty" ending on Linux, and
+        // EBADF/ENXIO mean the fd is gone: end the stream so node-pty's
+        // 'close' handler runs and its deferred 'exit' fires.
+        if (code === 'EIO' || code === 'EBADF' || code === 'ENXIO') { this.push(null); return; }
+        this.destroy(err as Error);
+        return;
+      }
+      if (n === 0) { this.push(null); return; }
+      // Copy out of the reused scratch buffer before handing it downstream.
+      if (!this.push(Buffer.from(this._scratch.subarray(0, n)))) return; // respect backpressure (pause())
+    }
+  }
+
+  _destroy(err: Error | null, cb: (e: Error | null) => void): void {
+    if (this._timer !== undefined) { clearTimeout(this._timer); this._timer = undefined; }
+    try { closeSync(this._ptyFd); } catch { /* fd already reaped */ }
+    cb(err);
+  }
+
+  // node-pty's Terminal.end() forwards to the socket; tty.ReadStream has it via
+  // net.Socket, plain Readable does not.
+  end(): void { this.destroy(); }
+}
+
+/** pty.spawn, with the read path made to actually re-poll the fd under Bun. */
+function spawnPty(
+  command: string,
+  args: string[],
+  options: pty.IPtyForkOptions,
+): pty.IPty {
+  if (!IS_BUN) return pty.spawn(command, args, options);
+  const tty = createRequire(import.meta.url)('node:tty') as { ReadStream: unknown };
+  const original = tty.ReadStream;
+  tty.ReadStream = PolledPtyReadStream;
+  try {
+    return pty.spawn(command, args, options);
+  } finally {
+    tty.ReadStream = original;
+  }
+}
 
 afterEach(() => {
   for (const child of children.splice(0)) {
@@ -203,7 +330,7 @@ async function spawnPicker(
   // node-pty takes command and args separately, so build the runtime-aware
   // prefix by hand instead of going through the spawnTsScript wrapper.
   const { command, prefixArgs } = tsRunnerPrefix();
-  const child = pty.spawn(command, [...prefixArgs, CLI_PATH, 'list'], {
+  const child = spawnPty(command, [...prefixArgs, CLI_PATH, 'list'], {
     cwd: join(TEST_DIR, '..'),
     env,
     cols,

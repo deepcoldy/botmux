@@ -12,7 +12,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   __testOnly_readComm,
   __testOnly_readCwd,
@@ -57,7 +57,26 @@ describe('readComm', () => {
     // Linux /proc/<pid>/comm 给短名 "node"；BSD ps 给完整路径，readComm
     // 已统一 basename，所以这里都不应包含 "/"。
     expect(comm).not.toContain('/');
-    expect(comm).toMatch(/^node/i);
+    // 断言 comm == 「spawn 时用的可执行文件的 basename」，而不是硬编码 /^node/i。
+    //
+    // 为什么必须这样写：target 子进程是用 `process.execPath` spawn 的（见
+    // beforeAll），所以它的运行时身份跟着**跑测试的 runner**变：
+    //   - vitest（测试体永远在 Node 里跑）→ execPath 是 node    → comm "node"
+    //   - `bun test`（bun 原生 runner）    → execPath 是 bun.exe → comm "bun.exe"
+    // 硬编码 /^node/i 等于假设 runner 一定是 Node，在 bun 腿上必红
+    // （实测 Received: "bun.exe"）—— 红的是这条断言，不是 readComm：同一个
+    // readComm 拿到真 node 子进程时照样返回 "node"。
+    //
+    // 用 slice(0, 15) 而不是完整 basename：Linux 的 /proc/<pid>/comm 截断在
+    // TASK_COMM_LEN=15（实测把 node 复制成 21 字符的 averyverylongnodename，
+    // comm 回来是 "averyverylongno"）。今天两个 runner 的名字是 4 / 7 字符，
+    // 比完整 basename 也能过，但钉死完整名会在将来任何长名字运行时上烂掉。
+    //
+    // 注意这是**收紧**不是放宽：精确 basename 相等严格强于 /^node/i 前缀匹配。
+    // 上面 toBeDefined() / not.toContain('/') 两条保持原样不动 —— 它们才是这个
+    // 文件存在的理由（macOS BSD `ps -o comm=` 返回完整路径的历史回归），且在
+    // bun 下本来就是绿的。
+    expect(comm).toBe(basename(process.execPath).slice(0, 15));
   });
 
   it('对不存在的 PID 返回 undefined', () => {
