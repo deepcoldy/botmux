@@ -5,7 +5,7 @@ import { listTeamGroups } from './team-groups-store.js';
 
 export interface FeedbackPolicyLayer {
   enabled?: boolean;
-  audience?: 'requester' | 'reviewers';
+  audience?: 'requester' | 'reviewers' | 'everyone';
   reviewers?: unknown[];
   visibleSemantics?: unknown[];
   buttons?: unknown[];
@@ -40,7 +40,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
   const input = record(raw, 'feedback');
   rejectUnknown(input, TOP_LEVEL, 'feedback');
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('feedback.enabled must be boolean');
-  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers') throw new Error('feedback.audience must be requester or reviewers');
+  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers' && input.audience !== 'everyone') throw new Error('feedback.audience must be requester, reviewers or everyone');
   if (input.allowReselect !== undefined && typeof input.allowReselect !== 'boolean') throw new Error('feedback.allowReselect must be boolean');
   if (input.reviewers !== undefined && !Array.isArray(input.reviewers)) throw new Error('feedback.reviewers must be an array');
   if (input.visibleSemantics !== undefined && !Array.isArray(input.visibleSemantics)) throw new Error('feedback.visibleSemantics must be an array');
@@ -69,7 +69,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
 
   const layer: FeedbackPolicyLayer = {
     ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
-    ...(input.audience !== undefined ? { audience: input.audience as 'requester' | 'reviewers' } : {}),
+    ...(input.audience !== undefined ? { audience: input.audience as 'requester' | 'reviewers' | 'everyone' } : {}),
     ...(input.reviewers !== undefined ? { reviewers: structuredClone(input.reviewers) } : {}),
     ...(input.visibleSemantics !== undefined ? { visibleSemantics: structuredClone(input.visibleSemantics) } : {}),
     ...(input.buttons !== undefined ? { buttons: structuredClone(input.buttons) } : {}),

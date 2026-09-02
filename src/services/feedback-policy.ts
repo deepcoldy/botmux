@@ -7,10 +7,15 @@ export type FeedbackButtonStyle = 'primary' | 'default' | 'danger';
  *    answer was addressed to (session owner / turn recipient) can click.
  *  - `reviewers`: an explicit allowlist of trusted human identities. Used for
  *    bot-triggered auto-analysis (Oncall/alert listeners) where the requester
- *    is another bot and no single human owner exists. Deliberately NOT
- *    "anyone in the chat" — every entry must be a verifiable human identity.
+ *    is another bot and no single human owner exists. Entries may be `ou_`/`on_`
+ *    ids or a full email — emails are resolved to this bot's app-scoped
+ *    open_id at send time (the callback stays network-free) and frozen into the
+ *    delivery snapshot. Deliberately NOT "anyone in the chat".
+ *  - `everyone`: any operator whose identity the platform can verify may click.
+ *    An explicit escape hatch when a chat trusts every member to give feedback
+ *    (a bot sender still cannot forge a human id). No allowlist.
  */
-export type FeedbackAudience = 'requester' | 'reviewers';
+export type FeedbackAudience = 'requester' | 'reviewers' | 'everyone';
 
 export interface FeedbackButton {
   key: string;
@@ -26,10 +31,10 @@ export interface FeedbackPolicy {
   audience: FeedbackAudience;
   /**
    * Trusted human identities allowed to click when `audience === 'reviewers'`.
-   * Entries are `ou_` (app-scoped open_id) or `on_` (cross-app union_id) and are
-   * matched at callback time against the platform-verified operator with no
-   * network lookup, so a bot sender can never satisfy an entry. Absent/empty for
-   * `requester`.
+   * Config accepts `ou_`/`on_` ids and full email; email entries are
+   * resolved to this bot's app-scoped open_id at send time so the callback can
+   * match with no network lookup (a bot sender can never satisfy an entry).
+   * Absent/empty for `requester` and `everyone`.
    */
   reviewers: string[];
   visibleSemantics: FeedbackSemantic[];
@@ -84,13 +89,22 @@ function semantic(value: unknown, path: string): FeedbackSemantic {
 }
 
 /**
- * A reviewer entry must be a platform-verifiable human identity. The card
- * callback only ever exposes the operator's `ou_` (app-scoped open_id) and,
- * when present/resolvable, `on_` (cross-app union_id). Matching those directly
- * needs no network call and can never be satisfied by a bot sender. We
- * deliberately accept ONLY `ou_`/`on_`: an email/mobile could not be matched at
- * callback time without a lookup and would ship as silently-dead config. Per
- * the app-scoped-open_id boundary, cross-app reviewers should use `on_`.
+ * Reviewer-entry format checks. Kept in sync (deliberately, by value) with the
+ * canonical owner-allowedUsers email predicate in `setup/bot-config-editor.ts`;
+ * this module stays a dependency-free leaf (it is imported by the store,
+ * resolver, cli and worker-pool).
+ */
+const FULL_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * A reviewer entry must be a human identity this bot can prove.
+ *  - `ou_`/`on_` are matched directly against the platform-verified callback
+ *    operator with no network call — a bot sender can never satisfy one.
+ *  - A full email is human-readable and resolved to this bot's
+ *    app-scoped `ou_` at SEND time (see `materializeFeedbackReviewers`); the
+ *    callback still matches network-free against the frozen, resolved id.
+ * A bare prefix (e.g. "alice") is rejected — same rule as owner allowedUsers.
+ * Cross-app reviewers should prefer `on_` (an `ou_` is app-scoped).
  */
 function reviewerIdentity(value: unknown, path: string): string {
   if (typeof value !== 'string') throw new Error(`${path} must be a string`);
@@ -99,7 +113,8 @@ function reviewerIdentity(value: unknown, path: string): string {
     if (entry.length < 4) throw new Error(`${path} is not a valid open_id/union_id`);
     return entry;
   }
-  throw new Error(`${path} must be an ou_ open_id or on_ union_id`);
+  if (FULL_EMAIL_RE.test(entry)) return entry;
+  throw new Error(`${path} must be an ou_/on_ id or a full email`);
 }
 
 /**
@@ -119,10 +134,12 @@ export function validateReviewerEntries(value: unknown, path = 'feedback.reviewe
 export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   const input = object(raw, 'feedback');
   if (input.enabled !== true) throw new Error('feedback.enabled must be true');
-  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers') {
-    throw new Error('feedback.audience must be requester or reviewers');
+  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers' && input.audience !== 'everyone') {
+    throw new Error('feedback.audience must be requester, reviewers or everyone');
   }
-  const audience: FeedbackAudience = input.audience === 'reviewers' ? 'reviewers' : 'requester';
+  const audience: FeedbackAudience = input.audience === 'reviewers' || input.audience === 'everyone'
+    ? input.audience
+    : 'requester';
 
   let reviewers: string[] = [];
   if (input.reviewers !== undefined) {
@@ -135,9 +152,9 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
     throw new Error('feedback.audience "reviewers" requires a non-empty feedback.reviewers allowlist');
   }
   // A reviewers allowlist only has meaning under the reviewers audience; reject
-  // the combination rather than silently ignoring it (a requester-only card
-  // must never appear to have carried an allowlist).
-  if (audience === 'requester' && reviewers.length > 0) {
+  // the combination rather than silently ignoring it (a requester-only or
+  // everyone card must never appear to have carried an allowlist).
+  if (audience !== 'reviewers' && reviewers.length > 0) {
     throw new Error('feedback.reviewers requires feedback.audience "reviewers"');
   }
 
@@ -202,4 +219,57 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
 export function resolveFeedbackPolicy(raw: unknown, bot?: { apiOnly?: boolean }): FeedbackPolicy | undefined {
   if (bot?.apiOnly || !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw as { enabled?: unknown }).enabled !== true) return undefined;
   return normalizeFeedbackPolicy(raw);
+}
+
+/** Whether an entry needs a send-time contact lookup to become a matchable id. */
+function isResolvableReviewerEntry(entry: string): boolean {
+  return !entry.startsWith('ou_') && !entry.startsWith('on_');
+}
+
+/**
+ * Freeze the `reviewers` allowlist into ids the network-free callback can match.
+ *
+ * Email entries are human-readable config but cannot be compared against
+ * a card operator without a contact lookup, so we resolve them ONCE here (at
+ * send time, with the bot's own app credentials) into this bot's app-scoped
+ * `ou_`, exactly like owner `allowedUsers`. `ou_`/`on_` pass through untouched.
+ *
+ * Fail closed by dropping only the entries this resolution could not prove:
+ *  - a resolver that maps an email to an `ou_` replaces that entry;
+ *  - an unresolved email is DROPPED (never shipped as a dead entry that
+ *    silently gates nothing, and never left as raw text the callback can't
+ *    match). If every entry drops, the caller sees an empty allowlist and must
+ *    fail closed (no clickable control) rather than emitting an open card.
+ *
+ * `resolve` receives the raw email entries and returns a map from the
+ * raw entry to a resolved `ou_` (missing key = unresolved). It is only called
+ * when there is something to resolve, so `everyone`/`requester` and pure-id
+ * `reviewers` policies never trigger a lookup.
+ */
+export async function materializeFeedbackReviewers(
+  policy: FeedbackPolicy,
+  resolve: (entries: string[]) => Promise<Map<string, string>>,
+): Promise<FeedbackPolicy> {
+  if (policy.audience !== 'reviewers') return policy;
+  const pending = policy.reviewers.filter(isResolvableReviewerEntry);
+  if (pending.length === 0) return policy;
+  let map: Map<string, string>;
+  try {
+    map = await resolve(pending);
+  } catch {
+    // A transient resolver failure must not silently widen or dead-gate the
+    // card. Drop the unresolved entries; keep any literal ids that need no
+    // lookup. An all-dropped result yields an empty allowlist (caller fails
+    // closed), never an open one.
+    map = new Map();
+  }
+  const seen = new Set<string>();
+  const reviewers: string[] = [];
+  for (const entry of policy.reviewers) {
+    const resolved = isResolvableReviewerEntry(entry) ? map.get(entry) : entry;
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    reviewers.push(resolved);
+  }
+  return { ...policy, reviewers };
 }

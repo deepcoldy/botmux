@@ -143,11 +143,24 @@ describe('feedback policy layered resolution', () => {
 
   it('format-validates a reviewers layer but leaves the audience coupling to the merged whole', () => {
     // A partial layer may carry reviewers without audience (the coupling is only
-    // enforced once merged), but the entries must still be verifiable ids.
-    expect(normalizeFeedbackPolicyLayer({ reviewers: ['ou_alice', 'on_bob'] })).toMatchObject({ reviewers: ['ou_alice', 'on_bob'] });
-    expect(() => normalizeFeedbackPolicyLayer({ reviewers: ['alice@example.com'] })).toThrow(/open_id or on_ union_id/);
+    // enforced once merged), but the entries must still be ids or full emails.
+    expect(normalizeFeedbackPolicyLayer({ reviewers: ['ou_alice', 'on_bob', 'alice@example.com'] })).toMatchObject({
+      reviewers: ['ou_alice', 'on_bob', 'alice@example.com'],
+    });
+    expect(() => normalizeFeedbackPolicyLayer({ reviewers: ['alice'] })).toThrow(/full email/);
     expect(() => normalizeFeedbackPolicyLayer({ reviewers: 'ou_alice' })).toThrow(/reviewers/);
     expect(() => normalizeFeedbackPolicyLayer({ audience: 'anyone' })).toThrow(/audience/);
+  });
+
+  it('allows everyone at any layer without a reviewers allowlist', () => {
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true },
+      chat: { audience: 'everyone' },
+    })).toMatchObject({ enabled: true, audience: 'everyone', reviewers: [] });
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true, audience: 'reviewers', reviewers: ['ou_alice'] },
+      chat: { audience: 'everyone', reviewers: [] },
+    })).toMatchObject({ audience: 'everyone', reviewers: [] });
   });
 
   it('traces the effective source chain and reports ambiguous local team bindings', () => {

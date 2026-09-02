@@ -14597,15 +14597,37 @@ function deliverFinalOutput(
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
       // worker/Riff environment received; live config applies on the next fork.
-      const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      let feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      // Freeze email reviewers into this bot's app-scoped open_id so the
+      // card callback can match network-free against the delivery snapshot. Pure
+      // ou_/on_ lists (and requester/everyone) skip the lookup. If resolution
+      // empties the list, fail closed (drop the feedback control).
+      if (feedbackPolicy && feedbackPolicy.audience === 'reviewers') {
+        try {
+          const { materializeFeedbackReviewers } = await import('../services/feedback-policy.js');
+          const { resolveAllowedUsersWithMap } = await import('../im/lark/client.js');
+          feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
+            const { map } = await resolveAllowedUsersWithMap(ds.larkAppId, entries);
+            const resolved = new Map<string, string>();
+            for (const entry of entries) {
+              const id = map.get(entry);
+              if (id && id.startsWith('ou_')) resolved.set(entry, id);
+            }
+            return resolved;
+          });
+        } catch {
+          feedbackPolicy = undefined;
+        }
+        if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
+      }
       const feedbackRequesterSubjectId = recipientOpenId;
-      // `reviewers` audience is gated by its frozen allowlist, so the control is
-      // valid even for an ownerless bot-triggered session with no human
-      // recipient; `requester` audience still needs the recipient to be
+      // `reviewers`/`everyone` audiences gate clicks without a human requester,
+      // so the control is valid even for an ownerless bot-triggered session with
+      // no human recipient; `requester` audience still needs the recipient to be
       // clickable. Never re-derive an owner here — the ownerless session stays
       // ownerless (no @-loop back to the alerting bot).
       const feedback = feedbackPolicy
-        && (feedbackPolicy.audience === 'reviewers' || feedbackRequesterSubjectId)
+        && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
         ? { policy: feedbackPolicy }
         : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);

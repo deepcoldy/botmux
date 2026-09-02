@@ -181,3 +181,49 @@ describe('feedback callback reviewers audience', () => {
     store.close();
   });
 });
+
+describe('feedback callback everyone audience', () => {
+  async function everyoneSetup() {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
+    const response = store.createResponse({ interactionId: 'int-everyone', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+    return { store, delivery };
+  }
+
+  it('lets any platform-identified operator click without a requester', async () => {
+    const { store, delivery } = await everyoneSetup();
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_anyone')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('prefers the verified union_id as the feedback subject', async () => {
+    const { store, delivery } = await everyoneSetup();
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone', undefined, 'on_anyone'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'on_anyone')).toMatchObject({ result: 'conclusive_usable' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_anyone')).toBeUndefined();
+    store.close();
+  });
+
+  it('still rejects a callback with no platform-verified operator identity', async () => {
+    const { store } = await everyoneSetup();
+    const input = event({ action: 'feedback_submit', result: 'conclusive_usable' });
+    delete input.operator;
+    const result = await handleSkillFeedbackCardAction(input, 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '无法验证反馈来源，请重试' });
+    store.close();
+  });
+});

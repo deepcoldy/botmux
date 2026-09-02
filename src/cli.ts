@@ -8986,11 +8986,34 @@ async function cmdSend(rest: string[]): Promise<void> {
   } catch {
     feedbackPolicy = undefined;
   }
+  // Freeze email reviewers into this bot's app-scoped open_id NOW, with
+  // the bot's own credentials, so the card callback can match network-free
+  // against the delivery snapshot. Pure ou_/on_ lists (and requester/everyone)
+  // skip the lookup. If resolution empties a reviewers list, fail closed (no
+  // feedback control) rather than ship a card nobody can click.
+  if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'reviewers') {
+    try {
+      const { materializeFeedbackReviewers } = await import('./services/feedback-policy.js');
+      const { resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
+      feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
+        const { map } = await resolveAllowedUsersWithMap(s.larkAppId!, entries);
+        const resolved = new Map<string, string>();
+        for (const entry of entries) {
+          const id = map.get(entry);
+          if (id && id.startsWith('ou_')) resolved.set(entry, id);
+        }
+        return resolved;
+      });
+    } catch {
+      feedbackPolicy = undefined;
+    }
+    if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
+  }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
-  // `reviewers` audience gates clicks by its frozen allowlist, not by a human
-  // requester — this is the bot-triggered auto-analysis case (issue #1178) where
-  // the exact turn sender is another bot. Only the `requester` audience needs a
-  // resolvable human recipient to make its control clickable.
+  // `reviewers`/`everyone` audiences gate clicks without a human requester —
+  // this is the bot-triggered auto-analysis case (issue #1178) where the exact
+  // turn sender is another bot. Only the `requester` audience needs a resolvable
+  // human recipient to make its control clickable.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);

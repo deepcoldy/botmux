@@ -85,17 +85,25 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
   let baseCard = delivery.baseCard;
   try { baseCard = await deps.loadBaseCard?.(platformMessageId) ?? baseCard; }
   catch { /* platform fetch is best-effort; the content-free template remains usable */ }
-  // Identity gate. `reviewers` audience matches the platform-verified operator
-  // against the delivery's frozen allowlist (a per-delivery snapshot, so later
-  // config changes never re-gate an old card); `requester` keeps the original
-  // "only the addressed human" contract. Both fail closed when no trusted
-  // identity can be established — a bot sender exposes no listed human id.
+  // Identity gate. `reviewers` matches the platform-verified operator against
+  // the delivery's frozen allowlist (a per-delivery snapshot of already-resolved
+  // ids, so later config changes never re-gate an old card and no network call
+  // happens here); `everyone` accepts any operator whose id the platform
+  // verified; `requester` keeps the original "only the addressed human"
+  // contract. All fail closed when no verifiable identity exists — a bot sender
+  // exposes no listed/verifiable human id.
   let operatorSubjectId: string | undefined;
   if (delivery.policy.audience === 'reviewers') {
     const reviewers = new Set(delivery.policy.reviewers);
     operatorSubjectId = [operatorOpenId, verifiedOperator.unionId]
       .find((id): id is string => !!id && reviewers.has(id));
     if (!operatorSubjectId) return { toast: { type: 'error', content: '仅指定的反馈人可反馈' } };
+  } else if (delivery.policy.audience === 'everyone') {
+    // Anyone may click, but we still key the feedback on a verified id so the
+    // record has a real subject and a bot cannot forge one. Prefer the
+    // cross-app union_id; fall back to the app-scoped open_id.
+    operatorSubjectId = verifiedOperator.unionId ?? operatorOpenId;
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
   } else {
     operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
       ? operatorOpenId
