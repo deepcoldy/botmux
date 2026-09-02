@@ -27,11 +27,27 @@ import {
 } from '../src/core/session-preview.js';
 import { resolveSessionPreviewForProxy } from '../src/dashboard/preview-contract.js';
 
+/**
+ * Self-exit when reparented (the parent process died). Covers the residual
+ * where vitest is Ctrl-C'd / crashes and afterEach never runs: the detached
+ * children are in their own process group, so the terminal's SIGINT does not
+ * reach them, and without this they would survive forever (one leaked
+ * listener per aborted run).
+ *
+ * The criterion is "ppid CHANGED", not "ppid === 1": an ancestor that set
+ * PR_SET_CHILD_SUBREAPER reparents orphans to itself instead of init, so
+ * ppid would never become 1 there and the watchdog would silently never
+ * fire. "Changed" fires for init, a subreaper, or any other reparenting
+ * target. (Verified: with a subreaper ancestor, the orphaned grandchild's
+ * ppid is the subreaper's pid, not 1.)
+ */
+const ORPHAN_WATCHDOG = 'const __parent = process.ppid; setInterval(() => { if (process.ppid !== __parent) process.exit(0); }, 1000);';
+
 const LISTEN_SCRIPT = `
 const net = require('net');
 const s = net.createServer();
 s.listen(0, '127.0.0.1', () => console.log('port ' + s.address().port));
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 /** 抢占一个指定端口号（模拟 dev server 退出后，别的本机进程拿到同一个号码）。 */
@@ -48,7 +64,7 @@ const attempt = () => {
   s.listen(port, '127.0.0.1', () => console.log('up'));
 };
 attempt();
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 /** 起一个孙子进程去监听：验证血缘是按 ppid 链向下走的，不是只看直接子进程。 */
@@ -56,7 +72,7 @@ const GRANDCHILD_SCRIPT = `
 const cp = require('child_process');
 const g = cp.spawn(process.execPath, ['-e', process.argv[1]], { stdio: ['ignore', 'pipe', 'ignore'] });
 g.stdout.on('data', d => process.stdout.write(d));
-setInterval(() => {}, 1000);
+${ORPHAN_WATCHDOG}
 `;
 
 const children: ChildProcess[] = [];
@@ -292,6 +308,52 @@ describe.skipIf(process.platform !== 'linux')('P1-12 preview listener ownership 
       proof: { pid: 4242, procStart: '918273', inode: '556677' },
       procRoot: missingRoot,
     })).toBe('unverifiable');
+  });
+
+  it('orphan watchdog: a script self-exits when its parent dies', async () => {
+    // The watchdog criterion is "ppid CHANGED", not "ppid === 1" (see
+    // ORPHAN_WATCHDOG): a PR_SET_CHILD_SUBREAPER ancestor reparents orphans to
+    // itself, so ppid === 1 would never fire there. This test only asserts the
+    // change-triggered exit; the reparenting target (init or subreaper) is
+    // irrelevant to the criterion.
+    const WATCHDOG = 'const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 100);';
+    const NO_WATCHDOG = 'setInterval(() => {}, 100);';
+    // Each grandparent spawns a grandchild and exits after the grandchild has
+    // started (1000ms, ~20x Node startup), so the grandchild records its
+    // ORIGINAL ppid before the reparenting.
+    const spawnAndExit = (grandchildScript: string) => startChild(`
+      const cp = require('child_process');
+      const g = cp.spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });
+      console.log(g.pid);
+      setTimeout(() => process.exit(0), 1000);
+    `);
+    const watchdogGrandparent = spawnAndExit(WATCHDOG);
+    const noWatchdogGrandparent = spawnAndExit(NO_WATCHDOG);
+    const watchdogPid = Number(await waitForLine(watchdogGrandparent, /^\d+$/));
+    const noWatchdogPid = Number(await waitForLine(noWatchdogGrandparent, /^\d+$/));
+
+    const isAlive = (pid: number): boolean => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+
+    // Watchdog grandchild: ppid changed → exits within ~100ms of the grandparent's exit.
+    const watchdogExited = await new Promise<boolean>((resolve) => {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (!isAlive(watchdogPid)) { clearInterval(timer); resolve(true); return; }
+        if (Date.now() - start > 5000) { clearInterval(timer); resolve(false); }
+      }, 50);
+      timer.unref?.();
+    });
+
+    // Negative control: without the watchdog, the grandchild survives the
+    // reparenting (proves the watchdog is load-bearing, not the OS cleaning up).
+    // Kill it before asserting so a failed assertion cannot leak it.
+    const noWatchdogSurvived = isAlive(noWatchdogPid);
+    try { process.kill(noWatchdogPid, 'SIGKILL'); } catch { /* already gone */ }
+
+    expect(watchdogExited).toBe(true);
+    expect(noWatchdogSurvived).toBe(true);
   });
 });
 
