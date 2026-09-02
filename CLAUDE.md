@@ -69,9 +69,19 @@ worktree 的 `node_modules` **形态不统一**，是逐个手工决定的，不
 
 **怀疑自己的 worktree 被挪了指针，怎么验、怎么还原**：
 
-1. `git reflog show <branch>` 找旧 SHA（看 `Reset to` 记录）；
-2. `git -C <worktree> write-tree` 取 index 的 tree hash，与 `git rev-parse <旧SHA>^{tree}` 对比——**精确相等**就是指针被挪的指纹（index 是旧树、HEAD 是新树）；注意同样的症状（几百条 staged）也可能是真工作，必须逐个验、不能看数字下结论；
-3. 还原：`git update-ref refs/heads/<branch> <旧SHA> <新SHA>`（**带 old-value 做 CAS**，避免并发下再踩）。
+1. `git reflog show <branch>` 找旧 SHA（看 `Reset to` 记录）。reflog 默认 90 天、可能被 `gc` / `reflog expire` 清掉——过期了走第 3 步的兜底；
+2. `git -C <worktree> write-tree` 取 index 的 tree hash，与 `git rev-parse <旧SHA>^{tree}` 对比——**精确相等**就是指针被挪的指纹（index 是旧树、HEAD 是新树）。注意同样的症状（几百条 staged）也可能是真工作，必须逐个验、不能看数字下结论。`write-tree` 只往对象库写一个 tree 对象（append-only），**不改 index 与工作区**，在别人的 worktree 上跑也安全；
+3. **reflog 过期的兜底**：不依赖 reflog，直接用 index tree 反查 commit——
+
+   ```bash
+   t=$(git -C <worktree> write-tree)
+   git log --all --format='%H %s' | while read sha subj; do
+     [ "$(git rev-parse "$sha^{tree}" 2>/dev/null)" = "$t" ] && echo "命中: ${sha:0:9} $subj"
+   done
+   ```
+
+   实测直接命中 `b4bba94dd feat(card): …(#1067)`——无需 reflog 就定位到指针原位，还顺带读出「这是哪个 PR 的树」，比纯 SHA 更好判断是谁的树被挪了；
+4. 还原：`git update-ref refs/heads/<branch> <旧SHA> <新SHA>`（**带 old-value 做 CAS**，避免并发下再踩）。
 
 **未经确认不动别人的 worktree**——哪怕你「看出」它是假树，清理由该会话自己或维护者决定。
 
