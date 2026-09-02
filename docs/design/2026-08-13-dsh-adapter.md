@@ -30,7 +30,9 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
   - 请求 3 个：`initialize {cwd, provider, model, maxTokens?}` → `{serverInfo}`；`session/prompt {sessionId, contentBlocks}` → `{messageId}`（入队回执，**不是最终结果**）；`shutdown`。
   - 通知 4 个：`session.event {sessionId, event}`（完整事件流）、`session.status {sessionId, status: 'idle'|'running'}`、`subagent.started`、`subagent.finished`。
   - session 语义：`sessionId` 由客户端指定，未知 id 懒创建；**同一连接内**复用 id 即多轮（server 内存 Map 持有 agent）。
-- runtime 启动**必须显式给配置**（`$DSH_CORDIS_CONFIG` 或 argv 位置参数）。wheel 默认 `cordis.yml` 含：jsonrpc-server + agent-spine + llm-deepseek + JSONL 持久化 + checkpoint 策略 + 本地 bash + 本地 fs。会话根目录 `$DSH_SESSION_ROOT`（默认进程 cwd 下 `./.sessions`），工作目录 `$DSH_CWD`。
+- runtime 启动走**标准 profile 机制**：`dsh --profile <name>`（botmux 默认 `botmux`）。profile 位于 `~/.dsh/profiles/<name>/`，dsh 以其中的 **`package.json` 判定 profile 是否存在**（不是目录、也不是 `cordis.yml`），且只有 `web` / `headless` 是 shipped template——其它 profile 不会被 CLI 自动创建，需要先落盘骨架（`package.json` 声明 `dsh-base` bundle + `cordis.yml` 空数组 + `cordis.patch.yml`），再 `dsh plugin --profile <name> add <pkg>` 把依赖装进 profile 的 `node_modules`（dsh 自己**不会**触发安装）。插件组合由 `cordis.patch.yml` 在 `dsh-base` 之上叠加。会话根目录 `$DSH_SESSION_ROOT`（默认进程 cwd 下 `./.sessions`），工作目录 `$DSH_CWD`。
+  - `cordis.patch.yml` 的条目有两种语义，混用会静默失效：`- insert: [...]` 才是**插入**新 entry；裸 `- id: X`（无 `insert`）是对**已存在** entry 的覆盖，目标 id 不存在时只 warn + 跳过。所以 botmux 的默认 patch 只 insert `dsh-base` 真正缺的 `sdk-jsonrpc-server`，其余能力全部沿用 `dsh-base`（agent / llm / bash / fs / sessions / sandbox / subagent 等 70+ 行），并 disable 掉 headless 下会阻塞 `loader.await()` 的 Web GUI 行（`hmr` / `web` / `web-search-deepseek` / `tool-web`）。
+  - `@deepseek-ai/dsh-*` 目前**只发 prerelease**，且 `latest` dist-tag 指向的是很早的版本（实测 `dsh-sdk-jsonrpc-server`：`latest → 0.0.1-rc.5`、`next → 0.1.1-rc.2`）。因此依赖范围必须带 prerelease 标识（`^0.1.1-rc.1`）——`^0.1.1` 乃至 `*` 都解析不到任何版本，`npm install` 会直接 `ETARGET`。
 - 模型鉴权：`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` 环境变量。
 - 事件信封（session.event 的 event）：`{type, seq, time, data}`，type 包括 `turn/start`、`turn/end`（data.reason.kind）、`assistant/message`（data.message.content 块：text/reasoning/tool-call，data.usage）、`tool/call`、`tool/result`、`assistant/chunk` 等。
 - **SDK 协议没有 cancel**；没有权限请求（权限由配置侧决定）；不支持图片（只收 text 块）。
@@ -90,7 +92,7 @@ worker 解码 final → 投递飞书
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
 
-**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-config`（可选）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout`（默认 600s）。
+**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-profile`（可选，默认 `botmux`）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout`（默认 600s）。
 
 **boot**：
 1. 解析 profile 名称：`--dsh-profile`（默认 `botmux`）。
