@@ -179,8 +179,8 @@ describe('dsh-runner', () => {
     h = spawnRunner('happy', ['--dsh-profile', 'botmux'], {}, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    // The profile directory is created but the runner no longer generates cordis.yml
-    // (the dsh --profile CLI handles composition).
+    // The profile directory is created and seeded with package.json + cordis.yml
+    // so `dsh --profile botmux` can start on a clean HOME.
     expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
 
     // initialize carries the provider + model from settings.yaml.
