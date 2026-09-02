@@ -448,9 +448,11 @@ function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
     : tr('schedules.deliveryTopLevel');
 }
 
-function repeatLabel(s: ScheduleRow): string {
-  if (!s.repeat) return '—';
-  return `${s.repeat.completed}/${s.repeat.times ?? '∞'}`;
+export function formatScheduleRepeat(
+  repeat?: { times: number | null; completed: number },
+): string | null {
+  if (!repeat) return null;
+  return `${repeat.completed}/${repeat.times ?? '∞'}`;
 }
 
 function delay(ms: number): Promise<void> {
@@ -886,6 +888,7 @@ function ScheduleRowCard(props: {
   const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
   const toggleKey = `${s.id}:${toggleOp}`;
   const runKey = `${s.id}:run`;
+  const repeat = formatScheduleRepeat(s.repeat);
   return (
     <OverviewListItem kind="schedule" className="schedule-list-row" data-id={s.id}>
       <OverviewListMain>
@@ -922,7 +925,7 @@ function ScheduleRowCard(props: {
           ) : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
-          <span>{tr('schedules.repeat')}: {repeatLabel(s)}</span>
+          {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
         </div>
       </OverviewListMain>
       <OverviewListTail>

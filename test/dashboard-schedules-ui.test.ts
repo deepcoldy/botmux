@@ -7,6 +7,7 @@ import {
   canSubmitSchedule,
   checkSchedule,
   filterSchedules,
+  formatScheduleRepeat,
   formatScheduleRunDuration,
   fmtScheduleDate,
   schedulePreconditionEditorInitialState,
@@ -108,6 +109,22 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain("s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null");
     expect(page).not.toContain('op="delivery"');
     expect(page).not.toContain('setDeliver(');
+  });
+
+  it('shows run counts only for schedules that configure repeat limits', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(formatScheduleRepeat()).toBeNull();
+    expect(formatScheduleRepeat({ times: null, completed: 5 })).toBe('5/∞');
+    expect(formatScheduleRepeat({ times: 10, completed: 3 })).toBe('3/10');
+    expect(page).toContain('const repeat = formatScheduleRepeat(s.repeat);');
+    expect(page).toContain(
+      "{repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}",
+    );
+    expect(zh('schedules.repeat')).toBe('执行次数');
+    expect(en('schedules.repeat')).toBe('Run count');
   });
 
   it('prefills revealed preconditions and keeps a fail-safe for incomplete legacy projections', () => {
