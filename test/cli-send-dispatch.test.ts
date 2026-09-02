@@ -385,6 +385,62 @@ describe('normalizeInteractiveCardInput', () => {
     if (!res.ok) expect(res.error).toContain('callback');
   });
 
+  it('accepts form callbacks only through an explicitly selected plugin action route', () => {
+    const pluginAction = 'example_plugin_review_submit';
+    const raw = JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'form',
+          name: 'review_form',
+          elements: [
+            {
+              tag: 'select_static',
+              name: 'finding_action',
+              options: [{ text: { tag: 'plain_text', content: 'fix' }, value: 'fix' }],
+            },
+            { tag: 'input', name: 'reason' },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: 'submit' },
+              action_type: 'form_submit',
+              value: { action: pluginAction, request_id: 'request-1' },
+            },
+          ],
+        }],
+      },
+    });
+
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === pluginAction },
+    });
+    expect(accepted.ok).toBe(true);
+
+    const denied = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another_plugin_action' },
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.error).toContain('callback');
+  });
+
+  it('keeps built-in key/root routing sealed in plugin-card mode', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: 'x' }, value: 'x' }],
+          value: { action: 'example_plugin_action', key: 'repo_worktree' },
+        }],
+      },
+    }), {
+      callbackPolicy: { allowsAction: action => action === 'example_plugin_action' },
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('value.key');
+  });
+
   it('rejects value.key dropdowns (adopt/worktree namespace, not just value.action)', () => {
     // Replicates botmux's own select_static shape (card-builder.ts): the dropdown
     // dispatch discriminator is `value.key`, not `value.action`. A hand-crafted

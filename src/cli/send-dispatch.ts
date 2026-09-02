@@ -200,6 +200,14 @@ export type NormalizedInteractiveCardResult =
   | { ok: true; card: Record<string, unknown>; cardJson: string }
   | { ok: false; error: string };
 
+export interface InteractiveCardCallbackPolicy {
+  /**
+   * A custom card may use a callback only when the selected, enabled plugin
+   * owns that exact action route. The default (no policy) remains display-only.
+   */
+  allowsAction(action: string): boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -253,32 +261,76 @@ function isOpenUrlButton(el: Record<string, unknown>): boolean {
 // Custom cards are display + open_url only, so ALL callback-capable controls
 // are rejected — not just the ones whose payload hits a botmux privileged
 // dispatch. Returns the offending JSON path, or null if the card is clean.
-function findDisallowedCardCallback(value: unknown, path = 'card'): string | null {
+function pluginActionFor(value: Record<string, unknown>): string | undefined {
+  if (!isRecord(value.value)) return undefined;
+  const action = value.value.action;
+  return typeof action === 'string' && action.trim() ? action.trim() : undefined;
+}
+
+function hasAllowedFormSubmit(
+  value: unknown,
+  policy: InteractiveCardCallbackPolicy,
+): boolean {
+  if (Array.isArray(value)) return value.some(child => hasAllowedFormSubmit(child, policy));
+  if (!isRecord(value)) return false;
+  const isSubmit = value.form_action_type === 'submit' || value.action_type === 'form_submit';
+  const action = pluginActionFor(value);
+  if (isSubmit && action && policy.allowsAction(action)) return true;
+  return Object.values(value).some(child => hasAllowedFormSubmit(child, policy));
+}
+
+function findDisallowedCardCallback(
+  value: unknown,
+  path = 'card',
+  policy?: InteractiveCardCallbackPolicy,
+  inAllowedPluginForm = false,
+): string | null {
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      const found = findDisallowedCardCallback(value[i], `${path}[${i}]`);
+      const found = findDisallowedCardCallback(value[i], `${path}[${i}]`, policy, inAllowedPluginForm);
       if (found) return found;
     }
     return null;
   }
   if (!isRecord(value)) return null;
 
+  // A form is trusted as one unit only when its submit button carries an exact
+  // action route owned by the selected plugin. This lets ordinary form inputs
+  // contribute form_value without turning every input name into an independent
+  // Botmux callback namespace.
+  const allowedPluginForm = inAllowedPluginForm
+    || (value.tag === 'form' && !!policy && hasAllowedFormSubmit(value, policy));
+  const action = pluginActionFor(value);
+  const allowedPluginAction = !!action && !!policy && policy.allowsAction(action);
+
+  // Built-in Botmux routing fields remain sealed even in plugin-card mode. A
+  // plugin must use its declared action namespace and handle its own payload.
+  if (isRecord(value.value)) {
+    for (const field of ['key', 'root_id'] as const) {
+      if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
+    }
+  }
+
   // v2 `behaviors:[{type:'callback'}]` fires a server-side card.action.trigger
   // callback. open_url behaviors are display/jump only and stay allowed.
-  if (value.type === 'callback') return `${path}.type`;
+  if (value.type === 'callback' && !allowedPluginAction) return `${path}.type`;
   // Form submit/reset buttons ALSO fire card.action.trigger (delivering
   // form_value to the handler). Feishu marks them with real schema fields —
   // v2 `form_action_type:'submit'|'reset'`, v1 `action_type:'form_submit'|
   // 'form_reset'` (see settings-card.ts / card-builder.ts) — NOT a
   // `type:'form_action'`. Reject those so a custom card stays display-only.
-  if (typeof value.form_action_type === 'string') return `${path}.form_action_type`;
+  if (typeof value.form_action_type === 'string' && !allowedPluginAction) {
+    return `${path}.form_action_type`;
+  }
   if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
-    return `${path}.action_type`;
+    if (!allowedPluginAction) return `${path}.action_type`;
   }
   if (typeof value.tag === 'string') {
     // Interactive input controls (dropdowns/pickers/inputs/image-select) — reject
     // by tag even without a `value` payload; interacting still fires a callback.
-    if (CALLBACK_CONTROL_TAGS.has(value.tag)) return `${path}.tag(${value.tag})`;
+    if (CALLBACK_CONTROL_TAGS.has(value.tag) && !allowedPluginAction && !allowedPluginForm) {
+      return `${path}.tag(${value.tag})`;
+    }
     // A button is allowed only as an open_url jump with NO own `value` payload.
     // `value` may be a plain string OR object (both round-trip a callback), so
     // reject on presence, not shape. A plain button (no open_url) also fires a
@@ -286,20 +338,18 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
     // this way, so free-form chart_spec data like `{tag:'x', value:{…}}` isn't
     // misread as a control.
     if (value.tag === 'button') {
-      if ('value' in value && value.value !== undefined) return `${path}.value`;
-      if (!isOpenUrlButton(value)) return `${path}.tag(button)`;
+      if ('value' in value && value.value !== undefined && !allowedPluginAction) return `${path}.value`;
+      if (!allowedPluginAction && !isOpenUrlButton(value)) return `${path}.tag(button)`;
     }
   }
   // Belt: reserved botmux routing discriminators anywhere (defence in depth —
   // e.g. a value round-tripped inside a behavior, or a tag we didn't enumerate).
-  if (isRecord(value.value)) {
-    for (const field of ['action', 'key', 'root_id'] as const) {
-      if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
-    }
+  if (action && !allowedPluginAction) {
+    return `${path}.value.action`;
   }
 
   for (const [key, child] of Object.entries(value)) {
-    const found = findDisallowedCardCallback(child, `${path}.${key}`);
+    const found = findDisallowedCardCallback(child, `${path}.${key}`, policy, allowedPluginForm);
     if (found) return found;
   }
   return null;
@@ -312,12 +362,17 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
  *   - webhook/openapi-style wrapper: {"msg_type":"interactive","card":{...}}
  *   - wrapper with string/object content: {"msg_type":"interactive","content":"{...}"}
  *
- * Deliberately rejects callback actions. botmux owns a broad card-action
+ * Rejects callback actions by default. botmux owns a broad card-action
  * namespace (close/restart/ask/relay/dashboard/etc.); arbitrary callbacks from
  * a CLI-created card would be routed through those handlers with host-side
- * privileges after a user clicks. Display cards and open-url buttons still work.
+ * privileges after a user clicks. An explicit callbackPolicy may admit only
+ * actions that resolve to one selected, enabled plugin; built-in key/root
+ * discriminators remain sealed. Display cards and open-url buttons still work.
  */
-export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiveCardResult {
+export function normalizeInteractiveCardInput(
+  raw: string,
+  options: { callbackPolicy?: InteractiveCardCallbackPolicy } = {},
+): NormalizedInteractiveCardResult {
   if (!raw.trim()) return { ok: false, error: '自定义卡片 JSON 不能为空' };
 
   const parsed = parseJson(raw, '自定义卡片 JSON');
@@ -343,7 +398,11 @@ export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiv
   const normalized = cardObjectFromValue(cardSource, '自定义卡片');
   if (!normalized.ok) return normalized;
 
-  const callbackPath = findDisallowedCardCallback(normalized.card);
+  const callbackPath = findDisallowedCardCallback(
+    normalized.card,
+    'card',
+    options.callbackPolicy,
+  );
   if (callbackPath) {
     return {
       ok: false,

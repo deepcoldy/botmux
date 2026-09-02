@@ -6173,6 +6173,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --plugin-card-action <plugin-id>
+                                       显式允许该已启用插件声明的 callback action
        --layout result|progress|risk|blocked|handoff
                                        可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
@@ -8202,9 +8204,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --card-json 需要 JSON 字符串参数');
     process.exit(2);
   }
+  if (flagPresentButValueMissing(rest, '--plugin-card-action')) {
+    console.error('botmux send: --plugin-card-action 需要 plugin id');
+    process.exit(2);
+  }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  const pluginCardActionId = argValue(rest, '--plugin-card-action');
+  if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
+    console.error(`botmux send: 无效 plugin id: ${pluginCardActionId}`);
+    process.exit(2);
+  }
+  if (pluginCardActionId !== undefined && !customCardRequested) {
+    console.error('botmux send: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
+    process.exit(2);
+  }
   const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length;
   if (responseKindOccurrences > 1) {
     console.error('botmux send: --response-kind 只能指定一次');
@@ -8580,7 +8595,48 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!existsSync(cardFile)) { console.error(`文件不存在: ${cardFile}`); process.exit(1); }
       rawCard = readFileSync(cardFile, 'utf-8');
     }
-    const normalizedCard = normalizeInteractiveCardInput(rawCard);
+    let callbackPolicy: { allowsAction(action: string): boolean } | undefined;
+    if (pluginCardActionId) {
+      const { loadBotConfigs: loadPluginTargetBotConfigs } = await import('./bot-registry.js');
+      const pluginTargetBot = loadPluginTargetBotConfigs()
+        .find(bot => bot.larkAppId === s.larkAppId);
+      if (!pluginTargetBot) {
+        console.error(`botmux send: 找不到当前 Bot 配置 (${s.larkAppId})`);
+        process.exit(2);
+      }
+      const enabledPluginIds = resolveEffectivePluginIds(
+        pluginTargetBot,
+        readGlobalConfig(),
+      );
+      if (!enabledPluginIds.includes(pluginCardActionId)) {
+        console.error(`botmux send: 插件 ${pluginCardActionId} 未对当前 Bot 启用`);
+        process.exit(2);
+      }
+      const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+      const registry = readPluginRegistry();
+      const pluginRecord = registry.plugins[pluginCardActionId];
+      if (!pluginRecord?.contributions?.cardActions) {
+        console.error(`botmux send: 插件 ${pluginCardActionId} 未声明 cardActions`);
+        process.exit(2);
+      }
+      const { readPluginServiceState } = await import('./core/plugins/service-manager.js');
+      const serviceState = readPluginServiceState(pluginCardActionId);
+      if (serviceState?.status !== 'online') {
+        console.error(`botmux send: 插件 ${pluginCardActionId} 的 host service 未在线`);
+        process.exit(2);
+      }
+      const enabledRecords = enabledPluginIds
+        .map(id => registry.plugins[id])
+        .filter((record): record is NonNullable<typeof record> => record !== undefined);
+      const { resolvePluginCardActionRoute } = await import('./core/plugins/card-actions/gateway.js');
+      callbackPolicy = {
+        allowsAction(action: string): boolean {
+          const route = resolvePluginCardActionRoute(enabledRecords, action);
+          return route.kind === 'matched' && route.record.id === pluginCardActionId;
+        },
+      };
+    }
+    const normalizedCard = normalizeInteractiveCardInput(rawCard, { callbackPolicy });
     if (!normalizedCard.ok) { console.error(`botmux send: ${normalizedCard.error}`); process.exit(2); }
     customCard = normalizedCard.card;
   } else if (contentFile) {
