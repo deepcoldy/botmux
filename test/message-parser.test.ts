@@ -7,8 +7,8 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
-import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -671,6 +671,30 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('发送给');
   });
 
+  it('keeps a grey body line containing one U+2063 separator', () => {
+    const bodyLine = "<font color='grey'>注：U+2063 写作 a\u2063b</font>";
+    const raw = buildMarkdownCard(
+      ['结论如下', '', bodyLine, '', '请据此推进'].join('\n'),
+      'ou_owner',
+    );
+    const textB = extractCardContent(raw);
+    const result = mergeCardText(textB, textB);
+
+    expect(result).toContain('结论如下');
+    expect(result).toContain(bodyLine);
+    expect(result).toContain('请据此推进');
+    expect(result).not.toContain('发送给');
+  });
+
+  it('keeps a non-grey body line containing the full footer marker', () => {
+    const bodyLine = `正文包含不可见序列 a${REPLY_CARD_FOOTER_MARKER}b`;
+    const card = {
+      body: { elements: [{ tag: 'markdown', content: bodyLine }] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toContain(bodyLine);
+  });
+
   it('round-trips standalone reply headings without losing section text', () => {
     const raw = buildMarkdownCard(
       '# 执行结果\n\n核心链路已验证。\n\n## 下一步\n\n请在飞书确认排版。',
@@ -938,12 +962,25 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
       elements: [
         [{ tag: 'text', text: '正文内容' }],
         [
-          { tag: 'text', text: 'Acme ·⁣ 上下文 12.3K · 发送给：' },
+          { tag: 'text', text: `Acme ·${REPLY_CARD_FOOTER_MARKER} 上下文 12.3K · 发送给：` },
           { tag: 'at', user_name: 'Owner' },
         ],
       ],
     };
     expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('keeps Format A body text containing only one U+2063 separator', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文 a\u2063b' },
+        { tag: 'text', text: ' 后续正文' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe(
+      '正文 a\u2063b 后续正文',
+    );
   });
 
   it('drops a brand-disabled recipient-only footer without requiring a visible separator', () => {

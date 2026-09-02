@@ -26,6 +26,7 @@ import {
   extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
+  REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -1081,7 +1082,7 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      'Acme ·⁣ '
+      `Acme ·${REPLY_CARD_FOOTER_MARKER} `
       + '上下文 12.3K · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
@@ -1216,7 +1217,7 @@ describe('buildReplyCardFooter', () => {
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
     expect(footer?.content).not.toContain('·');
     expect(footer?.content).toContain('<at id=ou_abc></at>');
-    expect(footer?.content.replace('⁣', '')).toBe(
+    expect(footer?.content.replaceAll(REPLY_CARD_FOOTER_MARKER, '')).toBe(
       "<font color='grey'>发送给：<at id=ou_abc></at></font>",
     );
   });
@@ -1226,7 +1227,9 @@ describe('buildReplyCardFooter', () => {
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
     expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
-    expect(footer?.content).toContain(`${DEFAULT_BRAND_LABEL} ·⁣ 上下文 5K/200K (3%)`);
+    expect(footer?.content).toContain(
+      `${DEFAULT_BRAND_LABEL} ·${REPLY_CARD_FOOTER_MARKER} 上下文 5K/200K (3%)`,
+    );
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 });
