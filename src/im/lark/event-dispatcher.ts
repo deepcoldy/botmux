@@ -75,6 +75,7 @@ import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agen
 import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
+import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -961,8 +962,9 @@ export function rawMessageIngressAnchor(larkAppId: string, message: any): string
 // re-push (unlike events). If a handler (e.g. restart, which spawns a worker)
 // might exceed the budget, we ACK before 3s with a toast and patch the card
 // afterwards — missing the deadline otherwise surfaces error 200341 to the user.
-// 2500ms leaves headroom for the WS frame round-trip inside the 3s window.
-const CARD_ACTION_ACK_TIMEOUT_MS = 2500;
+// The per-bot cutoff defaults to 2500ms, preserving headroom for the WS frame
+// round-trip inside the 3s window. It is resolved for every callback so a
+// `/botconfig` update takes effect without reconnecting the dispatcher.
 const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
 const cardActionInFlight = new Set<string>();
 
@@ -1047,9 +1049,7 @@ async function patchTimedOutCardActionResult(larkAppId: string, data: any, shape
 }
 
 async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: EventHandlers): Promise<any> {
-  const eventId = eventIdForKey(data);
-  const key = cardActionKey(larkAppId, data);
-
+  const eventId = eventIdForKey(data), key = cardActionKey(larkAppId, data);
   // Durable dedupe ONLY when the platform gave a stable per-interaction id:
   // suppresses a same-interaction redelivery over the long-connection so a
   // non-idempotent action (restart/close) can't double-fire after the first
@@ -1067,6 +1067,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
+  const ackTimeoutMs = resolveCardActionAckTimeoutMs(getBot(larkAppId).config.cardActionAckTimeoutMs);
   cardActionInFlight.add(key);
   let timedOut = false;
   const work = handlers.handleCardAction(data, larkAppId)
@@ -1102,12 +1103,12 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     cardActionInFlight.delete(key);
   });
 
-  const timeout = new Promise(resolve => setTimeout(resolve, CARD_ACTION_ACK_TIMEOUT_MS, CARD_ACTION_TIMEOUT));
+  const timeout = new Promise(resolve => setTimeout(resolve, ackTimeoutMs, CARD_ACTION_TIMEOUT));
   const result = await Promise.race([work, timeout]);
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
     logger.warn(
-      `[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; `
+      `[card-action] handler exceeded ${ackTimeoutMs}ms; `
       + `ACKing first and continuing in background: app=${larkAppId}`,
     );
     return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)) } };

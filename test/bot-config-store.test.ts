@@ -89,6 +89,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
     expect(keys).toContain('feedback');
+    expect(keys).toContain('cardActionAckTimeoutMs');
   });
 
   it('strictly normalizes feedback JSON through the shared config field', async () => {
@@ -629,6 +630,33 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().maxLiveWorkers).toBeUndefined();
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('cardActionAckTimeoutMs enforces its range and hot-updates the registered Bot', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('cardActionAckTimeoutMs')!;
+    expect(spec).toMatchObject({
+      kind: 'number',
+      effect: 'immediate',
+      clearable: true,
+      min: 500,
+      max: 2_500,
+    });
+    expect(store.coerceConfigValue(spec, 500)).toEqual({ ok: true, value: 500 });
+    expect(store.coerceConfigValue(spec, '2500')).toEqual({ ok: true, value: 2_500 });
+    expect(store.coerceConfigValue(spec, 499)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 2_501)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1_000.5)).toEqual({ ok: false, reason: 'invalid_number' });
+
+    const set = await store.applyConfigField('app_default', spec, 1_200);
+    expect(set).toMatchObject({ ok: true, oldText: '∅', newText: '1200', effect: 'immediate' });
+    expect(readConfig().cardActionAckTimeoutMs).toBe(1_200);
+    expect(registry.getBot('app_default').config.cardActionAckTimeoutMs).toBe(1_200);
+
+    const unset = await store.applyConfigField('app_default', spec, null);
+    expect(unset.ok).toBe(true);
+    expect(readConfig().cardActionAckTimeoutMs).toBeUndefined();
+    expect(registry.getBot('app_default').config.cardActionAckTimeoutMs).toBeUndefined();
   });
 
   it('session owner reminder config round-trips and hot-updates the registered Bot', async () => {

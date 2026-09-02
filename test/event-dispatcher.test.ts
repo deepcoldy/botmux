@@ -823,6 +823,7 @@ function setupBotState(opts?: {
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
 	  summaryMemoryPath?: string;
+	  cardActionAckTimeoutMs?: number;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -857,6 +858,7 @@ function setupBotState(opts?: {
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
 	      summaryMemoryPath: opts?.summaryMemoryPath,
+	      cardActionAckTimeoutMs: opts?.cardActionAckTimeoutMs,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -7341,6 +7343,39 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(result).toEqual({});
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('handler boom'));
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('hot-applies the bot-level card action ACK cutoff without reconnecting', async () => {
+    setupBotState({ cardActionAckTimeoutMs: 1_000 });
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => {
+      release = () => resolve(undefined);
+    }) as any);
+
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        action: { value: { action: 'custom_ack_cutoff' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_custom_ack_cutoff' },
+      });
+      let settled = false;
+      void call.then(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(call).resolves.toEqual({
+        toast: { type: 'info', content: '操作已收到，后台处理中' },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('handler exceeded 1000ms'));
+
+      release();
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('为慢插件先 ACK 再更新原卡片', async () => {

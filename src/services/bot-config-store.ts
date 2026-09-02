@@ -37,6 +37,10 @@ import {
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
 } from './codex-reasoning-effort.js';
+import {
+  MAX_CARD_ACTION_ACK_TIMEOUT_MS,
+  MIN_CARD_ACTION_ACK_TIMEOUT_MS,
+} from '../core/card-action-ack.js';
 
 /**
  * 生效时机：
@@ -64,6 +68,10 @@ export interface ConfigFieldSpec {
   enumValues?: readonly string[];
   /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
   maxLen?: number;
+  /** kind==='number' 的闭区间下界；缺省仍只要求正整数。 */
+  min?: number;
+  /** kind==='number' 的闭区间上界；缺省不设上限。 */
+  max?: number;
   /** kind==='stringList' 的自定义解析器（自由文本 → 归一化数组）。缺省用
    *  customPassthroughCommands 的逗号/空格分隔解析；带参数的命令行字段
    *  （如 startupCommands）须指定按逗号/换行分隔、保留内部空格的解析器。 */
@@ -110,6 +118,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat', 'group'], hint: '私聊单聊模式 thread|chat|group；默认 chat=扁平连续会话，thread=每条 DM 独立会话，group=每条 DM 自动建专属会话群（chat/unset 回默认）' },
+  { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
@@ -467,6 +476,12 @@ export type CoerceResult =
   // union of literals plus those prefixed forms rather than a closed literal set.
   | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` };
 
+const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
+  Number.isInteger(value)
+    && value >= (spec.min ?? 1)
+    && (spec.max === undefined || value <= spec.max)
+);
+
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
  * string|boolean。dir 在此做存在性检查（无 locale，返回结构化 reason，调用方再本地化）。
@@ -480,7 +495,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
   }
   if (spec.kind === 'number') {
     const n = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
-    return Number.isInteger(n) && n > 0 ? { ok: true, value: n } : { ok: false, reason: 'invalid_number' };
+    return isConfigNumberInRange(spec, n) ? { ok: true, value: n } : { ok: false, reason: 'invalid_number' };
   }
   const s = String(raw ?? '').trim();
   if (!s) return { ok: false, reason: 'empty' };

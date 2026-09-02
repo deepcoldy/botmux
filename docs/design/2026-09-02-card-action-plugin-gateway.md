@@ -120,7 +120,7 @@ Content-Type: application/json
 
 ## ACK、慢响应与幂等
 
-飞书同步回调的 3 秒期限仍由 Botmux dispatcher 管理。插件在 2.5 秒内完成时，toast/card 直接作为 ACK；超过 2.5 秒时，Botmux 先返回“后台处理中”，继续等待插件，但最多 30 秒。插件随后返回 card 时，Botmux 只更新原 `open_message_id` 一次；迟到的 toast 无法再显示，只记录不含正文的状态日志。
+飞书同步回调的 3 秒期限仍由 Botmux dispatcher 管理。每个 Bot 可通过 `/botconfig set cardActionAckTimeoutMs <毫秒>` 设置同步等待时长，合法范围 500–2500ms，默认 2500ms，`unset` 恢复默认且均为热更新；该值统一作用于该 Bot 的内置动作和所有插件，插件不能自行覆盖。处理在期限内完成时，toast/card 直接作为 ACK；超过期限时，Botmux 先返回“后台处理中”，继续等待插件，但插件请求最多 30 秒。插件随后返回 card 时，Botmux 只更新原 `open_message_id` 一次；迟到的 toast 无法再显示，只记录不含正文的状态日志。
 
 Botmux 会用稳定 `eventId` 阻止长连接重推造成的重复投递，并在单进程内抑制同时进行的重复回调。这个传输去重不能替代业务幂等：插件仍须以 `eventId` 保护持久化写入和外部副作用。
 

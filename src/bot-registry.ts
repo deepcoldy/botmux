@@ -47,6 +47,7 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1327,6 +1328,13 @@ export interface BotConfig {
    * 具体 app/租户，不在运行时切换（要换平台 = 重新配/加一个 bot）。
    */
   brand?: Brand;
+  /**
+   * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
+   * handler is still running at this point, Botmux ACKs with a background-work
+   * toast and applies a later card result via message.patch. Valid range is
+   * 500–2500 ms; unset or invalid values keep the 2500 ms default.
+   */
+  cardActionAckTimeoutMs?: number;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
   /**
@@ -3261,6 +3269,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entryCliId,
