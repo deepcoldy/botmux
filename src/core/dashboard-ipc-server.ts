@@ -115,6 +115,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
+import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -3038,8 +3039,17 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/locate', async (req, res, params) => {
   const sid = params.sessionId;
+  let expected: SessionLocateExpectedScope = {};
+  try {
+    expected = await readJsonBody(req, 8 * 1024);
+  } catch (err) {
+    return jsonRes(res, err instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false,
+      error: err instanceof JsonBodyTooLargeError ? 'body_too_large' : 'invalid_json',
+    });
+  }
   const acq = locateLimiter.tryAcquire(sid);
   if (!acq.ok) {
     res.writeHead(429, {
@@ -3058,18 +3068,31 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   const ctx = ds
     ? {
         larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        scope: ds.session.scope,
+        status: ds.session.status,
         rootMessageId: ds.session.rootMessageId,
         ownerOpenId: ds.session.ownerOpenId,
       }
     : closed
       ? {
           larkAppId: closed.larkAppId ?? '',
+          chatId: closed.chatId,
+          scope: closed.scope,
+          status: closed.status,
           rootMessageId: closed.rootMessageId,
           ownerOpenId: closed.ownerOpenId,
         }
       : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  // Optional compare-before-locate guard used by the public `/sessions` card.
+  // Existing dashboard callers send `{}` and keep their historical behavior.
+  // When present, every field is checked against the daemon's latest row so a
+  // transfer/close racing the card handler's fresh GET fails closed here.
+  if (!matchesExpectedSessionLocateScope(ctx, expected)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_scope_changed' });
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });

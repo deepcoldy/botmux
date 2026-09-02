@@ -1446,6 +1446,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── Public `/sessions` current-group callbacks ─────────────────────
+  // Kept separate from dash_sessions_*: this card is available to ordinary
+  // command operators and exposes only navigation, never dashboard mutations.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('group_sessions_') &&
+    larkAppId
+  ) {
+    const { handleGroupSessionsCardAction } = await import('./group-sessions-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    return handleGroupSessionsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: localeForBot(larkAppId),
+    });
+  }
+
   // ─── `/dashboard schedules` callbacks ────────────────────────────────
   if (
     typeof value?.action === 'string' &&

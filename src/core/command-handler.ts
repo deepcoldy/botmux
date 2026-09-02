@@ -18,6 +18,7 @@ import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
+import { handleGroupSessionsCommand } from './group-sessions-command.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
@@ -131,7 +132,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -2673,6 +2674,13 @@ export async function handleCommand(
         break;
       }
 
+      case '/sessions': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleGroupSessionsCommand(message, rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Current-group sessions command handled`);
+        break;
+      }
+
       case '/role': {
         const chatId = ds?.chatId;
         if (!chatId || !larkAppId) {
@@ -4553,6 +4561,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),

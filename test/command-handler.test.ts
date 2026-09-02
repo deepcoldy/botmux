@@ -666,7 +666,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -699,10 +699,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 36 = master 的 35 条（含 /forklist、/cot、/cli）+ /retry。
+    // 37 = master 的 36 条 + /sessions。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(36);
+    expect(DAEMON_COMMANDS.size).toBe(37);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -957,6 +957,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/group')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/g')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/skills')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/sessions')).toBe(true);
   });
 
   it('is a subset of DAEMON_COMMANDS (they are still daemon-handled)', () => {

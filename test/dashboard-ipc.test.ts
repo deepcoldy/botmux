@@ -4313,6 +4313,46 @@ describe('POST /api/sessions/:sessionId/locate rate limit', () => {
     expect(second.status).toBe(429);
     expect(second.headers.get('retry-after')).toBeTruthy();
   });
+
+  it('fails closed when the atomic expected chat/app/scope guard no longer matches', async () => {
+    const sessionId = 'sX-guard-scope';
+    const appId = 'cli_guard_bot';
+    const rootMessageId = 'om_guard_root';
+    workerPool.setActiveSessionsRegistry(new Map([[
+      sessionKey(rootMessageId, appId),
+      {
+        larkAppId: appId,
+        chatId: 'oc_current',
+        scope: 'thread',
+        session: {
+          sessionId,
+          larkAppId: appId,
+          chatId: 'oc_current',
+          rootMessageId,
+          scope: 'thread',
+          status: 'active',
+          ownerOpenId: 'ou_owner',
+        },
+      } as any,
+    ]]));
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${sessionId}/locate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          expectedLarkAppId: appId,
+          expectedChatId: 'oc_stale_card',
+          expectedScope: 'thread',
+          expectedOpen: true,
+        }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ ok: false, error: 'session_scope_changed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+    }
+  });
 });
 
 describe('GET /api/schedules', () => {
