@@ -278,7 +278,7 @@ if (probe.error || probe.status !== 0) {
 }
 
 // ── Write the single launcher ──────────────────────────────────────────────────
-// Same path + same atomic-write discipline as the daemon and `pnpm use:here` use
+// Same path + same atomic-write discipline as the daemon and `bun run use:here` use
 // (src/daemon.ts, scripts/claim-botmux-bin.mjs), because concurrent CLI sessions
 // `exec` this file constantly and a half-written script breaks every `botmux send`
 // in flight. Three parts, none optional: realpath first (else we rename over a

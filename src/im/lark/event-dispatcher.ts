@@ -4466,7 +4466,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     wsConfig: { pingTimeout: 30 },
     // 重连握手卡死（DNS/代理/NAT）兜底，避免单次握手永久 pending。
     handshakeTimeoutMs: 15_000,
-    // 重连过程打日志，便于事后从 `pnpm daemon:logs` 复盘（warn 默认看不到这些）。
+    // 重连过程打日志，便于事后从 `bun run daemon:logs` 复盘（warn 默认看不到这些）。
     onReconnecting: () => logger.warn(`[ws] ${larkAppId} reconnecting…`),
     onReconnected: () => logger.info(`[ws] ${larkAppId} reconnected`),
     onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message}`),

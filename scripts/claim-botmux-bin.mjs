@@ -48,7 +48,7 @@ function atomicWriteFileSync(filePath, data, mode) {
   }
 }
 
-// 逃生阀：偶尔只想 build 不想抢全局时 `BOTMUX_NO_CLAIM=1 pnpm use:here`
+// 逃生阀：偶尔只想 build 不想抢全局时 `BOTMUX_NO_CLAIM=1 bun run use:here`
 if (process.env.BOTMUX_NO_CLAIM) {
   console.log('↪︎ BOTMUX_NO_CLAIM 已设，跳过认领全局 botmux');
   process.exit(0);
