@@ -2,6 +2,7 @@
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
+import { spawnSync } from 'node:child_process';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
@@ -232,7 +233,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -853,13 +854,14 @@ function createDshProfile(name: string): string {
   // dsh judges a profile's existence by its package.json (not the directory
   // or cordis.yml). Non-shipped profiles must include the dsh-base bundle.
   const pkgJson = join(profileDir, 'package.json');
-  if (!existsSync(pkgJson)) {
+  const isNew = !existsSync(pkgJson);
+  if (isNew) {
     const pkg = {
       name: `dsh-profile-${name}`,
       private: true,
       dependencies: {
-        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.1.1',
-        '@deepseek-ai/dsh-sdk-protocol': '^0.1.1',
+        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.1.1-rc.1',
+        '@deepseek-ai/dsh-sdk-protocol': '^0.1.1-rc.1',
       },
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
     };
@@ -899,6 +901,20 @@ function createDshProfile(name: string): string {
     ].join('\n');
     writeFileSync(cordisPatchYml, patch, 'utf8');
   }
+
+  // Install profile dependencies. dsh plugin add uses the profile's package
+  // manager (pnpm) to install the declared dependencies into node_modules.
+  // We only need to trigger this once on new profiles; existing profiles
+  // already have their node_modules. dsh-sdk-jsonrpc-server has no dsh.bundle
+  // so this won't touch cordis.patch.yml.
+  if (isNew) {
+    const dshBin = resolveCommandReal('dsh');
+    spawnSync(dshBin, ['plugin', '--profile', name, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
+      stdio: 'pipe',
+      timeout: 120_000,
+    });
+  }
+
   return name;
 }
 

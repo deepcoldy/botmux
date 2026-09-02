@@ -27,7 +27,7 @@
  * (the in-memory session is lost; sessions persist on disk under
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -189,21 +189,27 @@ interface NativeDshConfig {
  *  restated here. Community plugins (traex-bridge, openviking, genui, etc.) are
  *  added by the user with `dsh plugin --profile <name> add <pkg>`.
  *
+ *  After writing the skeleton we call `dsh plugin --profile <name> add` to
+ *  install the dependencies into node_modules — without this, dsh can't load
+ *  the profile. dsh-sdk-jsonrpc-server is a prerelease (0.1.1-rc.x), so the
+ *  version range must be ^0.1.1-rc.1 (plain ^0.1.1 doesn't match prereleases).
+ *
  *  If the profile already exists, this is a no-op. */
-function ensureProfileDir(name: string): string {
+function ensureProfileDir(name: string, dshBin: string): string {
   const dir = join(homedir(), '.dsh', 'profiles', name);
   mkdirSync(dir, { recursive: true });
 
   const pkgJson = join(dir, 'package.json');
-  if (!existsSync(pkgJson)) {
+  const isNew = !existsSync(pkgJson);
+  if (isNew) {
     const pkg = {
       name: `dsh-profile-${name}`,
       private: true,
       dependencies: {
-        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.1.1',
+        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.1.1-rc.1',
         // dsh-sdk-protocol is a peer dep of sdk-jsonrpc-server; pnpm does not
         // auto-install peer deps, so we declare it explicitly.
-        '@deepseek-ai/dsh-sdk-protocol': '^0.1.1',
+        '@deepseek-ai/dsh-sdk-protocol': '^0.1.1-rc.1',
       },
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
     };
@@ -246,6 +252,18 @@ function ensureProfileDir(name: string): string {
     writeFileSync(cordisPatchYml, patch, 'utf8');
   }
 
+  // Install profile dependencies. dsh plugin add uses the profile's package
+  // manager (pnpm) to install the declared dependencies into node_modules.
+  // We only need to trigger this once on new profiles; existing profiles
+  // already have their node_modules. dsh-sdk-jsonrpc-server has no dsh.bundle
+  // so this won't touch cordis.patch.yml.
+  if (isNew) {
+    spawnSync(dshBin, ['plugin', '--profile', name, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
+      stdio: 'pipe',
+      timeout: 120_000,
+    });
+  }
+
   return dir;
 }
 
@@ -278,8 +296,8 @@ function loadCredentials(): Record<string, string> {
 function resolveNativeDshConfig(): NativeDshConfig {
   const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
 
-  // Ensure the profile directory exists (dsh CLI auto-creates cordis.yml).
-  ensureProfileDir(profileName);
+  // Ensure the profile directory exists and dependencies are installed.
+  ensureProfileDir(profileName, args.dshBin);
 
   // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
   //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
