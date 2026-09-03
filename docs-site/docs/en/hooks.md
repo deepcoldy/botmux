@@ -60,6 +60,8 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
 | `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
 
+> **`outbound.send` / `outbound.reply` cannot intercept.** They fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat; `mode:"sync"` there could only retract after the fact, which is not interception. Declaring `sync` on them degrades to async with a warning.
+
 ## Supported Events
 
 | Event | Trigger |
@@ -113,6 +115,20 @@ A regular hook is a *notification* — nothing reads its result. `prompt.submit`
 ```
 
 A ready-to-adapt example ships in the repo: `examples/hooks/prompt-gate.sh`.
+
+### When it fires
+
+**The gate runs *before* the prompt is handed to the CLI — not "typed into the box, before Enter".**
+
+That second moment does not exist in botmux: writing the text and pressing Enter are a single atomic adapter call (`writeInput` types line by line and the trailing Enter *is* the submit), with no insertion point between them.
+
+```
+Lark message → built-in permission checks → 🚦 prompt.submit gate → charge quota
+   → download attachments → createSession/forkWorker → IPC to worker
+   → writeInput (type + Enter, atomic) → CLI
+```
+
+The gate runs in the **daemon** process, before the CLI subprocess has this turn's input at all (for a new topic the CLI has not even been forked). A denied message never existed as far as the CLI is concerned.
 
 ### Expressing a verdict
 

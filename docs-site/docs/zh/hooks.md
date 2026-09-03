@@ -60,6 +60,8 @@ tail -f /tmp/botmux-hook.log
 | `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id |
 | `redact.fullContentEvents` | string[] | 可选。默认截断长文本；列入 allowlist 的事件透传全文 |
 
+> **`outbound.send` / `outbound.reply` 不能用来拦截。** 它们的发射点在飞书 API 调用**成功之后**（需先拿到 `messageId`），那一刻消息已经在群里了；加 `mode:"sync"` 也只能事后撤回，不是拦截。这两个事件写 `sync` 会降级为 async 并告警。
+
 ## 支持事件
 
 | 事件 | 触发时机 |
@@ -113,6 +115,19 @@ tail -f /tmp/botmux-hook.log
 ```
 
 仓库内置可直接改的示例：`examples/hooks/prompt-gate.sh`。
+
+### 触发时机
+
+**闸跑在「prompt 还没送进 CLI 之前」——不是「已经输进输入框、按 Enter 之前」。**
+
+后一种时机在 botmux 里**不存在**：写文本与按 Enter 是**同一次适配器调用中的原子动作**（`writeInput` 逐行打字、末尾那个 Enter 即提交），中间没有可插入的停顿。
+
+```
+飞书消息 → 内置权限校验 → 🚦 prompt.submit 闸 → 扣额度 → 下载附件
+        → createSession/forkWorker → IPC 到 worker → writeInput（打字+Enter，原子）→ CLI
+```
+
+闸执行于 **daemon 进程**，此时 CLI 子进程尚未拿到这一轮输入（新话题下 CLI 甚至还没 fork）。被拒的消息，CLI 完全不知道它存在过。
 
 ### 怎么表达裁决
 
