@@ -25,7 +25,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
-import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
@@ -837,6 +837,13 @@ export function prepareDirectSandbox(opts: {
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
   }
   for (const k of PROXY_ENV_KEYS) {
+    const v = process.env[k];
+    if (typeof v === 'string' && v) env[k] = v;
+  }
+  // Authority-symmetric with the proxy keys: a CA bundle the operator set (or
+  // the worker resolved) must survive into the bwrap child, or TLS breaks for
+  // the same reason this feature exists on darwin.
+  for (const k of CA_BUNDLE_ENV_KEYS) {
     const v = process.env[k];
     if (typeof v === 'string' && v) env[k] = v;
   }

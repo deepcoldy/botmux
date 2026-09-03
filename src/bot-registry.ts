@@ -1317,8 +1317,10 @@ export interface SessionGroupConfig {
    *   afterwards; works on any tenant — no tenant scope catalog involved.
    * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
    *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
-   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
-   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes —
+   *   a capability Feishu has not opened yet, so they are absent from the
+   *   scope catalog (verified on our tenant) and setup cannot even apply for
+   *   them (hence not the default). See services/feed-group-tagger.ts.
    * 'off' — no tagging.
    */
   tag?: {

@@ -703,6 +703,16 @@ describe('mira buildArgs', () => {
 
 describe('dsh buildArgs (runner model)', () => {
   const adapter = createDshAdapter('/opt/dsh/bin/dsh');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the node runner and passes the dsh runtime binary', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
@@ -741,6 +751,50 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain(String(30 * 60 * 1000));
   });
 
+  it('passes the question bridge patch to the runner when enabled for the default botmux profile', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false });
+      const patchIdx = args.indexOf('--bridge-patch');
+      expect(patchIdx).toBeGreaterThanOrEqual(0);
+      expect(args[patchIdx + 1]).toContain(join(root, '.botmux', 'dsh-question-bridge'));
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('materializes the question bridge for sandbox readonly paths even before buildArgs runs', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not inject the question bridge into custom dsh profiles', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+    const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false, dshProfile: 'custom' });
+    expect(args).toContain('--dsh-profile');
+    expect(args).toContain('custom');
+    expect(args).not.toContain('--bridge-patch');
+    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(homedir(), '.botmux', 'dsh-question-bridge'))]);
+  });
+
   it('omits --turn-timeout-ms when unset or non-positive', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
     expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
@@ -749,6 +803,26 @@ describe('dsh buildArgs (runner model)', () => {
 
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
+  });
+
+  it('exposes and pre-creates configured DSH_HOME for sandboxed profile state', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(configured.authPaths).toContain(customHome);
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+      expect(existsSync(join(customHome, 'sessions', 'botmux'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('readyPattern matches the runner prompt indicator', () => {
@@ -814,6 +888,16 @@ describe('dsh buildArgs (runner model)', () => {
 
 describe('dsh-tui buildArgs (PTY TUI model)', () => {
   const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the dsh-tui binary directly (no runner)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
@@ -833,8 +917,41 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args).toEqual(['--resume']);
   });
 
-  it('omits --resume on fresh spawn', () => {
+  it('omits --resume on fresh spawn when the question bridge is disabled', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('injects the question bridge patch as a single --patch= token when available', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-bridge-profile-'));
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = root;
+      const pkgRoot = join(root, 'profiles', 'dsh-tui', 'node_modules', '@deepseek-harness-tui', 'dsh-tui');
+      mkdirSync(join(pkgRoot, 'lib', 'types'), { recursive: true });
+      writeFileSync(join(root, 'profiles', 'dsh-tui', 'package.json'), JSON.stringify({ name: 'profile' }) + '\n');
+      writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+        name: '@deepseek-harness-tui/dsh-tui',
+        type: 'module',
+        exports: { '.': { import: './lib/types/index.js' } },
+      }) + '\n');
+      writeFileSync(join(pkgRoot, 'lib', 'types', 'index.js'), 'export function apply(){}\n');
+
+      const bridgeAdapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+      const patchArg = args.find(arg => arg.startsWith('--patch='));
+      expect(patchArg).toBeDefined();
+      expect(args).not.toContain('--patch');
+      expect(args).toContain('--resume');
+      expect(args).toContain('abc-123');
+      const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
+      expect(readonly?.length).toBe(1);
+      expect(patchArg).toContain(readonly![0]);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('has no portable copy-paste resume command (session id not tracked)', () => {
@@ -853,9 +970,25 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });
 
-  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+  it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     expect(adapter.authPaths).toContain('~/.dsh-tui');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      expect(configured.authPaths).toContain(customHome);
+      expect(configured.authPaths).toContain('~/.dsh-tui');
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('writeInput frames multiline text itself and presses one Enter', async () => {

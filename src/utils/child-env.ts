@@ -527,6 +527,15 @@ export const PROXY_ENV_KEYS = [
   'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
 ] as const;
 
+/** CA-bundle vars. Same shape as {@link PROXY_ENV_KEYS} and excluded from
+ *  BOTMUX_INJECTED_ENV_KEYS for the same reason: that list also drives the pane
+ *  `unset` clause and scrubTmuxServerGlobalEnv(), so listing a standard,
+ *  user-ownable variable there would DELETE the CA bundle a user configured for
+ *  their own tmux server / rcfile — and it would do so for every CLI on every
+ *  platform, not just the sandboxed Codex this exists for. Forwarded per pane by
+ *  buildBotmuxEnvAssignments instead. */
+export const CA_BUNDLE_ENV_KEYS = ['SSL_CERT_FILE'] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
@@ -538,6 +547,9 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   // via buildBotmuxEnvAssignments reads opts.env directly, so it's unaffected
   // by this client-side strip.
   ...PROXY_ENV_KEYS,
+  // Same reasoning as the proxy keys: keep a daemon-side CA bundle out of the
+  // shared server's global env, but never delete one the user set there.
+  ...CA_BUNDLE_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

@@ -3,6 +3,7 @@ import claude from './claude-code.js';
 import codex from './codex.js';
 import opencode from './opencode.js';
 import coco from './coco.js';
+import dsh from './dsh.js';
 
 const REGISTRY: Record<string, HookAskAdapter> = {
   'claude-code': claude,
@@ -24,6 +25,10 @@ const REGISTRY: Record<string, HookAskAdapter> = {
   // is delivered by keystroke-driving CoCo's native picker (see coco.ts +
   // daemon /api/asks coco branch + worker driveCocoPicker).
   coco,
+  // DSH/dsh-tui bridge plugins normalize ctx.userQuestions requests into this
+  // payload shape and expect a plain DSH AskUserQuestionAnswer JSON object back.
+  dsh,
+  'dsh-tui': dsh,
 };
 
 export function getHookAdapter(cliId: string): HookAskAdapter | undefined {

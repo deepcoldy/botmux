@@ -833,6 +833,15 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     expect(isolatedPaneReattachSafe(currentVersionNoState, ['credential', 'read', 'write'])).toBe(false);
     expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(12);
   });
+
+  it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
+    // A pane spawned before this change keeps its ORIGINAL process environment, so
+    // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep
+    // failing TLS on UnknownIssuer — before any output, so the symptom is a pane that
+    // simply never answers. The marker version is the only lever that turns such a
+    // pane into kill + cold-spawn, so bumping past 12 is load-bearing.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(12);
+  });
 });
 
 // ─── #714: new spawn-time sandbox mount (traex/coco migration markers) ────────

@@ -6,6 +6,7 @@ import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
 function runnerPath(): string {
   // Source-level worker integration tests execute through tsx and need the
@@ -29,6 +30,15 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured] : ['~/.dsh'];
+}
+
 export function createDshAdapter(pathOverride?: string): CliAdapter {
   // Resolve the wrapped `dsh` binary lazily, on first buildArgs
   // (spawn time), so constructing the adapter during `botmux setup` doesn't
@@ -36,6 +46,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   // itself.
   const rawDshBin = pathOverride ?? 'dsh';
   let cachedDshBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh' }));
   return {
     id: 'dsh',
     // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
@@ -44,7 +56,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
     // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
     // drop it.
-    authPaths: ['~/.dsh'],
+    get authPaths(): string[] { return dshAuthPaths(); },
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
@@ -58,14 +70,22 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommandReal(rawDshBin))];
     },
 
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
       // Pre-create the native dsh home + sessions subdir in the real HOME
       // before the worker enters the sandbox: the sandbox's keepExisting
       // filter drops authPaths that don't exist yet, and the runner can't
       // create them from inside.
       const dshHome = join(homedir(), '.dsh');
+      const activeDshHome = configuredDshHome();
       mkdirSync(dshHome, { recursive: true });
-      mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
+      mkdirSync(join(activeDshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
         runnerArgv0('dsh-runner', runnerPath()),
         '--session-id', sessionId,
@@ -76,7 +96,13 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
-      pushOpt(args, '--dsh-profile', dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux');
+      const profile = dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux';
+      pushOpt(args, '--dsh-profile', profile);
+      // Legacy DSH has a single provider seat. Only auto-inject into the
+      // botmux-owned default profile where we know no user question provider is
+      // present; custom profiles may intentionally carry their own provider.
+      const bridge = profile === 'botmux' ? bridgePatch() : null;
+      pushOpt(args, '--bridge-patch', bridge?.patchPath);
       // Per-bot turn timeout override; undefined → runner default (10 min).
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
         ? String(turnTimeoutMs)

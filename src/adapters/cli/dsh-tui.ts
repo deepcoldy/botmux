@@ -5,6 +5,16 @@ import { delay } from '../../utils/timing.js';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
+
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
+}
 
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
@@ -38,6 +48,8 @@ function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
 export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'dsh-tui';
   let cachedBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh-tui' }));
   // The launcher spawns `dsh` as a second-stage child. Inside the file sandbox
   // /run is masked, so an nvm/fnm-installed dsh would vanish — re-expose it
   // (same pattern as the dsh adapter's dsh binary).
@@ -50,6 +62,11 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommand('dsh'))];
     },
 
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
     buildArgs({ resume, resumeSessionId }) {
       // Pre-create the authPaths in the real HOME before the worker enters the
       // sandbox: the sandbox's keepExisting filter drops authPaths that don't
@@ -57,9 +74,17 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       // resume.txt — without this, sandbox:true would silently break cross-
       // session resume (same pattern as the dsh adapter's mkdirSync).
       const home = homedir();
+      const activeDshHome = configuredDshHome();
       mkdirSync(join(home, '.dsh'), { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
       mkdirSync(join(home, '.dsh-tui'), { recursive: true });
       const args: string[] = [];
+      const bridge = bridgePatch();
+      // dsh-tui's launcher treats a split `--patch /abs/path` value as a
+      // workspace target. Keep the DSH overlay as one token so it reaches
+      // `dsh --profile dsh-tui` intact.
+      if (bridge) args.push(`--patch=${bridge.patchPath}`);
       if (resume) {
         // Bare --resume makes the launcher read ~/.dsh-tui/resume.txt; an
         // explicit session id is passed through verbatim.
@@ -114,7 +139,7 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
-    authPaths: ['~/.dsh', '~/.dsh-tui'],
+    get authPaths(): string[] { return dshAuthPaths(); },
     // Model is NOT injected: the TUI resolves its (provider, model) route from
     // its own profile config / persisted /model choice, and the bot's model
     // field carries no provider — hardcoding deepseek-official would break
