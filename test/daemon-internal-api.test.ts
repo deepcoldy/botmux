@@ -175,6 +175,19 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(ids).not.toContain('sB');
   });
 
+  it('sessions-list ?fresh=1 reads the authenticated caller daemon instead of the aggregator cache', async () => {
+    const proxyToDaemon = vi.fn(async () => makeUpstream(200, {
+      sessions: [{ ...cliA, status: 'working' }, cliB],
+    }));
+    const api = createDaemonInternalApi(makeDeps({
+      getSessions: () => [{ ...cliA, status: 'idle' }],
+      proxyToDaemon,
+    }));
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list?fresh=1'), '', 'cli_a');
+    expect(r).toEqual({ status: 200, body: { sessions: [{ ...cliA, status: 'working' }] } });
+    expect(proxyToDaemon).toHaveBeenCalledWith('cli_a', '/api/sessions', { method: 'GET' });
+  });
+
   it('sessions-list with callerAppId=cli_a AND ?scope=global → ALL rows cross-bot', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list?scope=global'), '', 'cli_a');

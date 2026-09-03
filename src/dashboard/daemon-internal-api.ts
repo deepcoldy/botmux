@@ -256,6 +256,19 @@ const ROUTES: RouteDef[] = [
     pathRe: /^\/__daemon\/sessions-list$/,
     handle: async (_m, ctx, deps) => {
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      const wantsFresh = ctx.url.searchParams.get('fresh') === '1';
+      // Interactive `/sessions` refreshes need the daemon's live projection:
+      // the dashboard aggregator is event-driven and may briefly retain the
+      // previous idle status before a working-edge SSE patch arrives.
+      if (wantsFresh && !isGlobal && ctx.callerAppId !== undefined) {
+        const upstream = await deps.proxyToDaemon(ctx.callerAppId, '/api/sessions', { method: 'GET' });
+        const body = await readUpstream(upstream);
+        if (upstream.status !== 200) return { status: upstream.status, body };
+        const rows = Array.isArray((body as { sessions?: unknown[] } | null)?.sessions)
+          ? (body as { sessions: unknown[] }).sessions
+          : [];
+        return { status: 200, body: { sessions: scopeByCaller(rows, ctx.callerAppId) } };
+      }
       const sessions = isGlobal
         ? deps.getSessions()
         : scopeByCaller(deps.getSessions(), ctx.callerAppId);

@@ -41,7 +41,7 @@ export async function handleGroupSessionsCommand(
   const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
   let response: Awaited<ReturnType<DaemonClient['request']>>;
   try {
-    response = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    response = await client.request({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
   } catch (cause) {
     await deps.sessionReply(
       rootId,
