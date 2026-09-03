@@ -3,13 +3,17 @@
  * release notes accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
- * The registry lookups (`latest` + rollback packument) MUST go through the
- * registry npm is actually configured to use (`npm config get registry`): the
- * update button installs with the owning package manager, which resolves
- * through that same .npmrc family. Checking the public registry while
- * installing through a lagging mirror made the card advertise upgrades (and
- * rollback targets) that could never install. The public registry is only a
- * fallback for when the npm config can't be read (npm missing/unusual PATH).
+ * The `latest` lookup MUST go through the registry npm is actually configured
+ * to use (`npm config get registry`): the update button installs with the
+ * owning package manager, which resolves through that same .npmrc family.
+ * Checking the public registry while installing through a lagging mirror made
+ * the card advertise upgrades that could never install. The public registry is
+ * only a fallback for when the npm config can't be read (npm missing/unusual
+ * PATH). The ROLLBACK packument lookup, by contrast, deliberately stays
+ * public: the rollback install pins the registry to public too
+ * (`withGlobalInstallRegistry` in global-install.ts, rollback-only opt-in),
+ * and the allow-list validated against this packument must match the source
+ * that pin installs from.
  *
  * Every network call is best-effort: timeout-bounded and returns null / [] on
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
@@ -179,11 +183,12 @@ let npmRegistryInFlight: Promise<string> | null = null;
  * read is NOT cached — a transient spawn failure at startup would otherwise
  * pin the fallback (public registry) forever, re-introducing the very
  * check/install mismatch this module exists to prevent. Retrying is naturally
- * rate-limited by the caller's version cache.
+ * rate-limited by the caller's version cache. The reader is injectable so
+ * tests can cover the cache policy itself (exported for tests only).
  */
-function resolveNpmRegistryBase(): Promise<string> {
+export function resolveNpmRegistryBase(read: () => Promise<string> = spawnNpmConfigRegistry): Promise<string> {
   if (npmRegistryBase) return Promise.resolve(npmRegistryBase);
-  npmRegistryInFlight ??= spawnNpmConfigRegistry()
+  npmRegistryInFlight ??= read()
     .then(raw => {
       const base = normalizeRegistryBase(raw);
       if (base) npmRegistryBase = base;
@@ -263,15 +268,23 @@ export function selectRollbackVersions(raw: unknown, current: string, max = 3): 
     }));
 }
 
-/** Fetch the packument (from the npm-configured registry) used to offer an
- *  allow-listed rollback target — same source the install would pull from. */
+/**
+ * Fetch the packument used to offer an allow-listed rollback target.
+ * Deliberately PUBLIC, not the npm-configured registry: the rollback install
+ * pins its registry to public too (`withGlobalInstallRegistry`, rollback-only
+ * opt-in in global-install.ts), and the allow-list validated against this
+ * packument must match the source that pin installs from. Following the
+ * configured registry here would break rollback for whitelists that don't
+ * proxy botmux (lookup 503 → versions_unavailable) even though the pinned
+ * public install would have worked.
+ */
 export async function fetchRollbackVersions(
   current: string,
   opts?: FetchOpts & { max?: number },
 ): Promise<RollbackVersionsResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(registryPackumentUrl(await effectiveRegistryBase(opts?.registry)), {
+    const res = await fetchImpl(registryPackumentUrl(PUBLIC_REGISTRY), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });

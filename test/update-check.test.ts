@@ -13,6 +13,7 @@ import {
   normalizeRegistryBase,
   registryLatestUrl,
   registryPackumentUrl,
+  resolveNpmRegistryBase,
 } from '../src/core/update-check.js';
 
 describe('parseVersion', () => {
@@ -141,6 +142,9 @@ describe('normalizeRegistryBase', () => {
   it('takes the last http(s) line — wrapper shims may print banners before the value', () => {
     expect(normalizeRegistryBase('nvm shim banner v1.2.3\nhttps://mirror.example.com\n')).toBe('https://mirror.example.com/');
     expect(normalizeRegistryBase('https://first.example.com\nnot a url\n')).toBe('https://first.example.com/');
+    // Direction lock: with TWO valid http(s) lines the LAST one wins — a
+    // from-the-front scan (the tempting wrong direction) returns the first.
+    expect(normalizeRegistryBase('https://first.example.com\nhttps://last.example.com\n')).toBe('https://last.example.com/');
   });
   it('null on non-http(s) garbage (never a fetch target)', () => {
     expect(normalizeRegistryBase('')).toBeNull();
@@ -187,6 +191,19 @@ describe('fetchLatestVersion', () => {
   });
 });
 
+describe('resolveNpmRegistryBase cache policy', () => {
+  // Mutates the module-level cache in a fixed sequence from a clean start
+  // (no other test caches a successful read), so it must stay one `it`.
+  it('falls back on failure WITHOUT caching, then caches the first success for the process lifetime', async () => {
+    // 1. Failed read → public fallback, and the failure must not be cached…
+    expect(await resolveNpmRegistryBase(async () => '')).toBe('https://registry.npmjs.org/');
+    // 2. …because the next call retries and picks up the real config.
+    expect(await resolveNpmRegistryBase(async () => 'nvm banner\nhttps://cache-check.example.com\n')).toBe('https://cache-check.example.com/');
+    // 3. A successful read IS cached — a later config change is not re-read.
+    expect(await resolveNpmRegistryBase(async () => 'https://other.example.com/')).toBe('https://cache-check.example.com/');
+  });
+});
+
 describe('rollback versions', () => {
   const packument = {
     versions: {
@@ -227,7 +244,6 @@ describe('rollback versions', () => {
 
   it('fetches and filters the registry packument', async () => {
     const out = await fetchRollbackVersions('3.0.0', {
-      registry: 'https://registry.npmjs.org/',
       fetchImpl: async () => jsonResponse(200, packument),
       max: 1,
     });
@@ -237,19 +253,19 @@ describe('rollback versions', () => {
     });
   });
 
-  it('queries the configured registry for the packument — same source the rollback install would pull from', async () => {
+  it('rollback packument stays PUBLIC — same source the pinned rollback install resolves from', async () => {
     let seen = '';
     const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, packument); };
-    await fetchRollbackVersions('3.0.0', { registry: 'https://mirror.example.com', fetchImpl });
-    expect(seen).toBe('https://mirror.example.com/botmux');
+    await fetchRollbackVersions('3.0.0', { fetchImpl });
+    expect(seen).toBe('https://registry.npmjs.org/botmux');
   });
 
   it('reports registry and malformed-response failures', async () => {
-    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(503, {}) }))
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(503, {}) }))
       .toEqual({ ok: false, versions: [] });
-    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, {}) }))
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(200, {}) }))
       .toEqual({ ok: false, versions: [] });
-    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => { throw new Error('offline'); } }))
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => { throw new Error('offline'); } }))
       .toEqual({ ok: false, versions: [] });
   });
 });
