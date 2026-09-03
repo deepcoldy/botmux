@@ -161,11 +161,22 @@ describe('mergeModelFallbackObservation', () => {
       servingModel: 'claude-opus-4-8',
     });
     expect(same).toEqual({ next: FALLBACK, changed: true });
-    const switchedBack = mergeModelFallbackObservation(undefined, {
-      fallback: FALLBACK,
+    const switchedBack = mergeModelFallbackObservation(FALLBACK, {
+      fallback: { ...FALLBACK, uuid: 'u-second', fallbackModel: 'claude-sonnet-4-5' },
       servingModel: 'claude-fable-5-1',
     });
     expect(switchedBack).toEqual({ next: undefined, changed: true });
+  });
+
+  it('reports no change when both rules fire but the state lands where it began', () => {
+    // Cold start on a session the user already switched back: the tail scan
+    // finds the record AND a newer reply on another model, so (b) then (c) run
+    // and we end on "no notice" — exactly what we held. Reporting `changed`
+    // here would cost a wasted card patch on every worker start.
+    expect(mergeModelFallbackObservation(undefined, {
+      fallback: FALLBACK,
+      servingModel: 'claude-fable-5-1',
+    })).toEqual({ next: undefined, changed: false });
   });
 
   it('never clears on a serving model when no record is held', () => {

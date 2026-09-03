@@ -307,13 +307,19 @@ export class ClaudeModelFallbackTracker {
     for (const ev of events) {
       const rec = parseClaudeModelFallbackEvent(ev);
       if (rec) {
-        if (rec.scope === 'local' || this.seenUuids.has(rec.uuid)) continue;
-        this.rememberUuid(rec.uuid);
-        fallback = rec;
+        if (rec.scope === 'local') continue;
         // Replies written BEFORE the switch say nothing about what serves now;
         // shipping one alongside the switch would make the daemon clear the
-        // notice the instant it appeared.
+        // notice the instant it appeared. That holds whether or not the record
+        // is new to us, so the reset comes BEFORE the uuid dedupe: a re-drain
+        // from offset 0 (a jsonl switch, a baseline self-heal) replays the
+        // switch together with every reply that preceded it, and skipping the
+        // reset would let one of those older replies reach the daemon as
+        // "Claude answered on a different model".
         servingModel = undefined;
+        if (this.seenUuids.has(rec.uuid)) continue;
+        this.rememberUuid(rec.uuid);
+        fallback = rec;
         continue;
       }
       const serving = servingModelFromAssistantEvent(ev);

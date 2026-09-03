@@ -391,6 +391,9 @@ export function getDaemonStreamingCardUsageSnapshot(
  *      that "Claude answered on a different model" is the ONLY evidence of a
  *      switch back. Ordering matters: a `servingModel` arriving in the same
  *      message as a `fallback` was observed AFTER it, so (c) runs after (b).
+ *   d) `changed` compares the resulting STATE with the one we came in with, so
+ *      a message that runs both rules and lands back where it started costs no
+ *      write and no card patch.
  *
  * Everything else — a missing record, a restarted worker, a transcript window
  * too short to reach the switch — leaves the state exactly as it was. Absence
@@ -401,19 +404,20 @@ export function mergeModelFallbackObservation(
   msg: { fallback?: ModelFallbackState; servingModel?: string },
 ): { next: ModelFallbackState | undefined; changed: boolean } {
   let next = current;
-  let changed = false;
-  if (msg.fallback && next?.uuid !== msg.fallback.uuid) {
-    next = msg.fallback;
-    changed = true;
-  }
+  if (msg.fallback && next?.uuid !== msg.fallback.uuid) next = msg.fallback;
   if (msg.servingModel && next) {
     const serving = normalizeClaudeModelId(msg.servingModel);
     if (serving && serving !== normalizeClaudeModelId(next.fallbackModel)) {
       next = undefined;
-      changed = true;
     }
   }
-  return { next, changed };
+  // `changed` is about the STATE, not about which rules fired. A cold-start
+  // message carrying a record together with a serving model that already
+  // disagrees with it runs both rules and lands back on "no notice" — where we
+  // started — so persisting and patching the card for it would be a wasted
+  // Feishu edit on every worker start of an already-switched-back session.
+  // Same uuid identity the persist dirty-check uses.
+  return { next, changed: current?.uuid !== next?.uuid };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';

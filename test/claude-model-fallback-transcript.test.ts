@@ -238,6 +238,26 @@ describe('ClaudeModelFallbackTracker', () => {
     expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toBeNull();
   });
 
+  it('a re-drained record still drops the replies written before it', () => {
+    // A jsonl switch / baseline self-heal rewinds the bridge to offset 0 and
+    // replays the WHOLE file in one batch. The switch record is a dup by then,
+    // but the replies preceding it are still stale: without a reset on the dup
+    // the worker would report the pre-switch model and the daemon would read it
+    // as a switch back and clear a notice that is still current.
+    const tracker = new ClaudeModelFallbackTracker();
+    tracker.observe([assistant('claude-fable-5-1'), REFUSAL_RECORD as TranscriptEvent]);
+    expect(tracker.observe([
+      assistant('claude-fable-5-1'),
+      REFUSAL_RECORD as TranscriptEvent,
+    ])).toBeNull();
+    // …and the post-switch reply in the same replay is still reported.
+    expect(tracker.observe([
+      assistant('claude-fable-5-1'),
+      REFUSAL_RECORD as TranscriptEvent,
+      assistant('claude-opus-4-8'),
+    ])).toEqual({ servingModel: 'claude-opus-4-8' });
+  });
+
   it('ignores a sub-agent (scope local) fallback entirely', () => {
     const tracker = new ClaudeModelFallbackTracker();
     expect(tracker.observe([{ ...REFUSAL_RECORD, scope: 'local' } as TranscriptEvent])).toBeNull();
