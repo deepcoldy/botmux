@@ -159,6 +159,8 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(envelope).toContain('<whiteboard');
     // hook 模式用描述式文案（命令式原文只出现在 inline 路径）
     expect(envelope).toContain('本会话通过 botmux 桥接飞书');
+    expect(envelope).toContain('`botmux send` 是唯一用户可见回复通道');
+    expect(envelope).toContain('不得用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复');
     expect(envelope).not.toContain('至少 botmux send 回应一次');
   });
 
