@@ -4937,6 +4937,24 @@ function fireSessionlessCommandDetached(
   );
 }
 
+/** `/sessions` is read-only group discovery and intentionally uses the talk
+ * gate rather than the daemon-management gate. Keep human and bot senders on
+ * the same predicates used by ordinary message admission. The command handler
+ * still rejects p2p before reading any session rows. */
+function canTalkForGroupSessions(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  botTrustUnionId: string | undefined,
+  memberUnionId: string | undefined,
+  chatType: 'p2p' | 'group' | undefined,
+  botSender: boolean,
+): boolean {
+  return botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId).allowed
+    : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -18004,6 +18022,32 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
+    // Unlike daemon-management commands, `/sessions` is a read-only view of
+    // metadata already visible in this group. Authorize it at canTalk level so
+    // ordinary permitted members can use the MVP without a per-bot downgrade
+    // list, while keeping every other daemon command on canOperate by default.
+    if (cmd === '/sessions') {
+      if (!canTalkForGroupSessions(
+        larkAppId,
+        chatId,
+        senderOpenId,
+        teamTrustUnionId,
+        senderUnionId,
+        chatType,
+        senderIsBotForSlashGate,
+      )) {
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      fireSessionlessCommandDetached(
+        cmd,
+        anchor,
+        { ...parsed, content: commandContent, chatId },
+        larkAppId,
+        invocationDeps,
+      );
+      return;
+    }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
@@ -19481,6 +19525,29 @@ async function handleThreadReplyAdmitted(
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
+    if (cmd === '/sessions') {
+      const botSender = isBotSenderType || isForeignBot;
+      if (!canTalkForGroupSessions(
+        larkAppId,
+        effectiveThreadChatId,
+        threadSenderOpenId,
+        threadTeamTrustUnionId,
+        threadSenderUnionId,
+        ctxChatType,
+        botSender,
+      )) {
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      fireSessionlessCommandDetached(
+        cmd,
+        anchor,
+        { ...parsed, content: commandContent, chatId: effectiveThreadChatId },
+        larkAppId,
+        invocationDeps,
+      );
       return;
     }
     if (cmd === '/vc-auth') {

@@ -4353,6 +4353,44 @@ describe('POST /api/sessions/:sessionId/locate rate limit', () => {
       workerPool.setActiveSessionsRegistry(new Map());
     }
   });
+
+  it.each(['null', '42', '"str"', '[]', 'true'])(
+    'rejects a non-object locate body before scope validation: %s',
+    async (body) => {
+      const sessionId = 'sX-invalid-locate-body';
+      const appId = 'cli_guard_bot';
+      const rootMessageId = 'om_guard_root';
+      workerPool.setActiveSessionsRegistry(new Map([[
+        sessionKey(rootMessageId, appId),
+        {
+          larkAppId: appId,
+          chatId: 'oc_current',
+          scope: 'thread',
+          session: {
+            sessionId,
+            larkAppId: appId,
+            chatId: 'oc_current',
+            rootMessageId,
+            scope: 'thread',
+            status: 'active',
+            ownerOpenId: 'ou_owner',
+          },
+        } as any,
+      ]]));
+      try {
+        handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+        const response = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${sessionId}/locate`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ ok: false, error: 'body_must_be_object' });
+      } finally {
+        workerPool.setActiveSessionsRegistry(new Map());
+      }
+    },
+  );
 });
 
 describe('GET /api/schedules', () => {

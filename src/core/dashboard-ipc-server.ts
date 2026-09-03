@@ -3041,15 +3041,19 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
 
 ipcRoute('POST', '/api/sessions/:sessionId/locate', async (req, res, params) => {
   const sid = params.sessionId;
-  let expected: SessionLocateExpectedScope = {};
+  let body: unknown;
   try {
-    expected = await readJsonBody(req, 8 * 1024);
+    body = await readJsonBody(req, 8 * 1024);
   } catch (err) {
     return jsonRes(res, err instanceof JsonBodyTooLargeError ? 413 : 400, {
       ok: false,
       error: err instanceof JsonBodyTooLargeError ? 'body_too_large' : 'invalid_json',
     });
   }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const expected = body as SessionLocateExpectedScope;
   const acq = locateLimiter.tryAcquire(sid);
   if (!acq.ok) {
     res.writeHead(429, {

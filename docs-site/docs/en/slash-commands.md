@@ -34,6 +34,10 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
 | `/issue release` | Run inside the group created when the task was claimed: hands the task back to the platform's todo pool so someone else can take it. The group and session are **not** disbanded — the conversation is kept. Also limited to the bot's `allowedUsers` |
 
+`/sessions` card preview:
+
+![Current-group active topic sessions card](/img/sessions-command-card.png)
+
 See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`. You can also make `/repo` the new topic's first command:
 
 - `/t /repo <path|project name>`

@@ -34,6 +34,10 @@
 | `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
 | `/issue release` | 在领取任务时建出来的那个群里发，把任务退回平台「待领取」，别人可以重新领。群和会话**不会自动解散**，对话记录保留。同样限该 bot 的 `allowedUsers` |
 
+`/sessions` 卡片示意：
+
+![当前群活跃话题会话卡片](/img/sessions-command-card.png)
+
 裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。也可以把 `/repo` 作为新话题的首条命令：
 
 - `/t /repo <路径|项目名>`
