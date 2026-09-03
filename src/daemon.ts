@@ -157,7 +157,10 @@ function resolveScheduleRunLogErrorDetails(
   error: unknown,
 ): ScheduleRunLogErrorDetails {
   if (precondition !== 'error') {
-    return { errorCode: 'model_dispatch_error' };
+    return {
+      errorCode: 'model_dispatch_error',
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
   return {
     errorCode: error instanceof SchedulePreconditionError

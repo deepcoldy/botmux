@@ -94,8 +94,6 @@ fi`;
 
 export type SchedulePreconditionFormError =
   | 'source_required'
-  | 'script_required'
-  | 'file_required'
   | 'file_nul'
   | 'file_tilde';
 
@@ -217,6 +215,7 @@ function SchedulePreconditionSourceHelp(props: {
           ? tr('schedules.form.preconditionSourceInline')
           : tr('schedules.form.preconditionSourceFile')}
       </h3>
+      <p>{tr('schedules.form.preconditionEnableHelp')}</p>
       {source === 'inline' ? (
         <p>{tr('schedules.form.preconditionHelp')}</p>
       ) : (
@@ -384,13 +383,17 @@ export function buildSchedulePreconditionFormFields(input: {
   initialScript: string;
   initialFilePath: string;
   enabled: boolean;
-  remove: boolean;
   mode: PreconditionEditMode;
   script: string;
   filePath: string;
 }): { ok: true; fields: SchedulePreconditionFormFields } | { ok: false; error: SchedulePreconditionFormError } {
-  if (input.remove) return { ok: true, fields: { preconditionScript: null } };
   if (!input.hasExisting && !input.enabled) return { ok: true, fields: {} };
+  const currentSourceEmpty = input.mode === 'inline'
+    ? !input.script.trim()
+    : input.mode === 'file' && !input.filePath.trim();
+  if (currentSourceEmpty) {
+    return { ok: true, fields: input.hasExisting ? { preconditionScript: null } : {} };
+  }
 
   const fields: SchedulePreconditionFormFields = {};
   if (!input.hasExisting || input.enabled !== input.initialEnabled) {
@@ -402,7 +405,6 @@ export function buildSchedulePreconditionFormFields(input: {
       : { ok: false, error: 'source_required' };
   }
   if (input.mode === 'inline') {
-    if (!input.script.trim()) return { ok: false, error: 'script_required' };
     const sourceChanged = !input.hasExisting
       || input.initialMode !== 'inline'
       || input.script !== input.initialScript;
@@ -410,7 +412,6 @@ export function buildSchedulePreconditionFormFields(input: {
     return { ok: true, fields };
   }
   const path = input.filePath.trim();
-  if (!path) return { ok: false, error: 'file_required' };
   if (path.includes('\0')) return { ok: false, error: 'file_nul' };
   if (path.startsWith('~')) return { ok: false, error: 'file_tilde' };
   const sourceChanged = !input.hasExisting
@@ -510,10 +511,6 @@ export function scheduleTargetChatIds(
     chatIds.push(chatId);
   }
   return chatIds;
-}
-
-export function parseScheduleChatIds(value: string): string[] {
-  return scheduleTargetChatIds({ chatIds: value.split(/[\s,;]+/) });
 }
 
 export function scheduleRunTargetResults(value: unknown): ScheduleTargetRunResult[] {
@@ -1614,7 +1611,7 @@ interface ScheduleFormData {
   larkAppId: string;
 }
 
-function ScheduleFormModal(props: {
+export function ScheduleFormModal(props: {
   open: boolean;
   editing: ScheduleRow | null;
   error: string | null;
@@ -1626,6 +1623,9 @@ function ScheduleFormModal(props: {
 }) {
   const { editing, tr, bots, open, scheduleTimeZone } = props;
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const chatPickerRef = useRef<HTMLDivElement | null>(null);
+  const chatPickerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const chatSearchRef = useRef<HTMLInputElement | null>(null);
   const preconditionHelpReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const [preconditionHelpSource, setPreconditionHelpSource] = useState<PreconditionHelpSource | null>(null);
   const [name, setName] = useState(editing?.name ?? '');
@@ -1642,7 +1642,6 @@ function ScheduleFormModal(props: {
   );
   const [preconditionScript, setPreconditionScript] = useState(initialPrecondition.script);
   const [preconditionFilePath, setPreconditionFilePath] = useState(initialPrecondition.filePath);
-  const [removePrecondition, setRemovePrecondition] = useState(false);
   const [preconditionError, setPreconditionError] = useState<SchedulePreconditionFormError | null>(null);
   const [silent, setSilent] = useState(editing?.silent === true);
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
@@ -1659,9 +1658,10 @@ function ScheduleFormModal(props: {
   const [chatIds, setChatIds] = useState(initialChatIds);
   const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
   const [groups, setGroups] = useState<GroupChat[]>([]);
-  const [chatManual, setChatManual] = useState(false);
-  const [chatManualValue, setChatManualValue] = useState(initialChatIds.join('\n'));
+  const [groupsLoading, setGroupsLoading] = useState(true);
+  const [groupsLoadError, setGroupsLoadError] = useState(false);
   const [chatQuery, setChatQuery] = useState('');
+  const [chatPickerOpen, setChatPickerOpen] = useState(false);
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
@@ -1678,14 +1678,40 @@ function ScheduleFormModal(props: {
     }
   }, [open]);
 
+  useEffect(() => {
+    if (!open || !chatPickerOpen) return;
+    chatSearchRef.current?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (chatPickerRef.current?.contains(event.target as Node)) return;
+      setChatPickerOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      // Close this picker first, without dismissing the parent edit dialog.
+      event.preventDefault();
+      event.stopPropagation();
+      setChatPickerOpen(false);
+      chatPickerTriggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [open, chatPickerOpen]);
+
   // 创建和编辑都拉取群列表（30s 缓存，与 Groups 等入口共享），这样编辑时
   // 可以改选同一 Bot 已加入的其它群；Bot 本身仍保持不可变。
   useEffect(() => {
     if (!open || localDelivery) return;
     let cancelled = false;
+    setGroupsLoading(true);
+    setGroupsLoadError(false);
     fetchGroupsSnapshot({ cacheMs: 30_000 })
       .then(snap => { if (!cancelled) setGroups(snap.chats); })
-      .catch(() => undefined);
+      .catch(() => { if (!cancelled) setGroupsLoadError(true); })
+      .finally(() => { if (!cancelled) setGroupsLoading(false); });
     return () => { cancelled = true; };
   }, [open, localDelivery]);
 
@@ -1750,9 +1776,14 @@ function ScheduleFormModal(props: {
       ))
     : selectorOptions;
 
-  const showGroupSelect = !localDelivery
-    && !chatManual
-    && (selectorOptions.length > 0 || groups.length > 0);
+  const selectedChatLabels = chatIds.map(chatId => (
+    selectorOptions.find(group => group.chatId === chatId)?.name
+    ?? chatDisplayTitle({
+      chatId,
+      chatDisplayName: editing?.chatId === chatId ? editing.chatDisplayName : undefined,
+    })
+    ?? chatId
+  ));
   const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
   const schedulePreview = check?.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
@@ -1776,17 +1807,13 @@ function ScheduleFormModal(props: {
     : '';
   const preconditionErrorText = preconditionError === 'source_required'
     ? tr('schedules.form.preconditionErrSource')
-    : preconditionError === 'script_required'
-      ? tr('schedules.form.preconditionErrScript')
-      : preconditionError === 'file_required'
-        ? tr('schedules.form.preconditionErrFile')
-        : preconditionError === 'file_nul'
-          ? tr('schedules.form.preconditionErrFileNul')
-          : preconditionError === 'file_tilde'
-            ? tr('schedules.form.preconditionErrFileTilde')
-            : null;
+    : preconditionError === 'file_nul'
+      ? tr('schedules.form.preconditionErrFileNul')
+      : preconditionError === 'file_tilde'
+        ? tr('schedules.form.preconditionErrFileTilde')
+        : null;
 
-  function updateChatSelection(nextValues: readonly string[], syncManualValue = true): void {
+  function updateChatSelection(nextValues: readonly string[]): void {
     const nextChatIds = scheduleTargetChatIds({ chatIds: nextValues });
     if (
       initialTopicChatId
@@ -1795,7 +1822,6 @@ function ScheduleFormModal(props: {
       setRootMessageId('');
     }
     setChatIds(nextChatIds);
-    if (syncManualValue) setChatManualValue(nextChatIds.join('\n'));
   }
 
   function toggleChat(chatId: string, checked: boolean): void {
@@ -1838,7 +1864,6 @@ function ScheduleFormModal(props: {
       initialScript: initialPrecondition.script,
       initialFilePath: initialPrecondition.filePath,
       enabled: preconditionEnabled,
-      remove: removePrecondition,
       mode: preconditionMode,
       script: preconditionScript,
       filePath: preconditionFilePath,
@@ -1961,46 +1986,46 @@ function ScheduleFormModal(props: {
           )}
         </label>
         <div className="schedule-form-field schedule-precondition-field">
-          <span id="schedule-precondition-label" className="schedule-form-label">
-            {tr('schedules.form.precondition')}
-          </span>
-          <label className="toggle-row schedule-precondition-toggle">
-            <input
-              type="checkbox"
-              role="switch"
-              checked={preconditionEnabled}
-              disabled={removePrecondition}
-              aria-labelledby="schedule-precondition-label schedule-precondition-toggle-title"
-              aria-describedby="schedule-precondition-toggle-help"
-              aria-controls="schedule-precondition-panel"
-              onChange={e => {
-                setPreconditionEnabled(e.currentTarget.checked);
-                setPreconditionError(null);
-              }}
-            />
-            <span className="switch" aria-hidden="true" />
-            <span className="toggle-tx">
-              <strong id="schedule-precondition-toggle-title">{tr('schedules.form.preconditionEnable')}</strong>
-              <small id="schedule-precondition-toggle-help">
-                {tr('schedules.form.preconditionEnableHelp')}
-              </small>
+          <div className="schedule-precondition-header">
+            <span className="schedule-form-label">
+              <FieldTitle
+                help={tr('schedules.form.preconditionEnableHelp')}
+                helpLabel={tr('schedules.form.preconditionEnable')}
+              >
+                <span id="schedule-precondition-label">{tr('schedules.form.precondition')}</span>
+              </FieldTitle>
             </span>
-          </label>
+            <label className="toggle-row schedule-precondition-toggle">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={preconditionEnabled}
+                aria-labelledby="schedule-precondition-label"
+                aria-describedby="schedule-precondition-toggle-help"
+                aria-controls="schedule-precondition-panel"
+                onChange={e => {
+                  setPreconditionEnabled(e.currentTarget.checked);
+                  setPreconditionError(null);
+                }}
+              />
+              <span className="switch" aria-hidden="true" />
+              <span aria-hidden="true">{tr(preconditionEnabled ? 'schedules.enabled' : 'schedules.paused')}</span>
+            </label>
+          </div>
+          <span id="schedule-precondition-toggle-help" className="schedule-precondition-sr-only">
+            {tr('schedules.form.preconditionEnableHelp')}
+          </span>
 
-          {hasExistingPrecondition && !removePrecondition ? (
-            <p className={`schedule-precondition-status${preconditionEnabled ? '' : ' is-paused'}`} role="status">
-              {initialPrecondition.mode === 'keep'
-                ? tr('schedules.form.preconditionUnavailableHelp')
-                : preconditionEnabled
-                  ? tr('schedules.form.preconditionConfiguredHelp')
-                  : tr('schedules.form.preconditionPausedHelp')}
+          {hasExistingPrecondition && initialPrecondition.mode === 'keep' ? (
+            <p className="schedule-precondition-status" role="status">
+              {tr('schedules.form.preconditionUnavailableHelp')}
             </p>
           ) : null}
 
-          {(preconditionEnabled || hasExistingPrecondition) && !removePrecondition ? (
-            <div id="schedule-precondition-panel" className="schedule-precondition-panel">
+          {preconditionEnabled || hasExistingPrecondition ? (
+            <div className="schedule-precondition-toolbar">
               <fieldset className="schedule-precondition-source">
-                <legend>{tr('schedules.form.preconditionSource')}</legend>
+                <legend className="schedule-precondition-sr-only">{tr('schedules.form.preconditionSource')}</legend>
                 <div className="schedule-form-radio-group">
                   {initialPrecondition.mode === 'keep' ? (
                     <label>
@@ -2070,14 +2095,18 @@ function ScheduleFormModal(props: {
                   </span>
                 </div>
               </fieldset>
+            </div>
+          ) : null}
 
+          {preconditionEnabled || hasExistingPrecondition ? (
+            <div id="schedule-precondition-panel" className="schedule-precondition-panel">
               {preconditionMode === 'keep' ? (
                 <p className="schedule-form-help" role="note">
                   {tr('schedules.form.preconditionKeepHelp')}
                 </p>
               ) : preconditionMode === 'inline' ? (
                 <div className="schedule-form-field">
-                  <label className="schedule-form-label" htmlFor="schedule-precondition-script">
+                  <label className="schedule-precondition-sr-only" htmlFor="schedule-precondition-script">
                     {tr('schedules.form.preconditionInline')}
                   </label>
                   <textarea
@@ -2085,16 +2114,14 @@ function ScheduleFormModal(props: {
                     className="schedule-precondition-editor"
                     value={preconditionScript}
                     onChange={e => { setPreconditionScript(e.target.value); setPreconditionError(null); }}
-                    rows={5}
+                    rows={3}
                     spellCheck={false}
-                    aria-invalid={preconditionError === 'script_required' || undefined}
-                    aria-describedby={preconditionError ? 'schedule-precondition-error' : undefined}
                     placeholder={tr('schedules.form.preconditionPlaceholder')}
                   />
                 </div>
               ) : (
                 <div className="schedule-form-field">
-                  <label className="schedule-form-label" htmlFor="schedule-precondition-file-path">
+                  <label className="schedule-precondition-sr-only" htmlFor="schedule-precondition-file-path">
                     {tr('schedules.form.preconditionFilePath')}
                   </label>
                   <input
@@ -2119,22 +2146,6 @@ function ScheduleFormModal(props: {
               {preconditionErrorText}
             </small>
           ) : null}
-
-          {hasExistingPrecondition ? (
-            <label className="schedule-precondition-remove">
-              <input
-                type="checkbox"
-                checked={removePrecondition}
-                onChange={e => { setRemovePrecondition(e.target.checked); setPreconditionError(null); }}
-              />
-              <span>{tr('schedules.form.preconditionRemove')}</span>
-            </label>
-          ) : null}
-          {removePrecondition ? (
-            <small className="schedule-form-error-inline" role="status">
-              {tr('schedules.form.preconditionRemoveHelp')}
-            </small>
-          ) : null}
         </div>
         {!localDelivery ? (
           <div className="schedule-form-field">
@@ -2147,96 +2158,94 @@ function ScheduleFormModal(props: {
               </FieldTitle>{' '}
               <i className="req" aria-hidden="true">*</i>
             </span>
-            {showGroupSelect ? (
-              <>
-                <input
-                  className="schedule-chat-search"
-                  type="search"
-                  value={chatQuery}
-                  onChange={event => setChatQuery(event.currentTarget.value)}
-                  placeholder={tr('schedules.form.chatSearchPlaceholder')}
-                  aria-label={tr('schedules.form.chatSearchLabel')}
-                />
-                <div
-                  className="schedule-chat-selector"
-                  role="group"
-                  aria-label={tr('schedules.form.chatBinding')}
-                  aria-invalid={chatMissing || topicChatCountInvalid || undefined}
-                >
-                  {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
-                    const displayName = group.name ?? chatDisplayTitle({
-                      chatId: group.chatId,
-                      chatDisplayName: editing?.chatId === group.chatId
-                        ? editing.chatDisplayName
-                        : undefined,
-                    });
-                    return (
-                      <label
-                        key={group.chatId}
-                        className={`schedule-chat-option${group.retained ? ' is-retained' : ''}`}
-                        title={displayName ? `${displayName} · ${group.chatId}` : group.chatId}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={chatIds.includes(group.chatId)}
-                          onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}
-                        />
-                        <span>
-                          <strong>{displayName ?? group.chatId}</strong>
-                          {displayName ? <code>{group.chatId}</code> : null}
-                          {group.retained ? <small>{tr('schedules.form.chatRetained')}</small> : null}
-                        </span>
-                      </label>
-                    );
-                  }) : (
-                    <p className="schedule-chat-selector-empty">
-                      {selectorOptions.length > 0
-                        ? tr('schedules.form.chatNoMatch')
-                        : tr('schedules.form.chatEmpty')}
-                    </p>
-                  )}
-                </div>
-                <small className="schedule-form-help">
-                  {tr('schedules.form.chatSelectedCount', { count: chatIds.length })}
-                </small>
-                <button
-                  type="button"
-                  className="schedule-form-link"
-                  onClick={() => {
-                    setChatManualValue(chatIds.join('\n'));
-                    setChatManual(true);
-                  }}
-                >
-                  {tr('schedules.form.chatManual')}
-                </button>
-              </>
-            ) : (
-              <>
-                <textarea
-                  className="schedule-chat-manual-input"
-                  value={chatManualValue}
-                  onChange={event => {
-                    const value = event.currentTarget.value;
-                    setChatManualValue(value);
-                    updateChatSelection(parseScheduleChatIds(value), false);
-                  }}
-                  rows={3}
-                  placeholder={tr('schedules.form.chatManualPlaceholder')}
-                  required
-                  aria-invalid={chatMissing || topicChatCountInvalid || undefined}
-                />
-                <small className="schedule-form-help">{tr('schedules.form.chatManualHelp')}</small>
-                {selectorOptions.length > 0 || groups.length > 0 ? (
-                  <button
-                    type="button"
-                    className="schedule-form-link"
-                    onClick={() => setChatManual(false)}
-                  >
-                    {tr('schedules.form.chatBackToSelect')}
-                  </button>
+            <div
+              className="schedule-chat-picker"
+              ref={chatPickerRef}
+              onBlur={event => {
+                if (!event.currentTarget.contains(event.relatedTarget)) setChatPickerOpen(false);
+              }}
+            >
+              <button
+                type="button"
+                className="schedule-chat-picker-trigger"
+                ref={chatPickerTriggerRef}
+                aria-label={tr('schedules.form.chatBinding')}
+                aria-expanded={chatPickerOpen}
+                aria-controls={chatPickerOpen ? 'schedule-chat-picker-panel' : undefined}
+                aria-invalid={chatMissing || topicChatCountInvalid || undefined}
+                title={selectedChatLabels.join('\n')}
+                onClick={() => setChatPickerOpen(value => !value)}
+              >
+                <span className="schedule-chat-picker-summary">
+                  {selectedChatLabels.length > 0
+                    ? selectedChatLabels.join('、')
+                    : tr('schedules.form.chatSelectPlaceholder')}
+                </span>
+                {chatIds.length > 0 ? (
+                  <small>{tr('schedules.form.chatSelectedCount', { count: chatIds.length })}</small>
                 ) : null}
-              </>
-            )}
+                <span className="schedule-chat-picker-chevron" aria-hidden="true" />
+              </button>
+              {chatPickerOpen ? (
+                <div id="schedule-chat-picker-panel" className="schedule-chat-picker-panel">
+                  <input
+                    ref={chatSearchRef}
+                    className="schedule-chat-search"
+                    type="search"
+                    value={chatQuery}
+                    onChange={event => setChatQuery(event.currentTarget.value)}
+                    onKeyDown={event => { if (event.key === 'Enter') event.preventDefault(); }}
+                    placeholder={tr('schedules.form.chatSearchPlaceholder')}
+                    aria-label={tr('schedules.form.chatSearchLabel')}
+                  />
+                  {groupsLoading ? (
+                    <small className="schedule-form-help" role="status">{tr('common.loading')}</small>
+                  ) : null}
+                  {groupsLoadError ? (
+                    <small className="schedule-form-error-inline" role="alert">{tr('schedules.form.chatLoadError')}</small>
+                  ) : null}
+                  <div
+                    className="schedule-chat-selector"
+                    role="group"
+                    aria-label={tr('schedules.form.chatBinding')}
+                    aria-invalid={chatMissing || topicChatCountInvalid || undefined}
+                  >
+                    {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
+                      const displayName = group.name ?? chatDisplayTitle({
+                        chatId: group.chatId,
+                        chatDisplayName: editing?.chatId === group.chatId
+                          ? editing.chatDisplayName
+                          : undefined,
+                      });
+                      return (
+                        <label
+                          key={group.chatId}
+                          className={`schedule-chat-option${group.retained ? ' is-retained' : ''}`}
+                          title={displayName ? `${displayName} · ${group.chatId}` : group.chatId}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={chatIds.includes(group.chatId)}
+                            onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}
+                          />
+                          <span>
+                            <strong>{displayName ?? group.chatId}</strong>
+                            {displayName ? <code>{group.chatId}</code> : null}
+                            {group.retained ? <small>{tr('schedules.form.chatRetained')}</small> : null}
+                          </span>
+                        </label>
+                      );
+                    }) : !groupsLoading && !groupsLoadError ? (
+                      <p className="schedule-chat-selector-empty">
+                        {selectorOptions.length > 0
+                          ? tr('schedules.form.chatNoMatch')
+                          : tr('schedules.form.chatEmpty')}
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
             {chatMissing ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errChatRequired')}</small>
             ) : topicChatCountInvalid ? (

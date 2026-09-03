@@ -11,7 +11,6 @@ import {
   formatScheduleRepeat,
   formatScheduleRunDuration,
   fmtScheduleDate,
-  parseScheduleChatIds,
   scheduleRunTargetResults,
   scheduleRunHistoryForBackdrop,
   schedulePreconditionEditorInitialState,
@@ -238,7 +237,6 @@ describe('dashboard schedules React page helpers', () => {
       initialScript: '',
       initialFilePath: '',
       enabled: false,
-      remove: false,
       mode: 'inline',
       script: '',
       filePath: '',
@@ -251,7 +249,6 @@ describe('dashboard schedules React page helpers', () => {
       initialScript: 'printf 1',
       initialFilePath: '',
       enabled: true,
-      remove: false,
       mode: 'inline',
       script: 'printf 1',
       filePath: '',
@@ -264,21 +261,19 @@ describe('dashboard schedules React page helpers', () => {
       initialScript: '',
       initialFilePath: 'scripts/check-ready.sh',
       enabled: false,
-      remove: false,
       mode: 'file',
       script: '',
       filePath: 'scripts/check-ready.sh',
     })).toEqual({ ok: true, fields: {} });
   });
 
-  it('sends only an actual toggle, source replacement, or explicit removal', () => {
+  it('sends only an actual toggle, source replacement, or removal by clearing the current source', () => {
     const base = {
       hasExisting: true,
       initialEnabled: true,
       initialMode: 'inline',
       initialScript: 'printf 1',
       initialFilePath: '',
-      remove: false,
       script: 'printf 1',
       filePath: '',
     } as const;
@@ -329,7 +324,7 @@ describe('dashboard schedules React page helpers', () => {
       ...base,
       enabled: true,
       mode: 'inline',
-      remove: true,
+      script: '',
     })).toEqual({ ok: true, fields: { preconditionScript: null } });
 
     expect(buildSchedulePreconditionFormFields({
@@ -339,7 +334,6 @@ describe('dashboard schedules React page helpers', () => {
       initialScript: '',
       initialFilePath: '',
       enabled: true,
-      remove: false,
       mode: 'inline',
       script: 'printf 1',
       filePath: '',
@@ -349,7 +343,42 @@ describe('dashboard schedules React page helpers', () => {
     });
   });
 
-  it('validates visible inline and live-file sources before submit', () => {
+  it.each(['inline', 'file'] as const)('clears an existing %s source when its visible value is blank, even while paused', mode => {
+    for (const enabled of [true, false]) {
+      for (const value of ['', ' \n\t ']) {
+        expect(buildSchedulePreconditionFormFields({
+          hasExisting: true,
+          initialEnabled: true,
+          initialMode: mode,
+          initialScript: mode === 'inline' ? 'printf 1' : '',
+          initialFilePath: mode === 'file' ? 'scripts/check-ready.sh' : '',
+          enabled,
+          mode,
+          script: value,
+          filePath: value,
+        })).toEqual({ ok: true, fields: { preconditionScript: null } });
+      }
+    }
+  });
+
+  it('preserves the unreadable legacy keep source instead of treating it as an empty editor', () => {
+    const base = {
+      hasExisting: true,
+      initialEnabled: true,
+      initialMode: 'keep',
+      mode: 'keep',
+      initialScript: '',
+      initialFilePath: '',
+      script: '',
+      filePath: '',
+    } as const;
+    expect(buildSchedulePreconditionFormFields({ ...base, enabled: true }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, enabled: false }))
+      .toEqual({ ok: true, fields: { preconditionEnabled: false } });
+  });
+
+  it('omits blank new sources and still validates nonempty live-file paths before submit', () => {
     const base = {
       hasExisting: false,
       initialEnabled: false,
@@ -357,14 +386,17 @@ describe('dashboard schedules React page helpers', () => {
       initialScript: '',
       initialFilePath: '',
       enabled: true,
-      remove: false,
       script: '',
       filePath: '',
     } as const;
     expect(buildSchedulePreconditionFormFields({ ...base, mode: 'inline' }))
-      .toEqual({ ok: false, error: 'script_required' });
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'inline', script: ' \n\t ' }))
+      .toEqual({ ok: true, fields: {} });
     expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file' }))
-      .toEqual({ ok: false, error: 'file_required' });
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: ' \n\t ' }))
+      .toEqual({ ok: true, fields: {} });
     expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: '~/.ready' }))
       .toEqual({ ok: false, error: 'file_tilde' });
     expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: 'bad\0path' }))
@@ -385,11 +417,11 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain('useState(initialPrecondition.script)');
     expect(page).toContain('useState(initialPrecondition.filePath)');
     expect(page).toContain("initialPrecondition.mode === 'keep'");
-    expect(page).toContain('(preconditionEnabled || hasExistingPrecondition) && !removePrecondition');
+    expect(page).toContain('preconditionEnabled || hasExistingPrecondition');
+    expect(page).not.toContain('removePrecondition');
     expect(page).toContain('...(data.preconditionScript !== undefined');
     expect(page).toContain('...(data.preconditionFilePath !== undefined');
-    expect(page).toContain('disabled={removePrecondition}');
-    expect(page).toContain("tr('schedules.form.preconditionRemove')");
+    expect(page).not.toContain('className="schedule-precondition-remove"');
     expect(page).toContain('role="switch"');
     expect(page).toContain('<fieldset className="schedule-precondition-source">');
     expect(page).toContain('type="radio"');
@@ -401,11 +433,8 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain("tr('schedules.form.preconditionRule')");
     expect(page).toContain("tr('schedules.form.preconditionUseExample')");
     expect(page).toContain("tr('schedules.form.preconditionFileHelp')");
-    expect(zh('schedules.form.preconditionConfiguredHelp')).toContain('已在下方显示');
-    expect(zh('schedules.form.preconditionConfiguredHelp')).not.toContain('安全');
     expect(zh('schedules.form.preconditionSourceKeep')).toContain('暂不可读');
-    expect(en('schedules.form.preconditionConfiguredHelp')).toContain('shown below');
-    expect(en('schedules.form.preconditionConfiguredHelp')).not.toContain('security');
+    expect(en('schedules.form.preconditionSourceKeep')).toContain('unavailable');
   });
 
   it('moves the Bash gate and FD 3 examples into an accessible help dialog', () => {
@@ -451,8 +480,9 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).not.toContain('id="schedule-precondition-inline-help"');
     expect(page).not.toContain('id="schedule-precondition-file-help"');
     expect(page).not.toContain('className="schedule-precondition-guide"');
+    // Only file paths retain validation errors; empty inline scripts remove the gate.
     expect(page.match(/aria-describedby=\{preconditionError \? 'schedule-precondition-error' : undefined\}/g))
-      .toHaveLength(2);
+      .toHaveLength(1);
 
     expect(zh('schedules.form.preconditionRule')).toContain('stdout）去除首尾空白后严格等于 1');
     expect(zh('schedules.form.preconditionPromptHelp')).toContain('仅在本次执行中追加到原任务 Prompt');
@@ -531,6 +561,19 @@ describe('dashboard schedules React page helpers', () => {
     );
   });
 
+  it('keeps Bash options and help compact on desktop while preserving touch targets', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    expect(css).toMatch(/\.schedule-precondition-field \{[^}]*gap:\s*4px/);
+    expect(css).toMatch(/\.schedule-precondition-header \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-toggle \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-source label \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*24px;[^}]*height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-help-trigger > span \{[^}]*width:\s*14px;[^}]*height:\s*14px;[^}]*font-size:\s*10px/);
+    const touchRules = css.match(/@media \(pointer: coarse\) \{([\s\S]*?)\n\}/)?.[1];
+    expect(touchRules).toMatch(/\.schedule-precondition-toggle,[\s\S]*?\.schedule-precondition-source label \{[^}]*min-height:\s*44px/);
+    expect(touchRules).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*44px;[^}]*height:\s*44px/);
+  });
+
   it('shows a multi-chat summary in the row and an editable Bot-scoped selector', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain("import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';");
@@ -547,17 +590,18 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain('...selectedUnknownChatIds.map');
     expect(page).toContain("tr('schedules.form.chatRetained')");
     expect(page).toContain('chatIds: data.chatIds');
+    expect(page).not.toContain('chatManual');
+    expect(page).not.toContain('schedule-chat-manual-input');
     expect(page).not.toContain('When editing, chatId/larkAppId are immutable');
   });
 
-  it('prefers chatIds, falls back to legacy chatId, and parses manual multi-chat input', () => {
+  it('prefers normalized chatIds and falls back to legacy chatId', () => {
     expect(scheduleTargetChatIds({ chatId: ' oc_legacy ' })).toEqual(['oc_legacy']);
     expect(scheduleTargetChatIds({ chatIds: [' oc_a ', 'oc_b', 'oc_a', '', 7] })).toEqual([
       'oc_a',
       'oc_b',
     ]);
     expect(scheduleTargetChatIds({ chatIds: [], chatId: 'oc_ignored' })).toEqual([]);
-    expect(parseScheduleChatIds('oc_a\noc_b, oc_a;oc_c')).toEqual(['oc_a', 'oc_b', 'oc_c']);
   });
 
   it('puts an accessible multi-chat execution explanation immediately after 绑定群聊', () => {
@@ -631,6 +675,15 @@ describe('dashboard schedules React page helpers', () => {
   it('keeps the multi-chat selector compact, keyboard-visible, and scrollable', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
+    expect(css).toMatch(
+      /\.schedule-chat-picker-trigger \{[\s\S]*?min-height:\s*44px/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-picker-trigger:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-picker-summary \{[\s\S]*?min-width:\s*0[\s\S]*?text-overflow:\s*ellipsis/,
+    );
     expect(css).toMatch(
       /\.schedule-chat-selector \{[\s\S]*?max-height:\s*220px[\s\S]*?overflow-y:\s*auto/,
     );
