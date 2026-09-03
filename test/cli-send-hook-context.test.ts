@@ -587,6 +587,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
     expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
     expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    // The requester-identity gate is scoped to the `requester` audience only.
+    // `reviewers`/`everyone` authorize clicks without a human requester (a
+    // bot-triggered ownerless session), so re-widening this gate to every
+    // audience would silently make those cards unsendable.
+    expect(cmdSend).toContain("feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId");
     expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
     expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
     expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");

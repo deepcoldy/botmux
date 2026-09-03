@@ -218,6 +218,28 @@ describe('feedback callback everyone audience', () => {
     store.close();
   });
 
+  it('lets a non-requester click a delivery that DOES carry a requester', async () => {
+    // The other everyone cases use ownerless deliveries, where the `requester`
+    // branch's fallback happens to admit any verified operator too — so they
+    // stay green even with the everyone branch deleted. Pin the one behaviour
+    // only `everyone` produces: a delivery addressed to someone specific is
+    // still clickable by a different member of the chat.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
+    const response = store.createResponse({ interactionId: 'int-everyone-owned', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_asker' });
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_someone_else'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_someone_else')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
   it('still rejects a callback with no platform-verified operator identity', async () => {
     const { store } = await everyoneSetup();
     const input = event({ action: 'feedback_submit', result: 'conclusive_usable' });
