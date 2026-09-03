@@ -17,8 +17,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 /**
  * 获取 bot 的所有管理员 open_id 候选列表（保持优先级顺序）：
  * 1. 配置中显式指定的 ownerOpenId（若为 ou_）
- * 2. resolvedAllowedUsers 中的所有 ou_ 用户
- * 3. raw allowedUsers 中以 ou_ 开头的用户（防解析延迟兜底）
+ * 2. resolvedAllowedUsers 中的所有 ou_ 用户（已通过飞书联系人真实性校验，保持 fail-closed）
  */
 export function getBotAdminOpenIds(larkAppId: string): string[] {
   try {
@@ -28,11 +27,6 @@ export function getBotAdminOpenIds(larkAppId: string): string[] {
       out.push(bot.config.ownerOpenId);
     }
     for (const u of (bot.resolvedAllowedUsers ?? [])) {
-      if (typeof u === 'string' && u.startsWith('ou_') && !out.includes(u)) {
-        out.push(u);
-      }
-    }
-    for (const u of (bot.config.allowedUsers ?? [])) {
       if (typeof u === 'string' && u.startsWith('ou_') && !out.includes(u)) {
         out.push(u);
       }

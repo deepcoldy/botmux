@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
 import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
@@ -157,6 +157,30 @@ describe('bot-registry grant additions', () => {
   it('getOwnerOpenId undefined when no resolved ou_', () => {
     registerBot({ larkAppId: 'a3', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com'] });
     expect(getOwnerOpenId('a3')).toBeUndefined();
+  });
+
+  it('getOwnerOpenId prioritizes explicit ownerOpenId over resolvedAllowedUsers', () => {
+    const bot = registerBot({
+      larkAppId: 'a4',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_first', 'ou_second'];
+    expect(getOwnerOpenId('a4')).toBe('ou_owner_explicit');
+  });
+
+  it('getDashboardAdminOpenIds includes explicit ownerOpenId and resolvedAllowedUsers', () => {
+    const bot = registerBot({
+      larkAppId: 'a5',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first'],
+    });
+    bot.resolvedAllowedUsers = ['ou_first'];
+    expect(getDashboardAdminOpenIds('a5')).toEqual(['ou_owner_explicit', 'ou_first']);
   });
 
   it('parses messageQuota.defaultLimit only when a positive integer', () => {
