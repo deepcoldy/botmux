@@ -92,7 +92,7 @@ export interface ResolveGrantApproverDeps {
 
 /**
  * 决定在特定会话中，授权申请卡应该 @ 哪位管理员处置。
- * 
+ *
  * 策略：
  * 1. 获取该 bot 的所有管理员候选人（按配置顺序：ownerOpenId、resolvedAllowedUsers 等）。
  * 2. 若只有一个管理员（或无群 chatId / 非群聊），直接取该唯一/全局管理员（零额外网络开销）。
