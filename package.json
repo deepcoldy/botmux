@@ -3,7 +3,11 @@
   "version": "0.0.0",
   "description": "Bridge between IM platforms and AI coding CLIs \u2014 one topic, one CLI session with live streaming",
   "type": "module",
+  "bin": {
+    "botmux": "scripts/botmux-launcher.sh"
+  },
   "files": [
+    "scripts/botmux-launcher.sh",
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
     "README.md",

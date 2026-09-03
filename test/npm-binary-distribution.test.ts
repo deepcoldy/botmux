@@ -163,8 +163,24 @@ describe('package.json — lockfile safety and packaging', () => {
     // that lies about itself: `require('botmux')` would resolve and then fail on a
     // missing file. The package is a CLI delivered as a compiled binary, so it has
     // no library entry point at all.
-    expect(manifest.bin).toBeUndefined();
+    //
+    // `bin` IS set again (it was undefined between #1047 and the sh-launcher
+    // change), but only to a launcher this package actually ships. That is exactly
+    // the invariant this test is named after, so assert the invariant rather than
+    // the absence: every `bin` target must be a file inside `files`, and must not
+    // point into `dist/`. See the node-pty pin below for the shape that must NOT
+    // come back (`bin` → dist/cli.js, which needed a Node runtime + node-pty).
     expect(manifest.main).toBeUndefined();
+    const binTargets = Object.values((manifest.bin ?? {}) as Record<string, string>);
+    expect(binTargets).toEqual(['scripts/botmux-launcher.sh']);
+    for (const target of binTargets) {
+      expect(target.startsWith('dist/'), `${target} must not point into dist/`).toBe(false);
+      expect(
+        manifest.files.some((f: string) => f === target || f === 'scripts/' || f === 'scripts'),
+        `${target} is declared in bin but not shipped in files`,
+      ).toBe(true);
+      expect(existsSync(resolve(import.meta.dirname, '..', target)), `${target} missing on disk`).toBe(true);
+    }
   });
 
   it('ships the postinstall script in `files` (otherwise npm i -g fails hard)', () => {
@@ -587,13 +603,20 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     // pre-#1047 install reached the same unrunnable CLI with no `bin` involved —
     // that is the crash users hit on 3.18.7/3.18.8. `dist/` is out of `files` now
     // (asserted against real `npm pack` output above); keep BOTH pins.
+    //
+    // `bin` itself is back (sh launcher), so the pin can no longer be "bin is
+    // undefined". What must never come back is a `bin` that needs a NODE RUNTIME:
+    // the sh launcher `exec`s the platform binary directly and imports nothing.
     const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf-8')) as {
-      bin?: unknown;
+      bin?: Record<string, string>;
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
       optionalDependencies?: Record<string, string>;
     };
-    expect(manifest.bin).toBeUndefined();
+    for (const target of Object.values(manifest.bin ?? {})) {
+      expect(target.endsWith('.sh'), `bin ${target} must be the sh launcher, not a Node entry point`).toBe(true);
+      expect(target.startsWith('dist/'), `bin ${target} must not resolve into dist/`).toBe(false);
+    }
     // node-pty must be a devDependency and NOTHING else. It has an `install` script
     // and ships no linux prebuild, so ANY placement an end user's install would honor
     // (`dependencies` OR `optionalDependencies`) makes npm run node-gyp — measured:
