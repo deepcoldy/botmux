@@ -3012,7 +3012,10 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
 
 /** Build the dashboard URL(s) for a token, using the actually-bound port. The
  *  primary `url` routes through the central-platform machine subdomain when
- *  远程访问 is on and this host is bound (see buildDashboardUrls); `localUrl`
+ *  远程访问 is on and this host is bound (see buildDashboardUrls). The response
+ *  also carries `platformHosted`, which tells the CLI whether the token may be
+ *  stripped from a link shown to a human — only THIS process knows which base it
+ *  used, so it must say so rather than let callers re-derive it. `localUrl`
  *  carries the direct host:port fallback in that case (undefined otherwise). */
 function dashboardUrlsFor(token: string): DashboardUrls {
   return buildDashboardUrls({ host: config.dashboard.externalHost, port: boundDashboardPort, token });

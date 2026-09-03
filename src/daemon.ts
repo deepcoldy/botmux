@@ -19,9 +19,8 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled, isRemoteAccessEnabled } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
 import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
-import { platformMachineBaseUrl } from './platform/binding.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
@@ -21513,11 +21512,14 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
     // platform dashboard instead of an unreachable local host:port.
-    const urls = buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined });
-    // Only the central platform authenticates without the token (see above). The
-    // narrowing itself lives in core/dashboard-url.ts so it is unit-testable —
-    // daemon.ts exports nothing a test can reach.
-    return reportDashboardUrls(urls, Boolean(isRemoteAccessEnabled() && platformMachineBaseUrl()));
+    // `buildDashboardUrls` itself reports whether the base it chose is the
+    // platform's, so nothing here re-derives that bit (a caller that did — and
+    // got it wrong — is what this guard exists for). The narrowing lives in
+    // core/dashboard-url.ts so it is unit-testable: daemon.ts exports nothing a
+    // test can reach.
+    return reportDashboardUrls(
+      buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined }),
+    );
   } catch {
     return {};
   }

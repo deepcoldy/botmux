@@ -151,11 +151,12 @@ export async function cmdBind(
       path: '/__cli/current',
     });
     if (cur.ok) {
-      // 刚 bind 成功、platform.json 已落盘 ⇒ 必然是**中心平台托管**，所以主链接可以
-      // 去掉 token（平台注入身份，token 在那条路上已被压制成无效，只剩泄漏价值）。
-      // 本地直连那条仍带 token，默认隐藏。与 `botmux dashboard` 同一套收敛，判据的
-      // 收窄理由见 cli/dashboard-command.ts:formatDashboardSuccessLines。
-      const [primary, ...rest] = formatDashboardSuccessLines(cur, false, true);
+      // ⚠️ 这里曾硬编码 `platformHosted: true`，理由是「刚 bind 成功必然平台托管」——
+      // 那是错的：上面的 `remoteAccess === undefined` 才写 `true`，用户显式设过
+      // `false` 时保持 `false`。此时若配了 `BOTMUX_PUBLIC_URL` / Devbox 短链，
+      // dashboard 返回的是反代基址，硬编码 true 会**确定性**把 token 摘成死链。
+      // 现在一律读 dashboard 自己标注的 `cur.platformHosted`，不再由调用方判断。
+      const [primary, ...rest] = formatDashboardSuccessLines(cur);
       console.log(`  面板: ${primary}`);
       for (const line of rest) console.log(`  ${line}`);
     } else {

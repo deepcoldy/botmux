@@ -355,7 +355,8 @@ describe('formatDashboardSuccessLines', () => {
       ok: true,
       url: 'https://m-abc.platform.test/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
-    }, false, true);
+      platformHosted: true,
+    });
 
     expect(lines[0]).toBe('https://m-abc.platform.test/');
     // 无凭证形态必须走 hash 路由：`/workbench` 不在静态壳白名单里，token-free
@@ -370,16 +371,17 @@ describe('formatDashboardSuccessLines', () => {
       ok: true as const,
       url: 'https://m-abc.platform.test/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+      platformHosted: true,
     };
 
-    const hidden = formatDashboardSuccessLines(result, false, true);
+    const hidden = formatDashboardSuccessLines(result);
     const local = hidden.find(l => l.includes('本地直连'));
     // 该行仍在（人需要知道存在这条路），但链接本体不打印，且提示了参数名。
     expect(local).toBeDefined();
     expect(local).not.toContain('tok-abc');
     expect(local).toContain(DASHBOARD_LOCAL_TOKEN_FLAG);
 
-    const shown = formatDashboardSuccessLines(result, true, true);
+    const shown = formatDashboardSuccessLines(result, true);
     expect(shown).toContain('本地直连(平台异常时可用): http://10.0.0.7:7891/?t=tok-abc');
     // 显式索取时也要挨一句警告。
     expect(shown.join('\n')).toContain('等同管理员密码');
@@ -398,7 +400,8 @@ describe('formatDashboardSuccessLines', () => {
       ok: true,
       url: 'https://botmux.mycorp.example/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
-    }, false, false);
+      platformHosted: false,
+    });
 
     // token 必须留着 —— 它是这条路上唯一的凭证。
     expect(lines[0]).toBe('https://botmux.mycorp.example/?t=tok-abc');
@@ -407,8 +410,8 @@ describe('formatDashboardSuccessLines', () => {
   });
 
   // fail-safe 方向：判据取不到时保留 token。少一次「去 token」只是维持现状；
-  // 多一次却可能让 owner 完全进不去。
-  it('defaults to KEEPING the token when platformHosted is not supplied', () => {
+  // 多一次却可能让 owner 完全进不去。旧版 dashboard 不返回该字段就是这一格。
+  it('defaults to KEEPING the token when platformHosted is absent (older dashboard)', () => {
     const lines = formatDashboardSuccessLines({
       ok: true,
       url: 'https://m-abc.platform.test/?t=tok-abc',
@@ -423,7 +426,8 @@ describe('formatDashboardSuccessLines', () => {
     const lines = formatDashboardSuccessLines({
       ok: true,
       url: 'http://10.0.0.7:7891/?t=tok-abc',
-    }, false, true);
+      platformHosted: true,
+    });
     expect(lines[0]).toBe('http://10.0.0.7:7891/?t=tok-abc');
   });
 

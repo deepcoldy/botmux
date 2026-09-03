@@ -86,20 +86,22 @@ function legacyEnsureRouteMissing(result: DashboardResult): boolean {
  * 不在 `decideDashboardAuth` 的静态壳白名单里，token-free 访问实测 401（平台身份
  * 下也一样），会给出一条打不开的链接。有 token 时才用无 fragment 的 `/workbench`。
  *
+ * 判据 `result.platformHosted` 由**生成这条 URL 的 dashboard 进程**如实标注（见
+ * `cli/dashboard-endpoint.ts`），调用方不再自己算。这一点是被缺陷教出来的：
+ * `bind.ts` 曾硬编码 `true`，而 `cmdBind` 只在 `remoteAccess === undefined` 时才
+ * 写 `true` —— 用户显式设过 `false` 时若配了反代，就会**确定性**摘成死链。任何
+ * 「调用方自己判断」的形态都可能与生成 URL 的进程不一致，所以判据只有一个来源。
+ * 旧版 dashboard 不返回该字段时解析为 `false` = fail-safe（保留 token）。
+ *
  * @param showLocalTokenLink 用户是否显式递了 {@link DASHBOARD_LOCAL_TOKEN_FLAG}
- * @param platformHosted 这条链接是否由中心平台托管（即上文 ①）。注入而非在此直接
- *   读配置：本函数要保持纯函数以便测试，且 `cli.ts` 已有同款判据的先例
- *   （`ensureDevboxDashboardExportForCurrentPort` 的 `remoteBaseConfigured`）。
- *   默认 false = 保守：**拿不准就保留 token**，宁可多留一次凭证也不给死链。
  */
 export function formatDashboardSuccessLines(
   result: Extract<DashboardResult, { ok: true }>,
   showLocalTokenLink = false,
-  platformHosted = false,
 ): string[] {
   // 只有中心平台托管时 token 才是多余的。fail-safe 方向是「保留」：判据取不到时
   // 留着 token 只是维持现状，去掉却可能让 owner 完全进不去。
-  const dropToken = platformHosted && result.localUrl !== undefined;
+  const dropToken = result.platformHosted === true && result.localUrl !== undefined;
   const primary = dropToken ? stripDashboardToken(result.url) ?? result.url : result.url;
   const lines = [primary];
 

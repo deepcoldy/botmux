@@ -149,6 +149,8 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'http://1.2.3.4:7891/?t=abc',
       localUrl: undefined,
+      // 纯本地 ⟹ 不是平台托管 ⟹ token 是唯一入口，不可摘。
+      platformHosted: false,
     });
   });
 
@@ -158,6 +160,8 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'http://1.2.3.4:7891/?t=abc',
       localUrl: undefined,
+      // 开关开着但没绑定 ⟹ 主链接仍是本地 ⟹ 不是平台托管。
+      platformHosted: false,
     });
   });
 
@@ -167,6 +171,8 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'https://m-deadbeef.botmux.example/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
+      // 远程访问开 + 已绑定 ⟹ 主链接就是平台子域 ⟹ 唯一可摘 token 的形态。
+      platformHosted: true,
     });
   });
 
@@ -176,6 +182,7 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891 })).toEqual({
       url: 'https://m-deadbeef.botmux.example/',
       localUrl: 'http://1.2.3.4:7891/',
+      platformHosted: true,
     });
   });
 
@@ -184,6 +191,9 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
       url: 'https://botmux.example.com/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
+      // 🔴 关键回归：自建反代同样产生 localUrl，但**没有人注入身份** ⟹ 必须 false。
+      // 这一格是 `localUrl !== undefined` 那个错判据当初漏掉的场景。
+      platformHosted: false,
     });
   });
 
@@ -424,10 +434,11 @@ describe('reportDashboardUrls (Feishu card carrier)', () => {
   const tokenized = {
     url: 'https://m-abc.platform.test/?t=tok-abc',
     localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    platformHosted: true,
   };
 
   it('PLATFORM-HOSTED: strips the token AND withholds the local fallback entirely', () => {
-    const out = reportDashboardUrls(tokenized, true);
+    const out = reportDashboardUrls(tokenized);
     expect(out.url).toBe('https://m-abc.platform.test/');
     // localUrl 恒定带 token ⟹ 卡片一律不给（终端才有显式参数可取）。
     expect(out.localUrl).toBeUndefined();
@@ -436,18 +447,21 @@ describe('reportDashboardUrls (Feishu card carrier)', () => {
 
   it('NOT platform-hosted (reverse proxy / devbox / LAN): passes through untouched', () => {
     // 这几条路没有人注入身份，token 仍是唯一凭证 —— 摘了就是死链。
-    const out = reportDashboardUrls(tokenized, false);
-    expect(out).toEqual(tokenized);
+    const notPlatform = { ...tokenized, platformHosted: false };
+    const out = reportDashboardUrls(notPlatform);
+    expect(out).toEqual(notPlatform);
   });
 
   it('fail-safe: unparseable URL keeps the URL but still withholds localUrl', () => {
-    const out = reportDashboardUrls({ url: 'not-a-url', localUrl: 'http://10.0.0.7:7891/?t=tok' }, true);
+    const out = reportDashboardUrls({
+      url: 'not-a-url', localUrl: 'http://10.0.0.7:7891/?t=tok', platformHosted: true,
+    });
     expect(out.url).toBe('not-a-url');
     expect(out.localUrl).toBeUndefined();
   });
 
   it('is a no-op on an already token-free platform URL', () => {
-    expect(reportDashboardUrls({ url: 'https://m-abc.platform.test/' }, true))
-      .toEqual({ url: 'https://m-abc.platform.test/' });
+    expect(reportDashboardUrls({ url: 'https://m-abc.platform.test/', platformHosted: true }))
+      .toEqual({ url: 'https://m-abc.platform.test/', platformHosted: true });
   });
 });
