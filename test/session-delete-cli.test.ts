@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import {
   readPersistedSessionRows,
+  seedOccupancyLease,
   seedPersistedSessionRows,
   sessionStorePath,
 } from './helpers/session-store-disk.js';
@@ -301,6 +302,86 @@ describe('botmux delete — daemon-first close', () => {
         server.close(err => err ? reject(err) : resolve());
       });
     }
+  });
+
+  it('fails closed on a daemon rejection even when the occupancy lease has expired', async () => {
+    // A daemon that ANSWERS is alive and authoritative whatever the lease row
+    // says (its renew may have lapsed); an expired lease must never turn its
+    // rejection into a licence to close the row behind it.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-delete-relay-'));
+    tempDirs.push(dataDir, relayDir);
+    const session = makeSession('sess-delete-rejected-expired-lease');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
+    writeRelayCapability(relayDir);
+
+    const server = createServer(async (req, res) => {
+      await readRequestBody(req);
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end('{"ok":false,"error":"worker_unreachable"}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: relayDir,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('worker_unreachable');
+      expect(result.stdout).toContain('0 个会话');
+      expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('refuses the offline close while a live occupancy lease exists and no daemon is discoverable', async () => {
+    // Heartbeat file gone (or never written) but the store is leased by a live
+    // process: the Stage 1 hole. The CLI must leave the row and the worker alone.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-leased');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: process.pid, bootId: 'boot-live', leaseUntil: Date.now() + 60_000 });
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('owning_daemon_became_available');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('closes offline once the lease has expired and no heartbeat is fresh', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-lease-lapsed');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('daemon 离线，本地收口');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('closed');
   });
 
   it('uses the legacy local close only when no daemon is online', async () => {

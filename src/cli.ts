@@ -3612,6 +3612,13 @@ function mutateSessionOffline(
   ) as unknown as SessionData | undefined;
 }
 
+/** Is this bot's store held by a live host (occupancy lease, or a fresh
+ *  heartbeat while no live lease exists)? Same data dir as the store access
+ *  above. Never throws. */
+function occupancyHeld(larkAppId: string): boolean {
+  return isOccupancyHeld(larkAppId, { dataDir: resolveDataDir() });
+}
+
 type OfflineAbandonResult =
   | { ok: true; current: SessionData; cleanedBacking?: string }
   | { ok: false; error: string };
@@ -3628,12 +3635,8 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
   if (ownedWorkerPid) {
     // Narrow the unavoidable occupancy race: do not signal a worker after an
     // owning daemon has claimed the row. The locked write below repeats this.
-    if (current.larkAppId) {
-      try {
-        if (isOccupancyHeld(current.larkAppId, { dataDir: resolveDataDir() })) {
-          return { ok: false, error: 'owning_daemon_became_available' };
-        }
-      } catch { /* still offline */ }
+    if (current.larkAppId && occupancyHeld(current.larkAppId)) {
+      return { ok: false, error: 'owning_daemon_became_available' };
     }
     if (isProcessAlive(ownedWorkerPid)) {
       const signalled = killProcess(ownedWorkerPid);
@@ -3780,18 +3783,18 @@ async function postOwningDaemonSessionMutation(
       secret,
     );
   } catch (err) {
-    if (isOccupancyHeld(session.larkAppId, { dataDir: resolveDataDir() })) {
+    // No answer on the advertised port. A held store means the daemon is up
+    // but unreachable — surface that; otherwise the descriptor is a leftover
+    // and the offline path may proceed.
+    if (occupancyHeld(session.larkAppId)) {
       throw new Error(`连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}`);
     }
     return 'unavailable';
   }
   if (suffix === 'prune' && res.status === 409) return 'refused';
-  if (!res.ok) {
-    if (isOccupancyHeld(session.larkAppId, { dataDir: resolveDataDir() })) {
-      throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
-    }
-    return 'unavailable';
-  }
+  // A daemon that ANSWERED is alive and authoritative whatever the lease says:
+  // its rejection is terminal, never a licence to write behind it.
+  if (!res.ok) throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
   return 'applied';
 }
 
@@ -3840,13 +3843,15 @@ async function abandonSessionAuthoritatively(
             ? { ok: true, mode: 'daemon', residual }
             : { ok: true, mode: 'daemon' };
         }
-        // Daemon rejected the command. Fall back to offline only when occupancy
-        // says no host holds the row — a fresh heartbeat file is not enough.
-        if (isOccupancyHeld(session.larkAppId, { dataDir: resolveDataDir() })) {
-          return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
-        }
+        // Surface the daemon's own rejection reason (e.g. origin_unproven) and
+        // never fall back to a partial local kill: a daemon that answered is
+        // alive and holds authoritative in-memory state, whatever the lease
+        // or heartbeat file say.
+        return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
       } catch (err) {
-        if (isOccupancyHeld(session.larkAppId, { dataDir: resolveDataDir() })) {
+        // No answer. Only when nothing holds the store (no live lease, no fresh
+        // heartbeat) is the descriptor/injected port a leftover we may bypass.
+        if (occupancyHeld(session.larkAppId)) {
           return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
         }
       }

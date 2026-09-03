@@ -4,15 +4,16 @@
  * A session row has one authority at a time: while the owning bot's daemon is
  * up it holds the row in memory and will `persistRow` over anything written
  * behind its back, so every other process must send it a command instead.
- * Only when no daemon holds the SQLite occupancy lease may another process
- * publish the row itself — and the lease is re-read inside the store's write
- * exclusion, so a daemon that claims between the caller's check and the
- * commit wins.
+ * Only when no daemon holds the SQLite occupancy lease — and no fresh
+ * descriptor heartbeat says one is up — may another process publish the row
+ * itself. The lease is read inside the store's write exclusion, so a daemon
+ * that claims between the caller's check and the commit wins.
  *
  * `sessionStore.mutateSessionRowOffline` implements the exclusion and the
- * in-txn occupancy read. This wrapper supplies the upgrade-window heartbeat
- * probe used only when the occupancy row is absent (pre-occupancy daemon),
- * and so the probe and the store read resolve the SAME data dir.
+ * in-txn occupancy read. This wrapper supplies the heartbeat probe that still
+ * decides when no live lease exists (the upgrade window: a daemon that writes
+ * SQLite but not occupancy), and keeps the probe and the store read on the
+ * SAME data dir.
  * Stage 2 of `docs/design/2026-08-12-session-restage-store-first.md` deletes
  * the offline write: it becomes a lease plus the daemon's own apply.
  */
@@ -22,6 +23,7 @@ import {
   mutateSessionRowOffline,
   occupancyLeaseIsActive,
   readOccupancyLease,
+  type OccupancyLease,
 } from './session-store.js';
 import type { Session } from '../types.js';
 
@@ -33,9 +35,12 @@ function legacyHeartbeatHeld(larkAppId: string, dataDir: string): boolean {
 /**
  * Whether this bot's store is held by a live host.
  *
- * A present occupancy row is the authority (fresh heartbeat cannot override
- * an expired lease). A missing row falls back to the descriptor heartbeat —
- * the upgrade window for daemons that write SQLite but not occupancy.
+ * A live occupancy lease is the authority. Without one (row absent, expired,
+ * or unreadable) the descriptor heartbeat still counts — the upgrade window
+ * for daemons that write SQLite but not occupancy, including a rollback that
+ * runs behind a stale row a crashed newer build left. Never throws: callers
+ * sit inside IPC error handlers, and an unreadable store (sandbox read-only
+ * grant, corrupt file, no SQLite engine) must not replace their own error.
  */
 export function isOccupancyHeld(
   larkAppId: string,
@@ -43,9 +48,10 @@ export function isOccupancyHeld(
 ): boolean {
   const dataDir = options.dataDir ?? config.session.dataDir;
   const now = options.now ?? Date.now();
-  const lease = readOccupancyLease(larkAppId, dataDir);
-  if (lease) return occupancyLeaseIsActive(lease, now);
-  return legacyHeartbeatHeld(larkAppId, dataDir);
+  let lease: OccupancyLease | undefined;
+  try { lease = readOccupancyLease(larkAppId, dataDir); }
+  catch { lease = undefined; /* unreadable store → the heartbeat decides */ }
+  return occupancyLeaseIsActive(lease, now) || legacyHeartbeatHeld(larkAppId, dataDir);
 }
 
 /**

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
+import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 
 export interface DaemonInfo {
   larkAppId: string;
@@ -26,7 +27,7 @@ export interface DaemonInfo {
   resolvedAllowedUsers?: string[];
 }
 
-const STALE_MS = 90_000;
+const STALE_MS = DAEMON_HEARTBEAT_STALE_MS;
 const DEFAULT_REFRESH_MS = 15_000;
 
 export type RegistryListener = (online: DaemonInfo[]) => void;
