@@ -45,6 +45,18 @@ describe('model-fallback wiring (source lock)', () => {
       .toContain('publishModelFallbackIfChanged();');
   });
 
+  it('also seeds on the lazy baseline, when the transcript appears after attach', () => {
+    // bridgeAbsorbBaseline skips whatever is already in the file (EOF cursor in
+    // the non-adopt branch; bridgeQueue.absorb — not observeModelFallback — in
+    // the adopt one), so this second baseline site needs the tail scan too.
+    const ingest = sliceBetween(worker, 'function bridgeIngest(', 'function maybeEmitStructuredRateLimit');
+    const lazy = sliceBetween(ingest, 'if (!bridgeBaselineDone) {', '\n  }\n');
+    expect(lazy).toContain('bridgeAbsorbBaseline();');
+    expect(lazy).toContain('seedModelFallbackFromTranscript();');
+    expect(lazy.indexOf('seedModelFallbackFromTranscript();'))
+      .toBeGreaterThan(lazy.indexOf('bridgeAbsorbBaseline();'));
+  });
+
   it('rejects a stale worker generation and persists what it accepts', () => {
     const handler = sliceBetween(workerPool, "case 'model_fallback': {", "case 'codex_service_tier':");
     expect(handler).toContain('ds.workerGeneration !== workerGeneration');

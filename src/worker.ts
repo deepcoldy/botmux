@@ -5534,6 +5534,13 @@ function bridgeIngest(): void {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
     bridgeAbsorbBaseline();
+    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
+    // this one also skips the file's existing records — to EOF in the non-adopt
+    // branch, and in the adopt branch straight into bridgeQueue.absorb() rather
+    // than through observeModelFallback. Either way a switch already written to
+    // the file would never be seen. The tail scan is idempotent: re-seeding the
+    // same record is deduped by uuid and publishes nothing.
+    seedModelFallbackFromTranscript();
     return;
   }
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);

@@ -542,13 +542,20 @@ function escapeCardPlainText(value: string): string {
 
 const MODEL_FALLBACK_LABEL_MAX = 32;
 
+/** Bound one model-derived token of the notice. Every one of them comes from the
+ *  transcript, so the `/model` argument needs the same cap as the display
+ *  labels — an unbounded alias would blow up exactly the line those labels are
+ *  trimmed to keep short. Real Claude ids are well under the cap (the longest,
+ *  `claude-haiku-4-5-20251001`, is 25 chars), so this only ever bites a
+ *  pathological id whose `/model` hint could not have worked anyway. */
+function truncateModelToken(value: string): string {
+  return value.length > MODEL_FALLBACK_LABEL_MAX
+    ? `${value.slice(0, MODEL_FALLBACK_LABEL_MAX - 1)}…`
+    : value;
+}
+
 function fallbackModelText(id: string): string {
-  const label = claudeModelLabel(id);
-  return escapeCardPlainText(
-    label.length > MODEL_FALLBACK_LABEL_MAX
-      ? `${label.slice(0, MODEL_FALLBACK_LABEL_MAX - 1)}…`
-      : label,
-  );
+  return escapeCardPlainText(truncateModelToken(claudeModelLabel(id)));
 }
 
 /** One-line notice for a model fallback still in effect, or null when there is
@@ -568,7 +575,7 @@ export function cardModelFallbackNotice(
   return t(`card.model_fallback.${fallback.kind}`, {
     originalModel: fallbackModelText(fallback.originalModel),
     fallbackModel: fallbackModelText(fallback.fallbackModel),
-    alias: escapeCardPlainText(claudeModelAlias(fallback.originalModel)),
+    alias: escapeCardPlainText(truncateModelToken(claudeModelAlias(fallback.originalModel))),
     reason,
   }, locale);
 }

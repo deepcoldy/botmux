@@ -157,6 +157,27 @@ describe('cardModelFallbackNotice: copy', () => {
     expect(line.length).toBeLessThan(200);
   });
 
+  it('bounds the /model argument of an unrecognised id, like the labels', () => {
+    // The alias is transcript-derived too, so leaving it unbounded would blow
+    // up the very line the labels are truncated to keep short.
+    const line = cardModelFallbackNotice({
+      ...REFUSAL,
+      kind: 'consent',
+      originalModel: 'internal-model-'.repeat(20),
+      fallbackModel: 'claude-opus-5',
+    }, 'zh')!;
+    expect(line.length).toBeLessThan(200);
+    expect(line).toContain('…');
+    expect(line).not.toContain('internal-model-internal-model-internal-model-');
+    // A real-length unrecognised id is still echoed whole and stays actionable.
+    expect(cardModelFallbackNotice({
+      ...REFUSAL,
+      kind: 'consent',
+      originalModel: 'claude-3-7-sonnet-20250219',
+      fallbackModel: 'claude-opus-5',
+    }, 'zh')).toContain('/model claude-3-7-sonnet-20250219');
+  });
+
   it('returns null with no fallback or an incomplete one', () => {
     expect(cardModelFallbackNotice(undefined, 'zh')).toBeNull();
     expect(cardModelFallbackNotice({ ...REFUSAL, fallbackModel: '' }, 'zh')).toBeNull();
