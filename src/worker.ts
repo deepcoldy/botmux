@@ -8551,6 +8551,7 @@ let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
 // Throttle for the happy-path upload log in captureAndUpload (one line/min).
 let lastUploadLogAtMs = 0;
+let screenshotCaptureInFlight = false;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -8612,64 +8613,80 @@ async function captureAndUpload(): Promise<void> {
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
   if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
+  if (screenshotCaptureInFlight)    { logScreenshotSkip('capture/upload already in flight'); return; }
 
-  let png: Buffer;
-  let usageLimitContent = '';
+  screenshotCaptureInFlight = true;
   try {
-    // Preferred path: pipe-pane backends ask tmux for a fresh viewport
-    // snapshot and render it through a transient xterm-headless. This
-    // avoids the accumulated-buffer drift that produced duplicated /
-    // staircase content under the legacy long-lived renderer.
-    const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
-    if (pipeResult) {
-      if (pipeResult.ansi === lastShotHash) return;
-      lastShotHash = pipeResult.ansi;
-      png = pipeResult.png;
-      usageLimitContent = pipeResult.content;
-    } else {
-      // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
-      // still drive the long-lived renderer.
-      if (!renderer) { logScreenshotSkip('renderer=null'); return; }
-      const term = renderer.xterm;
-      const startY = term.buffer.active.baseY;
-      const snap = renderer.rawSnapshot();
-      const hash = createHash('md5').update(snap).digest('hex');
-      if (hash === lastShotHash) return;
-      lastShotHash = hash;
-      usageLimitContent = snap;
-      const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-      png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    let png: Buffer;
+    let usageLimitContent = '';
+    const previousShotHash = lastShotHash;
+    let attemptedShotHash: string | null = null;
+    try {
+      // Preferred path: pipe-pane backends ask tmux for a fresh viewport
+      // snapshot and render it through a transient xterm-headless. This
+      // avoids the accumulated-buffer drift that produced duplicated /
+      // staircase content under the legacy long-lived renderer.
+      const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+      if (pipeResult) {
+        if (pipeResult.ansi === lastShotHash) return;
+        attemptedShotHash = pipeResult.ansi;
+        lastShotHash = attemptedShotHash;
+        png = pipeResult.png;
+        usageLimitContent = pipeResult.content;
+      } else {
+        // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
+        // still drive the long-lived renderer.
+        if (!renderer) { logScreenshotSkip('renderer=null'); return; }
+        const term = renderer.xterm;
+        const startY = term.buffer.active.baseY;
+        const snap = renderer.rawSnapshot();
+        const hash = createHash('md5').update(snap).digest('hex');
+        if (hash === lastShotHash) return;
+        attemptedShotHash = hash;
+        lastShotHash = attemptedShotHash;
+        usageLimitContent = snap;
+        const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+        const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+      }
+    } catch (err: any) {
+      logError(`Screenshot render failed: ${err?.message ?? err}`);
+      return;
     }
-  } catch (err: any) {
-    logError(`Screenshot render failed: ${err?.message ?? err}`);
-    return;
-  }
 
-  let imageKey: string;
-  try {
-    imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
-  } catch (err: any) {
-    logError(`Screenshot upload failed: ${err?.message ?? err}`);
-    return;
-  }
+    let imageKey: string;
+    try {
+      imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
+    } catch (err: any) {
+      // Do not clobber a newer reset (display-mode change/manual refresh) that
+      // happened while the request was pending. Otherwise restore the prior
+      // hash so the next regular tick retries this unchanged frame.
+      if (attemptedShotHash !== null && lastShotHash === attemptedShotHash) {
+        lastShotHash = previousShotHash;
+      }
+      logError(`Screenshot upload failed: ${err?.message ?? err}`);
+      return;
+    }
 
-  const status = projectedRuntimeScreenStatus();
-  // Success is otherwise completely silent (skips and failures log above), which
-  // made "loop alive and uploading" indistinguishable from "loop never started"
-  // in the daemon log. One throttled line keeps the happy path observable.
-  const nowMs = Date.now();
-  if (nowMs - lastUploadLogAtMs >= 60_000) {
-    lastUploadLogAtMs = nowMs;
-    log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    const status = projectedRuntimeScreenStatus();
+    // Success is otherwise completely silent (skips and failures log above), which
+    // made "loop alive and uploading" indistinguishable from "loop never started"
+    // in the daemon log. One throttled line keeps the happy path observable.
+    const nowMs = Date.now();
+    if (nowMs - lastUploadLogAtMs >= 60_000) {
+      lastUploadLogAtMs = nowMs;
+      log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    }
+    send({
+      type: 'screenshot_uploaded',
+      imageKey,
+      ...classifyScreenUsageLimit(usageLimitContent, status),
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  } finally {
+    screenshotCaptureInFlight = false;
   }
-  send({
-    type: 'screenshot_uploaded',
-    imageKey,
-    ...classifyScreenUsageLimit(usageLimitContent, status),
-    turnId: currentBotmuxTurnId,
-    dispatchAttempt: currentBotmuxDispatchAttempt,
-  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
