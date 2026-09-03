@@ -55,6 +55,23 @@ function callback(action: Record<string, string>, operator = USER, messageId = '
 }
 
 describe('/sessions current-group card', () => {
+  it.each([
+    ['starting', '🟡'],
+    ['working', '🔵'],
+    ['idle', '🟢'],
+    ['analyzing', '🟣'],
+    ['stalled', '🔴'],
+    ['limited', '🔴'],
+    ['interrupted', '🟠'],
+  ] as const)('matches the streaming-card palette for %s', (status, icon) => {
+    const card = buildGroupSessionsCard(
+      [row({ status, title: `${status} topic` })],
+      { larkAppId: APP, chatId: CHAT, invokerOpenId: USER, locale: 'en', page: 1 },
+      NOW,
+    );
+    expect(card).toContain(`${icon} **${status} topic**`);
+  });
+
   it('filters simultaneously by bot, chat, and thread scope while retaining closed rows', () => {
     const keep = row();
     const closed = row({ sessionId: 'closed', status: 'closed' });
@@ -209,7 +226,7 @@ describe('/sessions current-group card', () => {
       method: 'GET',
       path: '/__daemon/sessions-list?fresh=1',
     });
-    expect(encoded).toContain('🟢 **Working topic**');
+    expect(encoded).toContain('🔵 **Working topic**');
     expect(encoded).toContain('Working');
   });
 

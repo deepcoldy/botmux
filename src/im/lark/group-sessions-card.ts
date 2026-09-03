@@ -24,6 +24,7 @@ import { type Locale, t } from '../../i18n/index.js';
 import { scheduleTimeZone } from '../../utils/timezone.js';
 import { getMessageChatId as defaultGetMessageChatId } from './client.js';
 import type { CardActionData } from './card-handler.js';
+import { STREAM_STATUS_TEMPLATE_ICON, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 
 export const GROUP_SESSIONS_ACTION_REFRESH = 'group_sessions_refresh' as const;
 export const GROUP_SESSIONS_ACTION_PAGE = 'group_sessions_page' as const;
@@ -64,18 +65,12 @@ function escapeLarkMd(text: string): string {
 }
 
 function statusIcon(status: string): string {
-  switch (status) {
-    case 'working': return '🟢';
-    case 'analyzing':
-    case 'starting': return '🔵';
-    case 'limited': return '🟡';
-    case 'stalled': return '🔴';
-    // Match the green header used by the session card for "Awaiting input".
-    case 'idle': return '🟢';
-    case 'dormant': return '⚫';
-    case 'closed': return '⚫';
-    default: return '⚪';
+  if (status === 'dormant' || status === 'closed') return '⚫';
+  if (status in STREAM_STATUS_TEMPLATE_MAP) {
+    const template = STREAM_STATUS_TEMPLATE_MAP[status as keyof typeof STREAM_STATUS_TEMPLATE_MAP];
+    return STREAM_STATUS_TEMPLATE_ICON[template];
   }
+  return '⚪';
 }
 
 function statusLabel(status: string, locale: Locale): string {
