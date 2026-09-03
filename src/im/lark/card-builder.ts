@@ -887,14 +887,6 @@ function pushStreamBody(
     });
     elements.push({ tag: 'hr' });
   }
-  // Model auto-fallback notice — deliberately pinned to the card rather than
-  // sent as its own message, right after the usage-limit line: both answer
-  // "why does this turn look off".
-  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
-  if (modelFallbackNotice) {
-    elements.push({ tag: 'markdown', content: modelFallbackNotice });
-    elements.push({ tag: 'hr' });
-  }
   if (displayMode === 'screenshot') {
     if (imageKey) {
       elements.push({ tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true });
@@ -1169,6 +1161,18 @@ export function buildStreamingCard(
         mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
         mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
       ],
+    });
+  }
+
+  // Model auto-fallback notice — pinned as small grey text at the very bottom of
+  // the session card (never a separate message) for as long as the session
+  // keeps running on the fallback model.
+  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
+  if (modelFallbackNotice) {
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${modelFallbackNotice}</font>`,
     });
   }
 

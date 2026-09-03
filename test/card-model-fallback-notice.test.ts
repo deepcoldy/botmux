@@ -194,15 +194,33 @@ describe('buildStreamingCard: model-fallback notice placement', () => {
     const withNotice = build({ usage: { context: null, tokens: null, modelFallback: REFUSAL } });
     const cleared = build({ usage: { context: null, tokens: null } });
     expect(noticeIn(cleared)).toBeUndefined();
-    // The cleared card also drops the notice's separator, not just its text.
-    expect(cleared.elements.length).toBe(withNotice.elements.length - 2);
+    // The notice is a single trailing element; nothing else changes.
+    expect(cleared.elements.length).toBe(withNotice.elements.length - 1);
+  });
+
+  it('is pinned as the last element, in small grey text, below the action rows', () => {
+    const card = build({
+      usage: { context: { usedTokens: 1000, windowTokens: 1_000_000, percentUsed: 0.1 }, tokens: { in: 1000, out: 50 }, modelFallback: REFUSAL },
+      locale: 'zh',
+    });
+    const elements = card.elements as any[];
+    const last = elements[elements.length - 1];
+    expect(last.tag).toBe('markdown');
+    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.content).toMatch(/^<font color='grey'>⚠️ 安全管控触发，已自动降级：.*<\/font>$/);
+    // Below the button rows and below the usage line, never above them.
+    expect(elements.findIndex(e => e.tag === 'action')).toBeGreaterThanOrEqual(0);
+    expect(elements.findIndex(e => e.tag === 'action')).toBeLessThan(elements.length - 1);
+    const usageIdx = elements.findIndex(e => typeof e.content === 'string' && e.content.includes('上下文'));
+    expect(usageIdx).toBeGreaterThanOrEqual(0);
+    expect(usageIdx).toBeLessThan(elements.length - 1);
   });
 
   it('renders nothing when no usage snapshot is supplied at all', () => {
     expect(noticeIn(build({}))).toBeUndefined();
   });
 
-  it('coexists with the usage-limit notice and renders after it', () => {
+  it('coexists with the usage-limit notice and stays below it', () => {
     const card = build({
       status: 'limited',
       usageLimit: { retryReady: false, retryLabel: '10:40pm' },
