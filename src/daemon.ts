@@ -3795,6 +3795,11 @@ export async function enforceMessageQuotaForCliInput(
     /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
      *  不传 = 调用方没有可判定的正文（纯控制路径），闸仍会跑但 content 为空。 */
     promptContent?: string;
+    /** 本轮附带的图片/文件**元信息**（type + name，不含内容）。
+     *  闸跑在附件下载之前（下载必须排在授权之后，否则未授权者也能让 bot 拉文件），
+     *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
+     *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
+    promptAttachments?: Array<{ type: string; name: string }>;
   },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) {
@@ -3813,6 +3818,7 @@ export async function enforceMessageQuotaForCliInput(
       botSender: !!botSender,
       talkReason: 'messageListener',
       content: opts.promptContent,
+      attachments: opts.promptAttachments,
     });
     if (!listenerGate.allowed) {
       logger.info(
@@ -3876,6 +3882,7 @@ export async function enforceMessageQuotaForCliInput(
     botSender: !!botSender,
     talkReason: ev.reason,
     content: opts?.promptContent,
+    attachments: opts?.promptAttachments,
   });
   if (!gate.allowed) {
     logger.info(
@@ -18295,6 +18302,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
     promptContent: content,
+    promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
   })) {
     return;
   }
@@ -19870,7 +19878,7 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { promptContent: parsed.content },
+    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
   )) {
     return;
   }

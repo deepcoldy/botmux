@@ -639,6 +639,41 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
       });
     });
 
+    it('sees attachment metadata even though the files are not downloaded yet', async () => {
+      // The gate runs BEFORE downloadResources (downloading must stay behind
+      // authorization, or an unauthorized sender could make the bot fetch
+      // files). So a gate cannot inspect file CONTENT — but it must at least
+      // see what is arriving, so "no .env uploads" style policy is writable.
+      const seen = join(gateDir, 'seen-attachments.json');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify(p.attachments ?? null));
+          const bad = (p.attachments ?? []).some(a => a.name.endsWith('.env'));
+          console.log(JSON.stringify(bad
+            ? { decision: 'deny', reason: 'secrets file rejected' }
+            : { decision: 'allow' }));
+        });
+      `);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_attach', 'om_anchor',
+        undefined, undefined, 'group', false,
+        {
+          promptContent: 'have a look',
+          promptAttachments: [{ type: 'file', name: 'prod.env' }],
+        },
+      )).resolves.toBe(false);
+
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toEqual([
+        { type: 'file', name: 'prod.env' },
+      ]);
+    });
+
     it('cannot loosen the built-in permission model', async () => {
       installGate(`console.log(JSON.stringify({ decision: 'allow' }));`);
 

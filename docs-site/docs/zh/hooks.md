@@ -84,7 +84,7 @@ tail -f /tmp/botmux-hook.log
 | 事件 | 额外字段 |
 |------|----------|
 | `topic.new` | `messageId`、`senderOpenId`、`senderType`、`msgType`、`content` |
-| `prompt.submit` | `messageId`、`chatId`、`chatType`、`anchor`、`senderOpenId`、`senderUnionId`、`memberUnionId`、`botSender`、`talkReason`、`content` |
+| `prompt.submit` | `messageId`、`chatId`、`chatType`、`anchor`、`senderOpenId`、`senderUnionId`、`memberUnionId`、`botSender`、`talkReason`、`content`、`attachments`（`[{type,name}]`，仅元信息） |
 | `thread.reply` | `messageId`、`rootId`、`parentId`、`senderOpenId`、`senderType`、`msgType`、`content` |
 | `outbound.send` | `messageId`、`msgType`、`uuid`、`content` |
 | `outbound.reply` | `messageId`、`replyId`、`msgType`、`replyInThread`、`uuid`、`content` |
@@ -136,6 +136,7 @@ stdout 必须是**整段 JSON 对象**才会被当作裁决。打印一行普通
 - **消息监听器（message listener）命中的第三方内容也会过闸**：那类内容来自告警 bot 等外部来源、同样会进 CLI，正是最该校验的。该路径本来就不扣额度，被拒时只记日志、不回消息（没有可回复的真人发送者）。
 - **闸拿到的是完整正文，不受 600 字符截断影响**：截断是为通知类 hook 设计的，而闸的判断依据就是内容本身——截断会让它对超长输入结构性失明（把恶意内容垫到 600 字符之后即可绕过）。
   ⚠️ **隐私含义**：配了 sync 闸就等于把**完整消息正文**交给那个命令。异步 hook 仍按原规则截断，未受影响。
+- **闸看得到附件的元信息，但看不到附件内容**：`attachments` 字段给出本轮的 `[{type,name}]`（如 `[{"type":"file","name":"prod.env"}]`），足以写「禁止上传 .env」「只许图片」这类策略；但闸跑在**附件下载之前**（下载必须排在授权之后，否则未授权者也能让 bot 去拉文件），所以**无法按文件内容判断**。
 - 同一条 hook 配置**只会跑一次**：作为闸执行后，不会再作为异步通知重复触发。
 
 ### 快速验证

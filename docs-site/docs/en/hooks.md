@@ -84,7 +84,7 @@ Different events carry extra fields:
 | Event | Extra fields |
 |------|----------|
 | `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
-| `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content` |
+| `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` (`[{type,name}]`, metadata only) |
 | `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
 | `outbound.send` | `messageId`, `msgType`, `uuid`, `content` |
 | `outbound.reply` | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
@@ -136,6 +136,7 @@ Stdout must be a **whole JSON object** to count as a verdict. Printing an ordina
 - **Message-listener traffic is adjudicated too.** That content comes from third parties (alert bots and the like) and still reaches a CLI, so it is exactly what a gate should inspect. That path never charges quota; a denial is logged only, with no reply (there is no human sender to answer).
 - **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
   ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
+- **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
 - A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
 
 ## Practical: Auto-Update Skills with session.start
