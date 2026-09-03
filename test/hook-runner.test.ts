@@ -563,6 +563,64 @@ describe('sync gate hooks (prompt.submit)', () => {
     expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
   });
 
+  it('gives a sync gate the FULL content, so padding cannot hide past the preview limit', async () => {
+    // Regression: prepareHookPayload truncates content at 600 chars for
+    // notification hooks. Reusing that for a gate made it structurally blind —
+    // an attacker pads 600 chars and hides the payload behind them. Verified
+    // pre-fix: a grep gate allowed 'A'.repeat(700) + ' rm -rf /'.
+    const seen = join(tmpDir, 'gate-content.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('content-gate.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify({
+            len: p.content.length,
+            truncated: p.contentTruncated,
+            sawTail: p.content.includes('SENTINEL_TAIL'),
+          }));
+          console.log(JSON.stringify({
+            decision: p.content.includes('SENTINEL_TAIL') ? 'deny' : 'allow',
+          }));
+        });
+      `),
+    }]);
+
+    const padded = `${'A'.repeat(700)} SENTINEL_TAIL`;
+    const decision = await evaluatePromptGate('prompt.submit', { content: padded });
+
+    expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+      len: padded.length,
+      truncated: false,
+      sawTail: true,
+    });
+    expect(decision.allowed).toBe(false);
+  });
+
+  it('still truncates content for async hooks, including on the gate event', () => {
+    const long = 'B'.repeat(900);
+    const asyncOnGateEvent = prepareHookPayload(
+      { event: 'prompt.submit', command: '/bin/true', mode: 'async' },
+      { event: 'prompt.submit', content: long },
+    );
+    expect(asyncOnGateEvent.content).toHaveLength(600);
+    expect(asyncOnGateEvent.contentTruncated).toBe(true);
+
+    // `sync` on a non-gate event is degraded to async at load time, but guard
+    // the raw shape too: full content must follow the GATE event, not the flag.
+    const syncOnNonGateEvent = prepareHookPayload(
+      { event: 'session.idle', command: '/bin/true', mode: 'sync' },
+      { event: 'session.idle', content: long },
+    );
+    expect(syncOnNonGateEvent.content).toHaveLength(600);
+    expect(syncOnNonGateEvent.contentTruncated).toBe(true);
+  });
+
   it('lets a stdout verdict win over a conflicting exit code (documented precedence)', async () => {
     // A checker that prints "allow" and then dies in its own cleanup still meant
     // allow. Documented in hooks.md as "stdout JSON takes precedence".

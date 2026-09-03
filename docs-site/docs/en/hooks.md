@@ -134,6 +134,8 @@ Stdout must be a **whole JSON object** to count as a verdict. Printing an ordina
 - **A broken hook is not a rejection.** Timeout, missing command, and crashes all follow `onError`, which defaults to `allow` — a broken checker should not brick the whole bot. Set `onError: "deny"` explicitly for the opposite.
 - **The latency lands directly on the inbound path.** Keep `timeoutMs` small (1–3s). Bot-level admission is concurrent so a slow gate will not stall the whole daemon, but replies **within one topic** hold an ordering lock — a slow gate makes later messages in that topic queue up. Do not lean on a large timeout to paper over a slow service. With no sync hook configured there is zero overhead — no spawn is added per message.
 - **Message-listener traffic is adjudicated too.** That content comes from third parties (alert bots and the like) and still reaches a CLI, so it is exactly what a gate should inspect. That path never charges quota; a denial is logged only, with no reply (there is no human sender to answer).
+- **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
+  ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
 - A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
 
 ## Practical: Auto-Update Skills with session.start

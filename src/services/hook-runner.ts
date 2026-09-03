@@ -39,6 +39,11 @@ export function isGateEvent(event: HookEvent): boolean {
   return GATE_EVENTS.includes(event);
 }
 
+/** A hook that actually adjudicates (blocking) rather than merely observing. */
+function isSyncGateHook(hook: { event: HookEvent; mode?: 'sync' | 'async' }): boolean {
+  return hook.mode === 'sync' && isGateEvent(hook.event);
+}
+
 export type HookFilter = {
   chatId?: string | string[];
   senderOpenId?: string | string[];
@@ -224,7 +229,16 @@ export function loadHookConfigs(opts: {
 }
 
 export function prepareHookPayload(hook: HookConfig, rawPayload: HookPayload): HookPayload {
-  const allowFullContent = !!hook.redact?.fullContentEvents?.includes(rawPayload.event);
+  // A sync gate hook DECIDES on this content, so truncating it would make the
+  // gate structurally blind past CONTENT_PREVIEW_LIMIT: an attacker just pads
+  // 600 chars and hides the payload behind them. (Verified before the fix: a
+  // grep-for-`rm -rf /` gate allowed `'A'.repeat(700) + ' rm -rf /'` while
+  // correctly denying the same string when short.) The preview limit exists to
+  // keep notification hooks from swallowing huge payloads — that rationale
+  // does not apply to a verdict input. Privacy note for operators is in
+  // hooks.md: configuring a sync gate hands it the full message text.
+  const allowFullContent = isSyncGateHook(hook)
+    || !!hook.redact?.fullContentEvents?.includes(rawPayload.event);
   const payload: HookPayload = { ...rawPayload };
 
   for (const field of CONTENT_FIELDS) {
