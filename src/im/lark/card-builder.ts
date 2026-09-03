@@ -1168,7 +1168,7 @@ export function buildStreamingCard(
     });
   }
 
-  // Model auto-fallback notice — pinned as small grey text at the very bottom of
+  // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
@@ -1176,7 +1176,7 @@ export function buildStreamingCard(
     elements.push({
       tag: 'markdown',
       text_size: MODEL_FALLBACK_NOTICE_TEXT_SIZE,
-      content: `<font color='grey'>${modelFallbackNotice}</font>`,
+      content: `<font color='yellow'>${modelFallbackNotice}</font>`,
     });
   }
 

@@ -68,12 +68,12 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
-  'card.model_fallback.refusal': '⚠️ 安全管控降级：{originalModel} → {fallbackModel}{reason}/model {alias} 切回',
-  'card.model_fallback.unavailable': '⚠️ 模型不可用已切换：{originalModel} → {fallbackModel}{reason}/model {alias} 切回',
-  'card.model_fallback.consent': '⚠️ 额度限制已切换：{originalModel} → {fallbackModel}{reason}/model {alias} 切回',
-  // {reason} 连同后面的分隔点一起替换：全角括号自带视觉间距，前面不再补空格。
-  'card.model_fallback.reason': '（{reason}）· ',
-  'card.model_fallback.no_reason': ' · ',
+  'card.model_fallback.refusal': '⚠️ 安全管控降级：{originalModel} → {fallbackModel}{reason}',
+  'card.model_fallback.unavailable': '⚠️ 模型不可用，本轮切换：{originalModel} → {fallbackModel}{reason}',
+  'card.model_fallback.consent': '⚠️ 额度限制已切换：{originalModel} → {fallbackModel}{reason}',
+  // {reason} 是行尾：全角括号自带视觉间距，前面不补空格；没有原因就什么都不加。
+  'card.model_fallback.reason': '（{reason}）',
+  'card.model_fallback.no_reason': '',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} 触发限流，本轮任务已暂停。请在 {retryLabel} 后重发上一条任务，或直接发送新消息继续。',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',

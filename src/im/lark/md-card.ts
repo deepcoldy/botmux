@@ -524,16 +524,6 @@ function claudeModelLabel(id: string): string {
   return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
 }
 
-/** The `/model <alias>` argument that puts the session back on `id`. Claude Code
- *  resolves the family aliases (fable/opus/sonnet/haiku) to the current
- *  recommended build; an unrecognised id is echoed verbatim so the hint stays
- *  actionable. */
-function claudeModelAlias(id: string): string {
-  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
-  const m = /^claude-(fable|opus|sonnet|haiku)-/i.exec(bare);
-  return m ? m[1].toLowerCase() : id.trim();
-}
-
 /** Escape markdown control characters without the non-breaking-space rewrite
  *  compactRuntimeLabel applies — this notice is prose, not a compact tail. */
 function escapeCardPlainText(value: string): string {
@@ -575,7 +565,6 @@ export function cardModelFallbackNotice(
   return t(`card.model_fallback.${fallback.kind}`, {
     originalModel: fallbackModelText(fallback.originalModel),
     fallbackModel: fallbackModelText(fallback.fallbackModel),
-    alias: escapeCardPlainText(truncateModelToken(claudeModelAlias(fallback.originalModel))),
     reason,
   }, locale);
 }
