@@ -20,6 +20,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -848,10 +849,6 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
-const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
-} as const;
-
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
@@ -1168,7 +1165,7 @@ export function buildStreamingCard(
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
@@ -1273,7 +1270,7 @@ export function buildPrivateSnapshotCard(
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
