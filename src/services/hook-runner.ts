@@ -13,6 +13,7 @@ export const HOOK_EVENTS = [
   'topic.new',
   'thread.reply',
   'prompt.submit',
+  'outbound.pre_send',
   'outbound.send',
   'outbound.reply',
   'schedule.fired',
@@ -32,8 +33,14 @@ export type HookEvent = typeof HOOK_EVENTS[number];
  * declaring sync on them would buy nothing but latency while still reading as
  * "this hook can block" to the operator. Those degrade to async with a warning
  * rather than silently pretending to gate — see `loadHookConfigs`.
+ *
+ * `outbound.send` / `outbound.reply` are deliberately NOT here: they fire only
+ * after the Lark API call succeeded (the payload needs the returned
+ * `messageId`), so by then the message is already in the chat and a "deny"
+ * could at best retract it — that is not interception. `outbound.pre_send`
+ * exists for that job and runs before the API call.
  */
-export const GATE_EVENTS: readonly HookEvent[] = ['prompt.submit'] as const;
+export const GATE_EVENTS: readonly HookEvent[] = ['prompt.submit', 'outbound.pre_send'] as const;
 
 export function isGateEvent(event: HookEvent): boolean {
   return GATE_EVENTS.includes(event);
@@ -668,6 +675,25 @@ async function evaluateOneGateHook(hook: HookConfig, payload: HookPayload): Prom
  * 没有配任何 sync hook 时零开销直接放行——绝大多数部署走的就是这条路径，
  * 不能因为加了这个能力就给每条消息都加一次 spawn。
  */
+/**
+ * Is any sync gate hook configured for this event RIGHT NOW?
+ *
+ * Purely synchronous, so a caller can skip `await evaluatePromptGate(...)`
+ * entirely when nothing is configured. That matters beyond saving work: an
+ * `await` inserted before an outbound API call defers it by a microtask, which
+ * is observable to fire-and-forget callers (`void sendUserMessage(...)`) and
+ * to anything asserting right after them. With no gate configured the feature
+ * must be invisible — same call ordering as before it existed.
+ */
+export function hasSyncGateHooks(event: HookEvent): boolean {
+  try {
+    if (!isGateEvent(event)) return false;
+    return loadHookConfigs().some(hook => hook.event === event && hook.mode === 'sync');
+  } catch {
+    return false;
+  }
+}
+
 export async function evaluatePromptGate(
   event: HookEvent,
   body: Record<string, unknown> = {},

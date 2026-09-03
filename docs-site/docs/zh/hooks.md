@@ -60,7 +60,7 @@ tail -f /tmp/botmux-hook.log
 | `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id |
 | `redact.fullContentEvents` | string[] | 可选。默认截断长文本；列入 allowlist 的事件透传全文 |
 
-> **`outbound.send` / `outbound.reply` 不能用来拦截。** 它们的发射点在飞书 API 调用**成功之后**（需先拿到 `messageId`），那一刻消息已经在群里了；加 `mode:"sync"` 也只能事后撤回，不是拦截。这两个事件写 `sync` 会降级为 async 并告警。
+> **想拦住「要发出去的消息」用 `outbound.pre_send`**（发送前，真能拦）。`outbound.send` / `outbound.reply` 是**发送后通知**——发射点在飞书 API 调用**成功之后**（需先拿到 `messageId`），那一刻消息已经在群里，加 `mode:"sync"` 也只能事后撤回。这两个事件写 `sync` 会降级为 async 并告警。
 
 ## 支持事件
 
@@ -68,7 +68,8 @@ tail -f /tmp/botmux-hook.log
 |------|----------|
 | `topic.new` | 收到新话题 / @mention |
 | `thread.reply` | 收到已有话题回复 |
-| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。唯一支持 `mode:"sync"` 前置拦截的事件 |
+| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。支持 `mode:"sync"` 拦截 |
+| `outbound.pre_send` | botmux **即将把消息发到飞书之前**（API 调用之前）。支持 `mode:"sync"` 拦截 |
 | `outbound.send` | botmux 发送普通消息成功 |
 | `outbound.reply` | botmux 回复话题消息成功 |
 | `schedule.fired` | 定时任务执行完成 |
@@ -87,6 +88,7 @@ tail -f /tmp/botmux-hook.log
 |------|----------|
 | `topic.new` | `messageId`、`senderOpenId`、`senderType`、`msgType`、`content` |
 | `prompt.submit` | `messageId`、`chatId`、`chatType`、`anchor`、`senderOpenId`、`senderUnionId`、`memberUnionId`、`botSender`、`talkReason`、`content`、`attachments`（`[{type,name}]`，仅元信息） |
+| `outbound.pre_send` | `surface`（`sendMessage`｜`replyMessage`｜`sendUserMessage`｜`sendEphemeralCard`）、`larkAppId`、`content`、`msgType`、`chatId`／`toOpenId`／`replyToMessageId`（随 surface 而定）、`uuid` |
 | `thread.reply` | `messageId`、`rootId`、`parentId`、`senderOpenId`、`senderType`、`msgType`、`content` |
 | `outbound.send` | `messageId`、`msgType`、`uuid`、`content` |
 | `outbound.reply` | `messageId`、`replyId`、`msgType`、`replyInThread`、`uuid`、`content` |
@@ -171,6 +173,78 @@ JSON
 ```
 
 在飞书里发一条消息：应当收到「本条消息被前置校验拦截」的回复，且 `/tmp/gate-payload.json` 里能看到本轮 payload。验证完记得清空 `hooks.json`。
+
+## 发送前校验闸（outbound.pre_send）
+
+与 `prompt.submit` 对称，但方向相反：`prompt.submit` 拦**进来的**消息，`outbound.pre_send` 拦 **botmux 要发出去的**消息。用于防止把密钥、内部信息、越权内容发进飞书群。
+
+未配置该闸时，这层检查是**同步 no-op**：不 spawn 进程，也不在 API 调用前插入任何额外的 microtask，调用时序与本特性存在之前逐字相同。
+
+```json
+[
+  {
+    "event": "outbound.pre_send",
+    "mode": "sync",
+    "command": "/root/bin/outbound-gate.sh",
+    "timeoutMs": 2000,
+    "onError": "allow"
+  }
+]
+```
+
+裁决写法与 `prompt.submit` 完全一致（stdout JSON 优先于退出码）。
+
+### 覆盖哪些发送口
+
+| 函数 | 场景 | 过闸 |
+|---|---|---|
+| `sendMessage` | 群消息（含 `botmux send`） | ✅ |
+| `replyMessage` | 话题内回复 | ✅ |
+| `sendUserMessage` | 私聊 DM | ✅ |
+| `sendEphemeralCard` | 仅本人可见的临时卡片 | ✅ |
+| `updateMessage` | **编辑已存在的卡片** | ❌ 不过闸（不是新发送） |
+
+payload 里的 `surface` 字段会告诉你是哪一种，可据此写不同策略。
+
+### 与 `outbound.send` 的区别（重要）
+
+| | `outbound.pre_send` | `outbound.send` / `outbound.reply` |
+|---|---|---|
+| 时机 | 飞书 API 调用**之前** | API 调用**成功之后** |
+| 能否拦截 | ✅ 能，消息不会出现在群里 | ❌ 不能，消息已经发出去了 |
+| 有无 `messageId` | 没有（还没发） | 有 |
+| 支持 `sync` | ✅ | ❌（写了降级为 async 并告警） |
+
+### 被拦之后会发生什么
+
+<callout emoji="⚠️" background-color="light-yellow">
+被拦的发送会**抛出 `OutboundBlockedError`**，而不是静默返回一个假的 messageId——那些函数的返回类型是「消息 id」，编一个假的会让调用方以为发成功了。
+
+调用方的既有错误处理会接住它：入站链路有统一兜底（失败通知本身也在 try/catch 里，不会因为通知同样被拦而循环）。但**这确实是一个行为变化**：配了 `outbound.pre_send` 且真的 deny 时，相关代码路径会走它的错误分支。建议先用 `onError: "allow"` 加只观察不拒绝的脚本跑一段时间，确认命中面之后再开启真正的拒绝。
+</callout>
+
+### 示例：拦住疑似密钥外泄
+
+```bash
+#!/bin/bash
+set -uo pipefail
+payload="$(cat)"
+command -v jq >/dev/null 2>&1 || { echo '{"decision":"allow"}'; exit 0; }
+
+content="$(printf '%s' "$payload" | jq -r '.content // empty')"
+surface="$(printf '%s' "$payload" | jq -r '.surface // empty')"
+
+# AWS key / 私钥 / 常见 token 形态
+if printf '%s' "$content" | grep -qE 'AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-[0-9A-Za-z-]{10,}'; then
+  echo '{"decision":"deny","reason":"疑似密钥，已拦截"}'
+  exit 0
+fi
+
+# 例：私聊 DM 不允许发卡片以外的长文本
+# [ "$surface" = "sendUserMessage" ] && [ "${#content}" -gt 2000 ] #   && { echo '{"decision":"deny","reason":"DM 长文本请改用群消息"}'; exit 0; }
+
+echo '{"decision":"allow"}'
+```
 
 ## 实践：用 session.start hook 自动更新 Skills
 

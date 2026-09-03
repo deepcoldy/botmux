@@ -60,7 +60,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
 | `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
 
-> **`outbound.send` / `outbound.reply` cannot intercept.** They fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat; `mode:"sync"` there could only retract after the fact, which is not interception. Declaring `sync` on them degrades to async with a warning.
+> **To block an outgoing message use `outbound.pre_send`** (fires before the API call and can actually stop it). `outbound.send` / `outbound.reply` are **post-send notifications**: they fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat. Declaring `sync` on them degrades to async with a warning.
 
 ## Supported Events
 
@@ -68,7 +68,8 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 |------|----------|
 | `topic.new` | A new topic / @mention is received |
 | `thread.reply` | A reply to an existing topic is received |
-| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. The only event that supports `mode:"sync"` blocking |
+| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Supports `mode:"sync"` blocking |
+| `outbound.pre_send` | botmux is **about to send a message to Lark** (before the API call). Supports `mode:"sync"` blocking |
 | `outbound.send` | botmux successfully sends a regular message |
 | `outbound.reply` | botmux successfully replies to a topic message |
 | `schedule.fired` | A scheduled task finishes running |
@@ -87,6 +88,7 @@ Different events carry extra fields:
 |------|----------|
 | `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
 | `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` (`[{type,name}]`, metadata only) |
+| `outbound.pre_send` | `surface` (`sendMessage`｜`replyMessage`｜`sendUserMessage`｜`sendEphemeralCard`), `larkAppId`, `content`, `msgType`, `chatId`/`toOpenId`/`replyToMessageId` (depends on surface), `uuid` |
 | `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
 | `outbound.send` | `messageId`, `msgType`, `uuid`, `content` |
 | `outbound.reply` | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
@@ -155,6 +157,53 @@ Stdout must be a **whole JSON object** to count as a verdict. Printing an ordina
 - **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
 - **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks and workflow-generated prompts do not** — those are automation the operator pre-authorized, not external input. Do not read the gate as "everything reaching the CLI was checked".
 - A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
+
+## Pre-send gate (outbound.pre_send)
+
+The mirror image of `prompt.submit`: that one gates messages coming **in**, this one gates messages botmux is about to send **out**. Use it to keep secrets, internal details, or out-of-policy content from reaching a Lark chat.
+
+```json
+[
+  {
+    "event": "outbound.pre_send",
+    "mode": "sync",
+    "command": "/root/bin/outbound-gate.sh",
+    "timeoutMs": 2000,
+    "onError": "allow"
+  }
+]
+```
+
+Verdicts work exactly as for `prompt.submit` (stdout JSON takes precedence over the exit code).
+
+### Which send paths are covered
+
+| Function | Used for | Gated |
+|---|---|---|
+| `sendMessage` | chat messages (including `botmux send`) | ✅ |
+| `replyMessage` | replies inside a topic | ✅ |
+| `sendUserMessage` | direct messages | ✅ |
+| `sendEphemeralCard` | ephemeral, single-viewer cards | ✅ |
+| `updateMessage` | **editing an existing card** | ❌ not gated (not a new send) |
+
+The `surface` field in the payload tells you which one, so a hook can apply different rules per path.
+
+### How it differs from `outbound.send`
+
+| | `outbound.pre_send` | `outbound.send` / `outbound.reply` |
+|---|---|---|
+| Timing | **before** the Lark API call | **after** the call succeeds |
+| Can block | ✅ the message never reaches the chat | ❌ already delivered |
+| Has `messageId` | no (nothing sent yet) | yes |
+| Supports `sync` | ✅ | ❌ (degrades to async with a warning) |
+
+### What a block does
+
+> ⚠️ A blocked send **throws `OutboundBlockedError`** rather than quietly returning a fake messageId — these functions are typed to return a message id, and inventing one would make callers believe the send succeeded.
+>
+> Existing error handling absorbs it (the inbound paths have a catch-all, and the failure notice itself is wrapped in try/catch so a blocked notice cannot loop). But this **is** a behaviour change: with a gate configured and actually denying, those code paths take their error branch. Roll it out with `onError: "allow"` and an observe-only script first, confirm what it would have blocked, then switch to real denials.
+
+With no `outbound.pre_send` gate configured, the check is a synchronous no-op — it adds no process spawn and no extra microtask before the API call, so call ordering is byte-for-byte what it was before the feature existed.
 
 ## Practical: Auto-Update Skills with session.start
 
