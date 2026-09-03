@@ -524,6 +524,9 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain('<code>.ready</code> → <code>{relativeScriptExample}</code>');
 
     expect(zh('schedules.form.preconditionFileHelp')).toContain('daemon 宿主机上的文件路径，不是上传文件');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('请仅使用可信脚本');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('无论路径是绝对还是相对');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('能修改该文件的程序或沙盒内模型都能改变下次执行内容');
     expect(zh('schedules.form.preconditionWorkingDir')).toContain('相对路径基准');
     expect(zh('schedules.form.preconditionWorkingDirUnavailable')).toContain('创建任务后重新编辑');
     expect(zh('schedules.form.preconditionScriptWorkingDirHelp')).toContain('不是 Bash 文件所在目录');
@@ -531,6 +534,9 @@ describe('dashboard schedules React page helpers', () => {
     expect(zh('schedules.form.preconditionFileRequirements')).toContain('符号链接');
 
     expect(en('schedules.form.preconditionFileHelp')).toContain('does not upload a file');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('use only trusted scripts');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('absolute or relative paths');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('program or sandboxed model that can modify this file');
     expect(en('schedules.form.preconditionWorkingDirUnavailable')).toContain('reopen it');
     expect(en('schedules.form.preconditionScriptWorkingDirHelp')).toContain('not the Bash file directory');
     expect(en('schedules.form.preconditionFileRequirements')).toContain('executable permission is not required');

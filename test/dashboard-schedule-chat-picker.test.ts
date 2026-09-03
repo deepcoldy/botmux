@@ -15,6 +15,11 @@ const CHATS = [
   { chatId: 'oc_alpha', name: 'Alpha', memberBots: [{ larkAppId: 'cli_picker', inChat: true }] },
   { chatId: 'oc_beta', name: 'Beta', memberBots: [{ larkAppId: 'cli_picker', inChat: true }] },
 ];
+const MANY_CHATS = Array.from({ length: 8 }, (_, index) => ({
+  chatId: `oc_group_${index + 1}`,
+  name: `Group ${index + 1}`,
+  memberBots: [{ larkAppId: 'cli_picker', inChat: true }],
+}));
 const EDITING = {
   id: 'schedule-picker-test',
   name: 'Picker test',
@@ -203,15 +208,67 @@ describe('schedule form chat picker', () => {
     expectNoManualEntry(form.root);
   });
 
-  it('shows a group-loading error in the dropdown instead of falling back to manual input', async () => {
+  it('retries a failed group load without losing the current selection', async () => {
+    let rejectRetry!: (reason: Error) => void;
     vi.mocked(fetchGroupsSnapshot).mockRejectedValueOnce(new Error('roster unavailable'));
-    const form = await renderForm();
+    vi.mocked(fetchGroupsSnapshot).mockReturnValueOnce(new Promise((_resolve, reject) => {
+      rejectRetry = reject;
+    }));
+    vi.mocked(fetchGroupsSnapshot).mockResolvedValueOnce({ bots: BOTS, chats: CHATS });
+    const form = await renderForm({ ...EDITING, chatIds: ['oc_alpha', 'oc_retained'] });
     form.toggle();
     expect(form.panel()[0].findByProps({ role: 'alert' }).children)
-      .toEqual(['无法加载群列表，请关闭编辑窗口后重试。']);
+      .toEqual(['无法加载群列表。']);
     expect(form.panel()[0].findAllByProps({ role: 'status' })).toHaveLength(0);
     expect(form.panel()[0].findAllByProps({ className: 'schedule-chat-selector-empty' })).toHaveLength(0);
+    expect(form.checkbox('oc_alpha')!.props.checked).toBe(true);
     expectNoManualEntry(form.root);
+    expect(form.onSubmit).not.toHaveBeenCalled();
+
+    const retry = () => form.panel()[0].findAllByType('button')
+      .find(button => button.children.includes('重新加载'))!;
+    act(() => retry().props.onClick());
+    expect(retry().props.type).toBe('button');
+    expect(retry().props.disabled).toBe(true);
+    expect(form.panel()[0].findByProps({ role: 'status' })).toBeDefined();
+    expect(form.checkbox('oc_alpha')!.props.checked).toBe(true);
+    expect(fetchGroupsSnapshot).toHaveBeenLastCalledWith({ cacheMs: 30_000, force: true });
+
+    await act(async () => rejectRetry(new Error('still unavailable')));
+    expect(retry().props.disabled).toBe(false);
+    expect(form.panel()[0].findByProps({ role: 'alert' })).toBeDefined();
+
+    await act(async () => retry().props.onClick());
+    expect(form.panel()[0].findAllByProps({ role: 'alert' })).toHaveLength(0);
+    expect(form.panel()[0].findAllByProps({ role: 'status' })).toHaveLength(0);
+    expect(form.checkbox('oc_alpha')!.props.checked).toBe(true);
+    expect(form.checkbox('oc_retained')!.props.checked).toBe(true);
+    expect(form.checkbox('oc_beta')).toBeDefined();
+    expect(fetchGroupsSnapshot).toHaveBeenCalledTimes(3);
+    expect(form.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('ignores a retry result after the form closes and reopens', async () => {
+    let resolveRetry!: (snapshot: Awaited<ReturnType<typeof fetchGroupsSnapshot>>) => void;
+    vi.mocked(fetchGroupsSnapshot).mockRejectedValueOnce(new Error('roster unavailable'));
+    vi.mocked(fetchGroupsSnapshot).mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
+    const form = await renderForm(EDITING);
+    form.toggle();
+    const retry = form.panel()[0].findAllByType('button')
+      .find(button => button.children.includes('重新加载'))!;
+    act(() => retry.props.onClick());
+    form.updateOpen(false);
+    await act(async () => form.updateOpen(true));
+    expect(form.trigger().props.title).toBe('Alpha');
+    expect(form.checkbox('oc_alpha')!.props.checked).toBe(true);
+
+    await act(async () => resolveRetry({
+      bots: BOTS,
+      chats: [{ ...CHATS[0], name: 'Stale group name' }],
+    }));
+    expect(form.trigger().props.title).toBe('Alpha');
+    expect(form.checkbox('oc_beta')).toBeDefined();
+    expect(form.panel()[0].findAllByProps({ role: 'alert' })).toHaveLength(0);
     expect(form.onSubmit).not.toHaveBeenCalled();
   });
 
@@ -273,6 +330,82 @@ describe('schedule form chat picker', () => {
     expect(form.trigger().props.title).toBe('Beta');
     expect(form.trigger().findByType('small').children).toEqual(['已选择 1 个群']);
     expect(form.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['create', null],
+    ['edit', { ...EDITING, chatIds: [] }],
+  ] as const)('limits new bindings to five groups in the %s form and validates submission', async (_mode, editing) => {
+    vi.mocked(fetchGroupsSnapshot).mockResolvedValueOnce({ bots: BOTS, chats: MANY_CHATS });
+    const form = await renderForm(editing);
+    if (!editing) {
+      const tr = createDashboardTranslator('zh');
+      act(() => {
+        form.root.findByProps({ name: 'name' }).props.onChange({ target: { value: 'Limit test' } });
+        form.root.findByProps({ placeholder: tr('schedules.form.scheduleHelp') }).props.onChange({
+          target: { value: '0 9 * * *' },
+        });
+        form.root.findByProps({ rows: 4 }).props.onChange({ target: { value: 'Test-only prompt' } });
+      });
+    }
+    form.toggle();
+    for (const group of MANY_CHATS.slice(0, 5)) {
+      act(() => form.checkbox(group.chatId)!.props.onChange({ currentTarget: { checked: true } }));
+    }
+    expect(form.checkbox('oc_group_6')!.props.disabled).toBe(true);
+    expect(form.checkbox('oc_group_1')!.props.disabled).toBe(false);
+    expect(form.root.findAllByType('small').some(node => node.children.includes(
+      '最多绑定 5 个群；如需更换，请先取消已选群。',
+    ))).toBe(true);
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      chatIds: MANY_CHATS.slice(0, 5).map(group => group.chatId),
+    }));
+    form.onSubmit.mockClear();
+
+    act(() => form.checkbox('oc_group_1')!.props.onChange({ currentTarget: { checked: false } }));
+    expect(form.checkbox('oc_group_6')!.props.disabled).toBe(false);
+    act(() => form.checkbox('oc_group_6')!.props.onChange({ currentTarget: { checked: true } }));
+    expect(form.checkbox('oc_group_7')!.props.disabled).toBe(true);
+
+    // Bypass the native disabled control to verify the independent submit guard.
+    act(() => form.checkbox('oc_group_7')!.props.onChange({ currentTarget: { checked: true } }));
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(form.trigger().props['aria-invalid']).toBe(true);
+    expect(form.root.findByProps({ id: 'schedule-chat-limit-error' }).children)
+      .toEqual(['每个定时任务最多绑定 5 个群，请减少群聊后保存。']);
+    expect(form.trigger().findByType('small').children).toEqual(['已选择 6 个群']);
+  });
+
+  it('preserves legacy bindings above five for other edits but requires changed bindings to fit the limit', async () => {
+    const originalChatIds = MANY_CHATS.slice(0, 7).map(group => group.chatId);
+    vi.mocked(fetchGroupsSnapshot).mockResolvedValueOnce({ bots: BOTS, chats: MANY_CHATS });
+    const form = await renderForm({ ...EDITING, chatIds: originalChatIds });
+    form.toggle();
+    expect(form.trigger().findByType('small').children).toEqual(['已选择 7 个群']);
+    expect(form.checkbox('oc_group_8')!.props.disabled).toBe(true);
+    expect(form.root.findAllByProps({ id: 'schedule-chat-limit-error' })).toHaveLength(0);
+    act(() => form.root.findByProps({ name: 'name' }).props.onChange({ target: { value: 'Renamed only' } }));
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Renamed only',
+      chatIds: originalChatIds,
+    }));
+    form.onSubmit.mockClear();
+
+    act(() => form.checkbox('oc_group_7')!.props.onChange({ currentTarget: { checked: false } }));
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(form.root.findByProps({ id: 'schedule-chat-limit-error' })).toBeDefined();
+    expect(form.checkbox('oc_group_6')!.props.disabled).toBe(false);
+
+    act(() => form.checkbox('oc_group_6')!.props.onChange({ currentTarget: { checked: false } }));
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+    expect(form.root.findAllByProps({ id: 'schedule-chat-limit-error' })).toHaveLength(0);
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      chatIds: originalChatIds.slice(0, 5),
+    }));
   });
 
   it('ignores pointerdown inside the picker and closes on an outside pointerdown', async () => {

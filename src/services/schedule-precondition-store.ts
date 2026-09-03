@@ -741,13 +741,3 @@ export function removeSchedulePrecondition(
     return true;
   });
 }
-
-export function hasSchedulePrecondition(
-  task: ScheduledTask,
-  appId: string,
-  options: SchedulePreconditionStoreOptions = {},
-): boolean {
-  assertTaskIdentity(task, appId);
-  const record = readRecord(appId, task.id, options);
-  return record !== undefined || taskRef(task) !== undefined;
-}

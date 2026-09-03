@@ -166,6 +166,33 @@ describe('scheduler.updateTask', () => {
     });
   });
 
+  it('rejects a six-chat update without mutating or publishing', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', { scope: 'chat' });
+    expect(updateTask(id, {
+      name: 'must not change',
+      chatIds: ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'],
+    })).toEqual({ ok: false, error: 'too_many_target_chats' });
+    expect(store.get(id)).toMatchObject({ name: 'demo', chatId: 'oc_x' });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unchanged legacy six-chat binding editable but rejects oversized changes', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const chatIds = ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'];
+    const id = seed('origin', { scope: 'chat', chatId: chatIds[0], chatIds });
+    expect(updateTask(id, { name: 'renamed', chatIds: [...chatIds] })).toEqual({ ok: true });
+    expect(updateTask(id, { silent: true })).toEqual({ ok: true });
+    expect(store.get(id)).toMatchObject({ name: 'renamed', silent: true, chatIds });
+    publish.mockClear();
+
+    expect(updateTask(id, { chatIds: [...chatIds].reverse() }))
+      .toEqual({ ok: false, error: 'too_many_target_chats' });
+    expect(publish).not.toHaveBeenCalled();
+    expect(updateTask(id, { chatIds: chatIds.slice(0, 5) })).toEqual({ ok: true });
+    expect(store.get(id)?.chatIds).toEqual(chatIds.slice(0, 5));
+  });
+
   it('collapses multi-chat to one and publishes null so Dashboard clears its cached array', async () => {
     const { updateTask } = await import('../src/core/scheduler.js');
     const id = seed('origin', {

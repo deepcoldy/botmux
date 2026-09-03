@@ -19,7 +19,6 @@ import {
   abortSchedulePrecondition,
   activateSchedulePrecondition,
   ensureSchedulePreconditionRoot,
-  hasSchedulePrecondition,
   getSchedulePreconditionSummary,
   rebindSchedulePrecondition,
   removeSchedulePrecondition,
@@ -96,7 +95,6 @@ function stageAndActivate(script = 'exit 1\n'): ScheduledTask {
 describe('schedule precondition protected store', () => {
   it('keeps legacy/no-script tasks unchanged without creating storage', () => {
     expect(resolveSchedulePrecondition(task(), APP_ID, options())).toEqual({ kind: 'none' });
-    expect(hasSchedulePrecondition(task(), APP_ID, options())).toBe(false);
     expect(existsSync(schedulePreconditionRoot(dataDir))).toBe(false);
   });
 
@@ -154,7 +152,6 @@ describe('schedule precondition protected store', () => {
       enabled: true,
       source: { kind: 'inline', script },
     });
-    expect(hasSchedulePrecondition(configured, APP_ID, options())).toBe(true);
   });
 
   it('persists a live file source without reading or rewriting its path', () => {
@@ -189,7 +186,6 @@ describe('schedule precondition protected store', () => {
       enabled: false,
       source: { kind: 'inline', script: 'echo 1\n' },
     });
-    expect(hasSchedulePrecondition(configured, APP_ID, options())).toBe(true);
     expectCode(
       () => resolveSchedulePrecondition(
         { ...configured, prompt: 'tampered while disabled' },

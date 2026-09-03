@@ -1,16 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
 import {
   __setScheduleStoreBeforeRenameTestHook,
+  createTask as createStoredTask,
+  effectiveScheduleChatIds,
   setScheduleScope,
   getTask,
   listTasks,
+  updateTask as updateStoredTask,
 } from '../src/services/schedule-store.js';
 import {
-  hasSchedulePrecondition,
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
@@ -53,12 +55,22 @@ function createParams(name = 'guarded') {
   };
 }
 
+function createLegacySixChatTask() {
+  const chatIds = ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'];
+  return createStoredTask({
+    ...createParams('legacy six chats'),
+    parsed: { kind: 'interval', minutes: 60, display: 'every hour' },
+    executionPosition: 'top-level',
+    chatId: chatIds[0],
+    chatIds,
+  });
+}
+
 describe('trusted schedule precondition configuration', () => {
   it('leaves the legacy create path untouched when no script is configured', () => {
     const task = createTaskWithOptionalPrecondition(createParams('legacy'), APP_ID);
 
     expect(task.preconditionRef).toBeUndefined();
-    expect(hasSchedulePrecondition(task, APP_ID)).toBe(false);
     expect(resolveSchedulePrecondition(task, APP_ID)).toEqual({ kind: 'none' });
     expect(existsSync(schedulePreconditionRoot())).toBe(false);
   });
@@ -81,6 +93,88 @@ describe('trusted schedule precondition configuration', () => {
       rootMessageId: 'om_topic',
     }, APP_ID)).toThrow('multiple_chats_topic_unsupported');
     expect(listTasks(APP_ID)).toHaveLength(1);
+  });
+
+  it.each([undefined, 'printf 1'])('limits new tasks to five unique chats with condition %j', (condition) => {
+    const chatIds = ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five'];
+    expect(() => createTaskWithOptionalPrecondition({
+      ...createParams(), chatIds: [...chatIds, 'oc_six'],
+    }, APP_ID, condition)).toThrow('too_many_target_chats');
+    expect(listTasks(APP_ID)).toEqual([]);
+    expect(existsSync(schedulePreconditionRoot())).toBe(false);
+
+    const created = createTaskWithOptionalPrecondition({
+      ...createParams(), chatIds: [...chatIds, ' oc_one '],
+    }, APP_ID, condition);
+    expect(created.chatIds).toEqual(chatIds);
+  });
+
+  it('rejects oversized target changes before touching the task or protected source', () => {
+    const created = createTaskWithOptionalPrecondition(createParams(), APP_ID, 'printf 1');
+    const path = schedulePreconditionPath(APP_ID, created.id);
+    const sourceBefore = readFileSync(path, 'utf8');
+    const events: DashboardEvent[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+    try {
+      expect(updateTaskWithOptionalPrecondition(created.id, {
+        name: 'must not change',
+        chatIds: ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'],
+      }, APP_ID, 'printf 0')).toEqual({ ok: false, error: 'too_many_target_chats' });
+    } finally {
+      unsubscribe();
+    }
+    expect(getTask(created.id, APP_ID)).toEqual(created);
+    expect(readFileSync(path, 'utf8')).toBe(sourceBefore);
+    expect(events).toEqual([]);
+  });
+
+  it('preserves unchanged legacy six-chat bindings and permits reducing them to five', () => {
+    const created = createLegacySixChatTask();
+    const original = created.chatIds!;
+    expect(updateTaskWithOptionalPrecondition(created.id, {
+      name: 'renamed legacy', chatIds: [...original],
+    }, APP_ID, 'printf 1')).toMatchObject({ ok: true });
+    updateStoredTask(created.id, { lastStatus: 'skipped' }, APP_ID);
+    expect(effectiveScheduleChatIds(getTask(created.id, APP_ID)!)).toEqual(original);
+    expect(getTask(created.id, APP_ID)).toMatchObject({
+      name: 'renamed legacy', enabled: true, lastStatus: 'skipped',
+    });
+    expect(updateTaskWithOptionalPrecondition(created.id, {
+      chatIds: [...original].reverse(),
+    }, APP_ID)).toEqual({ ok: false, error: 'too_many_target_chats' });
+    expect(updateTaskWithOptionalPrecondition(created.id, {
+      chatIds: [...original.slice(0, 5), 'oc_other'],
+    }, APP_ID)).toEqual({ ok: false, error: 'too_many_target_chats' });
+
+    expect(updateTaskWithOptionalPrecondition(created.id, {
+      chatIds: original.slice(0, 5),
+    }, APP_ID)).toMatchObject({ ok: true });
+    expect(getTask(created.id, APP_ID)?.chatIds).toEqual(original.slice(0, 5));
+    expect(resolveSchedulePrecondition(getTask(created.id, APP_ID)!, APP_ID)).toMatchObject({
+      kind: 'configured', source: { kind: 'inline', script: 'printf 1' },
+    });
+  });
+
+  it('restores a legacy six-chat binding if a five-chat compound update fails', () => {
+    const legacy = createLegacySixChatTask();
+    const created = updateTaskWithOptionalPrecondition(legacy.id, {}, APP_ID, 'printf 1').task!;
+    const path = schedulePreconditionPath(APP_ID, created.id);
+    const events: DashboardEvent[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+    __setScheduleStoreBeforeRenameTestHook(() => {
+      __setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(path, { force: true });
+    });
+    try {
+      expect(() => updateTaskWithOptionalPrecondition(created.id, {
+        chatIds: created.chatIds!.slice(0, 5),
+      }, APP_ID, 'printf 0')).toThrow('staged protected record is missing');
+    } finally {
+      unsubscribe();
+      __setScheduleStoreBeforeRenameTestHook(undefined);
+    }
+    expect(getTask(created.id, APP_ID)?.chatIds).toEqual(created.chatIds);
+    expect(events.filter(event => event.type === 'schedule.updated')).toEqual([]);
   });
 
   it('creates, rebinds, replaces, and explicitly clears a protected script', () => {

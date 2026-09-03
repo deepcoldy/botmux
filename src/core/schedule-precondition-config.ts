@@ -58,6 +58,10 @@ export function createTaskWithOptionalPrecondition(
   precondition?: SchedulePreconditionCreateInput,
 ): ScheduledTask {
   if (precondition === undefined) return scheduler.addTask(params);
+  if (params.chatIds !== undefined) {
+    const targets = scheduleStore.normalizeScheduleChatTargets(params);
+    scheduler.assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
+  }
   const definition = typeof precondition === 'string'
     ? precondition
     : validateSchedulePreconditionDefinition(precondition);
@@ -235,6 +239,20 @@ export function updateTaskWithOptionalPrecondition(
 ): SchedulePreconditionUpdateResult {
   const before = scheduleStore.getTask(id, appId);
   if (!before) return { ok: false, error: 'not_found' };
+
+  // Reject an oversized target change before staging or rewriting its sidecar.
+  // An unchanged legacy binding remains editable even if it exceeds the cap.
+  if (updates.chatId !== undefined || updates.chatIds !== undefined) {
+    try {
+      const targets = scheduleStore.normalizeScheduleChatTargets({
+        chatId: updates.chatId ?? before.chatId,
+        chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+      });
+      scheduler.assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId], before.chatIds ?? [before.chatId]);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
 
   // Resolution validates ref/state/instance/hash even for disabled records.
   // A malformed old condition must never be silently replaced, cleared, or

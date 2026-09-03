@@ -236,6 +236,9 @@ describe('schedule precondition compact editor', () => {
     expect(form.helpDialog.showModal).toHaveBeenCalledTimes(1);
     expect(form.helpCloseNode.focus).toHaveBeenCalledTimes(1);
     expect(textContent(form.root.findByProps({ id: 'schedule-precondition-source-help-title' }))).toBe(tr(titleKey));
+    const sourceHelpText = textContent(form.root.findByProps({ className: 'schedule-precondition-source-help' }));
+    expect(sourceHelpText.includes('请仅使用可信脚本')).toBe(source === 'file');
+    expect(textContent(form.field())).not.toContain('请仅使用可信脚本');
     expect(form.root.findAllByProps({ className: 'schedule-precondition-help-view-only' })).toHaveLength(1);
     expect(form.onSubmit).not.toHaveBeenCalled();
 

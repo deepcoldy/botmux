@@ -4,7 +4,10 @@ import { expandHomePath } from '../utils/working-dir.js';
 import { logger } from '../utils/logger.js';
 import { readSchedulePreconditionFile } from './schedule-precondition-file.js';
 import { resolveSchedulePrecondition } from './schedule-precondition-store.js';
-import { runSchedulePrecondition } from './schedule-precondition-runner.js';
+import {
+  runSchedulePrecondition,
+  SchedulePreconditionError,
+} from './schedule-precondition-runner.js';
 
 export type ScheduledTaskPreconditionOutcome = 'executed' | 'skipped';
 
@@ -37,13 +40,18 @@ const defaultDependencies: SchedulePreconditionGateDependencies = {
 };
 
 function resolvePreconditionWorkingDir(workingDir: string): string {
-  // Keep malformed empty directories on the existing fail-closed path instead
-  // of turning them into the daemon cwd via path.resolve(''). Normal schedule
-  // directories use the same home expansion as ordinary model sessions, then
-  // become absolute once so file lookup and Bash execution cannot disagree.
-  return workingDir.trim().length === 0
-    ? workingDir
-    : resolve(expandHomePath(workingDir));
+  // Node and Bun both treat an empty spawn cwd as the current process directory.
+  // Reject it before reading a file or starting Bash so a malformed task cannot
+  // silently run in the daemon cwd.
+  if (workingDir.trim().length === 0) {
+    throw new SchedulePreconditionError(
+      'spawn_failed',
+      'Scheduled task precondition requires a non-empty task working directory',
+    );
+  }
+  // Normal schedule directories use the same home expansion as ordinary model
+  // sessions, then become absolute once so file lookup and Bash execution agree.
+  return resolve(expandHomePath(workingDir));
 }
 
 function observePreconditionSafely(
@@ -106,9 +114,9 @@ export async function executeScheduledTaskWithPrecondition(
     return 'executed';
   }
 
-  const workingDir = resolvePreconditionWorkingDir(task.workingDir);
   let result: Awaited<ReturnType<typeof runSchedulePrecondition>>;
   try {
+    const workingDir = resolvePreconditionWorkingDir(task.workingDir);
     const script = condition.source.kind === 'inline'
       ? condition.source.script
       : dependencies.readFile(condition.source.path, workingDir);

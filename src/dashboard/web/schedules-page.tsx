@@ -78,6 +78,7 @@ type PreconditionHelpSource = 'inline' | 'file';
 const RUN_ACTION_MIN_PENDING_MS = 1000;
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
+const MAX_SCHEDULE_TARGET_CHATS = 5;
 const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f .ready; then
   printf '1\n'
 else
@@ -1419,7 +1420,9 @@ function SchedulesPage() {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        throw new Error(body?.error ?? `HTTP ${r.status}`);
+        throw new Error(body?.error === 'too_many_target_chats'
+          ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
+          : body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -1660,6 +1663,7 @@ export function ScheduleFormModal(props: {
   const [groups, setGroups] = useState<GroupChat[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(true);
   const [groupsLoadError, setGroupsLoadError] = useState(false);
+  const [groupsReloadNonce, setGroupsReloadNonce] = useState(0);
   const [chatQuery, setChatQuery] = useState('');
   const [chatPickerOpen, setChatPickerOpen] = useState(false);
   const [touched, setTouched] = useState(false);
@@ -1707,13 +1711,16 @@ export function ScheduleFormModal(props: {
     if (!open || localDelivery) return;
     let cancelled = false;
     setGroupsLoading(true);
-    setGroupsLoadError(false);
-    fetchGroupsSnapshot({ cacheMs: 30_000 })
-      .then(snap => { if (!cancelled) setGroups(snap.chats); })
+    fetchGroupsSnapshot({ cacheMs: 30_000, ...(groupsReloadNonce > 0 ? { force: true } : {}) })
+      .then(snap => {
+        if (cancelled) return;
+        setGroups(snap.chats);
+        setGroupsLoadError(false);
+      })
       .catch(() => { if (!cancelled) setGroupsLoadError(true); })
       .finally(() => { if (!cancelled) setGroupsLoading(false); });
     return () => { cancelled = true; };
-  }, [open, localDelivery]);
+  }, [open, localDelivery, groupsReloadNonce]);
 
   // If the modal opened before /api/bots resolved, default to the first bot
   // once it arrives so the submit button doesn't stay permanently disabled.
@@ -1789,6 +1796,10 @@ export function ScheduleFormModal(props: {
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
   const chatMissing = touched && !localDelivery && chatIds.length === 0;
+  const chatBindingChanged = chatIds.length !== initialChatIds.length
+    || chatIds.some((chatId, index) => chatId !== initialChatIds[index]);
+  const chatCountInvalid = !localDelivery && chatIds.length > MAX_SCHEDULE_TARGET_CHATS
+    && (!editing || chatBindingChanged);
   const topicChatCountInvalid = !localDelivery
     && executionPosition === 'topic'
     && chatIds.length > 1;
@@ -1854,6 +1865,7 @@ export function ScheduleFormModal(props: {
     if (!editing && !larkAppId) return;
     if (!name.trim() || !prompt.trim()) return;
     if (!localDelivery && chatIds.length === 0) return;
+    if (chatCountInvalid) return;
     if (!localDelivery && executionPosition === 'topic' && chatIds.length !== 1) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
     if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
@@ -2172,7 +2184,8 @@ export function ScheduleFormModal(props: {
                 aria-label={tr('schedules.form.chatBinding')}
                 aria-expanded={chatPickerOpen}
                 aria-controls={chatPickerOpen ? 'schedule-chat-picker-panel' : undefined}
-                aria-invalid={chatMissing || topicChatCountInvalid || undefined}
+                aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                 title={selectedChatLabels.join('\n')}
                 onClick={() => setChatPickerOpen(value => !value)}
               >
@@ -2186,6 +2199,13 @@ export function ScheduleFormModal(props: {
                 ) : null}
                 <span className="schedule-chat-picker-chevron" aria-hidden="true" />
               </button>
+              {chatIds.length >= MAX_SCHEDULE_TARGET_CHATS ? (
+                <small className="schedule-form-help">
+                  {tr(chatIds.length > MAX_SCHEDULE_TARGET_CHATS && !chatBindingChanged
+                    ? 'schedules.form.chatLegacyLimitHelp'
+                    : 'schedules.form.chatLimitHelp', { limit: MAX_SCHEDULE_TARGET_CHATS })}
+                </small>
+              ) : null}
               {chatPickerOpen ? (
                 <div id="schedule-chat-picker-panel" className="schedule-chat-picker-panel">
                   <input
@@ -2202,13 +2222,25 @@ export function ScheduleFormModal(props: {
                     <small className="schedule-form-help" role="status">{tr('common.loading')}</small>
                   ) : null}
                   {groupsLoadError ? (
-                    <small className="schedule-form-error-inline" role="alert">{tr('schedules.form.chatLoadError')}</small>
+                    <div className="schedule-form-help-with-count">
+                      <small className="schedule-form-error-inline" role="alert">
+                        {tr('schedules.form.chatLoadError')}
+                      </small>
+                      <button
+                        type="button"
+                        disabled={groupsLoading}
+                        onClick={() => setGroupsReloadNonce(value => value + 1)}
+                      >
+                        {tr('schedules.form.chatReload')}
+                      </button>
+                    </div>
                   ) : null}
                   <div
                     className="schedule-chat-selector"
                     role="group"
                     aria-label={tr('schedules.form.chatBinding')}
-                    aria-invalid={chatMissing || topicChatCountInvalid || undefined}
+                    aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                    aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                   >
                     {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
                       const displayName = group.name ?? chatDisplayTitle({
@@ -2226,6 +2258,9 @@ export function ScheduleFormModal(props: {
                           <input
                             type="checkbox"
                             checked={chatIds.includes(group.chatId)}
+                            disabled={!chatIds.includes(group.chatId)
+                              && executionPosition !== 'topic'
+                              && chatIds.length >= MAX_SCHEDULE_TARGET_CHATS}
                             onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}
                           />
                           <span>
@@ -2248,6 +2283,10 @@ export function ScheduleFormModal(props: {
             </div>
             {chatMissing ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errChatRequired')}</small>
+            ) : chatCountInvalid ? (
+              <small id="schedule-chat-limit-error" className="schedule-form-error-inline" role="alert">
+                {tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })}
+              </small>
             ) : topicChatCountInvalid ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errTopicSingleChat')}</small>
             ) : null}

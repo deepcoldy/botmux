@@ -19,43 +19,80 @@ const task: ScheduledTask = {
 };
 
 describe('executeScheduledTaskWithPrecondition', () => {
-  it('keeps legacy and unconfigured tasks on the original execution path', async () => {
-    const execute = vi.fn(async () => undefined);
-    const run = vi.fn();
-    const readFile = vi.fn();
+  it.each([task.workingDir, '', ' \t\n'])(
+    'keeps unconfigured tasks on the original path with workingDir %j',
+    async (workingDir) => {
+      const execute = vi.fn(async () => undefined);
+      const run = vi.fn();
+      const readFile = vi.fn();
 
-    await expect(executeScheduledTaskWithPrecondition(task, 'cli_app', execute, {
-      resolve: () => ({ kind: 'none' }),
-      readFile,
-      run,
-    })).resolves.toBe('executed');
+      await expect(executeScheduledTaskWithPrecondition({ ...task, workingDir }, 'cli_app', execute, {
+        resolve: () => ({ kind: 'none' }),
+        readFile,
+        run,
+      })).resolves.toBe('executed');
 
-    expect(execute).toHaveBeenCalledOnce();
-    expect(execute).toHaveBeenCalledWith();
-    expect(readFile).not.toHaveBeenCalled();
-    expect(run).not.toHaveBeenCalled();
-  });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledWith();
+      expect(readFile).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    },
+  );
 
-  it('bypasses file reads and Bash for an explicitly disabled definition', async () => {
-    const execute = vi.fn(async () => undefined);
-    const readFile = vi.fn();
-    const run = vi.fn();
+  it.each([task.workingDir, '', ' \t\n'])(
+    'bypasses file reads and Bash for a disabled definition with workingDir %j',
+    async (workingDir) => {
+      const execute = vi.fn(async () => undefined);
+      const readFile = vi.fn();
+      const run = vi.fn();
 
-    await expect(executeScheduledTaskWithPrecondition(task, 'cli_app', execute, {
-      resolve: () => ({
-        kind: 'configured',
-        enabled: false,
-        source: { kind: 'file', path: 'guard.sh' },
-      }),
-      readFile,
-      run,
-    })).resolves.toBe('executed');
+      await expect(executeScheduledTaskWithPrecondition({ ...task, workingDir }, 'cli_app', execute, {
+        resolve: () => ({
+          kind: 'configured',
+          enabled: false,
+          source: { kind: 'file', path: 'guard.sh' },
+        }),
+        readFile,
+        run,
+      })).resolves.toBe('executed');
 
-    expect(execute).toHaveBeenCalledOnce();
-    expect(execute).toHaveBeenCalledWith();
-    expect(readFile).not.toHaveBeenCalled();
-    expect(run).not.toHaveBeenCalled();
-  });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledWith();
+      expect(readFile).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { kind: 'inline', script: 'printf 1' } as const,
+    { kind: 'file', path: '/tmp/guard.sh' } as const,
+    { kind: 'file', path: 'guard.sh' } as const,
+  ].flatMap(source => ['', ' \t\n'].map(workingDir => ({ source, workingDir }))))(
+    'rejects an empty workingDir $workingDir before reading or running $source',
+    async ({ source, workingDir }) => {
+      const execute = vi.fn(async () => undefined);
+      const readFile = vi.fn(() => 'printf 1');
+      const run = vi.fn(async () => ({ decision: 'pass' as const }));
+      const observe = vi.fn();
+
+      await expect(executeScheduledTaskWithPrecondition({ ...task, workingDir }, 'cli_app', execute, {
+        resolve: () => ({ kind: 'configured', enabled: true, source }),
+        readFile,
+        run,
+      }, observe)).rejects.toMatchObject({
+        name: 'SchedulePreconditionError',
+        code: 'spawn_failed',
+        message: 'Scheduled task precondition requires a non-empty task working directory',
+      });
+
+      expect(readFile).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      expect(observe).toHaveBeenCalledExactlyOnceWith({
+        precondition: 'error', additionalPrompt: false,
+      });
+    },
+  );
 
   it('continues into the model path only after an inline Bash result passes', async () => {
     const execute = vi.fn(async () => undefined);

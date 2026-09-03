@@ -638,6 +638,17 @@ export function stopScheduler(): void {
   logger.info('[scheduler] Stopped');
 }
 
+/** Limit configuration writes, not loading, dispatch or trusted rollback of
+ * legacy tasks. The first chat is the primary target, so order matters. */
+export function assertScheduleChatTargetLimit(chatIds: readonly string[], previous?: readonly string[]): void {
+  if (
+    chatIds.length > 5
+    && (!previous || chatIds.length !== previous.length || chatIds.some((id, index) => id !== previous[index]))
+  ) {
+    throw new Error('too_many_target_chats');
+  }
+}
+
 export function addTask(params: {
   id?: string;
   preconditionRef?: string;
@@ -677,6 +688,7 @@ export function addTask(params: {
         chatId: params.chatId,
         chatIds: params.chatIds,
       });
+  assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
@@ -947,6 +959,9 @@ export function updateTask(
           chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
         })
       : { chatId: task.chatId, chatIds: task.chatIds };
+    if (targetUpdate) {
+      assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId], task.chatIds ?? [task.chatId]);
+    }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
