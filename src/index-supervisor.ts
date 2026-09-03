@@ -34,6 +34,12 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // process's env into every supervised member, so an unstripped secret would
 // sit in this long-lived process for its whole life and ride into every bot
 // daemon (which then strips it again at its own boot).
+//
+// This also cuts the ambient-env inheritance path into the dashboard
+// (supervisor is its parent; daemon is not). That's intentional: aligned
+// with the long-standing scrubPm2CallerEnv convention on the pm2 path; the
+// supervisor form never had this boundary before. The documented channel
+// remains ~/.botmux/.env — the dashboard loads that file itself.
 stripDashboardH5Env(process.env);
 // A supervisor is never a session (mirror index-daemon): a `botmux
 // start/restart` issued from inside a bot session leaks that session's
