@@ -70,7 +70,8 @@ function statusIcon(status: string): string {
     case 'starting': return '🔵';
     case 'limited': return '🟡';
     case 'stalled': return '🔴';
-    case 'idle': return '⚪';
+    // Match the green header used by the session card for "Awaiting input".
+    case 'idle': return '🟢';
     case 'dormant': return '⚫';
     case 'closed': return '⚫';
     default: return '⚪';
@@ -308,7 +309,7 @@ async function getScopedRows(
   locale: Locale,
 ): Promise<{ rows: SessionRow[] } | { errorResult: GroupSessionsCardHandlerResult }> {
   try {
-    const response = await client.request({ method: 'GET', path: '/__daemon/sessions-list' });
+    const response = await client.request({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
     if (response.status !== 200) {
       const reason = String((response.body as Record<string, unknown> | undefined)?.error ?? `http_${response.status}`);
       return { errorResult: error('card.group_sessions.list_failed', { reason }, locale) };

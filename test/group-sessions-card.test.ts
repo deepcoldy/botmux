@@ -87,6 +87,7 @@ describe('/sessions current-group card', () => {
       .join('\n');
     expect(visible).not.toContain('idle-secret');
     expect(visible).toContain('Active 2 · Closed 1');
+    expect(visible).toContain('🟢 **Idle**');
     expect(encoded).toContain('Data as of');
   });
 
@@ -183,6 +184,33 @@ describe('/sessions current-group card', () => {
     });
     expect(result.toast?.type).toBe('error');
     expect(createClient).not.toHaveBeenCalled();
+  });
+
+  it('refresh requests a fresh snapshot and renders a working topic session', async () => {
+    const client = clientWith([row({
+      sessionId: 'working-thread',
+      scope: 'thread',
+      status: 'working',
+      title: 'Working topic',
+    })]);
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_REFRESH,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      page: '1',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      locale: 'en',
+      nowMs: () => NOW,
+    });
+    const encoded = JSON.stringify(result.card?.data);
+    expect((client as any).request).toHaveBeenCalledWith({
+      method: 'GET',
+      path: '/__daemon/sessions-list?fresh=1',
+    });
+    expect(encoded).toContain('🟢 **Working topic**');
+    expect(encoded).toContain('Working');
   });
 
   it('freshly revalidates locate and sends an atomic daemon-side scope guard', async () => {
