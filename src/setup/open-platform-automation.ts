@@ -862,7 +862,16 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
   const wrapped = asRecord(root.data);
   const data = Object.keys(wrapped).length > 0 ? wrapped : root;
   const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
-  if (!Array.isArray(raw)) return null;
+  if (!Array.isArray(raw)) {
+    // 新建应用在白名单为空时会直接省略 redirectURL，而不是返回 []。
+    // 只在其它三个 safe_setting 标志字段都符合真实响应形状时才当空集；
+    // 普通 `{code:0,data:{}}` 仍是不可识别，继续零写入保护用户配置。
+    const omittedEmptyList = raw === undefined
+      && typeof data.allowRefreshToken === 'boolean'
+      && Array.isArray(data.ipWhiteList)
+      && Array.isArray(data.safeServerDomain);
+    return omittedEmptyList ? [] : null;
+  }
   return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
 }
 
