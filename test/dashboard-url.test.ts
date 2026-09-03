@@ -465,3 +465,27 @@ describe('reportDashboardUrls (Feishu card carrier)', () => {
       .toEqual({ url: 'https://m-abc.platform.test/', platformHosted: true });
   });
 });
+
+// ─── 协议加字段的版本混搭矩阵（两个方向都要成立）────────────────────────────
+// 新增 `platformHosted` 是加字段，所以升级不同步的两种组合都必须安全：
+//   · 新 CLI + 旧 dashboard：字段缺失 → 严格 true 判定为 false → 保留 token
+//     （由 dashboard-endpoint.test.ts 的解析用例覆盖）
+//   · 旧 CLI + 新 dashboard：旧 CLI 不认识该字段、也没有摘 token 的逻辑，
+//     它只会原样打印 `url` —— 所以 **`url` 必须始终带 token**。
+// 这条正是「协议层如实回原始 URL、由 CLI 决定摘不摘」这个设计的兑现点：
+// 如果当初让 dashboard 直接回摘好的 URL，旧 CLI 就会拿到一条进不去的链接。
+describe('buildDashboardUrls: the wire URL always keeps its token', () => {
+  beforeEach(() => {
+    setRemote(false); setPlatform(null); setPublic(null); setDevbox(null);
+  });
+
+  it('keeps ?t= in `url` even when platformHosted is true (old CLIs print it as-is)', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const urls = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
+    expect(urls.platformHosted).toBe(true);
+    // 摘 token 是消费端的决定，不是协议的决定。
+    expect(urls.url).toContain('?t=abc');
+    expect(urls.localUrl).toContain('?t=abc');
+  });
+});
