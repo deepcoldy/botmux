@@ -392,6 +392,41 @@ describe('/sessions command entry', () => {
     );
   });
 
+  it('publishes the new card before withdrawing the same caller\'s predecessor', async () => {
+    const client = clientWith([row()]);
+    const order: string[] = [];
+    const sessionReply = vi.fn(async () => {
+      order.push('publish');
+      return 'om_new';
+    });
+    const replaceLatestGroupSessionsCard = vi.fn(() => {
+      order.push('persist');
+      return 'om_old';
+    });
+    const deleteMessage = vi.fn(async () => {
+      order.push('delete');
+      return true;
+    });
+    await handleGroupSessionsCommand({
+      messageId: 'om_cmd', rootId: 'om_cmd', chatId: CHAT, senderId: USER,
+      senderType: 'user', msgType: 'text', content: '/sessions', createTime: '0',
+    }, 'om_cmd', CHAT, { sessionReply } as any, APP, {
+      createClient: () => client,
+      getChatModeStrict: vi.fn(async () => 'group'),
+      replaceLatestGroupSessionsCard,
+      deleteMessage,
+      dataDir: '/tmp/test-sessions-card-store',
+      locale: 'en',
+      nowMs: () => NOW,
+    });
+
+    expect(order).toEqual(['publish', 'persist', 'delete']);
+    expect(replaceLatestGroupSessionsCard).toHaveBeenCalledWith(
+      '/tmp/test-sessions-card-store', APP, CHAT, USER, 'om_new', NOW,
+    );
+    expect(deleteMessage).toHaveBeenCalledWith(APP, 'om_old');
+  });
+
   it('renders resume for a dashboard admin invoking the command', async () => {
     const client = clientWith([row({ status: 'closed' })]);
     const sessionReply = vi.fn(async () => 'om_reply');
