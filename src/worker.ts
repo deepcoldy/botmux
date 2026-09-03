@@ -17194,7 +17194,7 @@ body.touch #terminal .xterm-screen *{
 #login-banner.show{display:inline-block}
 /* ── Mobile input bar (ported from woof's #mobile-input-form) ──
    On touch devices the floating right-edge toolbar is hidden and this bar
-   replaces it: a row of shortcut keys (Paste/Ctrl-C/Esc/Tab/Enter/Shift-Tab)
+   replaces it: a scrollable row of shortcut/navigation keys
    plus a persistent input row with two modes:
      • live   : keystrokes are diff'd to ANSI sequences and sent as you type
      • buffer : text accumulates, sent wholesale on 发送/Enter
@@ -17206,25 +17206,25 @@ body.touch.has-token #mobile-input-bar{
   padding:6px max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));
   border-top:1px solid #2a2b3d;background:#0f0f14;
   transform:translateY(calc(0px - var(--keyboard-inset,0px)));transition:transform .12s ease}
-body.touch.has-token #terminal{
+body.touch.has-token #terminal .xterm{
   padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
 #mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
 #mobile-bar-keys button{
-  flex:none;min-width:44px;height:32px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
+  flex:none;min-width:44px;height:34px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
-#mobile-bar-row{display:flex;align-items:flex-end;gap:5px}
+#mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
 #mobile-input{
-  flex:1;min-width:0;min-height:38px;max-height:120px;resize:none;overflow-y:auto;
-  padding:9px 14px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
+  flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
+  padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
   font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
-  flex:none;width:38px;min-height:38px;height:38px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
+  flex:none;width:42px;min-height:42px;height:42px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
 #mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
@@ -17275,18 +17275,18 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     <button type="button" data-sk="tab">Tab</button>
     <button type="button" data-sk="left" title="左移" aria-label="左移">←</button>
     <button type="button" data-sk="right" title="右移" aria-label="右移">→</button>
+    <button id="mobile-up" type="button" data-sk="up" title="上移" aria-label="上移">↑</button>
+    <button id="mobile-down" type="button" data-sk="down" title="下移" aria-label="下移">↓</button>
+    <button id="mobile-bs" type="button" data-sk="bs" title="删除终端字符" aria-label="删除终端字符">⌫</button>
     <button type="button" data-sk="enter">Enter</button>
     <button type="button" data-sk="stab">Shift+Tab</button>
   </div>
   <div id="mobile-bar-row">
     <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
     <div id="mobile-input-wrap">
-      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="Type a command..." autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
+      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="输入命令…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
       <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
     </div>
-    <button id="mobile-up" type="button" title="上移" aria-label="上移">↑</button>
-    <button id="mobile-bs" type="button" title="删除终端字符" aria-label="删除终端字符">⌫</button>
-    <button id="mobile-down" type="button" title="下移" aria-label="下移">↓</button>
     <button id="mobile-send" type="submit">发送</button>
   </div>
 </form>
@@ -18251,9 +18251,6 @@ if(isTouch&&hasToken){(function(){
   var ta=document.getElementById('mobile-input');
   var modeBtn=document.getElementById('mobile-mode');
   var sendBtn=document.getElementById('mobile-send');
-  var upBtn=document.getElementById('mobile-up');
-  var downBtn=document.getElementById('mobile-down');
-  var bsBtn=document.getElementById('mobile-bs');
   var hint=document.getElementById('mobile-live-hint');
   var LIVE='live',BUFFER='buffer';
   var mode=BUFFER;
@@ -18305,7 +18302,9 @@ if(isTouch&&hasToken){(function(){
     measuredBarHeight=height;
     document.documentElement.style.setProperty('--mobile-bar-h',height+'px');
     onViewportResize();}
-  function resizeTa(){ta.style.height='38px';ta.style.height=Math.min(ta.scrollHeight,120)+'px';measureBar();}
+  function resizeTa(){ta.style.height='42px';
+    if(ta.value)ta.style.height=Math.min(Math.max(ta.scrollHeight,42),120)+'px';
+    measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
   function sendBuffered(appendEnter){
@@ -18321,7 +18320,7 @@ if(isTouch&&hasToken){(function(){
   function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
 
   // shortcut keys row
-  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r',stab:'\\x1b[Z'};
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
     btn.addEventListener('click',function(){btn.blur();
@@ -18344,9 +18343,6 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
 
-  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE)sendLiveKey('\\x1b[A');else sendInput('\\x1b[A');});
-  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE)sendLiveKey('\\x1b[B');else sendInput('\\x1b[B');});
-  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE)sendLiveKey('\\x7f');else sendInput('\\x7f');});
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
   ta.addEventListener('compositionstart',function(){mirror.composing=true;},{capture:true,passive:true});

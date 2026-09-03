@@ -81,26 +81,27 @@ function bootMobileInput(options: {
   readyState?: number;
   barHeight?: number;
   barRectHeight?: number;
+  textareaScrollHeight?: number;
 }): MobileHarness {
   const source = workerSource();
   const formStart = source.indexOf('<form id="mobile-input-bar"');
   const formEnd = source.indexOf('</form>', formStart);
   const form = source.slice(formStart, formEnd);
-  const shortcutActions = [...form.matchAll(/data-sk="([^"]+)"/g)].map(match => match[1]);
+  const shortcutButtons = [...form.matchAll(/<button([^>]*data-sk="([^"]+)"[^>]*)>/g)].map(match => {
+    const id = match[1].match(/id="([^"]+)"/)?.[1] ?? `shortcut-${match[2]}`;
+    return new FakeElement(id, { 'data-sk': match[2] });
+  });
 
   const bar = new FakeElement('mobile-input-bar');
   bar.offsetHeight = options.barHeight ?? 91;
   bar.rectHeight = options.barRectHeight;
   const textarea = new FakeElement('mobile-input');
+  textarea.scrollHeight = options.textareaScrollHeight ?? 38;
   const mode = new FakeElement('mobile-mode');
   const send = new FakeElement('mobile-send');
-  const up = new FakeElement('mobile-up');
-  const down = new FakeElement('mobile-down');
-  const backspace = new FakeElement('mobile-bs');
   const hint = new FakeElement('mobile-live-hint');
   const terminal = new FakeElement('terminal');
-  const shortcutButtons = shortcutActions.map(action => new FakeElement(`shortcut-${action}`, { 'data-sk': action }));
-  const controls = [mode, textarea, up, backspace, down, send, ...shortcutButtons];
+  const controls = [mode, textarea, send, ...shortcutButtons];
   bar.descendants = controls;
 
   const byId = new Map<string, FakeElement>([
@@ -108,11 +109,9 @@ function bootMobileInput(options: {
     [textarea.id, textarea],
     [mode.id, mode],
     [send.id, send],
-    [up.id, up],
-    [down.id, down],
-    [backspace.id, backspace],
     [hint.id, hint],
     [terminal.id, terminal],
+    ...shortcutButtons.map(button => [button.id, button] as const),
   ]);
   const rootProperties = new Map<string, string>();
   const body = new FakeElement('body');
@@ -184,7 +183,7 @@ describe('手机 Web 终端输入栏', () => {
   it('把实测底栏高度留给终端，390×844 时内容区不会落到底栏后面', () => {
     const source = workerSource();
     expect(source).toMatch(
-      /body\.touch\.has-token #terminal\s*\{[^}]*padding-bottom:\s*calc\(var\(--mobile-bar-h,\s*0px\)\s*\+\s*var\(--keyboard-inset,\s*0px\)\)/s,
+      /body\.touch\.has-token #terminal \.xterm\s*\{[^}]*padding-bottom:\s*calc\(var\(--mobile-bar-h,\s*0px\)\s*\+\s*var\(--keyboard-inset,\s*0px\)\)/s,
     );
     expect(source).toMatch(
       /transform:\s*translateY\(calc\(0px\s*-\s*var\(--keyboard-inset,\s*0px\)\)\)/,
@@ -194,6 +193,26 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.rootProperty('--mobile-bar-h')).toBe('89px');
     expect(844 - Number.parseInt(page.rootProperty('--mobile-bar-h')!, 10)).toBe(755);
     expect(page.viewportResizeCount()).toBeGreaterThan(0);
+  });
+
+  it('空输入保持单行，主输入行只保留等高的模式、输入和发送控件', () => {
+    const source = workerSource();
+    const rowStart = source.indexOf('<div id="mobile-bar-row">');
+    const rowEnd = source.indexOf('</div>\n</form>', rowStart);
+    const row = source.slice(rowStart, rowEnd);
+
+    expect(row).not.toMatch(/id="mobile-(?:up|bs|down)"/);
+    expect(row).toContain('placeholder="输入命令…"');
+    expect(source).toMatch(/#mobile-input\s*\{[^}]*min-height:42px/s);
+    expect(source).toMatch(/#mobile-bar-row button\s*\{[^}]*height:42px/s);
+
+    const page = bootMobileInput({ wsHasWrite: true, textareaScrollHeight: 54 });
+    expect(page.textarea.style.height).toBe('42px');
+
+    page.textarea.value = '需要换行的较长命令';
+    page.textarea.scrollHeight = 68;
+    page.textarea.dispatch('input');
+    expect(page.textarea.style.height).toBe('68px');
   });
 
   it('断线或权限未知时禁用输入且保留未发送草稿，恢复可写后再发送并清空', () => {
@@ -235,5 +254,19 @@ describe('手机 Web 终端输入栏', () => {
     left?.dispatch('click');
     right?.dispatch('click');
     expect(page.sentInputs()).toEqual(['\x1b[D', '\x1b[C']);
+  });
+
+  it('上移、删除和下移归入可滚动快捷键行，仍发送原有终端序列', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const up = page.shortcut('up');
+    const backspace = page.shortcut('bs');
+    const down = page.shortcut('down');
+    expect(up).toBeDefined();
+    expect(backspace).toBeDefined();
+    expect(down).toBeDefined();
+    up?.dispatch('click');
+    backspace?.dispatch('click');
+    down?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['\x1b[A', '\x7f', '\x1b[B']);
   });
 });
