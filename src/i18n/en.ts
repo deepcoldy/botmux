@@ -65,6 +65,13 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
+  'card.model_fallback.refusal': '⚠️ Safety guardrails tripped — auto-downgraded: {originalModel} → {fallbackModel}{reason}this session keeps running on {fallbackModel}; reply /model {alias} to switch back',
+  'card.model_fallback.unavailable': '⚠️ Model unavailable — auto-switched: {originalModel} → {fallbackModel}{reason}reply /model {alias} to switch back',
+  'card.model_fallback.consent': '⚠️ Usage quota limit — auto-switched: {originalModel} → {fallbackModel}{reason}reply /model {alias} to switch back',
+  // {reason} carries the separator that follows it, so the no-reason variant
+  // does not leave a doubled space.
+  'card.model_fallback.reason': ' ({reason}) · ',
+  'card.model_fallback.no_reason': ' · ',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} hit a rate limit — this turn is paused. Resend the last task after {retryLabel}, or send a new message to continue.',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',

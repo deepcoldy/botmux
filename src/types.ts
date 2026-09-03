@@ -596,6 +596,10 @@ export interface Session {
   currentImageKey?: string;
   currentTurnTitle?: string;
   usageLimit?: CliUsageLimitState;
+  /** Model fallback in effect. Persisted alongside usageLimit because the
+   *  worker's baseline cursors to EOF after a restart — the switch record is
+   *  already history by then and would never be drained again. */
+  modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -1284,6 +1288,29 @@ export type CotEntry =
   | { kind: 'tool_call'; id: string; name: string; args: string }
   | { kind: 'tool_result'; id: string; result: string };
 
+/** A Claude model switch that is still in effect: Claude Code fell back off the
+ *  configured model and every later reply is served by `fallbackModel` until the
+ *  user runs `/model` to switch back. Observed by the worker from the session
+ *  transcript, persisted on the Session, and rendered as one notice line on the
+ *  live card. */
+export interface ModelFallbackState {
+  /** uuid of the transcript record that caused the switch — the stable key for
+   *  dedupe and for "is this still the same switch". */
+  uuid: string;
+  /** 'refusal' = safety guardrails, 'unavailable' = model not usable,
+   *  'consent' = quota/billing confirmation. */
+  kind: 'refusal' | 'unavailable' | 'consent';
+  /** Configured model, as written in the transcript (e.g. `claude-fable-5-1[1m]`). */
+  originalModel: string;
+  /** Model now serving the session (e.g. `claude-opus-4-8[1m]`). */
+  fallbackModel: string;
+  /** Raw reason for a non-refusal switch: `overloaded`, `model_not_found`, … */
+  trigger?: string;
+  /** Refusal category (`cyber`, `bio`, …). */
+  apiRefusalCategory?: string;
+  observedAt?: string;
+}
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | {
@@ -1340,6 +1367,11 @@ export type WorkerToDaemon =
       model: string | null;
       reasoningEffort: string | null;
     }
+  /** Claude Code auto-switched the main session model, or the user switched
+   * back (`state: null`). The worker has already filtered `scope:"local"`
+   * sub-agent fallbacks, deduped by record uuid, and compared the serving model,
+   * so the daemon only stores and renders what arrives. */
+  | { type: 'model_fallback'; state: ModelFallbackState | null }
   | { type: 'native_session_title_generated'; title: string }
   | {
     type: 'claude_exit';

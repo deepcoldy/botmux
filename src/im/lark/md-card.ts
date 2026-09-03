@@ -26,6 +26,7 @@ import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
+import type { ModelFallbackState } from '../../types.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
@@ -101,6 +102,12 @@ export interface CardUsageSnapshot {
   reasoningEffort?: string;
   /** Frozen TraeX backend variant selected for this session. */
   modelBackendVariant?: string;
+  /** Claude model fallback in effect, rendered as its own notice line on the
+   *  live card. It rides this snapshot rather than a 23rd positional arg on
+   *  buildStreamingCard: every call site already forwards the snapshot (locked
+   *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
+   *  Not a usage metric, but the same class of runtime identity as `model`. */
+  modelFallback?: ModelFallbackState;
 }
 
 export interface ReplyCardFooter {
@@ -504,6 +511,66 @@ export function cardUsageRuntimeSegment(
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
   const tail = [variant, reasoningEffort].filter(Boolean);
   return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
+}
+
+/** Friendly Claude model name for card copy: `claude-fable-5-1[1m]` → `Fable 5.1`,
+ *  `claude-opus-5` → `Opus 5`. Anything that is not a recognised
+ *  `claude-<family>-<major>[-<minor>][-<date>]` id keeps its raw form. */
+function claudeModelLabel(id: string): string {
+  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
+  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{6,})?$/i.exec(bare);
+  if (!m) return id.trim();
+  const family = m[1].toLowerCase();
+  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
+}
+
+/** The `/model <alias>` argument that puts the session back on `id`. Claude Code
+ *  resolves the family aliases (fable/opus/sonnet/haiku) to the current
+ *  recommended build; an unrecognised id is echoed verbatim so the hint stays
+ *  actionable. */
+function claudeModelAlias(id: string): string {
+  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
+  const m = /^claude-(fable|opus|sonnet|haiku)-/i.exec(bare);
+  return m ? m[1].toLowerCase() : id.trim();
+}
+
+/** Escape markdown control characters without the non-breaking-space rewrite
+ *  compactRuntimeLabel applies — this notice is prose, not a compact tail. */
+function escapeCardPlainText(value: string): string {
+  return value.replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`);
+}
+
+const MODEL_FALLBACK_LABEL_MAX = 32;
+
+function fallbackModelText(id: string): string {
+  const label = claudeModelLabel(id);
+  return escapeCardPlainText(
+    label.length > MODEL_FALLBACK_LABEL_MAX
+      ? `${label.slice(0, MODEL_FALLBACK_LABEL_MAX - 1)}…`
+      : label,
+  );
+}
+
+/** One-line notice for a model fallback still in effect, or null when there is
+ *  none. Only the model ids and the reason are rendered — Claude's own record
+ *  carries a full paragraph of prose, which would swamp a status line. */
+export function cardModelFallbackNotice(
+  fallback: ModelFallbackState | undefined,
+  locale?: Locale,
+): string | null {
+  if (!fallback?.originalModel || !fallback.fallbackModel) return null;
+  const rawReason = fallback.kind === 'refusal'
+    ? fallback.apiRefusalCategory
+    : fallback.kind === 'unavailable' ? fallback.trigger : undefined;
+  const reason = rawReason
+    ? t('card.model_fallback.reason', { reason: escapeCardPlainText(rawReason) }, locale)
+    : t('card.model_fallback.no_reason', undefined, locale);
+  return t(`card.model_fallback.${fallback.kind}`, {
+    originalModel: fallbackModelText(fallback.originalModel),
+    fallbackModel: fallbackModelText(fallback.fallbackModel),
+    alias: escapeCardPlainText(claudeModelAlias(fallback.originalModel)),
+    reason,
+  }, locale);
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.

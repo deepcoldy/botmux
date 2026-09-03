@@ -13,6 +13,8 @@
  */
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
+import type { ModelFallbackState } from '../types.js';
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -27,6 +29,9 @@ export interface TranscriptEvent {
     /** Claude's API stop reason. `tool_use` is an intra-turn pause; terminal
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
+    /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
+     *  Code writes the placeholder `<synthetic>` on API-error records. */
+    model?: string;
   };
   /** API-error records. When the model call fails, Claude Code writes a
    *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
@@ -51,6 +56,14 @@ export interface TranscriptEvent {
     prompt?: unknown;
     commandMode?: string;
   };
+  /** Present on `type:"system"` model-switch records (see
+   *  {@link parseClaudeModelFallbackEvent}). `scope:"local"` marks a sub-agent /
+   *  side-question fallback that leaves the main session model untouched. */
+  scope?: string;
+  trigger?: string;
+  originalModel?: string;
+  fallbackModel?: string;
+  apiRefusalCategory?: string;
 }
 
 /**
@@ -78,6 +91,243 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
       .join(' ');
   }
   return '';
+}
+
+/** Kind of automatic model switch Claude Code recorded, mapped from the raw
+ *  `type:"system"` subtype so the card copy can branch on one stable value. */
+export type ClaudeModelFallbackKind = 'refusal' | 'unavailable' | 'consent';
+
+const MODEL_FALLBACK_KIND_BY_SUBTYPE: Record<string, ClaudeModelFallbackKind> = {
+  model_refusal_fallback: 'refusal',
+  model_fallback: 'unavailable',
+  model_consent_fallback: 'consent',
+};
+
+/** One parsed model-switch record. `scope: 'local'` is a sub-agent /
+ *  side-question fallback: the main session model did NOT change, so surfacing
+ *  it would mislead. Builds that predate the field omit it and read as
+ *  'session'. */
+export interface ClaudeModelFallbackRecord extends ModelFallbackState {
+  scope: 'session' | 'local';
+}
+
+/** Normalise a model id for comparison: drop a trailing context-window suffix
+ *  and lower-case. `originalModel` is written as `claude-fable-5-1[1m]` while an
+ *  assistant record's `message.model` is the bare `claude-fable-5-1`; without
+ *  this the "user switched back" check can never fire. */
+export function normalizeClaudeModelId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\[[^\]]*\]$/, '').trim().toLowerCase();
+  return normalized || undefined;
+}
+
+/** Parse a `type:"system"` model-switch record. Returns undefined for anything
+ *  else, and fail-closed for a record missing the uuid or either model id —
+ *  a half-written switch must not produce a notice we can never clear. */
+export function parseClaudeModelFallbackEvent(
+  ev: TranscriptEvent,
+): ClaudeModelFallbackRecord | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system') return undefined;
+  const kind = typeof ev.subtype === 'string'
+    ? MODEL_FALLBACK_KIND_BY_SUBTYPE[ev.subtype]
+    : undefined;
+  if (!kind) return undefined;
+  const uuid = typeof ev.uuid === 'string' ? ev.uuid.trim() : '';
+  const originalModel = typeof ev.originalModel === 'string' ? ev.originalModel.trim() : '';
+  const fallbackModel = typeof ev.fallbackModel === 'string' ? ev.fallbackModel.trim() : '';
+  if (!uuid || !originalModel || !fallbackModel) return undefined;
+  const trigger = typeof ev.trigger === 'string' ? ev.trigger.trim() : '';
+  const apiRefusalCategory = typeof ev.apiRefusalCategory === 'string'
+    ? ev.apiRefusalCategory.trim()
+    : '';
+  const observedAt = typeof ev.timestamp === 'string' ? ev.timestamp.trim() : '';
+  return {
+    uuid,
+    kind,
+    originalModel,
+    fallbackModel,
+    scope: ev.scope === 'local' ? 'local' : 'session',
+    ...(trigger ? { trigger } : {}),
+    ...(apiRefusalCategory ? { apiRefusalCategory } : {}),
+    ...(observedAt ? { observedAt } : {}),
+  };
+}
+
+/** Model that actually served an assistant record. Sub-agent output, API-error
+ *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
+ *  model, so they yield undefined rather than a false "model changed". */
+export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
+  if (!ev || typeof ev !== 'object') return undefined;
+  if ((ev as any).isSidechain === true) return undefined;
+  if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
+  if ((ev.message?.role ?? ev.type) !== 'assistant') return undefined;
+  const model = ev.message?.model?.trim();
+  if (!model || model === '<synthetic>') return undefined;
+  return model;
+}
+
+/** Resolve the model fallback still in effect from the newest session-scoped
+ *  switch record plus the model serving replies AFTER it. A serving model that
+ *  no longer matches means the user ran `/model` to switch back, so the notice
+ *  clears. An unknown serving model (no assistant reply since the switch) keeps
+ *  the notice — Claude stays on the fallback until told otherwise. */
+export function resolveActiveModelFallback(opts: {
+  fallback?: ClaudeModelFallbackRecord;
+  servingModel?: string;
+}): ModelFallbackState | null {
+  const rec = opts.fallback;
+  if (!rec || rec.scope === 'local') return null;
+  const serving = normalizeClaudeModelId(opts.servingModel);
+  if (serving && serving !== normalizeClaudeModelId(rec.fallbackModel)) return null;
+  return {
+    uuid: rec.uuid,
+    kind: rec.kind,
+    originalModel: rec.originalModel,
+    fallbackModel: rec.fallbackModel,
+    ...(rec.trigger ? { trigger: rec.trigger } : {}),
+    ...(rec.apiRefusalCategory ? { apiRefusalCategory: rec.apiRefusalCategory } : {}),
+    ...(rec.observedAt ? { observedAt: rec.observedAt } : {}),
+  };
+}
+
+/** Upper bound on the backward scan below. Same guard rationale as
+ *  TRAEX_RUNTIME_SCAN_MAX_BYTES: the fallback notice is advisory and must never
+ *  synchronously parse a multi-GB transcript at bridge start. */
+const CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Recover the current model-fallback state from a transcript's tail, for the
+ *  worker's cold start: baseline cursors straight to EOF, so a switch recorded
+ *  before `--resume` / a daemon restart is never drained again.
+ *
+ *  Scans BACKWARD and stops at the newest session-scoped switch record; the
+ *  serving model is therefore only collected from records NEWER than it, which
+ *  is exactly what {@link resolveActiveModelFallback} needs (an assistant reply
+ *  written before the switch says nothing about what serves now). A
+ *  non-newline-terminated tail is excluded via baselineJsonlCursor. */
+export function readLatestClaudeModelFallback(path: string): {
+  fallback?: ClaudeModelFallbackRecord;
+  servingModel?: string;
+} {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let fallback: ClaudeModelFallbackRecord | undefined;
+  let servingModel: string | undefined;
+  const emit = () => ({
+    ...(fallback ? { fallback } : {}),
+    ...(servingModel ? { servingModel } : {}),
+  });
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let ev: TranscriptEvent;
+    try { ev = JSON.parse(line) as TranscriptEvent; } catch { return false; }
+    if (!ev || typeof ev !== 'object') return false;
+    const rec = parseClaudeModelFallbackEvent(ev);
+    if (rec) {
+      if (rec.scope === 'local') return false;
+      fallback = rec;
+      return true;
+    }
+    if (!servingModel) servingModel = servingModelFromAssistantEvent(ev);
+    return false;
+  };
+
+  const floor = Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      // Drop the leading fragment only at the byte-cap floor (a truncated
+      // historical partial); at true file start it is a complete record.
+      carry = start === floor && floor > 0 ? Buffer.alloc(0) : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
+}
+
+/** Bound on the tracker's dedupe set. A long session can switch models many
+ *  times, so an unbounded set would leak slowly. */
+const MODEL_FALLBACK_SEEN_UUIDS_MAX = 256;
+
+/** Running model-fallback state for one Claude bridge. Owns the record-uuid
+ *  dedupe (the same record is re-drained after a truncation or a jsonl switch)
+ *  and the "serving model since the switch" rule, leaving the worker with only
+ *  the decision of when to publish. */
+export class ClaudeModelFallbackTracker {
+  private readonly seenUuids = new Set<string>();
+  private fallback: ClaudeModelFallbackRecord | undefined;
+  private servingModel: string | undefined;
+
+  /** Fold newly-drained events in, newest last. Returns the records newly
+   *  accepted, for the caller to log. `scope:"local"` records are skipped
+   *  outright: a sub-agent fell back on its own and the main session model is
+   *  untouched. */
+  observe(events: readonly TranscriptEvent[]): ClaudeModelFallbackRecord[] {
+    const accepted: ClaudeModelFallbackRecord[] = [];
+    for (const ev of events) {
+      const rec = parseClaudeModelFallbackEvent(ev);
+      if (rec) {
+        if (rec.scope === 'local' || this.seenUuids.has(rec.uuid)) continue;
+        this.seenUuids.add(rec.uuid);
+        if (this.seenUuids.size > MODEL_FALLBACK_SEEN_UUIDS_MAX) {
+          const oldest = this.seenUuids.values().next().value;
+          if (oldest !== undefined) this.seenUuids.delete(oldest);
+        }
+        this.fallback = rec;
+        // Replies written before the switch say nothing about what serves now;
+        // keeping the old value would clear the notice the instant it appeared.
+        this.servingModel = undefined;
+        accepted.push(rec);
+        continue;
+      }
+      const serving = servingModelFromAssistantEvent(ev);
+      if (serving) this.servingModel = serving;
+    }
+    return accepted;
+  }
+
+  /** Recover the state from a transcript tail at bridge start (see
+   *  {@link readLatestClaudeModelFallback}). */
+  seed(path: string): void {
+    const seeded = readLatestClaudeModelFallback(path);
+    if (seeded.fallback) {
+      this.fallback = seeded.fallback;
+      this.seenUuids.add(seeded.fallback.uuid);
+    }
+    this.servingModel = seeded.servingModel;
+  }
+
+  /** The fallback still in effect, or null. */
+  current(): ModelFallbackState | null {
+    return resolveActiveModelFallback({
+      fallback: this.fallback,
+      servingModel: this.servingModel,
+    });
+  }
 }
 
 /** Provider-neutral terminal semantics derived from one Claude transcript

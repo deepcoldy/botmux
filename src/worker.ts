@@ -61,7 +61,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -244,6 +244,7 @@ import type {
   DaemonToWorker,
   WorkerToDaemon,
   DisplayMode,
+  ModelFallbackState,
   TermActionKey,
   ScreenStatus,
   TrustedCaller,
@@ -4252,6 +4253,13 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Claude Code's automatic model switches for this bridge (uuid dedupe +
+ *  serving-model tracking live in the tracker). */
+const modelFallbackTracker = new ClaudeModelFallbackTracker();
+/** Last state pushed to the daemon (`null` = "no fallback"). `undefined` means
+ *  nothing pushed yet, so the first resolve always publishes — that initial
+ *  `null` is what clears a stale persisted notice. */
+let publishedModelFallback: ModelFallbackState | null | undefined;
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -5538,6 +5546,7 @@ function bridgeIngest(): void {
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
+  observeModelFallback(result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
@@ -5571,6 +5580,40 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
     log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return; // one limited emit per ingest is enough; state key is stable
   }
+}
+
+/** Fold newly-drained events into the model-fallback tracker and push the
+ *  resulting state to the daemon whenever it changes. Claude-only by
+ *  construction: bridgeIngest is the Claude bridge. */
+function observeModelFallback(events: readonly TranscriptEvent[]): void {
+  for (const rec of modelFallbackTracker.observe(events)) {
+    log(`Claude model fallback observed (kind=${rec.kind}, ${rec.originalModel} → ${rec.fallbackModel}, trigger=${rec.trigger ?? 'n/a'})`);
+  }
+  publishModelFallbackIfChanged();
+}
+
+/** Emit the resolved state only when it actually changed — bridgeIngest runs on
+ *  every fs.watch wakeup and once a second besides. Idempotent, so the baseline
+ *  seed and the incremental path can both call it. */
+function publishModelFallbackIfChanged(): void {
+  const state = modelFallbackTracker.current();
+  if (publishedModelFallback !== undefined && publishedModelFallback?.uuid === state?.uuid) return;
+  publishedModelFallback = state;
+  send({ type: 'model_fallback', state });
+}
+
+/** Seed the fallback state at bridge start. Baseline cursors to EOF, so a
+ *  switch recorded before `--resume` or a daemon restart is never drained;
+ *  a bounded backward scan recovers it (same shape as Codex/TRAE runtime
+ *  seeding). Always publishes, including `null` — the user may have switched
+ *  back while the daemon was down, and that has to overwrite the persisted
+ *  notice. */
+function seedModelFallbackFromTranscript(): void {
+  if (bridgeJsonlPath) {
+    try { modelFallbackTracker.seed(bridgeJsonlPath); }
+    catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); }
+  }
+  publishModelFallbackIfChanged();
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -5662,6 +5705,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   } else {
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
+  seedModelFallbackFromTranscript();
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.

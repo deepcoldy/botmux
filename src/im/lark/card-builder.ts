@@ -9,7 +9,7 @@ import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
+import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -885,6 +885,14 @@ function pushStreamBody(
         ? t('card.usage_limit.retry_ready', { cliName: escapeMd(cliName) }, locale)
         : t('card.usage_limit.retry_at', { cliName: escapeMd(cliName), retryLabel: usageLimit.retryLabel }, locale),
     });
+    elements.push({ tag: 'hr' });
+  }
+  // Model auto-fallback notice — deliberately pinned to the card rather than
+  // sent as its own message, right after the usage-limit line: both answer
+  // "why does this turn look off".
+  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
+  if (modelFallbackNotice) {
+    elements.push({ tag: 'markdown', content: modelFallbackNotice });
     elements.push({ tag: 'hr' });
   }
   if (displayMode === 'screenshot') {

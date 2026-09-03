@@ -339,6 +339,10 @@ export function getDaemonStreamingCardUsageSnapshot(
   const reasoningEffort = ds.activeReasoningEffort?.trim()
     || ds.session.reasoningEffort?.trim();
   const modelBackendVariant = ds.session.modelBackendVariant;
+  // The fallback notice is a warning about which model is answering, not a
+  // usage metric — it rides the snapshot (every buildStreamingCard call site
+  // already forwards one) but must survive the 'off'/'footer' early return.
+  const modelFallback = ds.modelFallback;
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
@@ -347,6 +351,7 @@ export function getDaemonStreamingCardUsageSnapshot(
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(modelBackendVariant ? { modelBackendVariant } : {}),
+        ...(modelFallback ? { modelFallback } : {}),
       };
     }
   } catch {
@@ -369,6 +374,7 @@ export function getDaemonStreamingCardUsageSnapshot(
     ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
     ...(modelBackendVariant ? { modelBackendVariant } : {}),
+    ...(modelFallback ? { modelFallback } : {}),
   };
 }
 
@@ -11153,6 +11159,11 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  // Same authority rule for the model-fallback notice, and it additionally
+  // guards a role switch to a non-Claude CLI, which would never send a
+  // clearing model_fallback of its own. A Claude worker re-seeds it from the
+  // transcript when its bridge starts.
+  ds.modelFallback = undefined;
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
@@ -12084,6 +12095,23 @@ function setupWorkerHandlers(
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
+        scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
+      case 'model_fallback': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored model_fallback from stale worker generation`);
+          break;
+        }
+        const next = msg.state ?? undefined;
+        if (ds.modelFallback?.uuid === next?.uuid) break;
+        ds.modelFallback = next;
+        persistStreamCardState(ds);
         scheduleActiveRuntimePatch(ds);
         break;
       }

@@ -1787,6 +1787,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
     JSON.stringify(s.lastCodexAppInput ?? null) === JSON.stringify(ds.lastCodexAppInput ?? null) &&
@@ -1800,6 +1801,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
+  s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
   if (ds.lastCodexAppInput) s.lastCodexAppInput = ds.lastCodexAppInput;
@@ -2212,6 +2214,7 @@ export async function restoreActiveSessions(
           currentImageKey: session.currentImageKey,
           currentTurnTitle: session.currentTurnTitle,
           usageLimit: session.usageLimit,
+          modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
           lastCodexAppInput: session.lastCodexAppInput,
@@ -2417,6 +2420,7 @@ export async function restoreActiveSessions(
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
       usageLimit: session.usageLimit,
+      modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
       lastCodexAppInput: session.lastCodexAppInput,
@@ -3119,6 +3123,7 @@ export async function resumeSession(
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
     usageLimit: session.usageLimit,
+    modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
     lastCodexAppInput: session.lastCodexAppInput,
