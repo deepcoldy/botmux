@@ -85,6 +85,31 @@ export function stripDashboardToken(dashboardUrl: string): string | null {
   return u.toString();
 }
 
+/**
+ * 收敛一组 Dashboard 链接，供**持久化载体**（飞书卡片：重启报告 DM、CLI 运行时更新
+ * 提醒）使用。
+ *
+ * 与终端输出（`cli/dashboard-command.ts:formatDashboardSuccessLines`）的区别在于
+ * 载体：卡片是**永久聊天记录**，可转发、可截图、可搜索，所以这里比终端更严格 ——
+ * 平台托管时不但摘掉主链接的 `?t=`，还**整条不返回 `localUrl`**（那一条恒定带
+ * token，是给终端里的 owner 当平台异常兜底的，不该主动推进聊天记录；owner 需要时
+ * 在终端用 `botmux dashboard` 的显式参数取）。
+ *
+ * `platformHosted` 的含义与判据收窄理由见
+ * {@link stripDashboardToken} 的调用方注释与 formatDashboardSuccessLines：**只有
+ * 中心平台**这一条腿会注入身份 + 走 SSO，自建反代 `BOTMUX_PUBLIC_URL` 与 Devbox
+ * 短链没有人注入身份、token 仍是唯一凭证，对它们摘会摘成死链。
+ *
+ * fail-safe：URL 不可解析（摘不掉）时保留原串，但仍然扣下 `localUrl`。
+ */
+export function reportDashboardUrls(
+  urls: DashboardUrls,
+  platformHosted: boolean,
+): DashboardUrls {
+  if (!platformHosted) return urls;
+  return { url: stripDashboardToken(urls.url) ?? urls.url };
+}
+
 /** Agent Workbench 在 Dashboard SPA 里的 hash 路由（见 dashboard/web/dashboard-routes.ts）。 */
 export const WORKBENCH_HASH_ROUTE = '#/agent-workbench';
 

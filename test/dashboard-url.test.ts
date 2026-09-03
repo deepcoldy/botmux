@@ -21,6 +21,7 @@ import {
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   formatUrlHost,
+  reportDashboardUrls,
   stripDashboardToken,
   workbenchEntryUrl,
   workbenchSpaUrl,
@@ -412,5 +413,41 @@ describe('stripDashboardToken', () => {
     for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
       expect(stripDashboardToken(bad)).toBeNull();
     }
+  });
+});
+
+// ─── 持久化载体（飞书卡片）比终端更严格 ──────────────────────────────────────
+// 回归背景：`daemon.ts:dashboardUrlForReport` 给「重启报告 DM 卡」和「CLI 运行时
+// 更新提醒卡」提供链接，第一版仍原样带 token —— 那是**永久聊天记录**，可转发/截图，
+// 正是本次要堵的泄漏面。我的「影响面」一开始漏掉了这条路径。
+describe('reportDashboardUrls (Feishu card carrier)', () => {
+  const tokenized = {
+    url: 'https://m-abc.platform.test/?t=tok-abc',
+    localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+  };
+
+  it('PLATFORM-HOSTED: strips the token AND withholds the local fallback entirely', () => {
+    const out = reportDashboardUrls(tokenized, true);
+    expect(out.url).toBe('https://m-abc.platform.test/');
+    // localUrl 恒定带 token ⟹ 卡片一律不给（终端才有显式参数可取）。
+    expect(out.localUrl).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('tok-abc');
+  });
+
+  it('NOT platform-hosted (reverse proxy / devbox / LAN): passes through untouched', () => {
+    // 这几条路没有人注入身份，token 仍是唯一凭证 —— 摘了就是死链。
+    const out = reportDashboardUrls(tokenized, false);
+    expect(out).toEqual(tokenized);
+  });
+
+  it('fail-safe: unparseable URL keeps the URL but still withholds localUrl', () => {
+    const out = reportDashboardUrls({ url: 'not-a-url', localUrl: 'http://10.0.0.7:7891/?t=tok' }, true);
+    expect(out.url).toBe('not-a-url');
+    expect(out.localUrl).toBeUndefined();
+  });
+
+  it('is a no-op on an already token-free platform URL', () => {
+    expect(reportDashboardUrls({ url: 'https://m-abc.platform.test/' }, true))
+      .toEqual({ url: 'https://m-abc.platform.test/' });
   });
 });
