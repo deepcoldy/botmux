@@ -58,7 +58,8 @@ export function isOccupancyHeld(
  * Mutate one exact row only while its owning daemon is absent.
  *
  * Returns the fresh row (mutated when `mutate` returned true), or undefined
- * when the row is missing or a daemon holds it. A row with no `larkAppId` is a
+ * when the row is missing, a daemon holds it, or the store write lock could
+ * not be taken. A row with no `larkAppId` is a
  * pre-per-bot legacy row in the flat store: no daemon owns one — daemons all
  * run per-bot stores — so there is nothing to probe and the write proceeds.
  */

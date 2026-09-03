@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -333,6 +334,41 @@ describe('the frozen import source is not a store', () => {
     expect(published?.status).toBe('closed');
     expect(published?.workerGeneration).toBe(7);
   });
+
+  it('offline mutation yields on SQLITE_BUSY instead of throwing', () => {
+    // Another writer already holds BEGIN IMMEDIATE past busy_timeout. That is
+    // the same "do not publish" outcome as a live occupancy lease — the CLI
+    // must get undefined, not a database-is-locked stack. Daemon load() still
+    // throws on the same contention (retryable, must not become empty cache).
+    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    init('appA');
+    listSessions();
+    init();
+    const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
+    const before = readPersistedSessionRows(tempDir, 'appA');
+    const writer = new DatabaseSync(dbPath);
+    writer.exec('PRAGMA busy_timeout = 3000');
+    writer.exec('BEGIN IMMEDIATE');
+    try {
+      const t0 = Date.now();
+      expect(mutateSessionRowOffline(
+        { sessionId: 's1', larkAppId: 'appA' },
+        (current) => { current.status = 'closed'; return true; },
+        { dataDir: tempDir },
+      )).toBeUndefined();
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(2500);
+      expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
+    } finally {
+      writer.exec('ROLLBACK');
+      writer.close();
+    }
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      (current) => { current.status = 'closed'; return true; },
+      { dataDir: tempDir },
+    );
+    expect(published?.status).toBe('closed');
+  }, 20_000);
 });
 
 // ─── cutover 竞态：daemon 首次 load × 在途离线写者 ───────────────────────────

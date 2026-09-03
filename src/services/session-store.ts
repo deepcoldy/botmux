@@ -2538,7 +2538,11 @@ export function readSessionRowCopiesAcrossStores(
  *
  * Returns the fresh row — mutated when `mutate` returned true, otherwise
  * unmodified (so `() => false` is an exclusion-ordered fresh read) — or
- * undefined when the row is absent or `abortIf` aborted.
+ * undefined when the row is absent, `abortIf` aborted, or the store's write
+ * lock could not be taken (another writer holds `BEGIN IMMEDIATE` past
+ * busy_timeout). Lock contention is the same clean yield as a held lease:
+ * the caller must not publish, and the CLI must not throw a stack. Other
+ * errors (missing engine, corrupt file) still surface.
  */
 export function mutateSessionRowOffline(
   target: { sessionId: string; larkAppId?: string },
@@ -2554,9 +2558,13 @@ export function mutateSessionRowOffline(
     // plant an empty store: that would make the daemon's import gate skip the
     // one-shot JSON import and silently drop every pre-SQLite row.
     if (!existsSync(ref.path)) return undefined;
-    const db = openDbForOwnStore(ref.path);
+    let db: SqliteDatabaseLike | undefined;
     let inTxn = false;
     try {
+      // openDbForOwnStore (schema ensure) and BEGIN IMMEDIATE both take the
+      // write lock. Contention here is "someone else is publishing", not a
+      // broken store — same abort as a live occupancy row.
+      db = openDbForOwnStore(ref.path);
       db.exec('BEGIN IMMEDIATE');
       inTxn = true;
       const lease = readOccupancyInTxn(db);
@@ -2572,9 +2580,12 @@ export function mutateSessionRowOffline(
       db.exec('COMMIT');
       inTxn = false;
       return current;
+    } catch (err) {
+      if (isTransientStoreContentionError(err)) return undefined;
+      throw err;
     } finally {
-      if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-      db.close();
+      if (inTxn) { try { db?.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+      try { db?.close(); } catch { /* already closed */ }
     }
   }
 
