@@ -19,7 +19,7 @@
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
 
@@ -164,7 +164,9 @@ export function registryPackumentUrl(base: string): string {
  */
 export function spawnNpmConfigRegistry(): Promise<string> {
   return new Promise(resolve => {
-    let child;
+    // Explicit type: settle() below references `child` from a closure created
+    // before the assignment, so `let child;`'s evolving-any can't be inferred.
+    let child: ChildProcess;
     let killTimer: NodeJS.Timeout | undefined;
     let graceTimer: NodeJS.Timeout | undefined;
     let settled = false;
@@ -173,6 +175,10 @@ export function spawnNpmConfigRegistry(): Promise<string> {
       settled = true;
       if (killTimer) clearTimeout(killTimer);
       if (graceTimer) clearTimeout(graceTimer);
+      // Release our read end and drop the data listener: a pipe-holding
+      // grandchild would otherwise keep the fd open AND keep `out` growing
+      // (unbounded memory) for as long as it writes to the dead pipe.
+      try { child.stdout?.destroy(); } catch { /* already closed */ }
       resolve(value);
     };
     try {
@@ -316,7 +322,7 @@ export function selectRollbackVersions(raw: unknown, current: string, max = 3): 
  * packument must match the source that pin installs from. Following the
  * configured registry here would break rollback for whitelists that don't
  * proxy botmux (lookup 503 → versions_unavailable) even though the pinned
- * public install would have worked.
+ * public install would have worked. (`opts.registry` does not apply here.)
  */
 export async function fetchRollbackVersions(
   current: string,

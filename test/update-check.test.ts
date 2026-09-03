@@ -225,7 +225,6 @@ describe('spawnNpmConfigRegistry hang resistance', () => {
       + 'exit 0\n', { mode: 0o755 });
     const oldPath = process.env.PATH;
     process.env.PATH = `${dir}:${oldPath}`;
-    let grandchildPid: number | undefined;
     try {
       const started = Date.now();
       const raw = await spawnNpmConfigRegistry();
@@ -233,10 +232,11 @@ describe('spawnNpmConfigRegistry hang resistance', () => {
       expect(raw).toBe('https://hang-check.example.com\n');
       // Grace path (~1s), not the 5s kill path and not a hang.
       expect(elapsed).toBeLessThan(4_000);
-      grandchildPid = Number(readFileSync(pidFile, 'utf8').trim()) || undefined;
     } finally {
       process.env.PATH = oldPath;
-      try { if (grandchildPid) process.kill(grandchildPid, 'SIGKILL'); } catch { /* already gone */ }
+      // Read the pid file in finally so the grandchild is cleaned up even
+      // when an assertion above failed (that's exactly the regression case).
+      try { process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL'); } catch { /* already gone */ }
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15_000);
