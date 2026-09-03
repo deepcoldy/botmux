@@ -18,6 +18,7 @@ export interface DashboardBotDescriptor {
   cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
@@ -66,6 +67,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
