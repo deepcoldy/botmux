@@ -22,6 +22,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeDispatchLaunchPolicy } from './core/dispatch-launch-contract.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
@@ -1356,6 +1357,8 @@ export interface BotConfig {
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
    */
   apiOnly?: boolean;
+  /** Internal, opt-in target policy for dispatch launch IPC. Absent/disabled fails closed. */
+  dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
@@ -1740,6 +1743,8 @@ export interface BotConfig {
    * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
    */
   quotaState?: { [quotaKey: string]: { limit: number; used: number } };
+  /** Internal exactly-once receipts for dispatch-launch quota charges. */
+  dispatchLaunchQuotaReceipts?: { [receiptId: string]: { allow: boolean; chargedAt: string } };
   /**
    * scope-aware 授权绝对过期时间。缺少对应记录表示永久授权；旧配置因此保持兼容。
    * key 与 quotaState 相同，便于授权、撤销和到期回收在同一 scope 上原子处理。
@@ -3178,6 +3183,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) quotaState = out;
     }
 
+    let dispatchLaunchQuotaReceipts: { [k: string]: { allow: boolean; chargedAt: string } } | undefined;
+    if (entry.dispatchLaunchQuotaReceipts && typeof entry.dispatchLaunchQuotaReceipts === 'object'
+        && !Array.isArray(entry.dispatchLaunchQuotaReceipts)) {
+      const out: { [k: string]: { allow: boolean; chargedAt: string } } = {};
+      for (const [key, value] of Object.entries(entry.dispatchLaunchQuotaReceipts)) {
+        if (!/^quota_[0-9a-f]{32}$/.test(key) || !value || typeof value !== 'object') continue;
+        const allow = (value as any).allow;
+        const chargedAt = (value as any).chargedAt;
+        if (typeof allow !== 'boolean' || typeof chargedAt !== 'string' || !Number.isFinite(Date.parse(chargedAt))) continue;
+        out[key] = { allow, chargedAt };
+      }
+      if (Object.keys(out).length > 0) dispatchLaunchQuotaReceipts = out;
+    }
+
     let grantExpiryState: { [k: string]: { expiresAt: number } } | undefined;
     if (entry.grantExpiryState && typeof entry.grantExpiryState === 'object' && !Array.isArray(entry.grantExpiryState)) {
       const out: { [k: string]: { expiresAt: number } } = {};
@@ -3317,6 +3336,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      dispatchLaunchPolicy: (() => {
+        if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;
+        try {
+          return normalizeDispatchLaunchPolicy(entry.dispatchLaunchPolicy);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid dispatchLaunchPolicy: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
@@ -3421,6 +3452,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       grantDefaultDurationMs,
       quotaState,
+      dispatchLaunchQuotaReceipts,
       grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.

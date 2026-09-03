@@ -21,6 +21,8 @@ export interface OnlineDaemonInfo {
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with bootInstanceId + ipcPort. */
   workflowIpcProtocol?: string;
+  /** Internal target-authoritative dispatch launch protocol. */
+  dispatchLaunchIpcProtocol?: 'v1';
   botName?: string;
   cliId?: string;
   pid?: number;
@@ -83,6 +85,9 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
           : {}),
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
+          : {}),
+        ...(d.dispatchLaunchIpcProtocol === 'v1'
+          ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
           : {}),
         ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
