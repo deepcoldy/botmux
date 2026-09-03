@@ -2443,9 +2443,17 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
   return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
-/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+/** Admins = all resolved allowedUsers + explicit ownerOpenId, matching `/botconfig`'s permission model. */
 export function getDashboardAdminOpenIds(larkAppId: string): string[] {
-  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
+  const bot = bots.get(larkAppId);
+  if (!bot) return [];
+  const list = [...(bot.resolvedAllowedUsers ?? [])];
+  if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
+    if (!list.includes(bot.config.ownerOpenId)) {
+      list.unshift(bot.config.ownerOpenId);
+    }
+  }
+  return list;
 }
 
 /**

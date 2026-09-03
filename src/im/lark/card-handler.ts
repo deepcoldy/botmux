@@ -1069,9 +1069,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'info', content: '该操作已执行过' } };
   }
   if (value?.action && (value.action === OVERLOAD_ACTION_CLEAN_STOPPED || value.action === OVERLOAD_ACTION_SUSPEND_IDLE) && larkAppId) {
-    if (!operatorOpenId || !isBotAdmin(larkAppId, operatorOpenId)) {
+    const owner = getOwnerOpenId(larkAppId);
+    if (!operatorOpenId || operatorOpenId !== owner) {
       logger.info(`Overload action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
-      return { toast: { type: 'error', content: '仅管理员可操作' } };
+      return { toast: { type: 'error', content: '仅 owner 可操作' } };
     }
     // Parse the card state carried on the button. Missing/corrupt → treat as a
     // stale card (daemon restart drops the nonce too).
@@ -1116,9 +1117,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // owner 强闸门 + 按 bundleId 分开的一次性 nonce 核销（可分别重启 Arc/Chrome/Edge，
   // 各一次）。重启在本机 daemon 直接执行（浏览器就跑在本机），不跨 daemon 扇出。
   if (value?.action === OVERLOAD_ACTION_RESTART_BROWSER && larkAppId) {
-    if (!operatorOpenId || !isBotAdmin(larkAppId, operatorOpenId)) {
+    const owner = getOwnerOpenId(larkAppId);
+    if (!operatorOpenId || operatorOpenId !== owner) {
       logger.info(`Overload browser-restart blocked for non-owner: ${operatorOpenId}`);
-      return { toast: { type: 'error', content: '仅管理员可操作' } };
+      return { toast: { type: 'error', content: '仅 owner 可操作' } };
     }
     const bundleId = typeof value.bundleId === 'string' ? value.bundleId : '';
     if (!bundleId) return { toast: { type: 'error', content: '按钮缺少 bundleId' } };

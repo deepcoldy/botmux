@@ -38,17 +38,30 @@ describe('grant-owner', () => {
         larkAppSecret: 's',
         cliId: 'claude-code',
         ownerOpenId: 'ou_owner_explicit',
-        allowedUsers: ['user@example.com', 'ou_admin_raw', 'ou_owner_explicit'],
+        allowedUsers: ['user@example.com', 'ou_owner_explicit'],
       });
       bot.resolvedAllowedUsers = ['ou_owner_explicit', 'ou_admin_resolved', 'ou_admin_2'];
 
       const admins = getBotAdminOpenIds('b_multi');
-      expect(admins).toEqual(['ou_owner_explicit', 'ou_admin_resolved', 'ou_admin_2', 'ou_admin_raw']);
+      expect(admins).toEqual(['ou_owner_explicit', 'ou_admin_resolved', 'ou_admin_2']);
 
       expect(isBotAdmin('b_multi', 'ou_owner_explicit')).toBe(true);
       expect(isBotAdmin('b_multi', 'ou_admin_resolved')).toBe(true);
-      expect(isBotAdmin('b_multi', 'ou_admin_raw')).toBe(true);
       expect(isBotAdmin('b_multi', 'ou_stranger')).toBe(false);
+    });
+
+    it('fails closed when raw allowedUsers failed contact resolution', () => {
+      const bot = registerBot({
+        larkAppId: 'b_fail_closed',
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_unresolved_cross_app'],
+      });
+      // applyAllowedUsersResolve drops unresolved/invalid ou_ from runtime resolvedAllowedUsers
+      bot.resolvedAllowedUsers = [];
+
+      expect(getBotAdminOpenIds('b_fail_closed')).toEqual([]);
+      expect(isBotAdmin('b_fail_closed', 'ou_unresolved_cross_app')).toBe(false);
     });
 
     it('handles bot without ownerOpenId (legacy config style)', () => {
