@@ -2526,6 +2526,14 @@ describe('altScreen property', () => {
     expect(createClaudeCodeAdapter('/bin/claude').altScreen).toBe(false);
   });
 
+  it('claude-code read-only viewers may forward wheel-only scroll', () => {
+    // Claude's TUI self-manages its transcript (no xterm/tmux scrollback), so the
+    // read-only web terminal can only page history by forwarding SGR wheel events
+    // back to the CLI. This opt-in gates that narrow, rate-limited `type:'scroll'`
+    // path (worker.ts / web-terminal-scroll.ts), mirroring opencode.
+    expect(createClaudeCodeAdapter('/bin/claude').readOnlyRemoteScroll).toBe(true);
+  });
+
   it('aiden does not use alt screen', () => {
     expect(createAidenAdapter('/bin/aiden').altScreen).toBe(false);
   });
