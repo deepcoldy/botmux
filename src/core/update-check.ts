@@ -3,10 +3,19 @@
  * release notes accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
+ * The registry lookups (`latest` + rollback packument) MUST go through the
+ * registry npm is actually configured to use (`npm config get registry`): the
+ * update button installs with the owning package manager, which resolves
+ * through that same .npmrc family. Checking the public registry while
+ * installing through a lagging mirror made the card advertise upgrades (and
+ * rollback targets) that could never install. The public registry is only a
+ * fallback for when the npm config can't be read (npm missing/unusual PATH).
+ *
  * Every network call is best-effort: timeout-bounded and returns null / [] on
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
+import { spawn } from 'node:child_process';
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
 
@@ -102,24 +111,114 @@ function vtag(v: string): string {
   return v.startsWith('v') ? v : `v${v}`;
 }
 
-const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
-const REGISTRY_PACKUMENT_URL = 'https://registry.npmjs.org/botmux';
+/** Fallback registry when the npm config can't be read (npm missing, odd PATH). */
+const PUBLIC_REGISTRY = 'https://registry.npmjs.org/';
+
+/**
+ * Normalize a raw registry value (`npm config get registry` output or a
+ * caller-supplied string) to a base URL with a trailing slash. npm prints the
+ * value as the last stdout line, but wrapper shims (nvm, corp-managed npm) may
+ * print banners first — so scan from the end and take the first line that
+ * parses as an http(s) URL. null when nothing does — garbage is never
+ * interpolated into a fetch target.
+ */
+export function normalizeRegistryBase(raw: string): string | null {
+  const lines = raw.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const v = lines[i].trim().replace(/^["']|["']$/g, '');
+    if (/^https?:\/\/\S+$/.test(v)) return v.endsWith('/') ? v : `${v}/`;
+  }
+  return null;
+}
+
+/** `GET {registry}botmux/latest` — the dist-tag manifest `@latest` installs. */
+export function registryLatestUrl(base: string): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}botmux/latest`;
+}
+
+/** `GET {registry}botmux` — the packument behind the rollback picker. */
+export function registryPackumentUrl(base: string): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}botmux`;
+}
+
+/**
+ * Read `npm config get registry` (honors user/global/project .npmrc and
+ * NPM_CONFIG_REGISTRY). Async spawn — the dashboard must not block on npm CLI
+ * startup (~0.5-1s) — with a hard kill at 5s. Always resolves: '' on any
+ * failure so the caller can fall back to the public registry.
+ */
+function spawnNpmConfigRegistry(): Promise<string> {
+  return new Promise(resolve => {
+    let child;
+    try {
+      child = spawn('npm', ['config', 'get', 'registry'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        shell: process.platform === 'win32', // resolve npm.cmd on Windows
+      });
+    } catch {
+      resolve('');
+      return;
+    }
+    let out = '';
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already exited */ } }, 5_000);
+    child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    child.on('error', () => { clearTimeout(timer); resolve(''); });
+    child.on('close', () => { clearTimeout(timer); resolve(out); });
+  });
+}
+
+let npmRegistryBase: string | null = null;   // successful reads only
+let npmRegistryInFlight: Promise<string> | null = null;
+
+/**
+ * The registry base package-manager installs resolve through. A successful
+ * read is cached for the process lifetime (registry config rarely changes,
+ * and the update flow restarts the process anyway when it matters). A failed
+ * read is NOT cached — a transient spawn failure at startup would otherwise
+ * pin the fallback (public registry) forever, re-introducing the very
+ * check/install mismatch this module exists to prevent. Retrying is naturally
+ * rate-limited by the caller's version cache.
+ */
+function resolveNpmRegistryBase(): Promise<string> {
+  if (npmRegistryBase) return Promise.resolve(npmRegistryBase);
+  npmRegistryInFlight ??= spawnNpmConfigRegistry()
+    .then(raw => {
+      const base = normalizeRegistryBase(raw);
+      if (base) npmRegistryBase = base;
+      return base ?? PUBLIC_REGISTRY;
+    })
+    .finally(() => { npmRegistryInFlight = null; });
+  return npmRegistryInFlight;
+}
+
+/** Resolve the fetch base for a registry lookup: the opts override (tests)
+ *  when given, else the npm-configured registry with public fallback. */
+async function effectiveRegistryBase(registry?: string): Promise<string> {
+  return registry !== undefined
+    ? (normalizeRegistryBase(registry) ?? PUBLIC_REGISTRY)
+    : resolveNpmRegistryBase();
+}
 
 export interface FetchOpts {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   auth?: GithubAuthResolveOptions;
+  /** Registry base override (tests / callers that already know it). Invalid
+   *  values fall back to the public registry, mirroring runtime behavior. */
+  registry?: string;
 }
 
 /**
- * The npm registry's `latest` dist-tag version — the authoritative target for
- * both npm and pnpm updates. null on any failure (offline, non-200,
- * malformed body, or a version string we can't parse).
+ * The `latest` dist-tag version on the registry npm is configured to use —
+ * the authoritative target of a `@latest` update. null on any failure
+ * (offline, non-200, malformed body, or a version string we can't parse).
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(REGISTRY_LATEST_URL, {
+    const res = await fetchImpl(registryLatestUrl(await effectiveRegistryBase(opts?.registry)), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
@@ -164,14 +263,15 @@ export function selectRollbackVersions(raw: unknown, current: string, max = 3): 
     }));
 }
 
-/** Fetch the npm packument used to offer an allow-listed rollback target. */
+/** Fetch the packument (from the npm-configured registry) used to offer an
+ *  allow-listed rollback target — same source the install would pull from. */
 export async function fetchRollbackVersions(
   current: string,
   opts?: FetchOpts & { max?: number },
 ): Promise<RollbackVersionsResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(REGISTRY_PACKUMENT_URL, {
+    const res = await fetchImpl(registryPackumentUrl(await effectiveRegistryBase(opts?.registry)), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });

@@ -10,6 +10,9 @@ import {
   selectRollbackVersions,
   fetchRollbackVersions,
   fetchReleasesSince,
+  normalizeRegistryBase,
+  registryLatestUrl,
+  registryPackumentUrl,
 } from '../src/core/update-check.js';
 
 describe('parseVersion', () => {
@@ -127,16 +130,60 @@ function jsonResponse(status: number, body: unknown): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response;
 }
 
+describe('normalizeRegistryBase', () => {
+  it('normalizes trailing slash, trims, strips matching quotes', () => {
+    expect(normalizeRegistryBase('https://mirror.example.com')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://mirror.example.com/')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('  https://mirror.example.com/\n')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('"https://mirror.example.com"')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://proxy.example.com/npm/')).toBe('https://proxy.example.com/npm/');
+  });
+  it('takes the last http(s) line — wrapper shims may print banners before the value', () => {
+    expect(normalizeRegistryBase('nvm shim banner v1.2.3\nhttps://mirror.example.com\n')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://first.example.com\nnot a url\n')).toBe('https://first.example.com/');
+  });
+  it('null on non-http(s) garbage (never a fetch target)', () => {
+    expect(normalizeRegistryBase('')).toBeNull();
+    expect(normalizeRegistryBase('not a url')).toBeNull();
+    expect(normalizeRegistryBase('javascript:alert(1)')).toBeNull();
+    expect(normalizeRegistryBase('ftp://example.com')).toBeNull();
+  });
+});
+
+describe('registryLatestUrl / registryPackumentUrl', () => {
+  it('builds the packument URLs from a base with or without slash', () => {
+    expect(registryLatestUrl('https://mirror.example.com/')).toBe('https://mirror.example.com/botmux/latest');
+    expect(registryLatestUrl('https://mirror.example.com')).toBe('https://mirror.example.com/botmux/latest');
+    expect(registryPackumentUrl('https://mirror.example.com/')).toBe('https://mirror.example.com/botmux');
+    expect(registryPackumentUrl('https://mirror.example.com')).toBe('https://mirror.example.com/botmux');
+  });
+});
+
 describe('fetchLatestVersion', () => {
+  // registry is pinned so the tests never spawn `npm config get registry`.
   it('returns the registry version', async () => {
-    const v = await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: '2.85.1' }) });
+    const v = await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, { version: '2.85.1' }) });
     expect(v).toBe('2.85.1');
   });
   it('null on non-200 / malformed / unparseable / throw', async () => {
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'latest' }) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => { throw new Error('offline'); } })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, {}) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, { version: 'latest' }) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => { throw new Error('offline'); } })).toBeNull();
+  });
+  it('queries the configured registry — the same source npm install resolves through', async () => {
+    let seen = '';
+    // `unknown` param: assignable to typeof fetch regardless of lib typings.
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, { version: '2.85.1' }); };
+    const v = await fetchLatestVersion({ registry: 'https://mirror.example.com', fetchImpl });
+    expect(v).toBe('2.85.1');
+    expect(seen).toBe('https://mirror.example.com/botmux/latest');
+  });
+  it('falls back to the public registry when the configured value is garbage', async () => {
+    let seen = '';
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, { version: '2.85.1' }); };
+    await fetchLatestVersion({ registry: 'garbage', fetchImpl });
+    expect(seen).toBe('https://registry.npmjs.org/botmux/latest');
   });
 });
 
@@ -180,6 +227,7 @@ describe('rollback versions', () => {
 
   it('fetches and filters the registry packument', async () => {
     const out = await fetchRollbackVersions('3.0.0', {
+      registry: 'https://registry.npmjs.org/',
       fetchImpl: async () => jsonResponse(200, packument),
       max: 1,
     });
@@ -189,12 +237,19 @@ describe('rollback versions', () => {
     });
   });
 
+  it('queries the configured registry for the packument — same source the rollback install would pull from', async () => {
+    let seen = '';
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, packument); };
+    await fetchRollbackVersions('3.0.0', { registry: 'https://mirror.example.com', fetchImpl });
+    expect(seen).toBe('https://mirror.example.com/botmux');
+  });
+
   it('reports registry and malformed-response failures', async () => {
-    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(503, {}) }))
+    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(503, {}) }))
       .toEqual({ ok: false, versions: [] });
-    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(200, {}) }))
+    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, {}) }))
       .toEqual({ ok: false, versions: [] });
-    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => { throw new Error('offline'); } }))
+    expect(await fetchRollbackVersions('3.0.0', { registry: 'https://registry.npmjs.org/', fetchImpl: async () => { throw new Error('offline'); } }))
       .toEqual({ ok: false, versions: [] });
   });
 });
