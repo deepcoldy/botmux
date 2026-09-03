@@ -14624,8 +14624,9 @@ function deliverFinalOutput(
       let feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
       // Freeze email reviewers into this bot's app-scoped open_id so the
       // card callback can match network-free against the delivery snapshot. Pure
-      // ou_/on_ lists (and requester/everyone) skip the lookup. If resolution
-      // empties the list, fail closed (drop the feedback control).
+      // ou_/on_ lists (and requester/everyone) skip the lookup. An empty
+      // materialized list keeps the control visible while the callback rejects
+      // every operator.
       if (feedbackPolicy && feedbackPolicy.audience === 'reviewers') {
         try {
           const { materializeFeedbackReviewers } = await import('../services/feedback-policy.js');
@@ -14642,7 +14643,6 @@ function deliverFinalOutput(
         } catch {
           feedbackPolicy = undefined;
         }
-        if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
       }
       const feedbackRequesterSubjectId = recipientOpenId;
       // `reviewers`/`everyone` audiences gate clicks without a human requester,

@@ -482,7 +482,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
   });
 
-  it('does not render a reviewers card when every email is unresolved', async () => {
+  it('renders a fail-closed reviewers card when every email is unresolved', async () => {
     resolveAllowedUsersWithMapMock.mockResolvedValue({
       resolved: [],
       map: new Map(),
@@ -501,7 +501,24 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('renders a fail-closed reviewers card when no reviewers are configured', async () => {
+    const sessionReply = vi.fn(async () => 'om_empty_reviewers_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    expect((await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
+      .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });
 
   it('keeps feedback disabled by default and does not open the store', async () => {

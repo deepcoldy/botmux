@@ -180,6 +180,14 @@ describe('feedback callback reviewers audience', () => {
     expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_reviewer')).toHaveLength(0);
     store.close();
   });
+
+  it('rejects every operator when the reviewers allowlist is empty', async () => {
+    const { store, delivery } = await reviewersSetup([]);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'), 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '仅指定的反馈人可反馈' });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_anyone')).toHaveLength(0);
+    store.close();
+  });
 });
 
 describe('feedback callback everyone audience', () => {
