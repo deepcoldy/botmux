@@ -2261,6 +2261,10 @@ export interface RoutingContext {
    *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
    *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
+  /** The inbound message was sent at the top level of a regular group. This
+   * remains true in `new-topic` mode even though its conversational route was
+   * rewritten to a fresh thread, allowing sessionless group UI to stay flat. */
+  regularGroupTopLevel?: boolean;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
   /** Set when the turn folded into the group chat-scope session from a Lark
@@ -4171,6 +4175,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         chatType,
         larkAppId,
         ...routing,
+        regularGroupTopLevel: routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread',
         replyRootId,
         promptOverride,
         commandTrigger,

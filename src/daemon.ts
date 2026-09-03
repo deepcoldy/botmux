@@ -18027,6 +18027,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // ordinary permitted members can use the MVP without a per-bot downgrade
     // list, while keeping every other daemon command on canOperate by default.
     if (cmd === '/sessions') {
+      // `/sessions` is group-level, sessionless UI. In a regular group whose
+      // conversation mode is `new-topic`, routing has already rewritten this
+      // top-level command to a fresh thread. Put this one reply back at the
+      // group top level; real topic/thread invocations keep their own thread.
+      const sessionsAnchor = ctx.regularGroupTopLevel ? chatId : anchor;
+      const sessionsDeps = ctx.regularGroupTopLevel
+        ? commandDepsForInvocation({
+            scope: 'chat',
+            chatId,
+            anchor: chatId,
+            messageId: parsed.messageId,
+          })
+        : invocationDeps;
       if (!canTalkForGroupSessions(
         larkAppId,
         chatId,
@@ -18036,15 +18049,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         chatType,
         senderIsBotForSlashGate,
       )) {
-        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await sessionsDeps.sessionReply(sessionsAnchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       fireSessionlessCommandDetached(
         cmd,
-        anchor,
+        sessionsAnchor,
         { ...parsed, content: commandContent, chatId },
         larkAppId,
-        invocationDeps,
+        sessionsDeps,
       );
       return;
     }

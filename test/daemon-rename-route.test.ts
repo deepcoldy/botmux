@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
@@ -113,6 +114,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
@@ -675,6 +677,30 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.daemonRequest).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(activeSessions.size).toBe(0);
+  });
+
+  it('regular-group top-level `/sessions` stays top-level even after new-topic routing', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_sessions_regular_group_top';
+    const data = makeEventData(messageId, '/sessions');
+
+    await handleNewTopic(data, {
+      ...makeCtx(messageId, messageId),
+      regularGroupTopLevel: true,
+    });
+
+    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage.mock.calls[0]?.[1]).toBe(CHAT);
+    expect(String(mocks.sendMessage.mock.calls[0]?.[2])).toContain('本群话题');
+    expect(mocks.createSession).not.toHaveBeenCalled();
   });
 
   it.each([
