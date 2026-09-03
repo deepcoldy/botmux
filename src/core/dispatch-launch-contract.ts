@@ -8,10 +8,7 @@ import {
   type CodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 
-/**
- * Data-only contract for a future target-daemon-authoritative dispatch launch.
- * Nothing in this module is connected to a command, route, or worker launch.
- */
+/** Versioned contract for the internal target-daemon-authoritative dispatch launch path. */
 export const DISPATCH_LAUNCH_PROTOCOL = 'v1' as const;
 export const DISPATCH_LAUNCH_SCHEMA_VERSION = 1 as const;
 export const DISPATCH_LAUNCH_POLICY_SCHEMA_VERSION = 1 as const;
@@ -193,6 +190,7 @@ interface DispatchLaunchOperationBaseV1 {
   sourceLarkAppId: string;
   sourceSessionId: string;
   sourceTurnId: string;
+  callerUnionId?: string;
   targetLarkAppId: string;
   chatId: string;
   kickoff: CanonicalDispatchLaunchKickoff;
@@ -268,9 +266,18 @@ export interface DispatchLaunchAdmissionReceiptV1 {
   sourceTurnId: string;
   /** Cross-app stable caller identity; never substitute an app-scoped open_id. */
   callerUnionId?: string;
+  /** Target-app-scoped identity resolved from live chat membership. */
+  sourceOpenId?: string;
+  chatType?: 'group' | 'p2p';
+  /** Frozen authorization facts; optional for receipts written by older builds. */
+  talkReason?: string;
+  quotaKey?: string;
+  grantChatId?: string;
   chatId: string;
   targetLarkAppId: string;
   policyDigest: string;
+  effectiveOverride?: DispatchLaunchEffectiveOverride;
+  launchIdentity?: DispatchLaunchIdentityV1;
   talkAuthorizationReceiptId: string;
   quotaReceiptId: string;
   workingDir: string;
@@ -423,6 +430,10 @@ const dispatchLaunchOperationBaseShape = {
   sourceLarkAppId: larkAppIdSchema,
   sourceSessionId: identifierSchema,
   sourceTurnId: identifierSchema,
+  callerUnionId: nonEmptyString
+    .max(DISPATCH_LAUNCH_CONTROL_LIMITS.callerUnionIdChars)
+    .regex(/^on_[A-Za-z0-9]+$/, 'must be a Lark union_id')
+    .optional(),
   targetLarkAppId: larkAppIdSchema,
   chatId: identifierSchema,
   kickoff: canonicalKickoffSchema,
@@ -563,9 +574,16 @@ export const DispatchLaunchAdmissionReceiptSchema = z.object({
     .max(DISPATCH_LAUNCH_CONTROL_LIMITS.callerUnionIdChars)
     .regex(/^on_[A-Za-z0-9]+$/, 'must be a Lark union_id')
     .optional(),
+  sourceOpenId: nonEmptyString.max(DISPATCH_LAUNCH_CONTROL_LIMITS.identifierChars).optional(),
+  chatType: z.enum(['group', 'p2p']).optional(),
+  talkReason: identifierSchema.optional(),
+  quotaKey: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.identifierChars).optional(),
+  grantChatId: identifierSchema.optional(),
   chatId: identifierSchema,
   targetLarkAppId: larkAppIdSchema,
   policyDigest: digestSchema,
+  effectiveOverride: effectiveOverrideSchema.optional(),
+  launchIdentity: launchIdentitySchema.optional(),
   talkAuthorizationReceiptId: identifierSchema,
   quotaReceiptId: identifierSchema,
   workingDir: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.workingDirChars),
@@ -830,8 +848,14 @@ export function parseDispatchLaunchAdmissionReceipt(raw: unknown): DispatchLaunc
   if (parsed.state === 'committed' && parsed.committedAt === undefined) {
     throw new Error('invalid dispatch launch admission receipt: committedAt is required');
   }
+  if (parsed.state === 'committed' && parsed.releasedAt !== undefined) {
+    throw new Error('invalid dispatch launch admission receipt: committed receipt must not be released');
+  }
   if (parsed.state === 'released' && parsed.releasedAt === undefined) {
     throw new Error('invalid dispatch launch admission receipt: releasedAt is required');
+  }
+  if (parsed.state === 'released' && parsed.committedAt !== undefined) {
+    throw new Error('invalid dispatch launch admission receipt: released receipt must not be committed');
   }
   return parsed;
 }

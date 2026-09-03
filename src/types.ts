@@ -263,6 +263,8 @@ export interface FailedTurnRecord {
 
 export interface Session {
   sessionId: string;
+  /** Internal target-side owner for an idempotent dispatch-launch session. */
+  dispatchLaunchId?: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
   chatId: string;
