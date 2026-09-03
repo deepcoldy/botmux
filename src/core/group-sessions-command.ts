@@ -1,6 +1,7 @@
 /** `/sessions` command entry: current bot + current group, safe public card. */
 
 import type { DaemonClient } from '../dashboard/daemon-internal-client.js';
+import { isDashboardAdmin, type DashboardAdminLookupDeps } from '../dashboard/dashboard-admins.js';
 import { createDaemonClientFor } from '../daemon-internal-client-wrapper.js';
 import { buildGroupSessionsCard } from '../im/lark/group-sessions-card.js';
 import { getChatModeStrict as defaultGetChatModeStrict } from '../im/lark/client.js';
@@ -9,7 +10,7 @@ import type { LarkMessage } from '../types.js';
 import type { CommandHandlerDeps } from './command-handler.js';
 import type { SessionRow } from './dashboard-rows.js';
 
-export interface GroupSessionsCommandDeps {
+export interface GroupSessionsCommandDeps extends DashboardAdminLookupDeps {
   createClient?: (larkAppId: string) => DaemonClient;
   getChatModeStrict?: (larkAppId: string, chatId: string) => Promise<'group' | 'topic' | 'p2p' | 'unknown'>;
   locale?: Locale;
@@ -61,6 +62,7 @@ export async function handleGroupSessionsCommand(
     larkAppId,
     chatId,
     invokerOpenId: message.senderId,
+    canResume: isDashboardAdmin(larkAppId, message.senderId, testDeps),
     locale,
     page: 1,
   }, testDeps.nowMs ? testDeps.nowMs() : Date.now());

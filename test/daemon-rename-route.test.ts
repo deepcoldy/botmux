@@ -670,7 +670,7 @@ describe('/rename production routing — must not pre-create a session (review P
     if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
     else await handleNewTopic(data, makeCtx(rootId, messageId));
 
-    await vi.waitFor(() => expect(repliedText()).toContain('本群活跃话题'));
+    await vi.waitFor(() => expect(repliedText()).toContain('本群话题'));
     expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
     expect(mocks.daemonRequest).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/sessions-list' });
     expect(mocks.createSession).not.toHaveBeenCalled();

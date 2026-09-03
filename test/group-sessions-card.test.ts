@@ -9,6 +9,7 @@ import {
   filterGroupSessions,
   GROUP_SESSIONS_ACTION_LOCATE,
   GROUP_SESSIONS_ACTION_REFRESH,
+  GROUP_SESSIONS_ACTION_RESUME,
   handleGroupSessionsCardAction,
 } from '../src/im/lark/group-sessions-card.js';
 
@@ -54,26 +55,29 @@ function callback(action: Record<string, string>, operator = USER, messageId = '
 }
 
 describe('/sessions current-group card', () => {
-  it('filters simultaneously by bot, chat, thread scope, and non-closed status', () => {
+  it('filters simultaneously by bot, chat, and thread scope while retaining closed rows', () => {
     const keep = row();
+    const closed = row({ sessionId: 'closed', status: 'closed' });
     const rows = [
       keep,
       row({ sessionId: 'other-bot', larkAppId: 'cli_other' }),
       row({ sessionId: 'other-chat', chatId: 'oc_other' }),
       row({ sessionId: 'chat-scope', scope: 'chat' }),
-      row({ sessionId: 'closed', status: 'closed' }),
+      closed,
       row({ sessionId: 'legacy-ownerless', larkAppId: '' }),
     ];
-    expect(filterGroupSessions(rows, { larkAppId: APP, chatId: CHAT })).toEqual([keep]);
+    expect(filterGroupSessions(rows, { larkAppId: APP, chatId: CHAT })).toEqual([keep, closed]);
   });
 
-  it('sorts running sessions first, hides sensitive fields, and uses direct topic links when present', () => {
+  it('sorts active sessions before closed, hides sensitive fields, and uses direct topic links when present', () => {
     const card = JSON.parse(buildGroupSessionsCard([
       row({ sessionId: 'idle-secret', title: 'Idle', status: 'idle', lastMessageAt: NOW - 1_000, workingDir: '/secret/repo' }),
       row({ sessionId: 'working-secret', title: 'Working', status: 'working', lastMessageAt: NOW - 50_000, feishuThreadLink: 'https://applink/topic' }),
-    ], { larkAppId: APP, chatId: CHAT, invokerOpenId: USER, locale: 'en', page: 1 }, NOW));
+      row({ sessionId: 'closed-secret', title: 'Closed', status: 'closed', lastMessageAt: NOW }),
+    ], { larkAppId: APP, chatId: CHAT, invokerOpenId: USER, locale: 'en', page: 1, timeZone: 'UTC' }, NOW));
     const encoded = JSON.stringify(card);
-    expect(encoded.indexOf('Working')).toBeLessThan(encoded.indexOf('Idle'));
+    expect(encoded.indexOf('**Working**')).toBeLessThan(encoded.indexOf('**Idle**'));
+    expect(encoded.indexOf('**Idle**')).toBeLessThan(encoded.indexOf('**Closed**'));
     expect(encoded).not.toContain('/secret/repo');
     expect(encoded).not.toContain('working-secret');
     expect(encoded).toContain('https://applink/topic');
@@ -82,6 +86,33 @@ describe('/sessions current-group card', () => {
       .filter(Boolean)
       .join('\n');
     expect(visible).not.toContain('idle-secret');
+    expect(visible).toContain('Active 2 · Closed 1');
+    expect(encoded).toContain('Data as of');
+  });
+
+  it('shows resume only for an admin-generated card and keeps the session id hidden from visible text', () => {
+    const closed = row({ status: 'closed', title: 'Old topic' });
+    const ordinary = buildGroupSessionsCard(
+      [closed],
+      { larkAppId: APP, chatId: CHAT, invokerOpenId: USER, locale: 'en', page: 1, timeZone: 'UTC' },
+      NOW,
+    );
+    const admin = JSON.parse(buildGroupSessionsCard(
+      [closed],
+      {
+        larkAppId: APP, chatId: CHAT, invokerOpenId: USER, canResume: true,
+        locale: 'en', page: 1, timeZone: 'UTC',
+      },
+      NOW,
+    ));
+    expect(ordinary).not.toContain(GROUP_SESSIONS_ACTION_RESUME);
+    expect(JSON.stringify(admin)).toContain(GROUP_SESSIONS_ACTION_RESUME);
+    const visible = admin.elements
+      .flatMap((element: any) => [element.text?.content, ...(element.actions ?? []).map((a: any) => a.text?.content)])
+      .filter(Boolean)
+      .join('\n');
+    expect(visible).toContain('Resume');
+    expect(visible).not.toContain('session-secret');
   });
 
   it('uses a locked legacy locate callback without rendering the session id', () => {
@@ -121,11 +152,11 @@ describe('/sessions current-group card', () => {
 
   it('renders a clear empty state when the current group has no matching sessions', () => {
     const card = buildGroupSessionsCard(
-      [row({ chatId: 'oc_other' }), row({ status: 'closed' })],
+      [row({ chatId: 'oc_other' }), row({ scope: 'chat' })],
       { larkAppId: APP, chatId: CHAT, invokerOpenId: USER, locale: 'en', page: 1 },
       NOW,
     );
-    expect(card).toContain('There are no active topic sessions for this bot in the current group.');
+    expect(card).toContain('There are no topic sessions for this bot in the current group.');
   });
 
   it('rejects a different operator before opening a Route B client', async () => {
@@ -179,22 +210,107 @@ describe('/sessions current-group card', () => {
     }));
   });
 
-  it('fails closed when the fresh row is closed or moved to another chat', async () => {
-    for (const stale of [row({ status: 'closed' }), row({ chatId: 'oc_other' })]) {
-      const client = clientWith([stale]);
-      const result = await handleGroupSessionsCardAction(callback({
-        action: GROUP_SESSIONS_ACTION_LOCATE,
-        invoker_open_id: USER,
-        chat_id: CHAT,
-        session_id: 'session-secret',
-      }), APP, {
-        createClient: () => client,
-        getMessageChatId: vi.fn(async () => CHAT),
-        locale: 'en',
-      });
-      expect(result.toast?.type).toBe('error');
-      expect(client.request).toHaveBeenCalledTimes(1);
-    }
+  it('locates a closed legacy row without requiring it to remain open', async () => {
+    const client = clientWith([row({ status: 'closed', feishuThreadLink: undefined })]);
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_LOCATE,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      locale: 'en',
+    });
+    expect(result.toast?.type).toBe('success');
+    expect(client.request).toHaveBeenLastCalledWith(expect.objectContaining({
+      body: expect.objectContaining({ expectedOpen: false }),
+    }));
+  });
+
+  it('fails closed when the fresh row moved to another chat', async () => {
+    const client = clientWith([row({ chatId: 'oc_other' })]);
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_LOCATE,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      locale: 'en',
+    });
+    expect(result.toast?.type).toBe('error');
+    expect(client.request).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a forged resume action from a non-admin before opening Route B', async () => {
+    const createClient = vi.fn();
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_RESUME,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient,
+      getMessageChatId: vi.fn(async () => CHAT),
+      getDashboardAdminOpenIds: () => [],
+      locale: 'en',
+    });
+    expect(result.toast?.content).toContain('Only bot admins');
+    expect(createClient).not.toHaveBeenCalled();
+  });
+
+  it('revalidates and resumes a closed row for an admin, then rebuilds page one', async () => {
+    let resumed = false;
+    const request = vi.fn(async (opts: { method?: string; path: string }) => {
+      if (opts.method === 'POST') {
+        resumed = true;
+        return { status: 200, body: { ok: true }, raw: '' };
+      }
+      return {
+        status: 200,
+        body: { sessions: [row({ status: resumed ? 'idle' : 'closed', title: 'Restored topic' })] },
+        raw: '',
+      };
+    });
+    const client = { request } as unknown as DaemonClient;
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_RESUME,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+      page: '3',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      getDashboardAdminOpenIds: () => [USER],
+      locale: 'en',
+      nowMs: () => NOW,
+    });
+    expect(request).toHaveBeenCalledWith({
+      method: 'POST',
+      path: '/__daemon/sessions/session-secret/resume',
+    });
+    expect(result.card?.data).toEqual(expect.objectContaining({ elements: expect.any(Array) }));
+    expect(JSON.stringify(result.card?.data)).toContain('Active 1 · Closed 0 · Page 1/1');
+  });
+
+  it('does not POST resume when the fresh row is no longer closed', async () => {
+    const client = clientWith([row({ status: 'idle' })]);
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_RESUME,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      getDashboardAdminOpenIds: () => [USER],
+      locale: 'en',
+    });
+    expect(result.toast?.type).toBe('error');
+    expect((client as any).request).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -227,7 +343,25 @@ describe('/sessions command entry', () => {
       nowMs: () => NOW,
     });
     expect(sessionReply).toHaveBeenCalledWith(
-      'om_cmd', expect.stringContaining('Active topics in this group'), 'interactive', APP,
+      'om_cmd', expect.stringContaining('Topics in this group'), 'interactive', APP,
+    );
+  });
+
+  it('renders resume for a dashboard admin invoking the command', async () => {
+    const client = clientWith([row({ status: 'closed' })]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    await handleGroupSessionsCommand({
+      messageId: 'om_cmd', rootId: 'om_cmd', chatId: CHAT, senderId: USER,
+      senderType: 'user', msgType: 'text', content: '/sessions', createTime: '0',
+    }, 'om_cmd', CHAT, { sessionReply } as any, APP, {
+      createClient: () => client,
+      getChatModeStrict: vi.fn(async () => 'topic'),
+      getDashboardAdminOpenIds: () => [USER],
+      locale: 'en',
+      nowMs: () => NOW,
+    });
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_cmd', expect.stringContaining(GROUP_SESSIONS_ACTION_RESUME), 'interactive', APP,
     );
   });
 });
