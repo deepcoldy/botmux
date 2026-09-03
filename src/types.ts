@@ -1003,7 +1003,7 @@ export interface ScheduledTask {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */

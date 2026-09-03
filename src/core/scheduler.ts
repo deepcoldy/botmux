@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
 import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
@@ -16,7 +17,7 @@ export interface ScheduleExecutionContext {
 }
 
 // Callback set by daemon to execute a scheduled task
-let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<void>) | null = null;
+let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -35,7 +36,7 @@ const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
 const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
 
-function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error' | 'skipped', error?: unknown): void {
   const chatIds = task.chatIds
     ? scheduleStore.effectiveScheduleChatIds(task)
     : [task.chatId];
@@ -58,7 +59,7 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
 }
 
 export function setExecuteCallback(
-  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<void>,
+  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>,
 ): void {
   executeCallback = cb;
 }
@@ -103,6 +104,29 @@ function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
 
 function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
   if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+}
+
+function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPreconditionOutcome | void): void {
+  const status = outcome === 'skipped' ? 'skipped' : 'ok';
+  if (status === 'skipped') {
+    let nextRunAt: string | undefined;
+    if (task.parsed.kind === 'once') {
+      // Keep a one-shot eligible after a skipped check, including runNow,
+      // which clears nextRunAt before dispatch. Do not bring a future plan forward.
+      const scheduledAt = task.nextRunAt ?? task.parsed.runAt;
+      const retryAt = Date.now() + TICK_INTERVAL_MS;
+      nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
+    }
+    scheduleStore.markSkipped(task.id, nextRunAt);
+  } else {
+    scheduleStore.markRun(task.id, true);
+    cleanupIfTaskWasAutoRemoved(task);
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id: task.id, runAt: Date.now(), status },
+  });
+  emitScheduleFiredHook(task, status);
 }
 
 /**
@@ -521,15 +545,7 @@ async function tick(): Promise<void> {
     if (executeCallback) {
       const taskId = task.id;
       executeCallback(task, executionContext)
-        .then(() => {
-          scheduleStore.markRun(taskId, true);
-          cleanupIfTaskWasAutoRemoved(task);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: { id: taskId, runAt: Date.now(), status: 'ok' },
-          });
-          emitScheduleFiredHook(task, 'ok');
-        })
+        .then(outcome => recordDispatchOutcome(task, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
           scheduleStore.markRun(taskId, false, err.message);
@@ -783,7 +799,7 @@ export function getNextRun(id: string): Date | null {
 /**
  * Fire a scheduled task immediately. Returns ok=false if id not found or the
  * scheduler hasn't been initialised with an executeCallback yet.  Emits a
- * `schedule.fired` event on completion (success or error).
+ * `schedule.fired` event on completion (success, skip or error).
  */
 export function runNow(id: string): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
@@ -801,15 +817,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
   void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
-    () => {
-      scheduleStore.markRun(task.id, true);
-      cleanupIfTaskWasAutoRemoved(task);
-      dashboardEventBus.publish({
-        type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'ok' },
-      });
-      emitScheduleFiredHook(task, 'ok');
-    },
+    outcome => recordDispatchOutcome(task, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
       scheduleStore.markRun(task.id, false, msg);

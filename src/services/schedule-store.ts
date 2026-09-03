@@ -678,6 +678,21 @@ export function updateTask(
   }, appId);
 }
 
+/** Record a skipped check without consuming a run or disabling a one-shot. */
+export function markSkipped(id: string, nextRunAt?: string): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+
+    task.lastRunAt = new Date().toISOString();
+    task.lastStatus = 'skipped';
+    task.lastError = undefined;
+    task.lastDeliveryError = undefined;
+    if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
+    return { result: undefined, changed: true };
+  });
+}
+
 /**
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
