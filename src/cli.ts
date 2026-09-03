@@ -153,6 +153,7 @@ import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/bi
 import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
+  DASHBOARD_LOCAL_TOKEN_FLAG,
   dashboardComingUpFromState,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
@@ -3364,9 +3365,12 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
     if (last.ok) {
-      console.log(`   面板: botmux dashboard (${last.url})`);
-      // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
-      if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
+      // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
+      // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
+      // 这段输出会被大模型读进上下文，所以第一行之外的安全提示也一起给。
+      const [primary, ...rest] = formatDashboardSuccessLines(last);
+      console.log(`   面板: botmux dashboard (${primary})`);
+      for (const line of rest) console.log(`   ${line}`);
       return;
     }
     const keepWaiting = shouldKeepWaitingForDashboard({
@@ -3395,8 +3399,9 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const rawAction = args[0]?.toLowerCase();
-  const resolvesEndpoint = args.length <= 1
+  const positional = args.filter(arg => arg !== DASHBOARD_LOCAL_TOKEN_FLAG);
+  const rawAction = positional[0]?.toLowerCase();
+  const resolvesEndpoint = positional.length <= 1
     && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
     && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
   if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
@@ -3418,9 +3423,10 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
-    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
-    for (const line of formatDashboardSuccessLines(r)) console.log(line);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、本地直连
+    // 兜底（默认隐藏，带 token）、以及给 AI 读的安全提示。绑定中心化平台后首行不再
+    // 带 token —— 行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r, execution.showLocalTokenLink)) console.log(line);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');

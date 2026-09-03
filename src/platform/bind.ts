@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { readPlatformBinding, writePlatformBinding } from './binding.js';
 import { postJson, type PostJsonResult } from './platform-http.js';
 import { callDashboard } from '../cli/dashboard-endpoint.js';
+import { formatDashboardSuccessLines } from '../cli/dashboard-command.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
 import { isManagedAgentHostCommandContext } from './host-command-context.js';
 
@@ -150,9 +151,12 @@ export async function cmdBind(
       path: '/__cli/current',
     });
     if (cur.ok) {
-      console.log(`  面板: ${cur.url}`);
-      // 附带本地直连兜底：中心化平台异常时仍可直接 ip:port 访问 dashboard。
-      if (cur.localUrl) console.log(`  本地直连(平台异常时可用): ${cur.localUrl}`);
+      // 刚绑完平台 ⇒ 主链接不带 token（token 在平台身份下被压制成无效，只剩泄漏
+      // 价值）；本地直连那条带 token，默认隐藏。与 `botmux dashboard` 同一套收敛，
+      // 见 cli/dashboard-command.ts:formatDashboardSuccessLines。
+      const [primary, ...rest] = formatDashboardSuccessLines(cur);
+      console.log(`  面板: ${primary}`);
+      for (const line of rest) console.log(`  ${line}`);
     } else {
       console.log('  面板: 运行 `botmux dashboard` 获取中心化平台链接。');
     }

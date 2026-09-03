@@ -21,6 +21,7 @@ import {
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   formatUrlHost,
+  stripDashboardToken,
   workbenchEntryUrl,
   workbenchSpaUrl,
 } from '../src/core/dashboard-url.js';
@@ -375,6 +376,41 @@ describe('workbench entry URL shapes', () => {
     for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
       expect(workbenchSpaUrl(bad)).toBeNull();
       expect(workbenchEntryUrl(bad)).toBeNull();
+    }
+  });
+});
+
+describe('stripDashboardToken', () => {
+  it('removes ?t= while keeping origin and path', () => {
+    expect(stripDashboardToken('https://m-abc.example/?t=secret')).toBe('https://m-abc.example/');
+    expect(stripDashboardToken('http://1.2.3.4:7891/?t=secret')).toBe('http://1.2.3.4:7891/');
+    expect(stripDashboardToken('https://m-abc.example/workbench?t=secret'))
+      .toBe('https://m-abc.example/workbench');
+  });
+
+  it('never leaves the token anywhere in the result', () => {
+    for (const url of [
+      'https://m-abc.example/?t=secret',
+      'https://m-abc.example/?t=secret#/agent-workbench',
+      'https://m-abc.example/workbench?t=secret&x=1',
+    ]) {
+      expect(stripDashboardToken(url)).not.toContain('secret');
+    }
+  });
+
+  // 只摘凭证，不清空查询串：将来可能有 next / 诊断开关等无害参数。
+  it('keeps other query params and the hash', () => {
+    expect(stripDashboardToken('https://m-abc.example/?t=secret&next=%2Fx#/agent-workbench'))
+      .toBe('https://m-abc.example/?next=%2Fx#/agent-workbench');
+  });
+
+  it('is a no-op on an already token-free URL', () => {
+    expect(stripDashboardToken('https://m-abc.example/')).toBe('https://m-abc.example/');
+  });
+
+  it('returns null for unparseable or non-http input instead of a half link', () => {
+    for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      expect(stripDashboardToken(bad)).toBeNull();
     }
   });
 });

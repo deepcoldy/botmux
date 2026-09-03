@@ -67,6 +67,24 @@ export function buildDashboardUrl(opts: { host: string; port: number | string; t
   return buildDashboardUrls(opts).url;
 }
 
+/**
+ * 去掉一条 Dashboard URL 上的 `?t=<token>`，保留 origin / 路径 / 其它查询参数。
+ *
+ * 用于「绑定中心化平台后不再把长期 token 印在链接上」：走平台子域时 token 对访问
+ * 毫无贡献（平台注入身份，`dashboard/request-identity.ts` 对 `platform-dashboard`
+ * 身份恒把 `presentedToken` 压成 undefined），只剩被复制 / 转发 / 截图时的泄漏
+ * 风险。不可解析时返回 null，调用方据此回退到原串，绝不拼出半截链接。
+ *
+ * 只删 `t`：其余查询参数（将来可能有的 `next`、诊断开关等）原样保留，因为这个函数
+ * 的职责是「摘掉凭证」，不是「清空查询串」。
+ */
+export function stripDashboardToken(dashboardUrl: string): string | null {
+  const u = parseHttpUrl(dashboardUrl);
+  if (!u) return null;
+  u.searchParams.delete('t');
+  return u.toString();
+}
+
 /** Agent Workbench 在 Dashboard SPA 里的 hash 路由（见 dashboard/web/dashboard-routes.ts）。 */
 export const WORKBENCH_HASH_ROUTE = '#/agent-workbench';
 

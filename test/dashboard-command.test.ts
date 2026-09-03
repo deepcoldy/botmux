@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  DASHBOARD_COMMAND_USAGE,
+  DASHBOARD_LINK_SAFETY_HINT,
+  DASHBOARD_LOCAL_TOKEN_FLAG,
   executeDashboardCommand,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
@@ -37,6 +40,7 @@ describe('executeDashboardCommand', () => {
       kind: 'endpoint',
       action: 'current',
       result: { ok: true, url: 'https://dashboard.test/?t=synthetic-created-token' },
+      showLocalTokenLink: false,
     });
   });
 
@@ -68,7 +72,9 @@ describe('executeDashboardCommand', () => {
 
     expect(callEndpoint).toHaveBeenCalledOnce();
     expect(callEndpoint).toHaveBeenCalledWith('/__cli/current');
-    expect(result).toEqual({ kind: 'endpoint', action: 'current', result: currentFailure });
+    expect(result).toEqual({
+      kind: 'endpoint', action: 'current', result: currentFailure, showLocalTokenLink: false,
+    });
   });
 
   it('falls back to legacy rotate only after current confirms a dashboard with no token and ensure is missing', async () => {
@@ -101,6 +107,7 @@ describe('executeDashboardCommand', () => {
       kind: 'endpoint',
       action: 'current',
       result: { ok: true, url: 'https://dashboard.test/?t=legacy-token' },
+      showLocalTokenLink: false,
     });
   });
 
@@ -182,7 +189,9 @@ describe('executeDashboardCommand', () => {
       '/__cli/current',
       '/__cli/ensure',
     ]);
-    expect(result).toEqual({ kind: 'endpoint', action: 'current', result: ensureFailure });
+    expect(result).toEqual({
+      kind: 'endpoint', action: 'current', result: ensureFailure, showLocalTokenLink: false,
+    });
   });
 
   it('rotates only when explicitly requested', async () => {
@@ -253,17 +262,76 @@ describe('formatDashboardFallbackFailure', () => {
   });
 });
 
+// ─── 隐藏参数的解析（新增行为）────────────────────────────────────────────────
+describe('executeDashboardCommand + the hidden local-token flag', () => {
+  const okCurrent = async () => ({
+    ok: true as const,
+    url: 'https://m-abc.platform.test/?t=tok-abc',
+    localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+  });
+
+  it('defaults to NOT showing the token link', async () => {
+    const r = await executeDashboardCommand([], okCurrent);
+    expect(r).toMatchObject({ kind: 'endpoint', showLocalTokenLink: false });
+  });
+
+  it('sets the opt-in when the exact flag is passed', async () => {
+    const r = await executeDashboardCommand([DASHBOARD_LOCAL_TOKEN_FLAG], okCurrent);
+    expect(r).toMatchObject({ kind: 'endpoint', action: 'current', showLocalTokenLink: true });
+  });
+
+  // 回归：flag 必须在「至多一个 positional」检查之前被摘掉，否则这条安全参数会把
+  // 它本该守护的命令直接判成 invalid。
+  it.each(['current', 'rotate'])('combines with the %s subcommand instead of becoming invalid', async (sub) => {
+    const calls: string[] = [];
+    const r = await executeDashboardCommand([sub, DASHBOARD_LOCAL_TOKEN_FLAG], async (path) => {
+      calls.push(path);
+      return { ok: true as const, url: 'https://d.test/?t=x' };
+    });
+    expect(r.kind).toBe('endpoint');
+    expect(r).toMatchObject({ action: sub, showLocalTokenLink: true });
+    expect(calls[0]).toBe(sub === 'rotate' ? '/__cli/rotate' : '/__cli/current');
+  });
+
+  it('accepts the flag before the subcommand too', async () => {
+    const r = await executeDashboardCommand([DASHBOARD_LOCAL_TOKEN_FLAG, 'rotate'], async () => ({
+      ok: true as const, url: 'https://d.test/?t=x',
+    }));
+    expect(r).toMatchObject({ kind: 'endpoint', action: 'rotate', showLocalTokenLink: true });
+  });
+
+  // 近似拼写不能静默放行 token —— 宁可报 invalid 让人看见，也不要「差不多就给」。
+  it('rejects a near-miss spelling rather than silently printing the token', async () => {
+    const callEndpoint = vi.fn();
+    const r = await executeDashboardCommand(['--i-am-the-owner-show-token-links'], callEndpoint);
+    expect(r.kind).toBe('invalid');
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('help still wins over the flag, and reaches no endpoint', async () => {
+    const callEndpoint = vi.fn();
+    expect(await executeDashboardCommand(
+      [DASHBOARD_LOCAL_TOKEN_FLAG, '--help'], callEndpoint,
+    )).toEqual({ kind: 'help' });
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+});
+
 describe('formatDashboardSuccessLines', () => {
-  it('prints the bare URL first, then the workbench entry on its own line', () => {
+  // 无 `localUrl` = 没有远程基址（未绑平台、无自建反代）。那时 token 是唯一入口，
+  // 必须原样保留 —— 去掉它，`http://ip:port/` 只是静态壳，SPA 探 /api/settings 拿
+  // 401，而 401 上的登录出口 `x-botmux-login-url` 未绑定时根本不生成。
+  it('LOCAL-ONLY: keeps the token — it is the only way in when no platform is bound', () => {
     const lines = formatDashboardSuccessLines({
       ok: true,
       url: 'http://10.0.0.7:7891/?t=tok-abc',
     });
 
-    expect(lines).toEqual([
-      'http://10.0.0.7:7891/?t=tok-abc',
-      '工作台: http://10.0.0.7:7891/workbench?t=tok-abc',
-    ]);
+    expect(lines[0]).toBe('http://10.0.0.7:7891/?t=tok-abc');
+    // 有 token 时用无 fragment 的 /workbench（复制粘贴不会被截断）。
+    expect(lines[1]).toBe('工作台: http://10.0.0.7:7891/workbench?t=tok-abc');
+    // 没有远程基址 ⇒ 没有「本地直连」这一行可隐藏。
+    expect(lines.some(l => l.includes('本地直连'))).toBe(false);
   });
 
   it('keeps line 0 a bare URL — the scripting contract (`botmux dashboard | head -1`)', () => {
@@ -274,28 +342,70 @@ describe('formatDashboardSuccessLines', () => {
     });
 
     // No label, no prefix, and parseable as-is.
-    expect(lines[0]).toBe('https://m-abc.platform.test/?t=tok-abc');
     expect(() => new URL(lines[0])).not.toThrow();
     expect(lines[0]).not.toContain('工作台');
+    expect(lines[0]).not.toContain(' ');
   });
 
-  it('derives the workbench entry from the SAME origin+token as the primary URL', () => {
-    // Remote-access on: the primary URL is the platform machine subdomain, so
-    // the workbench entry must follow it there rather than leaking host:port.
+  // ─── 绑定中心化平台 / 自建反代后：主链接不带 token ────────────────────────
+  // `localUrl` 有值就是「远程基址已生效」这一位（见 dashboard-url.ts）。走平台时
+  // token 被 request-identity 压制成 undefined、对访问零贡献，只剩泄漏价值。
+  it('REMOTE-BACKED: strips ?t= from the primary link and from the workbench entry', () => {
     const lines = formatDashboardSuccessLines({
       ok: true,
       url: 'https://m-abc.platform.test/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
     });
 
-    expect(lines).toEqual([
-      'https://m-abc.platform.test/?t=tok-abc',
-      '工作台: https://m-abc.platform.test/workbench?t=tok-abc',
-      '本地直连(平台异常时可用): http://10.0.0.7:7891/?t=tok-abc',
-    ]);
+    expect(lines[0]).toBe('https://m-abc.platform.test/');
+    // 无凭证形态必须走 hash 路由：`/workbench` 不在静态壳白名单里，token-free
+    // 访问是 401 死链（实测平台身份下同样 401）。
+    expect(lines[1]).toBe('工作台: https://m-abc.platform.test/#/agent-workbench');
+    // 整段输出里不得再出现 token —— 这是本次改动的核心断言。
+    expect(lines.join('\n')).not.toContain('tok-abc');
+  });
+
+  it('REMOTE-BACKED: hides the token-bearing local link behind the explicit flag', () => {
+    const result = {
+      ok: true as const,
+      url: 'https://m-abc.platform.test/?t=tok-abc',
+      localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    };
+
+    const hidden = formatDashboardSuccessLines(result);
+    const local = hidden.find(l => l.includes('本地直连'));
+    // 该行仍在（人需要知道存在这条路），但链接本体不打印，且提示了参数名。
+    expect(local).toBeDefined();
+    expect(local).not.toContain('tok-abc');
+    expect(local).toContain(DASHBOARD_LOCAL_TOKEN_FLAG);
+
+    const shown = formatDashboardSuccessLines(result, true);
+    expect(shown).toContain('本地直连(平台异常时可用): http://10.0.0.7:7891/?t=tok-abc');
+    // 显式索取时也要挨一句警告。
+    expect(shown.join('\n')).toContain('等同管理员密码');
+  });
+
+  it('always appends the AI-facing safety hint, naming both leak conditions', () => {
+    for (const result of [
+      { ok: true as const, url: 'http://10.0.0.7:7891/?t=tok-abc' },
+      { ok: true as const, url: 'https://m-abc.platform.test/?t=tok-abc', localUrl: 'http://10.0.0.7:7891/?t=tok-abc' },
+    ]) {
+      const text = formatDashboardSuccessLines(result).join('\n');
+      expect(text).toContain(DASHBOARD_LINK_SAFETY_HINT);
+      expect(text).toContain('owner');
+      expect(text).toContain('多人群');
+    }
+  });
+
+  // 隐藏参数不进 help：写进去等于邀请模型「既然有这个参数那就加上」。
+  it('keeps the token-link flag OUT of the usage text', () => {
+    expect(DASHBOARD_COMMAND_USAGE).not.toContain(DASHBOARD_LOCAL_TOKEN_FLAG);
+    expect(DASHBOARD_COMMAND_USAGE).not.toContain('token-link');
   });
 
   it('omits the workbench line rather than printing a half-built link', () => {
-    expect(formatDashboardSuccessLines({ ok: true, url: 'not-a-url' })).toEqual(['not-a-url']);
+    const lines = formatDashboardSuccessLines({ ok: true, url: 'not-a-url' });
+    expect(lines[0]).toBe('not-a-url');
+    expect(lines.some(l => l.startsWith('工作台'))).toBe(false);
   });
 });
