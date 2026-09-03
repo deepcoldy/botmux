@@ -1,0 +1,236 @@
+/* ═══════════════════════════════════════════════════════════════════
+   Botmux Design Tokens — Calm Console
+   加载在 style.css 之后，覆盖旧 token 值并新增设计系统 token。
+   所有页面通过 var() 引用，改这里 = 改全站。
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── 颜色：表面层 ── */
+  --bg: #f4f5f8;
+  --bg-soft: #eceef4;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-muted: #f7f8fa;
+  --surface-subtle: #f7f8fa;
+  --surface-hover: #f3f4f8;
+
+  /* ── 颜色：文字 ── */
+  --fg: #1a2233;
+  --muted: #566078;
+  --faint: #8a92a8;
+  --fg-2: #566078;
+  --fg-3: #8a92a8;
+  --fg-4: #b0b6c6;
+
+  /* ── 颜色：边框 ── */
+  --border: #e3e6ee;
+  --border-soft: #eceef4;
+  --border-subtle: #eceef4;
+  --border-strong: #c8cedb;
+
+  /* ── 颜色：品牌 ── */
+  --accent: #4f56e8;
+  --accent-strong: #4047de;
+  --accent-hover: #4047de;
+  --accent-bright: #8b91ff;
+  --accent-soft: #eef0fe;
+  --accent-border: #c5caf8;
+  --on-accent: #ffffff;
+  --brand-accent: #4f56e8;
+  --brand-accent-strong: #4047de;
+  --brand-accent-bright: #8b91ff;
+
+  /* ── 颜色：语义 ── */
+  --success: #1d9a63;
+  --success-soft: #e4f5ed;
+  --warning: #c07a12;
+  --warning-soft: #fbf1de;
+  --danger: #d83a48;
+  --danger-soft: #fcebed;
+  --info: #2b7bd8;
+  --info-soft: #e8f1fc;
+  --on-danger: #ffffff;
+
+  /* ── 颜色：会话状态 ── */
+  --st-need: #cf8413;
+  --st-need-soft: #fbf0da;
+  --st-work: #3b6fe0;
+  --st-work-soft: #e9f0fd;
+  --st-todo: #7a6fd0;
+  --st-todo-soft: #efedfc;
+  --st-idle: #8a92a8;
+  --st-idle-soft: #f0f2f7;
+
+  /* ── 字号（7 档） ── */
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-17: 17px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+
+  /* ── 字重（3 档） ── */
+  --fw-r: 400;
+  --fw-m: 500;
+  --fw-s: 600;
+
+  /* ── 行高（3 档） ── */
+  --lh-tight: 1.25;
+  --lh-title: 1.35;
+  --lh-body: 1.55;
+
+  /* ── 间距（4px 基准） ── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* ── 圆角（4 档） ── */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 999px;
+  --radius-xs: var(--radius-sm);
+  --radius: var(--radius-md);
+
+  /* ── 阴影（3 档） ── */
+  --sh-sm: 0 1px 2px rgba(18, 26, 44, .05);
+  --sh-md: 0 2px 8px rgba(18, 26, 44, .05), 0 8px 24px rgba(18, 26, 44, .06);
+  --sh-lg: 0 8px 32px rgba(18, 26, 44, .14);
+  --shadow: 0 18px 44px rgba(15, 23, 42, .08);
+  --modal-shadow: 0 24px 80px rgba(0, 0, 0, .25);
+  --modal-backdrop: rgba(10, 14, 18, .48);
+
+  /* ── 动效（2 档） ── */
+  --t-fast: 120ms ease-out;
+  --t-norm: 180ms ease-out;
+
+  /* ── 布局 ── */
+  --topbar-h: 56px;
+  --sidebar-w: 248px;
+  --button-height: 32px;
+  --button-compact-height: 28px;
+  --button-padding-x: 14px;
+
+  /* ── 字体 ── */
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", "Noto Sans SC", "Segoe UI", Inter, system-ui, sans-serif;
+  --sans: var(--font);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --font-mono: var(--mono);
+
+  /* ── 终端 ── */
+  --term-bg: #14181f;
+  --term-fg: #a8b3c7;
+
+  /* ── z-index 尺度 ── */
+  --z-base: 0;
+  --z-sticky: 100;
+  --z-drawer: 800;
+  --z-modal: 900;
+  --z-toast: 1000;
+}
+
+/* ═══ 暗色主题（纯 token 切换） ═══ */
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-soft: #0e141d;
+  --surface: #151b26;
+  --surface-raised: #1b2330;
+  --surface-muted: #121821;
+  --surface-subtle: #121821;
+  --surface-hover: #1c2431;
+
+  --fg: #dde4f0;
+  --muted: #99a4b8;
+  --faint: #69748a;
+  --fg-2: #99a4b8;
+  --fg-3: #69748a;
+  --fg-4: #4c566a;
+
+  --border: #26303f;
+  --border-soft: #1e2734;
+  --border-subtle: #1e2734;
+  --border-strong: #3a4658;
+
+  --accent: #7b82f5;
+  --accent-strong: #8d93f7;
+  --accent-hover: #8d93f7;
+  --accent-bright: #a5aaf8;
+  --accent-soft: rgba(123, 130, 245, .13);
+  --accent-border: rgba(123, 130, 245, .32);
+  --on-accent: #10131f;
+  --brand-accent: #7b82f5;
+  --brand-accent-strong: #8d93f7;
+  --brand-accent-bright: #a5aaf8;
+
+  --success: #4cc38a;
+  --success-soft: rgba(76, 195, 138, .12);
+  --warning: #d99e3f;
+  --warning-soft: rgba(217, 158, 63, .12);
+  --danger: #e56270;
+  --danger-soft: rgba(229, 98, 112, .12);
+  --info: #5b9ce0;
+  --info-soft: rgba(91, 156, 224, .12);
+  --on-danger: #10131f;
+
+  --st-need: #d99e3f;
+  --st-need-soft: rgba(217, 158, 63, .12);
+  --st-work: #6b96e8;
+  --st-work-soft: rgba(107, 150, 232, .12);
+  --st-todo: #9a8fe0;
+  --st-todo-soft: rgba(154, 143, 224, .12);
+  --st-idle: #69748a;
+  --st-idle-soft: rgba(140, 150, 170, .09);
+
+  --sh-sm: 0 1px 2px rgba(0, 0, 0, .3);
+  --sh-md: 0 2px 8px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+  --sh-lg: 0 8px 32px rgba(0, 0, 0, .5);
+  --shadow: 0 18px 44px rgba(0, 0, 0, .28);
+  --modal-shadow: 0 24px 80px rgba(0, 0, 0, .52);
+  --modal-backdrop: rgba(0, 0, 0, .62);
+
+  --term-bg: #0b0e13;
+}
+
+/* ═══ 基础排版 ═══ */
+html {
+  font-size: var(--fs-13);
+}
+body {
+  font-family: var(--font);
+  font-size: var(--fs-13);
+  line-height: var(--lh-body);
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ═══ 滚动条 ═══ */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-full);
+  border: 3px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--fg-4); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ═══ 焦点 ═══ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ═══ 选中 ═══ */
+::selection { background: var(--accent-soft); }

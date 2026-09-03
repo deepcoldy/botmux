@@ -33,7 +33,9 @@ function seedPlatformTeam(): void {
     rev: 'r1',
     teams: [{
       teamId: 't1', teamName: 'T1', groupChatIds: ['oc_hall', 'oc_group'],
-      bots: [{ appId: 'cli_peer', unionId: 'on_peer', name: 'Peer' }],
+      // 本 bot pf1 也在团队 bots roster 里 —— teamMember 腿现在锚在「本 bot ∈ 同队 bots」，
+      // 不再看 chatId。cli_peer 是同队的另一个 bot（teamBot 腿用）。
+      bots: [{ appId: 'cli_peer', unionId: 'on_peer', name: 'Peer' }, { appId: 'pf1', unionId: 'on_pf1', name: 'Self' }],
       memberUnionIds: ['on_teammate'],
     }],
   });
@@ -82,8 +84,8 @@ describe('evaluateTalk teamBot leg (quota gate end-to-end hole fix)', () => {
   });
 });
 
-describe('evaluateTalk teamMember leg (human 免grant, talk-only, chat-scoped)', () => {
-  it('allows a team member (human) TALK inside a team group via memberUnionId', () => {
+describe('evaluateTalk teamMember leg (human 免grant, talk-only, team-co-membership-scoped)', () => {
+  it('allows a team member (human) TALK when sender & bot share a platform team, via memberUnionId', () => {
     seedPlatformTeam();
     // 人的 union 走第 5 参 memberUnionId，不进 bot-trust（第 4 参）
     const ev = evaluateTalk('pf1', 'oc_group', 'ou_tp', undefined, 'on_teammate');
@@ -91,9 +93,12 @@ describe('evaluateTalk teamMember leg (human 免grant, talk-only, chat-scoped)',
     expect(ev.reason).toBe('teamMember');
   });
 
-  it('is chat-scoped: same member NOT allowed outside the team groups', () => {
+  it('is NOT chat-scoped: same member allowed in ANY chat, incl. 未登记的手动/原生 invite 群', () => {
     seedPlatformTeam();
-    expect(evaluateTalk('pf1', 'oc_random', 'ou_tp', undefined, 'on_teammate').allowed).toBe(false);
+    // oc_random 不在 groupChatIds 里（手动建群 / 原生 invite 场景）——照样免 grant
+    const ev = evaluateTalk('pf1', 'oc_random', 'ou_tp', undefined, 'on_teammate');
+    expect(ev.allowed).toBe(true);
+    expect(ev.reason).toBe('teamMember');
   });
 
   it('member union in the bot-trust slot must NOT grant operate (talk-only leg)', () => {

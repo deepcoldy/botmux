@@ -37,7 +37,7 @@ describe('worker pipe initial screen ordering', () => {
       source.indexOf("case 'close':"),
       source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
     // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
     // send() is dropped when process.exit(0) wedges in node-pty's native exit
@@ -448,8 +448,10 @@ describe('worker pipe initial screen ordering', () => {
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
     // Two additional checks normalize nested spawn failures before the three
-    // restart/init/message handlers consume them.
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    // restart/init/message handlers consume them; plus the generational-race
+    // provenance commit re-throws a superseded spawn instead of tearing down
+    // (the commit-fail path must not swallow CliSpawnSupersededError).
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(6);
     const restartHandler = source.slice(
       source.indexOf('async function restartCliProcess('),
       source.indexOf('// ─── HTTP + WebSocket Server'),
@@ -692,7 +694,7 @@ describe('worker pipe initial screen ordering', () => {
     const helper = source.slice(helperStart, helperEnd);
 
     expect(helperStart).toBeGreaterThan(-1);
-    expect(helper).toContain('if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;');
+    expect(helper).toContain('if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || (!be.captureCurrentScreen && !be.captureViewport && !cliAdapter?.isSessionBusy)) return;');
     expect(helper).toContain('if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;');
     expect(helper).not.toContain('pendingMessages.length > 0');
   });

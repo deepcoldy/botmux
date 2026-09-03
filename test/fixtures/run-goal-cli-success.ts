@@ -59,4 +59,5 @@ process.exitCode = await cmdGoal('run', [
   makeRunNode: () => runNode,
   validateManifest,
   readValidatedManifest: readAndValidateManifest,
+  env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
 });

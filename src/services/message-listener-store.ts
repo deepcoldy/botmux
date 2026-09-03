@@ -9,6 +9,7 @@ export type MessageListenerUpdate = {
   prompt: string;
   senderPolicy?: MessageListenerConfig['senderPolicy'];
   messagePolicy?: MessageListenerConfig['messagePolicy'];
+  contentPolicy?: MessageListenerConfig['contentPolicy'];
 };
 
 function stringList(raw: unknown): string[] | undefined {
@@ -77,6 +78,22 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const includeMsgTypes = stringList(rawMessage.includeMsgTypes);
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
 
+  const rawContent = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
+    ? entry.contentPolicy as Record<string, unknown>
+    : undefined;
+  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  if (rawContent) {
+    const includeKeywords = stringList(rawContent.includeKeywords);
+    // V1 is keyword-substring only (no regexes on the daemon main loop — see
+    // the contentPolicy type doc in bot-registry).
+    if (includeKeywords) {
+      contentPolicy = {
+        includeKeywords,
+        ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+      };
+    }
+  }
+
   return {
     enabled,
     ...(name ? { name } : {}),
@@ -85,6 +102,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     prompt,
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
+    ...(contentPolicy ? { contentPolicy } : {}),
   };
 }
 
@@ -134,6 +152,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     prompt: patch.prompt,
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }

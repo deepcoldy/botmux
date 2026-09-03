@@ -3,8 +3,11 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, m
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
+vi.mock('node:child_process', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
     execFileSync: vi.fn(),
@@ -21,6 +24,7 @@ import {
   parseZmxShortList,
   tmuxKeyToBytes,
   zmxControlEnv,
+  zmxFreshSessionEnv,
   ZmxBackend,
 } from '../src/adapters/backend/zmx-backend.js';
 import {
@@ -500,6 +504,34 @@ describe('zmx backend pure helpers', () => {
     expect(controlEnv.SAFE_FLAG).toBeUndefined();
     expect(controlEnv.ZMX_SESSION).toBeUndefined();
     expect(controlEnv.PATH).toContain('/bin');
+  });
+
+  it('pins TERM in the fresh-session create client env (zmx sessions inherit it verbatim)', () => {
+    const opts = {
+      cwd: '/tmp/work',
+      cols: 80,
+      rows: 24,
+      env: { PATH: '/bin', BOTMUX_SESSION_ID: 'session-secret' },
+    };
+    // No TERM inherited (the pm2-boundary scrub removed it from the
+    // daemon/worker env): the pin supplies the constant instead of leaving
+    // the whole session TERM-less — CLIs would fail supports-color detection
+    // and render colorless.
+    const env = zmxFreshSessionEnv(opts);
+    expect(env.TERM).toBe('xterm-256color');
+    // Still a control-env superset: payload-delivered keys stay stripped.
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+    // An inherited invoker TERM is overridden by the same constant every
+    // other backend PTY already forces — deterministic, invoker-independent.
+    expect(zmxFreshSessionEnv({ ...opts, env: { PATH: '/bin', TERM: 'xterm-ghostty' } }).TERM)
+      .toBe('xterm-256color');
+    // Source pin: only the one-shot create client (whose env becomes the
+    // session env) spawns with the pinned env; control clients (get/set/
+    // list/kill) keep the unpinned zmxControlEnv.
+    const src = readFileSync(new URL('../src/adapters/backend/zmx-backend.ts', import.meta.url), 'utf-8');
+    const spawnAt = src.indexOf("spawnSync('zmx', buildFreshAttachArgs(");
+    expect(spawnAt).toBeGreaterThan(-1);
+    expect(src.slice(spawnAt, src.indexOf('});', spawnAt))).toContain('env: zmxFreshSessionEnv(opts)');
   });
 
   it('keeps the POSIX ZMX payload path sourced through the user shell with the argv sentinel', () => {

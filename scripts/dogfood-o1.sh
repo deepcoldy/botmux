@@ -17,7 +17,7 @@ CLI="$ROOT/dist/cli.js"
 WORKFLOW_FILE="$ROOT/workflows/o1-canary.workflow.json"
 
 if [[ ! -f "$CLI" ]]; then
-  echo "dist/cli.js 不存在，先跑 pnpm build" >&2
+  echo "dist/cli.js 不存在，先跑 bun run build" >&2
   exit 1
 fi
 if [[ ! -f "$WORKFLOW_FILE" ]]; then

@@ -93,6 +93,12 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
       .filter((e: any) => e.tag === 'interactive_container')
       .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
 
+  it('uses Card JSON 2.0 fill width instead of the legacy wide-screen field', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en'));
+    expect(card.schema).toBe('2.0');
+    expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+  });
+
   it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
@@ -110,9 +116,10 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
+    expect(texts[0]).not.toContain('Session ID:');
   });
 
-  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+  it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],
       'om_root',
@@ -121,10 +128,23 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
-    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('distinguishes otherwise identical history candidates without showing their session ids', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', [
+      { cliSessionId: 'hidden-one', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+      { cliSessionId: 'hidden-two', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+    ]));
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain('Candidate: #1');
+    expect(texts[1]).toContain('Candidate: #2');
+    expect(JSON.stringify(texts)).not.toContain('hidden-one');
+    expect(JSON.stringify(texts)).not.toContain('hidden-two');
   });
 
   it('uses a configured runtime name for both live and resume rows', () => {
@@ -452,7 +472,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(quotaEdit.text.content).toBe('Set message quota');
-    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(text).toContain('Default: grant card 3 / Oncall unmetered');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -463,7 +483,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(text).toContain(`${current} messages per person on grant cards (Oncall unmetered)`);
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -474,7 +494,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -499,7 +519,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(input.default_value).toBe('');
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
   });
 });
 
@@ -910,6 +930,26 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
+    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).not.toContain('等待输入');
+    });
+
+    it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
@@ -1261,17 +1301,20 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
+      // （没有 turn 在跑），handler 侧只要求 worker 活着。
+      expect(actions.map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
     });
@@ -1283,6 +1326,55 @@ describe('buildStreamingCard', () => {
 
       expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
       expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+    });
+  });
+
+  // ── Writable terminal link (writableTerminalLinkInCard opt-in) ──────────
+
+  describe('writable terminal link', () => {
+    const WURL = 'https://example.com/writable?token=secret';
+
+    const buildWithWritable = (locale: 'zh' | 'en' = 'zh') => parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+      undefined, undefined, false, false, locale, undefined, WURL,
+    ));
+
+    const allActionButtons = (card: any): any[] =>
+      card.elements.filter((e: any) => e.tag === 'action').flatMap((row: any) => row.actions);
+
+    it('renders the writable URL as a primary URL button instead of a raw markdown link', () => {
+      const card = buildWithWritable();
+      // No markdown element carries the token URL (the previous shape rendered
+      // the long URL as a raw markdown link blob).
+      const mdLinks = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(mdLinks.every((m: any) => !m.content.includes('?token='))).toBe(true);
+
+      const writableBtn = allActionButtons(card).find((a: any) => a.multi_url?.url.includes('?token='));
+      expect(writableBtn).toBeDefined();
+      expect(writableBtn.type).toBe('primary');
+      expect(writableBtn.text.content).toContain('可操作');
+      expectDirectUrl(writableBtn.multi_url.url, WURL);
+      expectDirectUrl(writableBtn.multi_url.pc_url, WURL);
+      expect(writableBtn.multi_url.android_url).toBe(WURL);
+      expect(writableBtn.multi_url.ios_url).toBe(WURL);
+    });
+
+    it('keeps the group-visible warning as a note under the button (zh + en)', () => {
+      const zh = buildWithWritable('zh');
+      const zhNote = zh.elements.find((e: any) => e.tag === 'note');
+      expect(zhNote).toBeDefined();
+      expect(JSON.stringify(zhNote)).toContain('群内可见');
+
+      const en = buildWithWritable('en');
+      const enNote = en.elements.find((e: any) => e.tag === 'note');
+      expect(enNote).toBeDefined();
+      expect(JSON.stringify(enNote)).toContain('visible to everyone');
+    });
+
+    it('omits the writable button and warning when no writable URL is set', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
+      expect(allActionButtons(card).some((a: any) => a.multi_url?.url.includes('?token='))).toBe(false);
+      expect(card.elements.some((e: any) => e.tag === 'note')).toBe(false);
     });
   });
 
@@ -1662,6 +1754,34 @@ describe('buildSessionClosedCard', () => {
     const md = findMarkdownContent(card);
     expect(md).toContain('不支持');
     expect(md).not.toMatch(/```/);
+  });
+
+  it('warns that resume starts a FRESH session when resumeStartsFresh is set', () => {
+    // Copilot/Kimi without a persisted cliSessionId: resuming reactivates the
+    // topic route, but the next spawn starts a fresh session — the card must
+    // not imply history is restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-fresh', 'om_root', 'topic', 'copilot', undefined, null, 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('新起干净会话');
+    expect(md).toContain('重新激活');
+    // The generic "可在飞书内 resume" line must NOT appear — it implies the
+    // CLI history comes back.
+    expect(md).not.toContain('可在飞书内 resume');
+    expect(md).not.toMatch(/```/);
+  });
+
+  it('does not show the fresh-session warning when a precise resume command exists', () => {
+    // resumeStartsFresh is only meaningful in the no-command branch; with a
+    // precise command the history really will be restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-cmd', 'om_root', 'topic', 'cursor', undefined,
+      'cursor-agent --resume chat-1', 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain('新起干净会话');
   });
 
   it('emits a Resume button targeting the closed sessionId', () => {
@@ -2116,4 +2236,34 @@ describe('buildPrivateSnapshotCard', () => {
     const note = card.elements.find((e: any) => e.tag === 'note');
     expect(JSON.stringify(note)).toContain('🔒');
   });
+});
+
+describe('remote backends get no PTY quick-action keys', () => {
+  /** The 11 quick-action buttons only make sense with a local terminal. */
+  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+
+  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
+    const card = buildStreamingCard(
+      'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
+      cliId as never,
+      'screenshot' as never,
+    );
+    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+  }
+
+  it('renders them for a local CLI', () => {
+    // Guards the negative assertions below: if the buttons stopped being rendered
+    // at all, those would pass for the wrong reason.
+    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  });
+
+  for (const cliId of ['riff', 'mojo'] as const) {
+    it(`hides them for ${cliId}`, () => {
+      // A remote backend has no terminal to drive, so these clicks are silently
+      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
+      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
+      // the next remote CLI cannot regress this the same way.
+      expect(keysIn(cliId)).toEqual([]);
+    });
+  }
 });

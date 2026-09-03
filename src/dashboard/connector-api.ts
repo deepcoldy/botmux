@@ -103,6 +103,27 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   return { dedupKey: r.dedupKey.trim() };
 }
 
+/** Inbound idempotency config. Both knobs are optional and the whole object is
+ *  omitted when neither is set, so existing stores stay byte-identical (and
+ *  header/query carriage needs no config at all — it is always honoured). An
+ *  invalid `keyPath` is dropped rather than rejected: the field only ADDS a
+ *  carriage option, so a typo must not make an otherwise-valid connector
+ *  unsavable. Path syntax matches the dedupKey extractor's own grammar. */
+function normalizeIdempotency(v: unknown): ConnectorDefinition['idempotency'] | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const rawPath = typeof r.keyPath === 'string' ? r.keyPath.trim() : '';
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafeSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const keyPath = rawPath && pathPattern.test(rawPath)
+    && (rawPath.startsWith('$.') ? rawPath.slice(2) : rawPath).split('.').every(s => !unsafeSegments.has(s))
+    ? rawPath
+    : undefined;
+  const disabled = r.disabled === true;
+  if (!keyPath && !disabled) return undefined;
+  return { ...(keyPath ? { keyPath } : {}), ...(disabled ? { disabled: true } : {}) };
+}
+
 function normalizeTopicMessage(
   value: unknown,
   prior: ConnectorDefinition['topicMessage'] | undefined,
@@ -306,6 +327,12 @@ function normalizeConnectorInput(
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
     lifecycleExtractors,
+    // Absent in the request → keep whatever the stored connector had (a PATCH
+    // that doesn't mention idempotency must not silently turn it off).
+    ...(() => {
+      const idempotency = c.idempotency === undefined ? prior?.idempotency : normalizeIdempotency(c.idempotency);
+      return idempotency ? { idempotency } : {};
+    })(),
     ...(rateLimitCleared ? {} : rateLimit && Object.keys(rateLimit).length > 0 ? {
       rateLimit: {
         windowSeconds: positiveInt(rateLimit.windowSeconds, prior?.rateLimit?.windowSeconds ?? 60, 1, 86_400),

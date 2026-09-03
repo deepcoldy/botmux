@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
@@ -10,6 +11,9 @@ import {
   OverviewListTail,
 } from './dashboard-components.js';
 import { chatDisplayTitle, loadNameMaps } from './ui.js';
+import { confirm } from './confirm-modal.js';
+import { toast } from './toast.js';
+import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 
 type ScheduleRow = Record<string, any> & { id: string };
 type ScheduleAction = 'run' | 'pause' | 'resume';
@@ -72,6 +76,91 @@ function repeatLabel(s: ScheduleRow): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+// ── 调度规则内联校验 ─────────────────────────────────────────────────────────
+// 镜像服务端 parseSchedule 可识别的格式族；cron 走 croner 全量校验并给出
+// 「下次执行」预览，其余格式做模式识别，无法识别才红——避免误杀服务端能解析的
+// 中文自然语言。服务端仍是最终校验者。
+
+type ScheduleCheck =
+  | { ok: true; preview?: string }
+  | { ok: false; error: string };
+
+const CRON_TEMPLATES: Array<{ label: string; expr: string }> = [
+  { label: '工作日 09:00', expr: '0 9 * * 1-5' },
+  { label: '每日 09:00', expr: '0 9 * * *' },
+  { label: '每周一 09:00', expr: '0 9 * * 1' },
+  { label: '每小时', expr: '0 * * * *' },
+];
+
+const DURATION_UNIT_MS: Record<string, number> = {
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+};
+
+export function checkSchedule(
+  input: string,
+  tr: ReturnType<typeof useT>,
+  timeZone?: string,
+): ScheduleCheck {
+  const s = input.trim();
+  if (!s) return { ok: false, error: tr('schedules.form.errEmpty') };
+
+  // 5 字段 cron：croner 全量校验 + 下次执行预览（在调度器时区计算，避免浏览器时区偏差）
+  const parts = s.split(/\s+/);
+  if (parts.length === 5 && parts.every(p => /^[\d*\-,/]+$/.test(p))) {
+    try {
+      const next = new Cron(s, timeZone ? { timezone: timeZone } : undefined).nextRun();
+      if (!next) return { ok: false, error: tr('schedules.form.errCron') };
+      return { ok: true, preview: fmtScheduleDate(next.toISOString(), timeZone) };
+    } catch {
+      return { ok: false, error: tr('schedules.form.errCron') };
+    }
+  }
+
+  // every N(m|h|d) — interval
+  let m = s.match(/^every\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i);
+  if (m) return { ok: true };
+
+  // N(m|h|d) — one-shot
+  m = s.match(/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i);
+  if (m) {
+    const ms = parseInt(m[1], 10) * (DURATION_UNIT_MS[m[2][0].toLowerCase()] ?? 60_000);
+    return { ok: true, preview: fmtScheduleDate(new Date(Date.now() + ms).toISOString(), timeZone) };
+  }
+
+  // ISO 时间戳 — one-shot
+  if (/^\d{4}-\d{2}-\d{2}(T| |$)/.test(s)) {
+    const dt = new Date(s);
+    if (!isNaN(dt.getTime())) {
+      return { ok: true, preview: fmtScheduleDate(dt.toISOString(), timeZone) };
+    }
+  }
+
+  // 中文自然语言（对齐服务端 parseChineseSchedule 的前缀族，含工作日变体）。
+  // `每天` 是早期版本和 /schedule 一直支持的存量写法，不能只接受 `每日`。
+  if (/^(每[天日]|每周[一二三四五六日天]|每月\d{1,2}[号日]|每\d+小时|每小时|每\d+分钟|\d+\s*分钟后|\d+\s*小时后|明天|每个?工作日|工作日每[天日])/.test(s)) {
+    return { ok: true };
+  }
+
+  return { ok: false, error: tr('schedules.form.errFormat') };
+}
+
+export function canSubmitSchedule(
+  input: string,
+  original: string | undefined,
+  tr: ReturnType<typeof useT>,
+  timeZone?: string,
+): boolean {
+  const normalized = input.trim();
+  if (!normalized) return false;
+  // Existing tasks may contain syntax authored by an older release. The
+  // server only re-parses schedule when it changes, so an unchanged legacy
+  // value must not prevent edits to the task's other fields.
+  if (original !== undefined && normalized === original.trim()) return true;
+  return checkSchedule(normalized, tr, timeZone).ok;
 }
 
 function ScheduleRowCard(props: {
@@ -180,6 +269,8 @@ function SchedulesPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ScheduleRow | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  // 每次打开表单时递增，强制 ScheduleFormModal 重挂载以重置全部表单状态
+  const [formNonce, setFormNonce] = useState(0);
   const [bots, setBots] = useState<Array<{ larkAppId: string; botName?: string }>>([]);
   const [, setNameMapsVersion] = useState(0);
 
@@ -247,26 +338,34 @@ function SchedulesPage() {
   function openCreate(): void {
     setEditing(null);
     setFormError(null);
+    setFormNonce(n => n + 1);
     setFormOpen(true);
   }
 
   function openEdit(s: ScheduleRow): void {
     setEditing(s);
     setFormError(null);
+    setFormNonce(n => n + 1);
     setFormOpen(true);
   }
 
   async function handleDelete(s: ScheduleRow): Promise<void> {
-    if (!window.confirm(tr('schedules.deleteConfirm'))) return;
+    const ok = await confirm({
+      title: tr('schedules.delete'),
+      message: tr('schedules.deleteConfirm'),
+      danger: true,
+      confirmLabel: tr('schedules.delete'),
+    });
+    if (!ok) return;
     const key = `${s.id}:delete`;
     setPending(key);
     try {
       const r = await fetch(`/api/schedules/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
-      showFeedback(key, 'success');
+      toast(tr('schedules.deleteDone'), { kind: 'success' });
     } catch {
-      showFeedback(key, 'error');
+      toast(tr('schedules.deleteFailed'), { kind: 'error' });
     } finally {
       setPending(cur => cur === key ? null : cur);
     }
@@ -320,6 +419,10 @@ function SchedulesPage() {
         throw new Error(body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
+      toast(
+        editing ? tr('schedules.saved') : tr('schedules.createDone'),
+        { kind: 'success' },
+      );
     } catch (err) {
       setFormError(err instanceof Error ? err.message : String(err));
     }
@@ -397,16 +500,17 @@ function SchedulesPage() {
           )}
         </div>
       </section>
-      {formOpen ? (
-        <ScheduleFormModal
-          editing={editing}
-          error={formError}
-          bots={bots}
-          tr={tr}
-          onClose={() => setFormOpen(false)}
-          onSubmit={data => void handleSubmit(data)}
-        />
-      ) : null}
+      <ScheduleFormModal
+        key={`${editing?.id ?? 'new'}-${formNonce}`}
+        open={formOpen}
+        editing={editing}
+        error={formError}
+        bots={bots}
+        scheduleTimeZone={scheduleTimeZone}
+        tr={tr}
+        onClose={() => setFormOpen(false)}
+        onSubmit={data => void handleSubmit(data)}
+      />
     </section>
   );
 }
@@ -492,14 +596,17 @@ interface ScheduleFormData {
 }
 
 function ScheduleFormModal(props: {
+  open: boolean;
   editing: ScheduleRow | null;
   error: string | null;
   bots: Array<{ larkAppId: string; botName?: string }>;
+  scheduleTimeZone?: string;
   tr: ReturnType<typeof useT>;
   onClose(): void;
   onSubmit(data: ScheduleFormData): void;
 }) {
-  const { editing, tr, bots } = props;
+  const { editing, tr, bots, open, scheduleTimeZone } = props;
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const [name, setName] = useState(editing?.name ?? '');
   const [schedule, setSchedule] = useState(editing?.schedule ?? '');
   const [prompt, setPrompt] = useState(editing?.prompt ?? '');
@@ -513,7 +620,33 @@ function ScheduleFormModal(props: {
   const [topicTitle, setTopicTitle] = useState(editing?.topicTitle ?? '');
   const [chatId, setChatId] = useState(editing?.chatId ?? '');
   const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
+  const [groups, setGroups] = useState<GroupChat[]>([]);
+  const [chatManual, setChatManual] = useState(false);
+  const [touched, setTouched] = useState(false);
+  const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
+
+  // open 时 showModal + 聚焦首个输入；关闭时 close()（Esc/遮罩点击走 onClose）
+  useEffect(() => {
+    const dlg = dialogRef.current;
+    if (!dlg) return;
+    if (open && !dlg.open) {
+      dlg.showModal();
+      dlg.querySelector<HTMLElement>('input[name="name"]')?.focus();
+    } else if (!open && dlg.open) {
+      dlg.close();
+    }
+  }, [open]);
+
+  // 创建模式下拉取群列表（30s 缓存，与 Groups 等入口共享）
+  useEffect(() => {
+    if (!open || editing) return;
+    let cancelled = false;
+    fetchGroupsSnapshot({ cacheMs: 30_000 })
+      .then(snap => { if (!cancelled) setGroups(snap.chats); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [open, editing]);
 
   // If the modal opened before /api/bots resolved, default to the first bot
   // once it arrives so the submit button doesn't stay permanently disabled.
@@ -523,214 +656,330 @@ function ScheduleFormModal(props: {
     }
   }, [editing, larkAppId, bots]);
 
+  const check = useMemo(
+    () => schedule.trim() ? checkSchedule(schedule, tr, scheduleTimeZone) : null,
+    [schedule, tr, scheduleTimeZone],
+  );
+
+  // 只列出选中 bot 已在群的群（memberBots 有 inChat 记录时才过滤；
+  // 成员信息缺失时 fail-open 显示全部，避免阻塞创建）
+  const groupOptions = useMemo(() => {
+    const hasMembership = groups.some(g => g.memberBots?.length > 0);
+    const filtered = hasMembership && larkAppId
+      ? groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))
+      : groups;
+    // 有名群按名称排序，无名群（仅 oc_ ID）排最后
+    return [...filtered].sort((a, b) => {
+      const an = a.name ?? '';
+      const bn = b.name ?? '';
+      if (!an && !bn) return 0;
+      if (!an) return 1;
+      if (!bn) return -1;
+      return an.localeCompare(bn, 'zh-CN');
+    });
+  }, [groups, larkAppId]);
+
+  // bot 变更时，若当前 chatId 不在新 bot 的群列表中则清除，避免给不在群的 bot 投递
+  useEffect(() => {
+    if (!chatId || !larkAppId || groupOptions.length === 0) return;
+    if (!groupOptions.some(g => g.chatId === chatId)) setChatId('');
+  }, [larkAppId, groupOptions, chatId]);
+
+  const showGroupSelect = !editing && !localDelivery && !chatManual && groupOptions.length > 0;
+  const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
+  const schedulePreview = check?.ok ? check.preview : undefined;
+  const nameMissing = touched && !name.trim();
+  const promptMissing = touched && !prompt.trim();
+  const chatMissing = touched && !editing && !localDelivery && !chatId.trim();
+  const rootMissing = touched && !localDelivery && executionPosition === 'topic' && !rootMessageId.trim();
+
   function handleSubmit(e: React.FormEvent): void {
     e.preventDefault();
+    setTouched(true);
+    setScheduleTouched(true);
+    // 必填内联校验：不静默 return，每个缺字段都有可见红提示
     if (!editing && !larkAppId) return;
+    if (!name.trim() || !prompt.trim()) return;
+    if (!localDelivery && !chatId.trim()) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
+    if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     props.onSubmit({
-      name,
-      schedule,
+      name: name.trim(),
+      schedule: schedule.trim(),
       prompt,
       silent,
       executionPosition,
       rootMessageId: rootMessageId.trim(),
       topicTitle: topicTitle.trim(),
       updateExecutionPosition: !localDelivery,
-      chatId,
+      chatId: chatId.trim(),
       larkAppId,
     });
   }
 
   return (
-    <div className="schedule-form-overlay" onClick={props.onClose}>
-      <div
-        className="schedule-form-dialog"
-        role="dialog"
-        aria-modal="true"
-        onClick={e => e.stopPropagation()}
-      >
-        <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
-        <form onSubmit={handleSubmit} className="schedule-form">
-          {!editing ? (
-            <label className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
-              <select
-                value={larkAppId}
-                onChange={e => setLarkAppId(e.target.value)}
-                required
-              >
-                {bots.map(b => (
-                  <option key={b.larkAppId} value={b.larkAppId}>
-                    {b.botName ?? b.larkAppId}
-                  </option>
-                ))}
-              </select>
-            </label>
+    <dialog
+      ref={dialogRef}
+      className="schedule-form-dialog"
+      onClose={props.onClose}
+      onClick={e => { if (e.target === dialogRef.current) props.onClose(); }}
+    >
+      <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
+      <form onSubmit={handleSubmit} className="schedule-form" noValidate>
+        {!editing ? (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
+            <select
+              value={larkAppId}
+              onChange={e => setLarkAppId(e.target.value)}
+              required
+            >
+              {bots.map(b => (
+                <option key={b.larkAppId} value={b.larkAppId}>
+                  {b.botName ?? b.larkAppId}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.name')}</span>
+          <input
+            type="text"
+            name="name"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            required
+            autoFocus
+            aria-invalid={nameMissing || undefined}
+          />
+          {nameMissing ? (
+            <small className="schedule-form-error-inline">{tr('schedules.form.errNameRequired')}</small>
           ) : null}
-          <label className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.name')}</span>
-            <input
-              type="text"
-              value={name}
-              onChange={e => setName(e.target.value)}
-              required
-              autoFocus
-            />
-          </label>
-          <label className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
-            <input
-              type="text"
-              value={schedule}
-              onChange={e => setSchedule(e.target.value)}
-              placeholder={tr('schedules.form.scheduleHelp')}
-              required
-            />
+        </label>
+        <div className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
+          <div className="schedule-templates" role="group" aria-label={tr('schedules.form.templates')}>
+            {CRON_TEMPLATES.map(t => (
+              <button
+                key={t.expr}
+                type="button"
+                className={`schedule-template-chip${schedule === t.expr ? ' is-active' : ''}`}
+                onClick={() => { setSchedule(t.expr); setScheduleTouched(true); }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <input
+            type="text"
+            value={schedule}
+            onChange={e => { setSchedule(e.target.value); setScheduleTouched(true); }}
+            placeholder={tr('schedules.form.scheduleHelp')}
+            required
+            aria-invalid={scheduleInvalid || undefined}
+          />
+          {scheduleInvalid && check && !check.ok ? (
+            <small className="schedule-form-error-inline">{check.error}</small>
+          ) : schedulePreview ? (
+            <small className="schedule-form-preview">✓ {tr('schedules.form.nextRun')}：{schedulePreview}</small>
+          ) : (
             <small className="schedule-form-help">{tr('schedules.form.scheduleHelp')}</small>
-          </label>
-          <label className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.prompt')}</span>
-            <textarea
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              rows={4}
-              required
-            />
+          )}
+        </div>
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.prompt')} <i className="req" aria-hidden="true">*</i></span>
+          <textarea
+            value={prompt}
+            onChange={e => setPrompt(e.target.value)}
+            rows={4}
+            required
+            aria-invalid={promptMissing || undefined}
+          />
+          {promptMissing ? (
+            <small className="schedule-form-error-inline">{tr('schedules.form.errPromptRequired')}</small>
+          ) : (
             <small className="schedule-form-help">{tr('schedules.form.promptHelp')}</small>
-          </label>
+          )}
+        </label>
         {editing ? (
           <div className="schedule-form-field">
             <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
             <code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>
           </div>
-        ) : (
-          <label className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
-              <input
-                type="text"
-                value={chatId}
-                onChange={e => setChatId(e.target.value)}
-                placeholder="oc_..."
-                required
-              />
-            </label>
-          )}
-          {localDelivery ? (
-            <div className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>
-              <div className="schedule-form-placement">
-                <strong>{tr('schedules.deliveryLocal')}</strong>
-                <small className="schedule-form-help">{tr('schedules.form.localHelp')}</small>
-              </div>
-            </div>
-          ) : (
-            <div className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>
-              <div className="schedule-form-radio-group">
-                <label>
-                  <input
-                    type="radio"
-                    name="executionPosition"
-                    value="top-level"
-                    checked={executionPosition === 'top-level'}
-                    onChange={() => setExecutionPosition('top-level')}
-                  />
-                  {tr('schedules.deliveryTopLevel')}
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="executionPosition"
-                    value="topic"
-                    checked={executionPosition === 'topic'}
-                    onChange={() => setExecutionPosition('topic')}
-                  />
-                  {tr('schedules.deliveryThread')}
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="executionPosition"
-                    value="new-topic"
-                    checked={executionPosition === 'new-topic'}
-                    onChange={() => {
-                      setExecutionPosition('new-topic');
-                      setSilent(false);
-                    }}
-                  />
-                  {tr('schedules.deliveryNewTopic')}
-                </label>
-              </div>
-              <small className="schedule-form-help">
-                {executionPosition === 'top-level'
-                  ? tr('schedules.form.topLevelHelp')
-                  : executionPosition === 'topic'
-                    ? tr('schedules.form.topicHelp')
-                    : tr('schedules.form.newTopicHelp')}
-              </small>
-            </div>
-          )}
-          {!localDelivery && executionPosition === 'topic' ? (
-            <label className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.topicRoot')}</span>
-              <input
-                type="text"
-                value={rootMessageId}
-                onChange={e => setRootMessageId(e.target.value)}
-                placeholder="om_..."
-                required
-              />
-              <small className="schedule-form-help">{tr('schedules.form.topicRootHelp')}</small>
-            </label>
-          ) : null}
-          {!localDelivery && executionPosition === 'new-topic' ? (
-            <label className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.topicTitle')}</span>
-              <input
-                type="text"
-                value={topicTitle}
-                onChange={e => setTopicTitle(e.target.value)}
-                placeholder={tr('schedules.form.topicTitlePlaceholder')}
-                maxLength={200}
-              />
-              <small className="schedule-form-help schedule-form-help-with-count">
-                {tr('schedules.form.topicTitleHelp')}
-                <span>{Array.from(topicTitle).length}/200</span>
-              </small>
-            </label>
-          ) : null}
-          <label className="schedule-form-field schedule-form-toggle">
-            <input
-              type="checkbox"
-              checked={silent}
-              onChange={e => setSilent(e.target.checked)}
-            />
-            <span>
-              {tr('schedules.form.silent')}
-              <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
-            </span>
-          </label>
-          {executionPosition === 'new-topic' && silent ? (
-            <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
-          ) : null}
-          {props.error ? (
-            <p className="schedule-form-error">{props.error}</p>
-          ) : null}
-          <div className="schedule-form-actions">
-            <button type="button" className="schedule-form-cancel" onClick={props.onClose}>
-              {tr('schedules.form.cancel')}
-            </button>
-            <button
-              type="submit"
-              className="schedule-form-submit"
-              disabled={(!editing && !larkAppId)
-                || (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim())}
-            >
-              {editing ? tr('schedules.form.save') : tr('schedules.form.create')}
-            </button>
+        ) : !localDelivery ? (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.chat')} <i className="req" aria-hidden="true">*</i></span>
+            {showGroupSelect ? (
+              <>
+                <select
+                  value={chatId}
+                  onChange={e => setChatId(e.target.value)}
+                  required
+                  aria-invalid={chatMissing || undefined}
+                >
+                  <option value="" disabled>{tr('schedules.form.chatPlaceholder')}</option>
+                  {groupOptions.map(g => {
+                    const inChat = g.memberBots?.filter(b => b.inChat).length ?? 0;
+                    return (
+                      <option key={g.chatId} value={g.chatId}>
+                        {g.name ?? g.chatId}{inChat > 0 ? ` · ${inChat} bots` : ''}
+                      </option>
+                    );
+                  })}
+                </select>
+                <button
+                  type="button"
+                  className="schedule-form-link"
+                  onClick={() => setChatManual(true)}
+                >
+                  {tr('schedules.form.chatManual')}
+                </button>
+              </>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  value={chatId}
+                  onChange={e => setChatId(e.target.value)}
+                  placeholder="oc_..."
+                  required
+                  aria-invalid={chatMissing || undefined}
+                />
+                {groupOptions.length > 0 ? (
+                  <button
+                    type="button"
+                    className="schedule-form-link"
+                    onClick={() => { setChatManual(false); setChatId(''); }}
+                  >
+                    {tr('schedules.form.chatBackToSelect')}
+                  </button>
+                ) : null}
+              </>
+            )}
+            {chatMissing ? (
+              <small className="schedule-form-error-inline">{tr('schedules.form.errChatRequired')}</small>
+            ) : null}
           </div>
-        </form>
-      </div>
-    </div>
+        ) : null}
+        {localDelivery ? (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>
+            <div className="schedule-form-placement">
+              <strong>{tr('schedules.deliveryLocal')}</strong>
+              <small className="schedule-form-help">{tr('schedules.form.localHelp')}</small>
+            </div>
+          </div>
+        ) : (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>
+            <div className="schedule-form-radio-group">
+              <label>
+                <input
+                  type="radio"
+                  name="executionPosition"
+                  value="top-level"
+                  checked={executionPosition === 'top-level'}
+                  onChange={() => setExecutionPosition('top-level')}
+                />
+                {tr('schedules.deliveryTopLevel')}
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="executionPosition"
+                  value="topic"
+                  checked={executionPosition === 'topic'}
+                  onChange={() => setExecutionPosition('topic')}
+                />
+                {tr('schedules.deliveryThread')}
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="executionPosition"
+                  value="new-topic"
+                  checked={executionPosition === 'new-topic'}
+                  onChange={() => {
+                    setExecutionPosition('new-topic');
+                    setSilent(false);
+                  }}
+                />
+                {tr('schedules.deliveryNewTopic')}
+              </label>
+            </div>
+            <small className="schedule-form-help">
+              {executionPosition === 'top-level'
+                ? tr('schedules.form.topLevelHelp')
+                : executionPosition === 'topic'
+                  ? tr('schedules.form.topicHelp')
+                  : tr('schedules.form.newTopicHelp')}
+            </small>
+          </div>
+        )}
+        {!localDelivery && executionPosition === 'topic' ? (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.topicRoot')}</span>
+            <input
+              type="text"
+              value={rootMessageId}
+              onChange={e => setRootMessageId(e.target.value)}
+              placeholder="om_..."
+              required
+              aria-invalid={rootMissing || undefined}
+            />
+            {rootMissing ? (
+              <small className="schedule-form-error-inline">{tr('schedules.form.errRootRequired')}</small>
+            ) : (
+              <small className="schedule-form-help">{tr('schedules.form.topicRootHelp')}</small>
+            )}
+          </label>
+        ) : null}
+        {!localDelivery && executionPosition === 'new-topic' ? (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.topicTitle')}</span>
+            <input
+              type="text"
+              value={topicTitle}
+              onChange={e => setTopicTitle(e.target.value)}
+              placeholder={tr('schedules.form.topicTitlePlaceholder')}
+              maxLength={200}
+            />
+            <small className="schedule-form-help schedule-form-help-with-count">
+              {tr('schedules.form.topicTitleHelp')}
+              <span>{Array.from(topicTitle).length}/200</span>
+            </small>
+          </label>
+        ) : null}
+        <label className="schedule-form-field schedule-form-toggle">
+          <input
+            type="checkbox"
+            checked={silent}
+            onChange={e => setSilent(e.target.checked)}
+          />
+          <span>
+            {tr('schedules.form.silent')}
+            <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
+          </span>
+        </label>
+        {executionPosition === 'new-topic' && silent ? (
+          <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        ) : null}
+        {props.error ? (
+          <p className="schedule-form-error">{props.error}</p>
+        ) : null}
+        <div className="schedule-form-actions">
+          <button type="button" className="schedule-form-cancel" onClick={props.onClose}>
+            {tr('schedules.form.cancel')}
+          </button>
+          <button
+            type="submit"
+            className="schedule-form-submit"
+          >
+            {editing ? tr('schedules.form.save') : tr('schedules.form.create')}
+          </button>
+        </div>
+      </form>
+    </dialog>
   );
 }

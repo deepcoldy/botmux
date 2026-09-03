@@ -41,6 +41,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       enterMemUsedFrac: 0.92,
     },
     vcMeetingAgent: { enabled: true },
+    workflow: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -72,8 +73,6 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     isAutoUpdateSupportedInstall: vi.fn(() => true),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
-    syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
-    validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
     validateCodexNotifierTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
     validateHostOverloadAlertTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
     installCodexNotifierHook: vi.fn(),
@@ -236,6 +235,29 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ whiteboard: { enabled: true } });
   });
 
+  it('writes workflow.enabled toggle via mergeGlobalConfig, preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ workflow: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ workflow: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ workflow: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects a non-object workflow patch', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ workflow: 'off' }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_workflow' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-boolean workflow.enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ vcMeetingAgent: { enabled: false } }, deps);
@@ -243,27 +265,28 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: false } });
   });
 
-  it('validates then syncs vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
+  // 全局「会议事件接收 Bot」pin 已退役：daemon 侧每个 VC-active 的 bot 各自处理收到
+  // 的会议事件，没人再读 listenerBotAppId。写路径必须把历史残留擦掉，别在配置里留一
+  // 个谁都不读、看着却像还生效的字段。
+  it('erases a stale vcMeetingAgent.listenerBotAppId on the next write', async () => {
     const deps = makeDeps({
       readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_old' } })),
     });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: ' cli_listener ' } }, deps);
+    const r = await applySettingsWrite({ vcMeetingAgent: { enabled: true } }, deps);
     expect(r.ok).toBe(true);
-    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_listener');
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener', 'cli_old');
-    expect(vi.mocked(deps.validateVcMeetingListenerBotAppId).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(deps.syncVcMeetingListenerBotConfig).mock.invocationCallOrder[0]);
-    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
 
-  it('clears vcMeetingAgent.listenerBotAppId without validating', async () => {
+  it('never resurrects the retired listener pin from a client-supplied patch', async () => {
     const deps = makeDeps({
-      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } })),
+      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true } })),
     });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: null } }, deps);
+    // 老前端（或手搓 POST）还在提交这个字段时，也不能把 pin 写回去。
+    const r = await applySettingsWrite(
+      { vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } as any },
+      deps,
+    );
     expect(r.ok).toBe(true);
-    expect(deps.validateVcMeetingListenerBotAppId).not.toHaveBeenCalled();
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith(null, 'cli_listener');
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
 
@@ -527,37 +550,14 @@ describe('applySettingsWrite — validation errors', () => {
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
-  it('rejects invalid vcMeetingAgent.listenerBotAppId', async () => {
+  // listenerBotAppId 退役后不再是可写字段：只带它的 patch 等于什么都没改，必须被
+  // 当作空 patch 拒绝，而不是靠它触发一次全局写。
+  it('rejects a vcMeetingAgent patch that carries only the retired listener pin', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 123 } }, deps);
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_listener' } as any }, deps);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('invalid_vcMeetingAgent_listenerBotAppId');
-    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
-  });
-
-  it('rejects vcMeetingAgent.listenerBotAppId when validation fails', async () => {
-    const deps = makeDeps({
-      validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write' })),
-    });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_bad' } }, deps);
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write');
-    expect(deps.syncVcMeetingListenerBotConfig).not.toHaveBeenCalled();
-    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
-  });
-
-  it('rejects vcMeetingAgent.listenerBotAppId when per-bot defaults cannot be written', async () => {
-    const deps = makeDeps({
-      syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config' })),
-    });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_missing' } }, deps);
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config');
-    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_missing');
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing', null);
+    expect(r.error).toBe('invalid_vcMeetingAgent_enabled');
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -843,6 +843,80 @@ describe('applySettingsWrite — scheduleTimeZone', () => {
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ scheduleTimeZone: null });
   });
+});
+
+// oauthRedirectBase 是 OAuth 零粘贴授权的输入：授权链接回跳 `<base>/oauth/callback`，
+// 而 dashboard 的接收器是 pathname 精确匹配。所以只收 http(s) 的 origin，路径 / query /
+// fragment / 凭证一律拒——用户填错要在保存这一刻就知道，而不是等飞书跳回来才发现。
+describe('applySettingsWrite — oauthRedirectBase', () => {
+  it('persists a valid https origin', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'https://botmux.example.com' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it('accepts plain http with an explicit port (LAN / 自建反代场景)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'http://10.1.2.3:7891' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'http://10.1.2.3:7891' });
+  });
+
+  it('strips trailing slashes and surrounding whitespace', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '  https://botmux.example.com///  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it('normalizes scheme case and the default port away', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'HTTPS://Botmux.Example.COM:443' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it("clears the setting on '' → mergeGlobalConfig({ oauthRedirectBase: null })", async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  it('clears the setting on a whitespace-only string', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '   ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  it('clears the setting on null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: null }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  for (const [label, value] of [
+    ['a bare host without a scheme', 'botmux.example.com'],
+    ['a non-http(s) scheme', 'ftp://botmux.example.com'],
+    ['a path prefix (dashboard matches /oauth/callback exactly)', 'https://botmux.example.com/botmux'],
+    ['a query string', 'https://botmux.example.com?token=x'],
+    ['a fragment', 'https://botmux.example.com#x'],
+    ['embedded credentials', 'https://user:pw@botmux.example.com'],
+    ['a scheme with no host', 'http://'],
+    ['a non-string value', 42],
+  ] as Array<[string, unknown]>) {
+    it(`rejects ${label} → invalid_oauthRedirectBase (no write)`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ oauthRedirectBase: value }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('unreachable');
+      expect(r.error).toBe('invalid_oauthRedirectBase');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    });
+  }
 });
 
 describe('applySettingsWrite — IO surface', () => {

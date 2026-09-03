@@ -16,7 +16,7 @@ Options:
   --app-path <path>   Install destination. Must end with Botmux.app.
   --no-open          Do not open the app after installation.
   --skip-build       Reuse an existing dist/mac*/Botmux.app build.
-  --skip-deps        Do not run pnpm install when node_modules is missing.
+  --skip-deps        Do not run bun install when node_modules is missing.
   -h, --help         Show this help.
 EOF
 }
@@ -101,7 +101,7 @@ done
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "Botmux Desktop local install currently supports macOS only"
 command -v node >/dev/null 2>&1 || fail "Node.js 22 or newer is required"
-command -v pnpm >/dev/null 2>&1 || fail "pnpm is required. Try: corepack enable"
+command -v bun >/dev/null 2>&1 || fail "bun is required. See https://bun.sh (or: npm i -g bun)"
 command -v codesign >/dev/null 2>&1 || fail "codesign is required on macOS"
 command -v ditto >/dev/null 2>&1 || fail "ditto is required on macOS"
 
@@ -119,23 +119,25 @@ cd "$ROOT_DIR"
 
 if [[ "$SKIP_DEPS" -eq 0 && ! -x node_modules/.bin/tsc ]]; then
   log "Install dependencies"
-  pnpm install
+  bun install --frozen-lockfile
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   APP_VERSION="$(resolve_app_version)"
 
   log "Build bundled botmux runtime"
-  pnpm build
+  bun run build
 
   log "Build Desktop bundle"
-  pnpm desktop:bundle
+  bun run desktop:bundle
 
   log "Prepare bundled botmux and Node runtimes"
-  BOTMUX_DESKTOP_VERSION="$APP_VERSION" pnpm desktop:runtime
+  BOTMUX_DESKTOP_VERSION="$APP_VERSION" bun run desktop:runtime
 
   log "Package Botmux.app locally (version $APP_VERSION)"
-  pnpm exec electron-builder --mac dir --config electron-builder.yml -c.extraMetadata.version="$APP_VERSION"
+  # Not `bunx`: that would resolve/fetch a package by name. Use the locally
+  # installed binary, same as the release workflow does.
+  ./node_modules/.bin/electron-builder --mac dir --config electron-builder.yml -c.extraMetadata.version="$APP_VERSION"
 fi
 
 BUILT_APP=""

@@ -35,6 +35,13 @@ export function createRelayAdapter(pathOverride?: string): CliAdapter {
   const dataDir = deriveRelayDataDir();
   return createClaudeFamilyAdapter({
     id: 'relay',
+    // Relay 是 Claude Code 的 fork，落盘 transcript 与 Claude Code 逐字同构：
+    // per-project JSONL 里带权威回合终态（最终 assistant `stop_reason:end_turn`
+    // 非工具停 + system 回合标记），与 claude-code 依赖的边界完全一致（在真实
+    // ~/.relay/projects/*.jsonl 上核实）。因此它能诚实兑现同一份 turn-terminal
+    // 契约，opt-in 让 relay 系 bot 可当会议 agent（产出受管纪要/会中发言，靠这个
+    // 权威边界终结投递回合、去重防同一投递外部副作用执行两次）。
+    reliableTurnTerminal: true,
     // Relay's SuperRelay apiKey lives in `<configDir>/byted-cloud-auth.json`
     // (NOT under bytedcli), and bytedcli SSO state lives under
     // ~/.local/share/bytedcli — keep BOTH real + writable inside the file sandbox

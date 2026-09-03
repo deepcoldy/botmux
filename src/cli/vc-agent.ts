@@ -18,11 +18,13 @@ import {
 import { loadBotConfigs, registerBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { listVcMeetingRuntimeSessions } from '../services/vc-meeting-runtime-store.js';
+import { latestVcMeetingDeliveryForSession } from '../services/vc-meeting-delivery-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { resolveSessionContext } from '../core/session-marker.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import type { NormalizedVcMeetingItem } from '../vc-agent/types.js';
+import { loopbackFetch } from '../core/loopback-fetch.js';
 
 const VC_AGENT_SPEAK_MAX_TEXT_LENGTH = 200;
 
@@ -299,12 +301,29 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
     relayDir,
     process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
+  // The live process-tree marker only carries turnId/dispatchAttempt WHILE a
+  // delivery turn is executing; both are cleared when the turn goes idle. A
+  // meeting agent typically decides to speak AFTER it has finished processing
+  // the transcript (turn already terminal), so liveOrigin is usually empty here.
+  // Recover the delivery identity of the turn it just processed from the durable
+  // ledger (keyed only by sessionId) so the daemon can re-authorize in-meeting
+  // output against the completed receipt. The live marker still takes precedence
+  // when present (an in-flight turn).
+  let originTurnId = liveOrigin?.turnId;
+  let originDispatchAttempt = liveOrigin?.dispatchAttempt;
+  if ((originTurnId === undefined || originDispatchAttempt === undefined) && receiverSessionId) {
+    const durable = latestVcMeetingDeliveryForSession(config.session.dataDir, receiverSessionId);
+    if (durable) {
+      originTurnId ??= durable.receipt.deliveryKey;
+      originDispatchAttempt ??= durable.receipt.dispatchAttempt;
+    }
+  }
   const discoveredReceiver = receiverAppId ? findOnlineDaemon(receiverAppId) : null;
   const receiverPort = Number.isSafeInteger(receiverPortRaw) && receiverPortRaw > 0
     ? receiverPortRaw
     : discoveredReceiver?.ipcPort;
   if (receiverSessionId && receiverAppId && receiverPort) {
-    const managedResponse = await fetch(`http://127.0.0.1:${receiverPort}/api/vc-meetings/action-request`, {
+    const managedResponse = await loopbackFetch(`http://127.0.0.1:${receiverPort}/api/vc-meetings/action-request`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -315,9 +334,9 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
         content,
         ...(reason ? { reason } : {}),
         ...(fallbackText ? { fallbackText } : {}),
-        ...(liveOrigin?.turnId ? { originTurnId: liveOrigin.turnId } : {}),
-        ...(liveOrigin?.dispatchAttempt !== undefined
-          ? { originDispatchAttempt: liveOrigin.dispatchAttempt }
+        ...(originTurnId ? { originTurnId } : {}),
+        ...(originDispatchAttempt !== undefined
+          ? { originDispatchAttempt }
           : {}),
         ...(originCapability ? { originCapability } : {}),
       }),

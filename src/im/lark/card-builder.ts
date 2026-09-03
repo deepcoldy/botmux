@@ -1,3 +1,5 @@
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -5,8 +7,9 @@ import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.j
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
+import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -20,6 +23,18 @@ import {
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
+
+/** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
+ *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
+export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+/** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
+ *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
+export function contextCompactThreshold(): number {
+  const v = readGlobalConfig().dashboard?.contextCompactThreshold;
+  if (typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 100) return Math.round(v);
+  return DEFAULT_CONTEXT_COMPACT_THRESHOLD;
+}
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
@@ -79,12 +94,19 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
     { action: 'config_set', field: 'lang', ...locVal }));
-  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）。chat 与
-  // 未设等价，故 chat 选项用 unset 哨兵：选它即清字段、回默认（扁平连续 DM），
-  // 避免把字面 'chat' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启
-  // 前后一致）。只有显式 'thread'（每条 DM 独立）才是需要落盘的值。
-  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'thread' ? 'thread' : CONFIG_UNSET,
-    [{ text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' }],
+  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）| group
+  //（每条 DM 自动建专属会话群）。chat 与未设等价，故 chat 选项用 unset 哨兵：
+  // 选它即清字段、回默认（扁平连续 DM），避免把字面 'chat' 写进 bots.json（与
+  // dashboard 下拉一致，/botconfig get 重启前后一致）。只有显式 'thread' /
+  // 'group' 才是需要落盘的值——回显同样按这三态，已配 group 不再错显为 chat。
+  runSelects.push(configSelect(
+    t('card.config.p2p.placeholder', undefined, locale),
+    data.p2pMode === 'thread' ? 'thread' : data.p2pMode === 'group' ? 'group' : CONFIG_UNSET,
+    [
+      { text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET },
+      { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' },
+      { text: t('card.config.p2p.group', undefined, locale), value: 'group' },
+    ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
@@ -277,12 +299,15 @@ const cliDisplayNames: Record<CliId, string> = {
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
+  'ebsd': 'ebsd',
   'kimi': 'Kimi',
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
   'dsh': 'DeepSeek Harness',
+  'dsh-tui': 'DeepSeek Harness TUI',
+  'mojo': 'Mojo',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -427,7 +452,13 @@ export function buildSessionCard(
       });
     }
   }
-  if (showManageButtons && !adoptMode && effectiveCliId !== 'riff') {
+  // No restart button for ANY remote CLI: the riff worker refuses the IPC
+  // (dead button), and the mojo worker EXECUTES it — cancelling the remote
+  // session and cold-booting a context-less replacement. The riff-only literal
+  // rendered a live remote-destruction button on mojo cards (fourth-round
+  // review, gate 1); the click handler also guards, this keeps the surface
+  // honest.
+  if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
@@ -487,13 +518,19 @@ export function buildSessionClosedCard(
   cliResumeCommand?: string | null,
   locale?: Locale,
   runtimeDisplayName?: string,
+  resumeStartsFresh?: boolean,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
+    : resumeStartsFresh
+      // The CLI can only resume a precise session id and none was persisted:
+      // resuming reactivates the topic's message route, but the next spawn
+      // starts a FRESH session — say so instead of implying history is back.
+      ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
+      : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
@@ -812,21 +849,25 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green',
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
 } as const;
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    case 'idle': return t('card.status.idle', undefined, locale);
+    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
+    // from a hung session; say "handled, judged no reply needed" instead.
+    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
       ? t('card.status.retry_ready', undefined, locale)
       : t('card.status.limited', undefined, locale);
+    case 'interrupted': return t('card.status.interrupted', undefined, locale);
   }
 }
 
@@ -857,7 +898,9 @@ function pushStreamBody(
   // Native Context / Token usage line (grey, small) when this bot displays usage
   // on the streaming card. Missing metrics are omitted independently by
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
-  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
+  const usageSeg = usage
+    ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
+    : null;
   if (usageSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
@@ -871,10 +914,16 @@ function pushStreamBody(
     // runtime → the metrics render alone, unchanged.
     const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
     const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    // 上下文吃紧时整行转红（而不是另起一行报警）：提示就在用量数字旁边，一眼可见，
+    // 且不多占卡片高度。判据与 footer 里追加「建议压缩」的**是同一个谓词**——刻意不去
+    // 嗅 usageSeg 里有没有那串提示文案：那份文案是可被用户自定义覆盖的（覆盖成空串时
+    // `includes('')` 恒真 ⟹ 每张卡都会变红），且把颜色行为耦合到文案上会让「改个翻译」
+    // 静默改掉配色。
+    const overThreshold = !!usage && contextOverCompactThreshold(usage, contextCompactThreshold());
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',
-      content: `<font color='grey'>${line}</font>`,
+      content: `<font color='${overThreshold ? 'red' : 'grey'}'>${line}</font>`,
     });
   }
 }
@@ -910,6 +959,15 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
+  silentIdle?: boolean,
+  /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
+   *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
+   *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
+   *  fail-closed to the headless JSON-RPC runner, which matches this card's
+   *  pre-existing behaviour for dsh (no transcript ⇒ the old percentage gate
+   *  never showed the button either), so a call site that forgets to pass it
+   *  degrades to the status quo rather than to a broken button. */
+  dshRuntime?: 'official' | 'tui',
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -920,6 +978,14 @@ export function buildStreamingCard(
 
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
+
+  // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
+  // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
+  // （md-card.ts 的 cardUsageFooterSegment，streaming 变体）在渲染
+  // `上下文 34.3K/258.4K (13%) · 累计 … · 模型`——两者**同源**（都读
+  // usage.context.percentUsed），于是同一个百分比在一张卡上出现两次，而这一行还
+  // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
+  // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -972,6 +1038,44 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
+  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
+  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
+  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
+  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
+  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
+  // 闸门是拿错了判据。
+  //
+  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
+  //   ① remote CLI（riff/mojo）无本地终端可驱动；
+  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
+  //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
+  //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
+  //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
+  //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
+  // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
+  // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
+  if (!isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'compact_session', ...actionBase },
+    });
+  }
+  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
+  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
+  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
+  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
+  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.stop', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'stop_turn', ...actionBase },
+    });
+  }
   if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
@@ -1001,18 +1105,36 @@ export function buildStreamingCard(
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
   // link right in the card so anyone here can open a writable terminal without
   // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  // Rendered as a URL button (same shape as the read-only terminal button),
+  // not a markdown link: the token URL is long and wrapped into an ugly raw
+  // URL blob in the card. The group-visible warning stays as a note below.
   if (writableTerminalUrl) {
     elements.push({
-      tag: 'markdown',
-      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.open_writable_terminal', undefined, locale) },
+        type: 'primary',
+        multi_url: terminalMultiUrl(writableTerminalUrl),
+      }],
+    });
+    elements.push({
+      tag: 'note',
+      elements: [{
+        tag: 'lark_md',
+        content: t('card.writable_terminal_warning', undefined, locale),
+      }],
     });
   }
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
-  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  if (displayMode === 'screenshot' && cliId !== 'riff') {
+  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
+  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
+  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
+  // 以后再加远端 CLI 不会重复漏改。
+  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },
@@ -1045,7 +1167,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
@@ -1651,6 +1773,150 @@ export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: 
     ],
   };
   return JSON.stringify(card);
+}
+
+export interface TurnFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** `ambiguous` softens the title: the turn may have run, we just can't tell. */
+  status: 'failed' | 'ambiguous';
+  errorCode?: string;
+  /** Human-safe failure summary from the CLI, when it provided one. */
+  reason?: string;
+  failedAt?: Date;
+  /** The user's own prompt, for "which task was this". Truncated + escaped. */
+  task?: string;
+  /** Auto-continuation count, when a recovery ladder ran and gave up. */
+  continuations?: number;
+  /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
+   *  same policy, so `none` must not render a button. */
+  retryOffer: TurnRetryOffer;
+  /** Pins the button to one specific failed turn; a stale card fails closed. */
+  retryTurnId?: string;
+  /** Human to @-mention in the body. Omitted → no mention (never @ a bot). */
+  mentionOpenId?: string;
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 通用失败卡：一条失败通知同时承载「现在什么情况」与「可以怎么办」。
+ *
+ *  取代原先的纯文本通知（`worker.ordinary_recovery_*` / `claude_terminal_failure_unrecovered`），
+ *  并覆盖此前**完全静默**的 `ambiguous` 终态（CLI 崩溃 / 写入失败）——那类失败过去与
+ *  「正常干完」在用户眼里同形。
+ *
+ *  三条刻意的设计约束：
+ *  1. **errorCode 原样打出**。`ordinary_recovery_non_retryable` 是无条件兜底分支，
+ *     daemon 重启这类非模型错误也会落到那句「不能安全自动续跑」；把码摊开才能让
+ *     这种混淆可见，而不是继续被文案糊住。
+ *  2. **重试的副作用风险必须写在卡上**。`caveated` 时明说「可能已执行了一部分」——
+ *     `/retry` 是原样重发，不像自动续跑会带 checkpoint 提示。
+ *  3. **@人只在正文**（`lark_md`）。`plain_text` 标题会被 {@link plainTitle} 剥掉
+ *     `<at>`，放那儿等于不 @。 */
+export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
+  const { locale } = o;
+  const actionBase = {
+    root_id: o.rootId,
+    session_id: o.sessionId,
+    cli_id: o.cliId ?? 'claude-code',
+  };
+  const titleKey = o.status === 'ambiguous'
+    ? 'card.turn_failed.title_ambiguous'
+    : 'card.turn_failed.title';
+
+  const lines: string[] = [];
+  // 先 @ 人再讲事：飞书的通知摘要只取前一段，@ 放最后会被截掉。
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  // errorCode 是闭集常量（`cli_exit` / `provider_*` / `codexTaskFailureCode` 的
+  // 固定返回值），从不携带 provider 原文，所以用反引号包成行内代码而不是
+  // escapeMd —— 后者会把 `a_b_c` 里的下划线转义成可见的反斜杠，正是这类码最常
+  // 见的形态。仍然剥掉反引号与尖括号，避免任何一天码变成动态值时逃出代码段。
+  lines.push(t('card.turn_failed.field_error', {
+    errorCode: `\`${(o.errorCode ?? o.status).replace(/[`<>]/g, '')}\``,
+  }, locale));
+  if (o.reason) {
+    lines.push(t('card.turn_failed.reason', { reason: escapeMd(o.reason) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.turn_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  if (o.task) {
+    const trimmed = o.task.length > 80 ? `${o.task.slice(0, 80)}…` : o.task;
+    lines.push(t('card.turn_failed.field_task', { task: escapeMd(trimmed) }, locale));
+  }
+  if (o.continuations !== undefined && o.continuations > 0) {
+    lines.push(t('card.turn_failed.field_continuations', {
+      count: String(o.continuations),
+    }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+
+  // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
+  const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
+  const adviceKey = o.retryOffer === 'none'
+    ? 'card.turn_failed.no_retry'
+    : !o.retryTurnId
+      ? 'card.turn_failed.no_input'
+      : o.retryOffer === 'safe'
+        ? 'card.turn_failed.retry_safe'
+        : 'card.turn_failed.retry_caveated';
+  elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
+
+  const actions: any[] = [];
+  if (canRetry) {
+    actions.push({
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        // 语义跟着动作走：没跑过 = 重试（重发原话）；跑过一半 = 继续（读现场后
+        // 从 checkpoint 接着做）。文案说错会让用户对副作用风险判断错。
+        content: t(
+          o.retryOffer === 'safe' ? 'card.btn.retry_turn' : 'card.btn.continue_turn',
+          undefined,
+          locale,
+        ),
+      },
+      // caveated 用 default 而不是 primary：可能重复副作用的操作不该是视觉默认项。
+      type: o.retryOffer === 'safe' ? 'primary' : 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retryTurnId,
+        // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
+        // retryOffer，卡上写的语义就是真正会发生的事。
+        mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'default',
+      multi_url: terminalMultiUrl(o.terminalUrl),
+    });
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: t(titleKey, { cliName: plainTitle(o.cliName) }, locale),
+      },
+      template: 'red',
+    },
+    elements,
+  });
 }
 
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
@@ -2305,6 +2571,8 @@ export interface AdoptPickerEntry {
   target?: string;
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
+  /** One-based position among history candidates, for same-screen disambiguation. */
+  candidateNumber?: number;
 }
 
 /** Deterministic key for a live adoptable session (tmux/herdr/zellij).
@@ -2357,18 +2625,19 @@ export function buildAdoptEntries(
       timeMs: s.startedAt,
     };
   });
-  const resume: AdoptPickerEntry[] = resumable.map((r) => {
+  const resume: AdoptPickerEntry[] = resumable.map((r, index) => {
     const project = r.cwd.split('/').pop() || r.cwd;
     return {
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
       cliId: resumeCliId,
       ...(customName ? { cliDisplayName: customName } : {}),
-      title: r.title || r.cliSessionId.slice(0, 8),
+      title: r.title || project,
       project,
       cwd: r.cwd,
       sessionId: r.cliSessionId,
       timeMs: r.lastActivityAt || undefined,
+      candidateNumber: index + 1,
     };
   });
   return [...live, ...resume];
@@ -2489,7 +2758,7 @@ export function buildAdoptSelectCard(
   const labelKind    = t('card.adopt.field_kind',    undefined, locale);
   const labelCli     = t('card.adopt.field_cli',     undefined, locale);
   const labelDir     = t('card.adopt.field_dir',     undefined, locale);
-  const labelSession = t('card.adopt.field_session', undefined, locale);
+  const labelCandidate = t('card.adopt.field_candidate', undefined, locale);
   const labelTarget  = t('card.adopt.field_target',  undefined, locale);
   const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
   const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
@@ -2516,8 +2785,8 @@ export function buildAdoptSelectCard(
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
       `${labelDir}: \`${escapeMd(e.cwd)}\``,
-      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
     ];
+    if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
     if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
@@ -2603,7 +2872,7 @@ export function buildAdoptSelectCard(
 function wrapAdoptCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
-    config: { update_multi: true, wide_screen_mode: true },
+    config: { update_multi: true, width_mode: 'fill' },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },

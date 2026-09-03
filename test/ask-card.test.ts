@@ -257,7 +257,10 @@ describe('handleAskCardAction', () => {
     await expect(promise).resolves.toMatchObject({ kind: 'answered', answers: [['deploy']], by: 'ou_owner' });
   });
 
-  it('旧单选路径 ask_select：非授权人返回 warning toast', async () => {
+  // 未授权点击现在会先尝试弹授权卡（见 test/ask-unauthorized-grant.test.ts）。本用例的
+  // 'cli_ask' 未 registerBot → 升级模块取不到 bot 配置，降级成 'unavailable' 回落到
+  // 原「没有权限」文案。这条断言因此同时锁住了「升级失败绝不吞掉反馈」的降级契约。
+  it('旧单选路径 ask_select：非授权人返回 warning toast（授权卡发不出时的降级）', async () => {
     let captured: PendingAsk | undefined;
     setCardDispatcher({
       async send(ask) {
@@ -431,6 +434,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       nonce: capturedAsk!.nonce,
       by: 'ou_owner',
       selections: [['a', 'b']],
+      confirmEmpty: false,
     });
   });
 
@@ -452,6 +456,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       nonce: captured.nonce,
       by: 'ou_owner',
       selections: [['y']],
+      confirmEmpty: false,
     });
   });
 
@@ -493,6 +498,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       nonce: capturedAsk!.nonce,
       by: 'ou_owner',
       selections: [['a', 'b']],
+      confirmEmpty: false,
     });
   });
 
@@ -532,6 +538,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       nonce: capturedAsk!.nonce,
       by: 'ou_owner',
       selections: [['y'], ['a', 'b']],
+      confirmEmpty: false,
     });
   });
 
@@ -628,6 +635,172 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     const card = result as Record<string, any>;
     expect(card.header?.title?.content).toContain('已结束');
     expect(JSON.stringify(card)).toContain('A');
+  });
+});
+
+// ─── 空多选提交二次确认（B）─────────────────────────────────────────────────
+describe('handleAskCardAction: 空多选提交二次确认', () => {
+  async function registerMulti(overrides: Partial<Parameters<typeof registerAsk>[0]> = {}) {
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) { captured = ask; return { messageId: 'om_ask' }; },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      questions: [
+        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+      ...overrides,
+    });
+    await Promise.resolve();
+    return captured!;
+  }
+
+  it('全空提交（全多选）→ 不 settle，返回包成 card:{type:raw} 的 arm 卡片 + warning toast', async () => {
+    const ask = await registerMulti();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+
+    const r = result as Record<string, any>;
+    // 关键（外层整形契约）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
+    // 不能把 card 字段摊在顶层——否则 event-dispatcher 只认 toast、raw card 不 patch。
+    expect(r.card?.type).toBe('raw');
+    expect(r.card?.data?.elements).toBeDefined();
+    expect('elements' in r).toBe(false); // 顶层不得直接暴露 card 字段
+    expect(r.toast?.type).toBe('warning');
+    // arm 卡片里有红色「确认空提交」按钮 + confirm_empty 标志 + 警示文案
+    const cardBlob = JSON.stringify(r.card?.data);
+    expect(cardBlob).toContain('确认空提交');
+    expect(cardBlob).toContain('confirm_empty');
+    expect(cardBlob).toContain('你还没有勾选任何选项');
+    expect(cardBlob).not.toContain('已结束');
+    // 未 settle，可继续
+    expect(_getPending(ask.askId)?.settled).toBe(false);
+  });
+
+  it('arm 后再次点击（confirm_empty=\'true\'）→ 真正 settle 空答案', async () => {
+    const ask = await registerMulti();
+
+    // 第一次：拦成 arm（不 settle）
+    await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+    expect(_getPending(ask.askId)?.settled).toBe(false);
+
+    // 第二次：带 confirm_empty 字符串（飞书按钮 value 回传即字符串）→ settle
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce, confirm_empty: 'true' } },
+    });
+
+    // submitAsk 收到 confirmEmpty:true
+    expect(mockedSubmitAsk).toHaveBeenLastCalledWith({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner', confirmEmpty: true });
+    const card = result as Record<string, any>;
+    // 终态卡片（settle 用 settledCardResponse，直接是 raw 卡片体，不含 card 包裹）
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(_getPending(ask.askId)?.settled).toBe(true);
+  });
+
+  it('全空提交但 nonce 不匹配 → stale（不 arm，鉴权/nonce 先于二次确认）', async () => {
+    const ask = await registerMulti();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: 'WRONG' } },
+    });
+
+    // 鉴权与 nonce 顺序：arm 判定在 broker 里、位于 nonce/canTalk 校验之后 → 坏 nonce 走 stale
+    expect(JSON.stringify(result)).not.toContain('确认空提交');
+    expect((result as any)?.toast?.content).toContain('失效');
+    expect(_getPending(ask.askId)?.settled).toBe(false);
+  });
+
+  it('全空提交但无答复权 → unauthorized（不 arm）', async () => {
+    const ask = await registerMulti();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_intruder' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+
+    // 鉴权顺序：无权用户不该拿到 arm，应是 unauthorized
+    expect(JSON.stringify(result)).not.toContain('确认空提交');
+    expect((result as any)?.toast?.content).toContain('权限');
+    expect(_getPending(ask.askId)?.settled).toBe(false);
+  });
+
+  it('混合 [单选,多选] 全空 → 直接 stale，绝不 arm（避免二次点击死路）', async () => {
+    // 混合题约束：只要有一个单选问题，空集非有效答案，submitAsk 直接判 stale；
+    // 若误 arm，二次确认后仍因单选未选而 stale，形成永远提交不了的死路。
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { captured = ask; return { messageId: 'om_ask' }; } });
+    registerAsk({
+      larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_root', sessionId: 'sess-1',
+      questions: [
+        { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }] },
+        { prompt: 'q2', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce } },
+    });
+
+    expect(JSON.stringify(result)).not.toContain('确认空提交');
+    expect((result as any)?.toast?.content).toContain('失效'); // stale
+    expect(_getPending(captured!.askId)?.settled).toBe(false);
+  });
+
+  it('勾了至少一项再提交 → 不触发二次确认，直接 settle', async () => {
+    const ask = await registerMulti();
+
+    // 勾选 a
+    await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_TOGGLE_ACTION, ask_id: ask.askId, nonce: ask.nonce, question_index: '0', key: 'a' } },
+    });
+
+    // 提交（非空）→ 直接 settle，无二次确认
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+
+    const card = result as Record<string, any>;
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(JSON.stringify(card)).not.toContain('确认空提交');
+    expect(_getPending(ask.askId)?.settled).toBe(true);
+  });
+
+  it('纯单选问题的空提交不进二次确认（交由 submitAsk 判 stale）', async () => {
+    // 单选 ask：全空提交不该被 B 拦（B 只在全多选时触发）；submitAsk 对单选空集返回 stale。
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { captured = ask; return { messageId: 'om_ask' }; } });
+    registerAsk({
+      larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_root', sessionId: 'sess-1',
+      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }] }],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce } },
+    });
+
+    expect(JSON.stringify(result)).not.toContain('确认空提交');
+    expect(_getPending(captured!.askId)?.settled).toBe(false);
   });
 });
 

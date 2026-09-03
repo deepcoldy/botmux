@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import { recordDispatchRegistryEntry } from '../src/core/dispatch-registry.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
@@ -38,7 +39,10 @@ function spawnWriter(registryPath: string, seed: string, holdMs: number): ChildP
       await new Promise(resolve => setTimeout(resolve, ${holdMs}));
     });
   `;
-  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+  // Node still needs `--import tsx` on top of the eval args because the snippet
+  // imports a repo .ts module; Bun runs TypeScript natively.
+  const { command, prefixArgs } = tsRunnerPrefix();
+  return spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     stdio: ['ignore', 'ignore', 'pipe'],
   });

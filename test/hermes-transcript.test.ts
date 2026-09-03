@@ -5,16 +5,21 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('node:fs', async () => {
-  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+// A synchronous `require` inside the factory, not `await vi.importActual(...)`:
+// bun's `vi` shim has no `importActual`, and a fill that resolved without actually
+// loading the module would silently un-mock. `require` is what both runners accept.
+// The real module is SPREAD IN because bun links named exports for real — returning
+// only the overridden keys fails the whole file with "Export named 'X' not found".
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
   return {
     ...actual,
     existsSync: vi.fn(),
   };
 });
 
-vi.mock('node:child_process', async () => {
-  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
     spawnSync: vi.fn(),

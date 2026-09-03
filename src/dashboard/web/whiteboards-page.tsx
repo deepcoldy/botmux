@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { LoadingState, OverflowText } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { toast } from './toast.js';
 
 interface WhiteboardRow {
   id: string;
@@ -283,7 +284,7 @@ function WhiteboardsPage() {
       }
       setDeleteTarget(null);
     } catch (err) {
-      if (mountedRef.current) window.alert(`删除失败：${err instanceof Error ? err.message : String(err)}`);
+      if (mountedRef.current) toast(`删除失败：${err instanceof Error ? err.message : String(err)}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setDeleting(false);
     }

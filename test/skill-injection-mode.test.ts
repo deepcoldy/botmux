@@ -136,7 +136,7 @@ describe('resolveSkillInjectionSupport (dashboard control class)', () => {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden
-    for (const id of ['antigravity', 'aiden', 'hermes', 'mir', 'mira', 'codex-app'] as const) {
+    for (const id of ['antigravity', 'aiden', 'hermes', 'ebsd', 'mir', 'mira', 'codex-app'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('none');
     }
   });

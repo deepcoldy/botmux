@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -16,14 +16,24 @@ import {
 import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
 import {
   sessionMcpGatewayPathRegex,
+  sessionMcpGatewaySocketDir,
+  sessionMcpGatewaySocketPath,
   startSessionMcpGatewayHost,
 } from '../src/core/plugins/mcp/host.js';
+import {
+  MCP_GATEWAY_RELAY_PROTOCOL_VERSION,
+  mcpGatewayPaneReattachSafe,
+  readMcpGatewayLaunchRecord,
+  clearMcpGatewayLaunchRecord,
+  writeMcpGatewayLaunchRecord,
+} from '../src/core/plugins/mcp/launch-record.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../src/core/plugins/mcp/environment.js';
 import { mcpGatewayAuthTokenPath } from '../src/core/plugins/mcp/socket-auth.js';
 import { buildSeatbeltProfile } from '../src/adapters/cli/read-isolation.js';
+import { isBunRuntime, spawnSyncTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -79,9 +89,13 @@ describe('plugin MCP Gateway', () => {
   ): Promise<Client> {
     const env = mcpServeEnvironment(sessionId);
     if (options.dataDir !== undefined) env.SESSION_DATA_DIR = options.dataDir;
+    // Node needs an ABSOLUTE tsx specifier here (not the shared prefix's bare
+    // `tsx`): one case below runs with `cwd` outside the repo, where a bare
+    // specifier cannot be resolved. Bun runs TypeScript natively, so no prefix.
+    const tsxPrefix = isBunRuntime() ? [] : ['--import', import.meta.resolve('tsx')];
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', import.meta.resolve('tsx'), resolve('src/cli.ts'), 'mcp', 'serve'],
+      args: [...tsxPrefix, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: options.cwd ?? resolve('.'),
       env,
       stderr: 'pipe',
@@ -178,6 +192,147 @@ describe('plugin MCP Gateway', () => {
 
     await client.close();
     await gateway.close();
+  });
+
+  it('injects host-owned per-turn trusted caller metadata and overrides caller supplied metadata', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-trusted' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
+            senderType: 'user',
+          },
+          turnId: 'om_turn',
+          dispatchAttempt: 2,
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: 'echo',
+      arguments: {},
+      _meta: {
+        botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_forged',
+          requestUserUnionId: 'on_forged',
+        },
+        botmuxImpersonatedUnionId: 'on_sibling_forged',
+        customTrace: 'keep-me',
+      },
+    } as any);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"requestUserOpenId":"ou_trusted"');
+    expect(text).toContain('"requestUserUnionId":"on_trusted"');
+    expect(text).toContain('"requestLarkAppId":"cli_trusted"');
+    expect(text).toContain('"source":"schedule_creator"');
+    expect(text).toContain('"taskId":"task_123"');
+    expect(text).toContain('"senderType":"user"');
+    expect(text).toContain('"turnId":"om_turn"');
+    expect(text).toContain('"dispatchAttempt":2');
+    expect(text).toContain('"customTrace":"keep-me"');
+    expect(text).not.toContain('ou_forged');
+    expect(text).not.toContain('on_forged');
+    expect(text).not.toContain('on_sibling_forged');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('strips caller supplied trusted caller metadata when no host identity exists', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-untrusted' },
+    );
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: 'echo',
+      arguments: {},
+      _meta: {
+        botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_forged',
+          requestUserUnionId: 'on_forged',
+        },
+        botmuxImpersonatedUnionId: 'on_sibling_forged',
+        customTrace: 'keep-me',
+      },
+    } as any);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"customTrace":"keep-me"');
+    expect(text).not.toContain('botmuxTrustedCaller');
+    expect(text).not.toContain('ou_forged');
+    expect(text).not.toContain('on_forged');
+    expect(text).not.toContain('on_sibling_forged');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('strips caller supplied trusted identity headers before adding host-owned values', () => {
+    const untrustedGateway = new PluginMcpGateway(
+      [],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-untrusted' },
+    );
+    const stripped = (untrustedGateway as any).httpHeaders(
+      {
+        'x-botmux-turn-id': 'om_forged',
+        'x-keep': 'keep-me',
+      },
+      {
+        'x-botmux-trusted-open-id': 'ou_forged',
+        'x-botmux-dispatch-attempt': '9',
+      },
+    ) as Headers;
+    expect(stripped.get('x-botmux-trusted-open-id')).toBeNull();
+    expect(stripped.get('x-botmux-turn-id')).toBeNull();
+    expect(stripped.get('x-botmux-dispatch-attempt')).toBeNull();
+    expect(stripped.get('x-keep')).toBe('keep-me');
+
+    const trustedGateway = new PluginMcpGateway(
+      [],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-trusted' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
+            senderType: 'user',
+          },
+          turnId: 'om_trusted',
+          dispatchAttempt: 2,
+        }),
+      },
+    );
+    const trusted = (trustedGateway as any).httpHeaders(
+      { 'x-botmux-trusted-union-id': 'on_forged' },
+      { 'x-botmux-trusted-open-id': 'ou_forged' },
+    ) as Headers;
+    expect(trusted.get('x-botmux-trusted-open-id')).toBe('ou_trusted');
+    expect(trusted.get('x-botmux-trusted-union-id')).toBe('on_trusted');
+    expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
+    expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
+    expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
+    // Provenance stays on the local `_meta` path only: these headers reach every
+    // HTTP-transport MCP server, so they must not start carrying it.
+    expect(trusted.get('x-botmux-trusted-source')).toBeNull();
+    expect(trusted.get('x-botmux-task-id')).toBeNull();
+    expect(trusted.get('x-botmux-trusted-sender-type')).toBeNull();
   });
 
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {
@@ -314,8 +469,8 @@ describe('plugin MCP Gateway', () => {
     });
     const host = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -339,10 +494,219 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('relay survives a Gateway host replacement: reconnects, replays initialize, flushes buffered requests', async () => {
+    const sessionId = 'relay-reconnect-across-hosts';
+    const customDataDir = join(home, 'custom-botmux', 'data');
+    vi.stubEnv('SESSION_DATA_DIR', customDataDir);
+    installFixturePlugin('plugin-a', 'alpha');
+    refreshSessionMcpRuntimeManifest({
+      sessionId,
+      pluginIds: ['plugin-a'],
+      dataDir: customDataDir,
+    });
+    const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
+    const transport = new StdioClientTransport({
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: {
+        ...mcpServeEnvironment(sessionId),
+        SESSION_DATA_DIR: customDataDir,
+        [MCP_GATEWAY_SOCKET_ENV]: host1.socketPath,
+        [MCP_GATEWAY_REQUIRED_ENV]: '1',
+        BOTMUX_MCP_RELAY_BACKOFF_MS: '50',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'relay-reconnect-test', version: '1.0.0' });
+    let host2: Awaited<ReturnType<typeof startSessionMcpGatewayHost>> | undefined;
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+
+      // Kill the host the way a daemon restart does. The relay (and the MCP
+      // client on top of it) stays alive inside the "pane".
+      await host1.close();
+      // Give the relay a moment to observe the disconnect so the next request
+      // is deterministically buffered rather than racing the close event.
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 150));
+
+      // Issue a request during the outage — it must buffer, not fail.
+      const pendingCall = client.callTool({ name: 'echo', arguments: {} });
+
+      // Replacement worker: same session → same deterministic socket path.
+      host2 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
+      expect(host2.socketPath).toBe(host1.socketPath);
+
+      // The relay reconnects, replays initialize/initialized on the fresh
+      // Gateway connection (the client never re-initializes), then flushes the
+      // buffered call.
+      const result = await pendingCall;
+      expect((result.content[0] as { text: string }).text).toContain(`session=${sessionId}`);
+
+      // Steady-state after the swap keeps working.
+      expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+    } finally {
+      await client.close().catch(() => undefined);
+      await host2?.close();
+    }
+  }, 30_000);
+
+  it('decides pane reattach from the persisted Gateway launch record', () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const sessionId = 'launch-record-session';
+    const expected = sessionMcpGatewaySocketPath(sessionId, dataDir);
+
+    // No record (legacy pane or never launched with a gateway) → cold-resume.
+    expect(mcpGatewayPaneReattachSafe(readMcpGatewayLaunchRecord(dataDir, sessionId), expected)).toBe(false);
+
+    // Matching record from a reconnect-capable relay → reattach.
+    writeMcpGatewayLaunchRecord(dataDir, sessionId, expected);
+    expect(mcpGatewayPaneReattachSafe(readMcpGatewayLaunchRecord(dataDir, sessionId), expected)).toBe(true);
+
+    // Path mismatch (e.g. dataDir moved, or an mkdtemp-era path) → cold-resume.
+    expect(mcpGatewayPaneReattachSafe(
+      { version: MCP_GATEWAY_RELAY_PROTOCOL_VERSION, socketPath: '/tmp/bmcp-0-deadbeef-XYZ/g.sock' },
+      expected,
+    )).toBe(false);
+
+    // Pre-reconnect relay protocol → cold-resume.
+    expect(mcpGatewayPaneReattachSafe({ version: 1, socketPath: expected }, expected)).toBe(false);
+
+    // Cleared record (generation launched without a gateway) → cold-resume.
+    clearMcpGatewayLaunchRecord(dataDir, sessionId);
+    expect(readMcpGatewayLaunchRecord(dataDir, sessionId)).toBeNull();
+  });
+
+  // ─── Worker reattach wiring (source lock) ──────────────────────────────────
+  //
+  // spawnCli is not exported (repo convention: source-lock tests, see
+  // resume-fresh-policy.test.ts). These pin the P0 fix: the pane-reattach-safe
+  // branch MUST re-serve the trusted Gateway host at the deterministic path so
+  // the surviving pane's relay can reconnect. Without it (the shipped bug) the
+  // reattach branch only logged, willReattachPersistent stayed true, and the
+  // sole host starter (prepareCliPluginGenerationAndGateway) was gated out by
+  // `if (!willReattachPersistent)` — the relay then reconnected forever to a
+  // socket nothing binds.
+  describe('reattach-safe branch re-serves the Gateway host (source lock)', () => {
+    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+
+    it('exposes a host-only starter that does NOT refresh the plugin generation', () => {
+      // The starter must be separate from prepareCliPluginGenerationAndGateway
+      // (which calls refreshCliPluginGeneration) so a warm reattach keeps the
+      // CLI's existing catalog untouched while still binding a fresh host.
+      const start = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
+      expect(start).toBeGreaterThan(-1);
+      const block = workerSource.slice(start, start + 800);
+      expect(block).toContain('startSessionMcpGatewayHost(');
+      expect(block).toContain('writeMcpGatewayLaunchRecord(');
+      // Host-only: must NOT re-run the catalog/plugin refresh on this path.
+      expect(block).not.toContain('refreshCliPluginGeneration(');
+      // Both host-start paths (fresh/resumed via prepare*, and the re-served
+      // reattach host) route through this helper, so it MUST keep #917's
+      // per-turn trusted-caller provider wired — otherwise a warm reattach (and
+      // every spawn) would silently stop injecting the host-signed identity.
+      // The worker-level wiring is not otherwise exercised by a runtime test.
+      expect(block).toContain('trustedTurnIdentity: currentGatewayTrustedTurnIdentity');
+    });
+
+    it('starts the replacement host inside the paneRelayReattachSafe branch', () => {
+      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
+      expect(start).toBeGreaterThan(-1);
+      // Scope strictly to the reattach-safe branch (ends at the legacy
+      // cold-resume `else if`), so a host start anywhere else can't satisfy this.
+      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
+      expect(branchEnd).toBeGreaterThan(start);
+      const branch = workerSource.slice(start, branchEnd);
+      expect(branch).toContain('startAndRecordSessionMcpGatewayHost(');
+      // Only when this fresh worker has no live host yet — never stomp a host an
+      // in-worker restart already brought up.
+      expect(branch).toContain('if (!sessionMcpGatewayHost)');
+    });
+
+    it('re-serving is awaited and guarded by the spawn-generation fence', () => {
+      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
+      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
+      const branch = workerSource.slice(start, branchEnd);
+      expect(branch).toContain('await startAndRecordSessionMcpGatewayHost(');
+      // A concurrent restart must not let a superseded generation keep running.
+      expect(branch).toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
+    });
+  });
+
+  it('re-served reattach host binds the same deterministic path a stranded relay reconnects to', async () => {
+    // End-to-end proof of the fix's mechanism: a relay left running after its
+    // host dies (the daemon-restart pane) has an in-flight call HANG, and the
+    // moment a replacement host is bound at the SAME deterministic path — which
+    // is exactly what startAndRecordSessionMcpGatewayHost now does on the
+    // reattach branch — that same in-flight call resolves.
+    const sessionId = 'reattach-reserve-reconnect';
+    const dataDir = join(home, 'custom-botmux', 'data');
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    installFixturePlugin('plugin-a', 'alpha');
+    refreshSessionMcpRuntimeManifest({ sessionId, pluginIds: ['plugin-a'], dataDir });
+
+    const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir });
+    // The worker persists this record when it launches the CLI generation.
+    writeMcpGatewayLaunchRecord(dataDir, sessionId, host1.socketPath);
+
+    const transport = new StdioClientTransport({
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: {
+        ...mcpServeEnvironment(sessionId),
+        SESSION_DATA_DIR: dataDir,
+        [MCP_GATEWAY_SOCKET_ENV]: host1.socketPath,
+        [MCP_GATEWAY_REQUIRED_ENV]: '1',
+        BOTMUX_MCP_RELAY_BACKOFF_MS: '50',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'reattach-reserve-test', version: '1.0.0' });
+    let host2: Awaited<ReturnType<typeof startSessionMcpGatewayHost>> | undefined;
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map(t => t.name).sort()).toEqual(['alpha_unique', 'echo']);
+
+      // The worker's reattach decision, evaluated from the persisted record.
+      expect(mcpGatewayPaneReattachSafe(
+        readMcpGatewayLaunchRecord(dataDir, sessionId),
+        sessionMcpGatewaySocketPath(sessionId, dataDir),
+      )).toBe(true);
+
+      // Daemon restart kills the host; the pane's relay + client live on.
+      await host1.close();
+      await new Promise(r => setTimeout(r, 150));
+
+      // A call during the outage must buffer, not fail.
+      let settled = false;
+      const pendingCall = client.callTool({ name: 'echo', arguments: {} })
+        .then(res => { settled = true; return res; });
+      const duringOutage = await Promise.race([
+        pendingCall.then(() => 'resolved'),
+        new Promise<string>(r => setTimeout(() => r('still-pending'), 1500)),
+      ]);
+      expect(duringOutage).toBe('still-pending');
+      expect(settled).toBe(false);
+
+      // The fix: re-serve the host at the SAME deterministic path (what
+      // startAndRecordSessionMcpGatewayHost does on the reattach branch).
+      host2 = await startSessionMcpGatewayHost({ sessionId, dataDir });
+      expect(host2.socketPath).toBe(host1.socketPath);
+
+      const result = await pendingCall;
+      expect((result.content[0] as { text: string }).text).toContain(`session=${sessionId}`);
+    } finally {
+      await client.close().catch(() => undefined);
+      await host2?.close();
+    }
+  }, 30_000);
+
   it('fails closed when a managed relay loses its worker-owned socket', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {
@@ -358,9 +722,9 @@ describe('plugin MCP Gateway', () => {
   });
 
   it('fails closed when a managed relay has a socket but no authentication token', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {
@@ -445,15 +809,49 @@ describe('plugin MCP Gateway', () => {
     expect(profile.indexOf(writeDeny)).toBeGreaterThan(profile.indexOf(allow));
   });
 
-  it('revokes the worker-owned socket path synchronously during shutdown', async () => {
+  it('revokes the worker-owned socket path synchronously during shutdown but keeps the directory', async () => {
     const host = await startSessionMcpGatewayHost({
       sessionId: 'synchronous-socket-revoke',
       dataDir: join(home, 'custom-botmux', 'data'),
     });
     expect(existsSync(host.socketPath)).toBe(true);
     const closing = host.close();
-    expect(existsSync(host.socketDir)).toBe(false);
+    // The socket (the connectable capability) is gone synchronously; the
+    // directory must SURVIVE so a sandboxed pane's bwrap bind mount (pinned to
+    // the directory inode) still sees the replacement host's socket after a
+    // worker restart.
+    expect(existsSync(host.socketPath)).toBe(false);
+    expect(existsSync(host.socketDir)).toBe(true);
     await closing;
+  });
+
+  it('re-serves the same deterministic socket path across host generations', async () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const host1 = await startSessionMcpGatewayHost({ sessionId: 'stable-path', dataDir });
+    expect(host1.socketPath).toBe(sessionMcpGatewaySocketPath('stable-path', dataDir));
+    const path1 = host1.socketPath;
+    await host1.close();
+    const host2 = await startSessionMcpGatewayHost({ sessionId: 'stable-path', dataDir });
+    try {
+      expect(host2.socketPath).toBe(path1);
+      expect(existsSync(host2.socketPath)).toBe(true);
+    } finally {
+      await host2.close();
+    }
+  });
+
+  it('fails closed when the deterministic socket dir is a planted symlink', async () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const plantedTarget = join(home, 'attacker-target');
+    mkdirSync(plantedTarget, { recursive: true });
+    const dir = sessionMcpGatewaySocketDir('symlink-squat', dataDir);
+    symlinkSync(plantedTarget, dir);
+    try {
+      await expect(startSessionMcpGatewayHost({ sessionId: 'symlink-squat', dataDir }))
+        .rejects.toThrow(/not a directory/);
+    } finally {
+      rmSync(dir, { force: true });
+    }
   });
 
   it('closes the Gateway once when its MCP host stdin ends', async () => {

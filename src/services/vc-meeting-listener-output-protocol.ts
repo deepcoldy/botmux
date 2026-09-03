@@ -17,6 +17,20 @@ export const VC_MEETING_LISTENER_OUTPUT_CONTRACT =
   + 'A correction to previously stated information (including time, owner, scope, status, or conclusion) '
   + 'is new information and must not be suppressed merely because most surrounding text is unchanged.';
 
+/**
+ * Trusted per-turn override for a human question sent in the listener chat.
+ *
+ * Automatic meeting deliveries and listener-chat questions share one durable
+ * receiver session so the latter can use the meeting context. The automatic
+ * delivery protocol above must therefore be explicitly disabled for an IM
+ * follow-up; otherwise a model can carry its previous JSON transport contract
+ * into a normal human-facing answer.
+ */
+export const VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT =
+  '[Meeting listener-chat direct question] This turn is a direct human question, not an automatic meeting delivery. '
+  + 'Answer the person in natural-language Markdown only. Do not return, quote, or explain '
+  + 'the internal {"decision":"skip"} / {"decision":"publish","content":"..."} control JSON.\n';
+
 export const VC_MEETING_CONTROLLED_OUTPUT_INSTRUCTION_VERSION = 'meeting-consumer-v2' as const;
 
 /** Frozen on the delivery receipt so a pre-upgrade v1 retry may still emit its

@@ -367,7 +367,7 @@ describe('worker app-runner control-channel wiring', () => {
     const markerEnd = workerSource.indexOf('function handleAppRunnerOscMarker(', markerStart);
     const marker = workerSource.slice(markerStart, markerEnd);
     // The deliverable is derived by stripping; the gate input must be the raw text.
-    expect(marker).toContain('const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);');
+    expect(marker).toContain('const deliverableContent = bridgePostText(finalContent, false);');
     const gateInputIdx = marker.indexOf('finalText: finalContent };');
     expect(gateInputIdx).toBeGreaterThan(-1);
     // Guard against reintroducing the bug: the gateInput must NOT be built from

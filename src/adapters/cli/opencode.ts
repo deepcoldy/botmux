@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
@@ -39,7 +39,10 @@ function textMatches(actual: string, expected: string): boolean {
   // 宽容前缀匹配：多行内容在 TUI 里可能被嵌入换行提前提交（只提交了第一段），
   // 或 DB 侧截断。宁可认作已提交，也不误报"未确认"（与旧盲发行为对齐，不回退）。
   if (na.length > 0 && (ne.startsWith(na) || na.startsWith(ne.slice(0, na.length)))) return true;
-  return false;
+  // OpenCode 只会在原始输入前加 Directory Context；BotMux 信封本身必须作为
+  // 完整、不变的后缀落库。把 user_message 内容视为不透明文本，不解析其中可能
+  // 出现的 XML-looking 字符串。
+  return ne.length > 0 && na.endsWith(ne);
 }
 
 // -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
@@ -64,39 +67,23 @@ type StatementSyncLike = {
   all(...params: unknown[]): any[];
 };
 
-let sqliteModule: { DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => DatabaseSyncLike } | null = null;
-let sqliteLoadAttempted = false;
-
-function loadSqlite(): typeof sqliteModule {
-  if (sqliteLoadAttempted) return sqliteModule;
-  sqliteLoadAttempted = true;
-  // ESM 下没有裸 require（ReferenceError），必须走 createRequire —— traex.ts 曾因
-  // 裸 require 被 try/catch 吞掉而在生产 dist 里整条 SQLite 链路静默失效。
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as typeof sqliteModule;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
-}
-
 /** 只读打开 opencode.db 执行一次查询。DB 是 WAL 模式且被活跃 OpenCode 进程持有，
  *  read-only 连接可并发读；任何失败（模块缺失/文件不存在/短暂锁忙）都回落 null，
  *  上层按"无法验证"降级，不影响输入投递本身。opencode2 与 opencode 共用该库。 */
 export function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const mod = loadSqlite();
-  if (!mod) return null;
   const dbPath = opencodeDbPath();
   if (!existsSync(dbPath)) return null;
-  let db: DatabaseSyncLike | undefined;
+  // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
+  // binary (node:sqlite is absent under Bun). Returns null if neither loads,
+  // matching the best-effort degrade below.
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true }) as DatabaseSyncLike | null;
+  if (!db) return null;
   try {
-    db = new mod.DatabaseSync(dbPath, { readOnly: true });
     return fn(db);
   } catch {
     return null;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 
@@ -174,6 +161,14 @@ export async function detectOpenCodeSubmit(
         : { submitted: true };
     }
     await delayFn(800);
+    // 等待期间记录可能已落库：发送重试 Enter 前先复查，命中就不再补发 Enter
+    // （避免对已提交的内容多按一次回车，把输入框里本已提交的行再触发一次）。
+    const afterWait = detectNewSubmit(baseline, content, kind);
+    if (afterWait.found) {
+      return afterWait.cliSessionId
+        ? { submitted: true, cliSessionId: afterWait.cliSessionId }
+        : { submitted: true };
+    }
     if (!trySendEnter()) return { submitted: false };
   }
   const finalMatch = detectNewSubmit(baseline, content, kind);
@@ -218,6 +213,74 @@ export function sessionRowExists(cliSessionId: string, kind: OpenCodeDbKind = 'v
   });
 }
 
+/** 会话忙碌态判断的时效窗口（毫秒）。超过此窗口未更新的异常/孤儿记录不判忙，避免进程异常终止导致死锁。 */
+export const OPENCODE_BUSY_FRESHNESS_MS = 120_000;
+
+/**
+ * 探测 OpenCode 会话当前是否处于执行中（时效内的工具调用中或模型生成中）。
+ *
+ * 判 busy 准则（必须在 freshnessWindowMs 时效窗口内，满足任一即为 busy）：
+ *  1. 存在属于该 session、状态为 `status: "running"` 的 tool part；
+ *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳）。
+ */
+export function isOpenCodeSessionBusy(
+  cliSessionId: string,
+  kind: OpenCodeDbKind = 'v1',
+  freshnessWindowMs: number = OPENCODE_BUSY_FRESHNESS_MS,
+): boolean {
+  const freshBaseline = Date.now() - freshnessWindowMs;
+
+  if (kind === 'v2') {
+    return withDb((db) => {
+      // 1. 检查是否存在时效内处于 running 状态的 tool part
+      const runningTool = db.prepare(
+        "SELECT 1 AS busy FROM session_message " +
+        "WHERE session_id = ? AND time_created > ? " +
+        "  AND json_extract(data, '$.state.status') = 'running' " +
+        "LIMIT 1"
+      ).get(cliSessionId, freshBaseline) as { busy?: number } | undefined;
+      if (runningTool?.busy) return true;
+
+      // 2. 检查最新 assistant message 是否处于时效内的未完成态（无 completed 时间戳）
+      const lastMsg = db.prepare(
+        "SELECT json_extract(data, '$.time.completed') AS completed " +
+        "FROM session_message " +
+        "WHERE session_id = ? AND type = 'assistant' AND time_created > ? " +
+        "ORDER BY time_created DESC LIMIT 1"
+      ).get(cliSessionId, freshBaseline) as { completed?: number } | undefined;
+
+      if (!lastMsg) return false;
+      if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
+      return false;
+    }) ?? false;
+  }
+
+  return withDb((db) => {
+    // 1. 检查是否存在时效内处于 running 状态的 tool part
+    const runningTool = db.prepare(
+      "SELECT 1 AS busy FROM part " +
+      "WHERE session_id = ? AND time_created > ? " +
+      "  AND json_extract(data, '$.type') = 'tool' " +
+      "  AND json_extract(data, '$.state.status') = 'running' " +
+      "LIMIT 1"
+    ).get(cliSessionId, freshBaseline) as { busy?: number } | undefined;
+    if (runningTool?.busy) return true;
+
+    // 2. 检查最新 assistant message 是否处于时效内的未完成态（无 completed 时间戳）
+    const lastMsg = db.prepare(
+      "SELECT json_extract(data, '$.time.completed') AS completed " +
+      "FROM message " +
+      "WHERE session_id = ? AND time_created > ? " +
+      "  AND json_extract(data, '$.role') = 'assistant' " +
+      "ORDER BY time_created DESC LIMIT 1"
+    ).get(cliSessionId, freshBaseline) as { completed?: number } | undefined;
+
+    if (!lastMsg) return false;
+    if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
+    return false;
+  }) ?? false;
+}
+
 /** Import path（/adopt 第二过滤器）共用实现：从当前存储层的会话表列出可续接的
  *  顶层会话（parent_id 非空的是子代理会话，跳过）。opencode2 与 opencode 共用
  *  同一库文件，kind 区分表空间。 */
@@ -237,7 +300,7 @@ export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: R
     out.push({
       cliSessionId: r.id,
       cwd: r.directory,
-      title: (r.title ?? '').trim() || r.id,
+      title: (r.title ?? '').trim(),
       lastActivityAt: r.timeUpdated,
     });
   }
@@ -360,8 +423,17 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
+    busyPattern: undefined,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v1');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.config/opencode/skills',
     // botmux hook 安装：spawn 时写入 OpenCode 插件文件，
     // 使 question.asked 事件自动转发到 `botmux hook opencode`。

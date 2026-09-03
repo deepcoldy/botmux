@@ -84,10 +84,119 @@ export function scrubClaudeSessionMarkerEnv(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Dashboard-only Feishu/Lark H5 passwordless-login configuration. Every key in
+ * this family is read by ONE consumer — resolveDashboardH5AuthConfig() in
+ * src/dashboard/h5-auth.ts, inside the dashboard process — and by nothing else
+ * in the fleet. A session's CLI child has no reason to see any of it, and
+ * `..._APP_SECRET` is a full Feishu app credential: whoever holds it can mint
+ * app_access_token for the H5 login app, i.e. forge the identity the Dashboard
+ * authenticates on. The daemon loads ~/.botmux/.env wholesale (index-daemon.ts
+ * dotenv), so without this scrub the secret rode into every PTY/direct CLI
+ * child and every one-shot the daemon forks (session group-title).
+ *
+ * Redaction is BOTH belt and braces:
+ *  - these exact names sit in REDACTED_CHILD_ENV_KEYS, which also drives the
+ *    tmux pane wrapper's `unset` clause and the tmux client-env strip;
+ *  - redactChildEnv() additionally sweeps the whole
+ *    {@link DASHBOARD_H5_ENV_PREFIX}, so a future H5 knob is redacted the day
+ *    it is added rather than the day someone remembers this list.
+ */
+export const DASHBOARD_H5_ENV_PREFIX = 'BOTMUX_DASHBOARD_FEISHU_H5_';
+
+export const DASHBOARD_H5_ENV_KEYS = [
+  'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED',
+  'BOTMUX_DASHBOARD_FEISHU_H5_BRAND',
+  'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID',
+  'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET',
+  'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS',
+  'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH',
+  'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS',
+  'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE',
+  'BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS',
+] as const;
+
+/**
+ * Delete the entire Dashboard-only Feishu H5 login family from `env` IN PLACE:
+ * every named key in {@link DASHBOARD_H5_ENV_KEYS} plus a
+ * {@link DASHBOARD_H5_ENV_PREFIX} sweep, so a knob added tomorrow is stripped
+ * the day it ships rather than the day someone extends the list.
+ *
+ * The Dashboard is the family's ONLY consumer, and it receives the values by
+ * dotenv-loading ~/.botmux/.env itself (index-dashboard.ts) — NOT through the
+ * shared PM2 env block (the H5 keys are deliberately absent from
+ * DAEMON_ENV_KEYS). Every other botmux-owned process must therefore hold none
+ * of it. Call sites:
+ *  - index-daemon.ts boot: the daemon dotenv-loads the same .env wholesale, so
+ *    it must drop the family right after dotenv — a daemon holding the H5
+ *    APP_SECRET can mint app_access_token for the Dashboard's login app.
+ *  - core/maintenance.ts detachedRestartEnv(): the detached `botmux restart`
+ *    the DASHBOARD spawns (update/restart button) inherits the dashboard's env,
+ *    which legitimately holds the secrets; the restart driver does not need
+ *    them and must not carry them toward pm2.
+ * redactChildEnv() keeps its own equivalent strip as the second line of
+ * defense at every CLI-child boundary (PTY/tmux pane unset/one-shot).
+ */
+export function stripDashboardH5Env(env: NodeJS.ProcessEnv): void {
+  for (const key of DASHBOARD_H5_ENV_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(DASHBOARD_H5_ENV_PREFIX)) delete env[key];
+  }
+}
+
+/**
+ * Terminal/interactivity fingerprints of whichever process invoked a pm2
+ * mutation. pm2 persists the caller's env into every managed app (and into
+ * dump.pm2 for resurrect), so a `botmux restart` issued from an agent's
+ * non-interactive shell — Claude Code / Codex tool shells export NO_COLOR=1,
+ * CODEX_CI=1, PAGER=cat, plus the terminal-app identity of whatever terminal
+ * hosted them — bakes "you have no colors, you are in CI" into every daemon,
+ * which every worker and session PTY then inherits: all bot CLI TUIs render
+ * colorless, and TERMINFO can even point at a terminal app's private terminfo
+ * dir. A daemon is a headless service: every key here describes the invoker's
+ * terminal or harness, never the machine, so deleting them at the pm2
+ * boundary is always correct. Session PTYs set their own TERM (the backends
+ * spawn with name 'xterm-256color'), and a user who wants genuinely colorless
+ * bots keeps the per-bot `env` channel — like CLAUDE_EFFORT, the ambient
+ * "export it in the shell that runs `botmux restart`" channel is sacrificed
+ * because at this boundary it cannot be told apart from contamination.
+ */
+export const INVOKER_TERMINAL_ENV_KEYS = [
+  // Color semantics
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'CLICOLOR',
+  'CLICOLOR_FORCE',
+  // Terminal identity. TERMINFO is a single-directory override that terminal
+  // apps export for their own private terminfo bundle — invoker-scoped.
+  // TERMINFO_DIRS is deliberately ABSENT: it is a search-path list that
+  // NixOS/home-manager and custom-ncurses setups configure machine-wide, and
+  // deleting it would break terminfo resolution for every PTY on such hosts.
+  'TERM',
+  'COLORTERM',
+  'TERMINFO',
+  'TERM_PROGRAM',
+  'TERM_PROGRAM_VERSION',
+  'TERM_SESSION_ID',
+  // CI / agent-harness flags
+  'CI',
+  'CODEX_CI',
+  // Non-interactive pager pins agent shells export for their own subcommands
+  'PAGER',
+  'GIT_PAGER',
+  'GH_PAGER',
+] as const;
+
+/** Delete inherited invoker-terminal fingerprints from `env` in place. */
+export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of INVOKER_TERMINAL_ENV_KEYS) delete env[key];
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
- * loop), daemon-side GitHub API tokens, and claude-code's session markers
+ * loop), daemon-side GitHub API tokens, the Dashboard-only Feishu H5 login
+ * credentials (DASHBOARD_H5_ENV_KEYS), and claude-code's session markers
  * (CLAUDE_SESSION_MARKER_ENV_KEYS). The
  * child resolves Lark via the namespaced `BOTMUX_LARK_APP_ID` or via bots.json
  * on disk (im/lark/client.ts); the worker keeps its own bare creds
@@ -104,6 +213,12 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Dashboard-only Feishu H5 login config/credential family — see
+  // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
+  // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend
+  // the pane inherits the tmux SERVER's global env, which the client env cannot
+  // override.
+  ...DASHBOARD_H5_ENV_KEYS,
   ...CLAUDE_SESSION_MARKER_ENV_KEYS,
   // Parent-tmux client vars: when the daemon itself was started inside a tmux
   // session, process.env carries TMUX (server socket path) + TMUX_PANE. Leaking
@@ -228,6 +343,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // capability plus a fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  // Public per-session plugin action selectors. This lets isolated and remote
+  // CLIs validate interactive cards without reading host-only plugin files.
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
@@ -271,6 +389,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
   // fallback cannot drift to the default when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  // Normalized sparse reply-style snapshot. Shared/native skill loaders and
+  // `botmux send` consume this same session value; it must never enter a
+  // co-tenant tmux server's ambient environment.
+  'BOTMUX_REPLY_STYLE',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
@@ -301,7 +423,96 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  // ebsd service mode receives only endpoint/identity metadata and paths to
+  // host-managed credential files. Credential contents never enter this env.
+  'EBSD_BOTMUX_DIAG_ENDPOINT',
+  'EBSD_BOTMUX_DIAG_TOKEN_FILE',
+  'EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE',
+  'EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE',
+  'EBSD_BOTMUX_SUBJECT',
+  'EBSD_BOTMUX_REPOSITORY_ROOT',
+  'EBSD_NO_UPDATE_CHECK',
 ] as const;
+
+/**
+ * Session-only botmux identity and capabilities of the process that invoked a
+ * pm2 mutation. A `botmux restart` issued from inside a bot session carries
+ * that session's routing identity and capabilities; persisted by pm2 into the
+ * fleet, every daemon then carries a stale foreign turn identity, and a
+ * plugin service started from the same env would misroute its own
+ * `botmux send` to a long-dead thread.
+ *
+ * This is a DELIBERATELY hand-maintained list. It is NOT derived from
+ * BOTMUX_INJECTED_ENV_KEYS: that list is the tmux/pane TRANSPORT whitelist
+ * and mixes session-only keys with ambient/daemon config that merely needs
+ * pane delivery (CLAUDE_CODE_RESUME_TOKEN_THRESHOLD is ambient-only — worker
+ * reads it from its own process.env and per-bot env REJECTS it, so a boot
+ * scrub would silently kill the user's setting; HERMES_HOME and the two
+ * HERMES_BOTMUX_* roots are ambient install-location config nothing in
+ * botmux ever sets, same contract as GROK_HOME; BOTS_CONFIG /
+ * SESSION_DATA_DIR / BOTMUX_LARK_LIST_BOTS_API_* are documented ambient or
+ * ecosystem-block config). The reverse also holds: session/sandbox routing
+ * keys the pane transport never carries (BOTMUX_SESSION_SCOPE,
+ * BOTMUX_SEND_RELAY) still need scrubbing here. Every entry below is
+ * session-scoped BY CONSTRUCTION: the daemon/worker computes and injects it
+ * per session AFTER every boundary scrub, and no ambient/env-file channel for
+ * it exists.
+ */
+export const SESSION_TURN_MARKER_ENV_KEYS = [
+  // "Runs inside botmux" pane marker; pane wrapper injects it per session.
+  'BOTMUX',
+  // Turn/session routing identity (worker-injected per pane/turn).
+  'BOTMUX_SESSION_ID',
+  'BOTMUX_CHAT_ID',
+  'BOTMUX_CHAT_TYPE',
+  'BOTMUX_ROOT_MESSAGE_ID',
+  'BOTMUX_TURN_ID',
+  'BOTMUX_DISPATCH_ATTEMPT',
+  // thread|chat scope, computed per session from rootMessageId (worker.ts).
+  'BOTMUX_SESSION_SCOPE',
+  // Daemon-authenticated session owner, both channels (applySessionOwnerEnv).
+  'BOTMUX_OWNER_OPEN_ID',
+  '__OWNER_OPEN_ID',
+  // Unguessable pane/profile authority channel (daemon-rotated capability).
+  'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Sandbox send-relay directory — a per-session capability path.
+  'BOTMUX_SEND_RELAY',
+  // Session-scoped MCP gateway capability + fail-closed marker.
+  'BOTMUX_MCP_GATEWAY_SOCKET',
+  'BOTMUX_MCP_GATEWAY_REQUIRED',
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
+  // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
+  // boot (daemon.ts), so an inherited copy is always a stale foreign port.
+  'BOTMUX_DAEMON_IPC_PORT',
+  // Per-session read-isolation / apiOnly / sandbox verdicts (worker-owned).
+  'BOTMUX_READ_ISOLATION',
+  'BOTMUX_READ_ISOLATED',
+  'BOTMUX_API_ONLY',
+  'IS_SANDBOX',
+  // Per-session display footer resolved from bots.json (never env-configured).
+  'BOTMUX_BRAND_LABEL',
+  // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
+  // env is never a config input for it.
+  'BOTMUX_USAGE_DISPLAY',
+  // Spawn-time normalized reply style; unset/scrub at every session boundary to
+  // avoid cross-bot guide/card drift through a shared persistent backend.
+  'BOTMUX_REPLY_STYLE',
+  // One-shot per-session artifacts/paths.
+  'BOTMUX_PI_INITIAL_PROMPT_FILE',
+  'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
+  // Ready-gate hook command, sessionReadyHookCommand() per session.
+  'BOTMUX_READY_COMMAND',
+  // Per-app value pinned by the ecosystemConfig env block; an inherited copy
+  // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
+  'BOTMUX_LARK_APP_ID',
+  // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
+  'CJADK_INTERACTIVE',
+] as const;
+
+/** Delete inherited session-only identity/capabilities from `env` in place. */
+export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
+}
 
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly
@@ -381,5 +592,65 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
 export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
+  // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
+  // knob added later. No CLI child ever consumes one, so a prefix-wide strip
+  // cannot break a supported configuration channel. Same implementation as the
+  // daemon-boot / detached-restart strip so the two layers cannot drift.
+  stripDashboardH5Env(env);
   return env;
+}
+
+/**
+ * Scrub the env handed to an EXTERNAL long-lived child — a process that is not
+ * botmux's own code and therefore will not scrub itself.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE BOOT SCRUBS: a bot daemon and the
+ * dashboard strip these families in their OWN entrypoints (index-daemon.ts /
+ * index-dashboard.ts). That works because they are our code. A plugin service is
+ * an arbitrary third-party program: it inherits whatever we hand it and will
+ * never delete a key on our behalf, so the strip has to happen on OUR side,
+ * before the spawn.
+ *
+ * The set is deliberately IDENTICAL to what the pm2 path scrubbed
+ * (`scrubPm2CallerEnv`), because this replaces that path — a migration must not
+ * quietly reduce protection. Every family below has a measured fleet-wide
+ * failure mode; see each key list for the specifics:
+ *
+ *   • SESSION_CLI_HOME_ENV_KEYS      one bot reading/writing a sibling's CLI home
+ *   • CLAUDE_SESSION_MARKER_ENV_KEYS transcript saving flipped off fleet-wide
+ *   • WORKFLOW_WORKER_ENV_KEYS       ordinary chats running in workflow mode
+ *   • dashboard H5 family            the app secret persisted into child state
+ *   • INVOKER_TERMINAL_ENV_KEYS      every PTY on the machine turned colorless
+ *   • SESSION_TURN_MARKER_ENV_KEYS   a long-lived proc carrying one turn's identity
+ *
+ * The graceful-exit sentinel is stripped for the same reason the pm2 path did it
+ * (stripPm2GracefulExitMarker, called by pm2Env before this scrub): it is the
+ * private handshake by which OUR OWN two managed cores report a clean shutdown as
+ * exit 90 instead of 0. resolveFleetDaemonEnv pins it for every supervised member,
+ * so without this an external command inherits it and any foreground `botmux` it
+ * launches would exit 90 on a clean stop — read back as a crash. An external
+ * member must never be told that 90 means "clean". (Stripping it here does NOT by
+ * itself stop the supervisor from reading a plain exit(90) as graceful; that is a
+ * separate decision in fleet-supervisor-policy's decideOnExit, which never looks
+ * at env. Both are required, which is why isGracefulExit is member-shape aware.)
+ *
+ * TERM is re-pinned rather than deleted, matching the pm2 path: deleting it
+ * makes a child's supports-color detection fail and render colorless, which is
+ * the same end state the invoker-terminal scrub exists to prevent.
+ *
+ * Mutates `env` in place.
+ */
+export function scrubExternalMemberEnv(env: NodeJS.ProcessEnv): void {
+  scrubSessionCliHomeEnv(env);
+  scrubClaudeSessionMarkerEnv(env);
+  scrubWorkflowWorkerEnv(env);
+  stripDashboardH5Env(env);
+  scrubInvokerTerminalEnv(env);
+  scrubSessionTurnMarkerEnv(env);
+  // String literal, not an import: this module is deliberately dependency-free
+  // (see REDACTED_CHILD_ENV_KEYS, which spells the same key out for the same
+  // reason). A drift-guard test pins it to PM2_GRACEFUL_EXIT_CODE_ENV.
+  delete env.BOTMUX_PM2_GRACEFUL_EXIT_CODE;
+  env.TERM = 'xterm-256color';
 }

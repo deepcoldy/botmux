@@ -17,12 +17,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockExistsSync = vi.fn(() => true);
 const mockReadFileSync = vi.fn(() => '[]');
 const mockWriteFileSync = vi.fn();
+const mockCrossRefStatSync = vi.fn();
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
     existsSync: (...args: any[]) => mockExistsSync(...args),
     readFileSync: (...args: any[]) => mockReadFileSync(...args),
+    statSync: (path: any, ...args: any[]) => String(path).includes('bot-openids-')
+      ? mockCrossRefStatSync(path, ...args)
+      : (actual.statSync as any)(path, ...args),
     writeFileSync: (...args: any[]) => mockWriteFileSync(...args),
     mkdirSync: vi.fn(),
   };
@@ -153,6 +157,12 @@ import {
 import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
+import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
+import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
+import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
+import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -163,6 +173,10 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  __resetPeerCrossRefCacheForTest();
+  mockCrossRefStatSync.mockReset().mockReturnValue({
+    dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1,
+  });
   capturedWsClientOptions = undefined;
   config.daemon.forwardFollowupWaitMs = 0;
   mockReadFileSync.mockReset().mockReturnValue('[]');
@@ -803,11 +817,14 @@ function setupBotState(opts?: {
 	  autoGrantRequestCards?: boolean;
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
+	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
+	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
 	  summaryMemoryPath?: string;
+	  cardActionAckTimeoutMs?: number;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -836,11 +853,14 @@ function setupBotState(opts?: {
       autoGrantRequestCards: opts?.autoGrantRequestCards,
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
+	      commandTriggers: opts?.commandTriggers,
 	      chatReplyModes: opts?.chatReplyModes,
+	      chatMentionModes: opts?.chatMentionModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
 	      summaryMemoryPath: opts?.summaryMemoryPath,
+	      cardActionAckTimeoutMs: opts?.cardActionAckTimeoutMs,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -857,6 +877,7 @@ function setupBotState(opts?: {
   isSessionOwner: ReturnType<typeof vi.fn>;
   onChatModeConverted: ReturnType<typeof vi.fn>;
   resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
+  chatSessionAnsweredRootAtTopLevel: ReturnType<typeof vi.fn>;
   handleVcMeetingPush: ReturnType<typeof vi.fn>;
 } {
   return {
@@ -866,6 +887,7 @@ function setupBotState(opts?: {
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
     resolveReplyThreadAlias: vi.fn(() => null),
+    chatSessionAnsweredRootAtTopLevel: vi.fn(() => false),
     onChatModeConverted: vi.fn(),
   };
 }
@@ -923,6 +945,10 @@ function makeUserMessageEvent(opts: {
   chatType?: string;
   messageId?: string;
   mentions?: TestMention[];
+  /** Lark message_type. Defaults to 'text' — the substitute trigger only fires
+   *  on hand-typed text/post, so tests exercising a trigger must carry a real
+   *  type (real WS events always do; the field is only optional here). */
+  messageType?: string;
 }) {
   const threadId = opts.threadId === null
     ? undefined
@@ -934,6 +960,7 @@ function makeUserMessageEvent(opts: {
       thread_id: threadId,
       chat_id: opts.chatId ?? 'chat-001',
       chat_type: opts.chatType ?? 'group',
+      message_type: opts.messageType ?? 'text',
       content: opts.content,
       mentions: opts.mentions,
     },
@@ -3537,6 +3564,75 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  // Regression for the msg-type gate: a forwarded interactive card / merge_forward
+  // inherits the forwarded content's original recipients into the event's top-level
+  // mentions. Those are NOT a hand-typed @ by the sender, so they must never trigger
+  // the substitute. Only text/post (typed by the sender in the composer) may.
+  for (const badType of ['interactive', 'merge_forward', 'file', 'image']) {
+    it(`substituteMode: ${badType} carrying an inherited @substitute in top-level mentions does NOT trigger`, async () => {
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'new-topic',
+        substituteMode: {
+          enabled: true,
+          targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+          disclosure: 'prefix',
+        },
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      handlers.isSessionOwner.mockReturnValue(false);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '发送给:@Sub Person' }),
+        messageId: `msg-substitute-${badType}`,
+        chatId: 'chat-substitute',
+        chatType: 'group',
+        messageType: badType,
+        // Same mention shape a genuine text @ would carry — proving the gate keys
+        // off message_type, not off whether the mention "looks" real.
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+      });
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+  }
+
+  it('substituteMode: a message with no message_type does NOT trigger (fail-closed contract)', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-notype',
+      chatId: 'chat-substitute',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+    });
+    // Model an event that reached the resolver without a resolved type: neither
+    // WS (always sets message_type) nor the polled path (coalesces msg_type)
+    // should do this, so the gate must fail closed rather than trigger.
+    delete (event.message as any).message_type;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('substituteMode: top-level @substitute carries replyRootId=messageId so each trigger has its own reply anchor', async () => {
     // Regression: without replyRootId, multiple substitute triggers in the same
     // chat-scope session share/clear the currentReplyTarget, causing replies to
@@ -3705,6 +3801,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       messageId: 'msg-substitute-post',
       chatId: 'chat-substitute-post',
       chatType: 'group',
+      messageType: 'post',
     });
 
     await capturedHandlers['im.message.receive_v1'](event);
@@ -4214,6 +4311,198 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('chat mode: a topic opened ON an earlier top-level @ keeps the reply at top level (root_id is an om_ message, not the omt_ thread)', async () => {
+    // Regression (user-reported): 顶层 @bot 建立 chat-scope 会话后，用户在**同一条
+    // 顶层消息上手动「开启话题」**。飞书随后把该话题内的消息投递成
+    // root_id = 那条原顶层 om_ 消息、thread_id = 新建的 omt_ 话题 —— 即
+    // root_id !== thread_id，且 root_id 是一条普通 om_ 消息。
+    //
+    // 与上一个用例（root_id === thread_id === 既有话题根，回复必须留在话题里）
+    // 的区别就在这里：那是「消息本就诞生在既有话题内」，而这里的话题是在 bot 已
+    // 按顶层建立会话之后才出现的。此时 fold 判定折叠回群是对的（scope=chat），
+    // 但不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层 @ 得到的回复
+    // 会跑进一个他并未在其中 @ 过 bot 的话题里。
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-after-topic');
+    // 前提:bot 此前已按顶层平铺答过 om_earlier_top_level_at 这条消息
+    // (daemon 侧即 turnReplyContexts[root].target.mode === 'plain')。
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => rootId === 'om_earlier_top_level_at',
+    );
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up after I opened a topic' }),
+      // root_id 指向此前那条顶层 @ 消息（om_ 前缀），thread_id 是事后新建的话题
+      rootId: 'om_earlier_top_level_at',
+      threadId: 'omt_opened_afterwards',
+      messageId: 'msg-after-topic-opened',
+      chatId: 'chat-after-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const call = handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event);
+    expect(call).toBeTruthy();
+    // 会话仍折叠回群 chat-scope（这部分本来就是对的）
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-after-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    // 关键断言：不得把回复钉进事后创建的话题
+    expect(call![1].replyRootId).toBeUndefined();
+  });
+
+  // ── 判据本体的真机制覆盖 ─────────────────────────────────────────────
+  // 上一个用例把 chatSessionAnsweredRootAtTopLevel 当 mock 喂死值，验的是
+  // 「判据命中之后 dispatcher 怎么做」。但「判据在什么输入下才该命中」同样是
+  // 契约的一半，且只 mock 的话它零覆盖 —— 曾因此漏掉原生话题 seed 也被记成
+  // mode='plain' 的情况。所以下面这组用真 beginReplyTargetTurn 落记录、再喂给
+  // **真判据本体**（从 reply-target.js 导入 daemon 用的同一个函数，绝不在测试里
+  // 手抄一份 —— 手抄的副本会让判据本体的变异照样全绿）。
+  const chatScopeDs = (chatId: string): any => ({
+    scope: 'chat',
+    chatId,
+    session: {
+      sessionId: `sess-${chatId}`, chatId, rootMessageId: chatId, title: 't',
+      status: 'active', createdAt: new Date().toISOString(), scope: 'chat',
+    },
+  });
+
+  it('判据: 顶层 @ 那轮(无 thread_id)记为 plain+inThread:false → 命中', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_toplevel');
+    // daemon 顶层 @ 路径：replyRootId=undefined、inThread=!!parsed.threadId=false
+    beginReplyTargetTurn(ds, undefined, 'om_top_at', new Date().toISOString(), { inThread: false });
+    expect(ds.session.turnReplyContexts['om_top_at'])
+      .toMatchObject({ target: { mode: 'plain', chatId: 'oc_toplevel' }, inThread: false });
+    expect(answeredAtTopLevel(ds.session, 'om_top_at')).toBe(true);
+  });
+
+  it('判据: chat 模式原生话题 seed 同样记 plain,但 inThread:true → 不命中(真话题不被平铺)', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_native');
+    // chat 模式下原生话题的开场消息：thread_id=omt_* 但没有 root_id，于是
+    // maybeFold(缺 root_id)与 shared-seed(mode≠shared)双双早退 ⇒ replyRootId
+    // 仍是 undefined ⇒ target 同样是 plain。唯一能区分它的就是 inThread。
+    beginReplyTargetTurn(ds, undefined, 'om_native_seed', new Date().toISOString(), { inThread: true });
+    expect(ds.session.turnReplyContexts['om_native_seed'].target).toEqual({ mode: 'plain', chatId: 'oc_native' });
+    expect(answeredAtTopLevel(ds.session, 'om_native_seed')).toBe(false);
+  });
+
+  it('判据: 老会话记录没有 inThread 字段 → 不命中(fail toward 既有话题锚定)', async () => {
+    const { chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_legacy');
+    // PR 之前落盘的记录只有 target，没有 inThread。undefined !== false，
+    // 因此按「未知」处理、保持旧行为，而不是猜它是顶层。
+    ds.session.turnReplyContexts = { om_legacy: { target: { mode: 'plain', chatId: 'oc_legacy' } } };
+    expect(answeredAtTopLevel(ds.session, 'om_legacy')).toBe(false);
+  });
+
+  it('判据: 话题内被 @ 那轮按回复消息 id 记 thread 目标,root 本身查不到 → 不命中', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_infold');
+    // fold 路径：beginReplyTargetTurn(ds, replyRootId=rootId, turnId=messageId)
+    beginReplyTargetTurn(ds, 'om_existing_root', 'om_reply_msg', new Date().toISOString(), { inThread: true });
+    expect(answeredAtTopLevel(ds.session, 'om_existing_root')).toBe(false);
+    expect(ds.session.turnReplyContexts['om_reply_msg'].target)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_existing_root' });
+  });
+
+  it('端到端: 真记录 + 真判据 —— 事后开的话题被平铺,用户真开的话题保持锚定', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const now = new Date().toISOString();
+    const ds = chatScopeDs('chat-e2e');
+    // 会话历史里两条都被平铺答过，区别只在 inThread：
+    beginReplyTargetTurn(ds, undefined, 'om_top_level_at', now, { inThread: false }); // 顶层 @
+    beginReplyTargetTurn(ds, undefined, 'om_native_seed', now, { inThread: true });   // 原生话题 seed
+
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((a: string) => a === 'chat-e2e');
+    // 关键：注入的不是死值，而是真判据跑在真记录上
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => answeredAtTopLevel(ds.session, rootId),
+    );
+
+    const inbound = (rootId: string, messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up' }),
+      rootId,
+      threadId: 'omt_some_topic',
+      messageId,
+      chatId: 'chat-e2e',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const ctxFor = (event: any) => (
+      handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event)
+    )?.[1];
+
+    // ① 事后在顶层 @ 上开的话题 → 回复平铺回顶层
+    const afterFact = inbound('om_top_level_at', 'msg-after-fact');
+    await capturedHandlers['im.message.receive_v1'](afterFact);
+    await flushEventWork();
+    expect(ctxFor(afterFact)).toMatchObject({ scope: 'chat', anchor: 'chat-e2e' });
+    expect(ctxFor(afterFact).replyRootId).toBeUndefined();
+
+    // ② 用户真正开的原生话题 → 回复仍锚在该话题里（既有契约不受影响）
+    const genuine = inbound('om_native_seed', 'msg-in-genuine-topic');
+    await capturedHandlers['im.message.receive_v1'](genuine);
+    await flushEventWork();
+    expect(ctxFor(genuine)).toMatchObject({ scope: 'chat', anchor: 'chat-e2e', replyRootId: 'om_native_seed' });
+  });
+
+  it('抑制显示锚点时仍交出 foldedRootId,且真 producer 据此登记 alias(话题内非@消息能折回本会话)', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const now = new Date().toISOString();
+    const ds = chatScopeDs('chat-alias');
+    beginReplyTargetTurn(ds, undefined, 'om_top_at', now, { inThread: false });
+
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((a: string) => a === 'chat-alias');
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => answeredAtTopLevel(ds.session, rootId),
+    );
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up' }),
+      rootId: 'om_top_at',
+      threadId: 'omt_after_fact',
+      messageId: 'msg-alias-case',
+      chatId: 'chat-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    const ctx = (
+      handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event)
+    )?.[1];
+    // 显示锚点被抑制(回复平铺),但路由归属仍交出去
+    expect(ctx.replyRootId).toBeUndefined();
+    expect(ctx.foldedRootId).toBe('om_top_at');
+
+    // 真 producer 拿到 foldedRootId 后必须登记 alias,否则该话题内的非 @ 消息
+    // 查不到本会话会另起 thread 会话
+    beginReplyTargetTurn(ds, ctx.replyRootId, 'msg-alias-case', now, {
+      inThread: true,
+      foldedRootId: ctx.foldedRootId,
+    });
+    expect(ds.session.replyThreadAliases?.['om_top_at']).toBeTruthy();
+    // 抑制显示锚点的语义不变:不设 currentReplyTarget
+    expect(ds.session.currentReplyTarget).toBeUndefined();
   });
 
   it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {
@@ -5142,6 +5431,94 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
   });
 });
 
+describe('im.message.receive_v1 — per-chat mention mode (chatMentionModes overrides regularGroupMentionMode)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  // The per-chat override is the whole point of /mention-mode: this chat answers
+  // non-@ messages even though the per-bot default still demands an @.
+  it('per-chat never answers a non-@ message while the per-bot default stays always', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 也该回我' }),
+      messageId: 'msg-mm-never',
+      chatId: 'chat-mm-never',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      chatId: 'chat-mm-never',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // Same bot, same turn shape, a DIFFERENT chat: without an override the per-bot
+  // default governs, so this one is still dropped. Pins that the override is
+  // keyed by chat rather than flipping the policy bot-wide.
+  it('a chat without an override still requires an @ under the same per-bot default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 就不该回我' }),
+      messageId: 'msg-mm-other',
+      chatId: 'chat-mm-other',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // The reverse direction: an explicit per-chat 'always' must be able to opt a
+  // single chat back OUT of a permissive per-bot default.
+  it('per-chat always pins one chat back to @-required under a per-bot never default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'never',
+      chatMentionModes: { 'chat-mm-pinned': 'always' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '这个群我要求必须 @' }),
+      messageId: 'msg-mm-pinned',
+      chatId: 'chat-mm-pinned',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('globalGrants — global talk-only authorization (canTalk / canOperate)', () => {
   beforeEach(() => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
@@ -5176,6 +5553,97 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
     setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
+  });
+});
+
+describe('managed Agent clone owner boundary', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');
+  });
+
+  it('pins the excluded-key list so a field cannot be silently dropped', () => {
+    // 下面那条用例用 CLONE_EXCLUDED_KEYS 驱动断言，好处是新增字段自动覆盖，
+    // 但代价是「从清单里删一个字段」会连带把它的断言一起删掉（自指盲区，
+    // 实测反向变异确认过）。所以这里额外用**字面量**钉死清单内容：删字段
+    // 必须在这条上红。新增字段时同步更新这份字面量即可。
+    expect([...CLONE_EXCLUDED_KEYS]).toEqual([
+      'apiOnly',
+      'name',
+      'displayName',
+      'messageListeners',
+      'oncallChats',
+      'defaultOncallAutoboundChats',
+      'allowedChatGroups',
+      'chatGrants',
+      'globalGrants',
+      'quotaState',
+      'grantExpiryState',
+      'sessionGroup',
+      'chatReplyModes',
+      'chatFeedbackPolicies',
+      'noCardChats',
+      'activationPending',
+      'activationDeactivating',
+      'activationStarting',
+      'activationCommitted',
+    ]);
+  });
+
+  it('keeps the human owner operable without cloning source instance state', async () => {
+    // 用实现导出的清单驱动：新增实例态字段时这条用例自动覆盖到。清单本身
+    // 被上一条字面量用例钉死，两条合起来堵住「加了不测」与「删了不红」。
+    // name 是 pm2 进程名（string），单独构造；其余用可辨识的对象值填充。
+    const instanceKeys = CLONE_EXCLUDED_KEYS.filter(key => key !== 'name');
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      cliId: 'codex',
+      allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      name: 'source-proc',
+      ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
+    };
+    const owners = cloneOwnerEntries(source, 'cli_source', 'ou_source_owner');
+    expect(owners).toEqual(['ou_source_owner']);
+
+    const normalized = await normalizeManagedOwnerEntries(
+      owners.join(','),
+      { sourceAppId: 'cli_source', sourceOwnerOpenId: 'ou_source_owner', creatingApp: true },
+      async () => 'on_human_owner',
+    );
+    const target = cloneBotConfig(source, {
+      larkAppId: MY_APP_ID,
+      larkAppSecret: 'target-secret',
+      allowedUsers: normalized?.split(','),
+    });
+    expect(target.allowedUsers).toEqual(['on_human_owner']);
+    for (const key of CLONE_EXCLUDED_KEYS) expect(target).not.toHaveProperty(key);
+    // 行为配置仍照常克隆（否则「全删掉」也能让上面那条断言通过）。
+    expect(target.cliId).toBe('codex');
+
+    // 目标 app 启动时会把 union_id 解析成自己视角下的 open_id。
+    setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
+  });
+
+  it('never carries a source-app identity into the cloned bot', () => {
+    // ou_ open_id 与 app secret 都是 app-scoped：target 没有该字段时必须删除，
+    // 而不是把 source 的值留下来（那会把真人 owner 锁在新 Bot 外面）。
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      brand: 'lark',
+      allowedUsers: ['ou_source_owner'],
+      ownerOpenId: 'ou_source_owner',
+      cliId: 'codex',
+    };
+    const target = cloneBotConfig(source, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target.larkAppId).toBe('cli_target');
+    expect(target.larkAppSecret).toBe('target-secret');
+    for (const key of ['brand', 'allowedUsers', 'ownerOpenId']) {
+      expect(target).not.toHaveProperty(key);
+    }
   });
 });
 
@@ -6817,6 +7285,25 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
+  it('保持既有 Botmux 卡片动作行为不变', async () => {
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'builtin accepted' },
+    });
+    const data = {
+      event_id: 'evt-builtin',
+      action: { name: 'botmux_builtin_action', value: { action: 'botmux_builtin_action' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_builtin' },
+    };
+    const result = await capturedHandlers['card.action.trigger']({
+      ...data,
+    });
+
+    expect(result).toEqual({ toast: { type: 'success', content: 'builtin accepted' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledOnce();
+    expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
+  });
+
   it('returns a valid empty ACK when a fast card handler has no payload', async () => {
     handlers.handleCardAction.mockResolvedValue(undefined);
 
@@ -6828,6 +7315,22 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
 
     expect(result).toEqual({});
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('wraps a truthy empty object into an invalid empty-body card patch (why resume must bare-return, not `return {}`)', async () => {
+    // Guards the resume-branch fix: a handler returning `{}` is truthy and gets
+    // shaped into `{card:{type:raw,data:{}}}` — an in-place patch with an empty
+    // card body, NOT a no-UI ACK. The resume branch must bare-return (→ undefined)
+    // to land on the genuine empty-ACK `{}` asserted in the test above.
+    handlers.handleCardAction.mockResolvedValue({});
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-empty-obj' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_empty_obj_card' },
+    });
+
+    expect(result).toEqual({ card: { type: 'raw', data: {} } });
   });
 
   it('still returns a valid empty ACK when a card handler rejects', async () => {
@@ -6844,16 +7347,130 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('returns a toast before a slow handler settles, then patches the card in background', async () => {
+  it('hot-applies the bot-level card action ACK cutoff without reconnecting', async () => {
+    setupBotState({ cardActionAckTimeoutMs: 1_000 });
     let release!: () => void;
-    const slow = new Promise(resolve => { release = () => resolve({ type: 'late-card' }); });
-    handlers.handleCardAction.mockReturnValue(slow as any);
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => {
+      release = () => resolve(undefined);
+    }) as any);
+
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        action: { value: { action: 'custom_ack_cutoff' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_custom_ack_cutoff' },
+      });
+      let settled = false;
+      void call.then(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(call).resolves.toEqual({
+        toast: { type: 'info', content: '操作已收到，后台处理中' },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('handler exceeded 1000ms'));
+
+      release();
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('为慢插件先 ACK 再更新原卡片', async () => {
+    const token = 'slow-fixture-token';
+    const logPath = `/tmp/botmux-card-action-slow-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'card', logPath, '2700',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`slow_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'slow-actions',
+        packageName: '@botmux-ai/plugin-slow-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/slow-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'slow-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.slow.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
+
+      const startedAt = Date.now();
+      const result = await capturedHandlers['card.action.trigger']({
+        event_id: 'evt-slow-plugin',
+        action: { name: 'submit', value: { action: 'example.slow.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_slow_card' },
+      });
+      expect(result).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+
+      await vi.waitFor(() => {
+        expect(mockUpdateMessage).toHaveBeenCalledWith(
+          MY_APP_ID,
+          'om_slow_card',
+          JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+        );
+      }, { timeout: 2_000 });
+      expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
+  });
+
+  // Regression: browser-restart slow-fail visibility.
+  // the browser-restart handler can run up to ~12s (quit-wait), well past the
+  // 2.5s ACK window. A slow handler that resolves to a CARD body must be patched
+  // into the message in the background (owner sees the failure). Contrast with
+  // the very next test: a slow TOAST-only result is dropped, which is exactly
+  // why the handler now returns a failure CARD instead of a toast.
+  it('patches a slow browser-restart FAILURE card in after ACK (visible failure)', async () => {
+    let release!: () => void;
+    const failureCard = { elements: [{ tag: 'note', elements: [{ tag: 'lark_md', content: '⚠️ **Arc**：已退出但重开失败' }] }] };
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => { release = () => resolve(failureCard); }) as any);
 
     vi.useFakeTimers();
     const call = capturedHandlers['card.action.trigger']({
-      action: { value: { action: 'toggle_stream', root_id: 'root-slow' } },
+      action: { value: { action: 'overload_restart_browser', bundleId: 'company.thebrowser.Browser' } },
       operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_slow_card' },
+      context: { open_message_id: 'om_browser_fail' },
     });
     await vi.advanceTimersByTimeAsync(2500);
     await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
@@ -6862,7 +7479,30 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await vi.runAllTimersAsync();
     vi.useRealTimers();
 
-    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_slow_card', JSON.stringify({ type: 'late-card' }));
+    // The failure card is wrapped as a raw patch and applied to the message.
+    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_browser_fail', JSON.stringify(failureCard));
+  });
+
+  it('drops a slow TOAST-only result after ACK (proves why failures must be cards)', async () => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => { release = () => resolve({ toast: { type: 'error', content: 'too late' } }); }) as any);
+
+    vi.useFakeTimers();
+    const call = capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'overload_restart_browser', bundleId: 'com.google.Chrome' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_toast_dropped' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+
+    release();
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    // Toast-only slow result is NOT patched (dropped) — logged instead.
+    expect(mockUpdateMessage).not.toHaveBeenCalledWith(MY_APP_ID, 'om_toast_dropped', expect.anything());
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('slow handler resolved to a toast-only result'));
   });
 
   it('dedupes a repeated card action while the first copy is still running', async () => {
@@ -6883,23 +7523,96 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await first;
   });
 
-  it('dedupes a same-event_id redelivery that arrives AFTER the first copy completed', async () => {
-    handlers.handleCardAction.mockResolvedValue({ type: 'done-card' });
-    const event = {
-      event_id: 'evt-card-claim',
-      action: { value: { action: 'restart', root_id: 'root-claim' } },
+  it('按稳定 eventId 抑制重复业务投递', async () => {
+    const token = 'dedupe-fixture-token';
+    const logPath = `/tmp/botmux-card-action-dedupe-${process.pid}-${Date.now()}.ndjson`;
+    const child = spawnTsScript(resolve('test/fixtures/plugin-card-action-service.ts'), [
+      '0', '/botmux/card-actions/v1', token, 'success', logPath, '0',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const port = await new Promise<number>((resolvePort, reject) => {
+        let stdout = '';
+        let stderr = '';
+        const timeout = setTimeout(() => reject(new Error(`dedupe_fixture_timeout:${stderr}`)), 10_000);
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        child.stdout?.on('data', chunk => {
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline < 0) return;
+          clearTimeout(timeout);
+          resolvePort(JSON.parse(stdout.slice(0, newline)).port);
+        });
+        child.once('error', error => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      const record = {
+        id: 'dedupe-actions',
+        packageName: '@botmux-ai/plugin-dedupe-actions',
+        version: '1.0.0',
+        source: { type: 'local' as const, spec: '/plugins/dedupe-actions' },
+        manifest: { schemaVersion: 1 as const, id: 'dedupe-actions', service: { mode: 'auto' as const } },
+        contributions: {
+          service: { entry: 'service/index.js', mode: 'auto' as const },
+          cardActions: {
+            schemaVersion: 1 as const,
+            actions: ['example.dedupe.submit'],
+            endpoint: '/botmux/card-actions/v1',
+          },
+        },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      };
+      const gateway = createPluginCardActionGateway({
+        resolvePluginIds: () => [record.id],
+        readRegistry: () => ({ schemaVersion: 1, plugins: { [record.id]: record } }),
+        readServiceState: () => ({ pluginId: record.id, updatedAt: '', status: 'online', port }),
+        readToken: () => token,
+      });
+      handlers.handleCardAction.mockImplementation((data, appId) => gateway.dispatch(data, appId));
+      const event = {
+        event_id: 'evt-card-claim',
+        action: { value: { action: 'example.dedupe.submit' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_claim_card' },
+      };
+
+      const first = await capturedHandlers['card.action.trigger'](event);
+      expect(first).toEqual({ toast: { type: 'success', content: 'accepted' } });
+      const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
+      expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const requests = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+      expect(requests).toHaveLength(1);
+    } finally {
+      child.kill('SIGTERM');
+      const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      fs.rmSync(logPath, { force: true });
+    }
+  });
+
+  it('服务与长连接恢复后无需重新注册业务 Handler', async () => {
+    vi.useFakeTimers();
+    const reconnectHandlers = makeHandlers();
+    reconnectHandlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', reconnectHandlers) as any;
+    expect(ws.start).toHaveBeenCalledTimes(1);
+    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ws.start).toHaveBeenCalledTimes(2);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-after-reconnect',
+      action: { value: { action: 'example.submit' } },
       operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om_claim_card' },
-    };
-
-    const first = await capturedHandlers['card.action.trigger'](event);
-    expect(first).toEqual({ card: { type: 'raw', data: { type: 'done-card' } } });
-
-    // In-flight Set has already cleared in finally(); only the durable claim can
-    // still stop a redelivery from re-firing a non-idempotent action (restart).
-    const redelivery = await capturedHandlers['card.action.trigger']({ ...event });
-    expect(redelivery).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
-    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+      context: { open_message_id: 'om-reconnect' },
+    });
+    expect(result).toEqual({ toast: { type: 'success', content: 'accepted' } });
+    expect(reconnectHandlers.handleCardAction).toHaveBeenCalledOnce();
+    vi.useRealTimers();
   });
 
   it('does NOT durably dedupe distinct clicks without an event_id (legitimate repeat)', async () => {
@@ -7973,5 +8686,228 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
     // 本群缓存命中(没有多余重查),仍按 1v1 放行。
     expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
     expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── 免@ 斜杠命令（commandTriggers） ────────────────────────────────────────
+// 普通群里旁人直接发一条配置内的命令（未 @ 任何 bot）→ 落进该群已有的 chat-scope
+// 会话续聊。默认 mentionMode 保持 'always'：本特性与「群聊 @ 策略」正交，不靠
+// 把整个群改成免@ 来实现。
+describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  function setup(commandTriggers: any, opts?: { allowedUsers?: string[] }) {
+    setupBotState({
+      allowedUsers: opts?.allowedUsers ?? [USER_OPEN_ID],
+      commandTriggers,
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    // 多人多 bot 群：末条 solo 放行不成立，只有命令闸能放行。
+    mockGetChatInfo.mockResolvedValue({ userCount: 5, botCount: 2 });
+  });
+
+  let fireSeq = 0;
+  function fire(text: string, extra?: { chatId?: string; mentions?: TestMention[]; sender?: string }) {
+    // 每条消息一个独立 message_id：事件去重按 message_id 认领，同 id 的第二条会被
+    // 静默丢掉（本 describe 里有单测连发两条）。
+    return makeUserMessageEvent({
+      senderOpenId: extra?.sender ?? USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: `msg-cmd-trigger-${++fireSeq}`,
+      chatId: extra?.chatId ?? 'chat-cmd',
+      chatType: 'group',
+      mentions: extra?.mentions,
+    });
+  }
+
+  it('routes a bare configured command into the group chat-scope session', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // 模板是命令的行为定义；dispatcher 只负责把「命中的条目 + 本条消息的参数」下发，
+  // 真正的渲染在 daemon 侧（renderCommandTriggerPrompt）。
+  it('carries the configured template and the parsed args on the routing context', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下登录超时'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下登录超时' },
+    }));
+  });
+
+  // 核心需求：群里已经有会话时，裸命令要**续聊**，不是另起一个。
+  it('continues the existing group session instead of forking a new one', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-cmd');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ignores a command that is not on the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/deploy prod'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ignores ordinary chatter while the trigger is configured', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('今天这个登录问题谁看一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 危险命令必须 @：白名单被手改塞进 /close 也不生效（运行期 fail-closed）。
+  it('fails closed on a reserved daemon command smuggled into the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/close' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/close'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on a reserved passthrough command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/clear' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/clear'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('honours the chat allow-list and block-list', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }], chats: ['chat-in'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve a', { chatId: 'chat-out' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve b', { chatId: 'chat-in' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-in',
+    }));
+  });
+
+  it('stays quiet when the sender cannot talk to the bot', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] }, { allowedUsers: ['ou_someone_else'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // `@张三 /solve` 是指给张三的 —— 命令形态不改变「点名了别人就让路」这条群礼仪。
+  it('yields when the command message @mentions another member', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not fire in a topic group (话题群另有续话规则)', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    mockGetChatMode.mockResolvedValue('topic');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('stays off until enabled', async () => {
+    setup({ enabled: false, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 命令的含义不该取决于有没有 @：@ 了 bot 再发同一条命令，模板同样生效。
+  // 这是刻意的（否则「@ 了就变成另一种行为」才是特例），在此显式钉住。
+  it('@ 路径同样应用模板 —— 命令含义与是否 @ 无关', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下' },
+    }));
+  });
+
+  // @ 路径的**路由**不受影响（正文侧见上一条：模板同样生效）。
+  it('leaves the @mention path routing untouched', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
   });
 });

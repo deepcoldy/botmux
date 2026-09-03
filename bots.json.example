@@ -50,5 +50,14 @@
     "cliId": "pi",
     "allowedUsers": ["frank@company.com"],
     "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot7",
+    "larkAppSecret": "your_secret_7",
+    "cliId": "traex",
+    "model": "DeepSeek-V4-Pro",
+    "reasoningEffort": "medium",
+    "allowedUsers": ["grace@company.com"],
+    "workingDir": "~/projects"
   }
 ]

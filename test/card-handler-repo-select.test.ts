@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
   CARD_POSTING_SENTINEL: '__posting__',
   };
@@ -333,6 +333,51 @@ describe('repo select card — plain switch', () => {
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('/close');
   });
 
+  it('does not create a replacement session when the old close left a residual', async () => {
+    // Picking a directory is not consent to leave a remote session running. The old
+    // row DID close (quarantined lineage cannot be cancelled safely), so this is not
+    // a failure — but the switch must stop and say so rather than silently spawning
+    // a replacement on top of an uncancelled remote session.
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('mojo-parked-9');
+    expect(said).toContain('未创建新会话');
+  });
+
+  it('a LOCAL-subtree residual on card repo switch points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('本机');
+    expect(said).toContain('未创建新会话');
+    expect(said).not.toContain('undefined');
+    expect(said).not.toMatch(/远端会话.*未.*取消/);
+  });
+
   it('rejects a callback from any card id other than the currently published picker', async () => {
     const ds = makeDs({
       pendingRepo: true,
@@ -426,6 +471,35 @@ describe('repo select card — plain switch', () => {
     expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
     // The buffered message IS the first real user turn — nothing left pending.
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('uses the selected CLI snapshot when pendingRepo is submitted from the card', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      worker: null,
+      session: {
+        ...makeDs().session,
+        cliLaunchSnapshot: {
+          version: 1,
+          state: 'pending',
+          entryId: 'codex',
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: null,
+          reasoningEffort: null,
+          launchShell: null,
+          startupCommands: [],
+        },
+      },
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
   });
 
   // ─── empty start (no buffered user input at all) ─────────────────────────
@@ -1023,12 +1097,27 @@ describe('repo select card — plain switch', () => {
     const originalRoot = 'om_original_chat_start';
     const ds = makeDs({
       scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_old_reply_topic',
+        turnId: 'turn-old',
+        updatedAt: new Date().toISOString(),
+      },
+      replyThreadAliases: {
+        om_old_reply_topic: {
+          createdAt: new Date().toISOString(),
+          lastUsedAt: new Date().toISOString(),
+        },
+      },
+      streamCardReplyTargetKey: 'thread:om_old_reply_topic',
       session: {
         ...makeDs().session,
         scope: 'chat',
         rootMessageId: originalRoot,
       },
     });
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.replyThreadAliases = ds.replyThreadAliases;
+    ds.session.streamCardReplyTargetKey = 'thread:om_old_reply_topic';
     ds.session.workingDir = '/repos/gamma';
     const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -1050,6 +1139,12 @@ describe('repo select card — plain switch', () => {
     expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
     expect(ds.session.scope).toBe('chat');
     expect(ds.session.rootMessageId).toBe(originalRoot);
+    expect(ds.currentReplyTarget).toBeUndefined();
+    expect(ds.replyThreadAliases).toBeUndefined();
+    expect(ds.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases).toBeUndefined();
+    expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
     const persisted = vi.mocked(updateSession).mock.calls.find(
       ([s]) => s.sessionId.startsWith('uuid-new-'),
     )?.[0];
@@ -1084,7 +1179,7 @@ describe('repo select card — plain switch', () => {
     await Promise.resolve();
     expect(contenderEntered).toBe(false);
 
-    close.resolve({ ok: true, alreadyClosed: false });
+    close.resolve({ ok: true, outcome: 'closed', alreadyClosed: false });
     await switching;
     const ownerAfterSwitch = await contender;
     expect(contenderEntered).toBe(true);

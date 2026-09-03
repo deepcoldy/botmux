@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
+import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
@@ -49,6 +51,21 @@ const preparationRecords = vi.hoisted(() => [] as Array<{
 }>);
 const onlineDaemons = vi.hoisted(() => new Map<string, { larkAppId: string; ipcPort: number; pid?: number; lastHeartbeat?: number }>());
 const remoteFetchCalls = vi.hoisted(() => [] as Array<{ url: string; init?: RequestInit; body?: any }>);
+/**
+ * Install one mock for BOTH transports.
+ *
+ * Loopback callers were moved off the global `fetch` onto node:http (Bun's fetch
+ * silently proxies 127.0.0.1 when `no_proxy` does not list that literal address),
+ * so `vi.stubGlobal('fetch', …)` alone stopped intercepting them: these tests
+ * began opening REAL connections to ports like 4310/39003 and `remoteFetchCalls`
+ * stayed empty. Keep using the same mock for both so the assertions still see
+ * every request, remote and local alike.
+ */
+function stubAllFetch(mock: unknown): void {
+  vi.stubGlobal('fetch', mock);
+  __setLoopbackTransportForTests(mock as never);
+}
+
 const addBotToChatCalls = vi.hoisted(() => [] as Array<{ proxyLarkAppId: string; chatId: string; targetLarkAppIds: string[] }>);
 const addBotToChatFailures = vi.hoisted(() => ({ count: 0 }));
 const addBotToChatHolds = vi.hoisted(() => ({
@@ -464,6 +481,9 @@ function registerListenerBotForRejoin(opts: { realtimeVoice?: boolean } = {}): v
       enabled: true,
       larkCliProfile: APP_ID,
       attentionTargetOpenId: TARGET_OPEN_ID,
+      // 这批用例考的是监听群成员进出的围栏（谁被移出、谁能重新入群），跟会中角色
+      // 选择卡无关。显式关掉消费面，免得共享预设目录的卡片混进 sentMessages 的计数。
+      meetingConsumer: { enabled: false },
       ...(opts.realtimeVoice ? { realtimeVoice: { enabled: true } } : {}),
     },
   });
@@ -867,6 +887,7 @@ describe('VC meeting daemon session lifecycle', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    __testOnly_resetLarkGate();
     __vcMeetingAgentTest.reset();
     __testOnly_activeSessions.clear();
     sentMessages.length = 0;
@@ -909,7 +930,61 @@ describe('VC meeting daemon session lifecycle', () => {
     testDataDir = undefined;
     dataDirBeforeTest = undefined;
     vi.unstubAllGlobals();
+    // vi.unstubAllGlobals() knows nothing about the loopback transport seam, so it
+    // has to be cleared explicitly — otherwise a mock installed here leaks into
+    // every later test in the run.
+    __setLoopbackTransportForTests(undefined);
     delete process.env.BOTMUX_TIME_SCALE;
+  });
+
+  describe('larkCliProfile 入会身份默认值（拉任意 bot 进会即可用）', () => {
+    // beforeEach 注册的 APP_ID bot 只有 { enabled: true }，没有 larkCliProfile——
+    // 正是 fleet 里 43/47 从没点过「配置权限」按钮的 bot 的形状。这批用例锁住：
+    // 读路径把入会身份默认成 bot 自己的 appId，于是入会门禁不再以 no_profile 拒绝。
+    it('defaults larkCliProfile to the bot own appId when unset', () => {
+      const cfg = __vcMeetingAgentTest.effectiveConfig(APP_ID);
+      expect(cfg?.larkCliProfile).toBe(APP_ID);
+    });
+
+    it('never overrides an operator-set larkCliProfile', () => {
+      registerBot({
+        larkAppId: 'cli_vc_explicit_profile',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        vcMeetingAgent: { enabled: true, larkCliProfile: 'operator_chosen_profile' },
+      });
+      const cfg = __vcMeetingAgentTest.effectiveConfig('cli_vc_explicit_profile');
+      expect(cfg?.larkCliProfile).toBe('operator_chosen_profile');
+    });
+
+    it('applies the default even when the bot has no vcMeetingAgent block at all', () => {
+      registerBot({
+        larkAppId: 'cli_vc_bare',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      });
+      const cfg = __vcMeetingAgentTest.effectiveConfig('cli_vc_bare');
+      // vcMeetingAgentConfigActive 对 Feishu-connected bot 返回 {}，默认补上入会身份。
+      expect(cfg?.larkCliProfile).toBe('cli_vc_bare');
+    });
+
+    it('does not fabricate a profile for apiOnly bots (they never join)', () => {
+      registerBot({
+        larkAppId: 'cli_vc_api_only',
+        larkAppSecret: '',
+        cliId: 'claude-code',
+        apiOnly: true,
+        vcMeetingAgent: { enabled: true },
+      });
+      // apiOnly → vcMeetingAgentConfigActive 返回 undefined，读路径整段跳过。
+      expect(__vcMeetingAgentTest.effectiveConfig('cli_vc_api_only')).toBeUndefined();
+    });
+
+    it('does not mutate the stored bot config (pure read path)', () => {
+      __vcMeetingAgentTest.effectiveConfig(APP_ID);
+      // 存储侧仍是原始形状——默认值只活在读路径派生对象里，绝不回写 bots.json。
+      expect(getBot(APP_ID).config.vcMeetingAgent?.larkCliProfile).toBeUndefined();
+    });
   });
 
   it('ingests activity into the meeting session without dispatching workflow', async () => {
@@ -1469,15 +1544,21 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_tracked_global_off')).toBe(false);
   });
 
-  it('global listener bot selection blocks new meetings for non-selected apps', async () => {
+  it('a legacy global-listener pin is ignored: every enabled bot handles its own invite', async () => {
     registerBot({
       larkAppId: OTHER_APP_ID,
       larkAppSecret: 'secret',
       cliId: 'claude-code',
       vcMeetingAgent: { enabled: true },
     });
+    // Even with a legacy pin pointing at APP_ID, OTHER_APP_ID must start its own
+    // meeting now — the pin is retired and no longer routes/blocks.
     __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(APP_ID);
 
+    // 入会身份现在默认成 bot 自己的 appId（读路径），所以邀请会真的触发一次
+    // joinMeetingAsBot。让 mock 回同一个 meeting.id，避免走「join 回来的 id 与邀请
+    // 不一致 → 重映射 session key」的分支——那条分支是另一回事，本用例只考路由。
+    joinMeetingIdOverrides.push('m_global_listener_other');
     await __vcMeetingAgentTest.handlePush({
       larkAppId: OTHER_APP_ID,
       kind: 'meeting_invited',
@@ -1486,7 +1567,7 @@ describe('VC meeting daemon session lifecycle', () => {
       meeting: { id: 'm_global_listener_other', meetingNo: '123456789', topic: 'Wrong listener' },
       raw: { event: { meeting: { id: 'm_global_listener_other', meeting_no: '123456789' } } },
     });
-    expect(__vcMeetingAgentTest.hasSession(OTHER_APP_ID, 'm_global_listener_other')).toBe(false);
+    expect(__vcMeetingAgentTest.hasSession(OTHER_APP_ID, 'm_global_listener_other')).toBe(true);
 
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
@@ -1511,7 +1592,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_global_listener_selected')).toBe(true);
   });
 
-  it('global listener bot selection does not interrupt already tracked meetings on old apps', async () => {
+  it('a legacy global-listener pin set mid-stream never interrupts any bot\'s tracked meeting', async () => {
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
       kind: 'meeting_activity',
@@ -2030,10 +2111,17 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(joinCalls).toEqual([{ meetingNumber: '123456789', profile: APP_ID }]);
     expect(groupCreateCalls).toHaveLength(1);
     expect(groupCreateCalls[0].userOpenIds).toEqual([TARGET_OPEN_ID]);
-    expect(sentMessages.some(msg => msg.msgType === 'interactive')).toBe(false);
-    expect(sentMessages).toHaveLength(1);
-    expect(sentMessages[0].receiveId).toBe('oc_listener_1');
-    expect(JSON.parse(sentMessages[0].content).text).toContain('会议监听已开始');
+    const textMessages = sentMessages.filter(msg => msg.msgType !== 'interactive');
+    expect(textMessages).toHaveLength(1);
+    expect(textMessages[0].receiveId).toBe('oc_listener_1');
+    expect(JSON.parse(textMessages[0].content).text).toContain('会议监听已开始');
+
+    // 这个 bot 从没配过 meetingConsumer——过去意味着「进会只能干听，一个角色都选
+    // 不到」。现在它继承 fleet 共享预设目录，被拉进会就直接拿到角色选择卡。
+    const consumerCards = sentMessages.filter(msg => msg.msgType === 'interactive');
+    expect(consumerCards).toHaveLength(1);
+    const labels = interactiveCardLabels(JSON.parse(consumerCards[0].content));
+    expect(labels.some(label => label?.includes('会议纪要'))).toBe(true);
 
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
@@ -2046,7 +2134,7 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(joinCalls).toHaveLength(1);
     expect(groupCreateCalls).toHaveLength(1);
-    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages).toHaveLength(2);
   });
 
   it('skips join and DMs the owner when the lark-cli join profile cannot be provisioned', async () => {
@@ -2201,7 +2289,9 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(sentMessages.filter(msg => msg.msgType === 'interactive')).toHaveLength(1);
     expect(joinCalls).toHaveLength(1);
     expect(groupCreateCalls).toHaveLength(1);
-    expect(realtimeVoiceEvents).toContain('stop:listener-removed');
+    // 实时语音改成按需建连后,入会不再急着开语音会话——本 bot 全程没发言,所以
+    // 移除时没有语音会话可停。语音生命周期由下面专门的按需建连用例覆盖。
+    expect(realtimeVoiceEvents).not.toContain('start');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_invite'))
       .toEqual(expect.objectContaining({
         listenerPresenceStale: true,
@@ -2582,6 +2672,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           consumerProfiles: [{
             id: 'self-speaker',
@@ -2646,8 +2737,11 @@ describe('VC meeting daemon session lifecycle', () => {
         memberEpoch: member!.memberEpoch,
       },
     });
-    expect(receiver?.activeKey).toContain(`vc-receiver:${member!.receiverSessionId}`);
-    expect(receiver?.activeKey).not.toBe(receiver?.ordinaryChatKey);
+    // Plan B: the meeting agent is an ordinary chat-scope session, so its
+    // active-map slot IS the normal (chatId, appId) key. Plain IM to this chat
+    // and meeting transcripts therefore fold into the SAME session.
+    expect(receiver?.activeKey).toBe(receiver?.ordinaryChatKey);
+    expect(receiver?.activeKey).not.toContain('vc-receiver:');
 
     const origin = {
       listenerAppId: member!.listenerAppId,
@@ -2823,6 +2917,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           selectionTimeoutMs: 20_000,
           consumerProfiles: [
@@ -3387,7 +3482,7 @@ describe('VC meeting daemon session lifecycle', () => {
       observeRemoteRegistration = resolve;
     });
     let remoteRegistrationBody: any;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -5552,7 +5647,10 @@ describe('VC meeting daemon session lifecycle', () => {
     });
   });
 
-  it('uses all locally registered bots as meeting consumer candidates when no allowlist is configured', async () => {
+  it('offers shared role presets instead of other bots when the bot has no profiles of its own', async () => {
+    // 另一个在线 bot：老模型会把它列进「选 agent」下拉，选中后再 addBotToChat 把它
+    // 拉进监听群——「拉 A 进会却把 B 拉进群」。现在会中只选角色，执行方恒为收到
+    // 这场会议事件的 bot 自己，别的 bot 不该出现在卡片上。
     registerConsumerAgentBot();
     registerBot({
       larkAppId: APP_ID,
@@ -5582,10 +5680,9 @@ describe('VC meeting daemon session lifecycle', () => {
 
     const card = JSON.parse(sentMessages.find(msg => msg.msgType === 'interactive')!.content);
     const labels = interactiveCardLabels(card);
-    expect(labels).toContain('Meeting Bot (claude-code)');
-    expect(labels).toContain('Agent Claude (claude-code)');
-    expect(labels).not.toContain(APP_ID);
-    expect(labels).not.toContain(AGENT_APP_ID);
+    expect(labels.some(label => label?.includes('会议纪要'))).toBe(true);
+    expect(labels).not.toContain('Agent Claude (claude-code)');
+    expect(JSON.stringify(card)).not.toContain(AGENT_APP_ID);
   });
 
   it('adds the selected meeting consumer agent to the listener chat and pins chat-scope', async () => {
@@ -8044,9 +8141,12 @@ describe('VC meeting daemon session lifecycle', () => {
       AGENT_APP_ID,
       'oc_listener_1',
     );
-    expect(routed.result).toEqual({
-      anchorOverride: `vc-receiver:${member.receiverSessionId}`,
-    });
+    // Plan B: the meeting agent is an ordinary chat-scope session at the normal
+    // (chatId, appId) slot, so the natural chat anchor already resolves it — the
+    // hook no longer returns a `vc-receiver:` anchor override. It still stamps
+    // vcMeetingImTurnOrigin (below) so the @mention follow-up carries meeting
+    // delivery identity, and it does not itself trigger a session turn.
+    expect(routed.result).toBeUndefined();
     expect(routed.ctx).toMatchObject({
       vcMeetingContextMayLag: false,
       vcMeetingContextLifecycle: 'sealed',
@@ -8096,7 +8196,7 @@ describe('VC meeting daemon session lifecycle', () => {
     });
     __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(AGENT_APP_ID);
     __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(false);
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       remoteFetchCalls.push({ url, init, body });
@@ -8187,6 +8287,73 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls[0].req.envelope.rawText).toContain('@用户 这个问题需要马上看一下');
   });
 
+  it('treats any instruction-source speech as a fast signal (no question mark required)', async () => {
+    // The authorizing user speaking plain statements used to wait out the
+    // regular flush tick (only "@" chats or instruction-source questions were
+    // fast) — the operator's own words now inject immediately.
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_operator_fast',
+      meeting: { id: 'm_operator_fast', meetingNo: '555555561', topic: 'Operator speech fast signal' },
+      raw: { event: { meeting: { id: 'm_operator_fast', meeting_no: '555555561' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_operator_fast_activity',
+      meeting: { id: 'm_joined_555555561', meetingNo: '555555561', topic: 'Operator speech fast signal' },
+      raw: {
+        event: {
+          meeting_actitivty_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555561', meeting_no: '555555561', topic: 'Operator speech fast signal' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_operator_fast_1',
+                  sender: { open_id: TARGET_OPEN_ID, user_name: 'Operator' },
+                  text: '先把上周的进展同步一下',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('先把上周的进展同步一下');
+  });
+
   it('temporarily authorizes in-meeting instruction sources without expanding output approval', async () => {
     registerConsumerAgentBot();
     registerBot({
@@ -8199,6 +8366,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           minBatchChars: 1_000,
           minBatchItems: 10,
@@ -8428,7 +8596,7 @@ describe('VC meeting daemon session lifecycle', () => {
       updatedAt: Date.now(),
       expiresAt: Date.now() + 60_000,
     });
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -8756,7 +8924,7 @@ describe('VC meeting daemon session lifecycle', () => {
       ipcPort: 39001,
       lastHeartbeat: Date.now(),
     });
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -8896,7 +9064,7 @@ describe('VC meeting daemon session lifecycle', () => {
       lastHeartbeat: Date.now(),
     });
     const deliveryBodies: any[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       remoteFetchCalls.push({ url, init, body });
@@ -9003,6 +9171,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9079,7 +9248,9 @@ describe('VC meeting daemon session lifecycle', () => {
           attentionTargetOpenId: TARGET_OPEN_ID,
           realtimeVoice: { enabled: true },
           meetingConsumer: {
+            voiceOutputPolicy: 'approval', // voice half of this test exercises review; default is now 'allow'
             enabled: true,
+            textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
             defaultMode: 'listenOnly',
             agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
           },
@@ -9206,6 +9377,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
         },
@@ -9359,6 +9531,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9423,6 +9596,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9486,6 +9660,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9571,6 +9746,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9645,6 +9821,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9703,6 +9880,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9770,6 +9948,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9842,6 +10021,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9894,6 +10074,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9946,6 +10127,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9999,6 +10181,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -10066,6 +10249,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },

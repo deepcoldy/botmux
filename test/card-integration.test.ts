@@ -616,6 +616,93 @@ describe('Card integration: full event flow', () => {
       }
     });
 
+    it('close reports a residual instead of the ordinary closed card', async () => {
+      // The row DID close, so this is not a failure — but a remote session was
+      // deliberately left running (quarantined lineage cannot be cancelled safely).
+      // Sending the normal closed card here would tell the user it is all gone.
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast).toEqual(expect.objectContaining({
+        type: 'warning',
+        content: expect.stringContaining('mojo-parked-9'),
+      }));
+      expect(result?.toast?.content).toContain('未被取消');
+      // No ordinary "closed" card on either delivery path.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('a LOCAL-subtree residual close toast points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast?.type).toBe('warning');
+      expect(result?.toast?.content).toContain('本机');
+      expect(result?.toast?.content).not.toContain('undefined');
+      expect(result?.toast?.content).not.toMatch(/远端会话.*未.*取消/);
+    });
+
+    it('close refusal reports the remote id and does not send a closed card', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        taskId: 'mojo-uncertain-9',
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast).toEqual(expect.objectContaining({
+        type: 'warning',
+        content: expect.stringContaining('mojo-uncertain-9'),
+      }));
+      expect(result?.toast?.content).toContain('mojo_close_reconciliation_required');
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const botRegMod = await import('../src/bot-registry.js');
@@ -965,7 +1052,7 @@ describe('Card integration: full event flow', () => {
         ds.session.status = 'closed';
         signalCloseStarted();
         await closeCleanupPending;
-        return { ok: true, alreadyClosed: false, known: true };
+        return { ok: true, outcome: 'closed', alreadyClosed: false, known: true };
       });
 
       const closeAction = handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);

@@ -55,6 +55,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
   // exercise the restore-time transient-failure quarantine path.
   promoteQueuedActivationTail: vi.fn(() => true),
@@ -115,7 +116,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
     if (s && s.status !== 'closed') store.closeSession(sid);
-    return { ok: true, alreadyClosed: false };
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
 
@@ -175,6 +176,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import {
   closeSession,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   killStalePids,
   promoteQueuedActivationTail,
@@ -194,6 +196,7 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
 });
@@ -253,7 +256,25 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
-    it('rejects manual resume for a closed dedicated VC receiver without mutating its state or routing map', async () => {
+    it('returns adopt_unsupported for a disconnected existing App Server adopt', async () => {
+      const s = sessionStore.createSession('oc_chat', 'om_root', 'Codex App: shared thread');
+      s.cliId = 'codex';
+      s.cliSessionId = '019e-existing-app-server-thread';
+      s.existingAppServerEndpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+      sessionStore.updateSession(s);
+      sessionStore.closeSession(s.sessionId);
+
+      const r = await resumeSession(s.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {
+      // Under Plan B a meeting agent is an ordinary chat-scope session, so a
+      // closed one is resumable like any chat session — the vc_receiver_managed
+      // refusal is gone. Here the chat anchor is already held by a live ordinary
+      // chat, so the resume correctly falls through to the ordinary
+      // anchor-occupancy guard instead of a VC-specific refusal.
       const receiver = makeClosedSession({
         chatId: 'oc_listener',
         rootMessageId: 'oc_listener',
@@ -281,7 +302,10 @@ describe('resumeSession', () => {
 
       const r = await resumeSession(receiver.sessionId, map);
 
-      expect(r).toEqual({ ok: false, error: 'vc_receiver_managed' });
+      // No VC-specific refusal — the ordinary anchor-occupancy guard wins because
+      // a live chat session already owns this chat's slot.
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('anchor_occupied');
       expect(sessionStore.getSession(receiver.sessionId)?.status).toBe('closed');
       expect(map.size).toBe(1);
       expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
@@ -479,7 +503,7 @@ describe('resumeSession', () => {
         cleanupStarted();
         await paused;
         sessionStore.closeSession(sid);
-        return { ok: true, alreadyClosed: false } as any;
+        return { ok: true, outcome: 'closed', alreadyClosed: false } as any;
       });
 
       const resuming = resumeSession(closed.sessionId, map);
@@ -569,6 +593,36 @@ describe('resumeSession', () => {
       expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
     });
 
+    it('re-attaches persisted ordinary-turn recovery only after the winning owner is restored', async () => {
+      const recovering = sessionStore.createSession(
+        'oc_recovery',
+        'om_recovery',
+        'recovering turn',
+        'group',
+      );
+      recovering.larkAppId = 'app_test';
+      recovering.scope = 'thread';
+      recovering.cliId = 'claude-code';
+      recovering.workingDir = '/tmp/proj';
+      recovering.ordinaryTurnRecovery = {
+        logicalTurnId: 'om_original',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        status: 'backoff',
+        nextAttemptAt: Date.now() + 2_000,
+        lastErrorCode: 'provider_unexpected_eof',
+      };
+      sessionStore.updateSession(recovering);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_recovery', 'app_test'));
+      expect(restored?.session.sessionId).toBe(recovering.sessionId);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledTimes(1);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(restored);
+    });
+
     it.each([
       ['pending repo setup', (session: any) => {
         session.queued = true;
@@ -614,7 +668,7 @@ describe('resumeSession', () => {
       expect(result.ds.pendingRepo).toBeFalsy();
     });
 
-    it('restores dedicated VC receivers without collapsing them into the ordinary chat slot', async () => {
+    it('Plan B: collapses legacy dedicated VC receiver rows into the ordinary chat slot on restore', async () => {
       const make = (title: string, receiver?: { meetingId: string; memberId: string }) => {
         const s = sessionStore.createSession('oc_listener', 'oc_listener', title, 'group');
         s.larkAppId = 'app_test';
@@ -632,6 +686,13 @@ describe('resumeSession', () => {
         sessionStore.updateSession(s);
         return s;
       };
+      // A plain IM session and two legacy dedicated-receiver rows, all for the
+      // same listener chat. Under the old model these lived at three distinct
+      // `vc-receiver:` keys; under Plan B a meeting agent is an ordinary
+      // chat-scope session, so all three resolve to the SAME (chatId, appId)
+      // slot. The restore CAS keeps the first-priority winner and closes the
+      // duplicate losers — the authoritative meeting lifecycle later re-ensures a
+      // fresh binding at that same ordinary slot.
       const ordinary = make('ordinary chat');
       const meetingA = make('meeting A', { meetingId: 'meeting-a', memberId: 'member-a' });
       const meetingB = make('meeting B', { meetingId: 'meeting-b', memberId: 'member-b' });
@@ -639,12 +700,53 @@ describe('resumeSession', () => {
 
       await restoreActiveSessions(map);
 
-      expect(map.get(sessionKey('oc_listener', 'app_test'))?.session.sessionId).toBe(ordinary.sessionId);
-      expect(map.get(sessionKey(`vc-receiver:${meetingA.sessionId}`, 'app_test'))?.session.sessionId)
-        .toBe(meetingA.sessionId);
-      expect(map.get(sessionKey(`vc-receiver:${meetingB.sessionId}`, 'app_test'))?.session.sessionId)
-        .toBe(meetingB.sessionId);
-      expect(map.size).toBe(3);
+      // Exactly one active-map entry, at the ordinary chat key — no `vc-receiver:`
+      // isolated keys survive.
+      expect(map.size).toBe(1);
+      const winner = map.get(sessionKey('oc_listener', 'app_test'));
+      expect(winner).toBeDefined();
+      expect([...map.keys()].some(k => k.includes('vc-receiver:'))).toBe(false);
+      // The first same-priority row (the plain IM session) wins; the two
+      // duplicate meeting rows are closed as collision losers.
+      expect(winner?.session.sessionId).toBe(ordinary.sessionId);
+      expect(sessionStore.getSession(meetingA.sessionId)?.status).toBe('closed');
+      expect(sessionStore.getSession(meetingB.sessionId)?.status).toBe('closed');
+    });
+
+    it('Plan B: a lone legacy meeting row restores at the ordinary chat key with its marker intact', async () => {
+      // Migration compat: a legacy dedicated-receiver row with no competing chat
+      // session at its listener chat must restore cleanly into the ordinary
+      // (chatId, appId) slot (no vc-receiver: key), keeping vcMeetingReceiver as
+      // delivery metadata so the meeting lifecycle + ledger still resolve it by
+      // sessionId. No hard hash migration is needed — the sessionId is stable
+      // across the key change.
+      const s = sessionStore.createSession('oc_solo_listener', 'oc_solo_listener', 'meeting solo', 'group');
+      s.larkAppId = 'app_test';
+      s.scope = 'chat';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/proj';
+      s.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      };
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('oc_solo_listener', 'app_test'));
+      expect(restored?.session.sessionId).toBe(s.sessionId);
+      expect([...map.keys()].some(k => k.includes('vc-receiver:'))).toBe(false);
+      // Marker retained as delivery metadata (not stripped) so meeting delivery
+      // still targets this exact session by id.
+      expect(restored?.session.vcMeetingReceiver).toMatchObject({
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      });
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
     });
 
     it('keeps the row closed when a concurrent close cancels resume registration', async () => {

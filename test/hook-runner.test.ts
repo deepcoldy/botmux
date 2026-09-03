@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
+import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 
 import {
   filterMatches,
@@ -42,9 +44,12 @@ describe('parseHookCommand', () => {
 
 describe('managed hook forwarding', () => {
   it('uses only the frozen protected port and exact original tuple', async () => {
-    const originalFetch = globalThis.fetch;
+    // The forwarder deliberately uses the proxy-immune loopback transport (node:http),
+    // so stubbing `globalThis.fetch` no longer intercepts it — that stub made the
+    // test open a REAL connection to port 4310 and record zero calls. Inject the
+    // transport seam instead; the assertions below are unchanged.
     const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
-    globalThis.fetch = fetchMock as typeof fetch;
+    const originalTransport = __setLoopbackTransportForTests(fetchMock as never);
     try {
       await forwardEmitToDaemon(
         'outbound.send',
@@ -59,7 +64,7 @@ describe('managed hook forwarding', () => {
         },
       );
     } finally {
-      globalThis.fetch = originalFetch;
+      __setLoopbackTransportForTests(originalTransport);
     }
 
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -78,14 +83,14 @@ describe('managed hook forwarding', () => {
     const oldSession = process.env.BOTMUX_SESSION_ID;
     const oldApp = process.env.BOTMUX_LARK_APP_ID;
     const oldHooks = process.env.BOTMUX_HOOKS_JSON;
-    const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
     process.env.BOTMUX_SESSION_ID = '';
     process.env.BOTMUX_LARK_APP_ID = '';
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify([
       { event: 'outbound.send', command: `/usr/bin/touch ${marker}` },
     ]);
-    globalThis.fetch = fetchMock as typeof fetch;
+    // Same reason as above: intercept the loopback transport, not globalThis.fetch.
+    const originalTransport = __setLoopbackTransportForTests(fetchMock as never);
     try {
       emitHookEvent('outbound.send', { content: 'managed' }, {
         managedOrigin: {
@@ -99,7 +104,7 @@ describe('managed hook forwarding', () => {
       await new Promise(resolve => setTimeout(resolve, 25));
       expect(existsSync(marker)).toBe(false);
     } finally {
-      globalThis.fetch = originalFetch;
+      __setLoopbackTransportForTests(originalTransport);
       if (oldSession === undefined) delete process.env.BOTMUX_SESSION_ID;
       else process.env.BOTMUX_SESSION_ID = oldSession;
       if (oldApp === undefined) delete process.env.BOTMUX_LARK_APP_ID;
@@ -352,17 +357,19 @@ describe('runHookCommandForTest', () => {
 
   it('does not keep CLI-style emitHookEvent processes alive for running hooks', () => {
     const started = Date.now();
+    // Node needs `--import tsx` on top of the eval args because the snippet
+    // imports a repo .ts module; Bun runs TypeScript natively.
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hello' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hello' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -389,17 +396,17 @@ describe('runHookCommandForTest', () => {
     // session-scoped env leaked into the process (e.g. pm2 startOrRestart
     // injecting the caller's environment after an in-session `botmux restart`).
     const marker = join(tmpDir, 'daemon-local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
-          "emitHookEventLocal('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
+            "emitHookEventLocal('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -434,17 +441,17 @@ describe('runHookCommandForTest', () => {
     // running, so findOnlineDaemon returns null and the forward silently
     // drops — the local-spawn marker file therefore must not appear.
     const marker = join(tmpDir, 'local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),

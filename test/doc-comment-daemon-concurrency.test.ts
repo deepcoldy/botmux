@@ -86,11 +86,15 @@ function makeDocDs(sessionId: string, fileToken = 'doccnFILE'): DaemonSession {
 }
 
 describe('document-comment routing generation primitives', () => {
+  // The first daemon.js dynamic import pays the whole module-graph transform
+  // cost; under full-suite fork parallelism that can exceed the 10s default
+  // hookTimeout (the unit project only raises testTimeout). Align the hook
+  // budget with the project's 30s testTimeout.
   beforeEach(async () => {
     const daemon = await import('../src/daemon.js');
     daemon.__testOnly_activeSessions.clear();
     daemon.__testOnly_resetDocCommentClaims();
-  });
+  }, 30_000);
 
   it('accepts only the exact map occupant, Session object, route, and active status', async () => {
     const daemon = await import('../src/daemon.js');

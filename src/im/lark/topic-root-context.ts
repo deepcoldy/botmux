@@ -18,8 +18,9 @@
  * root to resolve thread_id, then pulls up to 50 *full* message bodies — and
  * when thread_id can't be resolved it falls back to paging the *whole chat*
  * (potentially the entire large-group history) to filter by root_id. On top of
- * that, the Asc+50 cap means the "count" is only a floor (the oldest 50), so
- * printing it as an exact total is misleading. Since the daemon gate has
+ * that, the 50-per-page cap means the "count" is only a floor (as of the
+ * Desc-paging fix, the newest 50), so printing it as an exact total is
+ * misleading. Since the daemon gate has
  * *already* proven this is a topic reply, we don't need a network call at all:
  * emit the hint unconditionally and let the CLI decide whether to run
  * `botmux history` (thread-scope by default → walks this very thread, with its

@@ -22,6 +22,7 @@ vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: class MockHerdrBackend {
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
     static managedSessionName = vi.fn(() => 'botmux');
+    static defaultAgentName = vi.fn(() => 'botmux');
     static hasSession = vi.fn(() => false);
     static probeSession = vi.fn(() => 'missing');
     static hasAgent = vi.fn(() => false);
@@ -316,7 +317,7 @@ describe('selectSessionBackend', () => {
     expect(selected.isTmuxMode).toBe(false);
     expect(selected.isPipeMode).toBe(false);
     expect(selected.backend.constructor.name).toBe('MockZellijBackend');
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'auto' });
   });
 
   it('marks an existing zellij session as reattach without making it pipe mode', () => {
@@ -326,7 +327,57 @@ describe('selectSessionBackend', () => {
 
     expect(selected.isZellijMode).toBe(true);
     expect(selected.isPipeMode).toBe(false);
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
+  });
+
+  // F1 regression: the worker resolves zellij existence through a tri-state
+  // probe ONCE and biases an indeterminate answer toward reattach, then threads
+  // that frozen decision in as `hasExistingSession`. The selector must honour
+  // it verbatim — a bare `hasSession()` re-probe here would re-run the same
+  // load-fragile `list-sessions` and, on a sustained-load `false`, do a FRESH
+  // spawn that collides with the still-live named session ("Session already
+  // exists"), which is exactly the crash-loop the gate exemption was meant to
+  // avoid.
+  it('reattaches zellij on a threaded-in existence decision even when a live re-probe would say false', () => {
+    // Simulate the sustained-load case: hasSession() (the re-probe) returns
+    // false, but the frozen decision from the gate is "treat as present".
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(false);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'zellij',
+      hasExistingSession: true,
+    });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
+    // The threaded decision must WIN — the live re-probe must not be consulted.
+    expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('cold-spawns zellij on a threaded-in absent decision even if a live re-probe would say true', () => {
+    // Post-kill gates reset the frozen probe to "gone"; a stale live re-probe
+    // saying true must NOT resurrect a reattach to the pane just torn down.
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'zellij',
+      hasExistingSession: false,
+    });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'frozen' });
+    expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a live zellij hasSession probe (auto mode) when no decision is threaded in', () => {
+    // Default callers / tests that do not thread a frozen decision keep the old
+    // behaviour: consult the live probe AND let spawn() self-heal (auto).
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
+    expect(ZellijBackend.hasSession).toHaveBeenCalledTimes(1);
   });
 
   it('uses zmx tail signals, history snapshots, and send as a managed pipe backend', () => {
@@ -343,6 +394,64 @@ describe('selectSessionBackend', () => {
       isReattach: true,
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
     });
+  });
+
+  // ── Owned isolation/MCP Herdr host: agent-precise reattach-vs-fresh (generational
+  //    race symmetric case). host = bmx-<sid8>. Must use TRI-STATE probes; NEVER
+  //    predict reattach from the session alone (a live host whose botmux agent
+  //    vanished would loop the backend's frozen reattach guard, and the worker
+  //    would have skipped the PENDING + credential wrapper cold-path). ──
+  const OWNED_SID = 'aabbccdd-197d-4781-845b-c541dceb8980';
+  const ownedHost = `bmx-${OWNED_SID.slice(0, 8)}`;
+
+  it('owned host + agent BOTH exist → warm reattach the same owned host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    expect(selected.isReattach).toBe(true);
+    expect((selected.backend as any).opts.isReattach).toBe(true);
+  });
+
+  it('owned host EXISTS but agent MISSING → cold start IN the same host (isReattach:false), no teardown, no migrate to shared', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // SAME owned host retained (not migrated to the shared 'botmux' host)…
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    // …but cold: worker will write PENDING + assemble the credential wrapper first.
+    expect(selected.isReattach).toBe(false);
+    expect((selected.backend as any).opts.isReattach).toBe(false);
+    // Never tore down the still-live host.
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host exists but agent probe UNKNOWN → refuse (no kill, no spawn)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('unknown');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/agent .* probe inconclusive|reattach-vs-fresh/);
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host probe UNKNOWN → refuse (never fail-open by collapsing unknown to a fresh migrate)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'unknown' : 'missing');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/owned herdr session .* probe inconclusive|reattach-vs-fresh/);
+  });
+
+  it('owned host MISSING → migrate to the shared machine-wide botmux host (fresh)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux'); // shared exists, owned missing
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'missing' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // Falls through to the shared 'botmux' host cold path.
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect(selected.isReattach).toBe(false);
   });
 });
 

@@ -8,7 +8,7 @@ import {
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 type TerminalStatus = 'completed' | 'failed' | 'ambiguous';
-type Terminal = { turnId: string; dispatchAttempt: number; status: TerminalStatus; errorCode?: string };
+type Terminal = { turnId: string; dispatchAttempt: number; status: TerminalStatus; errorCode?: string; retryable?: boolean };
 
 function user(uuid: string, content: string): TranscriptEvent {
   return { type: 'user', uuid, message: { role: 'user', content } };
@@ -51,7 +51,19 @@ class ContractHarness {
   ingest(events: TranscriptEvent[]): void {
     this.queue.ingest(events, '/tmp/claude-session.jsonl');
     for (const turn of this.queue.drainEmittable({ explicitTerminalOnly: true })) {
-      this.emit(turn.turnId, turn.dispatchAttempt!, 'completed');
+      if (turn.rateLimited) continue;
+      const outcome = turn.terminalOutcome;
+      // Mirrors worker.ts emitReadyTurns: a SYNTHESISED local turn has no Lark
+      // turn behind it, so its failure must not reach the daemon (which would
+      // render a user-facing 「本轮执行失败」card for a turn nobody sent).
+      if (turn.isLocal && outcome && outcome.status !== 'completed') continue;
+      this.emit(
+        turn.turnId,
+        turn.dispatchAttempt!,
+        outcome?.status ?? 'completed',
+        outcome?.errorCode,
+        outcome?.retryable,
+      );
     }
   }
 
@@ -68,9 +80,16 @@ class ContractHarness {
     dispatchAttempt: number,
     status: TerminalStatus,
     errorCode?: string,
+    retryable?: boolean,
   ): void {
     if (!this.deduper.claim('receiver-session', turnId, dispatchAttempt)) return;
-    this.emitted.push({ turnId, dispatchAttempt, status, ...(errorCode ? { errorCode } : {}) });
+    this.emitted.push({
+      turnId,
+      dispatchAttempt,
+      status,
+      ...(errorCode ? { errorCode } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+    });
   }
 }
 
@@ -106,6 +125,50 @@ describe('Claude durable turn terminal contract', () => {
       { turnId: 'delivery-1', dispatchAttempt: 1, status: 'completed' },
       { turnId: 'delivery-2', dispatchAttempt: 1, status: 'completed' },
     ]);
+  });
+
+  it('maps the observed EOF fixture to retryable failed and ignores the later duration marker', () => {
+    const h = new ContractHarness();
+    h.mark('delivery-eof', 'continue the task', 1);
+    h.ingest([
+      user('u-eof', 'continue the task'),
+      {
+        type: 'assistant',
+        uuid: 'fixture-error',
+        isApiErrorMessage: true,
+        error: 'unknown',
+        message: {
+          role: 'assistant',
+          stop_reason: 'stop_sequence',
+          content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+        },
+      },
+      turnDuration('fixture-duration'),
+    ]);
+
+    expect(h.emitted).toEqual([{
+      turnId: 'delivery-eof',
+      dispatchAttempt: 1,
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    }]);
+  });
+
+  it('does not emit an ordinary terminal for a structured 429 boundary', () => {
+    const h = new ContractHarness();
+    h.mark('limited-turn', 'limited request', 1);
+    h.ingest([
+      user('u-limit', 'limited request'),
+      {
+        type: 'assistant', uuid: 'rl-contract', isApiErrorMessage: true,
+        error: 'rate_limit', apiErrorStatus: 429,
+        message: { role: 'assistant', content: [], stop_reason: 'stop_sequence' },
+      },
+      turnDuration('duration-limit'),
+    ]);
+
+    expect(h.emitted).toEqual([]);
   });
 
   it('settles an empty/silent final without fabricating visible assistant text', () => {
@@ -216,5 +279,130 @@ describe('Claude durable turn terminal contract', () => {
     expect(source).toContain("'terminal_bridge_unavailable'");
     expect(source).toMatch(/emitTurnTerminal\([\s\S]*?'ambiguous',[\s\S]*?'cli_exit'/);
     expect(source).toContain('requireExplicitTerminalForDurable: true');
+  });
+
+  /**
+   * A synthesised local turn must never raise a user-visible failure.
+   *
+   * `local-*` / `local-headless-*` ids are minted by the attribution queue for
+   * transcript activity that matched no pending Lark mark — terminal-typed
+   * input, or (after a restart) replayed history whose original mark is gone.
+   * Its transcript FALLBACK is already suppressed unconditionally, but its
+   * TERMINAL used to flow straight through, and the daemon renders any
+   * non-completed terminal as a 「本轮执行失败」card stamped `new Date()` plus
+   * the session's CURRENT lastUserPrompt — so the card named the wrong time
+   * and the wrong task.
+   *
+   * MEASURED on a live session: a `provider_server_error` recorded at 09:17
+   * was re-surfaced as a fresh failure card at 16:44 and again the next day at
+   * 04:32, both times at a daemon restart. The production log is unambiguous —
+   * 33 local turns logged "suppressed" on that tick and the failing one logged
+   * nothing at all, because it took the early `continue` before the gate.
+   */
+  describe('synthesised local turns raise no user-visible failure', () => {
+    /** The exact shape claude writes when a stream dies mid-response. */
+    function connectionLost(uuid: string): TranscriptEvent {
+      return {
+        type: 'assistant',
+        uuid,
+        isApiErrorMessage: true,
+        error: 'server_error',
+        message: {
+          role: 'assistant',
+          stop_reason: 'stop_sequence',
+          content: [{
+            type: 'text',
+            text: 'API Error: Connection lost mid-response. The response above may be incomplete.',
+          }],
+        },
+      } as TranscriptEvent;
+    }
+
+    it('emits no terminal for a local turn that died with provider_server_error', () => {
+      const h = new ContractHarness();
+      // No mark() at all → the user event synthesises a local turn.
+      h.ingest([
+        user('local-u', 'something typed straight into the pane'),
+        assistant('local-a', 'partial work', 'tool_use'),
+        connectionLost('local-err'),
+        turnDuration('local-dur'),
+      ]);
+      expect(h.emitted).toEqual([]);
+    });
+
+    it('emits no terminal for a HEADLESS local turn that died with provider_server_error', () => {
+      // The other synthesis path: an assistant boundary arrives with no
+      // collecting context at all (a restart cut the stream and the user event
+      // was already absorbed), so the queue mints `local-headless-<uuid>`.
+      // Reviewed as logically covered by the same gate, but it had no sample of
+      // its own — and "covered by the same branch" is an argument, not a test.
+      const h = new ContractHarness();
+      h.ingest([
+        assistant('headless-a', 'partial work with no user event', 'tool_use'),
+        connectionLost('headless-err'),
+        turnDuration('headless-dur'),
+      ]);
+      expect(h.emitted).toEqual([]);
+    });
+
+    it('still emits the failure for a REAL Lark turn — the card must not be lost', () => {
+      // Positive control. Without this, the fix above could be "suppress
+      // everything" and the suite would not notice.
+      const h = new ContractHarness();
+      h.mark('delivery-1', 'a real lark prompt', 1);
+      h.ingest([
+        user('u1', 'a real lark prompt'),
+        assistant('a1', 'partial work', 'tool_use'),
+        connectionLost('err-1'),
+        turnDuration('dur-1'),
+      ]);
+      expect(h.emitted).toEqual([{
+        turnId: 'delivery-1',
+        dispatchAttempt: 1,
+        status: 'failed',
+        errorCode: 'provider_server_error',
+        retryable: true,
+      }]);
+    });
+
+    it('still emits a local turn\'s COMPLETED terminal (bookkeeping, invisible to the user)', () => {
+      // The gate is scoped to the failure arm only: a completed local terminal
+      // settles the dedupe claim / durable release / CoT finalize and shows the
+      // user nothing, so suppressing it too would be a silent behaviour change.
+      const h = new ContractHarness();
+      h.ingest([
+        user('local-u', 'typed in the pane'),
+        assistant('local-a', 'done', 'end_turn'),
+      ]);
+      expect(h.emitted).toHaveLength(1);
+      expect(h.emitted[0].status).toBe('completed');
+      expect(h.emitted[0].turnId.startsWith('local-')).toBe(true);
+    });
+
+    it('worker.ts gates the terminal on isLocal, not only the fallback', () => {
+      const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+      // The guard must live in the TERMINAL loop. Anchored on the log line so a
+      // refactor that drops the gate fails here rather than silently reopening
+      // the card path.
+      expect(source).toContain('Bridge terminal suppressed for synthesised local turn');
+      expect(source).toMatch(
+        /if \(turn\.isLocal && outcome && outcome\.status !== 'completed'\) \{/,
+      );
+      // ORDER, not merely presence. Keeping every byte of the gate but moving
+      // it one call later — below emitTurnTerminal — resurrects the phantom
+      // card exactly (the failure terminal ships, then the gate logs and
+      // `continue`s into nothing), and every string assertion above stays
+      // green. Both indices are pinned > -1 first: toBeLessThan(-1, n) passes
+      // silently, so a slice that missed the function would fake a pass.
+      const fn = source.slice(
+        source.indexOf('function emitReadyTurns('),
+        source.indexOf('function drainPathInto('),
+      );
+      const gateAt = fn.indexOf('Bridge terminal suppressed for synthesised local turn');
+      const emitAt = fn.indexOf('emitTurnTerminal(');
+      expect(gateAt).toBeGreaterThan(-1);
+      expect(emitAt).toBeGreaterThan(-1);
+      expect(gateAt).toBeLessThan(emitAt);
+    });
   });
 });

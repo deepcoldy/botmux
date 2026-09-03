@@ -50,6 +50,7 @@ export type {
 export interface GoalInputs {
   inputs: Array<{
     from: string;          // upstream nodeId
+    output?: string;       // schemaVersion 2 stable public-output key
     name: string;          // logical file name (from upstream manifest)
     path: string;          // ABSOLUTE path, ready to Read
     kind: ManifestFileKind;

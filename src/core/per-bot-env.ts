@@ -20,10 +20,11 @@
  * This is NOT a secret vault: values live in `bots.json` and the process
  * environment in plaintext, visible to local diagnostic tools.
  *
- * Caveat — file sandbox: when a session runs inside the bwrap file sandbox the
- * CLI's env is carried via `bwrap --setenv` (not the backend's injectEnv path),
- * so per-bot env may not reach a sandboxed CLI. The common provider use case
- * (GLM etc.) doesn't run sandboxed; sandbox + per-bot env is a possible follow-up.
+ * File sandbox: the backend applies this per-pane/per-child env to the outer
+ * bwrap/Seatbelt process. Neither wrapper clears inherited env, so the values
+ * reach the CLI without being placed in bwrap argv; bwrap's own `--setenv`
+ * pairs only override botmux-managed sandbox values such as HOME/PATH/relay.
+ * Both paths retain the same per-bot boundary and are regression-tested.
  */
 
 /** Valid POSIX-ish env var name: letter/underscore start, then word chars. */
@@ -65,6 +66,16 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'CLAUDE_PID',
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  // lark-cli keystore data root (Linux): `<value>/lark-cli` holds THIS bot's
+  // appsecret + the shared master key. The file sandbox freezes the keystore path
+  // from the worker's OWN process env value and denies the store (carving out only
+  // this bot's keys); a per-bot inject would (a) NOT reach a sandboxed child anyway
+  // (bwrap uses a --setenv allowlist that excludes it + the worker re-pins it), so
+  // it would be silently overridden — confusing — and (b) if it DID take effect on a
+  // non-sandboxed path, relocate the keystore out from under the frozen policy. So a
+  // per-bot `env` must not set it: reserve it (rejected + diagnosable), not silently
+  // accepted-then-ignored. The authoritative value is the worker's env.
+  'LARKSUITE_CLI_DATA_DIR',
   // Grok data root: daemon installs hooks/skills and drains transcripts under
   // the process-level GROK_HOME. A per-bot inject would only reach the child
   // CLI and split-brain path resolution (see grok-paths header).

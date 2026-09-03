@@ -124,7 +124,7 @@ describe('/botconfig free-input quota', () => {
 
     expect(result?.toast).toMatchObject({
       type: 'success',
-      content: `Message quota set: grant cards and Oncall use ${quota} messages per person`,
+      content: `Message quota set: ${quota} messages per person on grant cards (Oncall unmetered)`,
     });
     expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota.defaultLimit).toBe(quota);
     expect(registry.getBot('app_config').config.messageQuota?.defaultLimit).toBe(quota);
@@ -160,7 +160,7 @@ describe('/botconfig free-input quota', () => {
 
     expect(result?.toast).toMatchObject({
       type: 'success',
-      content: 'Default restored: grant cards use 3 messages per person and Oncall is unlimited',
+      content: 'Default restored: 3 messages per person on grant cards (Oncall unmetered)',
     });
     expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota).toBeUndefined();
     expect(registry.getBot('app_config').config.messageQuota).toBeUndefined();

@@ -10,6 +10,19 @@
 - **每轮一张新卡片**：上一轮卡片冻结存档，对话历史清晰可回溯；会话用 [`/relay`](/relay) 搬到别的群后，原卡片也会自动冻结为存档（移除按钮）。
 - **关闭时给「可恢复」卡片**：带「▶️ 恢复会话」按钮随时点回来继续；**该 CLI 若支持原生 resume**（adapter 实现了 `buildResumeCommand` 且有原生 session id），还会附上原生命令（如 `claude --resume <id>`）方便手动恢复；不支持时只给 botmux 的恢复按钮 + 一句提示。
 
+## 置顶当前实时卡片
+
+如果某个 bot 开启了 `pinStreamingCard`，Botmux 会尝试把**当前公开实时状态卡片**置顶到聊天顶部，方便随时点「关闭会话」或打开终端。
+
+- 这是 **per-bot、默认关闭、显式开启** 的选项。
+- 飞书层的 Pin 仍然是**按群生效**，但每个活跃会话依旧维护各自的当前/冻结流式卡片生命周期。也就是说，同一个群里如果有多个活跃话题或多个 bot，可能同时出现多个由不同会话独立维护的群级置顶项。
+- 只会处理当前公开 live-status 的真实 `streamCardId`。
+- repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡，以及其它交互卡都**不会**被置顶。
+- 通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 改开关后，Botmux 会对这个 bot 的**现有活跃会话**立即做 best-effort 热重算；配置响应本身不会等待飞书 Pin/Unpin 完成。
+- `/card pin off` 是**按群逃生阀**：保留实时卡片本身，但停止在当前群自动置顶；`/card pin on` 恢复当前群置顶；`/card pin status` 会区分 bot 级未开启、当前群显式关闭、以及当前群实际开启三种状态。
+- 失败是 **fail-open**：不会影响发卡、转移、恢复、关闭或配置写入。异常期间可能暂时没有任何 Pin，也可能短时间同时存在多个 Pin。
+- 该能力没有持久重试日志，重启后的恢复也刻意保持很窄。daemon 重启时，Botmux 把当前群 Pin 列表作为持久卡片唯一的来源判定：只有飞书返回 `operator_id_type: "app_id"` 且 `operator_id` 与当前 `larkAppId` 完全一致时，远端 Pin 才算可证明；即便如此，后续清理权限仍然只限于与本进程入队瞬间已知的本地候选 ID 做**严格交集**。若当前卡已经由人工、其它应用或不完整/混合来源置顶，Botmux 会保留原状，既不认领也不重复 Pin；只有列表中不存在当前卡时才会创建，并要求返回的 `data.pin` 同时精确匹配消息 ID 和当前应用来源。Botmux 不会对任意远端 Pin 做宽扫清理，读取或 Pin API 失败时继续 fail-open。显式 bot 级/按群关闭只清理进程内已拥有的 ID，加上远端刚证明属于同应用的本地候选；普通 disable、关闭会话和转移只清理进程内已拥有的 ID。
+
 > **打开终端 = 只读**：卡片主按钮「🖥️ 打开 Web 终端」是只读查看；要**可写操作**点「🔑 获取操作链接」——**私密投递**：普通平铺群优先发一张群内「仅你可见」的 ephemeral 卡（不用离开会话），话题/线程或私聊、以及 ephemeral 失败时才走私聊 DM。「🔄 重启」「接管配置」等管理按钮在**会话卡**上，不在每轮的流式卡上。
 
 ## 打断 / 纠偏正在跑的一轮
@@ -23,3 +36,25 @@
 卡片正文是终端画面的**实时截图（图片）**，不是文本渲染。CLI 主动发的消息（通过 `botmux send`）则是独立的富文本 / 图文消息，可带图片、文件、@mention；需要完全自定义展示时也可以用 `--card-file` / `--card-json` 发送原始 interactive 卡片 JSON。
 
 > ⚠️ 原始卡片**只允许纯展示 + open_url 跳转按钮**：任何会触发回调的控件——回调按钮（带 `value`）、下拉 / 人员选择、日期时间选择、输入框、表单提交——都会被拒绝。这是防止自定义卡片伪造交互回调。
+
+## 发送后更新卡片（card patch）
+
+`botmux send --card-file/--card-json` 成功后会输出 `{"success":true,"messageId":"om_...",...}`。用 `botmux card patch` 可以按这个 messageId **原地更新**同一张卡片——不发新消息、不换群/话题，适合做进度卡片：
+
+```bash
+# 1. 发一张「进行中」卡片，从输出 JSON 里拿 messageId
+botmux send --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 0%"}]}}' --no-mention
+# → {"success":true,"messageId":"om_xxx","sessionId":"..."}
+
+# 2. 用 jq 提取 messageId，原地更新到 50%
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 50%"}]}}'
+
+# 3. 完成时再更新一次
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"green","title":{"tag":"plain_text","content":"部署完成"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"✅ 已上线"}]}}'
+```
+
+- 更新用的卡片 JSON 与发送时走**同一套安全校验**（纯展示 + open_url，回调控件被拒）。
+- 示例中的 `send` 带 `--no-mention`：进度卡片不需要 @ 任何人，显式声明不提及可避免被 mention 策略门拦截（exit 2）。
+- Bot 身份从会话上下文解析（与 `send` 相同）；消息已撤回、无权限、目标不是卡片消息等错误会原样透出（exit 1）。
+- 成功输出 `{"success":true,"messageId":"om_xxx","sessionId":"..."}`（stdout 只有 JSON）；参数错误 exit 2。

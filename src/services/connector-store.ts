@@ -77,6 +77,22 @@ export interface ConnectorDefinition {
   lifecycleExtractors: null | {
     dedupKey: string;
   };
+  /** Inbound duplicate-delivery suppression for an at-least-once upstream.
+   *
+   *  Header/query carriage needs NO config — a key presented by the sender is
+   *  always honoured (sending it IS the declaration that the delivery is
+   *  uniquely identified), which is what makes this fix land on existing
+   *  connectors without an edit. These two knobs only cover what can't be
+   *  inferred:
+   *  - `keyPath`: dotted body path for senders that can't set a header (they can
+   *    only paste a URL), so the unique id lives inside the event JSON.
+   *  - `disabled`: escape hatch for an upstream that reuses one id across
+   *    genuinely distinct events, where suppression would lose real events.
+   *  Absent (older stores) = header/query honoured, no body path. */
+  idempotency?: {
+    keyPath?: string;
+    disabled?: boolean;
+  };
   rateLimit?: {
     windowSeconds: number;
     maxRequests: number;

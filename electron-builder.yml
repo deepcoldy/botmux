@@ -19,7 +19,24 @@ mac:
   # Both per-arch builds intentionally carry both bundled Node/runtime trees.
   # Keep those already architecture-qualified Mach-O files instead of asking
   # @electron/universal to lipo identical copies a second time.
-  x64ArchFiles: 'Contents/Resources/{node/**,runtime/node_modules/.pnpm/**}'
+  #
+  # The glob must match the INSTALLED layout. `prepare-desktop-runtime.mjs` builds
+  # this tree with `bun install`, so packages land flat at
+  # `node_modules/<name>/…` (verified: the canvas natives are at
+  # `node_modules/@napi-rs/canvas-<platform>/…node`).
+  #
+  # A glob that matches nothing does NOT error — it would silently stop excluding
+  # these files and let universal try to lipo them. So this pattern is asserted in
+  # test/desktop/desktop-bundled-runtime.test.ts rather than trusted.
+  #
+  # NOTE: this deliberately does NOT try to also cover pnpm's old nested
+  # `node_modules/.pnpm/<name>@<ver>/…` layout. `**` cannot reach it: x64ArchFiles
+  # is a minimatch pattern and minimatch does not match dotfiles unless `dot:true`
+  # is passed (it isn't), so `.pnpm` is invisible to it. Covering that layout would
+  # need `.pnpm/**` spelled out explicitly — pointless now that nothing installs
+  # this tree with pnpm. If the installer ever changes again, re-verify the match
+  # instead of assuming `**` is broad enough.
+  x64ArchFiles: 'Contents/Resources/{node/**,runtime/node_modules/**}'
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false

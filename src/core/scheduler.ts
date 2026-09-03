@@ -575,6 +575,14 @@ export function addTask(params: {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  /** Creator's Lark open_id, stamped so daemon-initiated scheduled turns can
+   *  authenticate workflow commands as the creator (see
+   *  scheduled-turn-provenance). Absent for CLI-created tasks without a
+   *  resolvable creator — those keep the historical behavior. */
+  ownerOpenId?: string;
+  /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
+   *  a task without it runs its scheduled turns with no user identity. */
+  ownerUnionId?: string;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -609,6 +617,8 @@ export function addTask(params: {
     creatorChatId: params.creatorChatId,
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
+    ownerOpenId: params.ownerOpenId,
+    ownerUnionId: params.ownerUnionId,
     nextRunAt,
     repeat: params.repeat,
     // Delivery shape is now expressed by scope/rootMessageId. Persist only the
@@ -764,14 +774,25 @@ export function toggleDelivery(id: string): {
   let executionPosition: ScheduleExecutionPosition;
   if (current === 'topic') executionPosition = 'top-level';
   else if (current === 'top-level') executionPosition = 'new-topic';
-  else executionPosition = task.rootMessageId ? 'topic' : 'top-level';
+  // Leaving the fresh-topic state parks at top level. The retained root is
+  // never reused to cycle back into a topic silently — that was the
+  // adopt-topic leak.
+  else executionPosition = 'top-level';
   if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
-  const scope: 'chat' | 'thread' = executionPosition === 'topic' ? 'thread' : 'chat';
-  scheduleStore.updateTask(id, { scope, executionPosition });
+  // Topic is never a toggle target (it needs an explicit re-anchor via
+  // updateTask), so every cycle state above lands in chat scope.
+  const scope: 'chat' | 'thread' = 'chat';
+  // Parking at top level clears the retained root bookmark (undefined in the
+  // store; null in the dashboard event so JSON/SSE caches clear it too) — no
+  // later toggle or stale cache may re-enter the original topic.
+  const clearsRoot = executionPosition === 'top-level' && task.rootMessageId !== undefined;
+  scheduleStore.updateTask(id, clearsRoot
+    ? { scope, executionPosition, rootMessageId: undefined }
+    : { scope, executionPosition });
   const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch: { scope, executionPosition } },
+    body: { id, patch: clearsRoot ? { scope, executionPosition, rootMessageId: null } : { scope, executionPosition } },
   });
   return { ok: true, deliver, executionPosition };
 }
@@ -827,6 +848,13 @@ export function updateTask(
     patch.scope = executionPosition === 'topic' ? 'thread' : 'chat';
     patch.executionPosition = executionPosition;
     patch.deliver = 'origin';
+    // Parking at top level (or fresh topic) clears the retained root bookmark
+    // so execution can never silently return to the originating (e.g. adopted)
+    // topic — even when the client carries a stale root (dashboard edit form).
+    if (executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      patch.rootMessageId = undefined;
+      eventPatch.rootMessageId = null;
+    }
   } else if (updates.deliver !== undefined) {
     patch.deliver = 'origin';
   }

@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { FrozenSessionReplyContext, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -86,6 +86,15 @@ export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
   | { mode: 'thread'; rootMessageId: string }
   | { mode: 'quote'; rootMessageId: string };
+
+/** Stable key for one visible Lark destination. Keep the reply mode in the key:
+ * a quoted top-level reply and a reply inside that message's thread share the
+ * same message id but are different visible surfaces. */
+export function replyTargetKey(target: FrozenSessionReplyTarget): string {
+  return target.mode === 'plain'
+    ? `plain:${target.chatId}`
+    : `${target.mode}:${target.rootMessageId}`;
+}
 
 /** Freeze the visible Lark destination for one inbound turn before any
  * lifecycle mutation can replace or remove its session. `replyRootId` is
@@ -254,7 +263,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
 ): void {
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
@@ -277,6 +286,13 @@ export function beginReplyTargetTurn(
       : {}),
     ...(ds.session.quoteTargetSenderIsBot !== undefined
       ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
+      : {}),
+    // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
+    // "answered flat but the inbound was already inside a topic" (a native
+    // topic seed). Thread-scope turns route off session.rootMessageId and
+    // never consult this, so recording it there would only be dead metadata.
+    ...(ds.scope === 'chat' && opts?.inThread !== undefined
+      ? { inThread: opts.inThread }
       : {}),
   };
   const overflow = Object.keys(exactContexts).length - 256;
@@ -324,6 +340,23 @@ export function beginReplyTargetTurn(
     ds.session.replyThreadAliases = aliases;
     ds.session.currentReplyTarget = target;
     return;
+  }
+  // The turn folded into this chat-scope session from a Lark thread whose root
+  // we deliberately did NOT anchor the visible reply to (an after-the-fact
+  // topic — see chatSessionAnsweredRootAtTopLevel). Routing and display are
+  // separate contracts: the reply stays flat, but this session must still be
+  // discoverable by that root, or a later NON-@ message inside that topic
+  // misses `findChatReplyAlias` and forks a brand-new thread-scope session
+  // instead of folding back here (reachable under the never/topic/ambient
+  // mention modes, which answer un-@'d messages).
+  if (opts?.foldedRootId) {
+    const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
+    aliases[opts.foldedRootId] = {
+      createdAt: aliases[opts.foldedRootId]?.createdAt ?? nowIso,
+      lastUsedAt: nowIso,
+    };
+    ds.replyThreadAliases = aliases;
+    ds.session.replyThreadAliases = aliases;
   }
   ds.currentReplyTarget = undefined;
   ds.session.currentReplyTarget = undefined;
@@ -432,4 +465,98 @@ export function syncReplyTargetState(ds: DaemonSession, s?: Session): void {
   const source = s ?? ds.session;
   ds.replyThreadAliases = source.replyThreadAliases;
   ds.currentReplyTarget = source.currentReplyTarget;
+}
+
+/**
+ * Rebind reply metadata after a live DaemonSession is moved to another Lark
+ * destination or assigned a replacement Session record. Source-chat message
+ * ids must never survive as routing authority in the new destination.
+ *
+ * Per-turn sender/participant attribution is retained for buffered inputs, but
+ * every visible target is rewritten to the session's new canonical surface.
+ * Callers detach/clear the old live card before invoking this helper, so its
+ * persisted destination key is cleared as part of the same lifecycle boundary.
+ */
+export function rehomeReplyTargetState(ds: DaemonSession): void {
+  const target = resolveInboundReplyTarget({
+    scope: ds.scope,
+    chatId: ds.chatId,
+    threadRootId: ds.session.rootMessageId,
+  });
+
+  if (ds.session.turnReplyContexts) {
+    const contexts: NonNullable<Session['turnReplyContexts']> = {};
+    for (const [turnId, context] of Object.entries(ds.session.turnReplyContexts)) {
+      contexts[turnId] = {
+        target,
+        ...(context.replyTargetSenderOpenId
+          ? { replyTargetSenderOpenId: context.replyTargetSenderOpenId }
+          : {}),
+        ...(context.replyTargetSenderIsBot !== undefined
+          ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
+          : {}),
+        // `inThread` is deliberately NOT carried over: it describes the shape of
+        // the inbound message in the SOURCE chat, which says nothing about the
+        // new destination. Readers treat its absence as "unknown" and fall back
+        // to pre-existing behavior, which is the safe direction here.
+      };
+    }
+    ds.session.turnReplyContexts = contexts;
+  }
+
+  if (ds.session.replyTargets) {
+    const targets: NonNullable<Session['replyTargets']> = {};
+    for (const [turnId, entry] of Object.entries(ds.session.replyTargets)) {
+      targets[turnId] = {
+        updatedAt: entry.updatedAt,
+        ...(entry.senderOpenId ? { senderOpenId: entry.senderOpenId } : {}),
+        ...(entry.participants?.length ? { participants: entry.participants } : {}),
+        ...(entry.participantsIncomplete ? { participantsIncomplete: true } : {}),
+      };
+    }
+    ds.session.replyTargets = targets;
+  }
+
+  ds.replyThreadAliases = undefined;
+  ds.currentReplyTarget = undefined;
+  ds.session.replyThreadAliases = undefined;
+  ds.session.currentReplyTarget = undefined;
+  ds.session.quoteTargetId = undefined;
+  ds.session.quoteTargetSenderOpenId = undefined;
+  ds.session.quoteTargetSenderIsBot = undefined;
+  ds.streamCardReplyTargetKey = undefined;
+  ds.session.streamCardReplyTargetKey = undefined;
+}
+
+/**
+ * True when `rootId` is a message this chat-scope session ALREADY answered as a
+ * flat turn **that arrived at the group's top level** — its frozen per-turn
+ * record is `{ target.mode: 'plain', inThread: false }`.
+ *
+ * Lives beside `beginReplyTargetTurn`, the sole writer of the record it reads:
+ * the two halves of this contract must not drift apart, and a predicate defined
+ * next to its producer can be unit-tested against real records instead of being
+ * re-implemented (and silently diverging) at the call site.
+ *
+ * Used by the regular-group fold to tell apart:
+ *   • 顶层 @ 之后用户才在那条消息上「开启话题」 — Lark then delivers that topic's
+ *     messages as root_id=<原顶层消息> + thread_id=<新建 omt_>. The turn still
+ *     folds into the group chat-scope session, but the visible reply must NOT be
+ *     anchored into a topic the user never @'d the bot in.
+ *   • 用户真正开的原生话题 — must keep its existing topic anchoring.
+ *
+ * `mode === 'plain'` alone cannot separate the two: a native-topic seed is
+ * recorded `plain` as well (its opening message carries thread_id but no
+ * root_id, so neither the fold nor the shared-topic seeder supplies a
+ * replyRootId). `inThread` is the load-bearing half. A record written before
+ * `inThread` existed leaves it undefined — not `false` — so it reads as
+ * "unknown" and keeps the pre-existing behavior rather than guessing.
+ */
+export function chatSessionAnsweredRootAtTopLevel(
+  s: Pick<Session, 'scope' | 'turnReplyContexts'>,
+  rootId: string,
+): boolean {
+  if (s.scope !== 'chat') return false;
+  const context = s.turnReplyContexts?.[rootId];
+  return context?.target?.mode === 'plain' && context.inThread === false;
 }

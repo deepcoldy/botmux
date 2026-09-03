@@ -155,7 +155,11 @@ describe('initial prompt argv byte-limit fallback', () => {
       expect(prepared.initialPrompt).toMatch(/^@.+\.prompt\.md$/);
       expect(readFileSync(prepared.cleanupPaths![0]!, 'utf-8')).toBe(prompt);
       expect(deferInitialPrompt).toBe(false);
-      expect(args).toEqual(['--session-id', 'sess-pi-long', prepared.initialPrompt]);
+      // The turn-boundary extension leads every Pi launch line (see
+      // `pi buildArgs` in cli-adapters.test.ts); this case is about the @file
+      // prompt, so assert the rest exactly.
+      expect(args.slice(0, 1)).toEqual(['--extension']);
+      expect(args.slice(2)).toEqual(['--session-id', 'sess-pi-long', prepared.initialPrompt]);
       expect(args).not.toContain(prompt);
       expect(shouldQueue).toBe(false);
     } finally {

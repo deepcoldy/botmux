@@ -18,12 +18,12 @@
 
 | project | 匹配 | 执行 | 入口 |
 | --- | --- | --- | --- |
-| `unit` | `*.test.ts` | **并行**（forks，每文件一进程） | `pnpm test`（默认） |
-| `e2e` | `*.e2e.ts` | **串行** + globalSetup | `pnpm test:e2e` / `test:codex` 等（opt-in） |
+| `unit` | `*.test.ts` | **并行**（forks，每文件一进程） | `bun run test`（默认） |
+| `e2e` | `*.e2e.ts` | **串行** + globalSetup | `bun run test:e2e` / `test:codex` 等（opt-in） |
 
 并行对单测是安全的：绑端口的测试都用 `listen(0)` 临时端口；`process.env` / `process.chdir` 的改动在 forks 下按文件进程隔离。实测并行前后**断言结果逐一致**（同样的预存失败、同样的通过数）。
 
-`pnpm test` 现在 `--project unit`，默认不再跑需要真实 CLI / 浏览器的 e2e。
+`bun run test` 现在 `--project unit`，默认不再跑需要真实 CLI / 浏览器的 e2e。
 
 ### 2. 集中式可缩放延时 `BOTMUX_TIME_SCALE`
 
@@ -46,11 +46,11 @@ export function delay(ms: number): Promise<void> { /* setTimeout(scaleMs(ms)) */
 ## 基准工具
 
 ```bash
-pnpm test:bench                     # 跑一次（生产配置），打印最慢文件 + 并行效率
-pnpm test:bench --compare           # 串行 / 并行 / 并行+缩放 三档对比 + speedup
-pnpm test:bench --top 25            # 调整最慢文件展示条数
-pnpm test:bench --json out.json     # 结果落盘，供 CI 消费
-pnpm test:bench --threshold 30      # 墙钟超 30s 则 exit 1（CI 回归闸）
+bun run test:bench                     # 跑一次（生产配置），打印最慢文件 + 并行效率
+bun run test:bench --compare           # 串行 / 并行 / 并行+缩放 三档对比 + speedup
+bun run test:bench --top 25            # 调整最慢文件展示条数
+bun run test:bench --json out.json     # 结果落盘，供 CI 消费
+bun run test:bench --threshold 30      # 墙钟超 30s 则 exit 1（CI 回归闸）
 ```
 
 脚本：`scripts/bench-tests.ts`。它用 `--reporter=json` 解析每文件耗时，报告墙钟、各文件耗时之和、**并行效率**（= Σ文件耗时 / 墙钟）、最慢文件占比，并能输出三档对比与 speedup。

@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { clientArgsMock, userGetMock, batchGetIdMock } = vi.hoisted(() => ({
+const { clientArgsMock, userGetMock, batchGetIdMock } = {
   clientArgsMock: vi.fn(),
   userGetMock: vi.fn(),
   batchGetIdMock: vi.fn(),
-}));
+};
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class {

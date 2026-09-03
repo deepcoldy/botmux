@@ -18,6 +18,7 @@ const fakeClient = {
   im: {
     v1: {
       message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })) },
+      pin: { create: vi.fn(async () => ({ code: 0 })), delete: vi.fn(async () => ({ code: 0 })) },
       messageReaction: { create: vi.fn(async () => ({ code: 0, data: { reaction_id: 'r' } })), delete: vi.fn(async () => ({ code: 0 })) },
     },
   },
@@ -42,6 +43,7 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => {
 
 import {
   sendMessage, replyMessage, updateMessage, deleteMessage,
+  pinMessage, unpinMessage,
   addReaction, removeReaction, sendUserMessage, sendEphemeralCard,
   deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
@@ -63,6 +65,10 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     await expect(replyMessage(APIONLY, 'om', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateMessage(APIONLY, 'om', '{}')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(deleteMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(pinMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(unpinMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    expect(fakeClient.im.v1.pin.create).not.toHaveBeenCalled();
+    expect(fakeClient.im.v1.pin.delete).not.toHaveBeenCalled();
     await expect(addReaction(APIONLY, 'om', 'THUMBSUP')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(removeReaction(APIONLY, 'om', 'r')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(sendUserMessage(APIONLY, 'ou', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);

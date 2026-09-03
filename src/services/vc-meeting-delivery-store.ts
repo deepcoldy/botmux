@@ -1351,6 +1351,59 @@ export function listActiveVcMeetingDeliveriesForSession(
 }
 
 /**
+ * Most-recent authorizable delivery receipt for a receiver session, INCLUDING a
+ * just-`completed` one. Unlike listActiveVcMeetingDeliveriesForSession (which
+ * skips terminal receipts), this returns the latest `dispatched` OR `completed`
+ * receipt by updatedAt.
+ *
+ * Why it exists: the in-meeting managed-output CLI (request-output) normally
+ * carries the LIVE turn's origin (turnId/dispatchAttempt) from the process-tree
+ * marker. But a meeting agent frequently decides to speak AFTER the delivery
+ * turn has gone idle — at which point the live marker's turn fields are cleared,
+ * so the CLI has no origin to send and the daemon's durable authorization
+ * fallback cannot fire. This lets the CLI recover the delivery identity of the
+ * turn it just processed from the durable ledger (keyed only by sessionId), so
+ * the daemon can re-authorize in-meeting output against the completed receipt
+ * (evaluateVcMeetingManagedSend with allowTerminalReceipt + forInMeetingOutput).
+ * Read-only; failed/abandoned/ambiguous receipts are never returned.
+ */
+export function latestVcMeetingDeliveryForSession(
+  dataDir: string,
+  receiverSessionId: string,
+): VcMeetingDeliveryLookupResult | undefined {
+  if (!receiverSessionId.trim()) return undefined;
+  const dir = join(dataDir, DIR_NAME);
+  if (!existsSync(dir)) return undefined;
+
+  let best: VcMeetingDeliveryLookupResult | undefined;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    const state = readStateFile(join(dir, name));
+    if (!state) continue;
+    for (const stream of Object.values(state.streams)) {
+      if (stream.receiverSessionId !== receiverSessionId) continue;
+      for (const receipt of Object.values(stream.receipts)) {
+        // Only receipts the daemon could still authorize in-meeting output for.
+        if (receipt.status !== 'dispatched' && receipt.status !== 'completed') continue;
+        if (best && receipt.updatedAt <= best.receipt.updatedAt) continue;
+        best = {
+          memberKey: {
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+          },
+          receiverSessionId: stream.receiverSessionId,
+          receipt,
+          receiverCommittedThrough: stream.receiverCommittedThrough,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+/**
  * 按 receiverSessionId 全局反查「当前有效」的 membership projection——
  * status === 'active' 且 memberEpoch 是该 member 的最新 epoch（换代后旧 epoch
  * 的投影残留不算数）。daemon 用它判断一个 botmux 会话是否绑定为 durable

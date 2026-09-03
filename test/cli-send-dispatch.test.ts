@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  describeSendFailure,
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
@@ -11,6 +12,32 @@ import {
 } from '../src/cli/send-dispatch.js';
 
 class MessageWithdrawnError extends Error {}
+
+describe('describeSendFailure', () => {
+  it('preserves Lark business details instead of falling back to the HTTP message', () => {
+    const err = {
+      isAxiosError: true,
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: {
+        status: 400,
+        data: {
+          code: 230022,
+          msg: 'content contains sensitive information',
+          log_id: 'LOGREAL123',
+        },
+      },
+    };
+
+    expect(describeSendFailure(err)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOGREAL123',
+    );
+  });
+
+  it('falls back to a plain Error message for non-Lark failures', () => {
+    expect(describeSendFailure(new Error('upload boom'))).toBe('upload boom');
+  });
+});
 
 describe('dispatchPrimaryMessage hook context wiring', () => {
   const baseOptions = {
@@ -218,6 +245,28 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       { path: '/y', error: 'dispatch down' },
     ]);
   });
+
+  it('surfaces the Lark business error (code/log_id) instead of a bare HTTP message', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => {
+      if (p === '/bad') {
+        throw {
+          isAxiosError: true,
+          config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+          response: { status: 400, data: { code: 230022, msg: 'content contains sensitive information', log_id: 'LOG789' } },
+          message: 'Request failed with status code 400',
+        };
+      }
+      return `key:${p}`;
+    });
+    const dispatch = vi.fn(async (content: string) => `om:${content}`);
+
+    const res = await sendFileAttachments({ uploadFile, dispatch }, 'cli_app', ['/bad']);
+
+    expect(res.failed).toEqual([{
+      path: '/bad',
+      error: 'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOG789',
+    }]);
+  });
 });
 
 describe('shouldSendAsPureVideo', () => {
@@ -334,6 +383,62 @@ describe('normalizeInteractiveCardInput', () => {
 
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain('callback');
+  });
+
+  it('accepts form callbacks only through an explicitly selected plugin action route', () => {
+    const pluginAction = 'example_plugin_review_submit';
+    const raw = JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'form',
+          name: 'review_form',
+          elements: [
+            {
+              tag: 'select_static',
+              name: 'finding_action',
+              options: [{ text: { tag: 'plain_text', content: 'fix' }, value: 'fix' }],
+            },
+            { tag: 'input', name: 'reason' },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: 'submit' },
+              action_type: 'form_submit',
+              value: { action: pluginAction, request_id: 'request-1' },
+            },
+          ],
+        }],
+      },
+    });
+
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === pluginAction },
+    });
+    expect(accepted.ok).toBe(true);
+
+    const denied = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another_plugin_action' },
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.error).toContain('callback');
+  });
+
+  it('keeps built-in key/root routing sealed in plugin-card mode', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: 'x' }, value: 'x' }],
+          value: { action: 'example_plugin_action', key: 'repo_worktree' },
+        }],
+      },
+    }), {
+      callbackPolicy: { allowsAction: action => action === 'example_plugin_action' },
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('value.key');
   });
 
   it('rejects value.key dropdowns (adopt/worktree namespace, not just value.action)', () => {

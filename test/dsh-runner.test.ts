@@ -5,11 +5,12 @@
  * Run: pnpm vitest run test/dsh-runner.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
 const FAKE_SERVER = resolve('test/fixtures/fake-dsh-server.mjs');
@@ -51,10 +52,15 @@ async function waitFor(
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function spawnRunner(scenario: string, extraArgs: string[] = []): Harness {
-  const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+function spawnRunner(
+  scenario: string,
+  extraArgs: string[] = [],
+  envOverrides: NodeJS.ProcessEnv = {},
+  homeOverride?: string,
+): Harness {
+  const home = homeOverride ?? mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
   const logPath = join(home, 'prompts.jsonl');
-  const child = spawn(process.execPath, ['--import', 'tsx', RUNNER_PATH,
+  const child = spawnTsScript(RUNNER_PATH, [
     '--session-id', 'test-session',
     '--dsh-bin', FAKE_SERVER,
     '--cwd', home,
@@ -67,8 +73,10 @@ function spawnRunner(scenario: string, extraArgs: string[] = []): Harness {
       HOME: home,
       FAKE_DSH_SCENARIO: scenario,
       FAKE_DSH_LOG: logPath,
+      DSH_CORDIS_CONFIG: '',
+      ...envOverrides,
     },
-  });
+  }) as ChildProcessWithoutNullStreams;
   liveChildren.add(child);
   const h: Harness = { child, home, logPath, stdout: '', stderr: '' };
   child.stdout.setEncoding('utf8');
@@ -79,10 +87,41 @@ function spawnRunner(scenario: string, extraArgs: string[] = []): Harness {
   return h;
 }
 
-function readPrompts(h: Harness): any[] {
+function readLog(h: Harness): any[] {
   if (!existsSync(h.logPath)) return [];
   return readFileSync(h.logPath, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
 }
+
+/** Only the session/prompt entries (initialize and phase markers filtered out). */
+function readPrompts(h: Harness): any[] {
+  return readLog(h).filter((r: any) => r.prompt);
+}
+
+/** Write a native ~/.dsh/settings.yaml + optional .credentials.yaml in the test HOME. */
+function writeNativeDshConfig(home: string, settingsYaml: string, credentialsYaml?: string): void {
+  const dshDir = join(home, '.dsh');
+  mkdirSync(dshDir, { recursive: true });
+  writeFileSync(join(dshDir, 'settings.yaml'), settingsYaml, 'utf8');
+  if (credentialsYaml !== undefined) {
+    writeFileSync(join(dshDir, '.credentials.yaml'), credentialsYaml, 'utf8');
+  }
+}
+
+const SUPER_RELAY_SETTINGS = `
+llm-pi-ai:
+  providers:
+    super-relay:
+      apiKeyEnv: SUPER_RELAY_API_KEY
+      api: openai-completions
+      baseURL: https://super-relay.example.com/v1
+      models:
+        - id: model_hub/es1_orange_o48
+          name: es1_orange_o48
+          contextWindow: 1000000
+agent-default-model:
+  provider: super-relay
+  model: model_hub/es1_orange_o48
+`;
 
 describe('dsh-runner', () => {
   let h: Harness | undefined;
@@ -118,8 +157,37 @@ describe('dsh-runner', () => {
     // Tool calls render as progress lines.
     expect(h.stdout).toContain('🔧 bash');
     expect(h.stdout).toContain('✓ bash');
-    // The vendored config was materialized under HOME.
-    expect(existsSync(join(h.home, '.botmux', 'dsh', 'cordis.yml'))).toBe(true);
+    // The profile directory is created under the native dsh home.
+    expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
+    // The legacy ~/.botmux/dsh path must not be created anymore.
+    expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
+  });
+
+  it('fails fast when the dsh binary is missing', async () => {
+    h = spawnRunner('happy', ['--dsh-bin', '/nonexistent/dsh']);
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const code = await exitPromise;
+
+    expect(code).toBe(1);
+    expect(h.stdout).not.toContain('dsh connected');
+    expect(h.stdout).not.toContain('›');
+  });
+
+  it('boots with a profile name and reads provider/model from settings.yaml', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', ['--dsh-profile', 'botmux'], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    // The profile directory is created and seeded with package.json + cordis.yml
+    // so `dsh --profile botmux` can start on a clean HOME.
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
+
+    // initialize carries the provider + model from settings.yaml.
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('model_hub/es1_orange_o48');
   });
 
   it('injects the identity preamble only on the first turn (multi-turn)', async () => {
@@ -220,7 +288,7 @@ describe('dsh-runner', () => {
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('你好，我是 dsh。');
     // The fixture logs phase markers: notifications must precede the response.
-    const phases = readPrompts(h).filter((r: any) => r.phase).map((r: any) => r.phase);
+    const phases = readLog(h).filter((r: any) => r.phase).map((r: any) => r.phase);
     expect(phases).toEqual(['notifications', 'response']);
   });
 
@@ -244,6 +312,38 @@ describe('dsh-runner', () => {
     expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
   });
 
+  it('rejects a prompt ACK without a message id instead of waiting for the turn watchdog', async () => {
+    h = spawnRunner('bad-prompt-ack', ['--turn-timeout-ms', '10000']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('第一次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 1, {
+      timeout: 3000,
+      label: 'protocol error final',
+    });
+    const errorFinal = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(errorFinal.payload.content).toContain('session/prompt returned no message id');
+
+    h.child.stdin.write(makeFrame('第二次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 2, { label: 'success final' });
+
+    const prompts = readPrompts(h);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('<botmux_identity>');
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
+  });
+
+  it('rejects an initialize response without a server identity', async () => {
+    h = spawnRunner('bad-initialize');
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const code = await exitPromise;
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain('initialize returned no server identity');
+    expect(h.stdout).not.toContain('dsh connected');
+    expect(h.stdout).not.toContain('›');
+  });
+
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {
     h = spawnRunner('hang', ['--turn-timeout-ms', '500']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
@@ -256,4 +356,144 @@ describe('dsh-runner', () => {
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('timed out');
   }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Native ~/.dsh config (settings.yaml + .credentials.yaml)
+  // -------------------------------------------------------------------------
+
+  it('reads pi-ai provider/model from ~/.dsh/settings.yaml for the initialize RPC', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: test-key-123\n');
+    h = spawnRunner('happy', [], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    // The profile directory is created under the native dsh home.
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
+    // No legacy ~/.botmux/dsh.
+    expect(existsSync(join(home, '.botmux', 'dsh'))).toBe(false);
+
+    // initialize carries the provider + model from settings.yaml.
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('model_hub/es1_orange_o48');
+
+    h.child.stdin.write(makeFrame('你好'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+  });
+
+  it('passes versioned credential refs to the dsh child without exposing records', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, `
+version: 1
+refs:
+  SUPER_RELAY_API_KEY: cred-from-versioned-file
+records:
+  llm-pi-ai/super-relay:
+    kind: grant
+    payload:
+      access: must-not-be-an-env-value
+`);
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: undefined,
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-versioned-file' }),
+      FAKE_DSH_EXPECT_ABSENT_ENV: 'records',
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(true);
+  });
+
+  it('retains support for pre-release flat credential files', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: cred-from-flat-file\n');
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: undefined,
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-flat-file' }),
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+  });
+
+  it('lets ambient credentials override the versioned credential file', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, `
+version: 1
+refs:
+  SUPER_RELAY_API_KEY: cred-from-file
+  EMPTY_CREDENTIAL: ''
+`);
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: 'cred-from-environment',
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-environment' }),
+      FAKE_DSH_EXPECT_ABSENT_ENV: 'EMPTY_CREDENTIAL',
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+  });
+
+  it('lets --model argv override the settings.yaml model', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', ['--model', 'custom-model'], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.model).toBe('custom-model');
+    expect(initEntry.initialize.provider).toBe('super-relay');
+  });
+
+  it('falls back to deepseek-official provider when settings.yaml is missing agent-default-model', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, `
+llm-pi-ai:
+  providers:
+    super-relay:
+      apiKeyEnv: SUPER_RELAY_API_KEY
+`);
+    h = spawnRunner('happy', [], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('deepseek-official');
+    expect(initEntry.initialize.model).toBe('deepseek-v4-flash');
+  });
+
+  it('passes the provider from settings.yaml to the initialize RPC even when it is not in llm-pi-ai.providers', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, `
+llm-pi-ai:
+  providers:
+    other-provider:
+      apiKeyEnv: OTHER_KEY
+agent-default-model:
+  provider: super-relay
+  model: some-model
+`);
+    h = spawnRunner('happy', [], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    // The runner no longer validates provider against llm-pi-ai.providers —
+    // the dsh --profile CLI handles plugin composition independently.
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('some-model');
+  });
+
+  it('passes deepseek-official provider/model from settings.yaml to the initialize RPC', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, `
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-pro
+`);
+    h = spawnRunner('happy', [], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('deepseek-official');
+    expect(initEntry.initialize.model).toBe('deepseek-v4-pro');
+  });
 });

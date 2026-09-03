@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -25,7 +26,7 @@ export function createMiraAdapter(_pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
       const args = [
-        runnerPath(),
+        runnerArgv0('mira-runner', runnerPath()),
         '--session-id', sessionId,
       ];
       if (resume && resumeSessionId) args.push('--mira-session-id', resumeSessionId);

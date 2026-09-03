@@ -1,112 +1,37 @@
-import { createHash } from 'node:crypto';
-import type { BotConfig } from '../bot-registry.js';
-import {
-  effectiveDefaultWorkingDir,
-  parseBotConfigsFromText,
-} from '../bot-registry.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { config } from '../config.js';
-import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
-import { canonicalJson } from '../utils/canonical-input-hash.js';
-import { rmwBotEntry } from './config-store.js';
-import { evaluateVcMeetingConsumerIsolation } from './vc-meeting-consumer-isolation.js';
-
-export interface VcMeetingConsumerBootstrapAgent {
-  appId: string;
-  workingDirReady: boolean;
-  reliableTurnTerminal: boolean;
-  /** May this bot act as a meeting consumer at all? Plan B: true unless an
-   *  explicit sandbox request is undeliverable (macOS/riff/herdr/zellij). */
-  managedSideEffectEligible: boolean;
-  /** Is the managed sandbox boundary actually in force (credential masked +
-   *  outbox relay)? false = unsandboxed, credential exposed to meeting input. */
-  sandboxIsolated: boolean;
-}
-
-export interface VcMeetingConsumerBootstrapAgentDeps {
-  workingDirReady(bot: BotConfig): boolean;
-  reliableTurnTerminal(bot: BotConfig): boolean;
-  managedSideEffectEligible(bot: BotConfig): boolean;
-  sandboxIsolated(bot: BotConfig): boolean;
-}
-
-function evaluateBotConsumerIsolation(bot: BotConfig) {
-  const cliId = bot.cliId ?? config.daemon.cliId;
-  const backendType = resolvePairedSpawnBackendType(
-    cliId,
-    undefined,
-    bot.backendType,
-    config.daemon.backendType,
-  );
-  return evaluateVcMeetingConsumerIsolation({
-    sandbox: bot.sandbox,
-    platform: process.platform,
-    backendType,
-  });
-}
-
-const defaultAgentDeps: VcMeetingConsumerBootstrapAgentDeps = {
-  workingDirReady(bot) {
-    try {
-      return !!(effectiveDefaultWorkingDir(bot) ?? bot.workingDir);
-    } catch {
-      return false;
-    }
-  },
-  reliableTurnTerminal(bot) {
-    if (!bot.cliId) return false;
-    try {
-      return createCliAdapterSync(bot.cliId, bot.cliPathOverride).reliableTurnTerminal === true;
-    } catch {
-      return false;
-    }
-  },
-  managedSideEffectEligible(bot) {
-    return evaluateBotConsumerIsolation(bot).ok;
-  },
-  sandboxIsolated(bot) {
-    const decision = evaluateBotConsumerIsolation(bot);
-    return decision.ok && decision.isolated;
-  },
-};
-
-export function buildVcMeetingConsumerBootstrapAgents(
-  configs: readonly BotConfig[],
-  deps: VcMeetingConsumerBootstrapAgentDeps = defaultAgentDeps,
-): VcMeetingConsumerBootstrapAgent[] {
-  return configs.map(bot => ({
-    appId: bot.larkAppId,
-    workingDirReady: deps.workingDirReady(bot),
-    reliableTurnTerminal: deps.reliableTurnTerminal(bot),
-    managedSideEffectEligible: deps.managedSideEffectEligible(bot),
-    sandboxIsolated: deps.sandboxIsolated(bot),
-  })).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
-}
-
 /**
- * Choose a durable receiver identity. Persisted legacy preferences, when a
- * caller explicitly supplies them, win. Otherwise prefer the listener itself
- * when structurally eligible, then fall back deterministically to another
- * eligible agent. Online state is deliberately absent because it is transient.
+ * 历史遗留的「默认会议角色预设」识别。
+ *
+ * 这个模块过去负责**生成**默认预设：daemon 启动时给本 bot 播种一条 `minutes`
+ * 预设，并把执行方 `agentAppId` 焊进去。整套播种已于 2026-08 退役——角色预设
+ * 改成全 fleet 共享目录 + 读路径内置默认（`vc-meeting-shared-consumer-catalog.ts`），
+ * 执行方永远是收到这场会议事件的 bot 自己。退役的两个理由：
+ *
+ *   1. 播种出来的 per-bot `consumerProfiles` 会永久遮蔽共享目录，操作者改共享
+ *      预设时被播种过的 bot 完全不跟随；
+ *   2. 播种时那条「本 bot 结构上不合格就换一个合格 bot」的兜底，会把**另一个**
+ *      bot 的 appId 写进预设，会中 `addBotToChat` 再照着它把无关 bot 拉进监听群
+ *      ——「拉 A 进会却把 B 拉进群」就是这么来的。
+ *
+ * 留下来的只有**识别**能力，三种：
+ *
+ *   - {@link hasLegacyVcMeetingConsumerAgentPolicy}：操作者按老模型手写过执行方
+ *     策略（`agentCandidates` 等）。绑定层据此不拿共享目录去覆盖它；
+ *   - {@link isVcMeetingSeededConsumerProfileBlock}：带 `defaultProfileBootstrap`
+ *     出处标记的 v2 播种残留。绑定层用它把这类配置当作「没有 per-bot 预设」，
+ *     于是这些 bot 回到共享目录（否则机器播种物会永久遮蔽操作者的共享预设）；
+ *   - {@link isLegacyVcMeetingDefaultConsumerSeedCandidate}：更早的 v1 播种物没有
+ *     出处标记，只能按逐字段形状识别。绑定层同样让它回到共享目录——v1 播种物一样
+ *     把执行方焊进了预设，一样可能焊的是另一个 bot。
+ *
+ * 识别刻意严格：近似形状可能是操作者自己写的，不能被当成机器生成物丢弃或迁移。
  */
-export function selectVcMeetingDefaultConsumerAgent(
-  listenerBotAppId: string,
-  agents: readonly VcMeetingConsumerBootstrapAgent[],
-  preferredAgentAppIds: readonly string[] = [],
-): VcMeetingConsumerBootstrapAgent | undefined {
-  const eligible = agents
-    .filter(agent => agent.workingDirReady
-      && agent.reliableTurnTerminal
-      && agent.managedSideEffectEligible)
-    .sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
-  for (const appId of preferredAgentAppIds) {
-    const preferred = eligible.find(agent => agent.appId === appId);
-    if (preferred) return preferred;
-  }
-  return eligible.find(agent => agent.appId === listenerBotAppId)
-    ?? eligible.find(agent => agent.appId !== listenerBotAppId);
-}
+import type { VcMeetingConsumerConfig } from '../types.js';
 
+const DEFAULT_CONSUMER_PROFILE_ID = 'minutes';
+const DEFAULT_CONSUMER_PROFILE_LABEL = '会议纪要';
+const LEGACY_DEFAULT_CONSUMER_PROFILE_INSTRUCTIONS = '持续整理会议纪要，重点记录已确认的决策、待办事项（含负责人和截止时间）以及未解决风险；字幕修订时更新已有条目，不重复记录同一事项。';
+
+/** 早于「预设目录」模型的按-bot 执行方字段，出现即说明是操作者手工配置过的老配置。 */
 const LEGACY_VC_CONSUMER_AGENT_FIELDS = [
   'defaultAgentAppId',
   'defaultAgent',
@@ -114,12 +39,6 @@ const LEGACY_VC_CONSUMER_AGENT_FIELDS = [
   'agents',
 ] as const;
 
-const DEFAULT_CONSUMER_PROFILE_GENERATOR_VERSION = 2;
-const LEGACY_PROVENANCE_GENERATOR_VERSION = 1;
-const DEFAULT_CONSUMER_PROFILE_ID = 'minutes';
-const DEFAULT_CONSUMER_PROFILE_LABEL = '会议纪要';
-const LEGACY_DEFAULT_CONSUMER_PROFILE_INSTRUCTIONS = '持续整理会议纪要，重点记录已确认的决策、待办事项（含负责人和截止时间）以及未解决风险；字幕修订时更新已有条目，不重复记录同一事项。';
-export const DEFAULT_CONSUMER_PROFILE_INSTRUCTIONS = '持续整理会议纪要，重点记录已确认的决策、待办事项（含负责人和截止时间）以及未解决风险；字幕修订时更新已有条目，不重复记录同一事项。仅在出现新的关键决策、明确待办或风险，或被用户点名时，才在监听群输出简洁增量；无实质增量时保持静默，不发送确认或心跳。需要向会议内发送文字或语音时，必须通过 botmux 受管 request-output/action gate 提交，不得绕过权限、所有权与审核策略。';
 const LEGACY_DEFAULT_CONSUMER_PROFILE_KEYS = [
   'agentAppId',
   'capabilities',
@@ -129,77 +48,6 @@ const LEGACY_DEFAULT_CONSUMER_PROFILE_KEYS = [
   'responseMode',
   'role',
 ] as const;
-
-export interface VcMeetingDefaultConsumerProfileOwnedConfig {
-  defaultMode: unknown;
-  defaultConsumerIds: unknown;
-  profile: unknown;
-}
-
-/** Hash exactly the fields owned by the default-profile generator. */
-export function computeVcMeetingDefaultConsumerProfileConfigHash(
-  input: VcMeetingDefaultConsumerProfileOwnedConfig,
-): string {
-  const canonicalOwnedConfig = canonicalJson({
-    defaultMode: input.defaultMode,
-    defaultConsumerIds: input.defaultConsumerIds,
-    profile: input.profile,
-  });
-  return `sha256:${createHash('sha256').update(canonicalOwnedConfig, 'utf8').digest('hex')}`;
-}
-
-/**
- * Verify that the current bootstrap marker still fingerprints the generated
- * defaults. Non-generator fields such as enabled/injectIntervalMs are excluded.
- */
-export function isVcMeetingDefaultConsumerProfileBootstrapIntact(
-  meetingConsumer: {
-    defaultMode?: unknown;
-    defaultConsumerIds?: unknown;
-    consumerProfiles?: unknown;
-    defaultProfileBootstrap?: unknown;
-  },
-): boolean {
-  return vcMeetingDefaultConsumerBootstrapProfileForVersion(
-    meetingConsumer,
-    DEFAULT_CONSUMER_PROFILE_GENERATOR_VERSION,
-  ) !== undefined;
-}
-
-function vcMeetingDefaultConsumerBootstrapProfileForVersion(
-  meetingConsumer: {
-    defaultMode?: unknown;
-    defaultConsumerIds?: unknown;
-    consumerProfiles?: unknown;
-    defaultProfileBootstrap?: unknown;
-  },
-  generatorVersion: number,
-): Record<string, unknown> | undefined {
-  const marker = meetingConsumer.defaultProfileBootstrap;
-  if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return undefined;
-  const markerEntry = marker as Record<string, unknown>;
-  if (markerEntry.generatorVersion !== generatorVersion
-    || typeof markerEntry.profileId !== 'string'
-    || typeof markerEntry.configHash !== 'string') return undefined;
-  if (!Array.isArray(meetingConsumer.consumerProfiles)) return undefined;
-  const matchingProfiles = meetingConsumer.consumerProfiles.filter(profile =>
-    !!profile
-    && typeof profile === 'object'
-    && !Array.isArray(profile)
-    && (profile as Record<string, unknown>).id === markerEntry.profileId);
-  if (matchingProfiles.length !== 1) return undefined;
-  try {
-    return markerEntry.configHash === computeVcMeetingDefaultConsumerProfileConfigHash({
-      defaultMode: meetingConsumer.defaultMode,
-      defaultConsumerIds: meetingConsumer.defaultConsumerIds,
-      profile: matchingProfiles[0],
-    })
-      ? matchingProfiles[0] as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function isLegacyGeneratedMinutesProfile(profile: unknown): profile is Record<string, unknown> & { agentAppId: string } {
   if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return false;
@@ -219,56 +67,44 @@ function isLegacyGeneratedMinutesProfile(profile: unknown): profile is Record<st
     && entry.capabilities[0] === 'meeting.read';
 }
 
-function createVcMeetingDefaultConsumerProfile(agentAppId: string): Record<string, unknown> {
-  return {
-    id: DEFAULT_CONSUMER_PROFILE_ID,
-    agentAppId,
-    label: DEFAULT_CONSUMER_PROFILE_LABEL,
-    role: 'minutes',
-    instructions: DEFAULT_CONSUMER_PROFILE_INSTRUCTIONS,
-    responseMode: 'listener_thread',
-    capabilities: [
-      'listener.output.request',
-      'meeting.output.request',
-      'meeting.read',
-    ],
-    ownedSinks: ['meeting_text', 'meeting_voice'],
-  };
+/**
+ * 这个 bot 的会议消费面是不是**操作者按老模型手工配过执行方策略**。
+ *
+ * 老模型（预设目录之前）用 `agentCandidates` / `defaultAgentAppId` 这类字段直接
+ * 点名「哪些 bot 可以当会议 agent」。这些字段一旦出现就是操作者显式意图，共享
+ * 目录不去覆盖它——那些 bot 继续按自己配的候选名单跑会中选择卡。
+ *
+ * 注意这与「拉 A 进会却把 B 拉进群」不是一回事：那条 bug 来自机器播种时焊进
+ * 预设的 `agentAppId`（操作者从没写过），而候选名单是操作者亲手列的。
+ */
+export function hasLegacyVcMeetingConsumerAgentPolicy(
+  meetingConsumer: unknown,
+): boolean {
+  if (!meetingConsumer || typeof meetingConsumer !== 'object' || Array.isArray(meetingConsumer)) return false;
+  return LEGACY_VC_CONSUMER_AGENT_FIELDS.some(
+    field => Object.prototype.hasOwnProperty.call(meetingConsumer, field),
+  );
 }
 
 /**
- * Upgrade only an untouched, single-profile v1 bootstrap. The single-profile
- * requirement matters because the v1 marker intentionally ignored extra
- * operator-owned catalog entries; silently adding listener/sink ownership in
- * that case could make previously composable selections conflict.
+ * 这份 per-bot 预设是不是**机器播种**出来的（而非操作者写的）。
+ *
+ * 判据是播种时写下的出处标记 `defaultProfileBootstrap` 正好覆盖当前这组预设：
+ * 只有一条预设、且 id 与出处记录的 `profileId` 一致。操作者后来改过（加了第二条
+ * 预设、换了 id）就不再匹配——那时它是操作者内容，必须原样保留。
+ *
+ * 绑定层据此让这些 bot 回到共享目录：机器播种物既会遮蔽操作者的共享预设，
+ * 里面的 `agentAppId` 还可能指向另一个 bot。判定只发生在读路径，不改磁盘。
  */
-function upgradeVcMeetingDefaultConsumerProfileV1(
-  meetingConsumer: Record<string, unknown>,
+export function isVcMeetingSeededConsumerProfileBlock(
+  meetingConsumer: Pick<VcMeetingConsumerConfig, 'consumerProfiles' | 'defaultProfileBootstrap'> | undefined,
 ): boolean {
-  if (meetingConsumer.defaultMode !== 'agents'
-    || !Array.isArray(meetingConsumer.defaultConsumerIds)
-    || meetingConsumer.defaultConsumerIds.length !== 1
-    || meetingConsumer.defaultConsumerIds[0] !== DEFAULT_CONSUMER_PROFILE_ID
-    || !Array.isArray(meetingConsumer.consumerProfiles)
-    || meetingConsumer.consumerProfiles.length !== 1) return false;
-  const profile = vcMeetingDefaultConsumerBootstrapProfileForVersion(
-    meetingConsumer,
-    LEGACY_PROVENANCE_GENERATOR_VERSION,
-  );
-  if (!isLegacyGeneratedMinutesProfile(profile)) return false;
-
-  const upgradedProfile = createVcMeetingDefaultConsumerProfile(profile.agentAppId);
-  meetingConsumer.consumerProfiles = [upgradedProfile];
-  meetingConsumer.defaultProfileBootstrap = {
-    generatorVersion: DEFAULT_CONSUMER_PROFILE_GENERATOR_VERSION,
-    profileId: DEFAULT_CONSUMER_PROFILE_ID,
-    configHash: computeVcMeetingDefaultConsumerProfileConfigHash({
-      defaultMode: 'agents',
-      defaultConsumerIds: [DEFAULT_CONSUMER_PROFILE_ID],
-      profile: upgradedProfile,
-    }),
-  };
-  return true;
+  const provenance = meetingConsumer?.defaultProfileBootstrap;
+  if (!provenance) return false;
+  const profiles = meetingConsumer?.consumerProfiles;
+  return Array.isArray(profiles)
+    && profiles.length === 1
+    && profiles[0]?.id === provenance.profileId;
 }
 
 /**
@@ -289,146 +125,4 @@ export function isLegacyVcMeetingDefaultConsumerSeedCandidate(
     || !Array.isArray(consumer.consumerProfiles)
     || consumer.consumerProfiles.length !== 1) return false;
   return isLegacyGeneratedMinutesProfile(consumer.consumerProfiles[0]);
-}
-
-/**
- * Mutate one latest raw meetingConsumer object only when no profile or legacy
- * agent policy has ever been initialized. Own-property checks are intentional:
- * `consumerProfiles: []` is an explicit opt-out and must never be resurrected.
- */
-export function seedVcMeetingDefaultConsumerProfile(
-  meetingConsumer: Record<string, unknown>,
-  listenerBotAppId: string,
-  agents: readonly VcMeetingConsumerBootstrapAgent[],
-): boolean {
-  // The same lock-scoped mutator handles fresh materialization and provenance-
-  // fenced v1 upgrades, so daemon boot and Dashboard listener selection cannot
-  // diverge. Upgrade before the own-property opt-out gates below.
-  if (upgradeVcMeetingDefaultConsumerProfileV1(meetingConsumer)) return true;
-  if (Object.prototype.hasOwnProperty.call(meetingConsumer, 'consumerProfiles')) return false;
-  if (Object.prototype.hasOwnProperty.call(meetingConsumer, 'defaultConsumerIds')) return false;
-  if (LEGACY_VC_CONSUMER_AGENT_FIELDS.some(field =>
-    Object.prototype.hasOwnProperty.call(meetingConsumer, field))) return false;
-  // Any explicitly persisted mode is operator-owned state. In particular,
-  // `defaultMode: listenOnly` must not be mistaken for a fresh install and
-  // silently changed to agents on upgrade.
-  if (Object.prototype.hasOwnProperty.call(meetingConsumer, 'defaultMode')) return false;
-
-  const agent = selectVcMeetingDefaultConsumerAgent(listenerBotAppId, agents);
-  if (!agent) return false;
-
-  const profile = createVcMeetingDefaultConsumerProfile(agent.appId);
-  const defaultConsumerIds = [DEFAULT_CONSUMER_PROFILE_ID];
-  meetingConsumer.consumerProfiles = [profile];
-  meetingConsumer.defaultMode = 'agents';
-  meetingConsumer.defaultConsumerIds = defaultConsumerIds;
-  meetingConsumer.defaultProfileBootstrap = {
-    generatorVersion: DEFAULT_CONSUMER_PROFILE_GENERATOR_VERSION,
-    profileId: DEFAULT_CONSUMER_PROFILE_ID,
-    configHash: computeVcMeetingDefaultConsumerProfileConfigHash({
-      defaultMode: 'agents',
-      defaultConsumerIds,
-      profile,
-    }),
-  };
-  return true;
-}
-
-export type BootstrapVcMeetingDefaultConsumerProfileResult =
-  | { ok: true; seeded: true; agentAppId: string }
-  | { ok: true; seeded: false; reason: 'disabled' | 'already_initialized' | 'legacy_config' | 'no_eligible_agent' }
-  | { ok: false; reason: 'bot_not_in_config' | 'config_unavailable' | 'validation_failed'; error?: string };
-
-/**
- * Lock-protected, idempotent one-time materialization used after daemon config
- * load. The latest file is parsed again under the lock, so concurrent daemon
- * starts and Dashboard saves cannot overwrite or resurrect an explicit empty
- * catalog.
- */
-export async function bootstrapVcMeetingDefaultConsumerProfile(
-  listenerBotAppId: string,
-  deps: VcMeetingConsumerBootstrapAgentDeps = defaultAgentDeps,
-): Promise<BootstrapVcMeetingDefaultConsumerProfileResult> {
-  try {
-    const result = await rmwBotEntry<BootstrapVcMeetingDefaultConsumerProfileResult>(
-      listenerBotAppId,
-      (entry, raw) => {
-        let configs: BotConfig[];
-        try {
-          configs = parseBotConfigsFromText(JSON.stringify(raw));
-        } catch (err) {
-          return {
-            write: false,
-            result: {
-              ok: false,
-              reason: 'validation_failed',
-              error: err instanceof Error ? err.message : String(err),
-            } as const,
-          };
-        }
-        const bot = configs.find(config => config.larkAppId === listenerBotAppId);
-        if (!bot) {
-          return { write: false, result: { ok: false, reason: 'bot_not_in_config' } as const };
-        }
-        const rawEntry = entry && typeof entry === 'object' && !Array.isArray(entry)
-          ? entry as Record<string, unknown>
-          : {};
-        const vcAgent = rawEntry.vcMeetingAgent && typeof rawEntry.vcMeetingAgent === 'object'
-          && !Array.isArray(rawEntry.vcMeetingAgent)
-          ? rawEntry.vcMeetingAgent as Record<string, unknown>
-          : undefined;
-        const consumer = vcAgent?.meetingConsumer && typeof vcAgent.meetingConsumer === 'object'
-          && !Array.isArray(vcAgent.meetingConsumer)
-          ? vcAgent.meetingConsumer as Record<string, unknown>
-          : undefined;
-        if (vcAgent?.enabled !== true || consumer?.enabled !== true) {
-          return { write: false, result: { ok: true, seeded: false, reason: 'disabled' } as const };
-        }
-        const hadConsumerProfiles = Object.prototype.hasOwnProperty.call(consumer, 'consumerProfiles');
-        const hasLegacy = LEGACY_VC_CONSUMER_AGENT_FIELDS.some(field =>
-          Object.prototype.hasOwnProperty.call(consumer, field))
-          || consumer.defaultMode === 'agent';
-        if (!seedVcMeetingDefaultConsumerProfile(
-          consumer,
-          listenerBotAppId,
-          buildVcMeetingConsumerBootstrapAgents(configs, deps),
-        )) {
-          if (hadConsumerProfiles) {
-            return { write: false, result: { ok: true, seeded: false, reason: 'already_initialized' } as const };
-          }
-          if (hasLegacy
-            || Object.prototype.hasOwnProperty.call(consumer, 'defaultConsumerIds')
-            || Object.prototype.hasOwnProperty.call(consumer, 'defaultMode')) {
-            return { write: false, result: { ok: true, seeded: false, reason: 'legacy_config' } as const };
-          }
-          return { write: false, result: { ok: true, seeded: false, reason: 'no_eligible_agent' } as const };
-        }
-        try {
-          // Validate the complete latest file, not only the generated fragment.
-          parseBotConfigsFromText(JSON.stringify(raw));
-        } catch (err) {
-          return {
-            write: false,
-            result: {
-              ok: false,
-              reason: 'validation_failed',
-              error: err instanceof Error ? err.message : String(err),
-            } as const,
-          };
-        }
-        const profile = (consumer.consumerProfiles as Array<{ agentAppId: string }>)[0]!;
-        return {
-          write: true,
-          result: { ok: true, seeded: true, agentAppId: profile.agentAppId } as const,
-        };
-      },
-    );
-    return result.ok ? result.result : { ok: false, reason: 'bot_not_in_config' };
-  } catch (err) {
-    return {
-      ok: false,
-      reason: 'config_unavailable',
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
 }

@@ -21,7 +21,7 @@ describe.sequential('unit-test session persistence', () => {
     sessionStore.init('unit_isolation_probe');
     sessionStore.createSession('oc_probe', 'om_probe', 'unit isolation probe');
 
-    expect(existsSync(join(isolatedDataDir, 'sessions-unit_isolation_probe.json'))).toBe(true);
+    expect(existsSync(join(isolatedDataDir, 'session-stores', 'unit_isolation_probe', 'sessions.db'))).toBe(true);
 
     process.env.SESSION_DATA_DIR = join(unitRoot, 'leaked-test-override');
   });

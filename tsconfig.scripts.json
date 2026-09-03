@@ -1,0 +1,23 @@
+{
+  // scripts/ 的类型检查配置。
+  //
+  // 为什么单独一份：`tsconfig.json` 只 include `src/**`，于是 scripts/ 下的验收脚本
+  // 与浏览器夹具**从来没被 tsc 看过**。它们直接 import 生产模块（h5-auth、
+  // session-preview、agent-workbench-view…），生产侧改了类型契约时脚本这边不会报错，
+  // 只会在运行时表现成「跑绿了但验的是旧契约」——批 1 与批 2 都真实踩到过这种 fixture
+  // 腐烂（脚本里缺 owner/workerGeneration、location 缺 protocol/hostname，仍然 exit 0）。
+  // 把 scripts/ 纳入同一套 strict 检查后，这类漂移在 `pnpm typecheck:scripts` 就被拦住。
+  //
+  // 这里只改「不产出、允许 src 之外的根目录」，其余编译选项（strict、NodeNext 解析、
+  // JSX）一律继承根配置——验的必须是生产同一套规则。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["scripts/**/*.ts", "scripts/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
+}

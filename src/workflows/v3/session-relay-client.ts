@@ -20,6 +20,7 @@ import { findAncestorSessionContext } from '../../core/session-marker.js';
 import type { WorkflowDaemonMutation, WorkflowDaemonMutationResponse } from './daemon-ipc-client.js';
 import { WorkflowDaemonMutationTransportError } from './daemon-ipc-client.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from './session-relay.js';
+import { loopbackFetchImpl } from '../../core/loopback-fetch.js';
 
 export interface WorkflowSessionRelayContext {
   sessionId: string;
@@ -119,7 +120,7 @@ export async function postWorkflowSessionRunMutation(input: {
       ? { originDispatchAttempt: input.context.dispatchAttempt }
       : {}),
   });
-  const fetchImpl = input.fetchImpl ?? fetch;
+  const fetchImpl = input.fetchImpl ?? loopbackFetchImpl;
   let response: Response;
   try {
     response = await fetchImpl(`http://127.0.0.1:${ipcPort}${path}`, {

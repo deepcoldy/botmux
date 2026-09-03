@@ -27,10 +27,10 @@
  * or another group stays flat.
  */
 import { rmwBotEntry } from './config-store.js';
-import { getBot, type ChatReplyMode } from '../bot-registry.js';
+import { getBot, type ChatReplyMode, type GroupMentionMode } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
-export type { ChatReplyMode } from '../bot-registry.js';
+export type { ChatReplyMode, GroupMentionMode } from '../bot-registry.js';
 
 export function normalizeChatReplyMode(raw: string | undefined): ChatReplyMode | undefined {
   const v = raw?.trim().toLowerCase();
@@ -59,8 +59,6 @@ function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   }
 }
 
-export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
-
 /**
  * Per-bot (bot-global) @-requirement policy for regular groups, default 'always'.
  *   • always  — @ required everywhere (incl. inside shared topics).
@@ -68,14 +66,40 @@ export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
  *   • never   — non-@ messages are always answered (where the bot has talk access).
  *   • ambient — like never, but stays quiet when the message @mentions another
  *               specific member (person/bot) without @ing this bot (redirect).
+ *
+ * Per-chat override (`chatMentionModes[chatId]`, written by `/mention-mode`)
+ * wins when present; otherwise the per-bot `regularGroupMentionMode` default.
  */
-export function resolveGroupMentionMode(larkAppId: string): GroupMentionMode {
+export function resolveGroupMentionMode(larkAppId: string, chatId?: string): GroupMentionMode {
+  try {
+    const cfg = getBot(larkAppId).config;
+    const perChat = chatId ? cfg.chatMentionModes?.[chatId] : undefined;
+    if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
+      return perChat;
+    }
+    const m = cfg.regularGroupMentionMode;
+    return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
+  } catch {
+    return 'always';
+  }
+}
+
+/** Per-bot default mention policy (`regularGroupMentionMode`, default 'always'). */
+function groupMentionDefaultMode(larkAppId: string): GroupMentionMode {
   try {
     const m = getBot(larkAppId).config.regularGroupMentionMode;
     return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
   } catch {
     return 'always';
   }
+}
+
+/** Parse `/mention-mode` argument; 'status'/empty → undefined (status query). */
+export function normalizeGroupMentionMode(raw: string | undefined): GroupMentionMode | undefined {
+  const v = raw?.trim().toLowerCase();
+  if (!v || v === 'status') return undefined;
+  if (v === 'always' || v === 'topic' || v === 'never' || v === 'ambient') return v;
+  return undefined;
 }
 
 /**
@@ -125,5 +149,43 @@ export async function setChatReplyMode(
   else next[chatId] = mode;
   bot.config.chatReplyModes = Object.keys(next).length > 0 ? next : undefined;
   logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}`);
+  return { ok: true, mode };
+}
+
+/**
+ * Persist the per-chat @-requirement policy (`/mention-mode`). Same tidy rule as
+ * setChatReplyMode: only store when it differs from the per-bot default, so
+ * bots.json stays clean in the common case while an explicit opt-out still
+ * sticks (e.g. per-bot default 'never', this chat pinned back to 'always').
+ */
+export async function setChatMentionMode(
+  larkAppId: string,
+  chatId: string,
+  mode: GroupMentionMode,
+): Promise<{ ok: true; mode: GroupMentionMode } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const redundant = mode === groupMentionDefaultMode(larkAppId);
+
+  const r = await rmwBotEntry<GroupMentionMode>(larkAppId, (entry) => {
+    if (!entry.chatMentionModes || typeof entry.chatMentionModes !== 'object' || Array.isArray(entry.chatMentionModes)) {
+      entry.chatMentionModes = {};
+    }
+    if (redundant) {
+      delete entry.chatMentionModes[chatId];
+      if (Object.keys(entry.chatMentionModes).length === 0) delete entry.chatMentionModes;
+    } else {
+      entry.chatMentionModes[chatId] = mode;
+    }
+    return { write: true, result: mode };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  const next = { ...(bot.config.chatMentionModes ?? {}) };
+  if (redundant) delete next[chatId];
+  else next[chatId] = mode;
+  bot.config.chatMentionModes = Object.keys(next).length > 0 ? next : undefined;
+  logger.info(`[mention-mode:${larkAppId}] chat=${chatId} mode=${mode}`);
   return { ok: true, mode };
 }

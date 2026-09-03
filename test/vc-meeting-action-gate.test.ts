@@ -313,6 +313,49 @@ describe('vc meeting managed action gate', () => {
     expect(gate.authorize).toHaveBeenCalledTimes(1);
   });
 
+  it('Plan B: creates an in-meeting action on a just-COMPLETED delivery (idle-gap: agent speaks after the turn ends)', async () => {
+    // The facilitator decides to speak AFTER it finished processing the
+    // transcript turn, so the delivery receipt is `completed`, not `dispatched`.
+    // Completion is terminal (no attempt N+1 can take over), so the action gate
+    // must still admit the in-meeting output for the exact completed attempt.
+    expect(completeVcMeetingDelivery(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      memberId: MEMBER,
+      memberEpoch: 1,
+      deliveryKey: DELIVERY,
+    }, { workerGeneration: 4, dispatchAttempt: 1 }, 135)).toMatchObject({
+      ok: true,
+      receipt: { status: 'completed', dispatchAttempt: 1 },
+    });
+
+    const gate = deps();
+    const result = await requestVcMeetingManagedAction(request({ dispatchAttempt: 1 }), gate, 140);
+    expect(result).toMatchObject({
+      status: 202,
+      body: { kind: 'execute', action: { status: 'attempting' } },
+    });
+    expect(gate.authorize).toHaveBeenCalledTimes(1);
+  });
+
+  it('Plan B: still rejects a NON-terminal-non-dispatched receipt (failed/ambiguous) for a new action', async () => {
+    // The completed relaxation must not open failed/ambiguous receipts.
+    expect(markVcMeetingDeliveryAmbiguous(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      memberId: MEMBER,
+      memberEpoch: 1,
+      deliveryKey: DELIVERY,
+    }, { workerGeneration: 4, dispatchAttempt: 1 }, 135)).toMatchObject({
+      ok: true,
+      receipt: { status: 'ambiguous' },
+    });
+    const gate = deps();
+    const result = await requestVcMeetingManagedAction(request({ dispatchAttempt: 1 }), gate, 140);
+    expect(result).toMatchObject({ status: 409, body: { errorCode: 'delivery_not_dispatched' } });
+    expect(gate.authorize).not.toHaveBeenCalled();
+  });
+
   it('rejects a delivery from a superseded member epoch', async () => {
     expect(applyVcMeetingMemberProjection(dir, projection({
       memberEpoch: 2,

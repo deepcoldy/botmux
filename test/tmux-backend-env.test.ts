@@ -29,6 +29,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as tmuxBackend from '../src/adapters/backend/tmux-backend.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -125,9 +126,11 @@ describe('buildBotmuxEnvAssignments()', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_USAGE_DISPLAY: 'footer',
+      BOTMUX_REPLY_STYLE: JSON.stringify({ layout: false, theme: 'minimal' }),
       PATH: '/usr/bin',
     });
     expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
+    expect(out).toContain('BOTMUX_REPLY_STYLE={"layout":false,"theme":"minimal"}');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
@@ -157,6 +160,27 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('CJADK_INTERACTIVE=0');
     // Non-cjadk bots don't set it → it must not appear.
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('CJADK_INTERACTIVE='))).toBe(false);
+  });
+
+  it('forwards only ebsd service metadata and credential file paths to the pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      EBSD_BOTMUX_DIAG_ENDPOINT: 'https://gateway.example',
+      EBSD_BOTMUX_DIAG_TOKEN_FILE: '/run/secrets/diag-token',
+      EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE: '/run/secrets/ak',
+      EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE: '/run/secrets/sk',
+      EBSD_BOTMUX_SUBJECT: 'botmux-ebsd@prod',
+      EBSD_BOTMUX_REPOSITORY_ROOT: '/srv/repos',
+      EBSD_NO_UPDATE_CHECK: '1',
+    });
+    expect(out).toEqual(expect.arrayContaining([
+      'EBSD_BOTMUX_DIAG_ENDPOINT=https://gateway.example',
+      'EBSD_BOTMUX_DIAG_TOKEN_FILE=/run/secrets/diag-token',
+      'EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE=/run/secrets/ak',
+      'EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE=/run/secrets/sk',
+      'EBSD_BOTMUX_SUBJECT=botmux-ebsd@prod',
+      'EBSD_BOTMUX_REPOSITORY_ROOT=/srv/repos',
+      'EBSD_NO_UPDATE_CHECK=1',
+    ]));
   });
 
   it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {
@@ -348,6 +372,15 @@ describe('buildBotmuxEnvAssignments()', () => {
       .toEqual(['HTTPS_PROXY=http://127.0.0.1:7890']);
   });
 
+  it('builds independent provider env for sibling bots without cross-key leakage', () => {
+    const botA = buildBotmuxEnvAssignments({}, { OPENAI_API_KEY: 'key-a' });
+    const botB = buildBotmuxEnvAssignments({}, { OPENAI_API_KEY: 'key-b' });
+    expect(botA).toEqual(['OPENAI_API_KEY=key-a']);
+    expect(botB).toEqual(['OPENAI_API_KEY=key-b']);
+    expect(botA).not.toContain('OPENAI_API_KEY=key-b');
+    expect(botB).not.toContain('OPENAI_API_KEY=key-a');
+  });
+
   it('re-sanitizes injectEnv: drops botmux-reserved keys even if they sneak in', () => {
     const out = buildBotmuxEnvAssignments(
       { BOTMUX: '1' },
@@ -470,22 +503,29 @@ describe('shellLaunchArgv()', () => {
 });
 
 describe('PtyBackend launchShell boundary', () => {
-  it('passes the requested CLI directly and ignores launchShell wrapping', async () => {
+  // bun 进程内 node-pty 对短命 `sh -c printf` 经常不回调 onData、立刻 onExit，
+  // buffer 为空（CI bun-test：Expected "DIRECT:cli-zero:arg-one", Received ""）。
+  // 同一断言的 bun 覆盖在 pty-backend-launch-shell.test.ts（mock spawn 参数）。
+  it.runIf(!isBunRuntime())('passes the requested CLI directly and ignores launchShell wrapping', async () => {
     const backend = new PtyBackend();
-    const output = await new Promise<string>((resolve) => {
-      let buffer = '';
-      backend.spawn('/bin/sh', ['-c', 'printf "DIRECT:%s:%s\\n" "$0" "$1"', 'cli-zero', 'arg-one'], {
-        cwd: tmpdir(),
-        cols: 80,
-        rows: 24,
-        env: { PATH: '/usr/bin:/bin' },
-        injectEnv: { BOTMUX: '1' },
-        launchShell: '/bin/fish',
+    try {
+      const output = await new Promise<string>((resolve) => {
+        let buffer = '';
+        backend.spawn('/bin/sh', ['-c', 'printf "DIRECT:%s:%s\\n" "$0" "$1"', 'cli-zero', 'arg-one'], {
+          cwd: tmpdir(),
+          cols: 80,
+          rows: 24,
+          env: { PATH: '/usr/bin:/bin' },
+          injectEnv: { BOTMUX: '1' },
+          launchShell: '/bin/fish',
+        });
+        backend.onData((data) => { buffer += data; });
+        backend.onExit(() => resolve(buffer));
       });
-      backend.onData((data) => { buffer += data; });
-      backend.onExit(() => resolve(buffer));
-    });
-    expect(output).toContain('DIRECT:cli-zero:arg-one');
+      expect(output).toContain('DIRECT:cli-zero:arg-one');
+    } finally {
+      backend.kill();
+    }
   });
 });
 

@@ -1,8 +1,9 @@
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const PROJECT_ROOT = join(__dirname, '..');
@@ -18,7 +19,7 @@ afterAll(() => {
 });
 
 function runCli(command: string): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(process.execPath, ['--import', 'tsx', CLI_PATH, command], {
+  const result = spawnSyncTsScript(CLI_PATH, [command], {
     cwd: PROJECT_ROOT,
     env: {
       ...process.env,
@@ -30,7 +31,8 @@ function runCli(command: string): { status: number | null; stdout: string; stder
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  // 助手返回 string | Buffer(不带 spawnSync 的 encoding 重载narrowing);此处 encoding:'utf8' 保证是 string。
+  return { status: result.status, stdout: result.stdout as string, stderr: result.stderr as string };
 }
 
 describe('botmux update alias', () => {
@@ -38,9 +40,16 @@ describe('botmux update alias', () => {
     const upgrade = runCli('upgrade');
     const update = runCli('update');
 
+    // Running from this checkout (has .git/src) → the local-dev update branch.
+    // PATH='' makes it abort deterministically at `git status` (ENOENT) right
+    // after the banner, so the test never runs a real pull/build/restart.
     expect(upgrade.status).toBe(1);
-    expect(upgrade.stderr).toContain('无法安全识别当前安装方式');
-    expect(update).toEqual(upgrade);
+    expect(upgrade.stdout).toContain('本地 checkout 更新');
+    // The core contract: `update` is a pure alias of `upgrade`. Compare the
+    // observable CLI output, not the whole spawnSync result — bun adds extra
+    // enumerable fields (`resourceUsage`, …) that differ across two invocations.
+    expect(update.status).toBe(upgrade.status);
+    expect(update.stdout).toBe(upgrade.stdout);
   });
 
   it('documents the alias in help', () => {

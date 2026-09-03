@@ -38,4 +38,29 @@ describe('Codex per-Bot reasoning effort', () => {
     }]));
     expect(config?.reasoningEffort).toBeUndefined();
   });
+
+  it('preserves safe TraeX reasoning effort and rejects unsupported levels', () => {
+    const configs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'traex-medium', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'medium' },
+      { larkAppId: 'traex-xhigh', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' },
+      { larkAppId: 'traex-invalid-pair', larkAppSecret: 'secret', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+    ]));
+    expect(configs.find(config => config.larkAppId === 'traex-medium')?.reasoningEffort).toBe('medium');
+    expect(configs.find(config => config.larkAppId === 'traex-xhigh')?.reasoningEffort).toBe('xhigh');
+    expect(configs.find(config => config.larkAppId === 'traex-invalid-pair')?.reasoningEffort).toBeUndefined();
+  });
+
+  it('preserves only valid TraeX backend variants', () => {
+    const configs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'traex-max', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'max' },
+      { larkAppId: 'traex-standard', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'standard' },
+      { larkAppId: 'traex-invalid', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'turbo' },
+      { larkAppId: 'codex-max', larkAppSecret: 'secret', cliId: 'codex', modelBackendVariant: 'max' },
+    ]));
+
+    expect(configs.find(config => config.larkAppId === 'traex-max')?.modelBackendVariant).toBe('max');
+    expect(configs.find(config => config.larkAppId === 'traex-standard')?.modelBackendVariant).toBe('standard');
+    expect(configs.find(config => config.larkAppId === 'traex-invalid')?.modelBackendVariant).toBeUndefined();
+    expect(configs.find(config => config.larkAppId === 'codex-max')?.modelBackendVariant).toBeUndefined();
+  });
 });

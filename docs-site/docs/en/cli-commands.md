@@ -7,7 +7,7 @@ Manage the daemon and sessions from the terminal.
 | `botmux setup` | Interactive configuration (first run / add / edit / delete a bot) |
 | `botmux start` | Start the daemon (managed by PM2) |
 | `botmux stop` | Stop the daemon |
-| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` also restarts botmux's PM2 God daemon |
+| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` additionally retires botmux's PM2 God daemon after the fleet is safely shut down, so the whole process tree restarts from the invoking shell's clean environment (plugin services are gracefully stopped first; auto ones come back after the restart) |
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
@@ -45,7 +45,9 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | Command | Description |
 |------|------|
 | `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`) |
-| `botmux bots list` | List the bots in the current group (including open_id) |
+| `botmux card patch --message-id <om_xxx> (--card-file <path> \| --card-json <json>)` | Update a previously sent custom card in place (no new message; the messageId comes from the send output) |
+| `botmux bots list` | List the bots in the current group (including open_id); `--scope team [--team <id>]` discovers same-team, opted-in agents across machines (by specialty) |
+| `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | Add same-team agents + their owners into a group you're already in (auto-adds the platform app first if absent) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
 | `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |

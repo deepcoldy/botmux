@@ -11,6 +11,7 @@
  */
 import type { Pcm } from './audio.js';
 import type { VoiceProviderEffectOptions } from './sami.js';
+import { isLoopbackUrl, loopbackFetch } from '../../core/loopback-fetch.js';
 
 export interface OpenAITtsConfig {
   baseUrl: string; // e.g. https://api.openai.com/v1 or http://127.0.0.1:8880/v1
@@ -48,7 +49,15 @@ export async function openaiSynthesizePcm(
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60000);
   try {
     await effects.beforeProviderEffect?.();
-    const res = await fetch(url, {
+    // A self-hosted endpoint is the documented case here (the config hint literally
+    // suggests `http://127.0.0.1:8880/v1`), and this request carries the API key.
+    // Under Bun the global fetch proxies 127.0.0.1 whenever `no_proxy` does not name
+    // that literal address — measured: the `Authorization: Bearer …` header arrived
+    // at the proxy and the call failed with the proxy's 403. Dispatch on the resolved
+    // URL so a local endpoint bypasses the proxy while a remote one still gets the
+    // native fetch (TLS, redirects, real proxying).
+    const send = isLoopbackUrl(url) ? loopbackFetch : fetch;
+    const res = await send(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

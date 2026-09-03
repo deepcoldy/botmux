@@ -10,7 +10,7 @@
  * chat) rather than relayed to the CLI. Used both for routing and to reject
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth', '/issue']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth', '/issue', '/cli']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -64,6 +64,53 @@ export const PASSTHROUGH_COMMANDS = new Set([
  * recognized as a command by the restriction gate.
  */
 export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
+
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
+ * requires every user message to pass through its service-user envelope and
+ * structured turn ledger. Raw passthrough (a literal `/compact\n` written to the
+ * PTY) bypasses that framing entirely: dsh's runner logs `ignoring non-frame
+ * input` and drops it, while mira/mir enqueue the line as an ordinary USER
+ * MESSAGE and burn a turn asking the model about it.
+ *
+ * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
+ * the Lark card builder can gate its own `/compact` affordance on the SAME
+ * predicate the router uses. Importing command-handler from card-builder would
+ * cycle (command-handler imports card-builder). The `remote-cli-ids.ts` header
+ * documents what happens when a card open-codes a single id instead: adding mojo
+ * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
+ * "can this CLI receive typed input" must call the predicate below, never
+ * hand-write a member of this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
+
+/**
+ * True for a CLI with no raw-passthrough surface (see
+ * {@link NO_RAW_PASSTHROUGH_CLI_IDS}).
+ *
+ * `dsh` is RUNTIME-DEPENDENT: a bot with `dshRuntime: 'tui'` runs the PTY-driven
+ * `dsh-tui` adapter — a genuine interactive TUI (same interaction model as
+ * claude-code) that DOES accept a raw `/compact`. That resolution happens inside
+ * the worker (`worker.ts`'s `cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'`),
+ * so daemon/card-side callers only ever see the bare `'dsh'` and must pass the
+ * runtime to get the right answer.
+ *
+ * `dshRuntime` is read from the LIVE bot config, never from
+ * `SessionCliLaunchSnapshotV1` — that snapshot has no such field, and the worker
+ * likewise pairs a frozen `cliId` with the live `dshRuntime`. Reading bot config
+ * therefore matches what actually spawns.
+ *
+ * Omitting `opts` is deliberately FAIL-CLOSED: bare `'dsh'` resolves to the
+ * headless JSON-RPC runner and returns true (no raw surface). Refusing a
+ * passthrough is recoverable; feeding one to a runner wedges the session or
+ * burns a turn.
+ */
+export function cliHasNoRawPassthroughSurface(
+  cliId: string | undefined,
+  opts?: { dshRuntime?: 'official' | 'tui' },
+): boolean {
+  if (!cliId) return false;
+  if (cliId === 'dsh' && opts?.dshRuntime === 'tui') return false;
+  return NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
 
 /**
  * Normalize a single custom passthrough command: lowercase, must match the

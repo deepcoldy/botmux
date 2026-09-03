@@ -31,6 +31,10 @@ describe('plugin manifest and registry basics', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('keeps plugin state inside the stubbed test home', () => {
+    expect(pluginRegistryPath()).toBe(join(home, '.botmux', 'plugins-registry.json'));
+  });
+
   it('normalizes plugin id lists by filtering invalid ids and deduping', () => {
     expect(normalizePluginIdList(['agent-chrome', 'bad/id', 'agent-chrome', '', 'gitlab'])).toEqual(['agent-chrome', 'gitlab']);
     expect(normalizePluginIdList(['bad/id', 1, ''])).toBeUndefined();
@@ -596,5 +600,121 @@ describe('plugin manifest and registry basics', () => {
     expect(readSkillRegistry().skills.browser).toBeUndefined();
     expect(readFileSync(codexConfigPath, 'utf8')).toBe(codexConfigBefore);
     expect(existsSync(pluginMaterializedPath('full-demo'))).toBe(false);
+  });
+
+  it('安装并启用一个合法的通用卡片动作插件', () => {
+    const source = join(home, 'card-actions-source');
+    const runtime = join(source, 'dist');
+    mkdirSync(join(runtime, 'service'), { recursive: true });
+    mkdirSync(join(runtime, 'card-actions'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-card-actions-demo',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: {
+        schemaVersion: 1,
+        id: 'card-actions-demo',
+        service: { mode: 'auto' },
+      },
+    }));
+    writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+    writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+    writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+    writeFileSync(join(runtime, 'card-actions', 'index.json'), JSON.stringify({
+      schemaVersion: 1,
+      actions: ['example.review.submit'],
+      actionPrefixes: ['example.review.'],
+      endpoint: '/botmux/card-actions/v1',
+    }));
+
+    const installed = installLocalPlugin(source);
+    const materialized = materializePlugin('card-actions-demo');
+    const expected = {
+      schemaVersion: 1,
+      actions: ['example.review.submit'],
+      actionPrefixes: ['example.review.'],
+      endpoint: '/botmux/card-actions/v1',
+    };
+    expect(installed.record.contributions?.cardActions).toEqual(expected);
+    expect(readPluginRegistry().plugins['card-actions-demo'].contributions?.cardActions).toEqual(expected);
+    expect(materialized.cardActions).toEqual(expected);
+
+    for (const publicPath of [pluginRegistryPath(), pluginMaterializedPath('card-actions-demo')]) {
+      const content = readFileSync(publicPath, 'utf8');
+      expect(content).not.toContain('BOTMUX_PLUGIN_CARD_ACTION_TOKEN');
+      expect(content).not.toContain('Bearer ');
+      expect(content).not.toContain('formValue');
+      expect(content).not.toContain('operator');
+    }
+  });
+
+  it('拒绝不安全或不完整的卡片动作声明', () => {
+    const makeSource = (id: string, declaration: unknown, options: { serviceFile?: boolean; serviceManifest?: boolean } = {}) => {
+      const source = join(home, id);
+      const runtime = join(source, 'dist');
+      mkdirSync(join(runtime, 'card-actions'), { recursive: true });
+      if (options.serviceFile !== false) {
+        mkdirSync(join(runtime, 'service'), { recursive: true });
+        writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+        writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+      }
+      writeFileSync(join(source, 'package.json'), JSON.stringify({
+        name: `@botmux-ai/plugin-${id}`,
+        version: '0.1.0',
+        type: 'module',
+        keywords: ['botmux-plugin'],
+        botmux: {
+          schemaVersion: 1,
+          id,
+          ...(options.serviceManifest === false ? {} : { service: { mode: 'auto' } }),
+        },
+      }));
+      writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+      writeFileSync(join(runtime, 'card-actions', 'index.json'), JSON.stringify(declaration));
+      return source;
+    };
+
+    const invalidCases: Array<[string, unknown, { serviceFile?: boolean; serviceManifest?: boolean }?]> = [
+      ['empty-selectors', { schemaVersion: 1, actions: [], actionPrefixes: [], endpoint: '/actions' }],
+      ['empty-selector', { schemaVersion: 1, actions: [''], endpoint: '/actions' }],
+      ['duplicate-selector', { schemaVersion: 1, actions: ['example.go', 'example.go'], endpoint: '/actions' }],
+      ['reserved-action', { schemaVersion: 1, actions: ['close'], endpoint: '/actions' }],
+      ['reserved-prefix', { schemaVersion: 1, actionPrefixes: ['dash_'], endpoint: '/actions' }],
+      ['remote-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: 'https://example.test/actions' }],
+      ['query-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions?next=remote' }],
+      ['escape-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/safe/%2e%2e/escape' }],
+      ['future-schema', { schemaVersion: 2, actions: ['example.go'], endpoint: '/actions' }],
+      ['missing-service-file', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions' }, { serviceFile: false }],
+      ['missing-service-manifest', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions' }, { serviceManifest: false }],
+    ];
+
+    for (const [id, declaration, options] of invalidCases) {
+      const source = makeSource(id, declaration, options);
+      expect(() => installLocalPlugin(source), id).toThrow(/plugin_(?:card|service)|invalid_plugin_card/);
+      expect(readPluginRegistry().plugins[id], id).toBeUndefined();
+      expect(existsSync(pluginHome(id)), id).toBe(false);
+    }
+
+    const source = makeSource('atomic-actions', {
+      schemaVersion: 1,
+      actions: ['example.go'],
+      endpoint: '/actions',
+    });
+    installLocalPlugin(source);
+    const runtimeMarker = join(pluginHome('atomic-actions'), 'dist', 'marker.txt');
+    writeFileSync(runtimeMarker, 'preserve-old-runtime\n');
+    const packageJson = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8'));
+    packageJson.version = '0.2.0';
+    writeFileSync(join(source, 'package.json'), JSON.stringify(packageJson));
+    writeFileSync(join(source, 'dist', 'card-actions', 'index.json'), JSON.stringify({
+      schemaVersion: 1,
+      actions: ['example.go'],
+      endpoint: 'http://remote.example/actions',
+    }));
+
+    expect(() => installLocalPlugin(source)).toThrow(/invalid_plugin_card_actions_endpoint/);
+    expect(readPluginRegistry().plugins['atomic-actions'].version).toBe('0.1.0');
+    expect(readFileSync(runtimeMarker, 'utf8')).toBe('preserve-old-runtime\n');
   });
 });

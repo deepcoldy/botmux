@@ -18,6 +18,7 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { isMojoFullyRemote } from './mojo-types.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -25,10 +26,12 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import { isStandaloneBinary } from '../../core/self-spawn.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { isValidPluginId } from '../../core/plugins/ids.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -234,13 +237,71 @@ function canonical(p: string): string {
 }
 
 /** Absolute path to this build's compiled cli.js (dist/cli.js), derived from
- *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js). */
+ *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js).
+ *
+ *  ⚠️ NOT VALID IN A COMPILED BINARY. There is no cli.js on disk there: the module
+ *  graph lives in the virtual, process-private `/$bunfs/`, so both candidates
+ *  below resolve against `/$bunfs/root` and collapse onto the real filesystem
+ *  root — MEASURED inside a real compiled binary: `/cli.js` and `/dist/cli.js`,
+ *  neither existing. Callers must therefore go through `botmuxCliInvocation()` (a
+ *  child spawn) or `botmuxShimExecLine()` (a shim handed to another process)
+ *  rather than calling this directly. */
 function distCliJs(): string {
   const colocated = fileURLToPath(new URL('../../cli.js', import.meta.url));
   if (existsSync(colocated)) return colocated;
-  // `pnpm daemon` loads this module from src/ through tsx, while the trusted
+  // `bun run daemon` loads this module from src/ through tsx, while the trusted
   // sandbox shim must still execute the built CLI entrypoint.
   return fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
+}
+
+/**
+ * `#!/bin/sh` body for the in-sandbox `botmux` shim.
+ *
+ * WHY THIS CANNOT BE ONE FORM FOR BOTH RUNTIMES: the shim is written to the host
+ * disk, ro-bound into the sandbox at `/run/sbxbin`, and then executed by a
+ * DIFFERENT process inside that sandbox. Two things follow, both MEASURED:
+ *
+ *   • `/$bunfs/` is process-private — a child sees nothing there, so a compiled
+ *     binary emitting `exec node "/dist/cli.js"` produces a shim whose target does
+ *     not exist for the only process that will ever run it; and
+ *   • `sh` expands the unescaped `$bunfs` inside double quotes to the empty
+ *     string, so even the literal path is lost (`"/$bunfs/cli.js"` → `//cli.js`).
+ *
+ * Verified against a real binary: running the compiled form of this line prints
+ * the botmux HELP BANNER and exits 0, so an in-sandbox `botmux send` silently
+ * does nothing.
+ *
+ * The two runtimes genuinely need DIFFERENT values — the source form must name
+ * `dist/cli.js` (a compiled binary has no such file) and the compiled form must
+ * name the executable itself (`process.execPath`, a real on-disk path even under
+ * --compile). Collapsing them is not possible; the guard here is that each branch
+ * is exercised by a test, since a wrong shim fails silently.
+ *
+ * Also note the compiled form drops `node` entirely: re-introducing an
+ * interpreter dependency would defeat the point of the self-contained binary, and
+ * the sandbox policy does not expose a node.
+ */
+export function botmuxShimExecLine(): string {
+  if (isStandaloneBinary()) {
+    return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`;
+  }
+  return `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`;
+}
+
+/**
+ * Command + leading args to run this build's CLI as a CHILD of the current
+ * process (used by the relay watcher to re-exec `botmux send` on the host).
+ *
+ * Same split as `src/core/self-spawn.ts`: under Node the script path is required
+ * (`node <dist/cli.js> send …`), while the compiled binary dispatches ordinary
+ * subcommands itself (`<binary> send …`) and must NOT be handed a script path —
+ * verified on a real binary that `<binary> "/dist/cli.js" send …` prints help and
+ * exits 0 instead of sending anything.
+ */
+export function botmuxCliInvocation(cliPathOverride?: string): { command: string; args: string[] } {
+  if (cliPathOverride) return { command: process.execPath, args: [cliPathOverride] };
+  if (isStandaloneBinary()) return { command: process.execPath, args: [] };
+  return { command: process.execPath, args: [distCliJs()] };
 }
 
 /** Is the file sandbox globally forced for this daemon? The real per-bot
@@ -364,15 +425,42 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
 }
 
 /**
- * Whether a LOCAL sandbox engine applies to this backend at all. riff has NO
- * local CLI process to wrap (execution happens in riff's own remote sandbox);
- * without this bypass the worker's fail-safe "backend not sandboxable" hard
- * error would brick every sandbox-enabled bot the moment it switches to riff.
- * Platform is no longer a factor — fs-policy sandboxes darwin AND linux.
+ * Whether a LOCAL sandbox engine applies to this backend at all.
+ *
+ * riff has NO local CLI process to wrap — execution happens entirely in riff's
+ * own remote sandbox. Without that bypass the worker's fail-safe "backend not
+ * sandboxable" hard error would brick every sandbox-enabled bot the moment it
+ * switches to riff. Platform is no longer a factor — fs-policy sandboxes darwin
+ * AND linux.
+ *
+ * mojo is NOT unconditionally remote, and this is the important asymmetry:
+ * MojoBackend spawns the `mojo` binary locally on every turn. Only with
+ * `cloud: true` do the agent's TOOLS run off-box; `cloud` is optional, and
+ * `localDaemon: true` explicitly opts INTO local execution. Treating mojo as
+ * remote regardless would silently skip the local sandbox for a bot that asked
+ * for `sandbox: true` — a fail-OPEN. So a mojo bypass requires proof of remote
+ * execution, and anything else keeps the local sandbox engaged (fail closed).
  */
-export function localSandboxApplies(backendType: string): boolean {
-  return backendType !== 'riff';
+export function localSandboxApplies(
+  backendType: string,
+  // `jwtEnv` / `env` are part of the proof: the launcher env decides which binary
+  // the next turn actually executes (see mojoUnprovableEnvKeys). A narrower type
+  // here silently DROPPED a caller's env and re-opened the bypass.
+  remoteExecution?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  },
+): boolean {
+  if (backendType === 'riff') return false;
+  if (backendType === 'mojo') {
+    return !isMojoFullyRemote(remoteExecution);
+  }
+  return true;
 }
+
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
@@ -572,6 +660,14 @@ export function prepareDirectSandbox(opts: {
   trustedBotmuxCommandPaths?: readonly string[];
   /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
   mcpGatewaySocketPath?: string;
+  /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
+   *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
+   *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
+   *  the SAME keystore the policy denied/carved-out — NOT the lexical env value, which on a
+   *  symlinked data root resolves to an unbound path inside the sandbox (ENOENT → auth
+   *  breaks) or a namespace the policy never anchored. Absent/empty →
+   *  unset in the child (default store, matching the policy's default resolution). */
+  larkCliDataDir?: string | null;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
@@ -588,7 +684,7 @@ export function prepareDirectSandbox(opts: {
   // `botmux` shim → THIS build's cli.js so in-sandbox `botmux send` hits relay
   // mode (and never needs bots.json, which the policy doesn't expose).
   const shim = join(shimBin, 'botmux');
-  writeFileSync(shim, `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`);
+  writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
 
   // usrmerge symlinks to replicate; deny rules that are FILES on the host need
@@ -656,11 +752,36 @@ export function prepareDirectSandbox(opts: {
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
+  // Overlay the shim onto every configured absolute `botmux` command path so an
+  // in-sandbox call by absolute path also reaches relay mode.
+  //
+  // ⚠️ EXCEPT when that path IS this executable. install.sh moves the compiled
+  // binary to `~/.botmux/bin/botmux` (install.sh:106) and the daemon runs from
+  // there, while `trustedBotmuxCommandPaths` defaults to exactly that path
+  // (gateway-installer.ts — `BOTMUX_BIN_PATH` has no writer anywhere, so the
+  // default is what production uses). Binding the shim over it makes the shim's
+  // own `exec "<process.execPath>"` resolve back to the shim: MEASURED with bwrap,
+  // the real binary never runs and the process ends in SILENT exit 0 (the kernel
+  // caps shebang recursion and gives up), i.e. an in-sandbox `botmux send` looks
+  // like it worked and sent nothing — the exact failure class this whole change
+  // exists to remove.
+  //
+  // Skipping the overlay is safe: `execPaths` always contains
+  // `dirname(canonical(process.execPath))` (worker.ts), so the real binary is
+  // already reachable inside the sandbox, and an absolute-path call lands on it
+  // directly. The PATH-shaped `botmux` still goes through `/run/sbxbin`, and relay
+  // mode is driven by env (BOTMUX_SANDBOX_OUTBOX etc.), not by which file answers
+  // the call. The npm layout — where the launcher and the platform binary are
+  // different files — still gets the overlay.
+  let selfExec: string | undefined;
+  try { selfExec = realpathSync(process.execPath); } catch { selfExec = undefined; }
   for (const rawTarget of [...new Set(opts.trustedBotmuxCommandPaths ?? [])]) {
     if (typeof rawTarget !== 'string' || !isAbsolute(rawTarget)) continue;
     const target = resolve(rawTarget);
     try {
       if (!lstatSync(target).isFile()) continue;
+      // Compare resolved paths: either side may be reached through a symlink.
+      if (selfExec !== undefined && realpathSync(target) === selfExec) continue;
       args.push('--ro-bind', shim, target);
     } catch { /* missing/stale config target — PATH shim remains available */ }
   }
@@ -721,6 +842,20 @@ export function prepareDirectSandbox(opts: {
   }
   args.push('--unsetenv', 'BOTS_CONFIG');
   args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
+  // LARKSUITE_CLI_DATA_DIR relocates the lark-cli keystore dir on Linux to
+  // `<value>/lark-cli`. Pin the child to the CANONICAL data root the worker resolved
+  // (opts.larkCliDataDir = dirname of the frozen keystore dir) so the in-sandbox lark-cli
+  // opens EXACTLY the keystore the policy denied/carved-out — same canonical namespace,
+  // not the lexical env value (which on a symlinked data root resolves to an unbound path
+  // inside the sandbox → ENOENT/auth-break, or a namespace the policy never anchored).
+  // Absent → unset so the child falls back to $HOME/.local/share,
+  // matching the policy's default resolution. Authoritative: applied last, and bwrap has
+  // no --clearenv so this overrides any inherited/rc-injected value.
+  if (opts.larkCliDataDir && opts.larkCliDataDir.startsWith('/')) {
+    args.push('--setenv', 'LARKSUITE_CLI_DATA_DIR', opts.larkCliDataDir);
+  } else {
+    args.push('--unsetenv', 'LARKSUITE_CLI_DATA_DIR');
+  }
   for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
   // Canonicalize the CLI binary before execvp: on a symlinked-$HOME host
   // (e.g. /home/u → /data00/home/u shared-drive mount) the worker hands us the
@@ -827,7 +962,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   }
 }
 
-// ─────────────────────── botmux send relay (unchanged) ───────────────────────
+// ─────────────────────── botmux send / dispatch relay ───────────────────────
 
 // Relay request schema (written by cli.ts relaySend, validated here). The
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
@@ -835,6 +970,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // write any outbox file, so everything here is treated as untrusted.
 //   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
+  command?: unknown;
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
@@ -846,15 +982,23 @@ export interface RelayRequest {
   originDispatchAttempt?: unknown;
   originCapability?: unknown;
 }
-// Presentation-only flags the sandbox may pass through. Path-bearing flags
+// Presentation flags plus the plugin id required to authorize a callback card.
+// Path-bearing flags
 // (--content-file/--file(s)/--image(s)/--video(s)), routing flags
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+const RELAY_FLAGS_VAL = new Set([
+  '--mention',
+  '--quote',
+  '--response-kind',
+  '--layout',
+  '--plugin-card-action',
+]);
 
 export interface ValidatedRelay {
+  command: 'send' | 'dispatch';
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
@@ -911,11 +1055,42 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     if (!safeName(a)) return { ok: false, error: 'video cover must be a plain outbox basename' };
     videoCoverNames.push(a);
   }
+  const command = req.command === undefined || req.command === 'send'
+    ? 'send'
+    : req.command === 'dispatch'
+      ? 'dispatch'
+      : null;
+  if (command === null) return { ok: false, error: 'command must be send or dispatch' };
+  if (command === 'dispatch' && (
+    preparedContentName !== undefined
+    || cardName !== undefined
+    || attachmentNames.length > 0
+    || videoNames.length > 0
+    || videoCoverNames.length > 0
+  )) {
+    return { ok: false, error: 'dispatch relay does not accept cards or attachments' };
+  }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
+    if (command === 'dispatch') {
+      if (f === '--steer') { flags.push(f); continue; }
+      if (!dispatchValueFlags.has(f)) return { ok: false, error: `dispatch flag not allowed: ${f}` };
+      const v = rawFlags[i + 1];
+      if (typeof v !== 'string' || !v || v.startsWith('--') || v.length > 512) {
+        return { ok: false, error: `dispatch flag ${f} needs a bounded string value` };
+      }
+      if (f === '--bot-app' && !/^cli_[A-Za-z0-9_-]{1,128}(?::[^\0]{1,200})?$/.test(v)) {
+        return { ok: false, error: 'dispatch --bot-app must be a stable app id' };
+      }
+      if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
+        return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      flags.push(f, v); i++; continue;
+    }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
     if (RELAY_FLAGS_VAL.has(f)) {
       const v = rawFlags[i + 1];
@@ -927,9 +1102,18 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
       }
+      if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
+        return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
+      }
+      if (f === '--plugin-card-action' && !isValidPluginId(v)) {
+        return { ok: false, error: 'flag --plugin-card-action must be a valid plugin id' };
+      }
       flags.push(f, v); i++; continue;
     }
     return { ok: false, error: `flag not allowed: ${f}` };
+  }
+  if (flags.includes('--plugin-card-action') && cardName === undefined) {
+    return { ok: false, error: 'flag --plugin-card-action requires a card file' };
   }
   const originTurnId = req.originTurnId === undefined
     ? undefined
@@ -958,6 +1142,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   return {
     ok: true,
     value: {
+      command,
       contentName: req.contentFile,
       preparedContentName,
       cardName,
@@ -1058,7 +1243,7 @@ export function startOutboxWatcher(
     cliPath?: string;
   } = {},
 ): () => void {
-  const cli = opts.cliPath ?? distCliJs();
+  const cliInvocation = botmuxCliInvocation(opts.cliPath);
   const authorize = opts.authorize;
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
@@ -1149,10 +1334,12 @@ export function startOutboxWatcher(
 
       const hostArgs = [
         ...v.value.flags,
-        ...(cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
-        ...attPaths.flatMap(a => ['--files', a]),
-        ...videoPaths.flatMap(a => ['--videos', a]),
-        ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
+        ...(v.value.command === 'dispatch'
+          ? ['--brief-file', contentDest]
+          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+        ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
+        ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
+        ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
       // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
@@ -1182,7 +1369,7 @@ export function startOutboxWatcher(
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
-      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
+      const child = spawn(cliInvocation.command, [...cliInvocation.args, v.value.command, ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });
@@ -1194,3 +1381,7 @@ export function startOutboxWatcher(
   timer.unref?.();
   return () => clearInterval(timer);
 }
+
+// Single definition, re-exported for the callers that historically imported it
+// from here. See mojo-types.ts for why a wrapperCli voids the proof.
+export { isMojoFullyRemote };

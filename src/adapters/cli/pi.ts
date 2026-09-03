@@ -1,9 +1,68 @@
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+
+/** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
+ *  or `undefined` when no readable copy exists on disk.
+ *
+ *  Returning `undefined` matters more than it looks: Pi treats an unloadable
+ *  `--extension` as FATAL (`Failed to load extension … Extension path does not
+ *  exist` → exit 1), so handing it a path that is not really there would take
+ *  down every Pi session rather than merely lose the boundary marker. The
+ *  caller therefore omits the flag entirely in that case and the reader falls
+ *  back to its timeout backstop — degraded, not broken.
+ *
+ *  The case is real, not theoretical: inside a `bun build --compile` binary the
+ *  module graph lives in the virtual `/$bunfs/` root, so both `__dirname`-derived
+ *  candidates resolve to paths that exist only inside this process — measured
+ *  `/$bunfs/root/pi-turn-boundary-extension.{js,ts}`, neither present on disk.
+ *  See CLAUDE.md on why a `__dirname` path must never be handed to another
+ *  process. Resolved lazily at spawn time so constructing the adapter never
+ *  touches the filesystem. */
+export function piTurnBoundaryExtensionPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    resolve(here, 'pi-turn-boundary-extension.js'),
+    resolve(here, 'pi-turn-boundary-extension.ts'),
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
+ *  branch is reachable in a test: that branch only happens inside a compiled
+ *  binary, which no test executes, and it is the branch whose regression kills
+ *  every Pi session. Taking the resolved path as a parameter lets a test drive
+ *  BOTH sides without stubbing the filesystem. */
+export function buildPiArgs(opts: {
+  sessionId: string;
+  initialPrompt?: string;
+  model?: string;
+  turnBoundaryExtension: string | undefined;
+}): string[] {
+  const args: string[] = [];
+  // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
+  // retries inside the same turn, so the transcript alone cannot say when a
+  // turn really ended. This extension appends Pi's own `agent_settled` boundary
+  // into the session JSONL the bridge already reads. Present on every
+  // Botmux-spawned Pi (a hand-started `pi` is unaffected, since the flag lives
+  // only in the argv we build). See pi-turn-boundary-extension.ts.
+  if (opts.turnBoundaryExtension) args.push('--extension', opts.turnBoundaryExtension);
+  args.push('--session-id', opts.sessionId);
+  if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  // Pi's interactive mode processes positional initial messages after TUI
+  // startup, avoiding stdin races while keeping the native TUI visible.
+  if (opts.initialPrompt) args.push(opts.initialPrompt);
+  return args;
+}
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
  *
@@ -47,10 +106,12 @@ import { delay } from '../../utils/timing.js';
  *       terminal stopReason), and `terminate` is not persisted — so that turn
  *       has no on-disk end marker.
  *  Setting `reliableTurnTerminal` would (a) claim VC-meeting delivery eligibility
- *  Pi can't honor, (b) suppress the busy-marker idle probe Pi actually relies on,
- *  and (c) make `structuredRateLimitAuthoritative` suppress Pi's screen `rate`
- *  verdict with no structured replacement (real 429s vanish). Leaving it unset
- *  keeps Pi on its proven quiescence + `Working...` busy-marker idle path.
+ *  Pi can't honor and (b) suppress the busy-marker idle probe Pi actually relies
+ *  on, so it stays unset — keeping Pi on its proven quiescence + `Working...`
+ *  busy-marker idle path. (Pi's screen `rate` verdict is NOT at risk here:
+ *  `structuredRateLimitAuthoritative` gates on `claudeDataDir` /
+ *  `emitsStructuredRateLimit`, neither of which Pi sets — Pi has no structured
+ *  rate-limit emit, so it correctly keeps screen-scanning real 429s.)
  *
  *  ## Idle detection
  *  Pi is a pure-quiescence adapter (no `readyPattern`, no `injectsReadyHook`).
@@ -58,7 +119,20 @@ import { delay } from '../../utils/timing.js';
  *  idle probe and the reattach probe (`scheduleReattachIdleProbe`, gated on
  *  `busyPattern`), so a turn — and a reattached persistent pane with no new PTY
  *  output — is marked ready via the `Working...` marker exactly as before this
- *  change. `assistant_final` events additionally fire idle when they land. */
+ *  change. `assistant_final` events additionally fire idle when they land.
+ *  Three guards keep quiescence honest (the raw heuristic alone mis-fires):
+ *    1. Startup window: the TUI renders its input box seconds before the CLI
+ *       begins consuming an argv-baked first prompt (extension/model loading).
+ *       The worker holds the first ready until the turn has visibly started —
+ *       `Working...` seen on PTY, or the transcript's first user record
+ *       (worker `spawnArgvTurnStartEvidenceSeen` gate).
+ *    2. Mid-turn: pi is in STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS, so a
+ *       transcript-started turn without a terminal suppresses screen idle
+ *       (drainPiTranscript emits terminals for stop/length-no-toolcall and the
+ *       hard error/aborted edges — see pi-transcript.ts for the accepted
+ *       custom-tool `terminate:true` gap).
+ *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
+ *       working when `Working...` reappears. */
 export function createPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
@@ -67,14 +141,12 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     resolvedBin: bin,
 
     buildArgs({ sessionId, initialPrompt, model }) {
-      const args = [
-        '--session-id', sessionId,
-      ];
-      if (model?.trim()) args.push('--model', model.trim());
-      // Pi's interactive mode processes positional initial messages after TUI
-      // startup, avoiding stdin races while keeping the native TUI visible.
-      if (initialPrompt) args.push(initialPrompt);
-      return args;
+      return buildPiArgs({
+        sessionId,
+        initialPrompt,
+        model,
+        turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+      });
     },
 
     buildResumeCommand({ sessionId }) {
@@ -112,6 +184,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     busyPattern: /Working\.\.\./,
+    // Self-heal for a falsely published ready (e.g. a startup-window quiescence
+    // idle slipping past the gates): if `Working...` renders AFTER an idle was
+    // reported, IdleDetector fires onBusy and the worker pulls isPromptReady
+    // back to false + republishes working. Safe as an idle→busy edge marker:
+    // Pi's `Working...` is an ephemeral status line, never part of transcript
+    // history redraws, so a completed turn cannot revive a closed card.
+    idleToBusyPattern: /Working\.\.\./,
     readyPattern: undefined,
     // Pi's native Message Queue parks/steers submit-while-busy input; the JSONL
     // transcript bridge (drainPiTranscript) + the `Working...` busy marker are

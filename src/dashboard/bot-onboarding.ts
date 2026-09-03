@@ -1,10 +1,9 @@
-import { createRequire } from 'node:module';
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
 import {
   detectUnusableOwnerEntries,
   resolveScannerAllowedUser,
@@ -19,7 +18,7 @@ import {
   type CriticalScopeReadbackResult,
   type RemainingStep,
 } from '../setup/verify-permissions.js';
-import { resolveSetupAppName } from '../setup/app-name.js';
+import { resolveCloneAppName, resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
@@ -36,9 +35,16 @@ import {
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 
-const require = createRequire(import.meta.url);
-const QRCode = require('qrcode-terminal/vendor/QRCode') as any;
-const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel') as Record<string, unknown>;
+// Static default-imports of qrcode-terminal's vendored QRCode class (its public
+// API only prints to a terminal; we need the low-level class to render a QR into
+// a data structure). Explicit `.js` file specifiers — NOT `createRequire(...)`
+// with a bare dir path — so `bun build --compile` traces and EMBEDS them into
+// the single-file binary. The old dynamic require left them unbundled, and the
+// compiled dashboard crashed at runtime with "Cannot find module
+// 'qrcode-terminal/vendor/QRCode' from /$bunfs/…". Both files are `module.exports
+// = …` CJS; ESM default-import interop gives the export on both Node and Bun.
+import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
+import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
 
 export type BotOnboardingStatus =
   | 'starting'
@@ -69,6 +75,14 @@ export interface BotOnboardingPermission {
   eventMode?: number;
   /** Exact baseline event + callback count ACK for MOSA-managed activation. */
   verifiedEventCount?: number;
+  /**
+   * redirect 白名单是否写成功。**独立于 ok**：权限/发版全绿但白名单没写上时，这个
+   * bot 一点授权就 20029（群聊模式 / 会话群标签 / `/login` 全都用不了），前端必须
+   * 能把这一步单独讲出来，不能被一句「权限配置完成」盖过去。
+   */
+  redirectConfigured?: boolean;
+  /** redirect 白名单未配置成功的原因。 */
+  redirectWarning?: string;
   /** 失败原因 / 信息 (失败时给出手动步骤) */
   reason?: string;
   message?: string;
@@ -141,8 +155,9 @@ export interface BotOnboardingSnapshot {
 
 /** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
 export interface BotOnboardingInput {
-  /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
+  /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
+  cloneSourceAppId?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
   registrationMode?: 'web' | 'compat';
   /**
@@ -1525,6 +1540,13 @@ export class BotOnboardingManager {
       subscribedEventCount: MANAGED_VERIFIED_EVENT_COUNT,
       missingVcEvents: [],
       eventModeReady: true,
+      // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
+      // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
+      redirectConfigured: false,
+      // 同上：本次没有读/写「权限可访问的数据范围」。0 + warning 才是诚实的
+      // 「没碰过」，报 0 而不带 warning 会被下游读成「本来就没有待配的」。
+      privilegeRangeCount: 0,
+      privilegeRangeWarning: '本次从权限台账重建，未读写权限数据范围',
       eventMode: managedPermission.eventMode,
       verifiedEventCount: managedPermission.verifiedEventCount,
       versionId: managedPermission.versionId,
@@ -1591,9 +1613,24 @@ export class BotOnboardingManager {
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const cloneSource = input.cloneSourceAppId
+      ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
+      : undefined;
+    if (input.cloneSourceAppId && !cloneSource) {
+      this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
     // Freeze the resolved name before any asynchronous work. Later bot list
     // changes must not make the name drift midway through onboarding.
-    const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+    const appName = cloneSource
+      ? resolveCloneAppName(
+          input.appName,
+          [cloneSource.displayName, cloneSource.name, input.cloneSourceAppId]
+            .find(value => typeof value === 'string' && value.trim()),
+          this.now(),
+        )
+      : resolveSetupAppName(input.appName, configuredBots.length);
     this.patch(id, {
       registrationMode: input.registrationMode ?? 'web',
       ...(input.requireCriticalScopesBeforeActivation
@@ -1673,9 +1710,9 @@ export class BotOnboardingManager {
 
     // CLI / 工作目录 / model 来自前端表单 (dashboard 已用 resolveCliId +
     // invalidWorkingDirs 校验过). 留空回退到 setup 同款默认: claude-code / '~'.
-    const cliId: CliId = input.cliId ?? 'claude-code';
-    const workingDir = input.workingDir?.trim() || '~';
-    const bot: Record<string, any> = {
+    let cliId: CliId = input.cliId ?? 'claude-code';
+    let workingDir = input.workingDir?.trim() || '~';
+    let bot: Record<string, any> = {
       larkAppId: result.appId,
       larkAppSecret: result.appSecret,
       cliId,
@@ -1689,6 +1726,11 @@ export class BotOnboardingManager {
     // brand 落盘：只在国际版写字段，feishu 留空（向后兼容，见 normalizeBrand）。
     if (result.brand === 'lark') {
       bot.brand = 'lark';
+    }
+    if (cloneSource) {
+      bot = cloneBotConfig(cloneSource, bot);
+      cliId = bot.cliId ?? 'claude-code';
+      workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
     }
     // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
     // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open
@@ -1888,6 +1930,8 @@ export class BotOnboardingManager {
           callbacks,
           sessionFilePath,
           meta.requireVerifiedEvents,
+          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
+          true,
         );
       }
       const first = await this.automateOpenPlatform({
@@ -1899,6 +1943,10 @@ export class BotOnboardingManager {
         disableQrLogin: meta.registrationMode === 'web',
         disableBytedcliFallback: meta.registrationMode === 'web',
         requireVerifiedEvents: meta.requireVerifiedEvents,
+        // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
+        // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
+        // runPermissionRecovery，那边不传。
+        appJustCreated: true,
         ...callbacks,
       });
       return first;
@@ -1996,6 +2044,7 @@ export class BotOnboardingManager {
     callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onQrScanConfirmed' | 'onStatus'>,
     sessionFilePath: string,
     requireVerifiedEvents: boolean,
+    appJustCreated = false,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2006,6 +2055,7 @@ export class BotOnboardingManager {
         disableQrLogin: false,
         disableBytedcliFallback: true,
         requireVerifiedEvents,
+        appJustCreated,
         ...callbacks,
       });
     } finally {
@@ -2035,6 +2085,9 @@ export class BotOnboardingManager {
           scopeWarning: auto.scopeWarning,
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
+          // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         }
       : {
           ok: false,
@@ -2043,6 +2096,8 @@ export class BotOnboardingManager {
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
           versionId: auto.versionId,
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         };
     this.patch(id, {
       status,

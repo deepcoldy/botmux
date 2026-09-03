@@ -37,6 +37,7 @@ export type {
   JournalMutation,
   StoredEvent,
   V3ErrorClass,
+  V3BlockedRecovery,
   V3Event,
   V3LoopRef,
   V3RunFailureReason,

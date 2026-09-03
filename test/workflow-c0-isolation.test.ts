@@ -8,7 +8,7 @@ const CLI_PATH = join(__dirname, '..', 'dist', 'cli.js');
 
 beforeAll(() => {
   if (!existsSync(CLI_PATH)) {
-    throw new Error(`dist/cli.js missing — run pnpm build first`);
+    throw new Error(`dist/cli.js missing — run bun run build first`);
   }
 });
 
@@ -63,6 +63,7 @@ describe('Slice C0 — chat side-effect isolation', () => {
     ['preset', 'export'],
     ['whiteboard', 'status'],
     ['vc-agent', 'join'],
+    ['actor', 'current', '--json'],
   ])('botmux %s is denied by the workflow root-command allowlist', (...args) => {
     const out = runCli(args, { BOTMUX_WORKFLOW: '1' });
     expect(out.status).toBe(2);

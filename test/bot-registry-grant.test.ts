@@ -16,6 +16,29 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
   });
 
+  it('parseBotConfigsFromText preserves & filters chatMentionModes (four-state)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'mm1', larkAppSecret: 's',
+      chatMentionModes: {
+        oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient',
+        // Case/padding are normalized; unknown values and blank chat ids are dropped.
+        oc_5: '  NEVER  ', oc_6: 'bogus', oc_7: 42, '': 'never', '   ': 'always',
+      },
+    }]));
+    expect(cfgs[0].chatMentionModes).toEqual({
+      oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient', oc_5: 'never',
+    });
+  });
+
+  it('parseBotConfigsFromText leaves chatMentionModes undefined when absent/all-invalid/not-an-object', () => {
+    const at = (entry: Record<string, unknown>) =>
+      parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mm2', larkAppSecret: 's', ...entry }]))[0].chatMentionModes;
+    expect(at({})).toBeUndefined();
+    expect(at({ chatMentionModes: { oc_1: 'nope' } })).toBeUndefined();
+    // An array is an object in JS — the parser must still reject it.
+    expect(at({ chatMentionModes: ['always'] })).toBeUndefined();
+  });
+
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'a1', larkAppSecret: 's',
@@ -88,6 +111,42 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[6].usageDisplay).toBeUndefined();
     // Legacy field is never re-emitted.
     expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
+  });
+
+  it('parses pinStreamingCard only as strict boolean true', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin1', larkAppSecret: 's', pinStreamingCard: true },
+    ]))[0].pinStreamingCard).toBe(true);
+
+    for (const bad of [undefined, false, 'true', 1, null]) {
+      const [cfg] = parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'pin2', larkAppSecret: 's', pinStreamingCard: bad },
+      ]));
+      expect(cfg.pinStreamingCard).toBeUndefined();
+    }
+  });
+
+  it('parses noPinStreamingCardChats as a trimmed, deduplicated string list', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'pin_chat_1',
+      larkAppSecret: 's',
+      noPinStreamingCardChats: [' oc_chat_a ', 'oc_chat_b', '', '   ', 'oc_chat_a', 1, null],
+    }]));
+    expect(cfg.noPinStreamingCardChats).toEqual(['oc_chat_a', 'oc_chat_b']);
+  });
+
+  it('leaves noPinStreamingCardChats undefined when absent, non-array, or all invalid', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_2', larkAppSecret: 's' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_3', larkAppSecret: 's', noPinStreamingCardChats: 'oc_chat_a' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_4', larkAppSecret: 's', noPinStreamingCardChats: ['', '  ', 1, null] },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
   });
 
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {

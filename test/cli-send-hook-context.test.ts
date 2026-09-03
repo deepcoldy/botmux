@@ -1,9 +1,10 @@
-import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {
   managedOriginCapabilityPath,
@@ -20,9 +21,7 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
   stderr: string;
 }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      '--import', 'tsx', join(__dirname, '..', 'src', 'cli.ts'), ...args,
-    ], {
+    const child = spawnTsScript(join(__dirname, '..', 'src', 'cli.ts'), args, {
       cwd: join(__dirname, '..'),
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -44,6 +43,57 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('cmdSend hook context wiring', () => {
+  it('passes Lark business error details through every cmdSend failure exit', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cliSource).toContain('describeSendFailure');
+    expect(cmdSend).toContain('语音发送失败：${describeSendFailure(e)}');
+    expect(cmdSend).toContain('文档评论发送失败：${describeSendFailure(e)}');
+    expect(cmdSend).toContain('发送失败: ${describeSendFailure(err)}');
+  });
+
+  it('parses and relays an explicit layout before building the canonical reply card', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const parseAt = cmdSend.indexOf('const replyLayoutRequest = parseReplyLayoutRequest(rest);');
+    const relayAt = cmdSend.indexOf('await relaySend(rest, relayDir, replyLayout);');
+
+    expect(parseAt).toBeGreaterThanOrEqual(0);
+    expect(relayAt).toBeGreaterThan(parseAt);
+    expect(cmdSend).toContain('let replyLayout = replyLayoutRequest.layout;');
+    expect(cmdSend).toContain('extractFirstReplyCardHeading(text)');
+    expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
+    expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
+    expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
+    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
+    expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
+  });
+
+  it('preserves plugin-card ownership across the sandbox host relay', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    expect(relaySend).toContain("'--plugin-card-action'");
+  });
+
+  it('strips trailing memory citations before relay and direct-send rendering', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    expect(relaySend).toContain('content = stripTrailingOaiMemoryCitation(content);');
+    expect(relaySend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
+      .toBeLessThan(relaySend.indexOf('prepareCardMarkdown('));
+
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain('content = stripTrailingOaiMemoryCitation(content);');
+    expect(cmdSend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
+      .toBeLessThan(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'));
+  });
+
   it('delegates CLI session snapshot loading to the session-store gate (scope repair lives behind it)', () => {
     const loadSessionsStart = cliSource.indexOf('function loadSessions()');
     expect(loadSessionsStart).toBeGreaterThanOrEqual(0);
@@ -141,7 +191,7 @@ describe('cmdSend hook context wiring', () => {
   it('does not promote detached spawn-time turn env while durable output is unsettled', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-stale-origin-'));
     try {
-      writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'app-a', {
         origin: {
           sessionId: 'origin',
           chatId: 'oc_origin',
@@ -168,29 +218,29 @@ describe('cmdSend hook context wiring', () => {
           createdAt: new Date(0).toISOString(),
           larkAppId: 'app-a',
         },
-      }));
-      const result = spawnSync(process.execPath, [
-        '--import', 'tsx',
-        join(__dirname, '..', 'src', 'cli.ts'),
-        'send', 'must-not-leak', '--session-id', 'destination', '--no-mention',
-      ], {
-        cwd: join(__dirname, '..'),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          SESSION_DATA_DIR: dataDir,
-          BOTMUX_SESSION_ID: 'origin',
-          // These are inherited spawn-time fallbacks, not a live marker or
-          // protected capability. They must not select (or bypass) a sink.
-          BOTMUX_TURN_ID: 'turn-stale',
-          BOTMUX_DISPATCH_ATTEMPT: '99',
-          BOTMUX_HOST_RELAY_AUTHORIZED: '',
-          BOTMUX_SEND_RELAY: '',
-          BOTMUX_WORKFLOW: '',
-          BOTMUX_LARK_APP_ID: '',
-          BOTMUX_LARK_APP_SECRET: '',
-        },
       });
+      const result = spawnSyncTsScript(
+        join(__dirname, '..', 'src', 'cli.ts'),
+        ['send', 'must-not-leak', '--session-id', 'destination', '--no-mention'],
+        {
+          cwd: join(__dirname, '..'),
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'origin',
+            // These are inherited spawn-time fallbacks, not a live marker or
+            // protected capability. They must not select (or bypass) a sink.
+            BOTMUX_TURN_ID: 'turn-stale',
+            BOTMUX_DISPATCH_ATTEMPT: '99',
+            BOTMUX_HOST_RELAY_AUTHORIZED: '',
+            BOTMUX_SEND_RELAY: '',
+            BOTMUX_WORKFLOW: '',
+            BOTMUX_LARK_APP_ID: '',
+            BOTMUX_LARK_APP_SECRET: '',
+          },
+        },
+      );
       expect(result.status).toBe(2);
       expect(result.stderr).toContain('unsettled durable output but no fresh authoritative dispatch identity');
       expect(result.stderr).not.toContain('must-not-leak');
@@ -219,13 +269,13 @@ describe('cmdSend hook context wiring', () => {
       content: 'prompt',
       deliverySink: 'lark',
     }];
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'read isolated', status: 'active', createdAt: new Date(0).toISOString(),
         larkAppId: 'app-a', cliId: 'codex-app', codexAppDispatchLedger: ledger,
       },
-    }));
+    });
     const fixture = join(root, 'host-send.mjs');
     writeFileSync(fixture, `
       import { readFileSync } from 'node:fs';
@@ -233,6 +283,7 @@ describe('cmdSend hook context wiring', () => {
       process.stdout.write(JSON.stringify({
         command: argv[0],
         content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        layout: argv.includes('--layout') ? argv[argv.indexOf('--layout') + 1] : null,
         responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
         sessionId: argv[argv.indexOf('--session-id') + 1],
         turnId: process.env.BOTMUX_TURN_ID,
@@ -257,7 +308,7 @@ describe('cmdSend hook context wiring', () => {
     });
     try {
       const result = await runCli(
-        ['send', 'relay body', '--session-id', 'session', '--no-mention'],
+        ['send', 'relay body', '--layout', 'risk', '--session-id', 'session', '--no-mention'],
         {
           ...process.env,
           SESSION_DATA_DIR: dataDir,
@@ -271,11 +322,32 @@ describe('cmdSend hook context wiring', () => {
       expect(JSON.parse(result.stdout)).toEqual({
         command: 'send',
         content: 'relay body',
+        layout: 'risk',
         responseKind: null,
         sessionId: 'session',
         turnId: 'turn-live',
         dispatchAttempt: '4',
         requiresLedger: '1',
+      });
+
+      const layoutOff = await runCli(
+        ['send', 'relay body without shell', '--layout', 'risk', '--session-id', 'session', '--no-mention'],
+        {
+          ...process.env,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_SEND_RELAY: outbox,
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: 'app-a',
+          BOTMUX_REPLY_STYLE: JSON.stringify({ layout: false }),
+        },
+      );
+      expect(layoutOff.code, layoutOff.stderr).toBe(0);
+      expect(layoutOff.stderr).toContain('当前 Bot 已关闭 layout');
+      expect(JSON.parse(layoutOff.stdout)).toMatchObject({
+        content: 'relay body without shell',
+        layout: null,
       });
     } finally {
       stop();
@@ -336,7 +408,7 @@ describe('cmdSend hook context wiring', () => {
         turnId: 'turn-stale', dispatchAttempt: 9,
       }),
     );
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'host', status: 'active', createdAt: new Date(0).toISOString(),
@@ -346,7 +418,7 @@ describe('cmdSend hook context wiring', () => {
           state: 'prepared', content: 'prompt', deliverySink: 'http_wait',
         }],
       },
-    }));
+    });
     try {
       const result = await runCli(
         ['send', 'must not relay', '--session-id', 'session', '--no-mention'],
@@ -370,13 +442,13 @@ describe('cmdSend hook context wiring', () => {
 
   it('rejects a trusted host re-exec when its authorized Codex App ledger was already settled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-ledger-gone-'));
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'settled', status: 'active', createdAt: new Date(0).toISOString(),
         larkAppId: 'app-a', cliId: 'codex-app', pid: process.pid,
       },
-    }));
+    });
     try {
       const result = await runCli(
         ['send', 'must not downgrade', '--session-id', 'session', '--no-mention'],
@@ -522,6 +594,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
     expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
     expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    // The requester-identity gate is scoped to the `requester` audience only.
+    // `reviewers`/`everyone` authorize clicks without a human requester (a
+    // bot-triggered ownerless session), so re-widening this gate to every
+    // audience would silently make those cards unsendable.
+    expect(cmdSend).toContain("feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId");
     expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
     expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
     expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");

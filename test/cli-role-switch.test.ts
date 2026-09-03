@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
+
 /** 角色切换命令 `botmux role switch <目录>`（第一次上线，未保留旧 `botmux cd` 别名——
  *  干净迭代）：daemon 侧硬校验目录必须在 ~/botmux-roles 下，名字→目录的解析由调用方
  *  （模型读 _role-protocol.md）完成。这里用 spawn 冒烟锁住：帮助文本主推 role switch、
@@ -17,9 +19,11 @@ function runCli(args: string[]): { status: number; stdout: string; stderr: strin
     const env = { ...process.env, HOME: home };
     delete env.BOTMUX_WORKFLOW;
     try {
+      // execFileSync 形态，wrapper 表达不了，用 runner 前缀拼 argv。
+      const { command, prefixArgs } = tsRunnerPrefix();
       const stdout = execFileSync(
-        process.execPath,
-        ['--import', 'tsx', fileURLToPath(new URL('../src/cli.ts', import.meta.url)), ...args],
+        command,
+        [...prefixArgs, fileURLToPath(new URL('../src/cli.ts', import.meta.url)), ...args],
         { cwd: process.cwd(), env, encoding: 'utf-8' },
       );
       return { status: 0, stdout, stderr: '' };

@@ -45,6 +45,56 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     ).toEqual({ action: 'spawn' });
   });
 
+  /**
+   * Regression: `hasSession()` is `probeSession() === 'exists'`, so it answers
+   * `false` both for "no such session" and for "the probe got no answer".
+   * Under host load the zellij existence check (`list-sessions`, needs a
+   * fork+exec) can be killed by its own timeout; the functional probe then
+   * spawns a background session and times out under the same pressure, and a
+   * session whose pane was alive the whole time got gated with
+   * "zellij 不可用".
+   */
+  it('does NOT gate zellij when the existence check itself got no answer', () => {
+    expect(
+      decideBackendGate({
+        requested: 'zellij',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: true,
+      }),
+    ).toEqual({ action: 'spawn' });
+  });
+
+  it('still gates zellij when the session is PROVABLY absent and the probe failed', () => {
+    // The guard must keep its teeth: an authoritative "no such session" plus a
+    // failed capability probe is the real "zellij is broken" case.
+    expect(
+      decideBackendGate({
+        requested: 'zellij',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: false,
+      }).action,
+    ).toBe('gate');
+  });
+
+  it('still gates ZMX on an indeterminate ownership probe (opposite asymmetry, unchanged)', () => {
+    // ZMX deliberately gates when ownership/protocol cannot be established —
+    // adopting someone else's session is the worse outcome there. It never sets
+    // existingSessionUnknown, so the zellij/tmux exemption must not reach it.
+    expect(
+      decideBackendGate({ requested: 'zmx', available: false, hasExistingSession: false }).action,
+    ).toBe('gate');
+  });
+
+  it('gates on an indeterminate zellij probe ONLY via the explicit flag, not via available=false', () => {
+    // Sanity: the exemption is opt-in per call site. A caller that never sets
+    // the flag keeps the old fail-closed behaviour.
+    expect(
+      decideBackendGate({ requested: 'zellij', available: false, hasExistingSession: false }).action,
+    ).toBe('gate');
+  });
+
   it('requires the ZMX protocol version before considering a managed live session', () => {
     const start = workerSource.indexOf("} else if (effectiveBackend === 'zmx') {");
     const end = workerSource.indexOf("} else if (effectiveBackend === 'herdr')", start);
@@ -55,6 +105,113 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     expect(gate.indexOf('probeZmxVersion()')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
     expect(gate).toContain("resolvedZmxSessionProbe = 'unknown'");
     expect(gate).toContain('hasExistingSession = false');
+    // ZMX must NOT opt into the indeterminate-existence exemption: an unproven
+    // ownership/protocol result has to keep gating.
+    expect(gate).not.toContain('existingSessionUnknown = true');
+  });
+
+  it('wires the zellij gate through the tri-state probe, not the boolean hasSession', () => {
+    const start = workerSource.indexOf("} else if (effectiveBackend === 'zellij') {");
+    const end = workerSource.indexOf("} else if (effectiveBackend === 'zmx')", start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate).toContain('ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))');
+    expect(gate).not.toContain('ZellijBackend.hasSession(');
+    // The capability probe runs ONLY on an authoritative 'missing'; an
+    // indeterminate answer must not fall through into it and then gate.
+    expect(gate).toContain("if (probeState === 'missing')");
+    expect(gate).toContain('existingSessionUnknown');
+  });
+
+  /**
+   * F2 regression: `probeSession` collapses a load-timeout AND a
+   * missing/unrunnable binary (ENOENT/EACCES) into the same 'unknown'. Only the
+   * load-timeout may take the spawn-instead-of-gate exemption; a genuinely
+   * absent zellij must still gate to the actionable install card rather than
+   * fall through and crash node-pty with `execvp failed`. The split MUST use a
+   * fork-free PATH check (`locateExecutable`), because a fork-based re-probe
+   * (`--version` / `isAvailable()`) would time out under the very host load
+   * that produced the 'unknown' in the first place.
+   */
+  it('splits an indeterminate zellij probe by a fork-free PATH check (ENOENT gates, load-timeout spawns)', () => {
+    const start = workerSource.indexOf("} else if (effectiveBackend === 'zellij') {");
+    const end = workerSource.indexOf("} else if (effectiveBackend === 'zmx')", start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // Split happens inside the indeterminate branch, keyed on binary presence.
+    const unknownBranch = gate.indexOf('existingSessionUnknown');
+    const pathCheck = gate.indexOf("locateExecutable('zellij'");
+    expect(pathCheck).toBeGreaterThan(unknownBranch);
+    // Absent binary: revoke the exemption AND fail the availability, so
+    // decideBackendGate reaches its terminal `gate` arm with the install reason.
+    expect(gate).toContain('existingSessionUnknown = false');
+    expect(gate).toContain("reason = 'zellij 二进制不在 PATH 上'");
+  });
+
+  it('freezes the zellij existence probe and threads it into selectSessionBackend for reattach', () => {
+    // F1 wiring: the gate records its tri-state answer once and the selector
+    // consumes it (biasing 'unknown' toward reattach), instead of the selector
+    // re-running a load-fragile live probe that would fresh-spawn into a
+    // collision under sustained load.
+    expect(workerSource).toContain('let resolvedZellijSessionProbe: SessionProbe | undefined;');
+    expect(workerSource).toContain('resolvedZellijSessionProbe = probeState;');
+    // Selector wiring: zellij reattaches on exists OR unknown, cold-spawns only
+    // on an authoritative missing.
+    const selectCall = workerSource.indexOf('const selectBackend = () => selectSessionBackend({');
+    const selectEnd = workerSource.indexOf('let selectedBackend = selectBackend();', selectCall);
+    const selectBlock = workerSource.slice(selectCall, selectEnd);
+    expect(selectBlock).toContain("effectiveBackend === 'zellij'");
+    expect(selectBlock).toContain("resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'");
+  });
+
+  it('resets the frozen zellij probe to missing after every post-kill re-selection', () => {
+    // Both persistent teardown gates must refresh the frozen zellij probe so a
+    // re-selection cold-spawns a fresh pane rather than reattaching to the one
+    // they just killed — but each gate's own strictness differs:
+    //  - read-isolation already throws unless the post-kill probe proved
+    //    'missing', so by then the pane is known gone → assign 'missing'.
+    //  - mcp-gateway only rejects a PROVEN-LIVE pane, so 'unknown' still
+    //    reaches its reset and must fail closed to 'missing' explicitly.
+    // Both post-kill resets are keyed off `postKillProbe`; every one of them
+    // must end at 'missing' so a teardown never leaves a reattachable state.
+    const postKillResets = (workerSource.match(/resolvedZellijSessionProbe = [^;\n]+;/g) ?? [])
+      .filter(r => r.includes('postKillProbe') || r === "resolvedZellijSessionProbe = 'missing';");
+    // 3 = read-isolation confirmPaneGone + mcp-gateway + the not-installed gate
+    // (all three converge on 'missing'); the two teardown ones are the point.
+    expect(postKillResets.length).toBeGreaterThanOrEqual(2);
+    for (const reset of postKillResets) {
+      expect(reset).toContain("'missing'");
+    }
+    // The laxer gate keeps its explicit fail-closed on an unproven answer.
+    expect(workerSource).toContain("resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';");
+    // And the stricter read-isolation gate records the proven-gone pane.
+    const confirmGone = workerSource.indexOf('confirmPaneGone: () => {');
+    const confirmGoneEnd = workerSource.indexOf('clearProvenanceVerified: () => {', confirmGone);
+    expect(confirmGone).toBeGreaterThan(-1);
+    expect(workerSource.slice(confirmGone, confirmGoneEnd))
+      .toContain("resolvedZellijSessionProbe = 'missing';");
+  });
+
+  it('fails closed on an indeterminate zellij pane in the mcp-gateway gate (no silent reattach to a possibly-dead host)', () => {
+    // The pre-spawn bias reattaches zellij on 'unknown', but an MCP-gateway pane
+    // must not: reattaching binds the CLI to a relay socket that cannot survive
+    // this worker, and the gate only cold-resumes on a proven 'exists'. So an
+    // unverifiable zellij pane here must refuse, exactly like zmx.
+    const start = workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length');
+    const end = workerSource.indexOf('// The plugin set is stable only', start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate).toContain("if (effectiveBackendType === 'zellij' && paneProbe === 'unknown')");
+    // It must throw (refuse), not fall through into a reattach.
+    const zellijUnknown = gate.indexOf("effectiveBackendType === 'zellij' && paneProbe === 'unknown'");
+    const nextThrow = gate.indexOf('throw new Error', zellijUnknown);
+    expect(nextThrow).toBeGreaterThan(zellijUnknown);
   });
 });
 
@@ -154,9 +311,11 @@ describe('persistent backend cold-restart ordering', () => {
     expect(thunk).toBeGreaterThan(-1);
 
     // Each `killPersistentBackendTarget` / `ZmxBackend.killManagedSession` gate
-    // must be followed by a re-selection before the backend is used.
+    // must be followed by a re-selection before the backend is used. The
+    // read-isolation kill now lives in the migrationEffects closures; the mcp gate
+    // is still inline.
     const gates = [
-      workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane'),
+      workerSource.indexOf('const migrationEffects: PersistentPaneMigrationEffects = {'),
       workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length'),
     ];
     for (const gate of gates) {
@@ -189,36 +348,43 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
   });
 
-  it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
+  it('read-isolation gate fail-closes on an inconclusive probe for EVERY backend; mcp-gateway keeps its ZMX-scoped semantics', () => {
     const readIsolationStart = workerSource.indexOf(
-      'if (appliedIsolationCapabilities.length > 0 && persistentSessionName',
+      "if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {",
     );
     const readIsolationEnd = workerSource.indexOf('let willReattachPersistent', readIsolationStart);
     const mcpStart = workerSource.indexOf(
       'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
     );
     const mcpEnd = workerSource.indexOf('// The plugin set is stable only', mcpStart);
-    const gates = [
-      workerSource.slice(readIsolationStart, readIsolationEnd),
-      workerSource.slice(mcpStart, mcpEnd),
-    ];
+    const readIsolationGate = workerSource.slice(readIsolationStart, readIsolationEnd);
+    const mcpGate = workerSource.slice(mcpStart, mcpEnd);
 
     expect(readIsolationStart).toBeGreaterThan(-1);
     expect(readIsolationEnd).toBeGreaterThan(readIsolationStart);
     expect(mcpStart).toBeGreaterThan(-1);
     expect(mcpEnd).toBeGreaterThan(mcpStart);
-    for (const gate of gates) {
-      expect(gate).toContain(
-        "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
-      );
-      expect(gate).not.toContain("if (paneProbe === 'unknown')");
-      expect(gate).toContain('shouldRejectPersistentPostKillProbe(');
-      expect(gate).not.toContain("postKillProbe !== 'missing'");
-    }
+
+    // ── read-isolation gate (this PR): liveness is TRI-STATE. `unknown` is routed
+    //    through the state machine (refuse-inconclusive-probe) for ALL backends, so
+    //    the OLD ZMX-only early `unknown` throw is GONE, and the post-kill confirm
+    //    requires an authoritative `missing` (NOT the ZMX-scoped shared helper). ──
+    expect(readIsolationGate).not.toContain(
+      "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
+    );
+    expect(readIsolationGate).toContain('paneProbe,'); // passed tri-state into the state machine
+    expect(readIsolationGate).toContain("postKillProbe !== 'missing'");
+    expect(readIsolationGate).not.toContain('shouldRejectPersistentPostKillProbe(');
+    expect(readIsolationGate).toContain('refuseInconclusiveProbe:');
+
+    // ── mcp-gateway gate (pre-existing, unchanged): still ZMX-scoped unknown +
+    //    shared helper. Not in scope for the no-transport tri-state fix. ──
+    expect(mcpGate).toContain("if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')");
+    expect(mcpGate).toContain('shouldRejectPersistentPostKillProbe(');
   });
 
   it('verifies read-isolation teardown against the exact captured backend target', () => {
-    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const start = workerSource.indexOf('const staleSessionName = persistentSessionName;');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const capture = gate.indexOf(
@@ -242,7 +408,7 @@ describe('persistent backend cold-restart ordering', () => {
   });
 
   it('refreshes the frozen ZMX probe before read-isolation re-selects the backend', () => {
-    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const start = workerSource.indexOf('const migrationEffects: PersistentPaneMigrationEffects = {');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const postKillProbe = gate.indexOf('const postKillProbe =');

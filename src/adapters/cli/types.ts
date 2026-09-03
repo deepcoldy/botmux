@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput } from '../../types.js';
+import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -29,6 +29,13 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /**
+   * An explicitly selected remote Codex App Server thread. When set, Codex
+   * history-submit verification accepts only this session id instead of
+   * checking rollout ownership through the local `codex --remote` client's
+   * PID—the rollout belongs to the external App Server, not the viewer.
+   */
+  expectedCodexSessionId?: string;
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
@@ -57,6 +64,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
 }
@@ -94,6 +102,17 @@ export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
 
+  /** Controls whether BotMux uses its routing/session XML envelope or the
+   *  non-command service-user envelope. The latter preserves the original
+   *  message body but adds a fixed safe prefix so OMP never interprets an
+   *  external `/`, `!`, `$ `, `.`, or `c` message as local TUI control input. */
+  readonly inputEnvelope?: 'standard' | 'service-user';
+
+  /** Whether the process-wide CLI_EXTRA_ARGS escape hatch may append argv.
+   *  Defaults to true. Managed service entrypoints should set false so their
+   *  fixed auth/session contract cannot be altered by ambient daemon config. */
+  readonly allowExtraArgs?: boolean;
+
   /** Declarative config target for the process-scoped Botmux MCP Gateway. */
   readonly mcpGateway?: McpGatewayInstallSpec;
 
@@ -125,17 +144,40 @@ export interface CliAdapter {
      *  their per-bot built-in skill injection mode for the system-prompt catalog;
      *  inline-prompt CLIs get theirs from session-manager instead. */
     larkAppId?: string;
+    /** No-transport session (apiOnly core-only bot OR HTTP virtual chat, i.e.
+     *  `!larkTransportEnabled({chatId, apiOnly})`). injectsSessionContext adapters
+     *  that build the routing block via `buildBotmuxSystemPromptText`
+     *  (claude-code / genius / grok) forward this so the send/@/silence
+     *  collaboration block is dropped for a program request/response turn — where
+     *  it is both noise and (for usage_silence) a conflict with the per-turn
+     *  <botmux_http_response_mode>. Non-injects CLIs get the same gate via
+     *  session-manager's buildBotmuxShellHints. Adapters without a routing block
+     *  ignore it. */
+    noTransport?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
-    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
-     *  Only codex/codex-app adapters honor it; others ignore. */
+    /** Optional per-bot turn timeout in milliseconds for runner-based adapters
+     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  adapters without a runner turn timeout ignore the field. */
+    turnTimeoutMs?: number;
+    /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
+     *  dsh runner; adapters without a dsh runner ignore the field. */
+    dshProfile?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
+     *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
+     *  with an explicit reasoning control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Optional TraeX process-scoped backend variant. Missing means inherit
+     * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
+    modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex App only: restricted local browser extension bridge. */
+    codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
      *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
      *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
@@ -223,6 +265,16 @@ export interface CliAdapter {
     cliSessionId?: string;
   }): string | null;
 
+  /** True when this adapter's `buildArgs` can only resume a PRECISE
+   *  `resumeSessionId` — a resume without one silently starts a FRESH session
+   *  (no `--continue` / "latest" fallback, which would risk loading a SIBLING
+   *  botmux session's conversation). The worker treats resume-without-id as a
+   *  fresh-demotion (drops resume, emits the existing "历史会话无法恢复" notice
+   *  once) so upper layers never describe a fresh launch as "history restored".
+   *  Adapters that can always resume (botmux sessionId IS the CLI session id,
+   *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
+  readonly resumeRequiresCliSessionId?: boolean;
+
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
    *
@@ -301,6 +353,12 @@ export interface CliAdapter {
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
      *  命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 CLI。 */
     readonly sessionStartCommand?: string;
+    /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
+     *  - claude-settings：写进全局 settings.json 的 hooks.UserPromptSubmit
+     *  hook 子进程按 stdin 的 prompt 内容指纹读回 daemon 预写的 sidecar，
+     *  以 additionalContext 注入为该轮 system-reminder；缺 env/未命中时
+     *  空输出 exit 0（fail-open）。 */
+    readonly userPromptSubmitCommand?: string;
   };
 
   /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
@@ -323,10 +381,40 @@ export interface CliAdapter {
    *  the worker may safely let quiescence mark the session idle. */
   readonly busyPattern?: RegExp;
 
+  /**
+   * Optional runtime session busy check against the CLI's native state store
+   * (e.g. OpenCode SQLite db). When true, suppresses premature idle detection
+   * even if PTY output has quiesced.
+   */
+  readonly isSessionBusy?: (opts: { sessionId: string; cliSessionId?: string }) => boolean;
+
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
    *  Kept separate from busyPattern because transcript/full-screen redraws may
    *  contain old busy text; existing adapters remain opt-out by default. */
   readonly idleToBusyPattern?: RegExp;
+
+  /** Opt-in PRE-idle busy latch for static busy screens that emit no further
+   *  PTY bytes after the initial render (e.g. a capacity-queue notice drawn
+   *  alongside a readyPattern status bar). Unlike busyPattern — a viewport
+   *  probe that only runs on backends whose screen cache is authoritative for
+   *  mutation — this consumes raw PTY evidence inside IdleDetector, so it also
+   *  holds on backends where screen capture must not mutate state (ZMX):
+   *  while latched, screen-derived idle is suppressed until a PTY chunk with
+   *  explicit composer evidence (staticBusyClearPattern) redraws AFTER the
+   *  last queue marker. The latch is set from the rolling outputTail (queue
+   *  markers can be split across chunks); clear is decided by the LAST
+   *  static/clear evidence position within the current chunk. reset() rebases
+   *  it. External structured completion (fireIdle) bypasses the latch — it is
+   *  authoritative independently of the screen observer. */
+  readonly staticBusyPattern?: RegExp;
+
+  /** Opt-in CLEAR pattern for the pre-idle static-busy latch. Matches the
+   *  real composer prompt (e.g. line-start ›/❯) so the latch can clear when
+   *  the queue screen redraws into the composer. Must NOT match the status
+   *  bar (e.g. `\d+% left`) — the queue screen itself carries a status bar,
+   *  so the broad readyPattern can never clear the latch. Only tested against
+   *  the CURRENT chunk (fresh composer evidence), not the rolling tail. */
+  readonly staticBusyClearPattern?: RegExp;
 
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
@@ -369,11 +457,35 @@ export interface CliAdapter {
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
+  /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
+   *  is injected as an INVISIBLE system-reminder (not rendered into the visible
+   *  transcript). When true and the per-bot `envelopeInjection` setting is
+   *  `auto`, the daemon moves the per-turn reminder/whiteboard blocks out of the
+   *  user turn text and into a sidecar that `botmux user-prompt-hook` reads back.
+   *  Only set for CLIs verified end-to-end; codex renders hook context as a
+   *  visible developer message and must NOT set this. */
+  readonly supportsInvisiblePromptHook?: boolean;
+
   /** The adapter exposes a transcript-backed end-of-turn boundary that the
    *  worker can report independently of whether fallback output is visible.
    *  Durable meeting delivery is fail-closed for adapters without this
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
+
+  /** The adapter PUBLISHES a structured `limited` screen_update from a machine
+   *  rate-limit signal in its transcript (not from scraping screen text). When
+   *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
+   *  authority and suppresses the screen-scan `rate` heuristic — otherwise the
+   *  model's own output or a dev editing rate-limit code puts "429" / "exceeded
+   *  retry limit" on screen and the scraper false-positives (it cannot tell a
+   *  printed "429" from a request that actually returned 429). The Claude family
+   *  is authoritative via `claudeDataDir` regardless of this flag; Codex sets it
+   *  because the worker's `maybeEmitCodexStructuredRateLimit` reads the rollout's
+   *  `codex_rate_limited` terminal and emits `limited`. Do NOT set it for a
+   *  codexBridgeQueue CLI that has no such emit (grok / traex / pi / hermes /
+   *  mtr / cursor) — suppressing their screen scan would silently drop the real
+   *  429 backoff + Dashboard「需要你」signal. */
+  readonly emitsStructuredRateLimit?: boolean;
 
   /** True when this adapter supports running under per-bot read isolation (its
    *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
@@ -406,12 +518,32 @@ export interface CliAdapter {
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 
+  /** Whether read-only Web Terminal viewers may forward SGR wheel events.
+   *  This is narrower than write access: the worker accepts only validated
+   *  mouse-wheel escape sequences, for TUIs whose transcript can only scroll
+   *  inside the alternate-screen app viewport. */
+  readonly readOnlyRemoteScroll?: boolean;
+
   /** Curated model candidates surfaced in `botmux setup`. When undefined the
    *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose
    *  model is fixed or set via a config file we don't manage). The order is
    *  presented as-is; the setup prompt always appends an "Other / custom"
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
+
+  /** Optional live model discovery: enumerate the models this CLI can actually
+   *  use right now (e.g. `traex debug models` prints its full catalogue as
+   *  JSON). The dashboard model picker invokes it on demand for the SELECTED
+   *  CLI only — never in a scan over all adapters — and merges the result with
+   *  `modelChoices`. Contract:
+   *  - MUST be fail-soft: return null on any error, timeout, or unparseable
+   *    output, never throw (the caller falls back to `modelChoices`);
+   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
+   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
+   *    JSON can be hundreds of KB;
+   *  - absent = the CLI cannot enumerate its models; the picker shows
+   *    `modelChoices` only. */
+  readonly detectModels?: () => Promise<readonly string[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,
@@ -465,7 +597,16 @@ export interface CliAdapter {
    *  (→ readOnly rule). `~`-expanded + existence-filtered by the worker, so
    *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
    *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
-  sandboxReadonlyPaths?(): readonly string[];
+  sandboxReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
+
+  /** Credential files a trusted service CLI must read inside the sandbox.
+   *  This is deliberately separate from ordinary readonlyRoots so adapters
+   *  cannot expose secrets accidentally. The worker validates exact regular
+   *  files and fs-policy emits them mandatory read-only, except that a
+   *  no-transport turn suppresses entries inside Feishu authority roots. Use
+   *  only when the CLI's model-facing tool surface has no general file/shell
+   *  escape, and return exact files rather than parent directories. */
+  sandboxSecretReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
 
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
@@ -535,4 +676,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo';

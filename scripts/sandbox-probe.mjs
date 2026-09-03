@@ -8,7 +8,7 @@
  * kernel level. No daemon / no Feishu round-trip required.
  *
  * Usage:
- *   pnpm build                       # dist must be current
+ *   bun run build                    # dist must be current
  *   node scripts/sandbox-probe.mjs                 # auto-detect a bot
  *   node scripts/sandbox-probe.mjs --app cli_xxx   # a specific bot
  *   node scripts/sandbox-probe.mjs --tools         # also probe python/perl/etc.

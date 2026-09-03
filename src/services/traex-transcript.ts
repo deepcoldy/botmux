@@ -3,13 +3,27 @@
  *
  * TRAE is a Codex-family CLI, but its terminal event is NOT byte-identical to
  * upstream Codex:
- *   - genuine user input is confirmed by event_msg `user_message`; TRAE also
- *     writes internal runtime injections as response_item role=user messages,
- *     so those records alone are not user-attribution evidence;
+ *   - genuine user input is confirmed by event_msg `user_message` or, in
+ *     TraeX 0.201.4 rollout dialect, event_msg `item_completed` with a
+ *     `UserMessage` item; TRAE also writes internal runtime injections as
+ *     response_item role=user messages, so those records alone are not
+ *     user-attribution evidence;
  *   - assistant response_item messages have no `phase` and are emitted many
  *     times during tool use, so none of them is a safe turn boundary;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
  *     the final visible text in `last_agent_message` (which may be empty).
+ *     When it is empty the drainer consults the turn's assistant records: a
+ *     `final_answer`-phase agent_message reconstructs a dropped final, and a
+ *     commentary message ending in the nothing-to-send sentinel marks
+ *     deliberate silence. Two newer dialects get the same treatment: an
+ *     `item_completed` AgentMessage item (0.201.4+ mirrors the assistant
+ *     message there, symmetric to the UserMessage user dialect) and a
+ *     phase-less `agent_message` (a dialect that dropped the `phase` field,
+ *     cf. codex >= 0.146) — the last of either is a final candidate unless it
+ *     ends in the nothing-to-send sentinel, which marks deliberate silence.
+ *     A non-null `error` payload maps the terminal to `failed` (mirroring the
+ *     Codex drainer) so a model-endpoint failure surfaces its real reason
+ *     instead of the misleading "completed but empty" diagnostic.
  *   - Directory layout differs: sessions live under
  *     ~/.trae/cli/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
  *     (note the extra `cli/` level vs Codex's ~/.codex/sessions/...).
@@ -35,10 +49,17 @@ import {
   type CodexBridgeEvent,
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
+  codexTaskFailureCode,
+  safeFailureSummary,
 } from './codex-transcript.js';
+import {
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
+} from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
+import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
-import { traeSessionsRoot } from './traex-paths.js';
+import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -51,6 +72,20 @@ export interface TraexDrainResult extends CodexDrainResult {
   latestReasoningEffort?: string;
 }
 
+export interface TraexDrainOptions {
+  /** Adopt mode: the adopted CLI is botmux-unaware, so the drainer must NOT
+   *  synthesise a bare nothing-to-send sentinel for an empty final — the emit
+   *  layer posts transcript text verbatim in adopt mode and the literal token
+   *  would leak into Lark. Default false (synthesise, matching the non-adopt
+   *  genuine-silence contract). */
+  adoptMode?: boolean;
+  /** Read-only probe: skip the per-turn agent_message cache mutations. Used by
+   *  submit-confirmation probes that re-drain the same live rollout at a
+   *  different offset and must not disturb the production drainer's pending
+   *  turn state. */
+  probe?: boolean;
+}
+
 export interface TraexRuntimeSnapshot {
   model?: string;
   reasoningEffort?: string;
@@ -58,6 +93,40 @@ export interface TraexRuntimeSnapshot {
 
 const IS_LINUX = platform() === 'linux';
 const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+type DatabaseSyncLike = {
+  prepare(sql: string): StatementSyncLike;
+  close(): void;
+};
+type StatementSyncLike = {
+  all(...params: unknown[]): any[];
+};
+
+function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
+  const dbPath = traeStateDbPath();
+  if (!existsSync(dbPath)) return null;
+  // Runtime-agnostic open: `node:sqlite` on Node, `bun:sqlite` on the compiled
+  // single-file binary. This MUST NOT go back to requiring `node:sqlite`
+  // directly — botmux ships as a `bun build --compile` executable, and taking
+  // that path there loses TRAE session lookup silently (the shim's null return
+  // is indistinguishable from "no db", so resume/verification just degrades
+  // with no error). See src/services/sqlite-compat.ts.
+  //
+  // NOTE for future merges: this file arrived from master with a direct
+  // `createRequire('node:sqlite')` and produced NO merge conflict, because the
+  // logic had moved here from the traex adapter — where the Bun fix lived. A
+  // clean merge is not a correct merge; re-check this call whenever the file
+  // moves again.
+  const db = openDatabaseSyncNow(dbPath) as DatabaseSyncLike | null;
+  if (!db) return null;
+  try {
+    return fn(db);
+  } catch {
+    return null;
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
 
 type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
 
@@ -72,6 +141,172 @@ const traexRolloutMetaCache = new Map<string, {
   kind: TraexRolloutKind;
   startedAtMs?: number;
 }>();
+
+/** Per-rollout `agent_message` state for the CURRENTLY OPEN turn, retained
+ *  across drain calls. A turn's commentary/final_answer records are almost
+ *  always drained in earlier polls than its `task_complete` (turns run for
+ *  minutes while the poller runs on the second scale), so same-batch state
+ *  would never see them. Reset on every `user_message` (turn start) and
+ *  consumed/cleared by `task_complete`/`turn_aborted` (turn end); a turn that
+ *  terminates without either leaves at most one stale entry, bounded by the
+ *  same cap/eviction as traexRolloutMetaCache. */
+interface TraexPendingAgentMessages {
+  /** Last commentary-phase `agent_message` since the turn's user_message.
+   *  Its trailing sentinel is the deliberate-silence signal. */
+  lastCommentary?: string;
+  /** Last final_answer-phase `agent_message` since the turn's user_message.
+   *  Defensive reconstruction source when task_complete drops the final it
+   *  actually produced. */
+  lastFinalAnswer?: string;
+  /** Last `item_completed` AgentMessage item text since the turn's
+   *  user_message. TraeX 0.201.4+ can mirror the assistant message as an
+   *  item_completed item (symmetric to the UserMessage user dialect), so the
+   *  last one is a final candidate. NOT phase-guaranteed: a candidate ending
+   *  in the nothing-to-send sentinel is deliberate-silence narration, and the
+   *  sentinel guard at task_complete distinguishes the two. */
+  lastAgentItemText?: string;
+  /** Last PHASE-LESS `agent_message` since the turn's user_message. A dialect
+   *  that dropped the `phase` field (cf. codex >= 0.146) makes commentary and
+   *  final byte-identical, so the last phase-less message is the best final
+   *  candidate — same sentinel guard as lastAgentItemText. */
+  lastAgentMessageNoPhase?: string;
+}
+
+const traexPendingAgentCache = new Map<string, TraexPendingAgentMessages>();
+const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
+
+/** New and legacy user event dialects can mirror one another in the same
+ * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
+ * identical prompts in distinct turns must remain distinct local turns. */
+const traexSeenUserTurns = new Map<string, Set<string>>();
+const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
+const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
+
+function claimTraexUserTurn(path: string, turnId: unknown): boolean {
+  if (typeof turnId !== 'string' || turnId.length === 0) return true;
+  let seen = traexSeenUserTurns.get(path);
+  if (!seen) {
+    seen = new Set<string>();
+    traexSeenUserTurns.set(path, seen);
+    if (traexSeenUserTurns.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+      const oldestPath = traexSeenUserTurns.keys().next().value;
+      if (oldestPath) traexSeenUserTurns.delete(oldestPath);
+    }
+  }
+  if (seen.has(turnId)) return false;
+  seen.add(turnId);
+  if (seen.size > TRAEX_SEEN_USER_TURNS_PER_PATH_MAX) {
+    const oldestTurnId = seen.keys().next().value;
+    if (oldestTurnId) seen.delete(oldestTurnId);
+  }
+  return true;
+}
+
+function itemCompletedUserText(item: unknown): string {
+  if (!item || typeof item !== 'object') return '';
+  const record = item as { type?: unknown; content?: unknown };
+  if (record.type !== 'UserMessage' || !Array.isArray(record.content)) return '';
+  const parts: string[] = [];
+  for (const block of record.content) {
+    if (!block || typeof block !== 'object') continue;
+    const textBlock = block as { type?: unknown; text?: unknown };
+    if (textBlock.type === 'text' && typeof textBlock.text === 'string') {
+      parts.push(textBlock.text);
+    }
+  }
+  return parts.join('');
+}
+
+/** Assistant-side mirror of itemCompletedUserText: extract the text of an
+ *  item_completed `AgentMessage` item. TraeX 0.201.4+ can emit the assistant
+ *  message in this shape (symmetric to the UserMessage user dialect), and a
+ *  later dialect may drop the agent_message phase field, so the drainer
+ *  tracks the last AgentMessage item as a final candidate. The block type is
+ *  accepted as 'Text' (observed TraeX 0.201.4 shape), 'output_text' (upstream
+ *  Responses API shape) or lowercase 'text' so dialect drift doesn't silently
+ *  drop the final; non-text blocks (reasoning, tool calls) carry no `text`
+ *  field and are skipped. */
+function itemCompletedAgentText(item: unknown): string {
+  if (!item || typeof item !== 'object') return '';
+  const record = item as { type?: unknown; content?: unknown };
+  if (record.type !== 'AgentMessage' || !Array.isArray(record.content)) return '';
+  const parts: string[] = [];
+  for (const block of record.content) {
+    if (!block || typeof block !== 'object') continue;
+    const textBlock = block as { type?: unknown; text?: unknown };
+    if (typeof textBlock.text !== 'string') continue;
+    if (textBlock.type === 'Text'
+      || textBlock.type === 'text'
+      || textBlock.type === 'output_text') {
+      parts.push(textBlock.text);
+    }
+  }
+  return parts.join('');
+}
+
+function traexPendingAgentState(path: string): TraexPendingAgentMessages {
+  let state = traexPendingAgentCache.get(path);
+  if (!state) {
+    state = {};
+    traexPendingAgentCache.set(path, state);
+    if (traexPendingAgentCache.size > TRAEX_PENDING_AGENT_CACHE_MAX) {
+      const oldest = traexPendingAgentCache.keys().next().value;
+      if (oldest) traexPendingAgentCache.delete(oldest);
+    }
+  }
+  return state;
+}
+
+/** Matches a commentary message that ENDS with a nothing-to-send sentinel
+ *  (current or legacy token), optionally glued to trailing prose — the shape
+ *  TRAE writes when the model replied via `botmux send` and kept only
+ *  narration in the commentary phase. Captures the exact token so the
+ *  synthesised final carries the same one the gate recognises. */
+const TRAEX_TRAILING_SENTINEL_RE = new RegExp(
+  `(${BRIDGE_NOTHING_TO_SEND_SENTINEL}|${BRIDGE_NO_REPLY_SENTINEL_LEGACY})\\s*$`,
+);
+
+function traexTrailingSentinel(message: string): string | undefined {
+  return TRAEX_TRAILING_SENTINEL_RE.exec(message)?.[1];
+}
+
+/** Recover the final text for a SUCCESSFUL turn whose task_complete carried no
+ *  last_agent_message. Sources in priority order:
+ *   1. a final_answer-phase agent_message — the phase field guarantees it is
+ *      the model's answer, not tool narration. Safe in BOTH modes;
+ *   2. the last item_completed AgentMessage item — the 0.201.4+ assistant
+ *      dialect (mirrors the UserMessage user dialect);
+ *   3. the last phase-less agent_message — a dialect that dropped the phase
+ *      field (cf. codex >= 0.146) makes commentary and final byte-identical,
+ *      so the last one is the best candidate.
+ *  Sources 2/3 are NOT phase-guaranteed: a candidate ending in the
+ *  nothing-to-send sentinel is deliberate-silence narration (the model
+ *  replied via `botmux send`), not an answer, so it is excluded from the
+ *  answer candidates and used only for the sentinel synthesis below.
+ *
+ *  Deliberate silence synthesises the bare sentinel the fallback gate already
+ *  treats as genuine silence — NON-ADOPT ONLY: adopt posts transcript text
+ *  verbatim, so a synthesised bare token would leak the literal into Lark. */
+function recoverTraexEmptyFinal(
+  pending: TraexPendingAgentMessages | undefined,
+  adoptMode: boolean,
+): string {
+  if (pending?.lastFinalAnswer?.trim()) return pending.lastFinalAnswer;
+  const candidates: string[] = [];
+  if (pending?.lastAgentItemText?.trim()) candidates.push(pending.lastAgentItemText);
+  if (pending?.lastAgentMessageNoPhase?.trim()) candidates.push(pending.lastAgentMessageNoPhase);
+  const answer = candidates.find(candidate => !traexTrailingSentinel(candidate));
+  if (answer) return answer;
+  if (adoptMode) return '';
+  // No real answer candidate: recognise deliberate silence from whichever
+  // tracked message carries the trailing sentinel (explicit commentary-phase
+  // first, then the phase-less/item candidates).
+  for (const source of [pending?.lastCommentary ?? '', ...candidates]) {
+    const sentinel = traexTrailingSentinel(source);
+    if (sentinel) return sentinel;
+  }
+  return '';
+}
 
 /** Upper bound on how far back readLatestTraexRuntime scans for the newest
  * model/effort. The newest turn_context sits near the tail, so this is only a
@@ -117,8 +352,26 @@ function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
  * `task_complete` is intentionally emitted even when last_agent_message is
  * missing/empty: a silent successful turn still has to release a durable
  * delivery. A non-newline-terminated tail is never parsed, so a process crash
- * halfway through the terminal JSON object cannot manufacture completion. */
-export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
+ * halfway through the terminal JSON object cannot manufacture completion.
+ *
+ * Terminal refinement on an empty `last_agent_message`:
+ *   - a non-null `error` payload maps the event to `failed` (same shape as the
+ *     Codex drainer) — traecli writes task_complete with
+ *     last_agent_message=null AND error when the model endpoint fails, so the
+ *     failure must not be read as a silent success;
+ *   - otherwise the turn's assistant records (tracked across drain calls)
+ *     recover a dropped final_answer, an item_completed AgentMessage item, or
+ *     a phase-less agent_message, and recognise a trailing nothing-to-send
+ *     sentinel on any of them as deliberate silence. The sentinel synthesis
+ *     runs only in non-adopt mode: adopt posts transcript text verbatim, so a
+ *     synthesised bare token would leak into Lark. */
+export function drainTraexRollout(
+  path: string,
+  fromOffset: number,
+  opts?: TraexDrainOptions,
+): TraexDrainResult {
+  const adoptMode = opts?.adoptMode === true;
+  const probe = opts?.probe === true;
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -137,6 +390,16 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
   const sourceSessionId = codexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  const seenUserTurns = new Set<string>();
+  const legacyUserIndexesWithoutTurnId = new Map<string, number>();
+  const claimUserTurn = (turnId: unknown): boolean => {
+    if (typeof turnId !== 'string' || turnId.length === 0) return true;
+    if (seenUserTurns.has(turnId)) return false;
+    seenUserTurns.add(turnId);
+    // Probes must not consume the persistent de-duplication claim that the
+    // production drainer needs when it observes this same record later.
+    return probe || claimTraexUserTurn(path, turnId);
+  };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   let cursor = start;
@@ -163,17 +426,117 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
-      if (userText) events.push({ ...base, kind: 'user', text: userText });
+      if (userText && claimUserTurn(payload.turn_id)) {
+        events.push({ ...base, kind: 'user', text: userText });
+        if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
+          legacyUserIndexesWithoutTurnId.set(userText, events.length - 1);
+        }
+        // New turn: drop any agent_message state an unterminated predecessor
+        // left behind so it can't be attributed to this turn.
+        if (!probe) traexPendingAgentCache.delete(path);
+      }
+      continue;
+    }
+    if (obj.type === 'event_msg'
+      && payload.type === 'item_completed') {
+      const userText = itemCompletedUserText(payload.item);
+      if (userText) {
+        if (claimUserTurn(payload.turn_id)) {
+          // Legacy user_message records did not always carry a turn id. When
+          // the same drain also contains their 0.201.4 UserMessage mirror,
+          // replace the uncorrelatable legacy event with the turn-addressable
+          // item_completed event instead of starting two local turns.
+          const legacyIndex = legacyUserIndexesWithoutTurnId.get(userText);
+          if (legacyIndex !== undefined) {
+            events.splice(legacyIndex, 1);
+            legacyUserIndexesWithoutTurnId.delete(userText);
+            for (const [text, index] of legacyUserIndexesWithoutTurnId) {
+              if (index > legacyIndex) legacyUserIndexesWithoutTurnId.set(text, index - 1);
+            }
+          }
+          events.push({ ...base, kind: 'user', text: userText });
+          // New turn: drop any agent_message state an unterminated predecessor
+          // left behind so it can't be attributed to this turn.
+          if (!probe) traexPendingAgentCache.delete(path);
+        }
+      } else if (!probe) {
+        // Assistant-side mirror of the UserMessage dialect: TraeX 0.201.4+
+        // can emit the assistant message as an item_completed AgentMessage
+        // item. Track the last one as a final candidate (the sentinel guard
+        // at task_complete distinguishes a real answer from deliberate-silence
+        // narration). Tool results and other item types yield no text.
+        const agentText = itemCompletedAgentText(payload.item);
+        if (agentText) {
+          traexPendingAgentState(path).lastAgentItemText = agentText;
+        }
+      }
+      continue;
+    }
+    // agent_message records are narration (commentary) or the produced final
+    // (final_answer). They are NOT turn boundaries — only task_complete is —
+    // so they are tracked per turn and consulted when the terminal arrives
+    // with an empty/missing last_agent_message. A dialect that dropped the
+    // `phase` field (cf. codex >= 0.146) writes phase-less records that are
+    // byte-identical for commentary and final; the last one is the best final
+    // candidate, tracked separately so an explicit commentary-phase message
+    // keeps its deliberate-silence semantics.
+    if (!probe
+      && obj.type === 'event_msg'
+      && payload.type === 'agent_message'
+      && typeof payload.message === 'string'
+      && payload.message.length > 0) {
+      const pending = traexPendingAgentState(path);
+      if (payload.phase === 'final_answer') pending.lastFinalAnswer = payload.message;
+      else if (typeof payload.phase !== 'string' || payload.phase.length === 0) {
+        pending.lastAgentMessageNoPhase = payload.message;
+      } else pending.lastCommentary = payload.message;
       continue;
     }
     if (obj.type === 'event_msg'
       && payload.type === 'task_complete'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      const pending = traexPendingAgentCache.get(path);
+      const failed = payload.error !== null && payload.error !== undefined;
+      const rawFinal = typeof payload.last_agent_message === 'string'
+        ? payload.last_agent_message
+        : '';
+      let text = rawFinal;
+      if (!failed && rawFinal.trim().length === 0) {
+        // TRAE wrote no final for a successful turn. Recover, in order:
+        //   1. a final_answer-phase agent_message — TRAE dropped the final it
+        //      actually produced (the phase field guarantees it is an answer,
+        //      not tool narration). Safe in BOTH modes: it is the model's real
+        //      answer, and adopt posts transcript text verbatim anyway;
+        //   2. the last item_completed AgentMessage item (0.201.4+ assistant
+        //      dialect) or the last phase-less agent_message (phase-dropped
+        //      dialect) — the model's real transcript answer, safe in BOTH
+        //      modes, unless it ends in the nothing-to-send sentinel (then it
+        //      is deliberate-silence narration, not an answer);
+        //   3. a commentary/candidate message ending in the nothing-to-send
+        //      sentinel — the model deliberately stayed silent (it replied via
+        //      `botmux send`), so synthesise the bare sentinel the fallback
+        //      gate already treats as genuine silence instead of tripping the
+        //      misleading "completed but empty" diagnostic. NON-ADOPT ONLY:
+        //      adopt posts transcript text verbatim, so a synthesised bare
+        //      token would leak the literal into Lark.
+        text = recoverTraexEmptyFinal(pending, adoptMode);
+      }
+      if (!probe) traexPendingAgentCache.delete(path);
+      legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,
         kind: 'assistant_final',
-        text: typeof payload.last_agent_message === 'string' ? payload.last_agent_message : '',
+        text,
+        // A non-null error means the turn FAILED (e.g. the model endpoint
+        // connection failed before any response). Mirror the Codex drainer:
+        // classify as failed with a safe code/summary so the worker surfaces
+        // the real reason instead of an empty-final alert.
+        ...(failed ? {
+          terminalStatus: 'failed' as const,
+          terminalErrorCode: codexTaskFailureCode(payload.error),
+          terminalErrorSummary: safeFailureSummary(payload.error),
+        } : {}),
       });
       continue;
     }
@@ -185,6 +548,8 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      if (!probe) traexPendingAgentCache.delete(path);
+      legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -285,15 +650,19 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Authoritative submit confirmation used by the adapter. Only a complete
- * event_msg/user_message record appended after `fromOffset` can match. */
+/** Submit-confirmation probe: only a complete user event record appended after
+ * `fromOffset` can match. Read-only — drains with `probe` so
+ * it never mutates the per-turn agent_message cache the production drainer
+ * relies on (a re-drain of the same live rollout at a different offset must
+ * not clear pending turn state). Not currently wired into the production
+ * submit-confirmation path; kept as a tested probe. */
 export function traexRolloutHasUserInputSince(
   path: string,
   fromOffset: number,
   expectedText: string,
 ): boolean {
   const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset).events.some(event =>
+  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
     event.kind === 'user' && normaliseInputText(event.text) === expected,
   );
 }
@@ -605,4 +974,26 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
     }
   }
   return undefined;
+}
+
+
+/** Find the newest TRAE native session whose first prompt contains Botmux's
+ *  session id. This mirrors Codex's history.jsonl bridge, but TRAE keeps the
+ *  mapping in the `threads` SQLite table. It is intentionally best-effort:
+ *  callers fall back to treating `sessionId` as a native id when unavailable. */
+export function findTraexSessionIdByBotmuxSessionId(botmuxSessionId: string): string | undefined {
+  if (!botmuxSessionId) return undefined;
+  return withTraeDb((db) => {
+    const rows = db.prepare(
+      'SELECT id, first_user_message AS firstMessage FROM threads ORDER BY created_at DESC LIMIT 200',
+    ).all() as { id?: string; firstMessage?: string }[];
+    for (const r of rows) {
+      if (typeof r.id === 'string'
+        && typeof r.firstMessage === 'string'
+        && r.firstMessage.includes(botmuxSessionId)) {
+        return r.id;
+      }
+    }
+    return undefined;
+  }) ?? undefined;
 }

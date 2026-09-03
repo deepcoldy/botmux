@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
+import { seedPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
 import {
   commitRestartIntentAttemptTo,
@@ -11,8 +12,8 @@ import {
   writeRestartIntentTo,
 } from '../src/services/restart-intent-store.js';
 
-function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
-  writeFileSync(join(dir, name), JSON.stringify(sessions));
+function writeSessions(dir: string, appId: string | undefined, sessions: Record<string, { status: string }>) {
+  seedPersistedSessionRows(dir, appId, sessions);
 }
 
 describe('countActiveSessionsOnDisk', () => {
@@ -20,10 +21,10 @@ describe('countActiveSessionsOnDisk', () => {
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-sess-')); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  it('counts active sessions across all bots’ session files', () => {
-    writeSessions(dir, 'sessions-cli_a.json', { s1: { status: 'active' }, s2: { status: 'closed' }, s3: { status: 'active' } });
-    writeSessions(dir, 'sessions-cli_b.json', { s4: { status: 'active' } });
-    writeSessions(dir, 'sessions.json', { s5: { status: 'active' }, s6: { status: 'closed' } });
+  it('counts active sessions across every bot’s session store', () => {
+    writeSessions(dir, 'cli_a', { s1: { status: 'active' }, s2: { status: 'closed' }, s3: { status: 'active' } });
+    writeSessions(dir, 'cli_b', { s4: { status: 'active' } });
+    writeSessions(dir, undefined, { s5: { status: 'active' }, s6: { status: 'closed' } });
     expect(countActiveSessionsOnDisk(dir)).toBe(4);
   });
 
@@ -32,10 +33,14 @@ describe('countActiveSessionsOnDisk', () => {
     expect(countActiveSessionsOnDisk(join(dir, 'nope'))).toBe(0);
   });
 
-  it('ignores non-session files and corrupt session files', () => {
-    writeSessions(dir, 'sessions-cli_a.json', { s1: { status: 'active' } });
-    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({ x: { status: 'active' } })); // not a session file
-    writeFileSync(join(dir, 'sessions-bad.json'), '{corrupt');
+  it('ignores unrelated files, frozen pre-SQLite JSON and corrupt stores', () => {
+    writeSessions(dir, 'cli_a', { s1: { status: 'active' } });
+    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({ x: { status: 'active' } })); // not a session store
+    // A frozen pre-SQLite JSON is an import source, not a store: counting it
+    // would double-count every row its .db already holds.
+    writeFileSync(join(dir, 'sessions-cli_a.json'), JSON.stringify({ s1: { status: 'active' } }));
+    mkdirSync(join(dir, 'session-stores', 'bad'), { recursive: true });
+    writeFileSync(sessionStorePath(dir, 'bad'), '{corrupt');
     expect(countActiveSessionsOnDisk(dir)).toBe(1);
   });
 });
@@ -149,7 +154,7 @@ describe('sendRestartReportIfPending', () => {
 
   it('consumes a fresh intent and DMs the owner a card with the session count + dashboard link', async () => {
     writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
-    writeFileSync(join(dir, 'sessions-cli_primary.json'), JSON.stringify({ s1: { status: 'active' }, s2: { status: 'active' } }));
+    seedPersistedSessionRows(dir, 'cli_primary', { s1: { status: 'active' }, s2: { status: 'active' } });
     const { w, sent } = fakeWiring();
 
     await sendRestartReportIfPending(w);

@@ -5,6 +5,7 @@ import {
   loadDashboardSecret,
   signCliAuth,
 } from '../dashboard/auth.js';
+import { loopbackFetch, type LoopbackFetchInit } from './loopback-fetch.js';
 
 const DEFAULT_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 
@@ -42,7 +43,15 @@ export function loadDaemonIpcSecret(secretPath = DEFAULT_SECRET_PATH): string {
   return secret;
 }
 
-/** Trusted-host fetch wrapper for daemon IPC. */
+/** Trusted-host fetch wrapper for daemon IPC.
+ *
+ * ⚠️ Uses {@link loopbackFetch}, never the global `fetch`: under Bun the global
+ * one routes 127.0.0.1 through `$http_proxy` whenever `no_proxy` does not name
+ * that literal address (CIDR and `localhost` do not count), and the corporate
+ * proxy answers an nginx HTML 403. Verified against this wrapper with a real Bun
+ * process and a stand-in proxy: global fetch → 403 from the proxy;
+ * `loopbackFetch` → straight to the daemon. See src/core/loopback-fetch.ts.
+ */
 export async function fetchDaemonIpc(
   port: number,
   path: string,
@@ -51,8 +60,10 @@ export async function fetchDaemonIpc(
 ): Promise<Response> {
   const resolvedSecret = secret ?? loadDaemonIpcSecret();
   const method = init.method ?? 'GET';
-  return fetch(`http://127.0.0.1:${port}${path}`, {
-    ...init,
+  return loopbackFetch(`http://127.0.0.1:${port}${path}`, {
+    method,
+    body: init.body as LoopbackFetchInit['body'],
+    signal: init.signal ?? undefined,
     headers: daemonIpcAuthHeaders({
       secret: resolvedSecret,
       port,

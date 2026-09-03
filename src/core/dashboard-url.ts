@@ -4,6 +4,7 @@ import {
   readPlatformBinding,
 } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 export interface DashboardUrls {
   /**
@@ -66,6 +67,76 @@ export function buildDashboardUrl(opts: { host: string; port: number | string; t
   return buildDashboardUrls(opts).url;
 }
 
+/** Agent Workbench 在 Dashboard SPA 里的 hash 路由（见 dashboard/web/dashboard-routes.ts）。 */
+export const WORKBENCH_HASH_ROUTE = '#/agent-workbench';
+
+/**
+ * 把一条 Dashboard 登录 URL（`<base>/?t=<token>`，见 {@link buildDashboardUrls}）
+ * 改写成**工作台直达** URL：`<base>/?t=<token>#/agent-workbench`。
+ *
+ * 用于飞书卡片的「打开工作台」按钮：token 留在查询串里（Dashboard 的鉴权只认
+ * `?t=`），hash 只负责选路由，所以两者可以共存。非 http/https 或不可解析的
+ * 输入返回 null，调用方据此不渲染按钮，绝不拼出半截链接。
+ */
+export function workbenchSpaUrl(dashboardUrl: string): string | null {
+  const u = parseHttpUrl(dashboardUrl);
+  if (!u) return null;
+  u.hash = WORKBENCH_HASH_ROUTE;
+  return u.toString();
+}
+
+/**
+ * 无 fragment 的工作台入口：`<base>/workbench?t=<token>`。
+ *
+ * Dashboard 自己 302 到 `/?t=…#/agent-workbench`（见 dashboard.ts 的 `/workbench`
+ * 分支）。终端/脚本里复制粘贴一条不带 `#` 的 URL 更不容易被截断或被 shell 当注释，
+ * 所以 CLI 打印这一形态。同样在无法解析时返回 null。
+ *
+ * ⚠️ 这是**唯一**保留「长期 token 直拼进 URL」的形态，只出现在两个**私人上下文**：
+ *   1. `botmux dashboard` 的终端输出（cli/dashboard-command.ts，终端是私人环境）；
+ *   2. owner 在工作台里自取常驻链接的响应（`GET /api/workbench/standing-link`，
+ *      仅本机完整管理身份可取、同源、`no-store`、每次落审计，见
+ *      dashboard/standing-link.ts）。
+ * 飞书卡片等**持久化载体**一律走 {@link workbenchTicketRedeemUrl} 的短时票据
+ * （P2-1）——长期 token 不进聊天记录这条红线不变。
+ */
+export function workbenchEntryUrl(dashboardUrl: string): string | null {
+  const u = parseHttpUrl(dashboardUrl);
+  if (!u) return null;
+  u.pathname = '/workbench';
+  u.hash = '';
+  return u.toString();
+}
+
+/**
+ * 短时票据兑换入口：`<base>/workbench-ticket/<ticket>`（P2-1）。
+ *
+ * 飞书卡片「打开工作台」按钮的目标形态：URL 只携带 30 分钟 TTL 的票据，不再
+ * 内嵌长期 Dashboard token。Dashboard 验票后按既有 `?t=` 流程种 legacy cookie
+ * 并 302 到 `/#/agent-workbench`（见 dashboard/workbench-ticket.ts）。base 沿用
+ * {@link buildDashboardUrls} 的远程访问翻转；查询串与 hash 一律清空——票据是
+ * 这条 URL 上唯一的凭证性内容。不可解析时返回 null，调用方据此不渲染按钮。
+ */
+export function workbenchTicketRedeemUrl(dashboardUrl: string, ticket: string): string | null {
+  const u = parseHttpUrl(dashboardUrl);
+  if (!u || !ticket) return null;
+  u.pathname = `/workbench-ticket/${encodeURIComponent(ticket)}`;
+  u.search = '';
+  u.hash = '';
+  return u.toString();
+}
+
+function parseHttpUrl(raw: string): URL | null {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The remote public base for dashboard-family links, or null when neither the
  * central platform (远程访问 on + bound) nor a self-hosted reverse proxy
@@ -78,7 +149,14 @@ export function buildDashboardUrl(opts: { host: string; port: number | string; t
  */
 function remotePublicBase(): string | null {
   const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
-  return platformBase ?? publicReverseProxyBaseUrl();
+  // The Devbox candidate validates itself against `~/.botmux/.dashboard-port`
+  // rather than against `opts.port`: the tunnel belongs to whichever port the
+  // dashboard actually bound, and several callers here pass the CONFIGURED port
+  // (v3 cards use config.dashboard.port), which goes stale the moment the
+  // dashboard probes upward on EADDRINUSE. Checking the caller's port would
+  // demote those links to an equally-stale local URL; checking the bound port
+  // answers the real question — is this cache still for the port we serve?
+  return platformBase ?? publicReverseProxyBaseUrl() ?? devboxDashboardBaseUrl();
 }
 
 /**
@@ -126,8 +204,17 @@ export function buildV3TerminalUrl(
  * Build the platform owner-login URL advertised by an unauthenticated
  * Dashboard response. The SPA replaces only the hash-route `next` value, so
  * the server never exposes the Dashboard token or machine tunnel credential.
+ *
+ * `next` is where the platform lands the browser AFTER it mints this machine's
+ * host-only proxy-session cookie (the credential the owner check reads; the
+ * cross-subdomain SSO cookie alone does NOT make a request owner-writable). It
+ * defaults to the SPA home `/#/`; pass a terminal path `/s/<sessionId>` so an
+ * owner opening the read-only web terminal is returned to that very terminal
+ * WITH the freshly-minted proxy cookie in place — the platform routes a
+ * `/s/`-prefixed `next` to the terminal subdomain surface, so the round-trip
+ * lands the owner back on a now-writable terminal instead of the dashboard.
  */
-export function buildPlatformDashboardLoginUrl(): string | undefined {
+export function buildPlatformDashboardLoginUrl(next: string = '/#/'): string | undefined {
   if (!isRemoteAccessEnabled()) return undefined;
   const binding = readPlatformBinding();
   const machineId = binding?.machineId.trim();
@@ -138,7 +225,8 @@ export function buildPlatformDashboardLoginUrl(): string | undefined {
       return undefined;
     }
     const loginUrl = new URL(`/open/${encodeURIComponent(machineId)}`, platform);
-    loginUrl.searchParams.set('next', '/#/');
+    // searchParams.set percent-encodes the whole value, so pass the raw path.
+    loginUrl.searchParams.set('next', next);
     return loginUrl.toString();
   } catch {
     return undefined;

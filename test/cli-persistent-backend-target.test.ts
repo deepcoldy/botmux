@@ -5,7 +5,7 @@
  * exercise the same list/auto-prune/offline-delete paths users invoke while
  * proving a shared host session is never collapsed back to bmx-<sid8>.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
@@ -18,6 +18,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import {
+  readPersistedSessionRows,
+  seedPersistedSessionRows,
+} from './helpers/session-store-disk.js';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = join(TEST_DIR, '..', 'src', 'cli.ts');
@@ -45,11 +50,18 @@ afterEach(() => {
   }
 });
 
+/**
+ * The CLI runs without `BOTMUX_LARK_APP_ID`, so its rows live in the legacy
+ * flat store (`<dataDir>/sessions.db`), not a per-bot one.
+ */
+function storedSession(dataDir: string, sessionId: string): Record<string, any> {
+  return readPersistedSessionRows(dataDir)[sessionId];
+}
+
 function makeFixture(): {
   dataDir: string;
   binDir: string;
   logPath: string;
-  sessionPath: string;
   session: StoredSession;
 } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-cli-target-'));
@@ -75,8 +87,7 @@ function makeFixture(): {
       agentName: 'agent-a',
     },
   };
-  const sessionPath = join(dataDir, 'sessions.json');
-  writeFileSync(sessionPath, JSON.stringify({ [session.sessionId]: session }));
+  seedPersistedSessionRows(dataDir, undefined, { [session.sessionId]: session });
 
   const fakeHerdr = join(binDir, 'herdr');
   writeFileSync(fakeHerdr, `#!/usr/bin/env node
@@ -93,7 +104,7 @@ if (args.join(' ') === 'session list --json') {
 `);
   chmodSync(fakeHerdr, 0o755);
 
-  return { dataDir, binDir, logPath, sessionPath, session };
+  return { dataDir, binDir, logPath, session };
 }
 
 function runCli(
@@ -115,10 +126,10 @@ function runCli(
     ]) {
       delete env[key];
     }
-    const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, ...args], {
+    const child = spawnTsScript(CLI_PATH, args, {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -144,7 +155,7 @@ describe('CLI persisted backend targets', () => {
     expect(result.stdout).toContain('shared-herdr-target');
     expect(result.stdout).toContain('herdr: work/agent-a');
     expect(readLog(fixture.logPath)).toContainEqual(['--session', 'work', 'agent', 'list']);
-    expect(JSON.parse(readFileSync(fixture.sessionPath, 'utf8'))[fixture.session.sessionId].status).toBe('active');
+    expect(storedSession(fixture.dataDir, fixture.session.sessionId).status).toBe('active');
   });
 
   it('offline delete closes only the persisted Herdr agent, never a derived whole session', async () => {
@@ -158,7 +169,7 @@ describe('CLI persisted backend targets', () => {
     expect(calls).toContainEqual(['--session', 'work', 'pane', 'close', 'pane-shared']);
     expect(calls.some(args => args.includes('bmx-abcdef12'))).toBe(false);
     expect(calls.some(args => args[0] === 'session' && (args[1] === 'stop' || args[1] === 'delete'))).toBe(false);
-    expect(JSON.parse(readFileSync(fixture.sessionPath, 'utf8'))[fixture.session.sessionId].status).toBe('closed');
+    expect(storedSession(fixture.dataDir, fixture.session.sessionId).status).toBe('closed');
   });
 
   it('keeps an offline ZMX session active when exact ownership cannot be proved', async () => {
@@ -172,8 +183,7 @@ describe('CLI persisted backend targets', () => {
 
     const sessionId = 'abcdef12-1111-2222-3333-444444444444';
     const sessionName = 'bmx-abcdef12';
-    const sessionPath = join(dataDir, 'sessions.json');
-    writeFileSync(sessionPath, JSON.stringify({
+    seedPersistedSessionRows(dataDir, undefined, {
       [sessionId]: {
         sessionId,
         chatId: 'oc_zmx_target',
@@ -188,7 +198,7 @@ describe('CLI persisted backend targets', () => {
           sessionName,
         },
       },
-    }));
+    });
 
     const fakeZmx = join(binDir, 'zmx');
     writeFileSync(fakeZmx, `#!/usr/bin/env node
@@ -227,7 +237,7 @@ if (args.join(' ') === 'list --short') {
     expect(result.stdout).toContain('已关闭 0 个会话');
     const calls = readLog(logPath);
     expect(calls.some(args => args[0] === 'kill')).toBe(false);
-    const stored = JSON.parse(readFileSync(sessionPath, 'utf8'))[sessionId];
+    const stored = storedSession(dataDir, sessionId);
     expect(stored.status).toBe('active');
     expect(stored.closedAt).toBeUndefined();
   });

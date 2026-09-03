@@ -891,11 +891,11 @@ export function convertLegacyWorkflowDefinition(input: {
     }
   }
 
-  let normalizedDagTemplate: { nodes: V3Node[] } | undefined;
+  let normalizedDagTemplate: { schemaVersion?: 1 | 2; nodes: V3Node[] } | undefined;
   if (!hasErrors(ctx)) {
     try {
       validateDag({ runId: 'legacy-migration-check', nodes });
-      normalizedDagTemplate = validateDagTemplate({ nodes });
+      normalizedDagTemplate = validateDagTemplate({ schemaVersion: 2, nodes });
       // Authoring boundary: a migrated v2 workflow becomes a NEW v3 definition,
       // so it must be lint-clean. Surface as a graceful migration issue (not a
       // crash) exactly like the other v3 DAG constraints.

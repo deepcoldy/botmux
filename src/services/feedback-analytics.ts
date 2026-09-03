@@ -1,6 +1,5 @@
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { openDatabaseSyncNow, type DatabaseSyncLike } from './sqlite-compat.js';
 
 export interface FeedbackAnalyticsFilters {
   from: string;
@@ -73,9 +72,14 @@ function feedbackWhere(filters: FeedbackAnalyticsFilters): SqlParts {
 const LATEST = `SELECT f.* FROM feedback_revisions f JOIN (SELECT delivery_id,operator_subject_id,MAX(revision) revision FROM feedback_revisions GROUP BY delivery_id,operator_subject_id) x ON x.delivery_id=f.delivery_id AND x.operator_subject_id=f.operator_subject_id AND x.revision=f.revision`;
 
 export class FeedbackAnalyticsService {
-  private readonly db: DatabaseSyncType;
+  private readonly db: DatabaseSyncLike;
   constructor(dataDir: string) {
-    this.db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'), { readOnly: true });
+    // Runtime-agnostic read-only open: node:sqlite on Node, bun:sqlite on the
+    // compiled binary. Throws (like the previous `new DatabaseSync`) if neither
+    // engine loads or the DB can't be opened — callers already handle that.
+    const db = openDatabaseSyncNow(join(dataDir, 'botmux-feedback.sqlite'), { readOnly: true });
+    if (!db) throw new Error('feedback analytics: no SQLite engine available (node:sqlite / bun:sqlite)');
+    this.db = db;
   }
   close(): void { this.db.close(); }
   summary(filters: FeedbackAnalyticsFilters): FeedbackAnalyticsSummary {

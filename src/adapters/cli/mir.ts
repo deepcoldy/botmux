@@ -3,7 +3,8 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
-import { resolveCommand } from './registry.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveCommandReal } from './registry.js';
 
 /**
  * Mir CLI (mircli) adapter — drives the local `mircli` in non-interactive Print
@@ -41,17 +42,33 @@ export function createMirAdapter(pathOverride?: string): CliAdapter {
   // (resolvedBin is the node runner itself). Resolve a bare name to an absolute
   // path and hand it to the runner via --mircli-bin; the runner falls back to
   // MIRCLI_BIN / `mircli` on PATH when unset.
+  //
+  // CANONICAL (resolveCommandReal): mir-runner.ts spawns this path verbatim
+  // (`this.mircliBin || MIRCLI_BIN || 'mircli'`), and the file sandbox authorizes
+  // `dirname(canonical(p))` — so a symlink-installed mircli would be
+  // authorized-as-canonical yet spawned-as-symlink and ENOENT inside the sandbox.
+  // Same defect class as codex-app / dsh.
   let cachedMircliBin: string | undefined;
   const mircliBin = (): string | undefined => {
     if (!pathOverride || !pathOverride.trim()) return undefined;
-    return (cachedMircliBin ??= resolveCommand(pathOverride.trim()));
+    return (cachedMircliBin ??= resolveCommandReal(pathOverride.trim()));
   };
   return {
     id: 'mir',
     resolvedBin: process.execPath,
 
+    // resolvedBin is node running the runner, so the REAL mircli is a SECOND-stage
+    // spawn that the sandbox would otherwise never expose (`--tmpfs /run` masks
+    // fnm/nvm bin farms). Declared only when an explicit override gives us a path
+    // to canonicalize — with no override the runner resolves `mircli` from PATH
+    // inside the sandbox, which this adapter cannot know here.
+    sandboxExtraExecPaths() {
+      const bin = mircliBin();
+      return bin ? [bin] : [];
+    },
+
     buildArgs({ sessionId, botName, botOpenId, locale }) {
-      const args = [runnerPath(), '--session-id', sessionId];
+      const args = [runnerArgv0('mir-runner', runnerPath()), '--session-id', sessionId];
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);

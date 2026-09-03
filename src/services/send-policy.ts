@@ -35,6 +35,55 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface AfterTheFactTopicQuoteArgs {
+  /** The message id this send would quote (null ⇒ nothing to decide). */
+  quoteTargetId: string | null;
+  /**
+   * The frozen per-turn record's `inThread` for the turn that produced
+   * `quoteTargetId`: did the inbound message arrive from INSIDE a topic?
+   * `undefined` = unknown (pre-`inThread` session row).
+   */
+  quotedTurnInThread?: boolean;
+  /**
+   * `thread_id` the quote target carries RIGHT NOW, freshly probed from Lark.
+   * `null` = confirmed no topic. `undefined` = probe failed / not attempted.
+   */
+  currentThreadId?: string | null;
+  /** An explicit `--quote <id>` is the operator's own choice; never override it. */
+  explicitQuote?: string;
+}
+
+/**
+ * Whether a chat-scope send must DROP its quote and post flat instead.
+ *
+ * Lark's reply API makes a reply inherit the **current** topic membership of the
+ * message it quotes — `reply_in_thread: false` only declines to OPEN a new
+ * topic, it cannot escape an existing one. So when the user @s the bot at group
+ * top level and only AFTERWARDS opens a 话题 on that very message, quoting it
+ * drops the answer into a topic the user never @'d the bot in (the same
+ * user-reported bug the regular-group fold fixes on the dispatcher side — this
+ * is its `botmux send` half, which owns the visible prose reply).
+ *
+ * Requires BOTH halves, so it can only ever fire on the exact reported case:
+ *   • the quoted turn arrived at top level (`inThread === false`), and
+ *   • that message NOW carries a `thread_id` — i.e. the topic appeared later.
+ *
+ * Fails toward the pre-existing behavior (keep quoting) whenever either half is
+ * unknown: an old session row has no `inThread`, and a failed/skipped probe
+ * leaves `currentThreadId` undefined. Quoting is the long-standing default, so
+ * uncertainty must never silently change where every normal reply lands.
+ */
+export function shouldDropAfterTheFactTopicQuote(args: AfterTheFactTopicQuoteArgs): boolean {
+  if (!args.quoteTargetId) return false;
+  // `--quote <id>` is an explicit operator instruction; honor it verbatim.
+  if (args.explicitQuote) return false;
+  // Only a turn PROVEN to have arrived at top level can be a victim here.
+  // `undefined` (legacy row) must keep the old behavior, never guess.
+  if (args.quotedTurnInThread !== false) return false;
+  // The topic must actually exist now. `undefined` = we don't know ⇒ keep quoting.
+  return typeof args.currentThreadId === 'string' && args.currentThreadId.trim().length > 0;
+}
+
 export interface ManagedVcQuoteArgs {
   managed: boolean;
   durableDelivery: boolean;
@@ -128,6 +177,70 @@ export function neutralizeLarkAtTags(content: string): string {
   return content
     .replace(/<at(?=\s|>)/giu, '＜at')
     .replace(/<\/at\s*>/giu, match => `＜${match.slice(1, -1)}＞`);
+}
+
+export interface RawMention {
+  /** open_id (ou_…), or a full email / union_id / mobile when the bot
+   *  enables arbitrary mention. */
+  identifier: string;
+  /** optional display name for inline <at> substitution */
+  name: string;
+}
+
+export interface MentionClassifyResult {
+  ok: boolean;
+  /** present when !ok — message to print before exit(2) */
+  error?: string;
+  /** literal open_id entries — always allowed, pass through untouched */
+  openIdMentions: RawMention[];
+  /** non-open_id entries that must be resolved + membership-gated (empty unless
+   *  the switch is on) */
+  toResolve: RawMention[];
+}
+
+/**
+ * Pure gate for `botmux send --mention` identifiers. Splits literal open_ids
+ * (always allowed) from non-open_id identifiers (email / union_id /
+ * mobile). Non-open_id identifiers are only permitted when the bot config sets
+ * `allowArbitraryMention`; otherwise this returns ok:false so the caller can
+ * reject before doing any Lark I/O. The actual email→open_id resolution and
+ * group-membership check are async side effects the caller performs on
+ * `toResolve`. Keeping the decision here makes it unit-testable without Lark.
+ */
+export function classifyMentionIdentifiers(
+  raw: RawMention[],
+  allowArbitraryMention: boolean,
+): MentionClassifyResult {
+  const openIdMentions = raw.filter(r => r.identifier.startsWith('ou_'));
+  const nonOpenId = raw.filter(r => !r.identifier.startsWith('ou_'));
+  if (nonOpenId.length > 0 && !allowArbitraryMention) {
+    return {
+      ok: false,
+      error:
+        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱 @ 任意人。\n` +
+        `如需按完整邮箱/手机号/union_id @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
+        `无法解析的项：${nonOpenId.map(r => r.identifier).join(', ')}`,
+      openIdMentions,
+      toResolve: [],
+    };
+  }
+  return { ok: true, openIdMentions, toResolve: nonOpenId };
+}
+
+/**
+ * Pure group-membership gate for resolved --mention targets. Given the resolved
+ * open_id per non-open_id identifier and the set of open_ids that are actually
+ * members of the destination chat, return the identifiers whose resolved open_id
+ * is NOT a member (the ones that must be rejected). Extracted from cmdSend so the
+ * "in-group passes / out-of-group rejected" contract is unit-testable without
+ * Lark I/O — a mutation that deletes the check (always [] ) or reverses it
+ * (`has` instead of `!has`) must make these tests fail.
+ */
+export function outsidersForMembership(
+  resolved: Array<{ identifier: string; openId: string }>,
+  memberIds: Set<string>,
+): Array<{ identifier: string; openId: string }> {
+  return resolved.filter(r => !memberIds.has(r.openId));
 }
 
 export interface MentionDecisionArgs {

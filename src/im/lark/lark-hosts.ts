@@ -68,6 +68,23 @@ export function chatAppLink(chatId: string, brand: Brand = 'feishu'): string {
   return `https://${larkHosts(brand).applink}/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
 }
 
+/**
+ * 构造「在飞书/Lark 客户端内，以 appCenter 标签页形态打开一个网页」的 AppLink。
+ *
+ * 为什么是 appCenter 而不是 sidebar-semi（见 card-builder.ts:sidebarUrl）：
+ * sidebar 是一次性侧边浮层，关掉就没了；appCenter 打开的是客户端左侧的应用标签
+ * 页，用户可以右键固定，等于给工作台一个常驻入口——这正是「零门槛拿到入口」要
+ * 的形态。
+ *
+ * `targetUrl` 必须整体 encodeURIComponent：工作台目标 URL 自带 `?t=<token>`
+ * 查询串和 `#/agent-workbench` fragment，不转义会被客户端当成 AppLink 自己的
+ * 参数、并在 `#` 处截断。
+ */
+export function appCenterAppLink(targetUrl: string, brand: Brand = 'feishu'): string {
+  const host = larkHosts(brand).applink;
+  return `https://${host}/client/web_url/open?mode=appCenter&url=${encodeURIComponent(targetUrl)}`;
+}
+
 /** Build an AppLink for a topic inside a topic group. `threadId` is the
  *  `omt_...` topic id, not the `om_...` root-message id used for routing.
  *  Lark's own message AppLinks use `thread_position=-1`; large positive values

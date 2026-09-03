@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
@@ -39,6 +39,15 @@ export class ZellijBackend implements SessionBackend {
   private readonly sessionName: string;
   private readonly ownsSession: boolean;
   private reattaching = false;
+  /** When true, the caller has ALREADY resolved reattach-vs-fresh (the worker's
+   *  frozen tri-state probe, refreshed to 'missing' after any teardown). spawn()
+   *  must then honour `reattaching` verbatim and skip its `|| hasSession()`
+   *  self-heal — that live re-probe would re-run the same load-fragile
+   *  `list-sessions` and, on a post-kill session that has not fully died yet,
+   *  flip a frozen `false` back to attach, reattaching to the very pane the
+   *  teardown gate just removed. 'auto' (default) keeps the self-heal for
+   *  callers that did not freeze a decision. */
+  private readonly frozenReattach: boolean;
   private configPath: string | null = null;
   private tmpConfigDir: string | null = null;
   /** Set by kill()/destroySession() so the pty-client exit they cause (an
@@ -60,10 +69,11 @@ export class ZellijBackend implements SessionBackend {
   cliPid?: number;
   cliCwd?: string;
 
-  constructor(sessionName: string, opts?: { ownsSession?: boolean; isReattach?: boolean; paneId?: string }) {
+  constructor(sessionName: string, opts?: { ownsSession?: boolean; isReattach?: boolean; paneId?: string; reattachDecision?: 'frozen' | 'auto' }) {
     this.sessionName = sessionName;
     this.ownsSession = opts?.ownsSession ?? true;
     this.reattaching = opts?.isReattach ?? false;
+    this.frozenReattach = opts?.reattachDecision === 'frozen';
     this.paneId = opts?.paneId ?? null;
   }
 
@@ -88,27 +98,75 @@ export class ZellijBackend implements SessionBackend {
   /** Like liveSessions(), but distinguishes "command failed/timed out" ({ok:false})
    *  from "command succeeded, zero live sessions" ({ok:true, sessions:[]}). The
    *  tri-state probe builds on this so a transient `list-sessions` failure isn't
-   *  read as "session gone". */
+   *  read as "session gone".
+   *
+   *  NOTE zellij exits **1** with stderr `No active zellij sessions found.` when
+   *  there are simply no sessions — an authoritative "zero", not a failure. A
+   *  bare catch would report that clean host as {ok:false} → `unknown`, and any
+   *  caller that biases `unknown` toward reattach would then `zellij attach` a
+   *  name that does not exist (exit 1) on every first start. So classify like
+   *  TmuxBackend.probeSession does: a numeric exit status with no signal is an
+   *  ANSWER from zellij; only a signal/timeout or a spawn failure (ENOENT/EACCES
+   *  — neither carries a numeric status) means we never got one.
+   *
+   *  The "answered" case is split by EXIT CODE, not by stderr wording alone:
+   *  zellij uses 1 for "listed fine, nothing live" and clap's 2 for usage errors
+   *  (verified against 0.44.1: a bogus flag/subcommand exits 2). But a numeric
+   *  status is only trusted AFTER ruling out a deadline — Node's timeout can
+   *  race the child's own exit and produce `ETIMEDOUT` alongside a clean status
+   *  (see isExecTimeoutError and the tmux-probe regression that pins it), which
+   *  is still "no answer". And a silent non-zero exit is not proof of emptiness:
+   *  we require zellij's explicit "no active sessions" line (or live rows) to
+   *  call it, so anything ambiguous degrades to `unknown` — the safe direction.
+   */
   static probeLiveSessions(): { ok: true; sessions: string[] } | { ok: false } {
+    let out: string;
     try {
-      const out = execFileSync('zellij', ['list-sessions', '--no-formatting'], {
+      out = execFileSync('zellij', ['list-sessions', '--no-formatting'], {
         encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 3000,
         env: zellijEnv(),
       });
-      return {
-        ok: true,
-        sessions: out
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l.length > 0 && !/EXITED/i.test(l))
-          .map(l => l.split(/\s+/)[0]!)
-          .filter(Boolean),
-      };
-    } catch {
+    } catch (e: any) {
+      // Deadline FIRST, before any numeric-status reasoning: when Node's timeout
+      // races the child's own exit, the error carries `code='ETIMEDOUT'` AND a
+      // clean `status` with no signal (see isExecTimeoutError + the
+      // tmux-probe.test.ts regression pinning that exact shape). Reading that as
+      // an answer would turn the very high-load timeout this PR exists to
+      // tolerate back into an authoritative "gone" — and in the strict post-kill
+      // path it would report an unconfirmed termination as proven.
+      if (isExecTimeoutError(e)) return { ok: false };
+      // Not answered at all (killed by a signal, or a spawn failure like
+      // ENOENT/EACCES which carries no numeric status): stay indeterminate.
+      if (!e || typeof e.status !== 'number' || e.signal) return { ok: false };
+      // Answered non-zero. Only exit 1 can mean "listed fine, nothing live";
+      // clap usage/startup errors are 2+ and prove nothing about liveness.
+      if (e.status !== 1) return { ok: false };
+      // If it printed live rows anyway, those win (never report a live pane gone).
+      const rows = ZellijBackend.parseLiveSessionRows(e.stdout?.toString?.() ?? '');
+      if (rows.length > 0) return { ok: true, sessions: rows };
+      // Require zellij's explicit "no active sessions" answer to call it empty.
+      // A SILENT non-zero exit proves nothing — treating it as zero is how an
+      // unconfirmed kill or a half-broken host would read as "session gone".
+      // (The message is hardcoded in zellij since our 0.44.0 floor; a future
+      // rewording degrades to `unknown`, which is the safe direction here.)
+      if (/no active zellij sessions/i.test((e.stderr?.toString?.() ?? '').trim())) {
+        return { ok: true, sessions: [] };
+      }
       return { ok: false };
     }
+    return { ok: true, sessions: ZellijBackend.parseLiveSessionRows(out) };
+  }
+
+  /** Live (non-EXITED) session names from `list-sessions --no-formatting` output. */
+  private static parseLiveSessionRows(raw: string): string[] {
+    return raw
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !/EXITED/i.test(l))
+      .map(l => l.split(/\s+/)[0]!)
+      .filter(Boolean);
   }
 
   static hasSession(name: string): boolean {
@@ -136,7 +194,30 @@ export class ZellijBackend implements SessionBackend {
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     // Reattach if the session is already live (daemon restarted, CLI survived).
-    this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    // Skip this self-heal when the caller froze the decision: a teardown gate
+    // may have just killed the pane and set reattaching=false, and a live
+    // re-probe here (same load-fragile `list-sessions`) could still see the
+    // not-yet-reaped session and wrongly flip us back to attach.
+    if (!this.frozenReattach) {
+      this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    }
+    if (this.frozenReattach && this.reattaching) {
+      // A frozen `attach` can still be objectively WRONG: the worker biases an
+      // indeterminate existence probe toward reattach (a live pane is likelier
+      // than a gone one under load), and not every path re-probes before we get
+      // here. `attach` on a session that does not exist exits 1 ("No session
+      // with the name … found!"), which reads as a CLI crash and burns a
+      // restart. So downgrade to a fresh spawn ONLY on an authoritative
+      // 'missing' — an indeterminate answer keeps the reattach bias, and a
+      // frozen `false` is never flipped the other way (that direction is the
+      // teardown guarantee this whole flag exists to protect).
+      if (ZellijBackend.probeSession(this.sessionName) === 'missing') {
+        logger.debug(
+          `[zellij:${this.sessionName}] frozen reattach downgraded to fresh spawn: session is provably absent`,
+        );
+        this.reattaching = false;
+      }
+    }
     logger.debug(
       `[zellij:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
       `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,

@@ -60,6 +60,29 @@ describe('mergeQueuedCliInput', () => {
     })).toBe(false);
   });
 
+  it('never merges a turn that carries an automatic native title', () => {
+    const pending = [{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }];
+
+    expect(mergeQueuedCliInput(pending, { content: 'second task', turnId: 't2' })).toBe(false);
+    expect(pending).toEqual([{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }]);
+
+    expect(mergeQueuedCliInput([{ content: 'ordinary', turnId: 't1' }], {
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      turnId: 't2',
+    })).toBe(false);
+  });
+
   it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
     const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
     expect(mergeQueuedCliInput(pending, {

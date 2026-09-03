@@ -35,4 +35,5 @@ await cmdGoal('run', [
   validateManifest: async () => ({ ok: false, problems: ['not reached'] }),
   readValidatedManifest: readAndValidateManifest,
   signalEmitter: signals as unknown as GoalCliDependencies['signalEmitter'],
+  env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
 });

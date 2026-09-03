@@ -3,12 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>botmux dashboard</title>
+  <title>Botmux</title>
   <link rel="preload" as="image" href="/assets/brand-logo.png" fetchpriority="high">
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.ico?v=20260708">
   <link rel="shortcut icon" type="image/png" href="/favicon.ico?v=20260708">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=20260708">
+  <!-- Lets the Workbench be added to a phone's home screen and launch without
+       browser chrome — the nearest equivalent to a pinned tab, which Feishu
+       itself does not offer for custom apps on mobile. -->
+  <link rel="manifest" href="/workbench.webmanifest">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Workbench">
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/design-tokens.css">
 </head>
 <body>
   <div id="app-root"></div>

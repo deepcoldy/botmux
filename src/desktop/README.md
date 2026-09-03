@@ -20,13 +20,13 @@
 
 - macOS
 - Node.js 22 或更高版本
-- pnpm
+- bun
 - 已下载本仓库源码
 
-如果没有 pnpm，可以先执行：
+如果没有 bun，可以先执行：
 
 ```bash
-corepack enable
+npm i -g bun
 ```
 
 ## 安装
@@ -61,7 +61,7 @@ bash src/desktop/install-local.sh --skip-deps
 bash src/desktop/install-local.sh --app-path /Applications/Botmux.app
 ```
 
-`--skip-build` 适合已经运行过 `pnpm desktop:bundle && pnpm exec electron-builder --mac dir --config electron-builder.yml -c.extraMetadata.version=<version>` 的开发场景。
+`--skip-build` 适合已经运行过 `bun run desktop:bundle && ./node_modules/.bin/electron-builder --mac dir --config electron-builder.yml -c.extraMetadata.version=<version>` 的开发场景。
 
 如果源码不是 git checkout，脚本无法通过 tag 推导版本号，可以显式传入：
 
@@ -85,13 +85,13 @@ bash src/desktop/install-local.sh
 安装后可以运行：
 
 ```bash
-pnpm desktop:smoke --skip-dashboard
+bun run desktop:smoke --skip-dashboard
 ```
 
 如果已经用当前源码启动了 botmux runtime，也可以运行完整检查：
 
 ```bash
-pnpm desktop:smoke
+bun run desktop:smoke
 ```
 
 ## 说明

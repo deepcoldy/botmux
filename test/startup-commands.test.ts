@@ -117,4 +117,9 @@ describe('worker.ts startup-commands wiring', () => {
     expect(src).toContain('args.unshift(...piInitialPromptAdditionalArgs);');
     expect(src).toContain('Object.assign(childEnv, piInitialPromptEnv);');
   });
+
+  it('does not route startupCommands into launch argv', () => {
+    expect(src).not.toContain('planStartupCommandsForCli');
+    expect(src).not.toContain('startupLaunchArgs');
+  });
 });

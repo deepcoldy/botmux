@@ -24,6 +24,8 @@ import { SPEC_SCHEMA_VERSION, type BotSnapshot } from '../src/workflows/v3/contr
 import { DagValidationError } from '../src/workflows/v3/dag.js';
 import { loadAuthorizedV3Run, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 function base(): string {
   return mkdtempSync(join(tmpdir(), 'v3-host-'));
@@ -41,7 +43,10 @@ function runTsChild(script: string): {
   exited: () => boolean;
   result: Promise<{ created: boolean; authorizedAt: string }>;
 } {
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+  // 不能用 spawnTsEval：内联脚本要 import 仓库内的 .ts 模块（.js specifier），
+  // Node 下丢掉 --import tsx 子进程会 ERR_MODULE_NOT_FOUND，所以拼 runner 前缀 + eval 参数。
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -150,7 +155,7 @@ function okArchitectDeps(): ArchitectDeps {
       notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
       manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
     }),
-    loadDag: () => ({ runId: 'r', nodes: [] }),
+    loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }),
     botSnapshot: DUMMY_BOT,
     resolveLarkAppSecret: () => undefined,
   };
@@ -238,7 +243,7 @@ describe('host — architect（codex 3 断言）', () => {
       const { runDir } = hostNew({ goal: 'g', baseDir: b, runId: 'r' });
       const deps: ArchitectDeps = {
         runArchitect: async () => { throw new Error('不该被调用'); },
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -259,7 +264,7 @@ describe('host — architect（codex 3 断言）', () => {
           notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
           manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
         }),
-        loadDag: () => ({ runId: 'r', nodes: [] }), // 校验通过（不抛）
+        loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }), // 校验通过（不抛）
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -359,6 +364,30 @@ describe('host — architect（codex 3 断言）', () => {
     }
   });
 
+  it('Architect 生成 legacy DAG 时拒绝进入 dag_ready', async () => {
+    const b = base();
+    try {
+      const { runDir } = toApprovedSpec(b);
+      const deps: ArchitectDeps = {
+        runArchitect: async (input) => ({
+          status: 'ok',
+          dagPath: join(input.runDir, 'dag.json'),
+          notesPath: join(input.runDir, 'notes.md'),
+          manifestPath: join(input.runDir, 'manifest.json'),
+        }),
+        loadDag: () => ({ runId: 'legacy', nodes: [] }),
+        botSnapshot: DUMMY_BOT,
+        resolveLarkAppSecret: () => undefined,
+      };
+
+      const out = await hostArchitect(runDir, deps);
+      expect(out).toMatchObject({ ok: false, state: { status: 'spec_approved' } });
+      expect(out.problems).toContain('architect dag.json must use schemaVersion 2');
+    } finally {
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
   it('并发 architect 共享 run 级 async transaction：attempt001 只启动一个 worker，竞争调用明确 busy', async () => {
     const b = base();
     let releaseWorker: () => void = () => {};
@@ -417,7 +446,7 @@ describe('host — approve-dag（gate-2）', () => {
           notesPath: join(input.runDir, 'notes.md'),
           manifestPath: join(input.runDir, 'manifest.json'),
         }),
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -835,13 +864,13 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-current', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           ownerOpenId: 'ou_owner_a', lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-current',
         },
-      }));
+      });
 
       expect(chatBindingFromEnv({
         SESSION_DATA_DIR: dataDir,
@@ -875,13 +904,13 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-old', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-new',
         },
-      }));
+      });
       expect(() => chatBindingFromEnv({
         SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 'sess-1', BOTMUX_OWNER_OPEN_ID: 'ou_owner_a',
       } as NodeJS.ProcessEnv, process.pid)).toThrow(/turn-old.*turn-new/);

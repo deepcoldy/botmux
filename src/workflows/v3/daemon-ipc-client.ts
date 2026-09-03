@@ -1,6 +1,7 @@
 /** Shared client for authenticated Workflow v3 daemon mutations. */
 
 import type { OnlineDaemonInfo } from '../../utils/daemon-discovery.js';
+import { loopbackFetchImpl } from '../../core/loopback-fetch.js';
 import {
   generateWorkflowDaemonIpcNonce,
   loadWorkflowDaemonIpcSecret,
@@ -84,7 +85,7 @@ export async function postWorkflowDaemonMutation(input: {
     timestamp,
     nonce,
   });
-  const fetchImpl = input.fetchImpl ?? fetch;
+  const fetchImpl = input.fetchImpl ?? loopbackFetchImpl;
   let response: Response;
   try {
     response = await fetchImpl(`http://127.0.0.1:${target.ipcPort}${pathWithQuery}`, {

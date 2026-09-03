@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
@@ -39,10 +39,29 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 > 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
 ```bash
-npm install -g botmux        # 需要 Node >= 22
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
+
+> botmux 本体是一个**自包含单文件二进制**，运行时已嵌在里面——**装它和跑它都不需要机器上有 Node**（你要接的 AI 编程 CLI 自己需要什么另算）。装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），按 OS/arch 自动选对应二进制、校验 SHA-256，并把 `~/.botmux/bin` 写进你当前 shell 的启动文件（zsh / bash / fish 各写对的那个），**开个新终端就能用**。
+>
+> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：PTY 已经嵌在二进制里。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，是完整支持的一等环境）。平台不在列表里、或下下来的二进制在本机跑不起来，安装会**明确报错并保留原有版本**，而不是装上一个起不来的命令。
+>
+> 升级：`botmux upgrade`（原地换二进制），或**重跑一遍上面那条 curl 命令**——同样原地升级，不会重复往启动文件里追加 PATH。
+
+<details>
+<summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
+
+```bash
+npm install -g botmux        # 需要 Node >= 22 装包本身
+```
+
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
+
+区别只在**谁来装、以后谁来升**：npm 路径需要 Node ≥ 22 才能执行安装本身，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致——同样的二进制、同样的命令。
+
+</details>
 
 然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
@@ -60,11 +79,43 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 ## 支持的 CLI / Agent
 
-`bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程）。代表项：
+`bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+
+`ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
+
+`bots.json` 里只放非敏感元数据和密钥文件路径，例如：
+
+```json
+{
+  "cliId": "ebsd",
+  "workingDir": "/var/lib/botmux/ebsd-work",
+  "sandbox": true,
+  "env": {
+    "EBSD_BOTMUX_DIAG_ENDPOINT": "https://ebsbot.example",
+    "EBSD_BOTMUX_DIAG_TOKEN_FILE": "/run/secrets/ebsd-botmux/diag-token",
+    "EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-ak",
+    "EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-sk",
+    "EBSD_BOTMUX_SUBJECT": "botmux-ebsd@prod",
+    "EBSD_BOTMUX_REPOSITORY_ROOT": "/srv/repos"
+  }
+}
+```
+
+三个密钥文件必须是运行 BotMux 的账号持有的 `0600` 普通文件，不能是符号链接；文件内容、AK/SK 和 Gateway token 都不得写进 `bots.json`。`workingDir` 应是专用空目录，仓库通过只读的 `EBSD_BOTMUX_REPOSITORY_ROOT` 暴露。Linux 开启 `sandbox` 前需安装 bubblewrap，隔离建立失败时会拒绝启动。当前/上一把 Gateway key 可以在服务端并存完成轮换，subject 保持不变。
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+
+### 会话级 CLI 选择
+
+在会话尚未启动前，可以用 `/cli <cliId>` 为当前会话选择已注册的 CLI，例如：
+
+```text
+/cli codex
+```
+
+这个选择只切换裸 CLI 适配器，不继承当前 bot 配置中的 `wrapperCli`、`model` 或 `startupCommands`。因此依赖 `ttadk`、`aiden` 等 wrapper / 网关才能启动的 CLI，不适合用会话级选择切换；应直接把 bot 默认配置设为对应的 wrapper 组合。会话启动后 CLI 选择冻结，后续消息和恢复都会继续使用该 CLI。
 
 ### 最终回答反馈（按 bot、默认关闭）
 

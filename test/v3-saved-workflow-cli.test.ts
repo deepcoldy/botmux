@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 import {
   assertAgentFacingAppendScope,
@@ -89,7 +90,7 @@ describe('Saved Workflow CLI current-turn authentication', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-b', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1',
           status: 'active',
@@ -101,7 +102,7 @@ describe('Saved Workflow CLI current-turn authentication', () => {
           lastCallerOpenId: 'ou_caller_b',
           quoteTargetId: 'turn-b',
         },
-      }));
+      });
 
       expect(contextFromEnv({
         SESSION_DATA_DIR: dataDir,
@@ -131,13 +132,13 @@ describe('Saved Workflow CLI current-turn authentication', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-old', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           ownerOpenId: 'ou_owner_a', lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-new',
         },
-      }));
+      });
 
       expect(() => contextFromEnv({
         SESSION_DATA_DIR: dataDir,

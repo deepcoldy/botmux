@@ -183,6 +183,7 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.overview.goto_schedules',
   'card.dashboard.overview.goto_settings',
   'card.dashboard.overview.goto_groups',
+  'card.dashboard.overview.open_workbench',
   'card.dashboard.overview.back_button',
   'card.dashboard.overview.dm_sent',
   'card.dashboard.overview.dm_failed',

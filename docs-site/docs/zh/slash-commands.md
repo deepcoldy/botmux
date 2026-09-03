@@ -11,6 +11,7 @@
 | `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名 |
 | `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
+| `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
 | `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（仅 Claude 系 / Codex 终端模式） |
@@ -18,11 +19,13 @@
 | `/fork --create <群名>` | 不建子话题，改为把当前会话分身到一个新建群 |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
 | `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
-| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照） |
+| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关 |
+| `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；仅 claude-code / codex 支持） |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
+| `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
 | `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
 | `/t [<内容>]` `/topic [<内容>]` | 普通群内强制新开话题；带内容提交首轮任务（需选仓则选择后开工），裸命令进入话题设置 |
 | `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
@@ -48,6 +51,7 @@
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
 | `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话，同一 DM 的消息共用一个会话（**默认**） |
 | `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程；同一已有 thread 内的回复继续该 thread 会话 |
+| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名、回群续聊自动恢复上下文；详见私聊会话模式 `p2pMode=group`） |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
@@ -100,6 +104,7 @@
 |------|------|
 | `/login` | 飞书用户授权，授权后可下载第三方卡片图片、以你身份调云文档/日历等 API |
 | `/login status` | 查看授权状态 |
+| `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
 
 ## 🎭 角色（人设）

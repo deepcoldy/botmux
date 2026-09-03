@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
@@ -12,6 +13,10 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { PricingOverrides } from './services/model-pricing.js';
+import type { BudgetConfig } from './services/budget-tracker.js';
+import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
@@ -19,13 +24,31 @@ import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
+import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import {
+  normalizeExistingAppServerConfig,
+  type ExistingAppServerConfig,
+} from './core/existing-app-server.js';
+import {
+  normalizeCodexBrowserConfig,
+  type CodexBrowserConfig,
+} from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
-import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeReplyStyleConfig,
+  type ReplyStyleConfig,
+} from './im/lark/reply-card-style.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeSessionOwnerReminderConfig,
+  type SessionOwnerReminderConfig,
+} from './core/session-owner-reminder.js';
+import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -65,6 +88,39 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
  * no daemon admission/mutation lock, so the interactive timeout's protective
  * purpose does not apply to them. Give uploads a far looser ceiling. */
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
+ * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
+ * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
+ * validate against this single bound.
+ */
+export const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Normalize an untrusted `turnTimeoutMs` value: a positive integer within the
+ * arm-able bound is kept, anything else (≤0, non-integer, over the bound,
+ * non-number, absent) collapses to `undefined` (= use the runner default).
+ */
+export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= MAX_TURN_TIMEOUT_MS
+    ? value
+    : undefined;
+}
+
+/**
+ * Normalize an untrusted `dshRuntime` value: only the two known variants are
+ * kept; anything else (typo, unknown string, wrong type) collapses to
+ * `undefined` (= official runner). The field is dsh-only; non-dsh CLIs drop
+ * it at the call site (same pattern as turnTimeoutMs).
+ */
+export function normalizeDshRuntime(value: unknown): 'official' | 'tui' | undefined {
+  return value === 'official' || value === 'tui' ? value : undefined;
+}
 
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
@@ -122,6 +178,8 @@ export function larkUploadHttpInstance(): unknown {
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+/** 普通群 @ 策略：always=必须 @｜topic=话题内免 @｜never=免 @｜ambient=免 @ 但 @ 别人时安静。 */
+export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
 /** Where a bot shows native Context / Token usage on its Session cards. */
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
 /** Default when a bot sets nothing: usage rides the live streaming card. */
@@ -163,12 +221,73 @@ export interface MessageListenerConfig {
     /** V1 only supports top-level group messages. */
     scope?: 'top_level';
   };
+  /**
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message (legacy behavior). When configured, a message matches the listener
+   * ONLY when its text satisfies the policy, so non-matching messages never
+   * wake the Agent. Keywords are case-insensitive substrings (linear-time
+   * `String.includes`, safe against attacker-controlled message text).
+   * `matchMode` 'any' (default) matches when at least one keyword hits; 'all'
+   * requires every keyword to hit.
+   *
+   * V1 intentionally does NOT support regexes: the policy is evaluated on the
+   * daemon main event loop for every inbound/backfilled message, and a user-
+   * authored JS regex with catastrophic backtracking (e.g. `(a+)+$`, 6 chars)
+   * freezes the whole multi-bot daemon for tens of seconds on a ~30-char
+   * message. A regex mode can return later behind a linear-time engine (RE2).
+   *
+   * bots.json example:
+   * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["报错","500"],"matchMode":"any"}}}}`
+   */
+  contentPolicy?: {
+    includeKeywords?: string[];
+    matchMode?: 'any' | 'all';
+  };
   replyPolicy?: {
     /** V1 always replies under the triggering message. */
     mode?: 'thread';
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
+}
+
+/**
+ * 免@ 斜杠命令：普通群里旁人直接发一条配置内的命令（如 `/solve`，未 @ 任何 bot）
+ * 时，把它当作对本 bot 的寻址，喂进该群已有的 chat-scope 会话续聊。
+ *
+ * 与 `messageListeners` 的分工：listener 是**观察者**（把消息包成
+ * `<observed_message trusted="false">` + 配置的 prompt，每条命中新开一个话题会话）；
+ * 这里是**命令通道**（原文直投既有会话）。两者语义不同，刻意不合并。
+ *
+ * 生效范围沿用 substituteMode 的惯用形状：`chats` 为空 = 所有群，非空 = 白名单；
+ * `excludedChats` deny-wins。判定见 services/command-trigger.ts。
+ */
+export interface CommandTriggerCommand {
+  /** 小写、`/` 开头的裸命令词。botmux 保留命令在运行期被硬拒
+   *  （reservedCommandKind），dashboard 保存时也会拒绝写入。 */
+  cmd: string;
+  /**
+   * 命中后交给 Agent 的 prompt 模板 —— 命令的**行为定义**。
+   *
+   * 不填则把用户原文投给会话（Agent 只看到 `/solve xxx` 这段文本，做什么由模型
+   * 自己判断）。填了则用模板替换原文：`{args}` 会被替换成命令后面那段文本；模板
+   * 里没有 `{args}` 时，参数追加在模板末尾（宁可多一段也不静默丢掉用户输入）。
+   *
+   * 模板对 **@ 与免@ 两条路径同样生效**：一条命令的含义不该取决于发的时候有没有
+   * @ bot，否则「@ 了就变成另一种行为」反而是特例。免@ 放行是寻址问题，模板是
+   * 行为问题，两者正交。
+   */
+  prompt?: string;
+}
+
+export interface CommandTriggerConfig {
+  enabled: boolean;
+  /** 免@ 生效的命令白名单，每条可带自己的 prompt 模板。 */
+  commands: CommandTriggerCommand[];
+  /** 可选的群白名单。留空/缺省 = 所有普通群。 */
+  chats?: string[];
+  /** 可选的群黑名单。deny-wins（同时出现在 chats 里也不生效）。 */
+  excludedChats?: string[];
 }
 
 export interface SummaryRangeConfig {
@@ -240,6 +359,13 @@ function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   return undefined;
 }
 
+function normalizeGroupMentionModeConfig(raw: unknown): GroupMentionMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'always' || v === 'topic' || v === 'never' || v === 'ambient') return v;
+  return undefined;
+}
+
 function normalizeContentTriggerScope(raw: unknown): ContentTriggerScope | undefined {
   if (typeof raw !== 'string') return undefined;
   const v = raw.trim().toLowerCase();
@@ -287,7 +413,11 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
+  // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
+  // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
+  // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
   const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
   const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
@@ -327,6 +457,18 @@ function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig
   if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
   if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
   if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
+  if (entry.textOutputPolicy === 'allow' || entry.textOutputPolicy === 'approval' || entry.textOutputPolicy === 'deny') {
+    out.textOutputPolicy = entry.textOutputPolicy;
+  }
+  if (entry.voiceOutputPolicy === 'allow' || entry.voiceOutputPolicy === 'approval' || entry.voiceOutputPolicy === 'deny') {
+    out.voiceOutputPolicy = entry.voiceOutputPolicy;
+  }
+
+  // per-bot 从共享目录挑的默认角色。与 consumerProfiles 无关(bot 继承目录、不拥有
+  // 预设),故无条件归一化,不触发 legacy "consumerProfiles required" resolver 门。
+  // 空串/空白 = 「跟随全局默认」,等同没配。
+  const catalogDefaultConsumerId = normalizeNonEmptyString(entry.catalogDefaultConsumerId);
+  if (catalogDefaultConsumerId) out.catalogDefaultConsumerId = catalogDefaultConsumerId;
 
   if (Object.prototype.hasOwnProperty.call(entry, 'defaultProfileBootstrap')) {
     const marker = entry.defaultProfileBootstrap;
@@ -523,7 +665,7 @@ function normalizeVcMeetingListenerDelivery(
   return { placement: entry.placement as 'auto' | 'chat' | 'topic' };
 }
 
-function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
+export function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
   const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
   if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
   return raw.map((value, index) => {
@@ -760,7 +902,10 @@ function normalizeVcMeetingRealtimeVoiceConfig(raw: unknown): VcMeetingRealtimeV
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingRealtimeVoiceConfig = {};
+  // 实时语音默认开启(vcMeetingRealtimeVoiceEnabled:enabled!==false),enabled:false 是
+  // 显式关闭,必须保留——只留 true 会让"关掉实时语音"round-trip 成 undefined(=默认开)。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const sampleRate = normalizePositiveInt(entry.sampleRate);
   const channels = normalizePositiveInt(entry.channels);
   const frameMs = normalizePositiveInt(entry.frameMs);
@@ -974,6 +1119,24 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
   messagePolicy.scope = 'top_level';
 
+  const contentRaw = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
+    ? entry.contentPolicy as Record<string, unknown>
+    : undefined;
+  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  if (contentRaw) {
+    const includeKeywords = normalizeMessageListenerStringList(contentRaw.includeKeywords);
+    // V1 is keyword-substring only (see the contentPolicy type doc for why no
+    // regexes on the daemon main loop). Only persist non-default flags; an
+    // all-empty policy is dropped entirely (matchesContentPolicy treats
+    // absent/empty as match-all).
+    if (includeKeywords) {
+      contentPolicy = {
+        includeKeywords,
+        ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+      };
+    }
+  }
+
   return {
     enabled,
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
@@ -982,6 +1145,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     prompt: prompt ?? '',
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
+    ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }
@@ -996,6 +1160,15 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
+
+/**
+ * A bots.json row may omit `cliId`. Historically that means claude-code, and such
+ * a row can still carry a legacy `cliPathOverride`. Anything that derives a
+ * selection from a RAW row must apply this same default, otherwise the selection
+ * looks changed and preservation logic is skipped. Exported so there is exactly
+ * one definition of the legacy default.
+ */
+export const LEGACY_DEFAULT_CLI_ID = 'claude-code';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -1102,6 +1275,71 @@ export interface VcMeetingRealtimeVoiceConfig {
   testSpeakOnStartText?: string;
 }
 
+/**
+ * Per-bot settings for p2pMode='group' session groups (each top-level DM
+ * message births a dedicated 1-user+1-bot group hosting the conversation).
+ * Everything is optional; effective defaults in parentheses.
+ */
+export interface SessionGroupConfig {
+  /** Group-name generation. */
+  naming?: {
+    /**
+     * 'ai-summary' (default): create with a truncated placeholder name, then
+     * asynchronously ask the bot's own CLI (one-shot headless call) for a
+     * short title and rename the chat when it lands. Falls back to the
+     * placeholder on failure/timeout.
+     * 'truncate': placeholder only — zero cost, zero delay.
+     */
+    mode?: 'ai-summary' | 'truncate';
+    /** Max title length in characters for the AI summary (12). */
+    maxLen?: number;
+  };
+  /**
+   * Optional fixed group-name prefix. Empty/undefined (default) = no prefix.
+   * Only needed as the match key for the rule-based feed-group mode (PR2).
+   */
+  namePrefix?: string;
+  /** Template working dir bound to each new session group (defaultWorkingDir). */
+  workingDir?: string;
+  /** Send a DM receipt linking the freshly-created group (true). */
+  dmReceipt?: boolean;
+  /**
+   * What to do with the group when its session is closed:
+   * 'keep' (default) — leave the group and registry entry; a later message in
+   * the group resumes the closed session (same-group resume). 'disband' /
+   * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
+   */
+  onClose?: 'keep' | 'disband' | 'archive';
+  /**
+   * Session-group tagging.
+   * 'feed-group' (default) — the owner's personal sidebar 消息分组 (feed
+   *   group). Needs a one-time user OAuth (im:feed_group_v1), auto-refreshed
+   *   afterwards; works on any tenant — no tenant scope catalog involved.
+   * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
+   *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
+   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   * 'off' — no tagging.
+   */
+  tag?: {
+    mode?: 'chat-tag' | 'feed-group' | 'off';
+    /**
+     * Tag / feed-group display name. Empty/absent (default) = 「<bot 显示名>会话」
+     * （多 bot / 多设备靠 bot 名区分；bot 显示名也拿不到时才保底成 Botmux群会话）。
+     * 回落链见 services/feed-group-tagger.ts 的 resolveSessionTagName。
+     */
+    name?: string;
+  };
+  /**
+   * Distinctive built-in group avatar for session groups — the zero-permission
+   * visual marker (works on tenants without the chat-tag catalog).
+   * 'auto' (default) applies it at birth; 'off' keeps Feishu's default avatar.
+   */
+  avatar?: 'auto' | 'off';
+  /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */
+  idleDays?: number;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -1130,6 +1368,13 @@ export interface BotConfig {
    * 具体 app/租户，不在运行时切换（要换平台 = 重新配/加一个 bot）。
    */
   brand?: Brand;
+  /**
+   * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
+   * handler is still running at this point, Botmux ACKs with a background-work
+   * toast and applies a later card result via message.patch. Valid range is
+   * 500–2500 ms; unset or invalid values keep the 2500 ms default.
+   */
+  cardActionAckTimeoutMs?: number;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
   /**
@@ -1188,7 +1433,32 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
-  /** Default Codex reasoning effort for newly created sessions. */
+  /** Optional TraeX backend variant. Missing inherits TraeX global config. */
+  modelBackendVariant?: 'standard' | 'max';
+  /**
+   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
+   * default (`DEFAULT_TURN_TIMEOUT_MS` in dsh-runner.ts). Positive integer
+   * only; unset/≤0/non-integer → runner default. Only affects the `dsh` CLI
+   * adapter; other adapters ignore the field.
+   */
+  turnTimeoutMs?: number;
+  /**
+   * Per-bot dsh profile name. Only meaningful when `cliId === 'dsh'`:
+   * the profile lives under ~/.dsh/profiles/<name>/ and contains the plugin
+   * composition (cordis.yml + cordis.patch.yml). Defaults to 'botmux'.
+   * Non-dsh CLIs ignore the field.
+   */
+  dshProfile?: string;
+  /**
+   * Per-bot dsh runtime variant. Only meaningful when `cliId === 'dsh'`:
+   *   - `'official'` (default): the headless JSON-RPC runner (dsh-runner.ts).
+   *   - `'tui'`: the interactive dsh-tui Ink TUI, driven via PTY (dsh-tui adapter).
+   * Non-dsh CLIs always drop the field. Selected via the dashboard "dsh 运行时"
+   * toggle; the worker resolves the effective adapter at spawn time.
+   */
+  dshRuntime?: 'official' | 'tui';
+  /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
@@ -1201,12 +1471,68 @@ export interface BotConfig {
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
   /**
+   * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
+   * backed by the locally installed Codex Chrome/Edge extension plugin.
+   */
+  codexBrowser?: CodexBrowserConfig;
+  /**
+   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
+   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
+   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
+   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
+   */
+  envelopeInjection?: 'auto' | 'off';
+  /**
+   * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
+   * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
+   * explicit `false` disables), so existing prompts stay byte-for-byte.
+   *
+   * Turn it off for a bot whose model mishandles the tag (cursor-agent copies
+   * `ou_xxx:名字` into its reply — see {@link renderCursorSenderNote}) or when
+   * the operator does not want per-message identity in the CLI transcript.
+   * The cursor anti-echo note is gated on the tag's presence, so it disappears
+   * together with it. `botmux send --mention-back` is UNAFFECTED: it reads
+   * `replyTargets[turnId].senderOpenId` (core/reply-target.ts), a daemon-side
+   * record independent of this prompt block.
+   *
+   * TWO OBSERVABILITY COSTS, both measured — see the `/config senderTag` hint:
+   *   1. `/adopt`'s botmux-origin filter loses one of its fingerprints. The
+   *      remaining structural anchors cover the shapes we ship (see
+   *      BOTMUX_INJECTION_PATTERNS in services/resumable-session-discovery.ts,
+   *      whose `^<chat_context_policy>` / `^<summary_memory>` anchors exist
+   *      precisely so a sender-less prompt is still recognized).
+   *   2. Dashboard session insight can no longer label a turn's sender type /
+   *      A2A agent name from the tag (services/insight/prompt.ts); it falls
+   *      back to the `[来自 … 的 @mention]` handoff marker when present.
+   *
+   * This is the first member of a per-bot prompt-block toggle cluster; keep
+   * future block switches (e.g. `<chat_context>`) adjacent so the gates stay
+   * discoverable together.
+   */
+  senderTag?: boolean;
+  /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
    * attached to a botmux-owned app-server thread, so input can't be dropped by
    * codex's terminal re-init. No effect on non-codex bots.
    */
   codexRpcInput?: boolean;
+  /**
+   * Experimental local-only attachment mode for an already-running Codex App
+   * Server. This does not make BotMux an app-server owner: after the operator
+   * explicitly selects an existing thread via `/adopt`, BotMux launches the
+   * official `codex --remote <endpoint> resume <thread>` TUI as a second
+   * client. For the `cliId: "codex"` shared-adopt path, new remote threads are
+   * deliberately not auto-created; `cliId: "codex-app"` retains its existing
+   * new-session workflow until the operator explicitly selects a shared thread.
+   */
+  existingAppServer?: ExistingAppServerConfig;
+  /**
+   * Codex credential policy. Missing/`shared` preserves the historical global
+   * auth refresh; `isolated` always redirects Codex into this bot's private
+   * CODEX_HOME and never reads or copies global auth, with or without sandbox.
+   */
+  codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -1254,6 +1580,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
+   * even when `backendType` is `'mojo'`: every field has a working default
+   * (`mojo` on PATH + an ambient login is a valid setup). Use it to pin the
+   * model, inject a JWT, or force `--cloud` execution.
+   */
+  mojo?: MojoConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -1266,6 +1600,9 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /** Periodically @ the persisted Session owner while selected actionable
+   * runtime states remain unchanged. Missing means disabled. */
+  sessionOwnerReminder?: SessionOwnerReminderConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -1340,6 +1677,8 @@ export interface BotConfig {
   defaultOncallAutoboundChats?: string[];
   /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
+  /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
+  chatMentionModes?: { [chatId: string]: GroupMentionMode };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -1379,9 +1718,10 @@ export interface BotConfig {
    */
   acceptSlashFromBots?: boolean;
   /**
-   * 消息额度覆盖配置：
-   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
-   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
+   * 消息额度覆盖配置 —— **只约束「授权卡 / 自助申请授权」放进来的访客**：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条。
+   *   • 配置正整数 D    → 卡片默认 D 条。
+   * **Oncall 群恒不限额、不读本字段**（历史上读过，病史见 event-dispatcher.oncallTalk）。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
@@ -1475,6 +1815,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Sparse per-bot reply-writing/card-style overrides. Missing fields inherit
+   * the built-in recipe and theme defaults; malformed hand-edited fields are
+   * dropped independently by {@link normalizeReplyStyleConfig}.
+   *
+   * Workers freeze the normalized sparse object into BOTMUX_REPLY_STYLE when a
+   * session starts so the guide an Agent reads and the card renderer it invokes
+   * cannot drift halfway through a long-lived pane.
+   */
+  replyStyle?: ReplyStyleConfig;
+  /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
    *   • `'footer'`                      → in the ordinary reply-card footer
@@ -1493,6 +1843,27 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * Pin the current public streaming card. Default false; best-effort only.
+   */
+  pinStreamingCard?: boolean;
+  /** chat_id list: chats where streaming-card Pin is disabled even when the
+   *  bot-level {@link pinStreamingCard} master switch is on. Written by
+   *  `/card pin off|on`. */
+  noPinStreamingCardChats?: string[];
+  /**
+   * Stream the model's thinking process (CoT) into a native Feishu CoT
+   * message per turn: a fixed-height scrolling bubble showing thinking
+   * paragraphs and tool calls as nodes, auto-collapsing when the turn settles.
+   * Default ON (absent/undefined = on); only an explicit false disables.
+   * Requires a transcript-backed CLI (claude-code and codex today); other
+   * CLIs simply never emit the thinking channel. Per-chat opt-out via
+   * {@link noCotChats} (`/cot off`).
+   */
+  thinkingCard?: boolean;
+  /** chat_id list: chats where the CoT (thinking process) message is suppressed
+   *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
+  noCotChats?: string[];
   /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
    * progress markers in card-off sessions. Missing/false preserves the current
@@ -1519,9 +1890,19 @@ export interface BotConfig {
    *     keeps 1:1 chatter out of one long-running CLI process.
    *   - 'chat': route DMs as one flat, continuous chat-scoped session (all
    *     messages share the same context, similar to Hermes/OpenClaw).
-   * Editable at runtime via `/botconfig p2pMode chat|thread` (owner/admin).
+   *   - 'group': every top-level DM message births a dedicated 1-user+1-bot
+   *     "session group" that hosts the conversation (the bot keeps chat
+   *     ownership; the group is registered in session-groups-store and the
+   *     session lands chat-scope inside it). Falls back to 'thread' behavior
+   *     when group creation fails.
+   * Editable at runtime via `/botconfig p2pMode chat|thread|group` (owner/admin).
    */
-  p2pMode?: 'thread' | 'chat';
+  p2pMode?: 'thread' | 'chat' | 'group';
+  /**
+   * Settings for p2pMode='group' session groups. All fields optional; see
+   * SessionGroupConfig for defaults. Ignored under other p2pModes.
+   */
+  sessionGroup?: SessionGroupConfig;
   /** chat_id list: chats where the live streaming card is suppressed (status falls back to master's pending-card morph). Written by `/card off|on`. */
   noCardChats?: string[];
   /**
@@ -1575,6 +1956,15 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 主动开工 — 场景①自定义入群 seed 消息文案（该消息同时是话题根/共享会话锚点，
+   * 只在话题群 / 普通群 new-topic / shared 模式下发送；普通群顶层平铺入群静默）。
+   * 缺省/空白 → 按 bot locale 回退内置 i18n 文案（daemon.auto_start_join_seed）。
+   * bots.json 手配 + dashboard「Bot 默认设置」可编辑（card-prefs 链路，清空保存即
+   * 恢复默认）。注意 forcePrompt（Issue Board 领取）路径会跳过
+   * {@link autoStartOnGroupJoin} 开关检查，开关关闭时 seed 仍可能发出。
+   */
+  autoStartOnGroupJoinSeed?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
@@ -1596,6 +1986,11 @@ export interface BotConfig {
    * fresh thread under the triggering message.
    */
   messageListeners?: Record<string, MessageListenerConfig>;
+  /**
+   * 免@ 斜杠命令。per-bot 一份命令表 + 生效群范围（chats 空 = 所有群，
+   * excludedChats deny-wins）。见 {@link CommandTriggerConfig}。
+   */
+  commandTriggers?: CommandTriggerConfig;
   /**
    * Worktree picker mode on the repo-select card. When true, the worktree
    * control renders the multi-repo selector (pick N repos + branch) instead of
@@ -1637,6 +2032,17 @@ export interface BotConfig {
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /**
+   * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
+   * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
+   * --mention 只接受字面 open_id，传入邮箱等非 open_id 标识会被拒绝，避免模型
+   * 自主决定 @ 谁时“乱发”。开启后：
+   *   1. --mention 的每个值先经 resolveAllowedUsersWithMap 解析成本 app open_id；
+   *   2. 解析结果再与目标群的成员列表（listChatMemberOpenIds）做交集校验，
+   *      只有确实在群里的人才会被 @，不在群里的直接拒绝发送。
+   * 是否开放由配置该 bot 的人决定。
+   */
+  allowArbitraryMention?: boolean;
+  /**
    * Regular-group substitute trigger. When enabled, an @mention of one of the
    * configured people is treated as an address to this bot when the sender can
    * talk to the bot. Matching currently uses mention open_id / user_id / union_id;
@@ -1676,6 +2082,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot pricing overrides for cost estimation. Merged over the built-in
+   * model price table. See services/model-pricing.ts.
+   */
+  pricing?: PricingOverrides;
+  /**
+   * Per-bot monthly budget config. When set, the daemon tracks spend and
+   * alerts/blocks at thresholds. See services/budget-tracker.ts.
+   */
+  budget?: BudgetConfig;
 }
 
 export interface BotState {
@@ -1711,6 +2127,7 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
   usageDisplayCache = null;
+  replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1777,6 +2194,16 @@ function shortLarkPath(url: unknown): string {
  * access token can't leak.
  */
 export function formatLarkError(v: any): string | null {
+  // The SDK logger calls logger.error(formatErrors(error)), so its first
+  // argument is an array containing the already-sanitized Axios shape. Accept
+  // that wrapper here as well as the raw error received by CLI callers.
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const formatted = formatLarkError(item);
+      if (formatted) return formatted;
+    }
+    return null;
+  }
   if (!v || typeof v !== 'object') return null;
   const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
   if (!isAxios) return null;
@@ -1796,6 +2223,12 @@ export function formatLarkError(v: any): string | null {
   if (typeof code === 'number') parts.push(`code=${code}`);
   if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
   if (logId) parts.push(`log_id=${logId}`);
+  // Without an HTTP response, the transport code/message is the only useful
+  // signal. Keep it while still excluding config, headers, and stack.
+  if (httpStatus == null && typeof code !== 'number') {
+    if (typeof v.code === 'string' && v.code) parts.push(v.code);
+    if (typeof v.message === 'string' && v.message) parts.push(`"${v.message}"`);
+  }
   if (!parts.length) return null;
   return parts.join(' ');
 }
@@ -1832,8 +2265,18 @@ export function vcMeetingAgentConfigActive(
   cfg: Pick<BotConfig, 'apiOnly' | 'vcMeetingAgent'> | undefined,
 ): VcMeetingAgentConfig | undefined {
   if (!cfg) return undefined;
+  // apiOnly (core-only) bots have no Feishu transport — a VC listener drives
+  // `lark-cli vc +meeting-events --as bot`, which breaks the zero-Feishu-network
+  // contract. This fail-close is the load-bearing invariant and must stay first.
   if (cfg.apiOnly === true) return undefined;
-  return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
+  // Bot-agnostic join (2026-08): any invited bot should join, so VC is active by
+  // default for every Feishu-connected bot. `vcMeetingAgent.enabled: false` is
+  // the explicit per-bot opt-out; unset/absent now means active. A bot with no
+  // vcMeetingAgent block at all gets an empty effective config so downstream
+  // reads (listenerChatId auto-create, profile provision, consumer defaults)
+  // work off their own fallbacks. Fleet-wide off remains the global switch.
+  if (cfg.vcMeetingAgent?.enabled === false) return undefined;
+  return cfg.vcMeetingAgent ?? {};
 }
 
 export function registerBot(cfg: BotConfig): BotState {
@@ -2082,6 +2525,7 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -2182,6 +2626,52 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
     return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
   } catch {
     return DEFAULT_USAGE_DISPLAY;
+  }
+}
+
+/**
+ * Resolve the normalized sparse reply-style snapshot for a bot.
+ *
+ * Unlike hot display-only settings, a running CLI pane must keep the same
+ * replyStyle it learned through the botmux-send guide when it later invokes
+ * `botmux send`. Therefore the spawn-time env snapshot intentionally wins for
+ * the current app; daemon callers without that snapshot use the loaded registry,
+ * and one-shot host CLIs fall back to an mtime-cached bots.json read.
+ */
+export function resolveReplyStyleConfig(larkAppId: string): ReplyStyleConfig | undefined {
+  if (process.env.BOTMUX_SESSION_ID
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_REPLY_STYLE' in process.env) {
+    try {
+      const parsed = JSON.parse(process.env.BOTMUX_REPLY_STYLE || '{}');
+      return normalizeReplyStyleConfig(parsed).config;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.replyStyle;
+
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path);
+    if (!replyStyleCache || replyStyleCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, ReplyStyleConfig | undefined>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeReplyStyleConfig(entry.replyStyle).config);
+          }
+        }
+      }
+      replyStyleCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return replyStyleCache.map.get(larkAppId);
+  } catch {
+    return undefined;
   }
 }
 
@@ -2465,6 +2955,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
+    // Validate the `mojo` block through the SHARED normalizer, so a hand-edited
+    // bots.json is held to exactly the same rules as `/config set mojo`.
+    //
+    // Fail CLOSED, and on types as well as names: `localDaemon: "false"` used to
+    // satisfy the sandbox check's `!== true` (bypassing local isolation) while
+    // being truthy in buildEnv (enabling host execution) — isolation off AND
+    // local execution on. A typo like `cluod: true` would likewise leave the
+    // cloud sandbox silently disabled.
+    if (entry.mojo !== undefined) {
+      const normalized = normalizeMojoConfig(entry.mojo);
+      if (!normalized.ok) {
+        throw new Error(`Bot config [${i}]: ${normalized.errors.join('; ')}`);
+      }
+    }
     // apiOnly (core-only) bots drive purely over the HTTP control API and never
     // connect to Feishu, so a real app secret is not required. larkAppId is still
     // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
@@ -2495,7 +2999,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // also persist an exactly-equal path shadow so a rollback to an older
     // BotMux still launches the same distribution. Any unequal pair would make
     // old and new versions disagree, so it fails closed below.
-    const entryCliId = entry.cliId ?? 'claude-code';
+    const entryCliId = entry.cliId ?? LEGACY_DEFAULT_CLI_ID;
     if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
       throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
     }
@@ -2510,6 +3014,39 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
+    }
+    const existingAppServer = normalizeExistingAppServerConfig(
+      entry.existingAppServer,
+      `Bot config [${i}].existingAppServer`,
+    );
+    const codexBrowser = normalizeCodexBrowserConfig(
+      entry.codexBrowser,
+      `Bot config [${i}].codexBrowser`,
+    );
+    if (codexBrowser) {
+      if (entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: codexBrowser is supported only for cliId "codex-app"`);
+      }
+      if (existingAppServer) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with existingAppServer`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with sandbox or readIsolation`);
+      }
+    }
+    if (existingAppServer) {
+      if (entryCliId !== 'codex' && entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: existingAppServer is supported only for cliId "codex" or "codex-app"`);
+      }
+      if (entry.codexRpcInput === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with codexRpcInput`);
+      }
+      if (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with wrapperCli`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with sandbox or readIsolation`);
+      }
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -2573,6 +3110,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (normalizedMode) out[cid] = normalizedMode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
+    }
+
+    // chatMentionModes：只保留每群显式设置，非法值丢弃。四态 always｜topic｜
+    // never｜ambient 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
+    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatMentionMode）。
+    let chatMentionModes: { [chatId: string]: GroupMentionMode } | undefined;
+    if (entry.chatMentionModes && typeof entry.chatMentionModes === 'object' && !Array.isArray(entry.chatMentionModes)) {
+      const out: { [chatId: string]: GroupMentionMode } = {};
+      for (const [cid, mode] of Object.entries(entry.chatMentionModes)) {
+        if (typeof cid !== 'string' || !cid.trim()) continue;
+        const normalizedMode = normalizeGroupMentionModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
+      }
+      if (Object.keys(out).length > 0) chatMentionModes = out;
     }
 
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
@@ -2700,6 +3251,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
+    const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
+    for (const warning of normalizedReplyStyle.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -2711,11 +3267,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
-    // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
+    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
+    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
+    // resolveAsrConfig 做，这里只挡明显垃圾。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
@@ -2729,9 +3287,26 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
-        if (v.engine || v.sami || v.openai || v.speaker) voice = v;
+        const a = (rawVoice as any).asr;
+        if (a && typeof a === 'object') v.asr = {
+          enabled: a.enabled === true,
+          baseUrl: typeof a.baseUrl === 'string' ? a.baseUrl : undefined,
+          apiKey: typeof a.apiKey === 'string' ? a.apiKey : undefined,
+          model: typeof a.model === 'string' ? a.model : undefined,
+          ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
+          ...(typeof a.language === 'string' ? { language: a.language } : {}),
+        };
+        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
       }
     }
+
+    // pricing：per-bot 定价覆盖。normalizePricingOverrides 做宽松校验，
+    // 非法项丢弃，全空返回 undefined。
+    const pricing = normalizePricingOverrides(entry.pricing);
+
+    // budget：per-bot 月度预算。parseBudgetConfig 做宽松校验，
+    // 非法/缺字段返回 null。
+    const budget = parseBudgetConfig(entry.budget);
 
     configs.push({
       larkAppId: entry.larkAppId,
@@ -2750,6 +3325,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entryCliId,
@@ -2766,16 +3342,30 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
-      reasoningEffort: isCodexReasoningCliId(entryCliId)
+      modelBackendVariant: entryCliId === 'traex'
+        && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
+        ? entry.modelBackendVariant
+        : undefined,
+      // Positive integer within the arm-able bound only; anything else → undefined
+      // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
+      turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
+      // dsh-only runtime variant; non-dsh CLIs drop it (same pattern as turnTimeoutMs).
+      dshRuntime: entryCliId === 'dsh' ? normalizeDshRuntime(entry.dshRuntime) : undefined,
+      reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
-        && codexModelSupportsReasoningEffort(
+        && cliModelSupportsReasoningEffort(
+          entryCliId,
           typeof entry.model === 'string' ? entry.model : undefined,
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
+      existingAppServer,
+      // Missing keeps the historical every-cold-spawn global auth refresh.
+      codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -2791,11 +3381,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -2819,6 +3411,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // true is persisted (undefined = off) so bots.json stays clean.
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
+      chatMentionModes,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
@@ -2845,6 +3438,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      replyStyle: normalizedReplyStyle.config,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.
@@ -2852,15 +3446,36 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      pinStreamingCard: entry.pinStreamingCard === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      thinkingCard: entry.thinkingCard === false ? false : undefined,
+      // Default ON, same convention as thinkingCard: an absent key means the
+      // <sender> tag is injected, so existing prompts are unchanged.
+      senderTag: entry.senderTag === false ? false : undefined,
+      noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
+        ? (() => {
+          const filtered = entry.noPinStreamingCardChats
+            .filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0)
+            .map((x: string) => x.trim());
+          const normalized = Array.from(new Set<string>(filtered));
+          return normalized.length > 0 ? normalized : undefined;
+        })()
+        : undefined,
+      noCotChats: Array.isArray(entry.noCotChats)
+        ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
+        : undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
         ? entry.receivedReactionEmoji.trim() : undefined,
       doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
         ? entry.doneReactionEmoji.trim() : undefined,
-      // Default is now 'chat' (flat continuous DM session). Only 'thread' is
-      // meaningful and persists; 'chat' (and anything else) normalizes to
-      // undefined so bots.json stays clean.
-      p2pMode: entry.p2pMode === 'thread' ? 'thread' : undefined,
+      // Default is now 'chat' (flat continuous DM session). Only 'thread' and
+      // 'group' are meaningful and persist; 'chat' (and anything else)
+      // normalizes to undefined so bots.json stays clean.
+      p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
+      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
+        ? entry.sessionGroup as SessionGroupConfig
+        : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
@@ -2878,8 +3493,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
+      // Preserve the configured seed verbatim; trim-to-undefined when blank
+      // so an empty string doesn't linger in bots.json.
+      autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' && entry.autoStartOnGroupJoinSeed.trim()
+        ? entry.autoStartOnGroupJoinSeed
+        : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
+      // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
+      allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
       messageListeners,
+      commandTriggers,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
       // 连续会话；群内原生话题各自独立会话), so only the NON-default modes
@@ -2914,6 +3538,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       summaryMemoryPath,
       contentTriggers,
       voice,
+      pricing,
+      budget: budget ?? undefined,
     });
   }
 

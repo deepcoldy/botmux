@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-vi.mock('node:fs', async (importOriginal) => {
-  const original = await importOriginal<typeof import('node:fs')>();
+vi.mock('node:fs', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const original = require('node:fs') as typeof import('node:fs');
   return {
     ...original,
     openSync: vi.fn(original.openSync),
@@ -40,6 +43,7 @@ import {
   validateRunEnvelope,
   type V3AdHocRunEnvelope,
 } from '../src/workflows/v3/run-envelope.js';
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const CREATED_AT = '2026-07-10T08:00:00.000Z';
 const AUTHORIZED_AT = '2026-07-10T08:01:00.000Z';
@@ -445,9 +449,11 @@ describe('v3 run envelope — create-once publication + read states', () => {
   // re-introduces a blocking open, the child is killed and execFileSync throws
   // ETIMEDOUT instead of the vitest worker hanging forever.
   function runEnvelopeDriver(mode: 'envelope' | 'load', runDir: string): Record<string, unknown> {
+    // execFileSync 形态，wrapper 表达不了，用 runner 前缀拼 argv。
+    const { command, prefixArgs } = tsRunnerPrefix();
     const stdout = execFileSync(
-      process.execPath,
-      ['--import', 'tsx', join(__dirname, 'fixtures', 'read-run-envelope-cli.ts'), mode, runDir],
+      command,
+      [...prefixArgs, join(__dirname, 'fixtures', 'read-run-envelope-cli.ts'), mode, runDir],
       { timeout: 15_000, encoding: 'utf8' },
     );
     return JSON.parse(stdout.trim().split('\n').pop()!) as Record<string, unknown>;

@@ -112,6 +112,7 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -417,6 +418,26 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+  });
+
+  it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    ds.session.webPort = 9999;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('exit', 1);
+
+    expect(ds.workerPort).toBe(null);
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: {
+        sessionId: 'sid-lifecycle-test',
+        patch: { webPort: null, workerPid: null },
+      },
+    });
   });
 
   it('suppresses external exit events for an intentional transfer detach', async () => {

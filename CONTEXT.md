@@ -19,6 +19,14 @@ _Avoid_: agent, app
 A continuing conversation between one chat anchor and one **Agent CLI**.
 _Avoid_: thread, task
 
+**Sender Identity**:
+The best-effort identity of the person or Bot that authored one inbound chat
+message. It follows each message turn rather than being fixed to a **Session**;
+multiple senders may therefore appear in one Session. Human sender identity may
+include an app-scoped open ID, display name, and email when the chat platform
+makes them available. Missing optional fields never block message delivery.
+_Avoid_: session owner, card recipient
+
 **Token Usage**:
 Token counts reported by an **Agent CLI** or its persisted transcript for a
 **Session**. Token In is the Agent CLI's native input-side total, including

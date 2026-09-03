@@ -19,11 +19,9 @@ function registryLockTarget(): string {
   return pluginRegistryPath();
 }
 
-function parsePluginRegistry(): PluginRegistryFile {
-  const file = pluginRegistryPath();
-  if (!existsSync(file)) return { schemaVersion: 1, plugins: {} };
+function parsePluginRegistryText(text: string): PluginRegistryFile {
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf-8'));
+    const parsed = JSON.parse(text);
     const rawPlugins = parsed?.plugins && typeof parsed.plugins === 'object' && !Array.isArray(parsed.plugins)
       ? parsed.plugins as Record<string, unknown>
       : {};
@@ -37,6 +35,16 @@ function parsePluginRegistry(): PluginRegistryFile {
       plugins[id] = record;
     }
     return { schemaVersion: 1, plugins };
+  } catch {
+    return { schemaVersion: 1, plugins: {} };
+  }
+}
+
+function parsePluginRegistry(): PluginRegistryFile {
+  const file = pluginRegistryPath();
+  if (!existsSync(file)) return { schemaVersion: 1, plugins: {} };
+  try {
+    return parsePluginRegistryText(readFileSync(file, 'utf-8'));
   } catch {
     return { schemaVersion: 1, plugins: {} };
   }
@@ -111,8 +119,93 @@ function readPluginRegistryUnlocked(): PluginRegistryFile {
   return migrateLegacyPluginMcpDescriptors(parsePluginRegistry());
 }
 
+/** The lock could not be CREATED because this process has no write authority
+ *  over `~/.botmux` — the sandboxed-bot case: its fs policy exposes
+ *  `plugins-registry.json` read-only, so `open('<registry>.lock', 'wx')` (or the
+ *  `ensurePluginRegistryDir` mkdir before it) fails outright. Deliberately does
+ *  NOT include EEXIST (another holder — `withFileLockSync` waits that out) or
+ *  `FILE_LOCK_TIMEOUT` (busy): both keep their current behaviour, because both
+ *  mean a writer exists and retrying is the right answer. */
+function isUnwritableLockError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EROFS';
+}
+
+/** Read for a caller that cannot take the lock. Two deliberate differences from
+ *  `readPluginRegistryUnlocked()`:
+ *
+ *  - It does NOT run the lazy legacy migration. That migration WRITES (moves an
+ *    inline MCP descriptor into the plugin's private file and rewrites the
+ *    registry), which is exactly what this caller has no authority to do. Legacy
+ *    records are projected to their public shape instead — a reader that cannot
+ *    perform the migration must not be handed the `command`/`env`/`url`/`headers`
+ *    fields the migration exists to move OUT of the registry. Validation stays
+ *    identical to the migrating path, so an invalid record still throws rather
+ *    than being served in a shape no consumer expects.
+ *  - It does NOT reuse `parsePluginRegistry`'s `existsSync` probe, which returns
+ *    false for an UNREADABLE file too: that would report a denied registry as
+ *    "no plugins installed" — byte-identical to a clean host, and silence is the
+ *    worst answer for a bot asking which plugins it is running. Only ENOENT is
+ *    empty; every other read failure propagates. */
+function readPluginRegistryReadOnly(): PluginRegistryFile {
+  let text: string;
+  try {
+    text = readFileSync(pluginRegistryPath(), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { schemaVersion: 1, plugins: {} };
+    throw error;
+  }
+  const registry = parsePluginRegistryText(text);
+  for (const record of Object.values(registry.plugins)) {
+    const mcp = (record.contributions as { mcp?: unknown } | undefined)?.mcp;
+    if (mcp === undefined) continue;
+    if (isPluginMcpServer(mcp)) {
+      if (mcp.name !== record.id) throw new Error(`invalid_legacy_plugin_mcp_descriptor:${record.id}`);
+      record.contributions = { ...record.contributions, mcp: publicPluginMcpContribution(mcp) };
+      continue;
+    }
+    if (!isPluginMcpContribution(mcp) || hasPrivateMcpFields(mcp)) {
+      throw new Error(`invalid_plugin_mcp_contribution:${record.id}`);
+    }
+  }
+  return registry;
+}
+
+/** The lock was created fine, but the LAZY MIGRATION inside it could not write.
+ *  This is the Linux/bwrap shape: `~/.botmux` is a fresh tmpfs (the ro-bind of the
+ *  registry auto-creates its parent), so `open(lock,'wx')` SUCCEEDS and the
+ *  migrating path runs — then `atomicWriteFileSync`'s rename onto the read-only
+ *  bind fails with EBUSY. Same for a private descriptor write under a read-only
+ *  plugin dir (EACCES/EPERM). Without this, a sandboxed bot with a legacy registry
+ *  gets an EBUSY instead of an answer.
+ *
+ *  `migrateLegacyPluginMcpDescriptors` re-wraps everything it catches, so the errno
+ *  is on `.cause`, NOT on the top level — checking `error.code` here would match
+ *  nothing. Requiring `cause.code` is also exactly what separates "we cannot write"
+ *  from "this record is invalid": `invalid_plugin_mcp_contribution` /
+ *  `invalid_legacy_plugin_mcp_descriptor` arrive wrapped in the same prefix but
+ *  carry no errno, so they keep propagating — swallowing those would destroy the
+ *  one check that stops private descriptor fields reaching a caller. */
+function isUnwritableMigrationError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (!error.message.startsWith('plugin_mcp_registry_migration_failed:')) return false;
+  const code = (error.cause as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'EROFS';
+}
+
 export function readPluginRegistry(): PluginRegistryFile {
-  return withFileLockSync(registryLockTarget(), () => readPluginRegistryUnlocked(), { maxWaitMs: 30_000 });
+  try {
+    return withFileLockSync(registryLockTarget(), () => readPluginRegistryUnlocked(), { maxWaitMs: 30_000 });
+  } catch (error) {
+    // A reader with no write authority degrades to the non-migrating read above —
+    // whether it was the LOCK it could not create (seatbelt: `~/.botmux` denied)
+    // or the MIGRATION it could not write (bwrap: lock fine, registry read-only).
+    // Writers (`writePluginRegistry` / `upsertInstalledPlugin` /
+    // `removeInstalledPlugin`) deliberately keep throwing: they genuinely cannot
+    // do their job here, and a silent no-op write is far worse than an EPERM.
+    if (!isUnwritableLockError(error) && !isUnwritableMigrationError(error)) throw error;
+    return readPluginRegistryReadOnly();
+  }
 }
 
 export function writePluginRegistry(registry: PluginRegistryFile): void {

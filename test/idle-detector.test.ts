@@ -10,9 +10,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -21,6 +23,8 @@ function makeCli(opts: {
   completionPattern?: RegExp;
   busyPattern?: RegExp;
   idleToBusyPattern?: RegExp;
+  staticBusyPattern?: RegExp;
+  staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
 } = {}): CliAdapter {
   return {
@@ -31,6 +35,8 @@ function makeCli(opts: {
     completionPattern: opts.completionPattern,
     busyPattern: opts.busyPattern,
     idleToBusyPattern: opts.idleToBusyPattern,
+    staticBusyPattern: opts.staticBusyPattern,
+    staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
     systemHints: [],
     altScreen: false,
@@ -147,11 +153,6 @@ describe('IdleDetector: onBusy()', () => {
 
   it.each([
     {
-      name: 'Pi',
-      cli: createPiAdapter('/bin/pi'),
-      redraw: '\x1b[2JWorking... on it',
-    },
-    {
       name: 'Genius',
       cli: createGeniusAdapter('/bin/genius'),
       redraw: '\x1b[2JThe previous screen said esc to interrupt while it was running.',
@@ -171,6 +172,514 @@ describe('IdleDetector: onBusy()', () => {
     detector.fireIdle();
     detector.feed(redraw);
     expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('Pi opts in: Working... after idle flips busy so a false ready self-heals', () => {
+    // Pi's `Working...` is an ephemeral status line — never part of transcript
+    // history redraws — so the adapter explicitly sets idleToBusyPattern. A
+    // falsely published ready (e.g. a startup-window quiescence idle that
+    // slipped past the gates) is corrected as soon as the marker renders:
+    // the worker's onBusy pulls isPromptReady back to false and republishes
+    // working.
+    const cli = createPiAdapter('/bin/pi');
+    expect(cli.idleToBusyPattern?.source).toBe(cli.busyPattern?.source);
+
+    const detector = new IdleDetector(cli);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K plain redraw without the marker');
+    expect(cb).not.toHaveBeenCalled();
+    detector.feed('\x1b[2K● Working... (esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Re-arms per idle cycle: a second marker in the same cycle stays quiet,
+    // the next idle re-arms the edge.
+    detector.feed('● Working... still');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.fireIdle();
+    detector.feed('● Working...');
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+});
+
+// ─── TraeX capacity-queue busy pattern (regression) ──────────────────────
+
+describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
+  // Bind directly to the production adapter so this suite stays honest if the
+  // pattern in adapters/cli/traex.ts ever changes — no parallel hand-rolled
+  // regex to drift out of sync. '/bin/true' stub keeps resolveCommand() from
+  // failing on hosts without `traex` installed; the lazy resolvedBin getter
+  // is never touched by IdleDetector.
+  //
+  // All PTY text below is composed from strings extracted verbatim from the
+  // traex binary's compiled-in TUI string tables (verified across all 9 local
+  // releases, 0.201.1-alpha.5 … 0.201.2-alpha.2):
+  //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  //   working labels:  "Working…", "Pondering…" (full rotation in traex.ts)
+  //   queue strings:   "Queued for capacity",
+  //                    "Too many requests right now. You're in the queue."
+  //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
+  // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
+  // (0 hits across all releases + the 94MB TUI logs).
+  const traexAdapter = createTraexAdapter('/bin/true');
+
+  it('flips a queued session back to busy when the capacity-queue string renders after a false idle', () => {
+    // TraeX's readyPattern matches the `\d+% left` status bar, so a static
+    // queue screen survives the 2s quiescence window and fires a false idle.
+    // The adapter's idleToBusyPattern must flip the session back to working
+    // as soon as the queue marker renders in the PTY stream.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2KQueued for capacity');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('flips busy when the full queue notice renders after a false idle', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed("\x1b[2KToo many requests right now. You're in the queue.");
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('flips busy when a spinner-anchored working label renders after a false idle', () => {
+    // The same self-heal must cover the ordinary working screen, not just
+    // the capacity queue — a false idle during a working turn should recover
+    // when the spinner status line renders again. The braille frame + label
+    // is the real TUI rendering (frame from the compiled-in spinner set,
+    // label from the compiled-in spinner string table).
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K⠋ Working…');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('flips busy on rotating spinner labels beyond Working…', () => {
+    // The working status rotates through the full compiled-in label set;
+    // every frame must self-heal a false idle.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K⠹ Pondering…');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('does not flip busy on an idle composer redraw', () => {
+    // The idle composer (with the `\d+% left` status bar that readyPattern
+    // matches) must NOT trigger the busy transition — only the explicit
+    // active-turn markers do.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('does not flip busy on prose containing a working label without the spinner frame', () => {
+    // The braille frame anchor is the discriminator: assistant output like
+    // "Working… on the fix" must not revive a completed card.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('Working… on the fix');
+    expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('re-arms the busy edge after the next idle cycle', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2KQueued for capacity');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // A second queue screen in the same idle→busy cycle stays quiet.
+    detector.feed('\x1b[2KQueued for capacity');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // The next idle re-arms the edge.
+    detector.fireIdle();
+    detector.feed('\x1b[2K⠼ Working it out…');
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+});
+
+// ─── TraeX static capacity-queue pre-idle latch (ZMX regression) ─────────
+
+describe('IdleDetector: static capacity-queue pre-idle latch', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Same production adapter as the suite above — see its comment for the
+  // binary-extraction evidence behind every string used here.
+  const traexAdapter = createTraexAdapter('/bin/true');
+
+  it('ZMX shape: one queue+status chunk followed by silence never goes idle; composer redraw recovers', () => {
+    // The supported ZMX backend cannot use busyPattern viewport probes
+    // (its history is not an authoritative viewport) and never feeds
+    // history into IdleDetector, so a static queue screen that matches
+    // readyPattern's `\d+% left` arm used to survive quiescence and fire a
+    // false idle with no PTY bytes left to self-heal. The pre-idle latch
+    // must consume the queue evidence straight from the byte stream.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Single chunk: ANSI clear-line + queue notice + readyPattern status bar.
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Complete silence, timers far past quiescence (2s) + spinner guard (3s).
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Queue resolves: the real composer redraws (prompt marker, no queue
+    // string) — the latch must clear and normal quiescence fire idle.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('holds the spinner-prefixed queue screen busy the same way', () => {
+    // The queue screen can render a frozen braille frame in front of the
+    // label; the spinner guard alone would expire after 3s and still
+    // false-idle. The latch must cover the spinner-prefixed form too.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2K⠋ Queued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('holds the full queue notice busy, with or without the at-position suffix', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed("\x1b[2KToo many requests right now. You're in the queue at position 3.\nContext 100% left");
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('does not latch on a mid-sentence prose quote of the queue string', () => {
+    // Line anchoring: assistant transcript prose quoting the queue notice
+    // mid-line must not suppress idle. The chunk carries a real composer at
+    // the bottom so quiescence is allowed to run.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('The CLI printed "Queued for capacity" and then stalled\n› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(5_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('does not clear the latch on a noise chunk without fresh ready evidence', () => {
+    // The latch is decided from the CURRENT chunk: a stray redraw fragment
+    // carrying neither the queue marker nor ready evidence must leave it
+    // armed (the queue screen's own `100% left` lingers in the tail and
+    // must not be allowed to clear it).
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('clears the latch on reset so a rebased cycle can go idle', () => {
+    // ZMX resync / botmux submit call reset(): a latched queue cycle must
+    // not suppress idle forever after the state rebase.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.reset();
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    // reset() synthesizes a recent spinner timestamp, so idle needs the full
+    // 3s spinner guard on top of the 2s quiescence window.
+    vi.advanceTimersByTime(6_000);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('lets external structured completion (fireIdle) through while latched', () => {
+    // reliableTurnTerminal (task_complete) is authoritative independently
+    // of the screen observer; the latch must not block it.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.fireIdle();
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('generic adapter: latch suppresses screen idle but not external idle, and recovers on composer', () => {
+    // Mechanism-level check with a stub adapter so the behavior does not
+    // depend on traex's exact string table.
+    const detector = new IdleDetector(makeCli({
+      staticBusyPattern: /(?:^|[\n\r])[ \t]*QUEUED/i,
+      staticBusyClearPattern: /PROMPT>/,
+      readyPattern: /PROMPT>/,
+    }));
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('QUEUED for capacity\n');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.fireIdle();
+    expect(idleCb).toHaveBeenCalledTimes(1);
+
+    // After the external idle, a composer redraw clears the latch and a
+    // later silence goes idle via the screen path.
+    detector.feed('PROMPT> ');
+    vi.advanceTimersByTime(5_500);
+    expect(idleCb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('chunk-invariant: queue line and status bar in separate deltas do not clear the latch', () => {
+    // ZMX captures history at ~50ms tail debounce / 250ms hot poll; adjacent
+    // prefix snapshots each emitData(delta). A queue line in one capture and
+    // the `\d+% left` status bar in the next must NOT clear the latch — the
+    // broad readyPattern matches the status bar, so only explicit composer
+    // evidence (staticBusyClearPattern) may clear it.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Chunk 1: queue line only (no status bar yet).
+    detector.feed('\x1b[2KQueued for capacity');
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Chunk 2: status bar in a separate delta. The old code cleared the
+    // latch here because readyPattern matches `\d+% left`.
+    detector.feed('\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer redraw clears the latch and idle fires.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('chunk-invariant: queue marker split across chunks is detected via rolling tail', () => {
+    // The queue text itself can be split across PTY chunks ("Queued for cap"
+    // + "acity"). The latch must scan the rolling outputTail, not just the
+    // current chunk, to detect the full marker.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Chunk 1: first half of the queue marker (no match yet).
+    detector.feed('\x1b[2KQueued for cap');
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Chunk 2: second half + status bar. The rolling tail now contains the
+    // full "Queued for capacity" string — the latch must fire.
+    detector.feed('acity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer redraw clears the latch and idle fires.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('chunk-internal freshness: submitted user line before fresh queue does not clear latch', () => {
+    // ZMX prefix snapshots merge new history into one delta. A submitted
+    // user message (`› text`) followed by a fresh queue line in the SAME
+    // chunk must NOT clear the latch — the queue is fresher evidence.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('› 请修复这个问题\nQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer (placeholder text, not a submitted user line) clears.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('chunk-internal freshness: queue before composer in same chunk clears latch', () => {
+    // The inverse: a queue line followed by a real composer redraw in the
+    // same chunk means the queue is gone — the latch must clear and idle
+    // must fire after quiescence.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\nContext 100% left\n› Ask TraeCode CLI to do anything');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: composer clear followed by status-only redraw does not re-latch', () => {
+    // After a composer redraw clears the latch, a subsequent status-bar-only
+    // chunk (no composer, no fresh queue) must NOT re-set the latch from
+    // stale queue text lingering in the rolling tail. ZMX hot-poll makes
+    // composer→status-redraw a common sequence. The status-only chunk
+    // arrives BEFORE quiescence fires (isIdle still false), so the stale
+    // tail is still present.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Queue screen latches.
+    detector.feed('Queued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Composer redraw clears the latch. Do NOT advance timers yet — the
+    // stale tail is still present.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything');
+
+    // Status-bar-only redraw: tail still has old queue text, but it must
+    // not re-latch (stale position < clear position).
+    detector.feed('\x1b[2K100% left');
+    vi.advanceTimersByTime(5_000);
+    // Idle fires: the latch was not re-set by the stale tail.
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: composer+status same chunk followed by status-only redraw does not re-latch', () => {
+    // Real-world shape: the composer line itself carries the status bar,
+    // followed by a pure status-bar redraw — all before quiescence fires.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\n100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Composer + status in the same chunk — clear wins (composer is after
+    // queue in the chunk).
+    detector.feed('› Ask TraeCode CLI to do anything   100% left');
+
+    // Pure status redraw must not re-latch from stale tail.
+    detector.feed('100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: fresh queue after clear re-latches (position > clear pos)', () => {
+    // Control: a genuinely new queue screen AFTER the clear must re-latch.
+    // The new queue arrives after idle fired (isIdle=true), so feed()
+    // resets the tail and clear position — the new queue is fresh.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\nContext 100% left');
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+
+    // New queue screen — fresh evidence after the clear.
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    // Latch held: idle does NOT fire again.
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: clear position shifts left when tail window slides', () => {
+    // After a composer clear, if the turn produces >~470 chars of output,
+    // the tail window slides (drops from head). The clear position must
+    // shift left too — otherwise a fresh queue landing at a low index in
+    // the new window is falsely treated as stale (position < clearPos).
+    // Do NOT advance timers between clear and fresh queue: an idle fire
+    // would reset clearPos via the isIdle path, making the test pass
+    // without exercising the slide-decrement.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Queue + filler + composer clear, all before any timer advance.
+    detector.feed('Queued for capacity\n100% left');
+    detector.feed('z'.repeat(471) + '\n');
+    detector.feed('\n› Ask TraeCode CLI to do anything');
+
+    // Fresh queue lands at a LOW index in the new tail window (after the
+    // slide). It must re-latch despite the old high clearPos.
+    detector.feed('\nQueued for capacity\n' + 't'.repeat(430));
+    vi.advanceTimersByTime(10_000);
+    // Latch held: idle does NOT fire. Without the slide-decrement, the
+    // stale clearPos would suppress the latch and idle would fire.
+    expect(idleCb).not.toHaveBeenCalled();
     detector.dispose();
   });
 });
@@ -318,6 +827,39 @@ describe('IdleDetector: quiescence detection', () => {
     detector.feed('READY>');
     vi.advanceTimersByTime(2000);
     expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  // Regression (PR #996 P0): cursor-agent renders `sessionEmpty ? "Plan,
+  // search, build anything" : "Add a follow-up"` and never reverts. The worker
+  // reset()s the detector before every write (clearing readySeen), and
+  // quiescence stays suppressed until readyPattern is seen again. A
+  // first-turn-only readyPattern therefore matched on turn 1 but never on turn
+  // 2+, so idle never fired again and the CLI was stuck reporting "working".
+  // With the real cursor adapter's two-state readyPattern, every turn's idle
+  // edge survives the reset.
+  it('cursor: idle still fires on turn 2+ after the composer placeholder switches', () => {
+    const detector = new IdleDetector(createCursorAdapter('/bin/cursor-agent'));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Turn 1: empty-session composer.
+    detector.feed('  → Plan, search, build anything');
+    vi.advanceTimersByTime(2000);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Worker resets before writing the next turn's input (clears readySeen).
+    detector.reset();
+
+    // Turn 2: cursor now shows the post-turn placeholder. The bug: this never
+    // matched a first-turn-only pattern, so readySeen stayed false and idle
+    // never fired. The fix: the two-state pattern matches, idle fires again.
+    detector.feed('working on it...');
+    vi.advanceTimersByTime(2000);
+    expect(cb, 'quiescence must stay suppressed until the post-turn composer is seen').toHaveBeenCalledTimes(1);
+    detector.feed('  → Add a follow-up');
+    vi.advanceTimersByTime(2000);
+    expect(cb, 'turn-2 idle must fire on the post-turn "Add a follow-up" placeholder').toHaveBeenCalledTimes(2);
     detector.dispose();
   });
 });

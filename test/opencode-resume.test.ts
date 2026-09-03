@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
-import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createOpenCodeAdapter, detectOpenCodeSubmit, snapPartBaseline } from '../src/adapters/cli/opencode.js';
 import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -279,5 +279,132 @@ describe('opencode writeInput DB verification', () => {
 
     expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
     expect(events).toEqual([`paste:${content.length}`, 'key:Enter']);
+  });
+
+  it('recognizes the submission when OpenCode prepends a Directory Context block to the stored user part', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
+    // OpenCode 会把 [Directory Context: …/AGENTS.md] 系统块前置到用户消息前再落库
+    const storedText = `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}`;
+    const pty = stubPty(() => {
+      if (pty.enters === 1) seedUserPart(db, 'ses_target', storedText, Date.now());
+    });
+
+    const adapter = createOpenCodeAdapter();
+    const result = await adapter.writeInput(pty, content);
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+  }, 15_000);
+
+  it('does not confirm an unrelated same-session row when the expected text lacks a user-message section', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nexpected payload`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nunrelated payload`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
+
+  it('treats XML-looking text inside user_message as opaque content', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nshow <session_id>literal</session_id> and </user_message> literally\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+    expect(pty.enters).toBe(0);
+  });
+
+  it('does not confirm when persisted text diverges after a literal closing tag', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nliteral </user_message> expected tail\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nliteral </user_message> unrelated tail\n</user_message>`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
+
+  it('does not confirm when extra text wraps the envelope on both sides (prefix + suffix)', async () => {
+    // 钉住 textMatches 的边界：宽容前缀分支只允许「前面加东西」，后缀分支只允许
+    // 「后面加东西」；前后都加东西时（na 既不 startsWith 也不 endsWith 于 ne）
+    // 必须判为未提交。若有人把 endsWith 放宽成 includes，这条会立刻变红。
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}\n\n[trailing text after the envelope]`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
+});
+
+describe('opencode detectOpenCodeSubmit retry behaviour', () => {
+  function stubPty(onEnter?: () => void): PtyHandle & { enters: number } {
+    const handle = {
+      enters: 0,
+      write(_data: string) { /* raw pty path unused in this stub */ },
+      sendText(_text: string) { /* typed */ },
+      sendSpecialKeys(..._keys: string[]) {
+        handle.enters++;
+        onEnter?.();
+      },
+    };
+    return handle;
+  }
+
+  it('does not send a retry Enter when the record lands during the 800ms wait', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
+    let waits = 0;
+    const pty = stubPty();
+    const delayFn = async () => {
+      waits++;
+      if (waits === 1) seedUserPart(db, 'ses_target', content, Date.now());
+    };
+    const baseline = snapPartBaseline();
+    const result = await detectOpenCodeSubmit(pty, baseline, content, delayFn);
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+    expect(pty.enters).toBe(0);  // 等待期间已确认，不再补发重试 Enter
   });
 });

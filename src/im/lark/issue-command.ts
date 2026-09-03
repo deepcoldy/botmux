@@ -16,7 +16,7 @@
  * 未经校验。
  */
 import { logger } from '../../utils/logger.js';
-import { scanMultipleProjects } from '../../services/project-scanner.js';
+import { describeProjectDir, scanMultipleProjects } from '../../services/project-scanner.js';
 import { configuredWorkingDirs, expandHomePath } from '../../utils/working-dir.js';
 import {
   ISSUE_ACTION_CLAIM_CANCEL,
@@ -54,8 +54,10 @@ export interface IssueCommandDeps {
   >;
   /** 该 bot 的管理员 open_id 名单（`resolvedAllowedUsers`）。 */
   allowedUsers: (larkAppId: string) => string[];
-  /** 该 bot 配置的工作目录（未展开 `~`）。 */
+  /** 该 bot 显式配置的仓库扫描根（未展开 `~`）。 */
   workingDirs: (larkAppId: string) => string[];
+  /** 该 bot 的有效固定目录（fixed / default-oncall，未展开 `~`）。 */
+  defaultWorkingDir: (larkAppId: string) => string | undefined;
   /** 跑 [[issue-release]] 的 `releaseIssue`。按锚点释放，锚点由调用方从当前会话推出来。 */
   runRelease: (anchorId: string) => Promise<TerminalResult>;
   /** 跑 [[issue-release]] 的 `completeIssue`（验收完成）。与释放同形，只是目标态不同。 */
@@ -120,18 +122,31 @@ function toRow(i: PlatformIssue): IssueRowData {
 /**
  * 扫出该 bot 可选的仓库。
  *
- * 不能直接用 `workingDirs`：它常常配的是一个工作区父目录（`~/claude-code-workspace`），
- * 直接当候选，选中的会是工作区根目录。扫一层才拿得到真正的仓库和 worktree。
+ * 显式 `workingDirs` 是工作区父目录，需要递归找出其中的仓库和 worktree。
+ * fixed / default-oncall 则钉住一个目录：只有该目录本身是 git 仓库时才直接生成唯一候选，
+ * 不能把它当扫描根，否则 `~` 等大目录会同步卡住卡片回调，单仓库也会展开数百个 worktree。
  */
 export function reposFor(larkAppId: string, deps: IssueCommandDeps): RepoChoice[] {
   const dirs = configuredWorkingDirs({ workingDirs: deps.workingDirs(larkAppId) }).map(expandHomePath);
-  if (!dirs.length) return [];
   try {
-    return scanMultipleProjects(dirs, 3, { includeWorktrees: true }).map((p) => ({
-      name: p.name,
-      path: p.path,
-      ...(p.branch ? { branch: p.branch } : {}),
-    }));
+    if (dirs.length > 0) {
+      return scanMultipleProjects(dirs, 3, { includeWorktrees: true }).map((p) => ({
+        name: p.name,
+        path: p.path,
+        ...(p.branch ? { branch: p.branch } : {}),
+      }));
+    }
+
+    const defaultDir = deps.defaultWorkingDir(larkAppId)?.trim();
+    if (!defaultDir) return [];
+    const path = expandHomePath(defaultDir);
+    const project = describeProjectDir(path);
+    if (!project) return [];
+    return [{
+      name: project.name,
+      path,
+      ...(project.branch ? { branch: project.branch } : {}),
+    }];
   } catch (e) {
     // 扫描失败不该让整个命令挂掉：回落到空候选，确认卡会说明"没扫到仓库"。
     logger.warn(`[issue] 扫描仓库失败: ${String((e as Error)?.message ?? e)}`);

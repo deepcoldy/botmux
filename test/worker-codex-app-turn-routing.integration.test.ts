@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -41,7 +42,11 @@ async function hardKillWorkerOnly(child: ChildProcess): Promise<void> {
 function waitForChildExit(
   child: ChildProcess,
   logs: string[],
-  timeoutMs = 10_000,
+  // The tmux-pipe lifecycle watcher now backs off its pane probes (1s→3s→9s),
+  // so a genuinely dead managed pane is torn down after ~13s worst-case
+  // (3 backed-off misses + lenient confirm) instead of the old ~3-4s. Give the
+  // worker-exit wait enough headroom to observe that teardown.
+  timeoutMs = 30_000,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
@@ -84,7 +89,7 @@ function spawnWorker(
   messages: WorkerToDaemon[],
   onMessage?: (message: WorkerToDaemon, child: ChildProcess) => void,
 ): ChildProcess {
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,
@@ -189,7 +194,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -319,7 +324,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -398,7 +403,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -475,7 +480,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

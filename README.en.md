@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
@@ -39,10 +39,29 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 > About 5 minutes: a single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (add `--no-open-platform-auto` to only create the app and skip the permission + publish automation, which you then complete manually; creating the app manually / pasting credentials is a separate option inside setup).
 
 ```bash
-npm install -g botmux        # requires Node >= 22
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # one scan to create the app → pick a CLI → pick a working dir (permissions + publish auto-configured)
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
+
+> botmux ships as a **self-contained single-file binary** with its runtime embedded — **neither installing nor running it needs Node on the machine** (whatever the AI coding CLI you bridge needs is its own matter). It installs to `~/.botmux/bin/botmux` (override with `BOTMUX_INSTALL_DIR`), picks the right binary for your OS/arch, verifies its SHA-256, and adds `~/.botmux/bin` to the startup file your shell actually reads (zsh / bash / fish each get the correct one), so **a new terminal has the command**.
+>
+> Nothing native is compiled during install (no Python / node-gyp / compiler): the PTY is already inside the binary. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2** — the daemon needs PTY / tmux / Unix signals and does not run on native Windows; WSL2 reports as linux and is a fully supported first-class environment. An unsupported platform, or a binary that cannot run on this host, **fails with an explicit error and leaves your existing install untouched** rather than leaving you with a command that won't start.
+>
+> To upgrade: `botmux upgrade` (replaces the binary in place), or just **re-run the curl command** — also an in-place upgrade, and it won't append a second PATH line.
+
+<details>
+<summary>Already living in the Node ecosystem? npm works too (same binary)</summary>
+
+```bash
+npm install -g botmux        # requires Node >= 22 to run the install itself
+```
+
+The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed); its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. So you end up with exactly **one** botmux version — no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
+
+The only difference is **who installs it and who upgrades it later**: the npm path needs Node ≥ 22 to run the install itself and hands upgrades back to `npm i -g botmux@latest`; the curl path never touches Node. Once running, the two are identical — same binary, same commands.
+
+</details>
 
 Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, manual permission / publish setup after `--no-open-platform-auto`, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
@@ -60,11 +79,43 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 ## Supported CLIs & Agents
 
-Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process). Representative ones:
+Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `mira` · `riff` (cloud agent) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
+
+The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
+
+Store only non-secret metadata and credential file paths in `bots.json`:
+
+```json
+{
+  "cliId": "ebsd",
+  "workingDir": "/var/lib/botmux/ebsd-work",
+  "sandbox": true,
+  "env": {
+    "EBSD_BOTMUX_DIAG_ENDPOINT": "https://ebsbot.example",
+    "EBSD_BOTMUX_DIAG_TOKEN_FILE": "/run/secrets/ebsd-botmux/diag-token",
+    "EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-ak",
+    "EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-sk",
+    "EBSD_BOTMUX_SUBJECT": "botmux-ebsd@prod",
+    "EBSD_BOTMUX_REPOSITORY_ROOT": "/srv/repos"
+  }
+}
+```
+
+The three credential files must be owner-held `0600` regular files, not symlinks. Never put their contents, the AK/SK, or the Gateway token in `bots.json`. Use a dedicated empty `workingDir`; repositories are exposed separately through the read-only `EBSD_BOTMUX_REPOSITORY_ROOT`. Linux hosts need bubblewrap before enabling `sandbox`, and startup fails closed if isolation cannot be established. The Gateway may accept current and previous keys during rotation while the subject remains stable.
 
 The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+
+### Session-level CLI selection
+
+Before a session starts, select a registered CLI for that session with `/cli <cliId>`, for example:
+
+```text
+/cli codex
+```
+
+This switches only the bare CLI adapter. It does not inherit the bot's `wrapperCli`, `model`, or `startupCommands`. CLIs that require a `ttadk`, `aiden`, or other wrapper / gateway setup should therefore remain configured as the bot's default wrapper combination. Once the session starts, the CLI selection is frozen and is reused for later messages and restores.
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 

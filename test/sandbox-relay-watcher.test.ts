@@ -20,6 +20,94 @@ afterEach(() => {
 });
 
 describe('sandbox relay watcher host handoff', () => {
+  it('re-execs dispatch on the host with a forced source session and bounded routing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'dispatch-echo.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const value = flag => argv[argv.indexOf(flag) + 1];
+      process.stdout.write(JSON.stringify({ command: argv[0], argv, sessionId: value('--session-id'), brief: readFileSync(value('--brief-file'), 'utf8') }));
+    `);
+    const id = 'dispatch-1';
+    writeFileSync(join(outbox, `${id}.content`), 'bounded task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--title', 'work', '--bot-app', 'cli_target', '--chat-id', 'oc_target'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const child = JSON.parse(response.stdout) as { command: string; argv: string[]; sessionId: string; brief: string };
+      expect(child.command).toBe('dispatch');
+      expect(child.sessionId).toBe('forced-source');
+      expect(child.brief).toBe('bounded task');
+      expect(child.argv).toContain('cli_target');
+      expect(child.argv).toContain('oc_target');
+    } finally {
+      stop();
+    }
+  });
+
+  it('rejects forged or legacy dispatch targets before spawning the host child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-reject-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write('ran');`);
+    const id = 'dispatch-reject';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch', contentFile: `${id}.content`, flags: ['--bot', 'friendly-name'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code).toBe(1);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain('dispatch flag not allowed');
+    } finally {
+      stop();
+    }
+  });
+
+  it('rejects a hand-written dispatch --into request at the watcher boundary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-into-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write('ran');`);
+    const id = 'dispatch-into-reject';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--bot-app', 'cli_target', '--into', 'om_other'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code).toBe(1);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain('dispatch flag not allowed: --into');
+    } finally {
+      stop();
+    }
+  });
+
   it('materializes prepared card bytes and passes only the private path to the host child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-watcher-'));
     roots.push(root);

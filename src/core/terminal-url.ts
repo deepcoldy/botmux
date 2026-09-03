@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { formatUrlHost } from './dashboard-url.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -105,6 +106,16 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     const publicBase = publicReverseProxyBaseUrl();
     if (publicBase) {
       const url = `${publicBase}/s/${ds.session.sessionId}`;
+      return opts.write
+        ? withCapability(url, 'token', ds.workerToken)
+        : withCapability(url, 'viewToken', ds.workerViewToken);
+    }
+    // Merlin Devbox 私有短链：同样走 dashboard 前门 `/s/<id>`，所以隧道对应的是
+    // dashboard 端口——不传 port，由 devboxDashboardBaseUrl() 按 `.dashboard-port`
+    // 解析当前实际端口并与缓存比对（端口漂移后回退本机，不指向旧隧道）。
+    const devboxBase = devboxDashboardBaseUrl();
+    if (devboxBase) {
+      const url = `${devboxBase}/s/${ds.session.sessionId}`;
       return opts.write
         ? withCapability(url, 'token', ds.workerToken)
         : withCapability(url, 'viewToken', ds.workerViewToken);

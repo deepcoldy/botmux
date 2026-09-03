@@ -1,9 +1,9 @@
-import { existsSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
 import {
   detectOpenCodeSubmit,
+  isOpenCodeSessionBusy,
   isOpenCodeSessionId,
   latestOpenCodeSessionForBotmuxSession,
   listOpenCodeResumableSessions,
@@ -133,8 +133,17 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    busyPattern: undefined,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v2');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.config/opencode/skills',
     // botmux ask-hook：V2 插件（新插件 API），写入 V2 全局插件发现目录。
     // ⚠️ beta 已知上游问题（next-17082）：HOME 是符号链接（如 /home→/data00/home）的

@@ -21,13 +21,27 @@ export class IdleDetector {
   private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
   private idleToBusyPattern: RegExp | undefined;
+  private staticBusyPattern: RegExp | undefined;
+  private staticBusyClearPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
+  /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
+   *  chunks carrying explicit static-busy evidence (scanned across chunks
+   *  via the rolling tail); suppresses screen-derived idle until a chunk
+   *  with explicit composer evidence (staticBusyClearPattern) redraws.
+   *  See CliAdapter.staticBusyPattern / staticBusyClearPattern. */
+  private staticBusyLatch = false;
+  /** Tail position of the last composer clear evidence. Queue evidence in
+   *  the tail at or before this position is stale (from before the clear)
+   *  and must not re-set the latch. -1 = no clear recorded. */
+  private staticBusyClearTailPos = -1;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
+    this.staticBusyPattern = cli.staticBusyPattern;
+    this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
   }
 
@@ -67,11 +81,19 @@ export class IdleDetector {
       this.isIdle = false;
       this.outputTail = '';
       this.readySeen = false;
+      this.staticBusyClearTailPos = -1;
       this.lastSpinnerAt = Date.now();
     }
 
     const stripped = this.stripAnsi(data);
-    this.outputTail = (this.outputTail + stripped).slice(-500);
+    // Shift the clear position left when the tail window drops characters
+    // from the head, so it stays relative to the current window.
+    const combined = this.outputTail + stripped;
+    const dropped = Math.max(0, combined.length - 500);
+    this.outputTail = combined.slice(-500);
+    if (this.staticBusyClearTailPos >= 0) {
+      this.staticBusyClearTailPos = Math.max(-1, this.staticBusyClearTailPos - dropped);
+    }
 
     // Only an explicitly opted-in CLI marker may turn a previously reported
     // idle cycle back into busy. Plain PTY activity — and legacy busyPattern
@@ -100,6 +122,43 @@ export class IdleDetector {
       this.readySeen = true;
     }
 
+    // Pre-idle static-busy latch (capacity-queue screens).
+    // SET: scan both the current chunk AND the rolling tail — the queue
+    //  marker can be split across chunks ("Queued for cap" + "acity"), and
+    //  the tail already holds the full text by the time the second chunk
+    //  arrives (consistent with idleToBusy/completionPattern split-chunk
+    //  handling).
+    // CLEAR: explicit composer evidence (staticBusyClearPattern) in the
+    //  CURRENT chunk. The broad readyPattern includes `\d+% left` (status
+    //  bar), which the queue screen itself carries — using it to clear
+    //  would re-open the false-idle bug when queue and status bar arrive
+    //  in separate chunks.
+    // ORDER: within a single chunk, whichever evidence appears LAST wins —
+    //  a submitted user message (`› text`) followed by a fresh queue line
+    //  must NOT clear the latch (the queue is fresher), while a queue line
+    //  followed by a real composer redraw must clear it.
+    // STALE-TAIL: after a clear, queue text lingering in the tail must not
+    //  re-set the latch. Record the clear position in the tail; only queue
+    //  evidence AFTER that position is fresh enough to set.
+    if (this.staticBusyPattern) {
+      const clearIdx = this.staticBusyClearPattern
+        ? lastMatchIndex(this.staticBusyClearPattern, stripped)
+        : -1;
+      const staticChunkIdx = lastMatchIndex(this.staticBusyPattern, stripped);
+      const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
+      if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
+        this.staticBusyLatch = false;
+        // Record where the clear landed in the tail so stale queue text
+        // before it doesn't re-set the latch on the next chunk.
+        const chunkStart = this.outputTail.length - stripped.length;
+        this.staticBusyClearTailPos = chunkStart >= 0
+          ? chunkStart + clearIdx
+          : this.outputTail.length;
+      } else if (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos) {
+        this.staticBusyLatch = true;
+      }
+    }
+
     // Track spinner — but not if it's part of completion marker,
     // and not after ready pattern is seen (status bar chars like · are not real spinners)
     if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(stripped) || this.completionPattern?.test(this.outputTail)) && !this.readySeen) {
@@ -114,7 +173,9 @@ export class IdleDetector {
       this.clearTimer();
       this.quiescenceTimer = setTimeout(() => {
         this.quiescenceTimer = null;
-        if (!this.isIdle) this.markIdle('screen');
+        // A static-busy latch outranks a completion marker: the queue screen
+        // can carry both, and the latch only clears on a composer redraw.
+        if (!this.isIdle && !this.staticBusyLatch) this.markIdle('screen');
       }, 500);
       return;
     }
@@ -132,6 +193,8 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
   }
@@ -147,6 +210,8 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = 0;
     this.clearTimer();
   }
@@ -166,11 +231,18 @@ export class IdleDetector {
     this.idleCallback = null;
     this.busyCallback = null;
     this.busyTransitionArmed = false;
+    this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
   }
 
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
+    // Explicit static-busy evidence (capacity queue): the screen is not
+    // quiescing into a prompt — it is parked on a queue notice. Do not mark
+    // idle and do not re-arm: the latch clears on the composer redraw, whose
+    // feed() re-arms quiescence.
+    if (this.staticBusyLatch) return;
     const sinceSpinner = Date.now() - this.lastSpinnerAt;
     if (sinceSpinner < SPINNER_GUARD_MS) {
       this.quiescenceTimer = setTimeout(
@@ -204,4 +276,17 @@ export class IdleDetector {
       .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
       .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
   }
+}
+
+/** Find the LAST match index of a regex in a string, or -1. Handles
+ *  non-global regexes by cloning with the g flag. */
+function lastMatchIndex(re: RegExp, s: string): number {
+  const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+  let last = -1;
+  let m: RegExpExecArray | null;
+  while ((m = g.exec(s)) !== null) {
+    last = m.index;
+    if (g.lastIndex === m.index) g.lastIndex++;
+  }
+  return last;
 }

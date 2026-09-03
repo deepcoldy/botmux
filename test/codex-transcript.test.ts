@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_AUTH_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -269,6 +269,40 @@ describe('extractLastCodexTurn', () => {
       mk('user', 'u2'),
     ]);
     expect(out).toEqual({ userText: 'u1', assistantText: 'a1' });
+  });
+});
+
+describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => {
+  it('classifies model gateway / upstream failures as codex_upstream_error', () => {
+    // Live incident shape: the model gateway cancelled the stream mid-turn.
+    expect(codexTaskFailureCode(
+      'upstream stream error: rpc error: code = 1 desc = Cancelled by backend [biz error]',
+    )).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('502 Bad Gateway')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('503 Service Unavailable')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode({ error: { message: 'Internal server error' } }))
+      .toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('Overloaded: please retry')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('checks upstream BEFORE connection so "gateway timeout" is server-side, not local network', () => {
+    expect(codexTaskFailureCode('504 Gateway Timeout')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('keeps the more specific categories ahead of upstream', () => {
+    // A gateway 429 is still a rate limit; a gateway 401 is still auth.
+    expect(codexTaskFailureCode('upstream error: 429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(codexTaskFailureCode('gateway rejected: 401 Unauthorized')).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(codexTaskFailureCode('invalid_request: empty_string')).toBe(CODEX_INVALID_REQUEST_ERROR_CODE);
+  });
+
+  it('keeps plain connectivity failures on codex_connection_failed', () => {
+    expect(codexTaskFailureCode('ECONNRESET: connection reset by peer')).toBe(CODEX_CONNECTION_ERROR_CODE);
+    expect(codexTaskFailureCode('getaddrinfo ENOTFOUND api.example.com')).toBe(CODEX_CONNECTION_ERROR_CODE);
+  });
+
+  it('falls back to codex_task_failed for unrecognized errors', () => {
+    expect(codexTaskFailureCode('something exploded')).toBe(CODEX_TASK_FAILED_ERROR_CODE);
   });
 });
 
@@ -643,7 +677,10 @@ describe('drainCodexRollout', () => {
     expect(r.events[1].terminalErrorCode).toBe('codex_turn_aborted:user_interrupt');
   });
 
-  it('skips reasoning / function_call / function_call_output / non-terminal event_msg', () => {
+  // Bare/malformed CoT-adjacent items (no summary text, no call ids) and
+  // non-terminal event_msg records still produce NO events — the cot channel
+  // only fires for well-formed items (see the dedicated describe below).
+  it('skips empty reasoning / id-less function_call(+output) / non-terminal event_msg', () => {
     writeFileSync(path,
       ev({ type: 'response_item', payload: { type: 'reasoning' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell' } }) +
@@ -655,6 +692,21 @@ describe('drainCodexRollout', () => {
     expect(r.events).toHaveLength(1);
     expect(r.events[0].kind).toBe('user');
     expect(r.events[0].text).toBe('actual prompt');
+  });
+
+  it('emits cot events for reasoning summaries and tool calls between the turn boundaries', () => {
+    writeFileSync(path,
+      ev(userResponseItem('do the thing')) +
+      ev({ type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: '**Plan** first I look around' }] } }) +
+      ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'call_1', arguments: '{"command":["bash","-lc","ls"]}' } }) +
+      ev({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_1', output: '{"output":"total 24","metadata":{"exit_code":0}}' } }) +
+      ev(assistantFinalResponseItem('done')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'cot', 'assistant_final']);
+    expect(r.events[1].cotEntries).toEqual([{ kind: 'thinking', text: '**Plan** first I look around' }]);
+    expect(r.events[2].cotEntries).toEqual([{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["bash","-lc","ls"]}' }]);
+    // Wrapped shell output is unwrapped to the inner text.
+    expect(r.events[3].cotEntries).toEqual([{ kind: 'tool_result', id: 'call_1', result: 'total 24' }]);
   });
 
   it('extracts turn_aborted as a no-output terminal edge', () => {
@@ -759,7 +811,7 @@ describe('drainCodexRollout', () => {
   });
 });
 
-function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
+function threadSettingsApplied(serviceTier?: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
   return {
     timestamp: ts,
     type: 'event_msg',
@@ -768,7 +820,7 @@ function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.00
       thread_settings: {
         model,
         model_provider_id: 'byteseed',
-        service_tier: serviceTier,
+        ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
       },
     },
   };
@@ -817,13 +869,12 @@ describe('Codex thread settings observation', () => {
     expect(scanCodexThreadSettings(path)?.serviceTier).toBe('priority');
   });
 
-  it('does not confuse a settings event that carries no service_tier', () => {
-    writeFileSync(path, ev({
-      timestamp: '2026-04-29T07:00:00.000Z',
-      type: 'event_msg',
-      payload: { type: 'thread_settings_applied', thread_settings: { model: 'x' } },
-    }));
-    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  it('treats a valid settings event that carries no service_tier as default', () => {
+    writeFileSync(path, ev(threadSettingsApplied()));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
   });
 
   it('reads the top-level reasoning_effort (follows an in-session /effort switch)', () => {
@@ -880,6 +931,29 @@ describe('Codex thread settings observation', () => {
 
     expect(second.events).toEqual([]);
     expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('clears a live priority snapshot when Codex omits service_tier', () => {
+    writeFileSync(path, ev(threadSettingsApplied('priority')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestThreadSettings?.serviceTier).toBe('priority');
+
+    appendFileSync(path, ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('backward scan returns the newest omitted service_tier as default', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('priority'))
+      + ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    expect(scanCodexThreadSettings(path)).toEqual({
       model: 'gpt-5.6-sol',
       serviceTier: 'default',
     });
@@ -997,3 +1071,49 @@ describe('readLatestCodexRuntime (attach bootstrap)', () => {
   });
 });
 
+describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
+  it('joins multiple summary_text blocks; falls back to reasoning_text when summary is empty', () => {
+    expect(codexCotEntriesFromResponseItem({
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: 'a' }, { type: 'summary_text', text: 'b' }],
+    })).toEqual([{ kind: 'thinking', text: 'a\n\nb' }]);
+    expect(codexCotEntriesFromResponseItem({
+      type: 'reasoning',
+      summary: [],
+      content: [{ type: 'reasoning_text', text: 'raw chain of thought' }],
+    })).toEqual([{ kind: 'thinking', text: 'raw chain of thought' }]);
+  });
+
+  it('truncates oversized function_call arguments with an ellipsis', () => {
+    const args = `{"content":"${'x'.repeat(2000)}"}`;
+    const [entry] = codexCotEntriesFromResponseItem({ type: 'function_call', name: 'apply_patch', call_id: 'c1', arguments: args });
+    expect(entry).toMatchObject({ kind: 'tool_call', id: 'c1', name: 'apply_patch' });
+    expect((entry as any).args.length).toBe(601); // 600-char cap + '…'
+    expect((entry as any).args.endsWith('…')).toBe(true);
+  });
+
+  it('maps local_shell_call and web_search_call to named tool calls', () => {
+    expect(codexCotEntriesFromResponseItem({
+      type: 'local_shell_call', call_id: 'c2', status: 'completed', action: { type: 'exec', command: ['ls'] },
+    })).toEqual([{ kind: 'tool_call', id: 'c2', name: 'shell', args: '{"type":"exec","command":["ls"]}' }]);
+    expect(codexCotEntriesFromResponseItem({
+      type: 'web_search_call', id: 'ws1', action: { query: 'feishu cot' },
+    })).toEqual([{ kind: 'tool_call', id: 'ws1', name: 'web_search', args: '{"query":"feishu cot"}' }]);
+  });
+
+  it('keeps a raw (non-wrapped) function_call_output string and maps custom tool calls', () => {
+    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: 'plain output' }))
+      .toEqual([{ kind: 'tool_result', id: 'c1', result: 'plain output' }]);
+    expect(codexCotEntriesFromResponseItem({ type: 'custom_tool_call', name: 'my_tool', call_id: 'c3', input: '{"x":1}' }))
+      .toEqual([{ kind: 'tool_call', id: 'c3', name: 'my_tool', args: '{"x":1}' }]);
+    expect(codexCotEntriesFromResponseItem({ type: 'custom_tool_call_output', call_id: 'c3', output: 'ok' }))
+      .toEqual([{ kind: 'tool_result', id: 'c3', result: 'ok' }]);
+  });
+
+  it('returns [] for messages, ghost snapshots and empty outputs', () => {
+    expect(codexCotEntriesFromResponseItem({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem({ type: 'ghost_snapshot' })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
+  });
+});

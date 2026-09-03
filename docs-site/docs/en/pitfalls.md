@@ -8,7 +8,8 @@
 
 ## Environment / Installation
 
-- **Node too old**: v18 and similar lack a built-in global `fetch`, so `botmux setup` throws `fetch is not defined` / `fetch failed` and won't write `bots.json`. → Upgrade to **Node ≥ 22**.
+- **`botmux: command not found` right after installing**: `~/.botmux/bin` isn't on PATH. Both install routes write your shell's startup file, but **you need a new terminal (or to source it) for it to take effect**. ⚠️ Known limitation: if `~/.botmux/bin` already happens to be on the *installing process's* PATH — **which is exactly the case when you install from inside a botmux CLI session**, since the daemon injects it into every session's PATH — `install.sh` concludes there is nothing to do and **writes no startup file**, so a new terminal still can't find it. → Install from an **ordinary terminal**, or add `export PATH="$HOME/.botmux/bin:$PATH"` to your startup file by hand.
+- **Node too old** (npm install path only): v18 and similar lack a built-in global `fetch`, so the `npm i -g botmux` postinstall or `botmux setup` throws `fetch is not defined` / `fetch failed`. → Upgrade to **Node ≥ 22**, or switch to the curl install (self-contained binary, no Node needed).
 - **First launch stuck on a manual confirmation**: On first run, a CLI (such as Claude Code) pops up a "trust this directory / bypass permissions" confirmation. If nobody has clicked through it, it hangs and reports a `tmux send-keys` error. → Confirm it manually once, and it won't appear again.
 
 ## Lost environment variables (high frequency)

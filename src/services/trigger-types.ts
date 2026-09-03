@@ -71,7 +71,7 @@ export interface TriggerRequest {
      *  freshly-spawned session; ignored when folding into an existing worker.
      *  Empty/omitted → the bot's configured default. */
     model?: string;
-    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
+    /** Per-turn reasoning effort. Same
      *  fresh-spawn-only semantics as `model`. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   };
@@ -153,6 +153,16 @@ export interface TriggerResponse {
   /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
    *  (follow-up async turn on an existing session). */
   turnIdempotencyKey?: string;
+  /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
+   *  unrelated to the daemon-side `idempotencyKey` lease above).
+   *  - `accepted`  — first delivery under this key; it was dispatched.
+   *  - `duplicate` — same key + same body as an earlier delivery; NOT dispatched,
+   *                  `firstTriggerId` names the turn that actually ran. */
+  idempotency?: {
+    key: string;
+    action: 'accepted' | 'duplicate';
+    firstTriggerId?: string;
+  };
   /** True when this response reused an EXISTING session for the idempotency key
    *  (no new session created, no re-dispatch) instead of creating a fresh one.
    *  Absent/false on the first (creating) call and on non-idempotent triggers. */

@@ -29,6 +29,7 @@ import {
   nextAppVersion,
   OpenPlatformApiError,
   readStoredCookiesFromSessionFile,
+  safeErrorMessage,
   type OpenPlatformApiClient,
   type OpenPlatformClientResult,
   type StoredCookie,
@@ -36,6 +37,7 @@ import {
 import { parseOnlineVisibility } from '../setup/open-platform-visibility.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { logger } from '../utils/logger.js';
+import { normalizeBotDescriptions } from './bot-description-schema.js';
 
 export type OpenPlatformRenameFailureReason =
   | 'unsupported_brand'
@@ -78,7 +80,8 @@ function failureFromError(err: unknown, fallbackReason: OpenPlatformRenameFailur
     }
     return { reason: fallbackReason, message: err.message };
   }
-  return { reason: fallbackReason, message: err instanceof Error ? err.message : String(err) };
+  // 网络类错误（undici "fetch failed"）的真实原因在 cause 链里，safeErrorMessage 会带上。
+  return { reason: fallbackReason, message: safeErrorMessage(err) };
 }
 
 // ── 共用链路：改基础信息 + 镜像线上可见范围建版发布 ─────────────────────────
@@ -89,31 +92,49 @@ function failureFromError(err: unknown, fallbackReason: OpenPlatformRenameFailur
 // （rename：全语言写新名；avatar：上传图片拿 url）→ 写 base_info → 建版（可见
 // 范围原样镜像，绝不收窄/放宽）→ publish/commit。
 
-interface BaseInfoChangeSpec {
+/**
+ * fail-closed 读到的、可安全全量回写的基础信息快照。所有字段都已校验：
+ * langs 非空且每项是字符串、primaryLang ∈ langs、desc 是字符串、每个已配语言
+ * 的 i18n 块都读到。构造 base_info payload 时必须原样回写这些字段，不得顶空值。
+ */
+type BaseInfoContext = {
+  client: OpenPlatformApiClient;
+  base: Record<string, unknown>;
+  primaryLang: string;
+  langs: string[];
+  desc: string;
+  i18nBlocks: Record<string, Record<string, unknown>>;
+};
+
+type BaseInfoLoadResult =
+  | { ok: true; context: BaseInfoContext }
+  | { ok: false; reason: OpenPlatformRenameFailureReason; message: string };
+
+interface BaseInfoChangeSpec<TFailure extends string = never> {
   /** 建版 changeLog / remark（开放平台后台版本记录里可见）。 */
   changeLog: string;
   remark: string;
-  /** 日志标签（rename / avatar）与成功日志摘要。 */
+  /** 日志标签（rename / avatar / description）与成功日志摘要。 */
   logLabel: string;
   logSummary: string;
+  /**
+   * 把 buildBaseInfoPayload 抛出的操作专属错误映射成结构化失败（如描述改动时
+   * 的 languages_changed）。返回 null 时链路回退到通用 failureFromError。
+   * rename / avatar 不提供该映射，其对外失败联合类型保持不变。
+   */
+  mapBuildError?: (error: unknown) => { reason: TFailure; message: string } | null;
   /**
    * 构造 base_info 写 payload（不含 clientId，由链路补上）。在所有读操作之后、
    * 第一笔写之前调用——这里抛错（含图片上传失败）时应用还没有任何改动。
    * ctx 里的 desc / i18nBlocks 已由链路 fail-closed 校验（读不到即中止），
    * 构造方必须原样回写它们，不得用空值顶替。
    */
-  buildBaseInfoPayload(ctx: {
-    client: OpenPlatformApiClient;
-    base: Record<string, unknown>;
-    langs: string[];
-    desc: string;
-    i18nBlocks: Record<string, Record<string, unknown>>;
-  }): Promise<Record<string, unknown>>;
+  buildBaseInfoPayload(ctx: BaseInfoContext): Promise<Record<string, unknown>>;
 }
 
-type BaseInfoChangeResult =
+type BaseInfoChangeResult<TFailure extends string = never> =
   | { ok: true; versionId: string }
-  | { ok: false; reason: OpenPlatformRenameFailureReason; message: string };
+  | { ok: false; reason: OpenPlatformRenameFailureReason | TFailure; message: string };
 
 // 同一 app 的「读快照 → 写 base_info → 建版发布」必须串行：rename 与 avatar 都是
 // 先读 base_info 快照再全量回写，并发交错会用旧快照把对方刚写的字段覆盖回去
@@ -133,21 +154,27 @@ async function withAppQueue<T>(appId: string, fn: () => Promise<T>): Promise<T> 
   }
 }
 
-async function applyBaseInfoChangeAndRepublish(
+async function applyBaseInfoChangeAndRepublish<TFailure extends string = never>(
   appId: string,
   brand: Brand | undefined,
   deps: OpenPlatformRenameDeps,
-  spec: BaseInfoChangeSpec,
-): Promise<BaseInfoChangeResult> {
+  spec: BaseInfoChangeSpec<TFailure>,
+): Promise<BaseInfoChangeResult<TFailure>> {
   return withAppQueue(appId, () => applyBaseInfoChangeAndRepublishSerialized(appId, brand, deps, spec));
 }
 
-async function applyBaseInfoChangeAndRepublishSerialized(
+/**
+ * fail-closed 加载可安全全量回写的基础信息快照：品牌 / cookie / client 构造，
+ * 读 `app/:id` 并校验 langs（缺失且 i18n 仅主语言时允许回退 [primaryLang]）、
+ * primaryLang ∈ langs、无重复语言、desc 是字符串、每个已配语言的 i18n 块都在。
+ * 任何校验失败在第一笔写之前返回，零副作用。读 / 改描述 / 改名 / 改头像共用它。
+ * 不获取队列——调用方（读操作 / applyBaseInfoChangeAndRepublishSerialized）负责排队。
+ */
+async function loadBaseInfoContext(
   appId: string,
   brand: Brand | undefined,
   deps: OpenPlatformRenameDeps,
-  spec: BaseInfoChangeSpec,
-): Promise<BaseInfoChangeResult> {
+): Promise<BaseInfoLoadResult> {
   if (normalizeBrand(brand) !== 'feishu') {
     return { ok: false, reason: 'unsupported_brand', message: '开放平台自动化当前只支持 feishu.cn 租户；国际版请到开放平台后台手动修改' };
   }
@@ -194,6 +221,9 @@ async function applyBaseInfoChangeAndRepublishSerialized(
       if (!rawLangs.every((l): l is string => typeof l === 'string' && l !== '')) {
         throw new Error('开放平台返回的 langs 形态未识别，已中止（全量回写可能删除语言配置）');
       }
+      if (new Set(rawLangs).size !== rawLangs.length) {
+        throw new Error('开放平台返回的 langs 含重复语言，已中止（全量回写可能删除语言配置）');
+      }
       langs = rawLangs;
     } else {
       const extraLangs = Object.keys(i18nCurrent).filter(k => k !== primaryLang);
@@ -201,6 +231,12 @@ async function applyBaseInfoChangeAndRepublishSerialized(
         throw new Error(`开放平台没有返回 langs 而 i18n 含多语言（${extraLangs.join(', ')}），已中止（全量回写会删除这些语言）`);
       }
       langs = [primaryLang];
+    }
+
+    // primaryLang 必须在 langs 内——否则顶层 desc 同步不到任何已配语言，且
+    // 快照形态未识别，宁可中止也不基于坏快照全量回写。
+    if (!langs.includes(primaryLang)) {
+      throw new Error(`开放平台返回的 primaryLang（${primaryLang}）不在 langs（${langs.join(', ')}）内，已中止（快照形态未识别）`);
     }
 
     // desc 与每个已配语言的 i18n 块必须能原样读到才允许回写——读不到时中止
@@ -219,6 +255,23 @@ async function applyBaseInfoChangeAndRepublishSerialized(
       i18nBlocks[lang] = block;
     }
 
+    return { ok: true, context: { client, base, primaryLang, langs, desc, i18nBlocks } };
+  } catch (err) {
+    return { ok: false, ...failureFromError(err) };
+  }
+}
+
+async function applyBaseInfoChangeAndRepublishSerialized<TFailure extends string = never>(
+  appId: string,
+  brand: Brand | undefined,
+  deps: OpenPlatformRenameDeps,
+  spec: BaseInfoChangeSpec<TFailure>,
+): Promise<BaseInfoChangeResult<TFailure>> {
+  const loaded = await loadBaseInfoContext(appId, brand, deps);
+  if (!loaded.ok) return loaded;
+  const { client } = loaded.context;
+
+  try {
     // 2) 预读并解析所有后续要用的数据 —— 在第一笔写操作之前完成。可见范围
     //    形态未识别（data 非对象 / 块缺键 / 集合非数组 / 条目解析不出 id）会在
     //    这里 fail closed（VisibilityParseError），此时基础信息还没写，零副作用
@@ -231,8 +284,17 @@ async function applyBaseInfoChangeAndRepublishSerialized(
     const versionList = await client.postJson(`/developers/v1/app_version/list/${appId}`, {});
     const appVersion = nextAppVersion(versionList);
 
-    // 3) 构造并写基础信息。
-    const baseInfoPayload = await spec.buildBaseInfoPayload({ client, base, langs, desc, i18nBlocks });
+    // 3) 构造并写基础信息。buildBaseInfoPayload 抛出的操作专属错误（如
+    //    languages_changed）先问 spec.mapBuildError；返回 null / 未提供时
+    //    回退到通用 failureFromError。校验类错误应发生在这里、第一笔写之前。
+    let baseInfoPayload: Record<string, unknown>;
+    try {
+      baseInfoPayload = await spec.buildBaseInfoPayload(loaded.context);
+    } catch (err) {
+      const mapped = spec.mapBuildError?.(err);
+      if (mapped) return { ok: false, ...mapped };
+      throw err;
+    }
     await client.postJson(`/developers/v1/base_info/${appId}`, { clientId: appId, ...baseInfoPayload });
 
     // 4) 建版发布。
@@ -252,6 +314,127 @@ async function applyBaseInfoChangeAndRepublishSerialized(
   } catch (err) {
     return { ok: false, ...failureFromError(err) };
   }
+}
+
+/**
+ * 只读地拉取飞书应用每个已配置语言的名片描述。复用 loadBaseInfoContext 的
+ * fail-closed 快照校验与 per-app 队列（与写操作串行，避免读到半写状态）。
+ * 主语言若在 i18n 里没有 description 字段，回退到顶层 desc；其它语言回退空串。
+ */
+export type OpenPlatformDescriptionReadResult =
+  | { ok: true; primaryLang: string; languages: Array<{ lang: string; description: string }> }
+  | { ok: false; reason: OpenPlatformRenameFailureReason; message: string };
+
+export async function readBotDescriptionsOnOpenPlatform(
+  appId: string,
+  brand: Brand | undefined,
+  deps: OpenPlatformRenameDeps = {},
+): Promise<OpenPlatformDescriptionReadResult> {
+  return withAppQueue(appId, async () => {
+    const loaded = await loadBaseInfoContext(appId, brand, deps);
+    if (!loaded.ok) return loaded;
+    const { primaryLang, langs, desc, i18nBlocks } = loaded.context;
+    return {
+      ok: true,
+      primaryLang,
+      languages: langs.map(lang => ({
+        lang,
+        description: typeof i18nBlocks[lang].description === 'string'
+          ? String(i18nBlocks[lang].description)
+          : lang === primaryLang ? desc : '',
+      })),
+    };
+  });
+}
+
+/**
+ * 更新飞书应用每个已配置语言的名片描述并发布新版本让名片生效。复用改名 /
+ * 改头像的「读快照 → 全量回写 base_info → 镜像线上可见范围建版发布」链路：
+ *   • 先纯函数校验入参（locale 键形态、非空、Unicode code point ≤120），非法
+ *     在加载 cookie 之前返回，零副作用；
+ *   • 提交的语言集合必须与开放平台当前 langs 完全一致（顺序无关），否则返回
+ *     languages_changed 且在第一笔写之前中止（不新增 / 删除语言）；
+ *   • 顶层 desc 同步为主语言描述；name / avatar / 其它 i18n 字段 / 线上可见范围
+ *     全部从快照原样保留。
+ */
+export type OpenPlatformDescriptionUpdateResult =
+  | {
+      ok: true;
+      primaryLang: string;
+      descriptions: Record<string, string>;
+      versionId?: string;
+    }
+  | {
+      ok: false;
+      reason: OpenPlatformRenameFailureReason
+        | 'invalid_descriptions'
+        | 'description_required'
+        | 'description_too_long'
+        | 'languages_changed';
+      message: string;
+      lang?: string;
+    };
+
+class DescriptionLanguagesChangedError extends Error {
+  constructor(readonly expected: string[], readonly submitted: string[]) {
+    super(`Configured languages changed: expected ${expected.join(', ')}, received ${submitted.join(', ')}`);
+    this.name = 'DescriptionLanguagesChangedError';
+  }
+}
+
+export async function updateBotDescriptionsOnOpenPlatform(
+  appId: string,
+  rawDescriptions: unknown,
+  brand: Brand | undefined,
+  deps: OpenPlatformRenameDeps = {},
+): Promise<OpenPlatformDescriptionUpdateResult> {
+  const normalized = normalizeBotDescriptions(rawDescriptions);
+  if (!normalized.ok) {
+    return { ...normalized, message: normalized.reason };
+  }
+  let primaryLang = '';
+  const result = await applyBaseInfoChangeAndRepublish<'languages_changed'>(appId, brand, deps, {
+    changeLog: 'Update localized bot descriptions',
+    remark: 'Update bot descriptions via botmux dashboard',
+    logLabel: 'description',
+    logSummary: 'Open Platform localized descriptions updated',
+    mapBuildError(error) {
+      return error instanceof DescriptionLanguagesChangedError
+        ? { reason: 'languages_changed' as const, message: error.message }
+        : null;
+    },
+    async buildBaseInfoPayload({ base, primaryLang: primary, langs, i18nBlocks }) {
+      const expected = [...langs].sort();
+      const submitted = Object.keys(normalized.descriptions).sort();
+      if (JSON.stringify(expected) !== JSON.stringify(submitted)) {
+        throw new DescriptionLanguagesChangedError(expected, submitted);
+      }
+      // base_info 是全量写接口，名字必须原样回写；当前名字读不到时宁可中止，
+      // 也不发布一个可能清空名字的版本。
+      const name = typeof base.name === 'string' && base.name ? base.name : '';
+      if (!name) throw new Error('开放平台没有返回应用当前名称，已中止改描述（避免覆盖名字）');
+      primaryLang = primary;
+      const i18n: Record<string, unknown> = {};
+      for (const lang of langs) {
+        i18n[lang] = { ...i18nBlocks[lang], description: normalized.descriptions[lang] };
+      }
+      const avatar = typeof base.avatar === 'string' && base.avatar ? { avatar: base.avatar } : {};
+      return {
+        name,
+        desc: normalized.descriptions[primary],
+        languages: langs,
+        i18n,
+        ...avatar,
+      };
+    },
+  });
+  if (!result.ok) return result;
+  return {
+    ok: true,
+    primaryLang,
+    descriptions: normalized.descriptions,
+    versionId: result.versionId,
+  };
 }
 
 /**

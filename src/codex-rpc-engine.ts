@@ -65,8 +65,9 @@ export interface CodexRpcEngineOpts {
    *  new incarnation of this session can reap a prior app-server (P0 teardown). */
   sessionId?: string;
   log?: LogFn;
-  /** Optional model + reasoning effort forwarded to thread config (P1). */
+  /** Optional model, backend variant, and reasoning effort forwarded to fresh thread config (P1). */
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
@@ -336,6 +337,7 @@ export class CodexRpcEngine {
     // either here would trip the app-server's model-resume-override short-circuit.
     if (!forResume) {
       if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.modelBackendVariant) config.model_backend_variant = this.opts.modelBackendVariant;
       if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
     }
     return {

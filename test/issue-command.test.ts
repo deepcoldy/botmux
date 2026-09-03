@@ -5,8 +5,10 @@ import {
   handleIssueDone,
   handleIssueRelease,
   handleIssueStatus,
+  reposFor,
   type IssueCommandDeps,
 } from '../src/im/lark/issue-command.js';
+import { describeProjectDir, scanMultipleProjects } from '../src/services/project-scanner.js';
 import {
   ISSUE_ACTION_CLAIM_CANCEL,
   ISSUE_ACTION_CLAIM_CONFIRM,
@@ -15,6 +17,11 @@ import {
   ISSUE_ACTION_PAGE,
   ISSUE_ACTION_TEAM,
 } from '../src/im/lark/issue-card.js';
+
+vi.mock('../src/services/project-scanner.js', () => ({
+  describeProjectDir: vi.fn(() => null),
+  scanMultipleProjects: vi.fn(() => []),
+}));
 
 const APP = 'cli_worker';
 const ME = 'ou_admin';
@@ -42,6 +49,7 @@ function deps(over: Partial<IssueCommandDeps> = {}) {
     runClaim,
     allowedUsers: () => [ME],
     workingDirs: () => [],
+    defaultWorkingDir: () => undefined,
     ...over,
   };
   return {
@@ -157,6 +165,63 @@ describe('看板导航', () => {
 });
 
 describe('领取', () => {
+  it('只把依赖提供的仓库目录传给候选扫描器', () => {
+    vi.clearAllMocks();
+    vi.mocked(scanMultipleProjects).mockReturnValueOnce([{
+      name: 'card-mode-repo',
+      path: '/w/card-mode-repo',
+      type: 'repo',
+      branch: 'main',
+    }]);
+
+    const choices = reposFor(APP, deps({
+      workingDirs: () => ['/w/card-mode'],
+      defaultWorkingDir: () => '/w/fixed-repo',
+    }).d);
+
+    expect(scanMultipleProjects).toHaveBeenCalledWith(
+      ['/w/card-mode'],
+      3,
+      { includeWorktrees: true },
+    );
+    expect(choices).toEqual([{
+      name: 'card-mode-repo',
+      path: '/w/card-mode-repo',
+      branch: 'main',
+    }]);
+    expect(describeProjectDir).not.toHaveBeenCalled();
+  });
+
+  it('fixed/oncall 默认目录本身是仓库时直接生成唯一候选', () => {
+    vi.clearAllMocks();
+    vi.mocked(describeProjectDir).mockReturnValueOnce({ name: 'fixed-repo', branch: 'main' });
+
+    const choices = reposFor(APP, deps({
+      workingDirs: () => [],
+      defaultWorkingDir: () => '/w/fixed-repo',
+    }).d);
+
+    expect(choices).toEqual([{
+      name: 'fixed-repo',
+      path: '/w/fixed-repo',
+      branch: 'main',
+    }]);
+    expect(describeProjectDir).toHaveBeenCalledWith('/w/fixed-repo');
+    expect(scanMultipleProjects).not.toHaveBeenCalled();
+  });
+
+  it('fixed/oncall 默认目录不是仓库时不递归扫描', () => {
+    vi.clearAllMocks();
+    const choices = reposFor(APP, deps({
+      workingDirs: () => [],
+      defaultWorkingDir: () => '/w/large-root',
+    }).d);
+
+    expect(choices).toEqual([]);
+    expect(describeProjectDir).toHaveBeenCalledWith('/w/large-root');
+    expect(scanMultipleProjects).not.toHaveBeenCalled();
+  });
+
   it('打开确认卡时按标签自动匹配仓库', async () => {
     const { d } = deps({ workingDirs: () => [] });
     const r = await handleIssueCardAction(

@@ -1,6 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
-const { FakeWebSocket } = vi.hoisted(() => {
+/**
+ * The fake socket class is created INSIDE the `ws` factory, and the tests reach it
+ * by importing the mocked module itself (below) — no shared outer binding.
+ *
+ * Two shapes were tried first and both failed, in opposite runners:
+ *   · `vi.hoisted(() => { class … })` — a vitest-only TRANSFORM, no `bun test`
+ *     equivalent; the file died under bun.
+ *   · a top-level `class`/`const` holder read from the factory body — vitest calls
+ *     the factory during the hoisted import phase, before those statements run.
+ *     Measured, twice: "Cannot access 'FakeWebSocket' before initialization", then
+ *     "Cannot access 'wsMock' before initialization".
+ * Anything the factory dereferences in its own body must therefore be created in
+ * that body. Importing the mock back is what both runners agree on.
+ */
+vi.mock('ws', () => {
   class FakeWebSocket {
     static instances: FakeWebSocket[] = [];
 
@@ -28,10 +44,24 @@ const { FakeWebSocket } = vi.hoisted(() => {
     }
   }
 
-  return { FakeWebSocket };
+  return { default: FakeWebSocket };
 });
 
-vi.mock('ws', () => ({ default: FakeWebSocket }));
+// The mocked class, pulled back in through the same specifier the code under test
+// uses. `vi.mocked` is not involved: this IS the fake, not a spy on the real one.
+import FakeWebSocketDefault from 'ws';
+
+interface FakeSocket {
+  readonly url: string;
+  readonly send: ReturnType<typeof vi.fn>;
+  readonly close: ReturnType<typeof vi.fn>;
+  emit(event: string, ...args: any[]): Promise<void>;
+}
+
+/** The live instance list, asserted on by the tests below. */
+function instances(): FakeSocket[] {
+  return (FakeWebSocketDefault as unknown as { instances: FakeSocket[] }).instances;
+}
 
 import { openaiSynthesizePcm } from '../src/services/voice/openai.js';
 import { mintSamiToken, samiSynthesizePcm } from '../src/services/voice/sami.js';
@@ -59,7 +89,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 describe('voice provider effect fences', () => {
   beforeEach(() => {
-    FakeWebSocket.instances.length = 0;
+    instances().length = 0;
   });
 
   afterEach(() => {
@@ -96,7 +126,7 @@ describe('voice provider effect fences', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(beforeProviderEffect).toHaveBeenCalledTimes(2);
-    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(instances()).toHaveLength(0);
   });
 
   it('awaits a fresh fence after async WebSocket open before sending', async () => {
@@ -114,8 +144,8 @@ describe('voice provider effect fences', () => {
       { speaker: 'voice' },
       { beforeProviderEffect },
     );
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const socket = FakeWebSocket.instances[0]!;
+    await vi.waitFor(() => expect(instances()).toHaveLength(1));
+    const socket = instances()[0]!;
 
     const opening = socket.emit('open');
     await vi.waitFor(() => expect(beforeProviderEffect).toHaveBeenCalledTimes(3));
@@ -157,8 +187,8 @@ describe('voice provider effect fences', () => {
       { speaker: 'voice' },
       { beforeProviderEffect },
     );
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const socket = FakeWebSocket.instances[0]!;
+    await vi.waitFor(() => expect(instances()).toHaveLength(1));
+    const socket = instances()[0]!;
 
     await socket.emit('open');
 
@@ -187,4 +217,113 @@ describe('voice provider effect fences', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(pcm).toMatchObject({ data: Buffer.from([4, 5, 6]), sampleRate: 24000, channels: 1 });
   });
+});
+
+/**
+ * A self-hosted TTS endpoint must not have its API key handed to an HTTP proxy.
+ *
+ * `openaiSynthesizePcm` sends `Authorization: Bearer <apiKey>` to `cfg.baseUrl`, and
+ * a LOCAL endpoint is the documented case (the config hint suggests
+ * `http://127.0.0.1:8880/v1`). Under Bun the global `fetch` routes 127.0.0.1 through
+ * `$http_proxy` unless `no_proxy` names that literal address — CIDR does not count —
+ * so the request, key included, went to the corporate proxy. Reproduced with a
+ * canary token: `PROXY_HIT POST …/v1/audio/speech auth=Bearer SECRET_CANARY`.
+ *
+ * This has to run in a REAL Bun process: Bun snapshots proxy config at startup, and
+ * vitest's own worker is Node (whose fetch ignores proxy env entirely), so an
+ * in-process assertion cannot see the defect at all.
+ */
+describe('openaiSynthesizePcm — a local endpoint bypasses the proxy', () => {
+  function resolveBun(): string | undefined {
+    if (process.env.BUN_PATH && existsSync(process.env.BUN_PATH)) return process.env.BUN_PATH;
+    for (const dir of (process.env.PATH ?? '').split(':')) {
+      if (!dir) continue;
+      const candidate = join(dir, 'bun');
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
+  it('does not send the Bearer token to $http_proxy', async () => {
+    const bun = resolveBun();
+    if (!bun) {
+      // Never silently pass in CI — a skipped security regression is worse than none.
+      if (process.env.CI) throw new Error('bun not found on PATH; this test must not be skipped in CI');
+      return;
+    }
+
+    const { createServer } = await import('node:http');
+    const servers: import('node:http').Server[] = [];
+    const listen = async (h: import('node:http').RequestListener) => {
+      const s = createServer(h); servers.push(s);
+      await new Promise<void>(r => s.listen(0, '127.0.0.1', () => r()));
+      return (s.address() as { port: number }).port;
+    };
+    try {
+      let proxyHits = 0;
+      let leakedAuth = '';
+      let localHits = 0;
+      const proxyPort = await listen((req, res) => {
+        proxyHits++;
+        leakedAuth = String(req.headers.authorization ?? '');
+        res.writeHead(403, { 'content-type': 'text/html' });
+        res.end('<html><title>403 Forbidden</title></html>');
+      });
+      const ttsPort = await listen((_req, res) => {
+        localHits++;
+        res.writeHead(200, { 'content-type': 'audio/pcm' });
+        res.end(Buffer.alloc(16));
+      });
+
+      const modulePath = join(__dirname, '..', 'src', 'services', 'voice', 'openai.ts');
+      const snippet = `
+        const { openaiSynthesizePcm } = await import(${JSON.stringify(modulePath)});
+        try {
+          await openaiSynthesizePcm(
+            { baseUrl: 'http://127.0.0.1:${ttsPort}/v1', model: 'm', apiKey: 'SECRET_CANARY' },
+            'hi', { speaker: 'a' },
+          );
+          process.stdout.write(JSON.stringify({ runtime: typeof Bun !== 'undefined' ? 'bun' : 'node', ok: true }));
+        } catch (e) {
+          process.stdout.write(JSON.stringify({ runtime: typeof Bun !== 'undefined' ? 'bun' : 'node', err: String(e && e.message) }));
+        }
+      `;
+      const { spawn } = await import('node:child_process');
+      const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+      const stdout = await new Promise<string>((resolve, reject) => {
+        // Async spawn: spawnSync would block this event loop and the servers above
+        // could never accept the child's connection.
+        const child = spawn(bun, ['-e', snippet], {
+          env: {
+            ...process.env,
+            http_proxy: proxyUrl, HTTP_PROXY: proxyUrl,
+            https_proxy: proxyUrl, HTTPS_PROXY: proxyUrl,
+            // The CIDR form real shell rc files use — the one Bun does not honour.
+            no_proxy: '127.0.0.0/8', NO_PROXY: '127.0.0.0/8',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '', err = '';
+        child.stdout.on('data', d => { out += String(d); });
+        child.stderr.on('data', d => { err += String(d); });
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('bun child timed out')); }, 25_000);
+        child.on('error', e => { clearTimeout(timer); reject(e); });
+        child.on('close', code => {
+          clearTimeout(timer);
+          if (code !== 0) reject(new Error(`bun child exited ${code}: ${err.slice(0, 400)}`));
+          else resolve(out);
+        });
+      });
+
+      const parsed = JSON.parse(stdout || '{}');
+      // Prove the child really was Bun, or the assertions below mean nothing.
+      expect(parsed.runtime).toBe('bun');
+      expect(leakedAuth).toBe('');
+      expect(proxyHits).toBe(0);
+      expect(localHits).toBe(1);
+      expect(parsed.ok).toBe(true);
+    } finally {
+      await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
+    }
+  }, 40_000);
 });

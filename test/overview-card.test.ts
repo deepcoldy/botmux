@@ -6,12 +6,19 @@
  * a fully-isolated handler suite covering refresh/goto/error paths.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SessionRow } from '../src/core/dashboard-rows.js';
+import { resolveWorkbenchButtonLinks } from '../src/core/workbench-link.js';
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import type { DashboardSettingsInput } from '../src/dashboard/settings-card-model.js';
+import { rotatePersistedToken } from '../src/dashboard/auth.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
+import { appCenterAppLink } from '../src/im/lark/lark-hosts.js';
 import {
   buildOverviewCard,
   countSessions,
@@ -231,6 +238,211 @@ describe('buildOverviewCard', () => {
     expect(buttonCount).toBe(5);
   });
 
+  // ─── 「打开工作台」入口 ─────────────────────────────────────────────
+  // The card is the ONLY zero-setup way into the Web Workbench from Feishu, so
+  // the link shape is asserted end-to-end: applink prefix + fully-encoded target
+  // carrying the `?t=` token on the `/workbench` standing entry.
+  //
+  // 入口形态：**只有按钮**。曾短暂在按钮下面多渲染一行明文链接（方便复制收藏），
+  // 产品试用后要求撤下——一整行 token 链接摊在正文里太吵，且卡片是持久化载体
+  // （历史/转发/截图都留着），明文摊开只会放大常驻凭证的暴露面。所以下面钉的
+  // 不变量是：token 只出现在按钮的 `multi_url` 里，卡片正文一个字节都没有。
+  describe('open-workbench button', () => {
+    const WORKBENCH_TARGET = 'http://10.0.0.7:7891/workbench?t=tok-abc';
+    const WORKBENCH_APPLINK = appCenterAppLink(WORKBENCH_TARGET, 'feishu');
+    const withWorkbench = {
+      ...baseOpts,
+      workbench: { appLink: WORKBENCH_APPLINK, webUrl: WORKBENCH_TARGET, credentialed: true },
+    };
+
+    function openWorkbenchButtons(json: string): any[] {
+      const parsed = JSON.parse(json);
+      return (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions as any[])
+        .filter((b: any) => b.text?.content === '打开工作台');
+    }
+
+    /**
+     * 卡片正文里所有可见文案（`div` / `note` 等非 action 元素的 content）。
+     * 用来钉「链接只在按钮的 multi_url 里，不摊在正文」这条不变量。
+     */
+    function bodyTexts(json: string): string[] {
+      const out: string[] = [];
+      const walk = (node: any): void => {
+        if (Array.isArray(node)) { node.forEach(walk); return; }
+        if (!node || typeof node !== 'object') return;
+        if (node.tag === 'action') return; // 按钮那块由 openWorkbenchButtons 单独断言
+        if (typeof node.content === 'string') out.push(node.content);
+        for (const value of Object.values(node)) walk(value);
+      };
+      walk(JSON.parse(json).elements);
+      return out;
+    }
+
+    it('renders exactly one 打开工作台 button whose PC target is the appCenter AppLink', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const buttons = openWorkbenchButtons(json);
+      expect(buttons.length).toBe(1);
+      expect(buttons[0].multi_url.url).toBe(
+        'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+        + '&url=http%3A%2F%2F10.0.0.7%3A7891%2Fworkbench%3Ft%3Dtok-abc',
+      );
+      expect(buttons[0].multi_url.pc_url).toBe(buttons[0].multi_url.url);
+    });
+
+    it('the AppLink target round-trips to the credentialed standing entry', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const link = new URL(openWorkbenchButtons(json)[0].multi_url.url as string);
+      expect(link.origin).toBe('https://applink.feishu.cn');
+      expect(link.pathname).toBe('/client/web_url/open');
+      // mode=appCenter = 飞书导航栏标签页，可右键固定；`window` 那种独立窗口关掉
+      // 就没了，配不上「常驻入口」。移动端不识别 mode，走下面的裸 webUrl。
+      expect(link.searchParams.get('mode')).toBe('appCenter');
+
+      const target = new URL(link.searchParams.get('url') as string);
+      expect(target.pathname).toBe('/workbench');
+      expect(target.searchParams.get('t')).toBe('tok-abc');
+    });
+
+    // 卡片正文里**不得**出现明文链接行（产品试用后撤下，见 describe 上方说明）。
+    // token 只跟着按钮的 multi_url 走：PC 是 applink 的 URL 编码形态，移动端是裸
+    // URL——四个字段各一份，卡片里出现的次数就到此为止。
+    it('never renders the standing link as a body row — the button is the only entry', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      for (const text of bodyTexts(json)) {
+        expect(text).not.toContain(WORKBENCH_TARGET);
+        expect(text).not.toContain('/workbench?t=');
+        expect(text).not.toContain('tok-abc');
+      }
+
+      const { multi_url: multiUrl } = openWorkbenchButtons(json)[0];
+      const carriers = [multiUrl.url, multiUrl.pc_url, multiUrl.android_url, multiUrl.ios_url];
+      for (const carrier of carriers) expect(carrier).toContain('tok-abc');
+      // 全卡片里 token 的出现次数 == 按钮上那几个 URL 字段，多一处就是正文漏了。
+      expect((json.match(/tok-abc/g) ?? []).length).toBe(carriers.length);
+    });
+
+    it('carries the standing-entry hint naming token rotation as the revocation lever', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      expect(json).toContain('常驻入口');
+      expect(json).toContain('轮换');
+      expect(json).toContain('botmux dashboard rotate');
+      // 小字只放自救命令，不放链接本体——正文零链接这条由上一个用例整体钉住。
+      expect(json).not.toContain('可收藏');
+    });
+
+    // 降级路径（fail open）：daemon 读不到 `.dashboard-token` 时照发卡片，只是
+    // 链接不带凭证 + 卡片明说要自己登录，而不是让整张卡片发不出去。
+    it('marks the link as credential-free when the token was unreadable', () => {
+      const bare = 'http://10.0.0.7:7891/#/agent-workbench';
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        {
+          ...baseOpts,
+          workbench: { appLink: appCenterAppLink(bare, 'feishu'), webUrl: bare, credentialed: false },
+        },
+      );
+      expect(openWorkbenchButtons(json).length).toBe(1);
+      expect(json).toContain('需在浏览器里登录');
+      // 降级态同样只有按钮：无凭证形态的那行明文链接一并撤下了。
+      for (const text of bodyTexts(json)) {
+        expect(text).not.toContain(bare);
+        expect(text).not.toContain('/#/agent-workbench');
+      }
+      // 没凭证就别吹「常驻不过期」——那句提示只属于真正带凭证的链接。
+      expect(json).not.toContain('常驻入口');
+      expect(json).not.toContain('rotate');
+    });
+
+    it('mobile falls back to the plain web URL (no appCenter container on phones)', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const { multi_url: multiUrl } = openWorkbenchButtons(json)[0];
+      expect(multiUrl.android_url).toBe(WORKBENCH_TARGET);
+      expect(multiUrl.ios_url).toBe(WORKBENCH_TARGET);
+    });
+
+    it('is a pure link button — no callback value, no invoker identity on it', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const button = openWorkbenchButtons(json)[0];
+      expect(button.value).toBeUndefined();
+      expect(JSON.stringify(button)).not.toContain(INVOKER);
+    });
+
+    it('renders nothing when no workbench link could be built (no dead button)', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        baseOpts,
+      );
+      expect(openWorkbenchButtons(json).length).toBe(0);
+      expect(json).not.toContain('打开工作台');
+      expect(json).not.toContain('applink');
+    });
+
+    it('leaves the existing navigation buttons untouched', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const parsed = JSON.parse(json);
+      const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+      // 4 goto rows + refresh + the new workbench row.
+      expect(actionRows.length).toBe(6);
+      for (const action of [
+        OVERVIEW_ACTION_REFRESH,
+        OVERVIEW_ACTION_GOTO_SESSIONS,
+        OVERVIEW_ACTION_GOTO_SCHEDULES,
+        OVERVIEW_ACTION_GOTO_SETTINGS,
+        OVERVIEW_ACTION_GOTO_GROUPS,
+      ]) {
+        expect(json).toContain(action);
+      }
+    });
+
+    it('en locale labels the button "Open Workbench"', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        { ...withWorkbench, locale: 'en' },
+      );
+      expect(json).toContain('Open Workbench');
+    });
+
+    it('a lark-brand bot gets the larksuite applink host', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        {
+          ...baseOpts,
+          workbench: {
+            appLink: appCenterAppLink(WORKBENCH_TARGET, 'lark'),
+            webUrl: WORKBENCH_TARGET,
+            credentialed: true,
+          },
+        },
+      );
+      const url = openWorkbenchButtons(json)[0].multi_url.url as string;
+      expect(url.startsWith('https://applink.larksuite.com/client/web_url/open?mode=appCenter')).toBe(true);
+      expect(url).not.toContain('applink.feishu.cn');
+    });
+  });
+
   it('action.value carries action + invoker_open_id and NOTHING identity-like', () => {
     const json = buildOverviewCard(
       { sessions: [], schedules: [], settings: makeSettings() },
@@ -281,6 +493,9 @@ describe('handleOverviewCardAction', () => {
       getOwnerOpenId: () => INVOKER,
       locale: 'zh',
       nowMs: () => 2_000_000,
+      // Production reads the dashboard port/token off disk; pin it here so the
+      // card content doesn't depend on the test machine's ~/.botmux state.
+      resolveWorkbench: () => undefined,
       requestSpy,
       ...over,
     };
@@ -310,6 +525,45 @@ describe('handleOverviewCardAction', () => {
     const cardJson = JSON.stringify(r.card?.data);
     // Result is an overview card (has the overview title).
     expect(cardJson).toContain('Dashboard 总览');
+  });
+
+  it('refresh keeps the 打开工作台 button (clicking 🔄 must not drop the entry)', async () => {
+    const target = 'http://10.0.0.7:7891/workbench?t=tok-abc';
+    const deps = makeDeps({
+      resolveWorkbench: vi.fn(() => ({
+        appLink: appCenterAppLink(target, 'feishu'),
+        webUrl: target,
+        credentialed: true,
+      })),
+    });
+    const r = await handleOverviewCardAction(
+      makeAction({ action: OVERVIEW_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    // Brand is resolved per-bot, so the link resolver is asked for THIS app.
+    expect(deps.resolveWorkbench).toHaveBeenCalledWith(LARK_APP_ID);
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('打开工作台');
+    expect(cardJson).toContain(
+      'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+      + '&url=http%3A%2F%2F10.0.0.7%3A7891%2Fworkbench%3Ft%3Dtok-abc',
+    );
+  });
+
+  it('a non-admin refresh never reaches the token-bearing workbench link', async () => {
+    const deps = makeDeps({
+      getDashboardAdminOpenIds: () => [INVOKER],
+      resolveWorkbench: vi.fn(() => ({ appLink: 'https://applink.feishu.cn/x', webUrl: 'http://x/' })),
+    });
+    const r = await handleOverviewCardAction(
+      makeAction({ action: OVERVIEW_ACTION_REFRESH, invoker_open_id: 'ou_stranger' }, 'ou_stranger'),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.resolveWorkbench).not.toHaveBeenCalled();
+    expect(r.card).toBeUndefined();
+    expect(r.toast).toBeDefined();
   });
 
   it('goto_sessions → GET /__daemon/sessions-list, returns sessions card as { card }', async () => {
@@ -456,5 +710,144 @@ describe('handleOverviewCardAction', () => {
     // The handler still gets to create a client (admin gate passed), but it
     // should NOT make any HTTP request for an unknown action.
     expect(deps.requestSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 真实 resolver 端到端：卡片直发**带凭证的常驻链接** ──────────────────────
+//
+// ⚠️ 断言方向在这里被**刻意反转**过，别照着 git 历史改回去。
+//
+// 这一组的前身是「workbench link never embeds the persisted dashboard token
+// (P2-1)」：它钉死的不变量是「卡片里只有 30 分钟短票，`.dashboard-token` 一个
+// 字节都不许出现」（commit 9b176a87 引入）。产品 owner 后来明确推翻了这条红线：
+// botmux 是**自部署**形态，用户就是自己实例的 owner，需要一条能收藏进书签、
+// **永不过期**的入口；短票 30 分钟即死，等于每次进工作台都得先回飞书发一次
+// `/dashboard`，这个代价大到让入口形同虚设。
+//
+// 决策与其风险对价（owner 拍板，不是实现疏忽）：
+//   · 收益：一条链接收藏即用，跨端、跨重启、跨 daemon 升级都不失效。
+//   · 代价：链接是长期凭证，且卡片是持久化载体（历史/转发/截图都比首次投递活
+//     得久）。这个风险由 **`botmux dashboard rotate` 兜底**——轮换后旧链接当场
+//     全废，卡片小字里就写着这条自救路径。
+//   · 未放宽的部分：**发出前的门禁一层没动**。`/dashboard` 命令入口仍由
+//     `dashboard-command/owner-gate.ts` 拦，卡片回调仍由 invoker-lock +
+//     `isDashboardAdmin` 拦，卡片仍是私信给发起人本人。
+//
+// 短票机制（`dashboard/workbench-ticket.ts` + 它的兑换端点与测试）**原样保留**，
+// 只是卡片不再调用它——将来若要回到短票形态，机制还在，不必重写。
+//
+// 所以下面断言的是新不变量：真实 resolveWorkbenchButtonLinks 拼出的链接**必须**
+// 携带落盘 token，且卡片 JSON 里**不再**出现 `/workbench-ticket/`。
+//
+// 补充（卡片形态收敛）：链接一度还在按钮下面多渲染一行明文，方便复制收藏；产品
+// 试用后要求撤下——卡片上只留按钮，token 只跟着按钮的 `multi_url` 走，正文里一个
+// 字节都没有。链接本体改由工作台 `⋯` 菜单的「常驻链接」面板 / 终端
+// `botmux dashboard` 自取。这不影响上面的凭证决策，只收窄了它在卡片里的暴露面。
+describe('workbench link embeds the standing dashboard token (product decision)', () => {
+  // 足够独特、绝不会偶然出现在 URL 结构里的 token 明文。
+  const LEAKY_TOKEN = 'LEAKY-LONG-LIVED-DASHBOARD-TOKEN-0123456789';
+  let homeDir: string;
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-wblink-'));
+    const botmuxDir = join(homeDir, '.botmux');
+    mkdirSync(botmuxDir, { mode: 0o700 });
+    chmodSync(botmuxDir, 0o700); // mkdirSync 的 mode 会被 umask 削减，显式钉死
+    writeFileSync(join(botmuxDir, '.dashboard-port'), '7899');
+    writeFileSync(join(botmuxDir, '.dashboard-token'), LEAKY_TOKEN, { mode: 0o600 });
+    savedHome = process.env.HOME;
+    process.env.HOME = homeDir;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it('resolveWorkbenchButtonLinks builds a credentialed /workbench?t= standing URL', () => {
+    const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    expect(links).toBeDefined();
+    expect(links!.credentialed).toBe(true);
+
+    // webUrl 形态：<base>/workbench?t=<长期 token>，无 hash（不带 `#` 的形态复制
+    // 粘贴时不会被截断，见 core/dashboard-url.ts:workbenchEntryUrl）。
+    const web = new URL(links!.webUrl);
+    expect(web.pathname).toBe('/workbench');
+    expect(web.searchParams.get('t')).toBe(LEAKY_TOKEN);
+    expect(web.hash).toBe('');
+
+    // PC 的 applink 里也必须带上同一枚 token（URL 编码形态）。
+    expect(links!.appLink).toContain(encodeURIComponent(links!.webUrl));
+
+    // 短票路径彻底退场：卡片链接不再走兑换端点。
+    for (const target of [links!.webUrl, links!.appLink]) {
+      expect(target).not.toContain('/workbench-ticket/');
+    }
+  });
+
+  it('the fully-rendered card JSON carries the standing token in the button only', () => {
+    const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    const json = buildOverviewCard(
+      { sessions: [], schedules: [], settings: makeSettings() },
+      { invokerOpenId: INVOKER, locale: 'zh', workbench: links },
+    );
+    const elements = (JSON.parse(json) as { elements: any[] }).elements;
+
+    // 反转后的核心断言：token **就该**进卡片——但只跟着按钮的 multi_url 走。
+    const button = elements
+      .filter(e => e.tag === 'action')
+      .flatMap(e => e.actions as any[])
+      .find(b => b.text?.content === '打开工作台');
+    expect(button).toBeDefined();
+    expect(button.multi_url.url).toContain(encodeURIComponent(links!.webUrl));
+    expect(button.multi_url.android_url).toBe(links!.webUrl);
+    expect(JSON.stringify(button)).toContain(LEAKY_TOKEN);
+
+    // 卡片正文（非按钮元素）一个字节的 token / 链接都没有：明文常驻链接那行在
+    // 产品试用后撤下了，正文只剩标题、小字提示和各分区摘要。
+    const body = JSON.stringify(elements.filter(e => e.tag !== 'action'));
+    expect(body).not.toContain(LEAKY_TOKEN);
+    expect(body).not.toContain('?t=');
+    expect(body).not.toContain('http://');
+
+    // 短票残留清零。
+    expect(json).not.toContain('/workbench-ticket/');
+    expect(json).not.toContain('workbench-ticket');
+  });
+
+  it('`dashboard rotate` makes every previously-sent card link dead, new cards carry the new token', () => {
+    const leaked = resolveWorkbenchButtonLinks(LARK_APP_ID)!.webUrl;
+    expect(leaked).toContain(LEAKY_TOKEN);
+
+    // 这就是那条兜底路径：owner 怀疑卡片/链接泄漏 → rotate → 泄漏出去的那条
+    // 常驻链接立刻失效（token 变了，dashboard 的 `?t=` 比对当场不通过）。
+    const rotated = rotatePersistedToken(join(homeDir, '.botmux', '.dashboard-token'));
+    expect(rotated).not.toBe(LEAKY_TOKEN);
+
+    const fresh = resolveWorkbenchButtonLinks(LARK_APP_ID)!.webUrl;
+    expect(fresh).toContain(rotated);
+    expect(fresh).not.toContain(LEAKY_TOKEN);
+  });
+
+  it('is STABLE across rebuilds — the whole point of a standing link', () => {
+    // 与短票时代的「每次构建都换一张票」正相反：同一枚 token 在，链接就必须逐字
+    // 相同，否则用户收藏的那条会和卡片里的对不上。
+    const first = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    const second = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    expect(first!.webUrl).toBe(second!.webUrl);
+    expect(first!.appLink).toBe(second!.appLink);
+  });
+
+  it('falls open to a credential-free link when the token is unreadable', () => {
+    // token 文件被改成不安全形状（组内可读）→ readSecureHostFileSync fail closed。
+    // 卡片不能因此发不出去：降级成无凭证链接 + credentialed:false，用户自己登录。
+    chmodSync(join(homeDir, '.botmux', '.dashboard-token'), 0o644);
+    const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    expect(links).toBeDefined();
+    expect(links!.credentialed).toBe(false);
+    expect(links!.webUrl).not.toContain(LEAKY_TOKEN);
+    expect(links!.webUrl).not.toContain('?t=');
   });
 });

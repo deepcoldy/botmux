@@ -558,13 +558,24 @@ export async function requestVcMeetingManagedAction(
   }
 
   // An origin that has not yet established an action must be the exact live
-  // dispatched attempt. In particular, attempt N may not create a terminal
-  // rejected action after attempt N+1 has taken over the same stable turn.
+  // dispatched attempt, OR the just-completed terminal attempt. In particular,
+  // attempt N may not create an action after attempt N+1 has taken over the same
+  // stable turn — the dispatchAttempt equality check below enforces that.
+  //
+  // Plan B: a meeting agent is an ordinary chat-scope session that typically
+  // decides to speak in-meeting AFTER it has finished processing the transcript
+  // turn (the delivery receipt is then `completed`, not `dispatched`). Accepting
+  // `completed` is safe: completion is TERMINAL, so no later attempt can take
+  // over it, and the dispatchAttempt equality check still pins the action to the
+  // exact attempt that ran. Only these two states are accepted; failed /
+  // ambiguous / abandoned still fail closed. (This gate is reached only by the
+  // in-meeting managed-action path — submitVcMeetingManagedAction — not by
+  // listener-group auto-post.)
   if (lookup.receipt.stableTurnId !== request.stableTurnId) {
     return errorResult(409, 'source_turn_mismatch', 'stable turn does not match the delivery receipt');
   }
-  if (lookup.receipt.status !== 'dispatched') {
-    return errorResult(409, 'delivery_not_dispatched', `delivery is ${lookup.receipt.status}, not dispatched`);
+  if (lookup.receipt.status !== 'dispatched' && lookup.receipt.status !== 'completed') {
+    return errorResult(409, 'delivery_not_dispatched', `delivery is ${lookup.receipt.status}, not dispatched or completed`);
   }
   if (lookup.receipt.dispatchAttempt !== request.dispatchAttempt) {
     return errorResult(409, 'stale_dispatch_attempt', 'action origin does not match the live delivery attempt');

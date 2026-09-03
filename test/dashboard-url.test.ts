@@ -11,6 +11,9 @@ vi.mock('../src/platform/binding.js', () => ({
   publicReverseProxyBaseUrl: vi.fn(() => null),
   readPlatformBinding: vi.fn(() => null),
 }));
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
 
 import {
   buildDashboardUrl,
@@ -18,6 +21,8 @@ import {
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   formatUrlHost,
+  workbenchEntryUrl,
+  workbenchSpaUrl,
 } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import {
@@ -25,6 +30,7 @@ import {
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../src/platform/binding.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
@@ -32,6 +38,7 @@ const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).
 const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
   vi.mocked(readPlatformBinding).mockReturnValue(binding)
 );
+const setDevbox = (base: string | null) => vi.mocked(devboxDashboardBaseUrl).mockReturnValue(base);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
@@ -39,6 +46,7 @@ describe('buildDashboardUrl', () => {
     setPlatform(null);
     setPublic(null);
     setBinding(null);
+    setDevbox(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -98,6 +106,33 @@ describe('buildDashboardUrl', () => {
       'https://m-deadbeef.botmux.example/?t=abc',
     );
   });
+
+  it('routes through a cached Merlin Devbox export when no explicit remote base exists', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+  });
+
+  // The Devbox lookup validates the cache against the port the dashboard
+  // actually bound (`.dashboard-port`), not against the port this link is for:
+  // v3 card callers pass config.dashboard.port, which goes stale after an
+  // EADDRINUSE probe, and would otherwise demote a working tunnel link.
+  it('asks the Devbox lookup about the bound port, not the caller port', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+    expect(devboxDashboardBaseUrl).toHaveBeenLastCalledWith();
+  });
+
+  it('lets BOTMUX_PUBLIC_URL win over a cached Merlin Devbox export', () => {
+    setPublic('https://botmux.example.com');
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://botmux.example.com/?t=abc',
+    );
+  });
 });
 
 describe('buildDashboardUrls', () => {
@@ -105,6 +140,7 @@ describe('buildDashboardUrls', () => {
     setRemote(false);
     setPlatform(null);
     setPublic(null);
+    setDevbox(null);
   });
 
   it('local-only: no localUrl fallback when the primary is already local', () => {
@@ -215,6 +251,18 @@ describe('buildPlatformDashboardLoginUrl', () => {
     setBinding({ platformUrl: 'https://platform.example/base', machineId: 'm/1', machineToken: 'secret' });
     expect(buildPlatformDashboardLoginUrl()).toContain('/open/m%2F1?');
   });
+
+  it('routes a `/s/<sessionId>` next so an owner logging in from the read-only terminal lands back on a writable terminal (#933)', () => {
+    setRemote(true);
+    setBinding({ platformUrl: 'https://platform.example', machineId: 'm-1', machineToken: 'secret' });
+    const url = buildPlatformDashboardLoginUrl('/s/sess-42');
+    // The platform routes a `/s/`-prefixed next to the terminal subdomain
+    // surface and mints the host-only proxy cookie there; the whole next is
+    // percent-encoded as one query value.
+    expect(url).toBe('https://platform.example/open/m-1?next=%2Fs%2Fsess-42');
+    // Default is unchanged — the existing SPA-401 caller must keep landing on /#/.
+    expect(buildPlatformDashboardLoginUrl()).toBe('https://platform.example/open/m-1?next=%2F%23%2F');
+  });
 });
 
 describe('buildV3RunDetailUrl', () => {
@@ -283,5 +331,50 @@ describe('buildV3RunDetailUrl', () => {
     expect(buildV3RunDetailUrl('run-1', { host: '::1', port: 7891 })).toBe(
       'http://[::1]:7891/#/v3/run-1',
     );
+  });
+});
+
+describe('workbench entry URL shapes', () => {
+  // Both derive from an already-built dashboard URL, so they inherit whatever
+  // base buildDashboardUrls picked (local host:port / platform subdomain /
+  // BOTMUX_PUBLIC_URL) with no second copy of that precedence rule.
+  const dashboardUrl = 'http://1.2.3.4:7891/?t=abc';
+
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setBinding(null);
+  });
+
+  it('workbenchSpaUrl keeps the ?t= token and adds the SPA hash route', () => {
+    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench');
+  });
+
+  it('workbenchEntryUrl swaps the path and drops the fragment', () => {
+    expect(workbenchEntryUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/workbench?t=abc');
+    // Already-hashed input normalizes to the same fragment-free entry.
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/?t=abc#/agent-workbench'))
+      .toBe('http://1.2.3.4:7891/workbench?t=abc');
+  });
+
+  it('follows the platform base rather than re-deriving host:port', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const { url } = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
+    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench');
+    expect(workbenchEntryUrl(url)).toBe('https://m-deadbeef.botmux.example/workbench?t=abc');
+  });
+
+  it('tolerates a token-less dashboard URL (user logs in on arrival)', () => {
+    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench');
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/workbench');
+  });
+
+  it('returns null for unparseable or non-http input instead of a half link', () => {
+    for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      expect(workbenchSpaUrl(bad)).toBeNull();
+      expect(workbenchEntryUrl(bad)).toBeNull();
+    }
   });
 });

@@ -23,6 +23,11 @@ import {
   V3DaemonCommandAuthorityError,
 } from './cli-daemon-command-authority.js';
 import { isValidRunId } from './ops-projection.js';
+import {
+  authorizeScheduledTurn,
+  parseScheduledTurnId,
+  scheduledTurnAuthErrorMessage,
+} from '../../core/scheduled-turn-provenance.js';
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
@@ -86,6 +91,20 @@ export function authorizeV3SessionRunMutationRequest(input: {
   session: V3SessionRelaySessionView | undefined;
   selfLarkAppId: string | undefined;
   baseDir: string;
+  /** Session data dir, for reading the per-bot schedules.json of a scheduled
+   *  turn. Required only when a `schedule:` turn is presented. */
+  sessionDataDir?: string;
+  /**
+   * Live owner gate for scheduled turns: must return true iff the task's
+   * creator (ownerOpenId) is still authorized for the bot. The daemon injects
+   * its resolvedAllowedUsers membership check, so on THIS relay path a
+   * creator removed from the bot loses workflow authority at the next
+   * mutation. The default non-sandbox signed-envelope route never reaches
+   * this relay and does not re-check membership (see
+   * scheduled-turn-provenance). Injected rather than imported to keep this
+   * module free of the daemon's bot-registry dependency.
+   */
+  isScheduleOwnerAllowed?: (larkAppId: string, ownerOpenId: string) => boolean;
 }): V3SessionRelayDecision {
   if (!isV3SessionRunMutation(input.mutation)) {
     return { ok: false, status: 404, error: 'unknown_mutation' };
@@ -133,7 +152,6 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // body cannot select another caller/chat/bot.
   const current = input.session;
   if (!current
-    || !nonEmpty(current.callerOpenId)
     || !nonEmpty(current.chatId)
     || !nonEmpty(current.larkAppId)) {
     return { ok: false, status: 403, error: 'session_identity_incomplete' };
@@ -142,23 +160,62 @@ export function authorizeV3SessionRunMutationRequest(input: {
     return { ok: false, status: 403, error: 'session_identity_incomplete' };
   }
 
-  // Generation join, mirroring the host path (current-turn-provenance.ts):
-  // lastCallerOpenId/quoteTargetId advance the moment the NEXT inbound message
-  // arrives, while the capability rotates only when that message is dequeued
-  // into the CLI (worker flushPending). The capability therefore proves turn
-  // A, but the caller fields may already describe a queued turn B — mixing the
-  // two would let A borrow B's identity. Only when the live capability's
-  // turnId IS the session's current turn pointer do all tuple fields belong to
-  // one generation (they are written atomically per inbound message);
-  // anything else fails closed, exactly like the host marker join.
   const liveTurnId = current.liveOrigin?.turnId;
-  const quoteTargetId = current.quoteTargetId;
-  const replyTurnId = current.currentReplyTargetTurnId;
-  if (!nonEmpty(liveTurnId)
-    || !nonEmpty(quoteTargetId)
-    || quoteTargetId !== liveTurnId
-    || (replyTurnId !== undefined && replyTurnId !== liveTurnId)) {
-    return { ok: false, status: 403, error: 'turn_provenance_stale' };
+
+  // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
+  // inbound message exists, so the session row carries no
+  // quoteTargetId/lastCallerOpenId for this turn. Authenticate via the task
+  // binding + the LIVE owner gate — on this relay path a creator removed
+  // from the bot's resolvedAllowedUsers is rejected here (the default
+  // non-sandbox signed-envelope route does not reach this path; see
+  // scheduled-turn-provenance). The tuple's callerOpenId is the task's
+  // creator, never anything the request chooses.
+  let callerOpenId: string;
+  if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
+    if (!input.sessionDataDir) {
+      return {
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+        detail: scheduledTurnAuthErrorMessage('task_not_found'),
+      };
+    }
+    // Fail closed when the daemon did not inject the live gate.
+    const gate = input.isScheduleOwnerAllowed ?? (() => false);
+    const auth = authorizeScheduledTurn({
+      turnId: liveTurnId,
+      dataDir: input.sessionDataDir,
+      sessionLarkAppId: current.larkAppId,
+      sessionChatId: current.chatId,
+      isOwnerAllowed: gate,
+    });
+    if ('error' in auth) {
+      return {
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+        detail: scheduledTurnAuthErrorMessage(auth.error),
+      };
+    }
+    callerOpenId = auth.ownerOpenId;
+  } else {
+    // Generation join, mirroring the host path (current-turn-provenance.ts):
+    // lastCallerOpenId/quoteTargetId advance the moment the NEXT inbound message
+    // arrives, while the capability rotates only when that message is dequeued
+    // into the CLI (worker flushPending). The capability therefore proves turn
+    // A, but the caller fields may already describe a queued turn B — mixing the
+    // two would let A borrow B's identity. Only when the live capability's
+    // turnId IS the session's current turn pointer do all tuple fields belong to
+    // one generation (they are written atomically per inbound message);
+    // anything else fails closed, exactly like the host marker join.
+    if (!nonEmpty(current.callerOpenId)) {
+      return { ok: false, status: 403, error: 'session_identity_incomplete' };
+    }
+    const quoteTargetId = current.quoteTargetId;
+    const replyTurnId = current.currentReplyTargetTurnId;
+    if (!nonEmpty(liveTurnId)
+      || !nonEmpty(quoteTargetId)
+      || quoteTargetId !== liveTurnId
+      || (replyTurnId !== undefined && replyTurnId !== liveTurnId)) {
+      return { ok: false, status: 403, error: 'turn_provenance_stale' };
+    }
+    callerOpenId = current.callerOpenId;
   }
 
   let authority;
@@ -167,7 +224,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
       runId: input.runId,
       baseDir: input.baseDir,
       current: {
-        callerOpenId: current.callerOpenId,
+        callerOpenId,
         chatId: current.chatId,
         larkAppId: current.larkAppId,
       },

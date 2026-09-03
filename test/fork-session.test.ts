@@ -8,13 +8,17 @@
  * source's context via the CLI-native fork primitive, and leaves the source
  * completely untouched. The most load-bearing behavior these tests lock is that
  * the child inherits the source's FROZEN LAUNCH POSTURE — sandbox decision,
- * model/effort override, and bot identity (larkAppId) — because the child is a
+ * effort override, and bot identity (larkAppId) — because the child is a
  * brand-new row (not a reused ds.session like transferSession), and a missing
  * field silently re-derives to the wrong value:
  *   • missing sandbox → forkWorker's resume=true path writes sandbox=false →
  *     a fork of a sandboxed session runs UNSANDBOXED (credential-seal escape);
- *   • missing model/effort → sessionAgentConfig re-freezes from the live bot
+ *   • missing effort → sessionAgentConfig re-freezes from the live bot
  *     config, dropping per-session overrides;
+ *   • the model is not FROZEN — it resolves from the live bot config on every
+ *     spawn — but the record of what the source last launched with travels so a
+ *     CLI-mismatched fork does not cold-spawn on the CLI default; an EXPLICIT
+ *     per-trigger override travels too, on the runtime (in-memory) session only;
  *   • missing larkAppId → restoreActiveSessions misattributes the fork to the
  *     first bot in the roster.
  *
@@ -81,6 +85,8 @@ import {
   isForkCapableSession,
   forkWorker,
   setActiveSessionsRegistry,
+  turnStartingCardStatus,
+  __testOnly_sessionAgentConfig as sessionAgentConfig,
 } from '../src/core/worker-pool.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -148,8 +154,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex'] as const) {
+  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -192,6 +198,27 @@ describe('isForkCapableSession', () => {
   it('refuses a non-forkable CLI (e.g. gemini)', () => {
     const ds = makeSourceDs({ cliId: 'gemini' });
     expect(isForkCapableSession(ds)).toBe(false);
+  });
+});
+
+describe('turnStartingCardStatus', () => {
+  it('starts a live Grok turn as working, not starting', () => {
+    const live = makeSourceDs({ cliId: 'grok' }, { workerReady: true });
+    expect(turnStartingCardStatus(live, 'grok')).toBe('working');
+    expect(turnStartingCardStatus(live, 'codex')).toBe('starting');
+  });
+
+  it('keeps Grok on starting until the worker has initialized', () => {
+    const cold = makeSourceDs({ cliId: 'grok' }, { workerReady: false });
+    expect(turnStartingCardStatus(cold, 'grok')).toBe('starting');
+  });
+
+  it('surfaces limited when a usage-limit state is present', () => {
+    const limited = makeSourceDs({ cliId: 'grok' }, {
+      workerReady: true,
+      usageLimit: { retryLabel: 'later' } as DaemonSession['usageLimit'],
+    });
+    expect(turnStartingCardStatus(limited, 'grok')).toBe('limited');
   });
 });
 
@@ -244,13 +271,13 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe(false);
   });
 
-  // ── P2: per-session model / reasoningEffort overrides + the agentFrozen
-  //    marker must ride along, else sessionAgentConfig re-freezes from the live
-  //    bot config and the clone silently drops the source's launch identity. ──
-  it('P2: model / reasoningEffort / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  // ── P2: the per-session reasoningEffort override + the agentFrozen marker
+  //    must ride along, else sessionAgentConfig re-freezes from the live bot
+  //    config and the clone silently drops the source's launch identity. ──
+  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
-      model: 'opus-custom',
       reasoningEffort: 'xhigh',
+      modelBackendVariant: 'max',
       cliRuntime: {
         id: 'custom-claude',
         displayName: 'Custom Claude',
@@ -267,13 +294,50 @@ describe('forkSession — frozen launch posture inheritance', () => {
     const r = await callFork(src);
     expect(r.ok).toBe(true);
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
-    expect(child.model).toBe('opus-custom');
     expect(child.reasoningEffort).toBe('xhigh');
+    expect(child.modelBackendVariant).toBe('max');
     expect(child.cliRuntime).toEqual(src.session.cliRuntime);
     expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
     expect(child.wrapperCli).toBe('ttadk');
     expect(child.agentFrozen).toBe(true);
+  });
+
+  // ── The model is not FROZEN (it resolves from the live bot config at every
+  //    spawn, so a same-CLI clone matches the source automatically), but the
+  //    record of what the source last launched with must still travel: a source
+  //    pinned to a CLI the bot no longer runs relies on that record (rule 3), and
+  //    a child without it would cold-spawn on the CLI default instead. ──
+  it('copies the last-launched model record so a CLI-mismatched fork keeps its model', async () => {
+    // Bot now runs claude-code; the source session is pinned to codex.
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', model: 'opus' },
+      botName: 'TestBot',
+    } as any);
+    const src = makeSourceDs({ cliId: 'codex', model: 'gpt-5.6' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.cliId).toBe('codex');
+    expect(child.model).toBe('gpt-5.6');   // not undefined, and not the bot's `opus`
+  });
+
+  // ── An EXPLICIT per-trigger override, however, must reach the clone: it lives
+  //    on the runtime session (in-memory, never persisted), so forkSession has
+  //    to hand it to the child ds or the fork silently drops to the bot default. ──
+  it('carries an explicit per-trigger model override onto the child runtime session', async () => {
+    const src = makeSourceDs({}, { spawnModelOverride: 'gpt-5.6-terra' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const [childDs] = forkWorkerSpy.mock.calls[0] as [DaemonSession];
+    expect(childDs.spawnModelOverride).toBe('gpt-5.6-terra');
+    // …and it stays out of the persisted row.
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.model).toBeUndefined();
   });
 
   // ── The larkAppId gap codex caught: the persisted child row must carry the
@@ -436,5 +500,84 @@ describe('forkSession — refusals', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('worker_busy');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * sessionAgentConfig — /cli cliLaunchSnapshot model resolution WIRING.
+ *
+ * The unit-level model contract lives in session-launch-model.test.ts (it tests
+ * resolveSessionLaunchModel directly). These tests guard the CALL SITE: that the
+ * snapshot branch actually routes model through that live resolution AFTER it
+ * stamps ds.session.cliId = selected.cliId, rather than freezing the (null)
+ * snapshot model. Reverting the fix to `model = selected.model ?? undefined`
+ * reddens the "same-CLI keeps bot model" and "override wins" cases here — which
+ * the function-level tests cannot catch.
+ */
+describe('sessionAgentConfig — /cli snapshot model wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+  });
+
+  const pendingSnapshot = (cliId: any) => ({
+    version: 1 as const,
+    state: 'pending' as const,
+    entryId: cliId,
+    cliId,
+    cliRuntime: null,
+    cliPathOverride: null,
+    wrapperCli: null,
+    model: null,
+    reasoningEffort: null,
+    launchShell: null,
+    startupCommands: [] as string[],
+  });
+
+  // A fresh /cli-selected session: no history, no model of its own, pending snapshot.
+  const selectedDs = (cliId: any, dsOverrides: Partial<DaemonSession> = {}) =>
+    makeSourceDs(
+      { cliId: undefined, cliSessionId: undefined, agentFrozen: false, model: undefined, cliLaunchSnapshot: pendingSnapshot(cliId) as any },
+      dsOverrides,
+    );
+
+  it('leaks no bot model across a cross-CLI selection (/cli codex on a claude bot)', () => {
+    const ds = selectedDs('codex');
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBeUndefined();          // opus must NOT reach codex
+    expect(ds.session.cliId).toBe('codex');     // snapshot resolved onto the session
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('keeps the bot model for a same-CLI selection (/cli codex on a codex bot)', () => {
+    const ds = selectedDs('codex');
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex', model: 'gpt-5.6' });
+    expect(cfg.model).toBe('gpt-5.6');          // same CLI → live bot model applies (== /restart)
+  });
+
+  it('honors a per-trigger spawnModelOverride on a /cli session', () => {
+    const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
+    expect(cfg.model).toBe('gpt-5.6-terra');    // override wins even on cross-CLI
+  });
+
+  it('freezes a TraeX backend variant for the session launch identity', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const first = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(first.modelBackendVariant).toBe('max');
+    expect(ds.session.modelBackendVariant).toBe('max');
+
+    const resumed = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'standard' });
+    expect(resumed.modelBackendVariant).toBe('max');
+  });
+
+  it('keeps old frozen sessions without a variant in inherit mode', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(cfg.modelBackendVariant).toBeUndefined();
   });
 });

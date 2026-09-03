@@ -1,10 +1,19 @@
 /**
  * Dashboard 私有 API：「会议角色预设」（VC meeting consumer profiles）。
  *
+ * 2026-08 起预设目录是**全 fleet 共享**的一份（`~/.botmux/config.json` 的
+ * `vcMeetingAgent.consumerCatalog`），不再按 bot 分开配置：
+ *
+ *   - 用户不用再手选「会议事件接收 Bot」——每个开着 VC 的 bot 都处理自己收到的
+ *     会议事件，被拉进会的是谁就由谁执行；
+ *   - 预设条目**不带** `agentAppId`。执行方在读路径合并时才绑定为收到事件的那个
+ *     bot（services/vc-meeting-shared-consumer-catalog.ts），所以「拉 A 进会却把
+ *     B 拉进监听群」在数据模型层面就不可表达。
+ *
  * 职责边界：本层只做 用户 DTO ↔ canonical 配置 的映射与 HTTP 语义包装；
- * 配置 RMW / revision 乐观并发 / 字段校验的权威在
- * `services/vc-meeting-consumer-profile-store.ts`（锁内复核），运行时冲突
- * 裁决的权威在 bot-registry resolver——Dashboard 校验只是提前反馈。
+ * revision 乐观并发 / 字段校验的权威在
+ * `services/vc-meeting-shared-consumer-catalog-store.ts`，运行时冲突裁决的权威
+ * 在 bot-registry resolver——Dashboard 校验只是提前反馈。
  *
  * permissionPreset 是纯 UI 概念，不持久化：保存时映射成 canonical
  * capabilities/ownedSinks 原语；`custom` 只允许复用同 id 既有 policy，
@@ -17,12 +26,13 @@ import type {
   VcMeetingConsumerResponseMode,
   VcMeetingListenerOutputPlacement,
 } from '../types.js';
+import type { VcMeetingSharedConsumerProfile } from '../global-config.js';
 import type { VcMeetingActivityType } from '../vc-agent/types.js';
 import type {
-  UpdateVcMeetingConsumerProfilesResult,
-  VcMeetingConsumerProfileFieldError,
-  VcMeetingConsumerProfilesSnapshot,
-} from '../services/vc-meeting-consumer-profile-store.js';
+  UpdateVcMeetingSharedConsumerCatalogResult,
+  VcMeetingSharedConsumerCatalogFieldError,
+  VcMeetingSharedConsumerCatalogSnapshot,
+} from '../services/vc-meeting-shared-consumer-catalog-store.js';
 import {
   VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
   type VcMeetingConsumerProfileTemplateCatalog,
@@ -33,10 +43,12 @@ export type VcMeetingPermissionPreset =
   | VcMeetingTemplatePermissionPreset
   | 'custom';
 
+/** 字段级错误的形状与 per-bot 时代一致，路径前缀也保持 `profiles[i].*`。 */
+export type VcMeetingConsumerProfileFieldError = VcMeetingSharedConsumerCatalogFieldError;
+
 export interface VcMeetingConsumerProfileDto {
   id: string;
   label?: string;
-  agentAppId: string;
   instructions?: string;
   activityTypes?: string[];
   responseMode: VcMeetingConsumerResponseMode;
@@ -58,28 +70,61 @@ export interface VcMeetingAgentOptionDto {
   /** Is the managed sandbox boundary actually in force? false ⇒ the bot's Lark
    *  credential is exposed to untrusted meeting input (informed opt-out). */
   sandboxIsolated: boolean;
+  /** 这个 bot 是否接收会议事件（bots.json vcMeetingAgent.enabled）。缺省视为
+   *  开启——VC 对每个连着飞书的 bot 默认可用，`enabled: false` 是显式退出。 */
+  vcEnabled: boolean;
+  /** apiOnly（无飞书连接）的 bot 结构上不可能收会议事件，UI 需要禁用它的开关。 */
+  vcEligible: boolean;
+  /** Configured per-bot in-meeting output policies (bots.json
+   *  vcMeetingAgent.meetingConsumer.*). null = unset → daemon default. */
+  textOutputPolicy: VcMeetingOutputPolicyValue | null;
+  voiceOutputPolicy: VcMeetingOutputPolicyValue | null;
+  /** vcMeetingAgent.realtimeVoice.enabled — hard gate for in-meeting voice. */
+  realtimeVoiceEnabled: boolean;
+  /** per-bot 从共享目录挑的默认角色 id（vcMeetingAgent.meetingConsumer.
+   *  catalogDefaultConsumerId）。null = 未挑 → 跟随共享目录全局默认。 */
+  catalogDefaultConsumerId: string | null;
+  /** Effective values after daemon defaults (kept in sync with
+   *  defaultVcMeetingTextOutputPolicy / defaultVcMeetingVoiceOutputPolicy). */
+  effectiveTextOutputPolicy: VcMeetingOutputPolicyValue;
+  effectiveVoiceOutputPolicy: VcMeetingOutputPolicyValue;
+}
+
+export type VcMeetingOutputPolicyValue = 'allow' | 'approval' | 'deny';
+
+export interface VcMeetingBotOutputPolicyPatch {
+  appId: string;
+  /** 会议事件接收开关（vcMeetingAgent.enabled）。 */
+  vcEnabled: boolean;
+  /** null clears the override back to the daemon default. */
+  textOutputPolicy: VcMeetingOutputPolicyValue | null;
+  voiceOutputPolicy: VcMeetingOutputPolicyValue | null;
+  realtimeVoiceEnabled: boolean;
+  /** per-bot 从共享目录挑的默认角色 id。null（或空串）= 跟随全局默认。
+   *  写到 vcMeetingAgent.meetingConsumer.catalogDefaultConsumerId。 */
+  catalogDefaultConsumerId: string | null;
 }
 
 export interface VcMeetingConsumerProfilesGetBody {
   ok: true;
-  listenerBotAppId: string;
   revision: string;
-  catalogState: VcMeetingConsumerProfilesSnapshot['catalogState'];
+  catalogState: VcMeetingSharedConsumerCatalogSnapshot['catalogState'];
   defaultMode: 'listenOnly' | 'agents';
   defaultConsumerIds: string[];
   profiles: VcMeetingConsumerProfileDto[];
   agentOptions: VcMeetingAgentOptionDto[];
   /** Versioned, read-only templates. Applying one creates a detached editable profile. */
   templateCatalog: VcMeetingConsumerProfileTemplateCatalog;
-  migrationOffer?: VcMeetingConsumerProfilesSnapshot['migrationOffer'];
 }
 
 export interface VcMeetingConsumerProfilesPutRequest {
-  listenerBotAppId: string;
   expectedRevision: string;
   defaultMode: 'listenOnly' | 'agents';
   defaultConsumerIds: string[];
   profiles: VcMeetingConsumerProfileDto[];
+  /** Optional per-bot patches applied to bots.json via the locked
+   *  read-modify-write path after the shared catalog update succeeds. */
+  botOutputPolicies?: VcMeetingBotOutputPolicyPatch[];
 }
 
 export type VcMeetingConsumerProfilesApiResult =
@@ -91,16 +136,14 @@ export type VcMeetingConsumerProfilesApiResult =
     } };
 
 export interface VcMeetingConsumerProfilesApiDeps {
-  readSnapshot(listenerBotAppId: string): Promise<VcMeetingConsumerProfilesSnapshot | undefined>;
-  updateSnapshot(
-    listenerBotAppId: string,
-    input: {
-      expectedRevision: string;
-      defaultMode: 'listenOnly' | 'agents';
-      defaultConsumerIds: string[];
-      profiles: VcMeetingConsumerProfileConfig[];
-    },
-  ): Promise<UpdateVcMeetingConsumerProfilesResult>;
+  /** 读全局共享目录。同步实现也可以——签名允许两者。 */
+  readCatalog(): VcMeetingSharedConsumerCatalogSnapshot | Promise<VcMeetingSharedConsumerCatalogSnapshot>;
+  updateCatalog(input: {
+    expectedRevision: string;
+    defaultMode: 'listenOnly' | 'agents';
+    defaultConsumerIds: string[];
+    profiles: VcMeetingSharedConsumerProfile[];
+  }): UpdateVcMeetingSharedConsumerCatalogResult | Promise<UpdateVcMeetingSharedConsumerCatalogResult>;
   loadBotConfigs(): BotConfig[];
   effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined;
   /** Online DaemonInfo botName lookup; undefined when the daemon is offline. */
@@ -109,8 +152,11 @@ export interface VcMeetingConsumerProfilesApiDeps {
   adapterReliableTurnTerminal(cliId: string | undefined, cliPathOverride?: string): boolean;
   managedSideEffectEligible(bot: BotConfig): boolean;
   sandboxIsolated(bot: BotConfig): boolean;
-  /** Called after a successful PUT so the live daemon reloads the new catalog. */
+  /** Called after a successful PUT so the live daemon reloads changed bots.json. */
   reloadDaemons(appIds: string[]): Promise<void>;
+  /** Locked read-modify-write of one bot's VC switches in bots.json
+   *  (vcMeetingAgent.enabled + meetingConsumer.* + realtimeVoice.enabled). */
+  applyBotOutputPolicy(patch: VcMeetingBotOutputPolicyPatch): Promise<{ ok: boolean; reason?: string }>;
 }
 
 const VC_MEETING_OUTPUT_CAPABILITY = 'meeting.output.request';
@@ -176,12 +222,11 @@ export function deriveVcMeetingPermissionPreset(
 }
 
 export function vcMeetingConsumerProfileToDto(
-  profile: VcMeetingConsumerProfileConfig,
+  profile: VcMeetingSharedConsumerProfile,
 ): VcMeetingConsumerProfileDto {
   return {
     id: profile.id,
     ...(profile.label ? { label: profile.label } : {}),
-    agentAppId: profile.agentAppId,
     ...(profile.instructions ? { instructions: profile.instructions } : {}),
     ...(profile.filter?.activityTypes?.length
       ? { activityTypes: [...profile.filter.activityTypes] }
@@ -193,7 +238,7 @@ export function vcMeetingConsumerProfileToDto(
 }
 
 type DtoValidation =
-  | { ok: true; profiles: VcMeetingConsumerProfileConfig[] }
+  | { ok: true; profiles: VcMeetingSharedConsumerProfile[] }
   | { ok: false; fieldErrors: VcMeetingConsumerProfileFieldError[] };
 
 /**
@@ -201,14 +246,16 @@ type DtoValidation =
  * （role 参与 profileHash，改写会造成不必要的 epoch 变更），新 id 用 id 作
  * role。custom 档只复用同 id 既有 capabilities/ownedSinks，新 id 无可复用
  * policy → fieldError。
+ *
+ * 输出**不含** `agentAppId`：共享目录不绑定执行方。
  */
 export function vcMeetingConsumerProfilesFromDtos(
   dtos: readonly VcMeetingConsumerProfileDto[],
-  existing: readonly VcMeetingConsumerProfileConfig[],
+  existing: readonly VcMeetingSharedConsumerProfile[],
 ): DtoValidation {
   const fieldErrors: VcMeetingConsumerProfileFieldError[] = [];
   const existingById = new Map(existing.map(profile => [profile.id, profile] as const));
-  const profiles: VcMeetingConsumerProfileConfig[] = [];
+  const profiles: VcMeetingSharedConsumerProfile[] = [];
   dtos.forEach((dto, index) => {
     const path = (field: string): string => `profiles[${index}].${field}`;
     if (!dto || typeof dto !== 'object' || Array.isArray(dto)) {
@@ -217,10 +264,6 @@ export function vcMeetingConsumerProfilesFromDtos(
     }
     if (typeof dto.id !== 'string' || !dto.id.trim()) {
       fieldErrors.push({ path: path('id'), message: 'id 不能为空' });
-      return;
-    }
-    if (typeof dto.agentAppId !== 'string' || !dto.agentAppId.trim()) {
-      fieldErrors.push({ path: path('agentAppId'), message: '必须选择一个 Agent' });
       return;
     }
     if (dto.responseMode !== 'silent' && dto.responseMode !== 'listener_thread') {
@@ -287,7 +330,6 @@ export function vcMeetingConsumerProfilesFromDtos(
     const instructions = dto.instructions?.trim();
     profiles.push({
       id: dto.id.trim(),
-      agentAppId: dto.agentAppId.trim(),
       ...(label ? { label } : {}),
       role: prior?.role ?? dto.id.trim(),
       ...(instructions ? { instructions } : {}),
@@ -325,6 +367,16 @@ export function buildVcMeetingAgentOptions(
     } catch {
       workingDirReady = false;
     }
+    const vc = bot.vcMeetingAgent;
+    const textOutputPolicy = normalizeOutputPolicy(vc?.meetingConsumer?.textOutputPolicy);
+    const voiceOutputPolicy = normalizeOutputPolicy(vc?.meetingConsumer?.voiceOutputPolicy);
+    // 实时语音能力默认开启：未配 = 开，只有显式 false 才关（与 daemon 的
+    // vcMeetingRealtimeVoiceEnabled 保持同一判定）。语音 WS 仍按需建连,能力开
+    // 不等于入会即连。
+    const realtimeVoiceEnabled = vc?.realtimeVoice?.enabled !== false;
+    // apiOnly（core-only）bot 没有飞书连接，收不到会议事件——与 bot-registry 的
+    // vcMeetingAgentConfigActive fail-close 保持同一判定。
+    const vcEligible = bot.apiOnly !== true;
     return {
       appId: bot.larkAppId,
       label: bot.displayName || deps.onlineBotName(bot.larkAppId) || bot.name || bot.larkAppId,
@@ -334,17 +386,106 @@ export function buildVcMeetingAgentOptions(
       reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot.cliId, bot.cliPathOverride),
       managedSideEffectEligible: deps.managedSideEffectEligible(bot),
       sandboxIsolated: deps.sandboxIsolated(bot),
+      // 缺省 = 开启：VC 对每个连着飞书的 bot 默认可用，enabled:false 才是退出。
+      vcEnabled: vcEligible && vc?.enabled !== false,
+      vcEligible,
+      textOutputPolicy,
+      voiceOutputPolicy,
+      realtimeVoiceEnabled,
+      catalogDefaultConsumerId: normalizeNonEmptyStringOrNull(vc?.meetingConsumer?.catalogDefaultConsumerId),
+      // Mirrors daemon defaultVcMeetingTextOutputPolicy / defaultVcMeetingVoiceOutputPolicy.
+      effectiveTextOutputPolicy: textOutputPolicy ?? 'allow',
+      effectiveVoiceOutputPolicy: !realtimeVoiceEnabled ? 'deny' : (voiceOutputPolicy ?? 'allow'),
     };
   }).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
 }
 
+function normalizeOutputPolicy(value: unknown): VcMeetingOutputPolicyValue | null {
+  return value === 'allow' || value === 'approval' || value === 'deny' ? value : null;
+}
+
+function normalizeNonEmptyStringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function parseBotOutputPolicyPatches(
+  raw: unknown,
+  knownAppIds: ReadonlySet<string>,
+  knownProfileIds: ReadonlySet<string>,
+): { ok: true; patches: VcMeetingBotOutputPolicyPatch[] } | { ok: false; fieldErrors: VcMeetingConsumerProfileFieldError[] } {
+  if (raw === undefined) return { ok: true, patches: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, fieldErrors: [{ path: 'botOutputPolicies', message: 'botOutputPolicies 必须是数组' }] };
+  }
+  const fieldErrors: VcMeetingConsumerProfileFieldError[] = [];
+  const patches: VcMeetingBotOutputPolicyPatch[] = [];
+  const seen = new Set<string>();
+  raw.forEach((item, index) => {
+    const path = (field: string): string => `botOutputPolicies[${index}].${field}`;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      fieldErrors.push({ path: `botOutputPolicies[${index}]`, message: '必须是对象' });
+      return;
+    }
+    const record = item as Record<string, unknown>;
+    const appId = typeof record.appId === 'string' ? record.appId.trim() : '';
+    if (!appId || !knownAppIds.has(appId)) {
+      fieldErrors.push({ path: path('appId'), message: '未知的 bot appId' });
+      return;
+    }
+    if (seen.has(appId)) {
+      fieldErrors.push({ path: path('appId'), message: '同一 bot 重复出现' });
+      return;
+    }
+    seen.add(appId);
+    const parsePolicy = (field: 'textOutputPolicy' | 'voiceOutputPolicy'): VcMeetingOutputPolicyValue | null | undefined => {
+      const value = record[field];
+      if (value === null) return null;
+      if (value === 'allow' || value === 'approval' || value === 'deny') return value;
+      fieldErrors.push({ path: path(field), message: '必须是 allow/approval/deny 或 null' });
+      return undefined;
+    };
+    const textOutputPolicy = parsePolicy('textOutputPolicy');
+    const voiceOutputPolicy = parsePolicy('voiceOutputPolicy');
+    if (typeof record.realtimeVoiceEnabled !== 'boolean') {
+      fieldErrors.push({ path: path('realtimeVoiceEnabled'), message: '必须是布尔值' });
+      return;
+    }
+    // 老客户端不发 vcEnabled：缺省保持「接收」，与 vcMeetingAgent.enabled 缺省
+    // 语义一致，绝不能把没提交这个字段解释成「关闭接收」。
+    if (record.vcEnabled !== undefined && typeof record.vcEnabled !== 'boolean') {
+      fieldErrors.push({ path: path('vcEnabled'), message: '必须是布尔值' });
+      return;
+    }
+    // per-bot 默认角色：null/缺省 = 跟随全局默认；给了字符串则必须命中本次提交的
+    // 目录角色 id（不然存了个悬空默认，会静默回落全局，误导操作者）。
+    let catalogDefaultConsumerId: string | null = null;
+    const rawDefault = record.catalogDefaultConsumerId;
+    if (rawDefault !== undefined && rawDefault !== null && rawDefault !== '') {
+      if (typeof rawDefault !== 'string' || !knownProfileIds.has(rawDefault)) {
+        fieldErrors.push({ path: path('catalogDefaultConsumerId'), message: '必须是本目录中存在的角色 id 或留空' });
+        return;
+      }
+      catalogDefaultConsumerId = rawDefault;
+    }
+    if (textOutputPolicy === undefined || voiceOutputPolicy === undefined) return;
+    patches.push({
+      appId,
+      vcEnabled: record.vcEnabled === undefined ? true : record.vcEnabled as boolean,
+      textOutputPolicy,
+      voiceOutputPolicy,
+      realtimeVoiceEnabled: record.realtimeVoiceEnabled,
+      catalogDefaultConsumerId,
+    });
+  });
+  return fieldErrors.length > 0 ? { ok: false, fieldErrors } : { ok: true, patches };
+}
+
 function snapshotBody(
-  snapshot: VcMeetingConsumerProfilesSnapshot,
+  snapshot: VcMeetingSharedConsumerCatalogSnapshot,
   agentOptions: VcMeetingAgentOptionDto[],
 ): VcMeetingConsumerProfilesGetBody {
   return {
     ok: true,
-    listenerBotAppId: snapshot.listenerBotAppId,
     revision: snapshot.revision,
     catalogState: snapshot.catalogState,
     defaultMode: snapshot.defaultMode,
@@ -352,24 +493,18 @@ function snapshotBody(
     profiles: snapshot.profiles.map(vcMeetingConsumerProfileToDto),
     agentOptions,
     templateCatalog: VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
-    ...(snapshot.migrationOffer ? { migrationOffer: snapshot.migrationOffer } : {}),
   };
 }
 
 export async function handleVcMeetingConsumerProfilesGet(
-  listenerBotAppId: string,
   deps: VcMeetingConsumerProfilesApiDeps,
 ): Promise<VcMeetingConsumerProfilesApiResult> {
-  if (!listenerBotAppId.trim()) {
-    return { status: 400, body: { ok: false, error: 'listenerBotAppId_required' } };
-  }
-  let snapshot: VcMeetingConsumerProfilesSnapshot | undefined;
+  let snapshot: VcMeetingSharedConsumerCatalogSnapshot;
   try {
-    snapshot = await deps.readSnapshot(listenerBotAppId.trim());
+    snapshot = await deps.readCatalog();
   } catch {
     return { status: 503, body: { ok: false, error: 'config_unavailable' } };
   }
-  if (!snapshot) return { status: 404, body: { ok: false, error: 'bot_not_in_config' } };
   return { status: 200, body: snapshotBody(snapshot, buildVcMeetingAgentOptions(deps)) };
 }
 
@@ -381,10 +516,6 @@ export async function handleVcMeetingConsumerProfilesPut(
     return { status: 400, body: { ok: false, error: 'bad_json' } };
   }
   const request = payload as Partial<VcMeetingConsumerProfilesPutRequest>;
-  const listenerBotAppId = typeof request.listenerBotAppId === 'string' ? request.listenerBotAppId.trim() : '';
-  if (!listenerBotAppId) {
-    return { status: 400, body: { ok: false, error: 'listenerBotAppId_required' } };
-  }
   if (typeof request.expectedRevision !== 'string' || !request.expectedRevision) {
     return { status: 400, body: { ok: false, error: 'expectedRevision_required' } };
   }
@@ -420,13 +551,12 @@ export async function handleVcMeetingConsumerProfilesPut(
     };
   }
 
-  let current: VcMeetingConsumerProfilesSnapshot | undefined;
+  let current: VcMeetingSharedConsumerCatalogSnapshot;
   try {
-    current = await deps.readSnapshot(listenerBotAppId);
+    current = await deps.readCatalog();
   } catch {
     return { status: 503, body: { ok: false, error: 'config_unavailable' } };
   }
-  if (!current) return { status: 404, body: { ok: false, error: 'bot_not_in_config' } };
 
   const mapped = vcMeetingConsumerProfilesFromDtos(
     request.profiles as VcMeetingConsumerProfileDto[],
@@ -439,9 +569,27 @@ export async function handleVcMeetingConsumerProfilesPut(
     };
   }
 
-  // defaultConsumerIds 原样提交：未知/重复/agents-空组合由 store 严格拒绝，
-  // 本层不做静默过滤（与 store 的 fail-loud 语义保持一致）。
-  const updated = await deps.updateSnapshot(listenerBotAppId, {
+  let knownAppIds: ReadonlySet<string>;
+  try {
+    knownAppIds = new Set(deps.loadBotConfigs().map(bot => bot.larkAppId));
+  } catch {
+    knownAppIds = new Set();
+  }
+  const parsedPolicies = parseBotOutputPolicyPatches(
+    request.botOutputPolicies,
+    knownAppIds,
+    new Set(mapped.profiles.map(profile => profile.id)),
+  );
+  if (!parsedPolicies.ok) {
+    return {
+      status: 422,
+      body: { ok: false, error: 'validation_failed', fieldErrors: parsedPolicies.fieldErrors },
+    };
+  }
+
+  // defaultConsumerIds 原样提交：未知/重复/agents-空组合以及「同时选中两个角色」
+  // 由 store 严格拒绝，本层不做静默过滤（与 store 的 fail-loud 语义保持一致）。
+  const updated = await deps.updateCatalog({
     expectedRevision: request.expectedRevision,
     defaultMode: request.defaultMode,
     defaultConsumerIds: [...request.defaultConsumerIds],
@@ -461,16 +609,42 @@ export async function handleVcMeetingConsumerProfilesPut(
         },
       };
     }
-    if (updated.reason === 'bot_not_in_config') {
-      return { status: 404, body: { ok: false, error: 'bot_not_in_config' } };
-    }
     return { status: 503, body: { ok: false, error: 'config_unavailable' } };
   }
 
+  // Per-bot switches go to bots.json through the locked RMW path. The shared
+  // catalog is already committed at this point; a policy failure is surfaced
+  // loudly (503) so the UI re-GETs and shows what actually landed.
+  const policyFailures: VcMeetingConsumerProfileFieldError[] = [];
+  for (const patch of parsedPolicies.patches) {
+    try {
+      const applied = await deps.applyBotOutputPolicy(patch);
+      if (!applied.ok) {
+        policyFailures.push({
+          path: `botOutputPolicies[${patch.appId}]`,
+          message: applied.reason ?? 'write_failed',
+        });
+      }
+    } catch (err) {
+      policyFailures.push({
+        path: `botOutputPolicies[${patch.appId}]`,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   try {
-    await deps.reloadDaemons([listenerBotAppId]);
+    // 共享目录不需要 reload：它在 daemon 侧走 mtime 缓存的 live 读，下一个会议
+    // 事件自然生效。只有落进 bots.json 的 per-bot 开关需要通知对应 daemon。
+    await deps.reloadDaemons(parsedPolicies.patches.map(patch => patch.appId));
   } catch {
     // 配置已落盘；reload 失败只影响热加载时效，下次 daemon 重启/重载自然收敛。
+  }
+  if (policyFailures.length > 0) {
+    return {
+      status: 503,
+      body: { ok: false, error: 'bot_policy_write_failed', fieldErrors: policyFailures },
+    };
   }
   return { status: 200, body: snapshotBody(updated.snapshot, buildVcMeetingAgentOptions(deps)) };
 }

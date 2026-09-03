@@ -18,6 +18,9 @@ function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 function abortEv(reason = 'interrupted', uuid?: string, ts = 0, sourceSessionId?: string): CodexBridgeEvent {
   return { uuid: uuid ?? `x${++nextUuid}`, timestampMs: ts, kind: 'turn_aborted', text: reason, sourceSessionId };
 }
+function cotEv(entries: NonNullable<CodexBridgeEvent['cotEntries']>, uuid?: string, ts = 0): CodexBridgeEvent {
+  return { uuid: uuid ?? `c${++nextUuid}`, timestampMs: ts, kind: 'cot', text: '', cotEntries: entries };
+}
 function markerForContent(sentAtMs: number, content: string): BridgeSendMarker {
   return { sentAtMs, ...buildBridgeSendMarkerContent(content) };
 }
@@ -51,6 +54,56 @@ function emitDecisions(
   }
   return out;
 }
+
+describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
+  it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
+    const q = new CodexBridgeQueue();
+    const seen: { turnId: string; entries: readonly unknown[] }[] = [];
+    q.setCotObserver((entries, turn) => seen.push({ turnId: turn.turnId, entries }));
+
+    // Before any turn is collecting: dropped (history replay safety).
+    q.ingest([cotEv([{ kind: 'thinking', text: 'stale history' }], 'c-early')]);
+    expect(seen).toEqual([]);
+
+    q.mark('t1', 'run the task', 100);
+    q.ingest([userEv('run the task', 'u-cot', 200)]);
+    q.ingest([cotEv([{ kind: 'thinking', text: 'let me look' }], 'c-think', 300)]);
+    q.ingest([cotEv([{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["ls"]}' }], 'c-call', 400)]);
+    expect(seen).toEqual([
+      { turnId: 't1', entries: [{ kind: 'thinking', text: 'let me look' }] },
+      { turnId: 't1', entries: [{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["ls"]}' }] },
+    ]);
+
+    // After the terminal edge nothing is collecting → dropped again.
+    q.ingest([asstEv('done', 'a-cot', 500)]);
+    q.ingest([cotEv([{ kind: 'thinking', text: 'post-final stray' }], 'c-late', 600)]);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('cot events never start, close or wedge a turn (attribution unchanged)', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'prompt', 100);
+    // cot arriving before the user event must not consume or block the mark.
+    q.ingest([cotEv([{ kind: 'thinking', text: 'pre-start' }], 'c-pre', 150)]);
+    expect(q.hasBlockingTurn()).toBe(false);
+    q.ingest([userEv('prompt', 'u1', 200)]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    q.ingest([cotEv([{ kind: 'thinking', text: 'mid' }], 'c-mid', 300)]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    q.ingest([asstEv('done', 'a1', 400)]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({ turnId: 't1', finalText: 'done' })]);
+  });
+
+  it('a throwing observer never breaks attribution', () => {
+    const q = new CodexBridgeQueue();
+    q.setCotObserver(() => { throw new Error('boom'); });
+    q.mark('t1', 'prompt', 100);
+    q.ingest([userEv('prompt', 'u1', 200)]);
+    expect(() => q.ingest([cotEv([{ kind: 'thinking', text: 'x' }], 'c1', 300)])).not.toThrow();
+    q.ingest([asstEv('done', 'a1', 400)]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({ turnId: 't1', finalText: 'done' })]);
+  });
+});
 
 describe('CodexBridgeQueue', () => {
   it('reports lifecycle busy only after transcript start until assistant_final closes the turn', () => {

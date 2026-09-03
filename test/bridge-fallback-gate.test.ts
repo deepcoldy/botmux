@@ -1,4 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
@@ -9,9 +11,19 @@ import {
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
+  structuredFallbackKind,
   stripTrailingBridgeSentinelLine,
+  stripTrailingOaiMemoryCitation,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
+import {
+  CODEX_CONNECTION_ERROR_CODE,
+  CODEX_RATE_LIMIT_ERROR_CODE,
+} from '../src/services/codex-transcript.js';
+import {
+  settleDeferredSubmitConfirmation,
+  type SubmitActivityEvidence,
+} from '../src/services/submit-confirmation.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -23,6 +35,172 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
     ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
+
+const memoryCitation = (lineEnding = '\n', rolloutIds = '019c1234') => [
+  '<oai-mem-citation>',
+  '<citation_entries>',
+  'MEMORY.md:10-12|note=[routing context]',
+  '</citation_entries>',
+  '<rollout_ids>',
+  rolloutIds,
+  '</rollout_ids>',
+  '</oai-mem-citation>',
+].join(lineEnding);
+
+describe('stripTrailingOaiMemoryCitation', () => {
+  it('strips only a complete citation suffix and its separator', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\n\n${memoryCitation()}`))
+      .toBe('Visible answer.');
+    expect(stripTrailingOaiMemoryCitation(memoryCitation())).toBe('');
+  });
+
+  it('accepts CRLF, trailing whitespace, and an empty rollout_ids section', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\r\n\r\n${memoryCitation('\r\n', '')}\r\n  `))
+      .toBe('Visible answer.');
+  });
+
+  it('preserves middle-of-body occurrences and fenced examples', () => {
+    const middle = `${memoryCitation()}\n\nMore visible prose.`;
+    expect(stripTrailingOaiMemoryCitation(middle)).toBe(middle);
+
+    const fenced = `Example:\n\n\`\`\`xml\n${memoryCitation()}\n\`\`\``;
+    expect(stripTrailingOaiMemoryCitation(fenced)).toBe(fenced);
+  });
+
+  it('preserves inline, malformed, and incomplete blocks', () => {
+    const inline = `answer ${memoryCitation()}`;
+    expect(stripTrailingOaiMemoryCitation(inline)).toBe(inline);
+
+    const missingRollouts = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n</oai-mem-citation>';
+    expect(stripTrailingOaiMemoryCitation(missingRollouts)).toBe(missingRollouts);
+
+    const unclosed = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n<rollout_ids>';
+    expect(stripTrailingOaiMemoryCitation(unclosed)).toBe(unclosed);
+  });
+
+  it('stops each section at its first closing tag', () => {
+    const extraCitationText = [
+      '<oai-mem-citation>',
+      '<citation_entries>first</citation_entries>',
+      'visible text after the first closing tag',
+      '<citation_entries>second</citation_entries>',
+      '<rollout_ids>019c1234</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraCitationText)).toBe(extraCitationText);
+
+    const extraRolloutText = [
+      '<oai-mem-citation>',
+      '<citation_entries>entry</citation_entries>',
+      '<rollout_ids>first</rollout_ids>',
+      'visible text after the first closing tag',
+      '<rollout_ids>second</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraRolloutText)).toBe(extraRolloutText);
+  });
+
+  it('handles a large malformed suffix without combinatorial backtracking', () => {
+    const repeatedCandidates = '</citation_entries><citation_entries>x'.repeat(25_000);
+    const malformed = `<oai-mem-citation><citation_entries>${repeatedCandidates}`
+      + '<rollout_ids>missing final envelope';
+    expect(stripTrailingOaiMemoryCitation(malformed)).toBe(malformed);
+  });
+});
+
+function workerFunctionSlice(name: string, nextName: string): string {
+  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+  const start = source.indexOf(`function ${name}`);
+  const end = source.indexOf(`function ${nextName}`, start + 1);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
+
+describe('worker submit-failure retry wiring', () => {
+  it('re-arms ordinary IM turns after active evidence through the bounded chain', () => {
+    const schedule = workerFunctionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    const activeStart = schedule.indexOf("case 'suppress-active':");
+    const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
+    expect(activeStart).toBeGreaterThanOrEqual(0);
+    expect(activeEnd).toBeGreaterThan(activeStart);
+
+    const active = schedule.slice(activeStart, activeEnd);
+    const rearm = active.indexOf('armDeferredRecheck()');
+    expect(rearm).toBeGreaterThanOrEqual(0);
+    expect(active.slice(0, rearm)).not.toContain('dispatchAttempt !== undefined');
+    expect(active).toContain('deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS');
+
+    const notifyStuck = schedule.slice(schedule.indexOf("case 'notify-stuck':"));
+    expect(notifyStuck).toContain('if (turnIdentity?.dispatchAttempt === undefined)');
+    expect(notifyStuck).toContain("type: 'user_notify'");
+    expect(notifyStuck).toContain('worker.submit_unconfirmed');
+  });
+});
+
+describe('deferred submit confirmation behavior', () => {
+  it('keeps ordinary IM unconfirmed while active evidence continues, then notifies after a quiet window', async () => {
+    const queue = new CodexBridgeQueue();
+    const evidence: Array<SubmitActivityEvidence | undefined> = [
+      'pty-output',
+      'botmux-send',
+      undefined,
+    ];
+
+    const actions = [];
+    for (const activityEvidence of evidence) {
+      const settlement = await settleDeferredSubmitConfirmation(queue, {
+        turnId: 'ordinary-im-turn',
+        recheck: async () => false,
+        usageLimitDetected: () => false,
+        activityEvidence: () => activityEvidence,
+        isCurrent: () => true,
+      });
+      expect(settlement.stale).toBe(false);
+      if (!settlement.stale) actions.push(settlement.action);
+    }
+
+    expect(actions).toEqual([
+      { kind: 'suppress-active', evidence: 'pty-output' },
+      { kind: 'suppress-active', evidence: 'botmux-send' },
+      { kind: 'notify-stuck' },
+    ]);
+  });
+
+  it('confirms an ordinary IM retry once the deferred history recheck sees the prompt', async () => {
+    const queue = new CodexBridgeQueue();
+    let recheckCalls = 0;
+    const actions = [];
+
+    for (let round = 0; round < 3; round += 1) {
+      const settlement = await settleDeferredSubmitConfirmation(queue, {
+        turnId: 'ordinary-im-turn',
+        recheck: async () => {
+          recheckCalls += 1;
+          return recheckCalls === 3
+            ? { submitted: true, cliSessionId: 'grok-session-id' }
+            : false;
+        },
+        usageLimitDetected: () => false,
+        activityEvidence: () => 'structured-transcript',
+        isCurrent: () => true,
+      });
+      expect(settlement.stale).toBe(false);
+      if (!settlement.stale) actions.push(settlement.action);
+      if (!settlement.stale && settlement.action.kind === 'suppress-confirmed') {
+        expect(settlement.cliSessionId).toBe('grok-session-id');
+        expect(settlement.lifecycle).toBe('unchanged');
+        break;
+      }
+    }
+
+    expect(actions).toEqual([
+      { kind: 'suppress-active', evidence: 'structured-transcript' },
+      { kind: 'suppress-active', evidence: 'structured-transcript' },
+      { kind: 'suppress-confirmed' },
+    ]);
+  });
+});
 
 describe('stripTrailingBridgeSentinelLine', () => {
   it('bare sentinel strips to empty (genuine silence)', () => {
@@ -72,7 +250,7 @@ describe('stripTrailingBridgeSentinelLine', () => {
   });
 });
 
-describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
+describe('bridgePostText (adopt sentinel contract — codex #791 blocker)', () => {
   it('non-adopt strips a trailing sentinel line (posts the prose)', () => {
     expect(bridgePostText(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`, false))
       .toBe('Here is the answer.');
@@ -80,7 +258,7 @@ describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
     expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, false)).toBe('');
   });
 
-  it('ADOPT returns text VERBATIM — never strips the sentinel', () => {
+  it('ADOPT preserves sentinel text verbatim', () => {
     // The adopted CLI is botmux-unaware; transcript drain is its only channel and
     // it may output the literal token as content. Stripping here would truncate a
     // real answer / drop a verbatim-token reply. shouldSuppressBridgeEmit(adopt)
@@ -96,6 +274,12 @@ describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
   it('leaves ordinary answers untouched in both modes', () => {
     expect(bridgePostText('a normal reply', false)).toBe('a normal reply');
     expect(bridgePostText('a normal reply', true)).toBe('a normal reply');
+  });
+
+  it('removes memory citation metadata from fallback output in both modes', () => {
+    const finalText = `Visible fallback.\n\n${memoryCitation()}`;
+    expect(bridgePostText(finalText, false)).toBe('Visible fallback.');
+    expect(bridgePostText(finalText, true)).toBe('Visible fallback.');
   });
 });
 
@@ -161,6 +345,20 @@ describe('buildBridgeSendMarkerContent', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
+  it('compares visible marker/final lengths without memory citation metadata', () => {
+    const visible = 'The answer already sent to the user.';
+    const withCitation = `${visible}\n\n${memoryCitation()}`;
+    const marker = markerForContent(150, withCitation);
+    expect(marker.contentLength).toBe(normalise(visible).length);
+    expect(marker.previewText).toBe(visible);
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: withCitation },
+      200,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
   it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
     expect(shouldSuppressBridgeEmit(
       { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },
@@ -550,5 +748,74 @@ describe('shouldEmitFailedBridgeFallback', () => {
       [],
       false,
     )).toBe(true);
+  });
+});
+
+describe('structuredFallbackKind', () => {
+  it('TRAE 429 (no dedicated rate-limit chain) falls through to the generic failed fallback', () => {
+    // The regression this guards: TRAE has no structured rate-limit chain, so
+    // skipping the generic failed fallback for codex_rate_limited posted
+    // nothing at all — "misleading but visible" regressed into "silent".
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      false, // hasDedicatedRateLimitChain=false (TRAE)
+    )).toBe('failed');
+  });
+
+  it('Codex 429 (dedicated chain) skips the generic failed fallback', () => {
+    // Codex's maybeEmitCodexStructuredRateLimit already surfaces the limit, so
+    // the generic failed fallback must not double-post.
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      true, // hasDedicatedRateLimitChain=true (Codex)
+    )).not.toBe('failed');
+  });
+
+  it('a non-rate-limit failure maps to the failed fallback with or without a chain', () => {
+    for (const hasChain of [false, true]) {
+      expect(structuredFallbackKind(
+        { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE },
+        undefined,
+        [],
+        false,
+        hasChain,
+      )).toBe('failed');
+    }
+  });
+
+  it('a non-empty final maps to final', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: 'answer' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('final');
+  });
+
+  it('an empty completed turn with no markers maps to empty_completed', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('empty_completed');
+  });
+
+  it('a turn suppressed by an in-window send marker maps to none', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [{ sentAtMs: 150 }],
+      false,
+      false,
+    )).toBe('none');
   });
 });

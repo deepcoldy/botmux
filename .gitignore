@@ -1,6 +1,9 @@
 node_modules
 .pnpm-store/
 dist/
+# 编译版单文件二进制（bun build --compile，每个 ~170MB）。CI 与发版都往这里写，
+# `bun run use:here --binary` 也默认在这里找 host-arch 产物。
+dist-bin/
 packages/workflow-core/dist/
 packages/workflow-core/.packs/
 data/
@@ -46,3 +49,7 @@ src/desktop/assets/*.png
 # 静默忽略，`git add` 只报一行提示，很容易漏提交。
 /platform/
 /mcp-gateway/
+.gdpa
+
+# OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
+.omo/

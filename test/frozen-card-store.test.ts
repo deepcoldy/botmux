@@ -237,7 +237,7 @@ describe('deleteFrozenCards', () => {
 describe('round-trip: save then load', () => {
   it('returns the same data after save + load', () => {
     const cards = new Map<string, FrozenCard>();
-    cards.set('nonce_1', makeFrozenCard({ messageId: 'om_111', content: 'snap 1', title: 'T1', expanded: false }));
+    cards.set('nonce_1', makeFrozenCard({ messageId: 'om_111', replyTargetKey: 'thread:om_topic_1', content: 'snap 1', title: 'T1', expanded: false }));
     cards.set('nonce_2', makeFrozenCard({ messageId: 'om_222', content: 'snap 2', title: 'T2', expanded: true }));
 
     saveFrozenCards('round-trip', cards);

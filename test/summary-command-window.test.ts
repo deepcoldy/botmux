@@ -21,10 +21,19 @@ vi.mock('../src/im/lark/client.js', () => ({
     return out.reverse();
   }),
   listThreadMessages: vi.fn(async () => []),
+  // message-parser (imported by summary-command) re-exports this name. Bun's
+  // mock is the whole module, so omitting it is a SyntaxError at import time.
+  getMessageDetail: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: () => BOT_OPEN_ID,
+  // logger / client import graph. Bun's mock is the whole module.
+  getLoadedConfigPath: () => undefined,
+  getBot: () => undefined,
+  getAllBots: () => [],
+  getBotClient: () => undefined,
+  getOwnerOpenId: () => undefined,
 }));
 
 const { buildSummaryCommandPrompt } = await import('../src/im/lark/summary-command.js');

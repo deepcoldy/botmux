@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { loopbackFetchImpl } from './loopback-fetch.js';
 import {
   closeSync,
   constants as fsConstants,
@@ -220,7 +221,7 @@ export async function attestManagedOrigin(input: {
   timer.unref?.();
   let response: Response;
   try {
-    response = await (input.fetchImpl ?? fetch)(
+    response = await (input.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${port}${MANAGED_ORIGIN_ATTEST_ROUTE}`,
       {
         method: 'POST',
