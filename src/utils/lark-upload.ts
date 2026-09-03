@@ -7,11 +7,9 @@ import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { type Brand, sdkDomain } from '../im/lark/lark-hosts.js';
 
-/** Screenshot/media uploads move real bytes and must not inherit an interactive
- * request bound. The worker's client currently has no timeout applied, but pin
- * an explicit generous ceiling on a dedicated http instance so this stays true
- * even if a future bound is added — mirrors bot-registry's upload client. */
-const UPLOAD_TIMEOUT_MS = 120_000;
+/** Bound both tenant-token acquisition and image upload so a stalled Lark
+ * request cannot occupy the worker's screenshot single-flight indefinitely. */
+const UPLOAD_TIMEOUT_MS = 30_000;
 
 let cachedUploadHttpInstance: any;
 function uploadHttpInstance(): any {

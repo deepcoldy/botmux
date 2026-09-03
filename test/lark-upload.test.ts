@@ -68,12 +68,12 @@ describe('uploadImageBuffer — brand domain', () => {
     ]);
   });
 
-  it('binds the upload client to a dedicated http instance with the 120s upload timeout', async () => {
+  it('binds the upload client to a dedicated http instance with the 30s upload timeout', async () => {
     const { uploadImageBuffer } = await fresh();
     await uploadImageBuffer('app', 'sec', Buffer.from('x'));
     const httpInstance = constructed[0]?.httpInstance as { defaults?: { timeout?: number } } | undefined;
     expect(httpInstance).toBeDefined();
-    expect(httpInstance?.defaults?.timeout).toBe(120_000);
+    expect(httpInstance?.defaults?.timeout).toBe(30_000);
   });
 
   it('falls back to the plain Client (no throw) when the SDK omits defaultHttpInstance', async () => {
