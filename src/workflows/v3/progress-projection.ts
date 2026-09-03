@@ -102,6 +102,7 @@ export interface V3ProgressView {
   terminal?: {
     sessionId: string;
     webPort?: number;
+    viewToken?: string;
   };
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
   updatedAt: string;
@@ -296,19 +297,29 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     .map((node) => node.id)
     .filter((nodeId) => refreshed.has(nodeId));
 
-  // Latest live terminal session across all nodes. Events are stored in
-  // journal order, so the last nodeSessionReady wins. Only outer-node sessions
-  // are surfaced (inner loop bodies stay private, like the rest of the view).
+  // Latest CURRENT live terminal session across all nodes. The final snapshot
+  // is the lifecycle fence: a terminal node, a superseded instance, or a ready
+  // event from an obsolete retry attempt cannot keep a card deep-link alive.
+  // Only outer-node sessions are surfaced (inner loop bodies stay private).
   let terminal: V3ProgressView['terminal'];
   for (const event of events) {
+    if (event.type !== 'nodeSessionReady' || !outerIds.has(event.nodeId)) continue;
+    const nodeState = snapshot.nodes.get(event.nodeId);
+    const effectiveInstanceMatches = event.instanceId
+      ? nodeState?.effectiveInstanceId === event.instanceId
+      : nodeState?.effectiveInstanceId === undefined;
+    const currentAttempt = snapshot.attempts.get(event.instanceId ?? event.nodeId);
     if (
-      event.type === 'nodeSessionReady' &&
-      outerIds.has(event.nodeId) &&
-      event.sessionInfo?.sessionId
+      nodeState?.status === 'running' &&
+      effectiveInstanceMatches &&
+      currentAttempt === event.attemptId &&
+      event.sessionInfo.sessionId &&
+      event.sessionInfo.viewToken
     ) {
       terminal = {
         sessionId: event.sessionInfo.sessionId,
         ...(event.sessionInfo.webPort ? { webPort: event.sessionInfo.webPort } : {}),
+        viewToken: event.sessionInfo.viewToken,
       };
     }
   }

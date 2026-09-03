@@ -17205,7 +17205,9 @@ body.touch.has-token #mobile-input-bar{
   display:flex;flex-direction:column;position:fixed;left:0;right:0;bottom:0;z-index:60;
   padding:6px max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));
   border-top:1px solid #2a2b3d;background:#0f0f14;
-  transform:translateY(calc(-1 * var(--keyboard-inset,0px)));transition:transform .12s ease}
+  transform:translateY(calc(0px - var(--keyboard-inset,0px)));transition:transform .12s ease}
+body.touch.has-token #terminal{
+  padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
 #mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
 #mobile-bar-keys button{
@@ -17226,6 +17228,7 @@ body.touch.has-token #mobile-input-bar{
   background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
 #mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-input-bar button:disabled,#mobile-input-bar textarea:disabled{opacity:.45;cursor:not-allowed}
 #mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
 #mobile-mode{min-width:48px;border-radius:8px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
 /* live mode: the textarea holds the IME draft but the typed text is already in
@@ -17270,6 +17273,8 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     <button type="button" data-sk="ctrlc">Ctrl+C</button>
     <button type="button" data-sk="esc">Esc</button>
     <button type="button" data-sk="tab">Tab</button>
+    <button type="button" data-sk="left" title="左移" aria-label="左移">←</button>
+    <button type="button" data-sk="right" title="右移" aria-label="右移">→</button>
     <button type="button" data-sk="enter">Enter</button>
     <button type="button" data-sk="stab">Shift+Tab</button>
   </div>
@@ -17404,6 +17409,7 @@ function _wbPostWrite(){
   // 发），嵌入方据此把上一条连接的结论清掉，而不是继续显示一个过期的判定。
   try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
 }
+var _wbMobileWriteState=null;
 function _wbSetWsWrite(v){
   var changed=wsHasWrite!==v;
   wsHasWrite=v;
@@ -17416,6 +17422,7 @@ function _wbSetWsWrite(v){
       else if(v===true)_wb.classList.remove('show');
     }
   }
+  if(_wbMobileWriteState)_wbMobileWriteState(v);
   _wbPostWrite();
 }
 // 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
@@ -18250,6 +18257,14 @@ if(isTouch&&hasToken){(function(){
   var hint=document.getElementById('mobile-live-hint');
   var LIVE='live',BUFFER='buffer';
   var mode=BUFFER;
+  var controls=bar.querySelectorAll('button,textarea');
+
+  function setWriteState(v){
+    var disabled=v!==true;
+    for(var ci=0;ci<controls.length;ci++)controls[ci].disabled=disabled;
+    bar.setAttribute('aria-disabled',disabled?'true':'false');
+  }
+  _wbMobileWriteState=setWriteState;
 
   // ── grapheme-aware edit-sequence mirror (from woof mobile_live_input.js) ──
   var CL='\\x1b[D',CR='\\x1b[C',BS='\\x7f';
@@ -18265,80 +18280,92 @@ if(isTouch&&hasToken){(function(){
     var rem=b.length-pre-suf,ins=a.slice(pre,a.length-suf).join('');
     return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
   var mirror={sent:'',held:'',composing:false};
-  function sendInput(seq){if(!seq||!ws_||ws_.readyState!==1)return false;
+  function sendInput(seq){if(!seq||wsHasWrite!==true||!ws_||ws_.readyState!==1)return false;
     try{ws_.send(JSON.stringify({type:'input',data:seq}));return true;}catch(e){return false;}}
-  function mirrorUpdate(v){mirror.held=String(v||'');
-    if(mirror.composing)return '';
-    if(mirror.held===mirror.sent)return '';
-    var seq=editSeq(mirror.sent,mirror.held);mirror.sent=mirror.held;return seq;}
-  function mirrorCommit(){var seq=mirrorUpdate(mirror.held);mirror.sent=mirror.held='';return seq;}
+  function syncMirror(v){mirror.held=String(v||'');
+    if(mirror.composing||mirror.held===mirror.sent)return true;
+    var seq=editSeq(mirror.sent,mirror.held);
+    if(!sendInput(seq))return false;
+    mirror.sent=mirror.held;return true;}
+  function sendLiveKey(key){
+    mirror.held=String(ta.value||'');
+    if(mirror.composing||wsHasWrite!==true)return false;
+    var payload=editSeq(mirror.sent,mirror.held)+(key||'');
+    if(payload&&!sendInput(payload))return false;
+    mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
 
   function setMode(m){mode=m;bar.setAttribute('data-mode',m);
     modeBtn.textContent=m===LIVE?'实时':'缓冲';
     modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入，点击切换为实时');}
-  function resizeTa(){ta.style.height='38px';ta.style.height=Math.min(ta.scrollHeight,120)+'px';}
+  var measuredBarHeight=-1;
+  function measureBar(){
+    var rect=bar.getBoundingClientRect?bar.getBoundingClientRect():null;
+    var height=Math.ceil((rect&&rect.height)||bar.offsetHeight||0);
+    if(height===measuredBarHeight)return;
+    measuredBarHeight=height;
+    document.documentElement.style.setProperty('--mobile-bar-h',height+'px');
+    onViewportResize();}
+  function resizeTa(){ta.style.height='38px';ta.style.height=Math.min(ta.scrollHeight,120)+'px';measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
   function sendBuffered(appendEnter){
     var text=ta.value;
     var payload=appendEnter?text+'\\n':text;
     if(!payload)return;
-    sendInput(payload.replace(/\\x1b/g,''));
+    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
-    var seq=mirrorCommit();
-    if(seq)sendInput(seq);
-    if(appendEnter)sendInput('\\r');
-    ta.value='';resizeTa();
-    showKeyboard();}
+    if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
   function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
 
   // shortcut keys row
-  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',enter:'\\r',stab:'\\x1b[Z'};
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r',stab:'\\x1b[Z'};
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
     btn.addEventListener('click',function(){btn.blur();
-      // flush any pending live text first so the key lands after it
-      if(mode===LIVE){var seq=mirrorCommit();if(seq)sendInput(seq);ta.value='';}
       var act=btn.getAttribute('data-sk');
       if(act==='paste'){
+        // Commit pending live text before the async clipboard result lands.
+        if(mode===LIVE&&!sendLiveKey(''))return;
         // Read the clipboard and send as terminal input. Async API; fall back
         // to focusing the textarea so the user can long-press paste.
         if(navigator.clipboard&&navigator.clipboard.readText){
           navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
         }else{showKeyboard();}
         return;}
-      sendInput(sk[act]);});})(keyBtns[i]);}
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});})(keyBtns[i]);}
 
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
-    if(mode===LIVE){var seq=mirrorCommit();if(seq)sendInput(seq);ta.value='';}
+    if(mode===LIVE&&!sendLiveKey(''))return;
     setMode(mode===LIVE?BUFFER:LIVE);
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
 
-  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[A');});
-  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[B');});
-  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x7f');});
+  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE)sendLiveKey('\\x1b[A');else sendInput('\\x1b[A');});
+  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE)sendLiveKey('\\x1b[B');else sendInput('\\x1b[B');});
+  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE)sendLiveKey('\\x7f');else sendInput('\\x7f');});
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
   ta.addEventListener('compositionstart',function(){mirror.composing=true;},{capture:true,passive:true});
   ta.addEventListener('compositionend',function(){mirror.composing=false;
-    if(mode===LIVE)sendInput(mirrorUpdate(ta.value));},{capture:true,passive:true});
+    if(mode===LIVE)syncMirror(ta.value);},{capture:true,passive:true});
   ta.addEventListener('input',function(){
     resizeTa();
-    if(mode===LIVE&&!mirror.composing)sendInput(mirrorUpdate(ta.value));});
+    if(mode===LIVE&&!mirror.composing)syncMirror(ta.value);});
   ta.addEventListener('keydown',function(e){
     // live mode intercepts nav keys so they go to the terminal, not the textarea
-    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown'].indexOf(e.key)>=0){
+    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
-      var s=mirrorCommit();if(s)sendInput(s);ta.value='';
-      sendInput({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B'}[e.key]);return;}
+      sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
-  setMode(BUFFER);resizeTa();
+  setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
+  if(typeof ResizeObserver!=='undefined'){
+    try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
+  }
   // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
   document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
   // keep the bar above the software keyboard using visualViewport when available
@@ -18346,7 +18373,7 @@ if(isTouch&&hasToken){(function(){
     var vkT=0;
     window.visualViewport.addEventListener('resize',function(){clearTimeout(vkT);vkT=setTimeout(function(){
       var vv=window.visualViewport;var inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);
-      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');},120);});
+      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');onViewportResize();},120);});
   }
 })();}
 </script>

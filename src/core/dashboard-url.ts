@@ -187,17 +187,20 @@ export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: n
  *
  * On the central HTTPS platform the same-origin `/s/<sessionId>` reverse proxy
  * reaches the worker; on a self-hosted LAN box the worker's own `webPort` is
- * used directly (mirrors `buildSessionTerminalUrl`). Returns null when no
- * reachable URL can be built (no webPort in LAN mode).
+ * used directly (mirrors `buildSessionTerminalUrl`). Both forms carry the
+ * worker's per-boot read capability. Returns null when that capability is
+ * absent, or when LAN mode has no reachable webPort.
  */
 export function buildV3TerminalUrl(
   sessionId: string,
-  opts: { host: string; webPort?: number },
+  opts: { host: string; webPort?: number; viewToken?: string },
 ): string | null {
+  if (!opts.viewToken) return null;
+  const capability = `?viewToken=${encodeURIComponent(opts.viewToken)}`;
   const base = remotePublicBase();
-  if (base) return `${base}/s/${encodeURIComponent(sessionId)}`;
+  if (base) return `${base}/s/${encodeURIComponent(sessionId)}/${capability}`;
   if (!opts.webPort || opts.webPort <= 0) return null;
-  return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}`;
+  return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`;
 }
 
 /**

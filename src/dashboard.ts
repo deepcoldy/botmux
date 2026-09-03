@@ -76,7 +76,10 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
-import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
+import {
+  defaultRunsDir as v3RunsDir,
+  liveV3TerminalPortForSession,
+} from './workflows/v3/ops-projection.js';
 import {
   verifyWorkflowDaemonIpcResponse,
   workflowDaemonIpcHeaders,
@@ -716,7 +719,9 @@ const previewGuardPage = createPreviewGuardPage({
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
 const terminalFrontProxy = createTerminalFrontProxy({
-  resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
+  resolvePort: sessionId => (
+    aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
+  ),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session

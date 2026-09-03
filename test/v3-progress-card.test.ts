@@ -314,7 +314,7 @@ describe('buildV3ProgressCard', () => {
 
   it('有终端会话时渲染「终端」按钮，URL 直连 worker 端口', () => {
     const card = parse(baseView({
-      terminal: { sessionId: 'sess-terminal-1', webPort: 8765 },
+      terminal: { sessionId: 'sess-terminal-1', webPort: 8765, viewToken: 'view token&1' },
     }));
     const terminalBtn = card.elements.find(
       (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
@@ -323,6 +323,7 @@ describe('buildV3ProgressCard', () => {
     const url = terminalBtn.actions[0].multi_url.url;
     // LAN 部署：直连 worker webPort；sessionId 不进 URL（按端口直达）。
     expect(url).toContain(':8765');
+    expect(url).toContain('?viewToken=view%20token%261');
     // 终端按钮在 Web 详情按钮之前
     const terminalIdx = card.elements.indexOf(terminalBtn);
     const detailIdx = card.elements.findIndex(
@@ -341,7 +342,17 @@ describe('buildV3ProgressCard', () => {
 
   it('终端会话无 webPort 且非远程部署时不渲染死链', () => {
     const card = parse(baseView({
-      terminal: { sessionId: 'sess-no-port' },
+      terminal: { sessionId: 'sess-no-port', viewToken: 'view-token' },
+    }));
+    const hasTerminal = card.elements.some(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
+    );
+    expect(hasTerminal).toBe(false);
+  });
+
+  it('终端会话缺少只读凭证时不渲染 403 死链', () => {
+    const card = parse(baseView({
+      terminal: { sessionId: 'sess-no-capability', webPort: 8765 },
     }));
     const hasTerminal = card.elements.some(
       (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',

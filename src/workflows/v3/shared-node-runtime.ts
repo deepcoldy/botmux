@@ -2595,14 +2595,18 @@ export async function runWorkflow(
       // dashboard can attach to the LIVE terminal.  Sync appendEvent (no await
       // on the pool's fire-and-forget ready path — codex note).
       onSessionReady: (info) => {
-        // Drop the write `token` — never persist it (codex security review):
-        // the dashboard view is read-only and doesn't need write access.
+        // Drop the write token permanently. Persist only the per-boot read
+        // capability that the card needs to open this exact live worker.
         appendEvent(journalPath, {
           type: 'nodeSessionReady',
           nodeId: node.id,
           ...(instanceId ? { instanceId } : {}),
           attemptId,
-          sessionInfo: { sessionId: info.sessionId, webPort: info.webPort },
+          sessionInfo: {
+            sessionId: info.sessionId,
+            webPort: info.webPort,
+            ...(info.viewToken ? { viewToken: info.viewToken } : {}),
+          },
           ptyLogPath: info.ptyLogPath,
         });
       },

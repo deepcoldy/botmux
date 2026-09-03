@@ -20,6 +20,7 @@ import {
   buildDashboardUrls,
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
+  buildV3TerminalUrl,
   formatUrlHost,
   workbenchEntryUrl,
   workbenchSpaUrl,
@@ -331,6 +332,41 @@ describe('buildV3RunDetailUrl', () => {
     expect(buildV3RunDetailUrl('run-1', { host: '::1', port: 7891 })).toBe(
       'http://[::1]:7891/#/v3/run-1',
     );
+  });
+});
+
+describe('buildV3TerminalUrl', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setDevbox(null);
+  });
+
+  it('builds a LAN worker link with the per-boot read capability', () => {
+    expect(buildV3TerminalUrl('sess/with space', {
+      host: '::1',
+      webPort: 8765,
+      viewToken: 'view token&1',
+    })).toBe('http://[::1]:8765/?viewToken=view%20token%261');
+  });
+
+  it('builds a central /s link carrying the same read capability', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3TerminalUrl('sess/with space', {
+      host: '10.0.0.8',
+      viewToken: 'view token&1',
+    })).toBe(
+      'https://m-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
+    );
+  });
+
+  it('refuses to render a terminal dead-link without a read capability', () => {
+    expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8', webPort: 8765 })).toBeNull();
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8' })).toBeNull();
   });
 });
 

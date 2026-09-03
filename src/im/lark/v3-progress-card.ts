@@ -43,6 +43,7 @@ export function buildV3ProgressCard(
     ? buildV3TerminalUrl(view.terminal.sessionId, {
         host: config.dashboard.externalHost,
         webPort: view.terminal.webPort,
+        viewToken: view.terminal.viewToken,
       })
     : null;
   const source = sourceLabel(view.source);
