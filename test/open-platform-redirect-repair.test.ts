@@ -57,6 +57,7 @@ const okSession = async () => ({
  */
 function makeClient(opts: {
   existing?: Record<string, string[] | 'unreadable'>;
+  readErrors?: Record<string, Error>;
   writeErrors?: Record<string, Array<Error | null>>;
 } = {}) {
   const reads: string[] = [];
@@ -77,6 +78,8 @@ function makeClient(opts: {
     if (read) {
       const appId = read[1];
       reads.push(appId);
+      const readError = (opts.readErrors ?? {})[appId];
+      if (readError) throw readError;
       const current = (opts.existing ?? {})[appId];
       if (current === 'unreadable') throw new Error('safe_setting read endpoint missing');
       return { code: 0, data: { allowRefreshToken: true, ipWhiteList: [], redirectURL: current ?? [], safeServerDomain: [] } };
@@ -97,6 +100,19 @@ function ownerDenied(appId: string): OpenPlatformApiError {
     `HTTP 403 /developers/v1/safe_setting/update/${appId}: code=10003`,
     { code: 10003, msg: 'no permission' },
     403,
+  );
+}
+
+/** ask.feishu.cn 粗检仍可通过，但 console 具体接口返回的实测登录失效形态。 */
+function webSessionExpired(appId: string): OpenPlatformApiError {
+  return new OpenPlatformApiError(
+    `HTTP 400 /developers/v1/safe_setting/${appId}: code=99991641 msg=Something went wrong, please log in again.`,
+    {
+      code: 99991641,
+      msg: 'Something went wrong, please log in again.',
+      error: { LogoutReason: 40, Code: 4101 },
+    },
+    400,
   );
 }
 
@@ -172,6 +188,56 @@ describe('repairOpenPlatformRedirects', () => {
 
     // 处置动作与「没登录」完全一样（重新扫码），不该让前端分两种提示。
     expect(out).toMatchObject({ ok: false, reason: 'login_required' });
+  });
+
+  it('safe_setting 读接口才报 Code=4101 登录失效 → login_required，且零写入', async () => {
+    const stub = makeClient({ readErrors: { cli_a: webSessionExpired('cli_a') } });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => WANTED,
+    });
+
+    expect(out).toMatchObject({ ok: false, reason: 'login_required' });
+    expect(stub.reads).toEqual(['cli_a']);
+    expect(stub.writes).toEqual([]);
+  });
+
+  it('safe_setting 写入时才过期也归 login_required，不当成单 bot failed', async () => {
+    const stub = makeClient({
+      existing: { cli_a: [] },
+      writeErrors: { cli_a: [webSessionExpired('cli_a')] },
+    });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => [LOOPBACK],
+    });
+
+    expect(out).toMatchObject({ ok: false, reason: 'login_required' });
+    expect(stub.writes).toHaveLength(1);
+  });
+
+  it('只有通用 code=99991641、没有登录失效强信号时仍归 failed，不误弹扫码', async () => {
+    const generic = new OpenPlatformApiError(
+      'HTTP 400 /developers/v1/safe_setting/cli_a: code=99991641 msg=Something went wrong.',
+      { code: 99991641, msg: 'Something went wrong.' },
+      400,
+    );
+    const stub = makeClient({ readErrors: { cli_a: generic } });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => WANTED,
+    });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.results[0]).toMatchObject({ appId: 'cli_a', status: 'failed' });
+    expect(stub.writes).toEqual([]);
   });
 
   it('拿 console 页面就失败 → network（可重试，不必重新扫码）', async () => {

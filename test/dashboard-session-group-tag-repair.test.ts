@@ -256,6 +256,7 @@ describe('SessionGroupTagRow — redirect 白名单修复', () => {
 
     const renderer = renderRow();
     await flush();
+    expect(repairButton(renderer).props.children).toBe('修复开放平台回调');
     await flush(() => { repairButton(renderer).props.onClick(); });
 
     expect(repairBodies).toEqual([{ appIds: ['cli_repairtest'] }]);
