@@ -32,6 +32,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnRe
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -378,6 +379,43 @@ export function getDaemonStreamingCardUsageSnapshot(
   };
 }
 
+/**
+ * Merge one worker `model_fallback` observation into the fallback the daemon
+ * holds. The daemon is the authority here, not the worker: the persisted state
+ * outlives every worker generation, while a worker only ever sees a bounded
+ * tail of the transcript.
+ *
+ * The rules, in order:
+ *   b) a switch record with a NEW uuid replaces whatever we held;
+ *   c) a serving model that disagrees with the held `fallbackModel` clears it —
+ *      that "Claude answered on a different model" is the ONLY evidence of a
+ *      switch back. Ordering matters: a `servingModel` arriving in the same
+ *      message as a `fallback` was observed AFTER it, so (c) runs after (b).
+ *
+ * Everything else — a missing record, a restarted worker, a transcript window
+ * too short to reach the switch — leaves the state exactly as it was. Absence
+ * of evidence is never evidence of a switch back.
+ */
+export function mergeModelFallbackObservation(
+  current: ModelFallbackState | undefined,
+  msg: { fallback?: ModelFallbackState; servingModel?: string },
+): { next: ModelFallbackState | undefined; changed: boolean } {
+  let next = current;
+  let changed = false;
+  if (msg.fallback && next?.uuid !== msg.fallback.uuid) {
+    next = msg.fallback;
+    changed = true;
+  }
+  if (msg.servingModel && next) {
+    const serving = normalizeClaudeModelId(msg.servingModel);
+    if (serving && serving !== normalizeClaudeModelId(next.fallbackModel)) {
+      next = undefined;
+      changed = true;
+    }
+  }
+  return { next, changed };
+}
+
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import {
@@ -413,6 +451,7 @@ import type {
   CodexAppTurnInput,
   FrozenSessionReplyTarget,
   DaemonToWorker,
+  ModelFallbackState,
   TrustedCaller,
   WorkerToDaemon,
   Session,
@@ -11159,11 +11198,16 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
-  // Same authority rule for the model-fallback notice, and it additionally
-  // guards a role switch to a non-Claude CLI, which would never send a
-  // clearing model_fallback of its own. A Claude worker re-seeds it from the
-  // transcript when its bridge starts.
-  ds.modelFallback = undefined;
+  // The model-fallback notice is the ONE runtime fact a worker generation does
+  // NOT own: it must survive every respawn and stay visible each round until
+  // Claude is observed answering on a different model. Clearing it here and
+  // waiting for the new worker to re-seed loses it whenever the switch record
+  // has scrolled out of the bounded tail scan (a long session), and nothing
+  // ever brings it back. So only a role switch AWAY from claude-code clears it
+  // — that worker would never send a correcting observation of its own.
+  if (sessionCliId(ds, getBot(ds.larkAppId).config) !== 'claude-code') {
+    ds.modelFallback = undefined;
+  }
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
@@ -12108,9 +12152,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored model_fallback from stale worker generation`);
           break;
         }
-        const next = msg.state ?? undefined;
-        if (ds.modelFallback?.uuid === next?.uuid) break;
-        ds.modelFallback = next;
+        // Claude-Code-only affordance (product decision). A worker for any
+        // other CLI has no business moving this state.
+        if (effectiveCliId !== 'claude-code') break;
+        const merged = mergeModelFallbackObservation(ds.modelFallback, msg);
+        if (!merged.changed) break;
+        ds.modelFallback = merged.next;
         persistStreamCardState(ds);
         scheduleActiveRuntimePatch(ds);
         break;

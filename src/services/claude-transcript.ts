@@ -120,6 +120,13 @@ export function normalizeClaudeModelId(value: string | undefined): string | unde
   return normalized || undefined;
 }
 
+/** True when a model id names a Fable model, whatever its case or context
+ *  suffix (`claude-fable-5-1[1m]`, `Claude-Fable-5[1M]`, …). The single place
+ *  the product's "Fable only" scope is expressed. */
+export function isFableModelId(value: string | undefined): boolean {
+  return normalizeClaudeModelId(value)?.startsWith('claude-fable') === true;
+}
+
 /** Parse a `type:"system"` model-switch record. Returns undefined for anything
  *  else, and fail-closed for a record missing the uuid or either model id —
  *  a half-written switch must not produce a notice we can never clear. */
@@ -135,6 +142,12 @@ export function parseClaudeModelFallbackEvent(
   const originalModel = typeof ev.originalModel === 'string' ? ev.originalModel.trim() : '';
   const fallbackModel = typeof ev.fallbackModel === 'string' ? ev.fallbackModel.trim() : '';
   if (!uuid || !originalModel || !fallbackModel) return undefined;
+  // PRODUCT DECISION: only a fall *off Fable* is surfaced. Claude Code also
+  // records ordinary safety downgrades between non-Fable models (Opus 5 →
+  // Opus 4.8), which are routine and must stay invisible. Gating here rather
+  // than at each call site means observe() / the tail scan / every future
+  // consumer inherits the scope for free.
+  if (!isFableModelId(originalModel)) return undefined;
   const trigger = typeof ev.trigger === 'string' ? ev.trigger.trim() : '';
   const apiRefusalCategory = typeof ev.apiRefusalCategory === 'string'
     ? ev.apiRefusalCategory.trim()
@@ -165,28 +178,11 @@ export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | un
   return model;
 }
 
-/** Resolve the model fallback still in effect from the newest session-scoped
- *  switch record plus the model serving replies AFTER it. A serving model that
- *  no longer matches means the user ran `/model` to switch back, so the notice
- *  clears. An unknown serving model (no assistant reply since the switch) keeps
- *  the notice — Claude stays on the fallback until told otherwise. */
-export function resolveActiveModelFallback(opts: {
-  fallback?: ClaudeModelFallbackRecord;
-  servingModel?: string;
-}): ModelFallbackState | null {
-  const rec = opts.fallback;
-  if (!rec || rec.scope === 'local') return null;
-  const serving = normalizeClaudeModelId(opts.servingModel);
-  if (serving && serving !== normalizeClaudeModelId(rec.fallbackModel)) return null;
-  return {
-    uuid: rec.uuid,
-    kind: rec.kind,
-    originalModel: rec.originalModel,
-    fallbackModel: rec.fallbackModel,
-    ...(rec.trigger ? { trigger: rec.trigger } : {}),
-    ...(rec.apiRefusalCategory ? { apiRefusalCategory: rec.apiRefusalCategory } : {}),
-    ...(rec.observedAt ? { observedAt: rec.observedAt } : {}),
-  };
+/** Drop the transcript-only `scope` field: what ships to the daemon and gets
+ *  persisted is the product state, not our parse bookkeeping. */
+export function modelFallbackStateOf(rec: ClaudeModelFallbackRecord): ModelFallbackState {
+  const { scope: _scope, ...state } = rec;
+  return state;
 }
 
 /** Upper bound on the backward scan below. Same guard rationale as
@@ -199,10 +195,12 @@ const CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES = 4 * 1024 * 1024;
  *  before `--resume` / a daemon restart is never drained again.
  *
  *  Scans BACKWARD and stops at the newest session-scoped switch record; the
- *  serving model is therefore only collected from records NEWER than it, which
- *  is exactly what {@link resolveActiveModelFallback} needs (an assistant reply
- *  written before the switch says nothing about what serves now). A
- *  non-newline-terminated tail is excluded via baselineJsonlCursor. */
+ *  serving model is therefore only collected from records NEWER than it (an
+ *  assistant reply written before the switch says nothing about what serves
+ *  now). With no switch record in the window the serving model is simply the
+ *  window's newest one — still useful, because the daemon compares it against
+ *  the fallback IT persisted. A non-newline-terminated tail is excluded via
+ *  baselineJsonlCursor. */
 export function readLatestClaudeModelFallback(path: string): {
   fallback?: ClaudeModelFallbackRecord;
   servingModel?: string;
@@ -273,60 +271,91 @@ export function readLatestClaudeModelFallback(path: string): {
  *  times, so an unbounded set would leak slowly. */
 const MODEL_FALLBACK_SEEN_UUIDS_MAX = 256;
 
-/** Running model-fallback state for one Claude bridge. Owns the record-uuid
+/** One report from the worker to the daemon: OBSERVED FACTS ONLY, never a
+ *  decision. The worker cannot decide whether the notice should still show —
+ *  its transcript window is bounded and it is younger than the session — so it
+ *  says what it saw and the daemon, which holds the persisted state, merges:
+ *
+ *   - `fallback` — a switch record it had not reported before;
+ *   - `servingModel` — the model serving the MAIN thread, whenever that value
+ *     changed since its last report.
+ *
+ *  Absence of a field means "nothing new observed", never "cleared". */
+export interface ModelFallbackObservation {
+  fallback?: ModelFallbackState;
+  servingModel?: string;
+}
+
+/** Running model-fallback observer for one Claude bridge. Owns the record-uuid
  *  dedupe (the same record is re-drained after a truncation or a jsonl switch)
- *  and the "serving model since the switch" rule, leaving the worker with only
- *  the decision of when to publish. */
+ *  and the "only report the serving model when it changed" rule, so the worker
+ *  is left with nothing but "did I see anything worth sending". */
 export class ClaudeModelFallbackTracker {
   private readonly seenUuids = new Set<string>();
-  private fallback: ClaudeModelFallbackRecord | undefined;
-  private servingModel: string | undefined;
+  /** Last serving model reported to the daemon, normalised. `undefined` = none
+   *  reported yet in this worker's lifetime, so the first one always ships. */
+  private reportedServingModel: string | undefined;
 
-  /** Fold newly-drained events in, newest last. Returns the records newly
-   *  accepted, for the caller to log. `scope:"local"` records are skipped
-   *  outright: a sub-agent fell back on its own and the main session model is
-   *  untouched. */
-  observe(events: readonly TranscriptEvent[]): ClaudeModelFallbackRecord[] {
-    const accepted: ClaudeModelFallbackRecord[] = [];
+  /** Fold newly-drained events in, newest last, and return what the daemon has
+   *  not been told yet (or null when there is nothing new). `scope:"local"`
+   *  records are skipped outright: a sub-agent fell back on its own and the
+   *  main session model is untouched. Non-Fable switches never even parse (see
+   *  {@link parseClaudeModelFallbackEvent}). */
+  observe(events: readonly TranscriptEvent[]): ModelFallbackObservation | null {
+    let fallback: ClaudeModelFallbackRecord | undefined;
+    let servingModel: string | undefined;
     for (const ev of events) {
       const rec = parseClaudeModelFallbackEvent(ev);
       if (rec) {
         if (rec.scope === 'local' || this.seenUuids.has(rec.uuid)) continue;
-        this.seenUuids.add(rec.uuid);
-        if (this.seenUuids.size > MODEL_FALLBACK_SEEN_UUIDS_MAX) {
-          const oldest = this.seenUuids.values().next().value;
-          if (oldest !== undefined) this.seenUuids.delete(oldest);
-        }
-        this.fallback = rec;
-        // Replies written before the switch say nothing about what serves now;
-        // keeping the old value would clear the notice the instant it appeared.
-        this.servingModel = undefined;
-        accepted.push(rec);
+        this.rememberUuid(rec.uuid);
+        fallback = rec;
+        // Replies written BEFORE the switch say nothing about what serves now;
+        // shipping one alongside the switch would make the daemon clear the
+        // notice the instant it appeared.
+        servingModel = undefined;
         continue;
       }
       const serving = servingModelFromAssistantEvent(ev);
-      if (serving) this.servingModel = serving;
+      if (serving) servingModel = serving;
     }
-    return accepted;
+    return this.report(fallback, servingModel);
   }
 
-  /** Recover the state from a transcript tail at bridge start (see
-   *  {@link readLatestClaudeModelFallback}). */
-  seed(path: string): void {
+  /** Recover what the transcript tail can show at bridge start (see
+   *  {@link readLatestClaudeModelFallback}) and report it verbatim. A scan that
+   *  finds nothing reports nothing — a short window is not evidence that the
+   *  daemon's persisted notice is stale. */
+  seed(path: string): ModelFallbackObservation | null {
     const seeded = readLatestClaudeModelFallback(path);
-    if (seeded.fallback) {
-      this.fallback = seeded.fallback;
-      this.seenUuids.add(seeded.fallback.uuid);
+    let fallback: ClaudeModelFallbackRecord | undefined;
+    if (seeded.fallback && !this.seenUuids.has(seeded.fallback.uuid)) {
+      this.rememberUuid(seeded.fallback.uuid);
+      fallback = seeded.fallback;
     }
-    this.servingModel = seeded.servingModel;
+    return this.report(fallback, seeded.servingModel);
   }
 
-  /** The fallback still in effect, or null. */
-  current(): ModelFallbackState | null {
-    return resolveActiveModelFallback({
-      fallback: this.fallback,
-      servingModel: this.servingModel,
-    });
+  private report(
+    fallback: ClaudeModelFallbackRecord | undefined,
+    servingModel: string | undefined,
+  ): ModelFallbackObservation | null {
+    const normalized = normalizeClaudeModelId(servingModel);
+    const servingChanged = normalized !== undefined && normalized !== this.reportedServingModel;
+    if (servingChanged) this.reportedServingModel = normalized;
+    if (!fallback && !servingChanged) return null;
+    return {
+      ...(fallback ? { fallback: modelFallbackStateOf(fallback) } : {}),
+      ...(servingChanged && servingModel ? { servingModel } : {}),
+    };
+  }
+
+  private rememberUuid(uuid: string): void {
+    this.seenUuids.add(uuid);
+    if (this.seenUuids.size > MODEL_FALLBACK_SEEN_UUIDS_MAX) {
+      const oldest = this.seenUuids.values().next().value;
+      if (oldest !== undefined) this.seenUuids.delete(oldest);
+    }
   }
 }
 

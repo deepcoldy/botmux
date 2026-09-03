@@ -61,7 +61,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -244,7 +244,6 @@ import type {
   DaemonToWorker,
   WorkerToDaemon,
   DisplayMode,
-  ModelFallbackState,
   TermActionKey,
   ScreenStatus,
   TrustedCaller,
@@ -4254,12 +4253,9 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's automatic model switches for this bridge (uuid dedupe +
- *  serving-model tracking live in the tracker). */
+ *  "only report the serving model when it changed" live in the tracker). The
+ *  worker reports observations only; the daemon owns the state and decides. */
 const modelFallbackTracker = new ClaudeModelFallbackTracker();
-/** Last state pushed to the daemon (`null` = "no fallback"). `undefined` means
- *  nothing pushed yet, so the first resolve always publishes — that initial
- *  `null` is what clears a stale persisted notice. */
-let publishedModelFallback: ModelFallbackState | null | undefined;
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -5589,38 +5585,38 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
   }
 }
 
-/** Fold newly-drained events into the model-fallback tracker and push the
- *  resulting state to the daemon whenever it changes. Claude-only by
- *  construction: bridgeIngest is the Claude bridge. */
+/** Fold newly-drained events into the model-fallback tracker and report what
+ *  the daemon has not been told yet. bridgeIngest is the Claude bridge, but the
+ *  notice is a claude-code-only product affordance, so the cliId gate is
+ *  explicit rather than implied by the call site. */
 function observeModelFallback(events: readonly TranscriptEvent[]): void {
-  for (const rec of modelFallbackTracker.observe(events)) {
+  if (lastInitConfig?.cliId !== 'claude-code') return;
+  reportModelFallbackObservation(modelFallbackTracker.observe(events));
+}
+
+/** Seed from the transcript tail at bridge start. Baseline cursors to EOF, so a
+ *  switch recorded before `--resume` or a daemon restart is never drained; a
+ *  bounded backward scan recovers what it can (same shape as Codex/TRAE runtime
+ *  seeding). A scan that finds NOTHING reports nothing: the daemon's persisted
+ *  notice outlives this worker, and a short window is not evidence against it. */
+function seedModelFallbackFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  let seeded: ModelFallbackObservation | null = null;
+  try { seeded = modelFallbackTracker.seed(bridgeJsonlPath); }
+  catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); return; }
+  reportModelFallbackObservation(seeded);
+}
+
+/** Ship one observation. Facts only — there is deliberately no shape here that
+ *  says "no fallback": clearing is the daemon's call, made from a serving model
+ *  that disagrees with the record it holds. */
+function reportModelFallbackObservation(observed: ModelFallbackObservation | null): void {
+  if (!observed) return;
+  const rec = observed.fallback;
+  if (rec) {
     log(`Claude model fallback observed (kind=${rec.kind}, ${rec.originalModel} → ${rec.fallbackModel}, trigger=${rec.trigger ?? 'n/a'})`);
   }
-  publishModelFallbackIfChanged();
-}
-
-/** Emit the resolved state only when it actually changed — bridgeIngest runs on
- *  every fs.watch wakeup and once a second besides. Idempotent, so the baseline
- *  seed and the incremental path can both call it. */
-function publishModelFallbackIfChanged(): void {
-  const state = modelFallbackTracker.current();
-  if (publishedModelFallback !== undefined && publishedModelFallback?.uuid === state?.uuid) return;
-  publishedModelFallback = state;
-  send({ type: 'model_fallback', state });
-}
-
-/** Seed the fallback state at bridge start. Baseline cursors to EOF, so a
- *  switch recorded before `--resume` or a daemon restart is never drained;
- *  a bounded backward scan recovers it (same shape as Codex/TRAE runtime
- *  seeding). Always publishes, including `null` — the user may have switched
- *  back while the daemon was down, and that has to overwrite the persisted
- *  notice. */
-function seedModelFallbackFromTranscript(): void {
-  if (bridgeJsonlPath) {
-    try { modelFallbackTracker.seed(bridgeJsonlPath); }
-    catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); }
-  }
-  publishModelFallbackIfChanged();
+  send({ type: 'model_fallback', ...observed });
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {

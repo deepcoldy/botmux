@@ -1367,11 +1367,16 @@ export type WorkerToDaemon =
       model: string | null;
       reasoningEffort: string | null;
     }
-  /** Claude Code auto-switched the main session model, or the user switched
-   * back (`state: null`). The worker has already filtered `scope:"local"`
-   * sub-agent fallbacks, deduped by record uuid, and compared the serving model,
-   * so the daemon only stores and renders what arrives. */
-  | { type: 'model_fallback'; state: ModelFallbackState | null }
+  /** OBSERVED FACTS about Claude Code's automatic model switching — never a
+   * decision. `fallback` is a switch record this worker had not reported yet
+   * (already filtered to `scope:"session"` and to Fable originals);
+   * `servingModel` is the model serving the MAIN thread, sent whenever it
+   * changed since the worker's last report. The daemon holds the state and
+   * merges: a new record replaces, and ONLY a serving model different from the
+   * held `fallbackModel` clears. An absent field means "nothing new observed" —
+   * a worker restart or a too-short transcript window must never read as
+   * "cleared". */
+  | { type: 'model_fallback'; fallback?: ModelFallbackState; servingModel?: string }
   | { type: 'native_session_title_generated'; title: string }
   | {
     type: 'claude_exit';
