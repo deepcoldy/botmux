@@ -1317,8 +1317,10 @@ export interface SessionGroupConfig {
    *   afterwards; works on any tenant — no tenant scope catalog involved.
    * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
    *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
-   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
-   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes —
+   *   a capability Feishu has not opened yet, so they are absent from the
+   *   scope catalog (verified on our tenant) and setup cannot even apply for
+   *   them (hence not the default). See services/feed-group-tagger.ts.
    * 'off' — no tagging.
    */
   tag?: {
@@ -1433,6 +1435,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Optional TraeX backend variant. Missing inherits TraeX global config. */
+  modelBackendVariant?: 'standard' | 'max';
   /**
    * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
    * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
@@ -1716,9 +1720,10 @@ export interface BotConfig {
    */
   acceptSlashFromBots?: boolean;
   /**
-   * 消息额度覆盖配置：
-   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
-   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
+   * 消息额度覆盖配置 —— **只约束「授权卡 / 自助申请授权」放进来的访客**：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条。
+   *   • 配置正整数 D    → 卡片默认 D 条。
+   * **Oncall 群恒不限额、不读本字段**（历史上读过，病史见 event-dispatcher.oncallTalk）。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
@@ -3338,6 +3343,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
+        : undefined,
+      modelBackendVariant: entryCliId === 'traex'
+        && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
+        ? entry.modelBackendVariant
         : undefined,
       // Positive integer within the arm-able bound only; anything else → undefined
       // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.

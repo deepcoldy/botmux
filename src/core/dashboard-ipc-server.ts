@@ -4015,6 +4015,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
+  let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
@@ -4036,6 +4037,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
+    modelBackendVariant = cfg.cliId === 'traex'
+      && (cfg.modelBackendVariant === 'standard' || cfg.modelBackendVariant === 'max')
+      ? cfg.modelBackendVariant
+      : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
     turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
       && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
@@ -4119,6 +4124,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliPathOverride,
     wrapperCli,
     model,
+    modelBackendVariant,
     reasoningEffort,
     turnTimeoutMs,
     dshRuntime,
@@ -4355,7 +4361,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
 //   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
-//   • messageQuotaDefaultLimit: number|null — 卡片/Oncall 额度覆盖（null = 卡片内置 3 条、Oncall 不限）
+//   • messageQuotaDefaultLimit: number|null — 授权卡访客额度覆盖（null = 卡片内置 3 条）；Oncall 恒不限额、不读它
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -4611,8 +4617,8 @@ ipcRoute('PUT', '/api/bot-description', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -4624,6 +4630,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
+  let modelBackendVariant: 'standard' | 'max' | undefined;
+  const supportsModelBackendVariant = selected.cliId === 'traex';
+  if (supportsModelBackendVariant
+      && modelBackendVariantFieldPresent
+      && body.modelBackendVariant !== null
+      && body.modelBackendVariant !== '') {
+    if (body.modelBackendVariant !== 'standard' && body.modelBackendVariant !== 'max') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_model_backend_variant' });
+    }
+    modelBackendVariant = body.modelBackendVariant;
+  }
   const reasoningEffortFieldPresent = Object.prototype.hasOwnProperty.call(body, 'reasoningEffort');
   const reasoningEffort = isCodexReasoningEffort(body.reasoningEffort) ? body.reasoningEffort : null;
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
@@ -4765,7 +4783,17 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model';
       nextReasoningEffort?: typeof reasoningEffort;
+      nextModelBackendVariant?: 'standard' | 'max';
     }>(larkAppId, (entry) => {
+    const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
+      ? entry.modelBackendVariant
+      : undefined;
+    const entryUsesTraex = entry.cliId === 'traex';
+    const nextModelBackendVariant = supportsModelBackendVariant
+      ? (modelBackendVariantFieldPresent
+        ? modelBackendVariant
+        : entryUsesTraex ? storedModelBackendVariant : undefined)
+      : undefined;
     const nextReasoningEffort = supportsReasoningEffort
       ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
       : undefined;
@@ -4789,6 +4817,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     }
     if (model) entry.model = model;
     else delete entry.model;
+    if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
+    else if (modelBackendVariantFieldPresent) {
+      if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
+      else delete entry.modelBackendVariant;
+    } else if (!entryUsesTraex) {
+      delete entry.modelBackendVariant;
+    }
     if (!supportsReasoningEffort) delete entry.reasoningEffort;
     else if (reasoningEffortFieldPresent) {
       if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
@@ -4823,7 +4858,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
       delete entry.backendType;
     }
-    return { write: true, result: { nextReasoningEffort } };
+    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
@@ -4841,6 +4876,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
+    bot.config.modelBackendVariant = supportsModelBackendVariant
+      ? r.result.nextModelBackendVariant
+      : undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
     // Mirror the entry write: non-dsh clears it, dsh with an explicit field
@@ -4869,6 +4907,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
+      modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
@@ -4955,7 +4994,8 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 // Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
 // name），但至少要带一个：
 //   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
-//         'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）| 'off'
+//         'chat-tag'（应用租户身份，无需用户授权，但飞书尚未开放该能力，权限
+//         目录里搜不到该 scope）| 'off'
 //   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
 //         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
 // 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。

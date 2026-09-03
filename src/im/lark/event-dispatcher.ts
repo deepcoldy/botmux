@@ -1686,20 +1686,20 @@ export interface TalkEvaluation {
   reason: TalkReason;
   quotaKey?: string;
   /**
-   * 仅在 reason==='oncall' 且命中 quotaKey 时可能为 true：本 oncall 用户在**同群**还持有一条
-   * 「未过期的显式 chatGrant」。oncall 与 chatGrant 共用同一把 chat quotaKey，owner 给 oncall
-   * 用户 /grant「不限」时磁盘上无 quota 记录（= 显式不限），若额度层再按 messageQuota.defaultLimit
-   * 懒初始化就会把「显式不限」静默套回 default。带上这个标志让额度层对这种交集**不兜 default**。
-   * 显式 N 授权已有 quota 记录，consumeQuota 直接消费现有记录，与本标志无关。
+   * **已无生产产出方**（保留字段，待独立 cleanup 一并删）。
+   * 历史语义：oncall 腿曾按 messageQuota.defaultLimit 挂 quotaKey，与 chatGrant 共用同一把 chat
+   * quotaKey，于是「oncall ∩ 显式不限 chatGrant」需要这个标志告诉额度层**不兜 default**。
+   * 现在 oncall 恒不挂 quotaKey（见 oncallTalk），该交集不再存在 —— 唯一产出这个标志的分支已删除，
+   * 没有任何代码再把它置为 true。
    */
   explicitGrantOverride?: boolean;
   /**
-   * 仅在 reason==='oncall' 且该用户同群持有一条**已过期** chatGrant 时给出：透传给
-   * consumeQuota，由它在**同一把额度锁内**以「当前 expiry」为权威判定——当前 expiry<=now 则原子清
-   *「成员+quota+expiry」并回落 oncall default；当前无 expiry/未来 expiry 则该 grant 仍 live（成员在→
-   * 不兜 default 按现有记录/不限消费；成员已被清→普通 oncall→回落 default）。收口进一把锁，杜绝跨
-   * await 用陈旧 ev 决策，也不会让过期成员关系残留成永久授权。（pure chatGrant/globalGrant 的过期走
-   * grantNotExpired 拒发。）
+   * **已无生产产出方**（保留字段，待独立 cleanup 一并删）。
+   * 历史语义：oncall 用户同群持有一条**已过期** chatGrant 时给出，透传给 consumeQuota 在同一把额度
+   * 锁内原子清「成员+quota+expiry」并回落 oncall default。现在 oncall 恒不挂 quotaKey，该腿不再产生
+   * 这个描述符；oncall 群里的过期 chatGrant 记录成为孤儿（该群不读 quotaState/expiry，不影响判定，
+   * 群一旦退出 oncall 即由 hasChatGrant 的 grantNotExpired 首条消息拒发 + 自愈清理）。
+   * 纯 chatGrant / globalGrant 的过期一直走 grantNotExpired 拒发，与本字段无关。
    */
   expiredGrantCleanup?: { scope: 'chat'; chatId: string; openId: string };
   /**
@@ -1739,32 +1739,22 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
 }
 
 /**
- * oncall 群命中的 talk 判定（chat 维度、与发送者无关）。抽成函数是为了让**会话群**的
- * 存量条目能原样复用旧语义，见 evaluateSessionGroupTalk 的兜底分支。
+ * oncall 群命中的 talk 判定（chat 维度、与发送者无关）——**恒不限额**。
+ *
+ * `messageQuota.defaultLimit` 的语义是「授权卡/自助申请授权放进来的**访客**默认额度」，
+ * oncall 群不读它。历史上曾读过：`2cbc61076`（一个讲「自助授权卡继承 defaultLimit」的
+ * commit）顺手把 oncall 从恒不限额改成「配了 defaultLimit 就挂 quotaKey」，commit message
+ * 未提及；随后 #768「统一文案」把这个既成事实写进了 dashboard 帮助文案与文档。实际后果：
+ *   • oncall 腿排在 peer/teamBot 之前 → 同团队 bot 本该「免 /grant 且不限额」，却被这条
+ *     访客额度连带计量，`teamBot` 腿结构上不可达；
+ *   • 额度耗尽后 `revokeQuotaGrant` 对 reason='oncall' 是 no-op（无 chatGrant 可删）→
+ *     授权并未真被收回，计数器也不会清，于是**每条后续消息都重发一张「额度已用尽」卡**；
+ *   • 而恢复手段只有「点名带额度」`/grant @x N`：裸 `/grant` 只写 allowedChatGroups
+ *     （同样被 oncall 短路）且不碰 quotaState，owner 反复授权无效。
+ * 即「限了额也没法用 /grant 提额」，护栏在 oncall 场景下只会把群锁死，因此不再计量。
+ * 访客侧不受影响：chatGrant / globalGrant 腿仍各自挂 quotaKey 并照常消费 defaultLimit。
  */
-function oncallTalk(
-  bot: ReturnType<typeof getBot>,
-  larkAppId: string,
-  chatId: string,
-  senderOpenId: string | undefined,
-): TalkEvaluation {
-  const def = bot.config.messageQuota?.defaultLimit;
-  if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
-    // 交集处理：同群若还持有显式 chatGrant，额度由授权决定而非 oncall default。
-    // 三态：live 显式授权 → explicitGrantOverride（不兜 default）；已过期 → expiredGrantCleanup
-    //（透传给 consumeQuota，锁内以当前 expiry 为准原子清成员+quota+expiry 并回落 default）；
-    // 非成员 → 无覆盖，正常走 oncall default 懒初始化。
-    const gk = chatQuotaKey(chatId, senderOpenId);
-    const isMember = !!bot.config.chatGrants?.[chatId]?.includes(senderOpenId);
-    const exp = isMember ? getGrantExpiresAt(larkAppId, gk) : undefined;
-    if (isMember && exp !== undefined && Date.now() >= exp) {
-      return {
-        allowed: true, reason: 'oncall', quotaKey: gk,
-        expiredGrantCleanup: { scope: 'chat', chatId, openId: senderOpenId },
-      };
-    }
-    return { allowed: true, reason: 'oncall', quotaKey: gk, explicitGrantOverride: isMember };
-  }
+function oncallTalk(): TalkEvaluation {
   return { allowed: true, reason: 'oncall' };
 }
 
@@ -1829,9 +1819,9 @@ function evaluateSessionGroupTalk(
   }
   // 存量会话群：provenance 是本次修复才加的字段，升级前出生的条目没有它。回退到旧的
   // oncall 语义，但**只对群主**生效（群里其他人的绕过口子照样堵死），以免升级瞬间把已有
-  // 会话群全部打成「无权发言」。这些群仍是每群一份额度，直到重新出生 —— 已知且有界。
+  // 会话群全部打成「无权发言」。oncall 现在恒不限额（见 oncallTalk），故这里也不再计量。
   if (!findOncallChat(larkAppId, chatId)) return undefined;
-  return oncallTalk(bot, larkAppId, chatId, senderOpenId);
+  return oncallTalk();
 }
 
 const expiryCleanupInFlight = new Set<string>();
@@ -1919,10 +1909,9 @@ export function evaluateTalk(
     const inherited = evaluateSessionGroupTalk(bot, larkAppId, chatId!, senderOpenId, sessionGroup);
     if (inherited) return inherited;
   } else if (chatId && findOncallChat(larkAppId, chatId)) {
-    // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
-    // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
-    // 便于 owner 后续 /grant @x N 续杯/重置）。
-    return oncallTalk(bot, larkAppId, chatId, senderOpenId);
+    // Oncall 群命中：**恒不限额**，不读 messageQuota.defaultLimit（那是访客授权额度，
+    // 详见 oncallTalk 的病史说明）。
+    return oncallTalk();
   }
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return { allowed: true, reason: 'peer' };
   // 跨部署团队 peer bot（旧版联邦学来的 union_id / 平台 roster 下发的 union_id）——

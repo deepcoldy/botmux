@@ -1,11 +1,12 @@
 import type { BotConfig } from '../bot-registry.js';
-import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
+import { normalizeFeedbackPolicy, validateReviewerEntries, type FeedbackPolicy } from './feedback-policy.js';
 import { getTeam } from './team-store.js';
 import { listTeamGroups } from './team-groups-store.js';
 
 export interface FeedbackPolicyLayer {
   enabled?: boolean;
-  audience?: 'requester';
+  audience?: 'requester' | 'reviewers' | 'everyone';
+  reviewers?: unknown[];
   visibleSemantics?: unknown[];
   buttons?: unknown[];
   negativeFollowup?: {
@@ -20,7 +21,7 @@ export interface FeedbackPolicyLayer {
   allowReselect?: boolean;
 }
 
-const TOP_LEVEL = new Set(['enabled', 'audience', 'visibleSemantics', 'buttons', 'negativeFollowup', 'allowReselect']);
+const TOP_LEVEL = new Set(['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'negativeFollowup', 'allowReselect']);
 const FOLLOWUP = new Set(['reasons', 'comment']);
 const COMMENT = new Set(['enabled', 'required', 'placeholder', 'maxLength']);
 
@@ -39,8 +40,9 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
   const input = record(raw, 'feedback');
   rejectUnknown(input, TOP_LEVEL, 'feedback');
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('feedback.enabled must be boolean');
-  if (input.audience !== undefined && input.audience !== 'requester') throw new Error('feedback.audience must be requester');
+  if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers' && input.audience !== 'everyone') throw new Error('feedback.audience must be requester, reviewers or everyone');
   if (input.allowReselect !== undefined && typeof input.allowReselect !== 'boolean') throw new Error('feedback.allowReselect must be boolean');
+  if (input.reviewers !== undefined && !Array.isArray(input.reviewers)) throw new Error('feedback.reviewers must be an array');
   if (input.visibleSemantics !== undefined && !Array.isArray(input.visibleSemantics)) throw new Error('feedback.visibleSemantics must be an array');
   if (input.buttons !== undefined && !Array.isArray(input.buttons)) throw new Error('feedback.buttons must be an array');
 
@@ -67,18 +69,24 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
 
   const layer: FeedbackPolicyLayer = {
     ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
-    ...(input.audience !== undefined ? { audience: input.audience as 'requester' } : {}),
+    ...(input.audience !== undefined ? { audience: input.audience as 'requester' | 'reviewers' | 'everyone' } : {}),
+    ...(input.reviewers !== undefined ? { reviewers: structuredClone(input.reviewers) } : {}),
     ...(input.visibleSemantics !== undefined ? { visibleSemantics: structuredClone(input.visibleSemantics) } : {}),
     ...(input.buttons !== undefined ? { buttons: structuredClone(input.buttons) } : {}),
     ...(negativeFollowup !== undefined ? { negativeFollowup } : {}),
     ...(input.allowReselect !== undefined ? { allowReselect: input.allowReselect } : {}),
   };
 
+  // Validate the reviewer allowlist FORMAT here (a partial layer may carry
+  // `reviewers` without `audience`, or vice-versa — the cross-field coupling is
+  // enforced only on the merged effective policy). Other atomic values are
+  // validated by delegating to the full normalizer below.
+  if (layer.reviewers !== undefined) validateReviewerEntries(layer.reviewers);
   // Validate supplied atomic values without expanding this persisted layer with
   // defaults. Layers remain partial so a restart cannot turn inherited values
   // into stale bot/chat-owned copies.
   if (layer.visibleSemantics !== undefined || layer.buttons !== undefined || layer.negativeFollowup !== undefined) {
-    normalizeFeedbackPolicy({ enabled: true, ...layer });
+    normalizeFeedbackPolicy({ enabled: true, ...layer, audience: 'requester', reviewers: undefined });
   }
   return layer;
 }
@@ -86,7 +94,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
 function mergeLayer(target: Record<string, unknown>, raw: FeedbackPolicyLayer | undefined): void {
   if (!raw) return;
   const layer = normalizeFeedbackPolicyLayer(raw);
-  for (const field of ['enabled', 'audience', 'visibleSemantics', 'buttons', 'allowReselect'] as const) {
+  for (const field of ['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'allowReselect'] as const) {
     if (layer[field] !== undefined) target[field] = structuredClone(layer[field]);
   }
   if (layer.negativeFollowup) {
@@ -112,7 +120,15 @@ export function resolveEffectiveFeedbackPolicy(input: {
   mergeLayer(merged, input.bot);
   mergeLayer(merged, input.chat);
   if (merged.enabled !== true) return undefined;
-  return structuredClone(normalizeFeedbackPolicy(merged));
+  // Individually-valid layers can still merge into an invalid whole — most
+  // notably `audience: 'reviewers'` with an empty reviewers allowlist once the
+  // layers are combined. Fail closed (feedback simply not shown) rather than
+  // letting the throw propagate to the unguarded worker-spawn delivery path.
+  try {
+    return structuredClone(normalizeFeedbackPolicy(merged));
+  } catch {
+    return undefined;
+  }
 }
 
 /** Resolve local hosted-team, bot, and bot-scoped chat layers at delivery time. */

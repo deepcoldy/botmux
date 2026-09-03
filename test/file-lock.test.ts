@@ -24,7 +24,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../src/core/session-marker.js';
 import {
   __testOnly_setFileLockHooks,
@@ -93,6 +93,25 @@ describe('withFileLock', () => {
     const result = withFileLockSync(target, () => 'ok-sync');
     expect(result).toBe('ok-sync');
     expect(existsSync(target + '.lock')).toBe(false);
+  });
+
+  it('does not sleep before timing out a sync zero-wait lock attempt', () => {
+    writeFileSync(target + '.lock', String(process.pid), 'utf8');
+    let nowMs = 1_000;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+    const wait = vi.spyOn(Atomics, 'wait').mockImplementation((_view, _index, _value, timeout) => {
+      nowMs += Number(timeout ?? 0);
+      return 'timed-out';
+    });
+
+    try {
+      expect(() => withFileLockSync(target, () => 'unreachable', { maxWaitMs: 0 }))
+        .toThrow(/file-lock timeout/);
+      expect(wait).not.toHaveBeenCalled();
+    } finally {
+      wait.mockRestore();
+      now.mockRestore();
+    }
   });
 
   it('propagates an async callback EEXIST exactly once', async () => {

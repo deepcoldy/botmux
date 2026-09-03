@@ -338,6 +338,7 @@ export function getDaemonStreamingCardUsageSnapshot(
   const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
   const reasoningEffort = ds.activeReasoningEffort?.trim()
     || ds.session.reasoningEffort?.trim();
+  const modelBackendVariant = ds.session.modelBackendVariant;
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
@@ -345,6 +346,7 @@ export function getDaemonStreamingCardUsageSnapshot(
         tokens: null,
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(modelBackendVariant ? { modelBackendVariant } : {}),
       };
     }
   } catch {
@@ -366,6 +368,7 @@ export function getDaemonStreamingCardUsageSnapshot(
     ...snapshot,
     ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
+    ...(modelBackendVariant ? { modelBackendVariant } : {}),
   };
 }
 
@@ -1466,8 +1469,8 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   if (selected) {
     if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
@@ -1480,6 +1483,9 @@ function sessionAgentConfig(
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
     const reasoningEffort = selected.reasoningEffort ?? undefined;
+    const modelBackendVariant = selected.cliId === 'traex'
+      ? selected.modelBackendVariant ?? undefined
+      : undefined;
     const launchShell = selected.launchShell ?? undefined;
     const startupCommands = [...selected.startupCommands];
     if (selected.state === 'pending') {
@@ -1489,6 +1495,7 @@ function sessionAgentConfig(
       ds.session.cliPathOverride = legacyPath;
       ds.session.wrapperCli = wrapperCli;
       ds.session.reasoningEffort = reasoningEffort;
+      ds.session.modelBackendVariant = modelBackendVariant;
       ds.session.agentFrozen = true;
       sessionStore.updateSession(ds.session);
     }
@@ -1500,7 +1507,7 @@ function sessionAgentConfig(
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, reasoningEffort, launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
   }
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
@@ -1544,6 +1551,9 @@ function sessionAgentConfig(
     ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
+    ds.session.modelBackendVariant = ds.session.cliId === 'traex'
+      ? ds.session.modelBackendVariant ?? botCfg.modelBackendVariant
+      : undefined;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
@@ -1572,6 +1582,10 @@ function sessionAgentConfig(
         repaired = true;
       }
     }
+    if (ds.session.cliId !== 'traex' && ds.session.modelBackendVariant !== undefined) {
+      ds.session.modelBackendVariant = undefined;
+      repaired = true;
+    }
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
@@ -1590,6 +1604,7 @@ function sessionAgentConfig(
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
     model,
+    modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
@@ -8529,6 +8544,7 @@ export async function forkSession(
   childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.modelBackendVariant = ds.session.modelBackendVariant;
   childSession.model = ds.session.model;
   childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
     ? {
@@ -10677,6 +10693,7 @@ export function forkWorker(
     wrapperCli: agentCfg.wrapperCli,
     launchShell: agentCfg.launchShell,
     model: agentCfg.model,
+    modelBackendVariant: agentCfg.modelBackendVariant,
     reasoningEffort: agentCfg.reasoningEffort,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
     // takes effect on the next worker fork without recreating the session.
@@ -14604,9 +14621,39 @@ function deliverFinalOutput(
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
       // worker/Riff environment received; live config applies on the next fork.
-      const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      let feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      // Freeze email reviewers into this bot's app-scoped open_id so the
+      // card callback can match network-free against the delivery snapshot. Pure
+      // ou_/on_ lists (and requester/everyone) skip the lookup. If resolution
+      // empties the list, fail closed (drop the feedback control).
+      if (feedbackPolicy && feedbackPolicy.audience === 'reviewers') {
+        try {
+          const { materializeFeedbackReviewers } = await import('../services/feedback-policy.js');
+          const { resolveAllowedUsersWithMap } = await import('../im/lark/client.js');
+          feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
+            const { map } = await resolveAllowedUsersWithMap(ds.larkAppId, entries);
+            const resolved = new Map<string, string>();
+            for (const entry of entries) {
+              const id = map.get(entry);
+              if (id && id.startsWith('ou_')) resolved.set(entry, id);
+            }
+            return resolved;
+          });
+        } catch {
+          feedbackPolicy = undefined;
+        }
+        if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
+      }
       const feedbackRequesterSubjectId = recipientOpenId;
-      const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
+      // `reviewers`/`everyone` audiences gate clicks without a human requester,
+      // so the control is valid even for an ownerless bot-triggered session with
+      // no human recipient; `requester` audience still needs the recipient to be
+      // clickable. Never re-derive an owner here — the ownerless session stays
+      // ownerless (no @-loop back to the alerting bot).
+      const feedback = feedbackPolicy
+        && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
+        ? { policy: feedbackPolicy }
+        : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
@@ -15096,6 +15143,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliPathOverride: agentCfg.cliPathOverride,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: agentCfg.model,
+    modelBackendVariant: agentCfg.modelBackendVariant,
     turnTimeoutMs: botCfg.turnTimeoutMs,
     dshProfile: botCfg.dshProfile,
     dshRuntime: botCfg.dshRuntime,

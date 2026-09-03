@@ -215,8 +215,8 @@ describe('bot defaults focused layout', () => {
     expect(page).not.toContain('data-action="toggle-grant-quota-oncall"');
     expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝内置默认：授权卡每人 {count} 条'");
     expect(i18n).toContain("'botDefaults.quotaDefault': '消息额度覆盖'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 每人 {count} 条（授权卡与 Oncall）'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限额'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 授权卡每人 {count} 条；Oncall 不限额'");
     expect(i18n).not.toContain("'botDefaults.grantDefaultsReset'");
     expect(i18n).not.toContain('点击“恢复默认限制”');
     expect(i18n).not.toContain('产品默认 3 条');

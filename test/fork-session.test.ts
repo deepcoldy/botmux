@@ -274,9 +274,10 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── P2: the per-session reasoningEffort override + the agentFrozen marker
   //    must ride along, else sessionAgentConfig re-freezes from the live bot
   //    config and the clone silently drops the source's launch identity. ──
-  it('P2: reasoningEffort / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
       reasoningEffort: 'xhigh',
+      modelBackendVariant: 'max',
       cliRuntime: {
         id: 'custom-claude',
         displayName: 'Custom Claude',
@@ -294,6 +295,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(r.ok).toBe(true);
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
     expect(child.reasoningEffort).toBe('xhigh');
+    expect(child.modelBackendVariant).toBe('max');
     expect(child.cliRuntime).toEqual(src.session.cliRuntime);
     expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
@@ -561,5 +563,21 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
     const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
     expect(cfg.model).toBe('gpt-5.6-terra');    // override wins even on cross-CLI
+  });
+
+  it('freezes a TraeX backend variant for the session launch identity', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const first = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(first.modelBackendVariant).toBe('max');
+    expect(ds.session.modelBackendVariant).toBe('max');
+
+    const resumed = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'standard' });
+    expect(resumed.modelBackendVariant).toBe('max');
+  });
+
+  it('keeps old frozen sessions without a variant in inherit mode', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(cfg.modelBackendVariant).toBeUndefined();
   });
 });

@@ -472,7 +472,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(quotaEdit.text.content).toBe('Set message quota');
-    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(text).toContain('Default: grant card 3 / Oncall unmetered');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -483,7 +483,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(text).toContain(`${current} messages per person on grant cards (Oncall unmetered)`);
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -494,7 +494,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -519,7 +519,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(input.default_value).toBe('');
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
   });
 });
 

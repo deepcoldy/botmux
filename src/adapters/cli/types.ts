@@ -171,6 +171,9 @@ export interface CliAdapter {
      *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
      *  with an explicit reasoning control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Optional TraeX process-scoped backend variant. Missing means inherit
+     * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
+    modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Codex App only: restricted local browser extension bridge. */

@@ -99,6 +99,8 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Frozen TraeX backend variant selected for this session. */
+  modelBackendVariant?: string;
 }
 
 export interface ReplyCardFooter {
@@ -478,7 +480,7 @@ export function cardUsageFooterSegment(
 }
 
 /** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
+ * {@link cardUsageFooterSegment}'s metric text. Returns `**model** variant · effort`
  * (model bolded within the shared grey markdown) or null when there is no model.
  * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
  * standalone runtime-only row when native usage is unavailable. The
@@ -494,8 +496,14 @@ export function cardUsageRuntimeSegment(
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
   const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
   if (!model) return null;
+  const variant = usage.modelBackendVariant === 'standard'
+    ? 'Standard'
+    : usage.modelBackendVariant === 'max'
+      ? 'Max'
+      : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
+  const tail = [variant, reasoningEffort].filter(Boolean);
+  return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.

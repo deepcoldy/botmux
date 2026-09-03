@@ -20,7 +20,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
-import { buildDashboardUrls } from './core/dashboard-url.js';
+import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
@@ -3834,14 +3834,13 @@ export async function enforceMessageQuotaForCliInput(
 
   let quota;
   try {
-    // oncall ∩ chatGrant 交集的额度决策**全部收口进 consumeQuota 的同一把锁**，杜绝跨 await
-    // 用陈旧 ev 决策：
-    //   • explicitGrantOverride（live 显式授权）→ 不兜 default（undefined）。
-    //   • expiredGrantCleanup（观察到过期 chatGrant）→ 透传给 consumeQuota，锁内以**当前 expiry**
-    //     为权威：当前 expiry<=now → 原子清「成员+quota+expiry」并回落 default；当前无/未来 expiry
-    //     → grant live（成员在→不兜 default 按现有/不限；成员已清→回落 default）。
-    //   • 其余 oncall（非成员）→ 兜 default。
-    // 传入的 def 是「拟回落值」；是否真用由 consumeQuota 锁内定夺（有 expiredGrant 时以 CAS 为准）。
+    // `def`（拟回落的懒初始化上限）在**当前生产路径下恒为 undefined**：只有 chatGrant / globalGrant
+    // 腿会挂 quotaKey，而 oncall 腿恒不挂（见 event-dispatcher.oncallTalk），所以带 reason==='oncall'
+    // 的判定在上面 `if (!ev.quotaKey) return true` 就已返回，走不到这里。访客的额度记录是**发卡那一刻**
+    // 按 `defaultLimit ?? 3` 写好的（ask-grant-request / grant-command / event-dispatcher 的自助申请卡），
+    // 不依赖 consumeQuota 的懒初始化。
+    // 表达式与 expiredGrantCleanup 透传一并保留：它们是上一版「oncall ∩ chatGrant 交集」的残留，
+    // 删除会牵动 consumeQuota 签名，留作独立 cleanup。
     const def = ev.reason === 'oncall' && !ev.explicitGrantOverride
       ? getBot(larkAppId).config.messageQuota?.defaultLimit
       : undefined;
@@ -21574,7 +21573,18 @@ function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
 
 /** Build the current dashboard URL (active token, not a rotation) from the
  *  dashboard process's persisted `.dashboard-port` / `.dashboard-token`. Falls
- *  back to a token-less base URL if the dashboard hasn't published a token yet. */
+ *  back to a token-less base URL if the dashboard hasn't published a token yet.
+ *
+ *  ⚠️ 这条 URL 的消费者是**飞书卡片**（重启报告 DM、CLI 运行时更新提醒），也就是
+ *  一条**永久聊天记录**：可转发、可截图、可被搜索。所以中心平台托管时必须把
+ *  `?t=` 摘掉 —— 走平台子域时身份由平台注入 + SSO，token 已被
+ *  `dashboard/request-identity.ts` 压制成无效（带上也是 401），对访问零贡献、
+ *  只剩泄漏价值。判据与 `cli/dashboard-command.ts:formatDashboardSuccessLines`
+ *  同源：**只有中心平台**这一条腿可以摘，自建反代 `BOTMUX_PUBLIC_URL` 与 Devbox
+ *  短链没有人注入身份、token 仍是唯一凭证，对它们摘会摘成死链。
+ *
+ *  同理平台托管时**不返回 `localUrl`**：那一条恒定带 token，是给终端里的 owner 当
+ *  平台异常兜底用的（`botmux dashboard` 有显式参数可取），不该主动推进聊天记录。 */
 function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   try {
     const dir = join(homedir(), '.botmux');
@@ -21583,10 +21593,15 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
     const tok = loadPersistedToken(join(dir, '.dashboard-token')) ?? '';
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
-    // platform dashboard instead of an unreachable local host:port. In that case
-    // localUrl carries the direct host:port fallback so the owner can still reach
-    // the dashboard if the platform is down.
-    return buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined });
+    // platform dashboard instead of an unreachable local host:port.
+    // `buildDashboardUrls` itself reports whether the base it chose is the
+    // platform's, so nothing here re-derives that bit (a caller that did — and
+    // got it wrong — is what this guard exists for). The narrowing lives in
+    // core/dashboard-url.ts so it is unit-testable: daemon.ts exports nothing a
+    // test can reach.
+    return reportDashboardUrls(
+      buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined }),
+    );
   } catch {
     return {};
   }

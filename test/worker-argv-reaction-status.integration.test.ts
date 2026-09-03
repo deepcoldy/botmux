@@ -123,6 +123,57 @@ function ompTranscriptRecord(
 }
 
 describe('worker argv reaction status', () => {
+  it('forwards the frozen TraeX backend variant into the actual spawn argv', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-traex-variant-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeTraex = join(root, 'fake-traex');
+    writeFileSync(fakeTraex, `#!/usr/bin/env node
+process.stdout.write('❯ Ready\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeTraex, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-traex-variant',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-traex-variant',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'traex',
+      cliPathOverride: fakeTraex,
+      modelBackendVariant: 'max',
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'model_backend_variant="max"');
+    expect(logs.join('')).toContain('Spawning fresh CLI:');
+  }, 15_000);
+
   it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
     tempDirs.add(root);

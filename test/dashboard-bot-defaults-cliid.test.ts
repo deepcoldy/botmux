@@ -291,6 +291,107 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows and saves a TraeX-only backend variant', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'traex',
+          model: body.model,
+          reasoningEffort: body.reasoningEffort,
+          modelBackendVariant: body.modelBackendVariant,
+          selectionKey: 'traex',
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+      const picker = root.findByProps({ dataInput: 'agentModelBackendVariant' });
+      expect(picker.props.value).toBe('max');
+      expect((picker.props.options as Array<{ value: string }>).map(option => option.value)).toEqual(['', 'standard', 'max']);
+      act(() => picker.props.onChange('standard'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'standard',
+      }]);
+
+      const codex = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol' });
+      expect(codex.root.findAllByProps({ dataInput: 'agentModelBackendVariant' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('clears a TraeX backend variant when switching away and back before save', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: body.cliId,
+          model: body.model,
+          reasoningEffort: body.reasoningEffort,
+          modelBackendVariant: null,
+          selectionKey: body.cliId,
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+      const cliPicker = root.findByProps({ dataInput: 'agentCliId' });
+      act(() => cliPicker.props.onChange('codex'));
+      act(() => cliPicker.props.onChange('traex'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: '',
+        cliRuntime: null,
+      }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   const dshCliState = {
     options: [
       { id: 'codex', label: 'Codex' },

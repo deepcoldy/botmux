@@ -49,4 +49,18 @@ describe('Codex per-Bot reasoning effort', () => {
     expect(configs.find(config => config.larkAppId === 'traex-xhigh')?.reasoningEffort).toBe('xhigh');
     expect(configs.find(config => config.larkAppId === 'traex-invalid-pair')?.reasoningEffort).toBeUndefined();
   });
+
+  it('preserves only valid TraeX backend variants', () => {
+    const configs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'traex-max', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'max' },
+      { larkAppId: 'traex-standard', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'standard' },
+      { larkAppId: 'traex-invalid', larkAppSecret: 'secret', cliId: 'traex', modelBackendVariant: 'turbo' },
+      { larkAppId: 'codex-max', larkAppSecret: 'secret', cliId: 'codex', modelBackendVariant: 'max' },
+    ]));
+
+    expect(configs.find(config => config.larkAppId === 'traex-max')?.modelBackendVariant).toBe('max');
+    expect(configs.find(config => config.larkAppId === 'traex-standard')?.modelBackendVariant).toBe('standard');
+    expect(configs.find(config => config.larkAppId === 'traex-invalid')?.modelBackendVariant).toBeUndefined();
+    expect(configs.find(config => config.larkAppId === 'codex-max')?.modelBackendVariant).toBeUndefined();
+  });
 });

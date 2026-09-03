@@ -7,26 +7,51 @@
 // Same boot hygiene as index-daemon: scrub any session-scoped env a parent may
 // have leaked, so children don't inherit a stale identity.
 
-import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, readFileSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import {
+  scrubClaudeSessionMarkerEnv,
+  scrubInvokerTerminalEnv,
+  scrubSessionCliHomeEnv,
+  scrubSessionTurnMarkerEnv,
+  scrubWorkflowWorkerEnv,
+  stripDashboardH5Env,
+} from './utils/child-env.js';
+import { scrubDetachedRestartEnvRefresh } from './core/restart-env-refresh.js';
 
 installStdioEpipeGuard();
 
 const configDir = join(homedir(), '.botmux');
-const globalEnv = join(configDir, '.env');
-dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
-// A supervisor is never a session (mirror index-daemon): scrub leaked identity.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_OWNER_OPEN_ID', '__OWNER_OPEN_ID']) {
-  delete process.env[k];
-}
+// The supervisor deliberately does NOT wholesale-load ~/.botmux/.env: that file
+// carries the Dashboard-only Feishu H5 login family, and the supervisor is not
+// its consumer (the dashboard reloads it itself via index-dashboard.ts). Any
+// INHERITED copy still has to go, because resolveFleetDaemonEnv() below spreads
+// this process's env into every supervised member — an unstripped secret would
+// sit in this long-lived process for its whole life and ride into every bot
+// daemon (which then strips it again at its own boot).
+//
+// This also cuts the ambient-env inheritance path into the dashboard
+// (supervisor is its parent; daemon is not). That's intentional: aligned
+// with the long-standing scrubPm2CallerEnv convention on the pm2 path; the
+// supervisor form never had this boundary before. The documented channel
+// remains ~/.botmux/.env — the dashboard loads that file itself.
+stripDashboardH5Env(process.env);
+// A supervisor is never a session (mirror index-daemon): a `botmux
+// start/restart` issued from inside a bot session leaks that session's
+// identity/capabilities into this long-lived process, and
+// resolveFleetDaemonEnv() bakes whatever remains here into every daemon
+// child's starting env for the supervisor's whole lifetime. Match
+// index-daemon.ts's boot scrub exactly (rather than a hand-picked subset of
+// keys) so this boundary can't silently fall behind the next key added there.
+scrubSessionTurnMarkerEnv(process.env);
 scrubSessionCliHomeEnv(process.env);
 scrubClaudeSessionMarkerEnv(process.env);
 scrubWorkflowWorkerEnv(process.env);
+scrubInvokerTerminalEnv(process.env);
+process.env.TERM = 'xterm-256color';
+scrubDetachedRestartEnvRefresh(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');

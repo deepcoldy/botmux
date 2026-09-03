@@ -179,6 +179,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
     wrapperCli: null,
     model: null,
     reasoningEffort: null,
+    modelBackendVariant: null,
     launchShell: null,
     startupCommands: [],
   };

@@ -44,7 +44,8 @@ export type TeamApiResult<T = any> = DashboardApiResult<T>;
 
 export interface FeedbackPolicyLayer {
   enabled?: boolean;
-  audience?: 'requester';
+  audience?: 'requester' | 'reviewers' | 'everyone';
+  reviewers?: unknown[];
   visibleSemantics?: unknown[];
   buttons?: unknown[];
   negativeFollowup?: { reasons?: unknown[]; comment?: { enabled?: boolean; required?: boolean; placeholder?: string; maxLength?: number } };

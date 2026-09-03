@@ -84,6 +84,26 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(params.config?.model_reasoning_effort).toBe('ultra');
   }, 20_000);
 
+  it('forwards backend variant on fresh thread/start and suppresses it on resume', async () => {
+    const startFile = join(tmpdir(), `fake-variant-start-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-variant-resume-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'variant-wiring',
+      modelBackendVariant: 'max',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    expect(startParams.config?.model_backend_variant).toBe('max');
+    expect(resumeParams.config?.model_backend_variant).toBeUndefined();
+  }, 20_000);
+
   it('SUPPRESSES model + reasoningEffort on thread/resume (start keeps both) — no resume drift', async () => {
     // Regression lock for the PR #639 P2: a cold resume must send NEITHER
     // config.model NOR config.model_reasoning_effort, or the app-server's

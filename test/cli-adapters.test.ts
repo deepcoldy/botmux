@@ -703,6 +703,16 @@ describe('mira buildArgs', () => {
 
 describe('dsh buildArgs (runner model)', () => {
   const adapter = createDshAdapter('/opt/dsh/bin/dsh');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the node runner and passes the dsh runtime binary', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
@@ -741,6 +751,50 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain(String(30 * 60 * 1000));
   });
 
+  it('passes the question bridge patch to the runner when enabled for the default botmux profile', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false });
+      const patchIdx = args.indexOf('--bridge-patch');
+      expect(patchIdx).toBeGreaterThanOrEqual(0);
+      expect(args[patchIdx + 1]).toContain(join(root, '.botmux', 'dsh-question-bridge'));
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('materializes the question bridge for sandbox readonly paths even before buildArgs runs', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not inject the question bridge into custom dsh profiles', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+    const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false, dshProfile: 'custom' });
+    expect(args).toContain('--dsh-profile');
+    expect(args).toContain('custom');
+    expect(args).not.toContain('--bridge-patch');
+    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(homedir(), '.botmux', 'dsh-question-bridge'))]);
+  });
+
   it('omits --turn-timeout-ms when unset or non-positive', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
     expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
@@ -749,6 +803,26 @@ describe('dsh buildArgs (runner model)', () => {
 
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
+  });
+
+  it('exposes and pre-creates configured DSH_HOME for sandboxed profile state', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(configured.authPaths).toContain(customHome);
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+      expect(existsSync(join(customHome, 'sessions', 'botmux'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('readyPattern matches the runner prompt indicator', () => {
@@ -814,6 +888,16 @@ describe('dsh buildArgs (runner model)', () => {
 
 describe('dsh-tui buildArgs (PTY TUI model)', () => {
   const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the dsh-tui binary directly (no runner)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
@@ -833,8 +917,41 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args).toEqual(['--resume']);
   });
 
-  it('omits --resume on fresh spawn', () => {
+  it('omits --resume on fresh spawn when the question bridge is disabled', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('injects the question bridge patch as a single --patch= token when available', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-bridge-profile-'));
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = root;
+      const pkgRoot = join(root, 'profiles', 'dsh-tui', 'node_modules', '@deepseek-harness-tui', 'dsh-tui');
+      mkdirSync(join(pkgRoot, 'lib', 'types'), { recursive: true });
+      writeFileSync(join(root, 'profiles', 'dsh-tui', 'package.json'), JSON.stringify({ name: 'profile' }) + '\n');
+      writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+        name: '@deepseek-harness-tui/dsh-tui',
+        type: 'module',
+        exports: { '.': { import: './lib/types/index.js' } },
+      }) + '\n');
+      writeFileSync(join(pkgRoot, 'lib', 'types', 'index.js'), 'export function apply(){}\n');
+
+      const bridgeAdapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+      const patchArg = args.find(arg => arg.startsWith('--patch='));
+      expect(patchArg).toBeDefined();
+      expect(args).not.toContain('--patch');
+      expect(args).toContain('--resume');
+      expect(args).toContain('abc-123');
+      const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
+      expect(readonly?.length).toBe(1);
+      expect(patchArg).toContain(readonly![0]);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('has no portable copy-paste resume command (session id not tracked)', () => {
@@ -853,21 +970,164 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });
 
-  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+  it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     expect(adapter.authPaths).toContain('~/.dsh-tui');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      expect(configured.authPaths).toContain(customHome);
+      expect(configured.authPaths).toContain('~/.dsh-tui');
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it('writeInput types text and presses Enter', async () => {
-    const sent: string[] = [];
-    const keys: string[][] = [];
+  it('writeInput frames multiline text itself and presses one Enter', async () => {
+    const content = 'line1\nline2\nline3';
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
     const pty = {
-      sendText: (t: string) => { sent.push(t); return true; },
-      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
     } as unknown as PtyHandle;
-    await adapter.writeInput!(pty, 'hello tui');
-    expect(sent).toEqual(['hello tui']);
-    expect(keys).toEqual([['Enter']]);
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput pastes a long botmux prompt as a single draft', async () => {
+    const content = [
+      '<botmux_routing>',
+      '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出。',
+      '</botmux_routing>',
+      '',
+      '<user_message>',
+      '请处理这个多行请求',
+      '</user_message>',
+      '',
+      '<botmux_skills>',
+      '  <skill name="botmux-send">',
+      '    <description>向飞书话题发送消息。</description>',
+      '  </skill>',
+      '</botmux_skills>',
+    ].join('\n');
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    await adapter.writeInput!(pty, content);
+
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput ignores void-returning pasteText and treats void sends as successful', async () => {
+    const content = 'line1\nline2';
+    const sendText = vi.fn(() => undefined);
+    const pasteText = vi.fn(() => undefined);
+    const sendSpecialKeys = vi.fn(() => undefined);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste with write when sendText is unavailable', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste on raw PTY fallback', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const pty = { write } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(write).toHaveBeenNthCalledWith(1, `\x1b[200~${content}\x1b[201~`);
+    expect(write).toHaveBeenNthCalledWith(2, '\r');
+  });
+
+  it('writeInput returns submitted false when paste, write, or Enter is rejected', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'paste rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+    } as unknown as PtyHandle, 'raw write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => true),
+      sendSpecialKeys: vi.fn(() => false),
+    } as unknown as PtyHandle, 'enter rejected')).resolves.toEqual({ submitted: false });
+  });
+
+  it('writeInput returns submitted false when bracketed paste send throws', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => { throw new Error('paste failed'); }),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'boom')).resolves.toEqual({ submitted: false });
   });
 });
 
@@ -2234,6 +2494,25 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('injects an explicit TraeX backend variant as a process config', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-variant',
+      resume: false,
+      modelBackendVariant: 'max',
+    });
+    const i = args.indexOf('model_backend_variant="max"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits the TraeX backend-variant config when inheriting', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-variant',
+      resume: false,
+    });
+    expect(args.join(' ')).not.toContain('model_backend_variant');
+  });
+
   it('injects structured reasoning effort as a TraeX launch config', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({
       sessionId: 'traex-effort',
@@ -2378,6 +2657,14 @@ describe('altScreen property', () => {
 
   it('claude-code does not use alt screen', () => {
     expect(createClaudeCodeAdapter('/bin/claude').altScreen).toBe(false);
+  });
+
+  it('claude-code read-only viewers may forward wheel-only scroll', () => {
+    // Claude's TUI self-manages its transcript (no xterm/tmux scrollback), so the
+    // read-only web terminal can only page history by forwarding SGR wheel events
+    // back to the CLI. This opt-in gates that narrow, rate-limited `type:'scroll'`
+    // path (worker.ts / web-terminal-scroll.ts), mirroring opencode.
+    expect(createClaudeCodeAdapter('/bin/claude').readOnlyRemoteScroll).toBe(true);
   });
 
   it('aiden does not use alt screen', () => {

@@ -61,6 +61,7 @@ export type BotDefaultsRow = {
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
   turnTimeoutMs?: number;

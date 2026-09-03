@@ -82,6 +82,20 @@ curl -sS -X POST "http://127.0.0.1:<ipcPort>/api/asks" \
 # 飞书点选 + 提交后，curl 返回 {"kind":"answered","answers":[["deploy"],["unit","types"]],...} 即全链路 OK
 ```
 
+## 8. DSH / dsh-tui question bridge
+
+DSH 不走 Claude/OpenCode 原生 hook 文件，而是由 botmux 在启动 DSH profile 时临时追加 `--patch=<bridgePatch>`：
+
+- official `dsh` runner：`dsh --profile <name> --patch=<bridgePatch>`；
+- `dshRuntime='tui'`：`dsh-tui --patch=<bridgePatch>`，必须是单 token `--patch=/abs/path`，不能用 split form `--patch /abs/path`。
+
+验证要点：
+
+1. 触发一个带两个选项的 `ask_user_question`，飞书应出现 botmux ask 卡片；点击后 DSH 继续并输出最终回答。
+2. 纯文本题、`plan-review`、重复/空/多行/过长 label 应整体 fallback/error：dsh-tui 回原生问卷，official runner 给可见错误，不应半接管。
+3. `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话，应不再注入 bridge patch。
+4. sandbox:true 下 bridge patch 目录必须只读可见，hook command 通过 `hookCommandParts()` 生成的 argv 可执行，不依赖全局 `botmux` shim。
+
 ## 注意
 
 - Codex 别测 askUserQuestion——它没有结构化提问 hook，adapter 对它永远 passthrough（无害）。

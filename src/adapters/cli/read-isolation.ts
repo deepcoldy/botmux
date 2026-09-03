@@ -350,11 +350,18 @@ export function buildSeatbeltProfile(
 //     cold-spawn ONCE under the new pending→commit contract — closing the INSTALLED
 //     BASE risk, not just new spawns. (A legacy no-state marker is now version-
 //     rejected, so validators no longer need to tolerate `state===undefined`.)
+//   · 11 → 12: sandboxed Codex receives a host-selected SSL_CERT_FILE so npm
+//     Codex's Rust TLS stack can use a stable CA bundle inside Seatbelt. Warm
+//     reattach would keep the old process environment and continue to fail on
+//     UnknownIssuer, so existing panes must cold-spawn once.
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration. Version
-// 12 adds the session-scoped plugin-card selector snapshot to the pane contract.
-export const ISOLATION_PANE_MARKER_VERSION = 12;
+// 12 adds the session-scoped plugin-card selector snapshot to the pane contract; 13
+// adds the host CA bundle startup env a sandboxed Codex pane needs — a pane spawned
+// before it keeps its ORIGINAL environment, so it would never see SSL_CERT_FILE and
+// would keep failing TLS on UnknownIssuer with no output at all.
+export const ISOLATION_PANE_MARKER_VERSION = 13;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

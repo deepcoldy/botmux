@@ -931,6 +931,13 @@ describe('buildMarkdownCard', () => {
     )).toBeNull();
   });
 
+  it('renders a backend variant between the model and reasoning effort', () => {
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
+      true,
+    )).toBe('**GPT-5.6-Terra** Max · xhigh');
+  });
+
   it('strips a leading provider/ routing prefix from the model name', () => {
     // model_hub/es1_orange_o48 → es1_orange_o48 (relay namespace hidden);
     // underscores are markdown-escaped by the shared compact formatter.

@@ -3877,6 +3877,48 @@ describe('PUT /api/bot-agent', () => {
         reasoningEffort: 'medium',
       });
 
+      const maxVariant = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'traex',
+          model: 'DeepSeek-V4-Pro',
+          reasoningEffort: 'medium',
+          modelBackendVariant: 'max',
+        }),
+      });
+      expect(maxVariant.status).toBe(200);
+      expect(await maxVariant.json()).toMatchObject({ modelBackendVariant: 'max' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ modelBackendVariant: 'max' });
+
+      const invalidVariant = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'traex',
+          model: 'DeepSeek-V4-Pro',
+          reasoningEffort: 'medium',
+          modelBackendVariant: 'turbo',
+        }),
+      });
+      expect(invalidVariant.status).toBe(400);
+      expect(await invalidVariant.json()).toMatchObject({ error: 'invalid_model_backend_variant' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ modelBackendVariant: 'max' });
+
+      const clearVariant = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'traex',
+          model: 'DeepSeek-V4-Pro',
+          reasoningEffort: 'medium',
+          modelBackendVariant: '',
+        }),
+      });
+      expect(clearVariant.status).toBe(200);
+      expect(await clearVariant.json()).toMatchObject({ modelBackendVariant: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].modelBackendVariant).toBeUndefined();
+
       const unsupported = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -3888,6 +3930,56 @@ describe('PUT /api/bot-agent', () => {
         model: 'DeepSeek-V4-Pro',
         reasoningEffort: 'medium',
       });
+
+      await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'traex',
+          model: 'DeepSeek-V4-Pro',
+          reasoningEffort: 'medium',
+          modelBackendVariant: 'standard',
+        }),
+      });
+      const switched = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'high' }),
+      });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ cliId: 'codex', modelBackendVariant: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].modelBackendVariant).toBeUndefined();
+
+      const nonTraexPayload = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: 'gpt-5.4',
+          reasoningEffort: 'high',
+          modelBackendVariant: 'stale-legacy-value',
+        }),
+      });
+      expect(nonTraexPayload.status).toBe(200);
+      expect(await nonTraexPayload.json()).toMatchObject({ cliId: 'codex', modelBackendVariant: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].modelBackendVariant).toBeUndefined();
+
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'gpt-5.4',
+        reasoningEffort: 'high',
+        modelBackendVariant: 'max',
+      }], null, 2));
+      const migrated = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'medium' }),
+      });
+      expect(migrated.status).toBe(200);
+      expect(await migrated.json()).toMatchObject({ cliId: 'traex', modelBackendVariant: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].modelBackendVariant).toBeUndefined();
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;

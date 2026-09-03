@@ -205,6 +205,7 @@ import {
   claimRestartLease,
   clearRestartIntent,
   clearRestartLease,
+  clearRestartLeaseLocked,
   hasActiveRestartLease,
   writeManualIntentIfAbsent,
   writeRestartIntent,
@@ -3011,7 +3012,10 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
 
 /** Build the dashboard URL(s) for a token, using the actually-bound port. The
  *  primary `url` routes through the central-platform machine subdomain when
- *  远程访问 is on and this host is bound (see buildDashboardUrls); `localUrl`
+ *  远程访问 is on and this host is bound (see buildDashboardUrls). The response
+ *  also carries `platformHosted`, which tells the CLI whether the token may be
+ *  stripped from a link shown to a human — only THIS process knows which base it
+ *  used, so it must say so rather than let callers re-derive it. `localUrl`
  *  carries the direct host:port fallback in that case (undefined otherwise). */
 function dashboardUrlsFor(token: string): DashboardUrls {
   return buildDashboardUrls({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
@@ -4620,7 +4624,9 @@ const server = createServer(async (req, res) => {
         }
         return;
       } catch (error) {
-        if (leaseId) clearRestartLease(leaseId);
+        if (leaseId && !clearRestartLeaseLocked(leaseId)) {
+          logger.warn('[dashboard] rollback lease cleanup deferred because the update lock is busy');
+        }
         if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         if (!res.headersSent) {
           return jsonRes(res, 500, {
@@ -4729,7 +4735,9 @@ const server = createServer(async (req, res) => {
             const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId!);
             if (!child.pid) throw new Error('restart driver did not start');
           } catch (error) {
-            clearRestartLease(leaseId!);
+            if (!clearRestartLeaseLocked(leaseId!)) {
+              logger.warn('[dashboard] restart lease cleanup deferred because the update lock is busy');
+            }
             logger.error(`[dashboard] restart launch failed: ${error instanceof Error ? error.message : error}`);
           }
         };

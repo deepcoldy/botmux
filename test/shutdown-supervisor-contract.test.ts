@@ -16,6 +16,7 @@ import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 const ipcServer = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
 // Contract for the built-in fleet supervisor (pm2-retired). The fleet lifecycle
@@ -83,12 +84,16 @@ describe('graceful shutdown supervisor contract', () => {
     const start = cli.indexOf('async function cmdRestart()');
     const end = cli.indexOf('export type StartBotLiveResult', start);
     const restart = cli.slice(start, end);
+    const consumeRefresh = restart.indexOf('prepareRestartDriverContext()');
+    const firstAwait = restart.indexOf('await ');
     const consume = restart.indexOf('consumeRestartIntentTo(');
     const writeIntent = restart.indexOf('writeRestartAttemptIntentTo(', consume);
-    const restartFleet = restart.indexOf('restartFleet()', writeIntent);
+    const restartFleet = restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })', writeIntent);
     const health = restart.indexOf('waitFleetOnline(', restartFleet);
     const removeOnFail = restart.indexOf('removeRestartIntentAttemptTo(', health);
     const commit = restart.indexOf('commitRestartIntentAttemptTo(', health);
+    expect(consumeRefresh).toBeGreaterThanOrEqual(0);
+    expect(consumeRefresh).toBeLessThan(firstAwait);
     expect(consume).toBeGreaterThanOrEqual(0);
     expect(writeIntent).toBeGreaterThan(consume);
     expect(restartFleet).toBeGreaterThan(writeIntent);
@@ -101,6 +106,24 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).not.toContain("runPm2(['start'");
     expect(restart).not.toContain('ecosystemConfig(');
     expect(restart).toContain('health.healthy');
+  });
+
+  it('uses the generation-locked best-effort clear after dashboard update locks are released', () => {
+    const rollback = dashboard.slice(
+      dashboard.indexOf("url.pathname === '/api/update/rollback'"),
+      dashboard.indexOf("url.pathname === '/api/update/restart'"),
+    );
+    const restart = dashboard.slice(
+      dashboard.indexOf("url.pathname === '/api/update/restart'"),
+      dashboard.indexOf("url.pathname === '/api/skills'"),
+    );
+    const rollbackOuterCatch = rollback.slice(rollback.lastIndexOf('} catch (error) {'));
+    const restartPostLockLaunch = restart.slice(restart.indexOf('// Spawn the detached driver after the lock is released.'));
+
+    expect(rollbackOuterCatch).toContain('clearRestartLeaseLocked(leaseId)');
+    expect(rollbackOuterCatch).not.toContain('if (leaseId) clearRestartLease(leaseId)');
+    expect(restartPostLockLaunch).toContain('clearRestartLeaseLocked(leaseId!)');
+    expect(restartPostLockLaunch).not.toContain('clearRestartLease(leaseId!)');
   });
 
   it('idempotent start is a supervisor no-op when a live supervisor already owns the fleet', () => {
@@ -131,7 +154,7 @@ describe('graceful shutdown supervisor contract', () => {
       cli.indexOf('/**\n * Bring a SINGLE bot'),
     );
     expect(cmdStart).toContain('startFleetViaSupervisor()');
-    expect(cmdRestart).toContain('restartFleet()');
+    expect(cmdRestart).toContain('restartFleet({ refreshPersistedEnv, readFailureFallback })');
     expect(startBot).toContain('startBotViaSupervisor(');
     expect(stopBot).toContain('stopBotViaSupervisor(');
     for (const [label, region] of [['start', cmdStart], ['restart', cmdRestart], ['start-bot', startBot], ['stop-bot', stopBot]] as const) {

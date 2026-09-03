@@ -131,7 +131,9 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: false } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7891/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
   });
 
   it.each([
@@ -143,7 +145,30 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/ensure',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken } }),
     });
-    expect(r).toEqual({ ok: true, url: `http://host:7891/?t=${token}` });
+    expect(r).toEqual({
+      ok: true, url: `http://host:7891/?t=${token}`, localUrl: undefined, platformHosted: false,
+    });
+  });
+
+  // ─── platformHosted 是「能不能摘 token」的唯一判据，只认严格 true ────────────
+  // 它由生成 URL 的 dashboard 进程如实标注：那是唯一知道自己用了哪条基址的进程。
+  // 调用方自己推断出过真缺陷（bind.ts 硬编码 true ⟹ 反代场景摘成死链），所以判据
+  // 收归协议层。fail-safe 方向：非严格 true 一律当 false（= 保留 token）。
+  it.each([
+    { name: 'strict true', body: { platformHosted: true }, expected: true },
+    { name: 'strict false', body: { platformHosted: false }, expected: false },
+    { name: 'absent (older dashboard)', body: {}, expected: false },
+    { name: 'string "true" (not a boolean)', body: { platformHosted: 'true' }, expected: false },
+    { name: 'number 1', body: { platformHosted: 1 }, expected: false },
+    { name: 'null', body: { platformHosted: null }, expected: false },
+  ])('parses platformHosted: $name -> $expected', async ({ body, expected }) => {
+    setPort(7891);
+    const fetchImpl = (async () => new Response(
+      JSON.stringify({ url: 'https://m-x.example/?t=fresh', ...body }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/current', fetchImpl });
+    expect(r.ok && r.platformHosted).toBe(expected);
   });
 
   it('surfaces the dashboard-provided localUrl fallback (platform link case)', async () => {
@@ -154,7 +179,13 @@ describe('callDashboard', () => {
       { status: 200 },
     )) as unknown as typeof fetch;
     const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl });
-    expect(r).toEqual({ ok: true, url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' });
+    expect(r).toEqual({
+      ok: true,
+      url: 'https://m-x.example/?t=fresh',
+      localUrl: 'http://10.0.0.1:7891/?t=fresh',
+      // 响应体没带 platformHosted（模拟旧版 dashboard）⟹ 必须解析成 false = 保留 token。
+      platformHosted: false,
+    });
   });
 
   it('does NOT mislabel a daemon-IPC 404 as no-active-token; self-heals to the real dashboard', async () => {
@@ -167,7 +198,9 @@ describe('callDashboard', () => {
         7901: { kind: 'dashboard', hasToken: true },
       }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7901/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7901/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
     // Port file healed to the discovered dashboard port.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7901');
   });
@@ -181,7 +214,9 @@ describe('callDashboard', () => {
         7897: { kind: 'dashboard', hasToken: true },
       }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7897/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7897/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7897');
   });
 
@@ -219,7 +254,9 @@ describe('callDashboard', () => {
       rescanWhenUnreachable: true,
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: true } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=current' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7891/?t=current', localUrl: undefined, platformHosted: false,
+    });
     // ...and the dead recorded port is healed, so the next call needs no rescan.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7891');
   });
@@ -244,7 +281,9 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/current',
       fetchImpl: makeFetch({ 7893: { kind: 'ipc' }, 7901: { kind: 'dashboard', hasToken: true } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7901/?t=current' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7901/?t=current', localUrl: undefined, platformHosted: false,
+    });
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7901');
   });
 
@@ -486,7 +525,9 @@ describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
       expect(parsed.runtime).toBe('bun');
       expect(proxyHits).toBe(0);
       expect(directHits).toBe(1);
-      expect(parsed.r).toEqual({ ok: true, url: 'http://dash.local/?t=direct' });
+      expect(parsed.r).toEqual({
+        ok: true, url: 'http://dash.local/?t=direct', platformHosted: false,
+      });
     } finally {
       await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
     }
@@ -532,7 +573,9 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     const execution = await executeDashboardCommand([], cliCaller);
     expect(execution.kind).toBe('endpoint');
     if (execution.kind === 'endpoint') {
-      expect(execution.result).toEqual({ ok: true, url: 'http://host:7891/?t=current' });
+      expect(execution.result).toEqual({
+        ok: true, url: 'http://host:7891/?t=current', localUrl: undefined, platformHosted: false,
+      });
     }
     // The dead port is healed, so subsequent calls need no scan at all.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7891');

@@ -1175,6 +1175,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       : undefined,
     systemHints: [],
     altScreen: false,
+    // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux
+    // 两边都无 scrollback；只读 Web 终端要把滚轮转成 SGR wheel 发回 CLI 才能翻页。
+    // 只读滚动走 worker 侧严格校验 + 限流的 `type:'scroll'` 通路（见 web-terminal-scroll.ts），
+    // 与 write 权限完全隔离，安全上与 opencode 一致。
+    readOnlyRemoteScroll: true,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.

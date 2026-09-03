@@ -4,10 +4,12 @@ import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
+  CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
+  PROXY_ENV_KEYS,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
@@ -257,6 +259,17 @@ describe('stripDashboardH5Env()', () => {
     const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
     expect(dotenvAt).toBeGreaterThan(-1);
     expect(stripAt).toBeGreaterThan(dotenvAt);
+  });
+
+  it('is called by index-supervisor.ts without wholesale dotenv loading (source pin)', () => {
+    // The supervisor scrubs any inherited H5 credentials before it seeds the
+    // fleet, but deliberately does NOT wholesale-load ~/.botmux/.env: doing so
+    // would place dashboard-only secrets in a long-lived parent of every bot.
+    // The dashboard remains the only entry that loads those settings from disk.
+    const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
+    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
+    expect(stripAt).toBeGreaterThan(-1);
+    expect(src).not.toContain('dotenvConfig(');
   });
 
   it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
@@ -597,6 +610,22 @@ describe('session CLI home scrub call sites', () => {
     expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
   });
 
+  it('the fleet supervisor and dashboard entry also scrub invoker-terminal fingerprints and turn markers', () => {
+    // Same two key families as the daemon-boot pin above, at the two other
+    // long-lived boundaries: resolveFleetDaemonEnv() bakes the supervisor's
+    // own (post-scrub) process.env into every daemon child + the dashboard,
+    // and the dashboard entry forks debug terminals / start-stop-bot CLI runs
+    // straight from its own process.env. Both used to scrub only a hand-picked
+    // 7-key subset of session identity and never touched invoker-terminal
+    // fingerprints at all — the gap this test closes.
+    for (const rel of ['index-supervisor.ts', 'index-dashboard.ts']) {
+      const src = read(rel);
+      expect(src, rel).toContain('scrubInvokerTerminalEnv(process.env)');
+      expect(src, rel).toContain('scrubSessionTurnMarkerEnv(process.env)');
+      expect(src, rel).toContain("process.env.TERM = 'xterm-256color'");
+    }
+  });
+
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
     // WORKER_REDACTED_ENV_KEYS is a private const in worker-pool.ts (worker fork
     // boundary, not importable without side effects), so pin at the source that
@@ -625,6 +654,17 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
+  });
+
+  it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {
+    // BOTMUX_INJECTED_ENV_KEYS also drives the pane `unset` clause and
+    // scrubTmuxServerGlobalEnv(), so a standard, user-ownable variable listed
+    // there would delete the CA bundle a user configured for their own tmux
+    // server — for every CLI, on every platform. Same reason PROXY_ENV_KEYS is
+    // kept out. Per-pane forwarding happens in buildBotmuxEnvAssignments.
+    expect(BOTMUX_INJECTED_ENV_KEYS).not.toContain('SSL_CERT_FILE');
+    expect(CA_BUNDLE_ENV_KEYS).toContain('SSL_CERT_FILE');
+    expect(PROXY_ENV_KEYS as readonly string[]).not.toContain('SSL_CERT_FILE');
   });
 });
 

@@ -117,6 +117,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -146,13 +147,13 @@ import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, 
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
-import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
 import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
+  DASHBOARD_LOCAL_TOKEN_FLAG,
   dashboardComingUpFromState,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
@@ -161,7 +162,11 @@ import {
   formatDashboardUnreachable,
   shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
-import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import {
+  globalInstallUpdateLockTarget,
+  installLatestBotmuxSync,
+  prepareRestartDriverContext,
+} from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -241,7 +246,6 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
-  bindRestartLeaseTo,
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
   removeRestartIntentAttemptTo,
@@ -2598,18 +2602,7 @@ interface RestartLifecycleFlags {
 
 
 async function cmdRestart(): Promise<void> {
-  const restartLeaseId = process.env.BOTMUX_RESTART_LEASE_ID;
-  const restartLeaseDir = process.env.BOTMUX_RESTART_LEASE_DIR;
-  delete process.env.BOTMUX_RESTART_LEASE_ID;
-  delete process.env.BOTMUX_RESTART_LEASE_DIR;
-  if (restartLeaseId) {
-    if (!restartLeaseDir) throw new Error('restart driver lease directory is missing');
-    let bound = false;
-    withFileLockSync(globalInstallUpdateLockTargetIn(restartLeaseDir), () => {
-      bound = bindRestartLeaseTo(restartLeaseDir, restartLeaseId, process.pid, Date.now());
-    });
-    if (!bound) throw new Error('failed to bind restart driver lease');
-  }
+  const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -2651,7 +2644,7 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const r = restartFleet();
+        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
         if (r.stop.action === 'timeout') {
           throw new Error(
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
@@ -3372,9 +3365,14 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
     if (last.ok) {
-      console.log(`   面板: botmux dashboard (${last.url})`);
-      // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
-      if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
+      // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
+      // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
+      // 这段输出会被大模型读进上下文，所以第一行之外的安全提示也一起给。
+      // 是否摘 token 由 dashboard 在响应里如实标注（result.platformHosted），
+      // CLI 不自己推断——自己推断过一次就出过缺陷（见 dashboard-command.ts）。
+      const [primary, ...rest] = formatDashboardSuccessLines(last);
+      console.log(`   面板: botmux dashboard (${primary})`);
+      for (const line of rest) console.log(`   ${line}`);
       return;
     }
     const keepWaiting = shouldKeepWaitingForDashboard({
@@ -3403,8 +3401,9 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const rawAction = args[0]?.toLowerCase();
-  const resolvesEndpoint = args.length <= 1
+  const positional = args.filter(arg => arg !== DASHBOARD_LOCAL_TOKEN_FLAG);
+  const rawAction = positional[0]?.toLowerCase();
+  const resolvesEndpoint = positional.length <= 1
     && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
     && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
   if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
@@ -3426,9 +3425,12 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
-    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
-    for (const line of formatDashboardSuccessLines(r)) console.log(line);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、本地直连
+    // 兜底（默认隐藏，带 token）、以及给 AI 读的安全提示。绑定中心化平台后首行不再
+    // 带 token —— 行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r, execution.showLocalTokenLink)) {
+      console.log(line);
+    }
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');
@@ -9077,8 +9079,35 @@ async function cmdSend(rest: string[]): Promise<void> {
   } catch {
     feedbackPolicy = undefined;
   }
+  // Freeze email reviewers into this bot's app-scoped open_id NOW, with
+  // the bot's own credentials, so the card callback can match network-free
+  // against the delivery snapshot. Pure ou_/on_ lists (and requester/everyone)
+  // skip the lookup. If resolution empties a reviewers list, fail closed (no
+  // feedback control) rather than ship a card nobody can click.
+  if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'reviewers') {
+    try {
+      const { materializeFeedbackReviewers } = await import('./services/feedback-policy.js');
+      const { resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
+      feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
+        const { map } = await resolveAllowedUsersWithMap(s.larkAppId!, entries);
+        const resolved = new Map<string, string>();
+        for (const entry of entries) {
+          const id = map.get(entry);
+          if (id && id.startsWith('ou_')) resolved.set(entry, id);
+        }
+        return resolved;
+      });
+    } catch {
+      feedbackPolicy = undefined;
+    }
+    if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
+  }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
-  if (feedbackPolicy && effectiveResponseKind === 'final' && !feedbackRequesterSubjectId) {
+  // `reviewers`/`everyone` audiences gate clicks without a human requester —
+  // this is the bot-triggered auto-analysis case (issue #1178) where the exact
+  // turn sender is another bot. Only the `requester` audience needs a resolvable
+  // human recipient to make its control clickable.
+  if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
@@ -10136,7 +10165,18 @@ async function postCurrentSessionDaemonRoute(input: {
 }
 
 async function cmdDispatch(rest: string[]): Promise<void> {
-  if (rest.includes('--help') || rest.includes('-h')) {
+  const parsedArgs = parseDispatchArgs(rest);
+  if (!parsedArgs.ok) {
+    console.error(JSON.stringify({
+      success: false,
+      errorCode: parsedArgs.errorCode,
+      detail: parsedArgs.error,
+      ...(parsedArgs.option ? { option: parsedArgs.option } : {}),
+    }));
+    process.exit(2);
+  }
+  const dispatchArgs = parsedArgs.value;
+  if (dispatchArgs.help) {
     console.log(`botmux dispatch — 开子项目话题、把 bot 拉进去协作（含 repo 预设 / 待命 / 追加）
 
 用法:
@@ -10179,18 +10219,18 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   assertTurnTransportOrExit('dispatch');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const sessionIdArg = argValue(rest, '--session-id');
-  const title = argValue(rest, '--title') ?? '';
-  const briefFile = argValue(rest, '--brief-file');
-  const overrideChatId = argValue(rest, '--chat-id');
-  const repo = argValue(rest, '--repo');
-  const intoRoot = argValue(rest, '--into');
-  const standby = rest.includes('--standby');
-  const steer = rest.includes('--steer');
-  const botSpecs = argValues(rest, '--bot');
-  const botAppSpecs = argValues(rest, '--bot-app');
+  const sessionIdArg = dispatchArgs.sessionId;
+  const title = dispatchArgs.title ?? '';
+  const briefFile = dispatchArgs.briefFile;
+  const overrideChatId = dispatchArgs.chatId;
+  const repo = dispatchArgs.repo;
+  const intoRoot = dispatchArgs.into;
+  const standby = dispatchArgs.standby;
+  const steer = dispatchArgs.steer;
+  const botSpecs = dispatchArgs.bots;
+  const botAppSpecs = dispatchArgs.botApps;
 
-  let brief = argValue(rest, '--brief') ?? '';
+  let brief = dispatchArgs.brief ?? '';
   if (briefFile) {
     if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
     brief = readFileSync(briefFile, 'utf-8');
