@@ -168,8 +168,10 @@ export interface CliAdapter {
      *  dsh runner; adapters without a dsh runner ignore the field. */
     dshProfile?: string;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
-     *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
-     *  with an explicit reasoning control honor it; others ignore. */
+     *  traex `model_reasoning_effort`, grok `--reasoning-effort`, claude-code
+     *  `--effort`). Only adapters with an explicit reasoning control honor it;
+     *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
+     *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
