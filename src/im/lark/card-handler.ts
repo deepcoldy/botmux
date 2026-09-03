@@ -1448,7 +1448,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // ─── Public `/sessions` current-group callbacks ─────────────────────
   // Kept separate from dash_sessions_*: this card is available to ordinary
-  // command operators and exposes only navigation, never dashboard mutations.
+  // command operators. Closed-session resume is separately admin-gated inside
+  // the public handler; every other action remains read-only navigation.
   if (
     typeof value?.action === 'string' &&
     value.action.startsWith('group_sessions_') &&
