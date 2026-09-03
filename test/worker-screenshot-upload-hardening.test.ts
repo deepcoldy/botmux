@@ -33,7 +33,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
       logScreenshotSkip, snapshotToPng, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
       projectedRuntimeScreenStatus, send, classifyScreenUsageLimit,
-      currentBotmuxTurnId, currentBotmuxDispatchAttempt,
+      currentBotmuxTurnId, currentBotmuxDispatchAttempt, log,
     } = deps;
     let displayMode = 'screenshot';
     let awaitingFirstPrompt = false;
@@ -43,6 +43,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     let larkBrandForUpload = 'feishu';
     let screenshotCaptureInFlight = false;
     let lastShotHash = '';
+    let lastUploadLogAtMs = 0;
     ${captureJs}
     return {
       captureAndUpload,
@@ -99,6 +100,7 @@ describe('worker screenshot upload hardening', () => {
       captureToPng: vi.fn(),
       uploadImageBuffer,
       logError: vi.fn(),
+      log: vi.fn(),
       projectedRuntimeScreenStatus: () => 'working',
       send,
       classifyScreenUsageLimit: () => ({ status: 'working' }),
@@ -162,6 +164,7 @@ describe('worker screenshot upload hardening', () => {
         rejectUpload = reject;
       })),
       logError: vi.fn(),
+      log: vi.fn(),
       projectedRuntimeScreenStatus: () => 'working',
       send: vi.fn(),
       classifyScreenUsageLimit: () => ({ status: 'working' }),
