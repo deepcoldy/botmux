@@ -39,7 +39,11 @@ import {
 import {
   allExpectedInChat,
   availableBotsForPicker,
+  botNameById,
+  chatHasAddableBots,
   collectGroupProfileEntries,
+  createAddBotsReconciler,
+  createReconciledChatCommitter,
   emptyGroupsSnapshot,
   fetchGroupsSnapshot,
   fetchRoleProfileSummaries,
@@ -47,7 +51,9 @@ import {
   injectOptimisticChat,
   isValidProfileId,
   loadGroupRoleProfileContext,
+  markBotsInChat,
   paginateGroupRows,
+  planAddBotsFollowup,
   roleKey,
   roleProfileBootstrapStatus,
   summarizeAddBotsResult,
@@ -153,7 +159,7 @@ function BotCheckboxes(props: {
   );
 }
 
-function AddBotsResult(props: { summary: AddBotsSummary }) {
+function AddBotsResult(props: { summary: AddBotsSummary; bots: GroupBot[] }) {
   const summary = props.summary;
   if (!summary.rows.length) {
     return <p className="hint-warn">没有返回添加结果。</p>;
@@ -164,9 +170,14 @@ function AddBotsResult(props: { summary: AddBotsSummary }) {
       <ul>
         {summary.rows.map((row, index) => {
           const id = String(row?.id ?? '?');
+          const name = botNameById(id, props.bots);
           return (
             <li key={`${id}-${index}`}>
-              <code>{id}</code>: {row?.ok ? 'OK' : `failed (${String(row?.error ?? 'unknown')})`}
+              <span className="g-add-bots-result-main">
+                <strong>{name}</strong>
+                <small>({id})</small>
+              </span>
+              {row?.ok ? ' : OK' : ` : failed (${String(row?.error ?? 'unknown')})`}
             </li>
           );
         })}
@@ -255,7 +266,7 @@ function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Transl
   );
 }
 
-const GroupListRow = memo(function GroupListRow(props: {
+export const GroupListRow = memo(function GroupListRow(props: {
   chat: GroupChat;
   bots: GroupBot[];
   roleContext: RoleProfileContext;
@@ -267,6 +278,10 @@ const GroupListRow = memo(function GroupListRow(props: {
   const { chat, tr } = props;
   const members = chat.memberBots ?? [];
   const inCount = members.filter(member => member.inChat).length;
+  // Grey out "添加 bot" when every roster bot is already in this chat — there is
+  // nothing to add, so opening the dialog would only show an empty picker. Derived
+  // from the snapshot, so it re-enables automatically once membership/roster shifts.
+  const hasAddableBots = chatHasAddableBots(chat, props.bots);
   return (
     <OverviewListItem kind="group" className="groups-list-row" data-chat={chat.chatId}>
       <ChatAvatar chat={chat} />
@@ -289,7 +304,12 @@ const GroupListRow = memo(function GroupListRow(props: {
       <div className="groups-row-lower">
         <GroupBotCoverage chat={chat} bots={props.bots} tr={tr} />
         <OverviewListTail>
-          <CreateActionButton className="add-bots" onClick={() => props.onAddBots(chat)}>{tr('groups.addBots')}</CreateActionButton>
+          <CreateActionButton
+            className="add-bots"
+            onClick={() => props.onAddBots(chat)}
+            disabled={!hasAddableBots}
+            title={hasAddableBots ? undefined : tr('groups.addBotsAllInChat')}
+          >{tr('groups.addBots')}</CreateActionButton>
           <button
             className="save-profile"
             type="button"
@@ -655,16 +675,24 @@ export function AddBotsDialog(props: {
   bots: GroupBot[];
   tr: Translator;
   onClose(): void;
-  onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
+  onBotsAdded(chatId: string, okIds: string[]): void;
 }) {
   const { chat, tr } = props;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
-  const [summary, setSummary] = useState<{ result: AddBotsSummary; refreshError?: unknown } | null>(null);
+  const [summary, setSummary] = useState<{ result: AddBotsSummary } | null>(null);
   const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
+  // Bots added optimistically in this dialog session. Kept locally because the
+  // parent's snapshot converges via a Lark-side-delayed reconciliation poll — the
+  // picker must drop them immediately, not wait for that round-trip.
+  const [locallyAdded, setLocallyAdded] = useState<Set<string>>(new Set());
   const inChatSet = useMemo(
     () => new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId)),
     [chat],
+  );
+  const effectiveExclude = useMemo(
+    () => new Set([...inChatSet, ...locallyAdded]),
+    [inChatSet, locallyAdded],
   );
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
@@ -693,12 +721,23 @@ export function AddBotsDialog(props: {
         });
       } else if (respBody.result) {
         const result = summarizeAddBotsResult(respBody.result);
-        try {
-          await props.onReloadGroups({ force: true });
-          setSummary({ result });
-        } catch (err) {
-          setSummary({ result, refreshError: `添加结果已返回，但刷新群组列表失败：${err}` });
+        const followup = planAddBotsFollowup(result, props.bots, effectiveExclude);
+        if (followup.okIds.length > 0) {
+          setSelectedBots(prev => {
+            const next = new Set(prev);
+            for (const id of followup.okIds) next.delete(id);
+            return next;
+          });
+          setLocallyAdded(prev => new Set([...prev, ...followup.okIds]));
+          // Parent optimistically flips inChat + reconciles server-side.
+          props.onBotsAdded(chat.chatId, followup.okIds);
         }
+        if (followup.shouldClose) {
+          toast(tr('groups.addBotsDone', { n: String(followup.okIds.length) }), { kind: 'success' });
+          props.onClose();
+          return;
+        }
+        setSummary({ result });
       } else {
         setError({ title: '响应异常', reason: JSON.stringify(respBody) });
       }
@@ -716,7 +755,7 @@ export function AddBotsDialog(props: {
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
         <BotCheckboxes
           bots={props.bots}
-          excludeIds={inChatSet}
+          excludeIds={effectiveExclude}
           tr={tr}
           selected={selectedBots}
           onToggle={(id, checked) => setSelectedBots(prev => {
@@ -727,12 +766,7 @@ export function AddBotsDialog(props: {
         />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
-          {summary ? (
-            <>
-              <AddBotsResult summary={summary.result} />
-              {summary.refreshError ? <DialogError title="刷新失败" reason={summary.refreshError} /> : null}
-            </>
-          ) : null}
+          {summary ? <AddBotsResult summary={summary.result} bots={props.bots} /> : null}
         </div>
         <div className="actions">
           <button type="button" id="g-cancel" onClick={props.onClose}>{tr('groups.cancel')}</button>
@@ -1343,6 +1377,7 @@ function DialogHost(props: {
   onClose(): void;
   onCreated(resp: any, selectedIds: string[], name: string): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
+  onBotsAdded(chatId: string, okIds: string[]): void;
   onRefreshRoleContext(): Promise<void>;
   setTimer(fn: () => void, ms: number): number;
 }) {
@@ -1382,7 +1417,7 @@ function DialogHost(props: {
         bots={props.snapshot.bots}
         tr={props.tr}
         onClose={props.onClose}
-        onReloadGroups={props.onReloadGroups}
+        onBotsAdded={props.onBotsAdded}
       />
     );
   } else if (props.dialog?.type === 'save-profile') {
@@ -1438,12 +1473,20 @@ function GroupsPage() {
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [page, setPage] = useState(1);
 
-  const setSnapshot = useCallback((next: GroupsSnapshot | ((cur: GroupsSnapshot) => GroupsSnapshot)) => {
-    setSnapshotState(cur => {
-      const resolved = typeof next === 'function' ? next(cur) : next;
-      snapshotRef.current = resolved;
-      return resolved;
-    });
+  // Single source of truth for snapshot writes: update the synchronous `snapshotRef`
+  // BEFORE enqueuing the React state update, and always enqueue an absolute value (never
+  // an updater). This keeps `snapshotRef.current` the immediate truth for every read path
+  // — critical for the add-bots reconciler, whose read→merge→write commits can interleave
+  // with other snapshot writes in one React batch. If the ref were updated *inside* a
+  // deferred state updater (the old shape), a stale updater flushing later could clobber a
+  // committer's already-synced ref, leaving state canonical but ref stale (and the next
+  // reconcile would then recompute from the stale ref). Functional `next` resolves against
+  // the live ref so it also composes correctly within a batch.
+  const setSnapshot = useCallback((next: GroupsSnapshot | ((cur: GroupsSnapshot) => GroupsSnapshot)): GroupsSnapshot => {
+    const resolved = typeof next === 'function' ? next(snapshotRef.current) : next;
+    snapshotRef.current = resolved;
+    setSnapshotState(resolved);
+    return resolved;
   }, []);
 
   const setTimer = useCallback((fn: () => void, ms: number): number => {
@@ -1503,6 +1546,36 @@ function GroupsPage() {
       }
     }
   }, [delay, refreshRoleProfileContext, setSnapshot]);
+
+  // Add-bots reconciliation. Batches on the same chat can overlap (the dialog lets the
+  // user submit batch B while batch A is still catching up Lark-side), so the pure
+  // `createAddBotsReconciler` guards against an older poll committing a server snapshot
+  // that still lacks B and rolling B's optimistic membership back — via a per-chat
+  // generation id plus a per-chat union of pending okIds. Kept in a ref so the guard
+  // state survives re-renders. Commit is scoped to the reconciled chat via
+  // `mergeReconciledChat`: a server snapshot fetched while reconciling chat-X still carries
+  // chat-Y's not-yet-propagated (missing) membership, so replacing the whole snapshot would
+  // roll Y back. `createReconciledChatCommitter` does read→merge→write atomically; it reuses
+  // the shared `setSnapshot` (sync ref-first) for the write so there is exactly ONE snapshot
+  // entry point — a stale updater cannot later clobber the committer's ref, and a second chat
+  // commit in the same React batch reads the first commit's canonical merge (both stay canonical).
+  const reconcilerRef = useRef<ReturnType<typeof createAddBotsReconciler> | null>(null);
+  if (!reconcilerRef.current) {
+    reconcilerRef.current = createAddBotsReconciler({
+      fetchSnapshot: () => fetchGroupsSnapshot({ force: true }),
+      delay: ms => delay(ms),
+      isMounted: () => mountedRef.current,
+      commit: createReconciledChatCommitter({
+        getSnapshot: () => snapshotRef.current,
+        applySnapshot: merged => { setSnapshot(merged); },
+        onCommitted: merged => { void refreshRoleProfileContext(merged); },
+      }),
+    });
+  }
+  const reconcileAddedBots = useCallback(
+    (chatId: string, okIds: string[]) => reconcilerRef.current!.reconcile(chatId, okIds),
+    [],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1585,13 +1658,25 @@ function GroupsPage() {
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 
+  // Mirrors handleCreated: the dialog reports which bots were actually added, we flip
+  // their `inChat` optimistically so the outer list updates without waiting for the
+  // Lark-side membership snapshot, then converge to the server truth. Reconciliation
+  // goes through `reconcileAddedBots` (not `refreshUntilSeen`) because overlapping
+  // batches on the same chat must not let an older poll roll a newer batch back.
+  function handleBotsAdded(chatId: string, okIds: string[]): void {
+    if (okIds.length === 0) return;
+    const optimistic = markBotsInChat(snapshotRef.current, chatId, okIds);
+    setSnapshot(optimistic);
+    void refreshRoleProfileContext(optimistic);
+    void reconcileAddedBots(chatId, okIds).catch(() => { /* tolerate */ });
+  }
+
   const openAddBotsDialog = useCallback((chat: GroupChat): void => {
-    const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
-    const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
-    if (!missing.length) {
-      toast('All configured bots are already in this chat.', { kind: 'warning' });
-      return;
-    }
+    // The "添加 bot" button is disabled when nothing is addable, so this is the
+    // normal open path. Guard defensively against a stale snapshot (button
+    // enabled but roster already full) by silently ignoring — no toast, since the
+    // greyed-out button already communicates "nothing to add".
+    if (!chatHasAddableBots(chat, snapshotRef.current.bots)) return;
     setDialog({ type: 'add-bots', chat });
   }, []);
 
@@ -1737,6 +1822,7 @@ function GroupsPage() {
         onClose={() => setDialog(null)}
         onCreated={handleCreated}
         onReloadGroups={reloadGroups}
+        onBotsAdded={handleBotsAdded}
         onRefreshRoleContext={() => refreshRoleProfileContext()}
         setTimer={setTimer}
       />
