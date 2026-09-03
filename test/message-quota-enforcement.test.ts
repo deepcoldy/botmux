@@ -2,7 +2,10 @@
  * Message quota enforcement wiring.
  * Run: pnpm vitest run test/message-quota-enforcement.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   consumeQuota: vi.fn(),
@@ -555,5 +558,154 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
     expect(mocks.consumeQuota).toHaveBeenCalledTimes(1);
     expect(mocks.maybeBirthSessionGroup).not.toHaveBeenCalled();
     expect(mocks.buildQuotaExhaustedCard).toHaveBeenCalled();
+  });
+
+  // ─── prompt.submit 同步前置校验闸接进这道闸的接线 ─────────────────────────
+  //
+  // 这里不 mock hook-runner：跑真的 evaluatePromptGate + 真的子进程，
+  // 才能证明「daemon 这一侧确实会问闸、并按裁决动作」。
+  describe('prompt.submit sync gate wiring', () => {
+    let gateDir = '';
+
+    beforeEach(() => {
+      gateDir = mkdtempSync(join(tmpdir(), 'quota-gate-'));
+    });
+
+    afterEach(() => {
+      delete process.env.BOTMUX_HOOKS_JSON;
+      if (gateDir) rmSync(gateDir, { recursive: true, force: true });
+      gateDir = '';
+    });
+
+    function installGate(body: string, extra: Record<string, unknown> = {}): void {
+      const script = join(gateDir, 'gate.js');
+      writeFileSync(script, body);
+      process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: `${process.execPath} ${script}`,
+        timeoutMs: 5000,
+        ...extra,
+      }]);
+    }
+
+    it('denies the message WITHOUT spending a quota unit', async () => {
+      installGate(`console.log(JSON.stringify({ decision: 'deny', reason: 'nope' }));`);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_deny', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'hello' },
+      )).resolves.toBe(false);
+
+      // 「扣了费就不能丢任务」的另一半：丢了任务就绝不能扣费。
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('allows the message and charges normally when the gate allows', async () => {
+      installGate(`console.log(JSON.stringify({ decision: 'allow' }));`);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_allow', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'hello' },
+      )).resolves.toBe(true);
+
+      expect(mocks.consumeQuota).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes the prompt text and sender to the gate', async () => {
+      const seen = join(gateDir, 'seen.json');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          writeFileSync(${JSON.stringify(seen)}, input);
+          console.log(JSON.stringify({ decision: 'allow' }));
+        });
+      `);
+
+      await enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_payload', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'deploy to prod' },
+      );
+
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+        event: 'prompt.submit',
+        content: 'deploy to prod',
+        senderOpenId: 'ou_chat',
+        chatId: 'oc_1',
+      });
+    });
+
+    it('cannot loosen the built-in permission model', async () => {
+      installGate(`console.log(JSON.stringify({ decision: 'allow' }));`);
+
+      // 内置闸拒掉的陌生人，hook 说 allow 也不能放进来。
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_stranger', 'om_gate_no_widen', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'let me in' },
+      )).resolves.toBe(false);
+    });
+
+    it('is not consulted for skipCharge control paths that never reach a CLI', async () => {
+      const ran = join(gateDir, 'ran');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(ran)}, 'x');
+        console.log(JSON.stringify({ decision: 'deny' }));
+      `);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_setup', 'om_anchor',
+        undefined, undefined, 'group', false, { skipCharge: true },
+      )).resolves.toBe(true);
+      expect(existsSync(ran)).toBe(false);
+    });
+
+    it('adjudicates message-listener traffic too (third-party content still reaches a CLI)', async () => {
+      installGate(`console.log(JSON.stringify({ decision: 'deny', reason: 'listener content rejected' }));`);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_listener_deny', 'om_anchor',
+        undefined, undefined, 'group', false,
+        { listenerAuthorized: true, promptContent: 'alert: rm -rf /' },
+      )).resolves.toBe(false);
+
+      // Listener path never charges, so a denial must not have touched quota.
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('still lets listener traffic through when the gate allows', async () => {
+      installGate(`console.log(JSON.stringify({ decision: 'allow' }));`);
+
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_listener_allow', 'om_anchor',
+        undefined, undefined, 'group', false,
+        { listenerAuthorized: true, promptContent: 'alert: disk 90%' },
+      )).resolves.toBe(true);
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('fails open when the gate hook is broken, and closed when onError is deny', async () => {
+      installGate(`process.exit(0);`, { command: join(gateDir, 'missing-binary') });
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_broken_open', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'x' },
+      )).resolves.toBe(true);
+
+      process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: join(gateDir, 'missing-binary'),
+        onError: 'deny',
+      }]);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_1', 'ou_chat', 'om_gate_broken_closed', 'om_anchor',
+        undefined, undefined, 'group', false, { promptContent: 'x' },
+      )).resolves.toBe(false);
+    });
   });
 });

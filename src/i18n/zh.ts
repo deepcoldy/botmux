@@ -1001,6 +1001,8 @@ export const messages: Record<string, string> = {
   'daemon.cmd_requires_session': '{cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} 是管理命令，仅 allowedUsers 可执行。需要授权请让 owner 把你加入该 Bot 的 allowedUsers（Dashboard 或 bots.json）。',
   'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。',
+  'daemon.prompt_gate_denied': '🚫 本条消息被前置校验拦截，未提交给 CLI。',
+  'daemon.prompt_gate_denied_reason': '🚫 本条消息被前置校验拦截，未提交给 CLI：{reason}',
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
   'daemon.ordinary_ingress_failed': '⚠️ 这条消息没有送达 CLI，请重发一次；若持续失败，可 /close 后重开话题。',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ 这条消息已接收，请勿原样重发（重发会重复执行）；失败发生在接收之后的状态回复/收尾步骤。若话题迟迟没有动静，可 /close 后重开话题再继续。',

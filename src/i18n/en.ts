@@ -1000,6 +1000,8 @@ export const messages: Record<string, string> = {
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is a management command, restricted to `allowedUsers`. To authorize, ask the owner to add you to this bot\'s `allowedUsers` (Dashboard or bots.json).',
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
+  'daemon.prompt_gate_denied': '🚫 This message was blocked by a pre-submit check and was not sent to the CLI.',
+  'daemon.prompt_gate_denied_reason': '🚫 This message was blocked by a pre-submit check and was not sent to the CLI: {reason}',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.ordinary_ingress_failed': '⚠️ This message did not reach the CLI. Please resend; if it keeps failing, `/close` and reopen the topic.',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ This message was received — do not resend it as-is (a resend would run it twice); the failure happened in a follow-up status reply or post-accept step. If nothing happens in this topic, `/close` and reopen the topic to continue.',

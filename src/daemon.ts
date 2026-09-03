@@ -98,7 +98,7 @@ import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
-import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
@@ -3788,9 +3788,41 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean; alreadyAuthorizedAndCharged?: boolean },
+  opts?: {
+    listenerAuthorized?: boolean;
+    skipCharge?: boolean;
+    alreadyAuthorizedAndCharged?: boolean;
+    /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
+     *  不传 = 调用方没有可判定的正文（纯控制路径），闸仍会跑但 content 为空。 */
+    promptContent?: string;
+  },
 ): Promise<boolean> {
-  if (opts?.listenerAuthorized) return true;
+  if (opts?.listenerAuthorized) {
+    // Listener matches skip the talk/quota model (a third-party alert bot is
+    // not a "sender" with a grant), but they DO reach a CLI — and their content
+    // is attacker-influenceable third-party text, which is exactly what a
+    // pre-submit gate exists to inspect. Ask the gate before returning; there
+    // is no charge on this path, so the charge-order invariant is not in play.
+    const listenerGate = await evaluatePromptGate('prompt.submit', {
+      larkAppId,
+      chatId,
+      chatType,
+      anchor,
+      messageId,
+      senderOpenId,
+      botSender: !!botSender,
+      talkReason: 'messageListener',
+      content: opts.promptContent,
+    });
+    if (!listenerGate.allowed) {
+      logger.info(
+        `[hooks:${larkAppId}] prompt.submit gate denied listener message ${messageId.substring(0, 12)}`
+        + `${listenerGate.reason ? `: ${listenerGate.reason}` : ''}`,
+      );
+      return false;
+    }
+    return true;
+  }
   // 会话群出生轮：**同一条消息**的授权判定与扣费，刚刚由本函数在原 DM 上下文里
   // 一起做完（handleNewTopicAdmitted 的建群前扣费点：扣费被拒必须零外部副作用，
   // 所以它必须排在 createGroupWithBots 之前）。这一轮绝不能再复查一次：
@@ -3824,6 +3856,50 @@ export async function enforceMessageQuotaForCliInput(
   // Control/setup messages still need the authorization decision above, but
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
+
+  // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
+  // 位置是被两条既有不变量夹死的，不能随意挪：
+  //   • 必须在 evaluateTalk 之后——内置权限模型仍是第一道；外部 hook 只能
+  //     在它放行之后再收紧，永远不能把内置闸拒掉的人放进来。
+  //   • 必须在 beginCharge 之前——本文件的硬不变量是「扣了费就不能丢任务，
+  //     丢任务就不能扣费」。放在扣费后被拒 = 用户额度少一格却什么也没发生。
+  // 没配 sync hook 时 evaluatePromptGate 直接返回 allow，零 spawn 零开销。
+  const gate = await evaluatePromptGate('prompt.submit', {
+    larkAppId,
+    chatId,
+    chatType,
+    anchor,
+    messageId,
+    senderOpenId,
+    senderUnionId,
+    memberUnionId,
+    botSender: !!botSender,
+    talkReason: ev.reason,
+    content: opts?.promptContent,
+  });
+  if (!gate.allowed) {
+    logger.info(
+      `[hooks:${larkAppId}] prompt.submit gate denied message ${messageId.substring(0, 12)} `
+      + `from ${senderOpenId?.substring(0, 12) ?? '?'}${gate.reason ? `: ${gate.reason}` : ''}`,
+    );
+    // 明确告诉用户被拦了。静默丢弃在这里是最坏选项：用户有权限、消息也没超额，
+    // 却凭空消失，只能反复重发。（内置权限模型的静默丢弃是另一回事——那里
+    // 沉默本身是为了不向未授权者泄露 bot 的存在。）
+    try {
+      await sessionReply(
+        anchor,
+        gate.reason
+          ? tr('daemon.prompt_gate_denied_reason', { reason: gate.reason }, localeForBot(larkAppId))
+          : tr('daemon.prompt_gate_denied', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    } catch (err) {
+      logger.warn(`[hooks:${larkAppId}] prompt gate denial notify failed: ${err}`);
+    }
+    return false;
+  }
+
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -17398,7 +17474,7 @@ async function startInitialPassthroughSession(args: {
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, { promptContent: commandContent || parsed.content })) {
     return;
   }
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
@@ -18218,6 +18294,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
+    promptContent: content,
   })) {
     return;
   }
@@ -19793,6 +19870,7 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
+    { promptContent: parsed.content },
   )) {
     return;
   }

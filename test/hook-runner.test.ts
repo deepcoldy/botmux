@@ -9,6 +9,8 @@ import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import {
   filterMatches,
   emitHookEvent,
+  emitHookEventLocal,
+  evaluatePromptGate,
   forwardEmitToDaemon,
   loadHookConfigs,
   parseHookCommand,
@@ -472,5 +474,274 @@ describe('runHookCommandForTest', () => {
     expect(result.status).toBe(0);
     // Give any (unintended) spawned hook child a moment to land its file.
     expect(existsSync(marker)).toBe(false);
+  });
+});
+
+// ─── 同步前置校验闸（sync gate hooks） ──────────────────────────────────────
+
+describe('sync gate hooks (prompt.submit)', () => {
+  /** 写一个按参数决定行为的 hook 脚本，返回可直接放进 command 的路径。 */
+  function writeHook(name: string, body: string): string {
+    const script = join(tmpDir, name);
+    writeFileSync(script, body);
+    return `${process.execPath} ${script}`;
+  }
+
+  function gateHooks(hooks: HookConfig[]): void {
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify(hooks);
+  }
+
+  afterEach(() => {
+    delete process.env.BOTMUX_HOOKS_JSON;
+  });
+
+  it('allows when no sync hook is configured (zero spawn)', async () => {
+    gateHooks([{ event: 'prompt.submit', command: '/bin/false', mode: 'async' }]);
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('denies on a JSON verdict and surfaces the reason to the caller', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny.js', `
+        console.log(JSON.stringify({ decision: 'deny', reason: 'not on the allowlist' }));
+      `),
+    }]);
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('not on the allowlist');
+  });
+
+  it('allows on a JSON allow verdict', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('allow.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('receives the prompt payload on stdin', async () => {
+    const output = join(tmpDir, 'seen-payload.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('capture.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          writeFileSync(${JSON.stringify(output)}, input);
+          console.log(JSON.stringify({ decision: 'allow' }));
+        });
+      `),
+    }]);
+    await evaluatePromptGate('prompt.submit', { content: 'review this', senderOpenId: 'ou_x' });
+    expect(JSON.parse(readFileSync(output, 'utf-8'))).toMatchObject({
+      event: 'prompt.submit',
+      content: 'review this',
+      senderOpenId: 'ou_x',
+    });
+  });
+
+  it('falls back to the exit code when stdout carries no verdict', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('exit1.js', `process.exit(1);`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(false);
+
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('exit0.js', `process.exit(0);`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('lets a stdout verdict win over a conflicting exit code (documented precedence)', async () => {
+    // A checker that prints "allow" and then dies in its own cleanup still meant
+    // allow. Documented in hooks.md as "stdout JSON takes precedence".
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('allow-then-crash.js', `
+        console.log(JSON.stringify({ decision: 'allow' }));
+        process.exit(3);
+      `),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+
+    // ...and the reverse: exit 0 but an explicit deny on stdout still denies.
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny-then-ok.js', `
+        console.log(JSON.stringify({ decision: 'deny', reason: 'policy' }));
+        process.exit(0);
+      `),
+    }]);
+    const denied = await evaluatePromptGate('prompt.submit', {});
+    expect(denied.allowed).toBe(false);
+    expect(denied.reason).toBe('policy');
+  });
+
+  it('ignores non-JSON chatter on stdout and uses the exit code', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('chatty.js', `
+        console.log('checking permissions...');
+        process.exit(0);
+      `),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('fails open on timeout by default, and closed when onError is deny', async () => {
+    const hang = writeHook('hang.js', `setTimeout(() => {}, 60000);`);
+
+    gateHooks([{ event: 'prompt.submit', mode: 'sync', command: hang, timeoutMs: 300 }]);
+    const openDecision = await evaluatePromptGate('prompt.submit', {});
+    expect(openDecision.allowed).toBe(true);
+    expect(openDecision.fromError).toBe(true);
+
+    gateHooks([{ event: 'prompt.submit', mode: 'sync', command: hang, timeoutMs: 300, onError: 'deny' }]);
+    const closedDecision = await evaluatePromptGate('prompt.submit', {});
+    expect(closedDecision.allowed).toBe(false);
+    expect(closedDecision.fromError).toBe(true);
+  });
+
+  it('fails open when the hook binary does not exist', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: join(tmpDir, 'definitely-not-here'),
+    }]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(true);
+    expect(decision.fromError).toBe(true);
+  });
+
+  it('ANDs multiple sync hooks and short-circuits after the first deny', async () => {
+    const secondRan = join(tmpDir, 'second-ran');
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('first-deny.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'first' }));`),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('second.js', `
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(secondRan)}, 'ran');
+          console.log(JSON.stringify({ decision: 'allow' }));
+        `),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('first');
+    expect(existsSync(secondRan)).toBe(false);
+  });
+
+  it('requires every sync hook to allow', async () => {
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('ok.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('nope.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'second' }));`),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('second');
+  });
+
+  it('honours filters, so an unmatched sender is not adjudicated', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny-all.js', `console.log(JSON.stringify({ decision: 'deny' }));`),
+      filter: { senderOpenId: 'ou_someone_else' },
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', { senderOpenId: 'ou_me' })).allowed).toBe(true);
+    expect((await evaluatePromptGate('prompt.submit', { senderOpenId: 'ou_someone_else' })).allowed).toBe(false);
+  });
+
+  it('degrades mode:sync to async on non-gate events instead of pretending to block', () => {
+    const hooks = loadHookConfigs({
+      env: {
+        BOTMUX_HOOKS_JSON: JSON.stringify([
+          { event: 'session.start', command: '/bin/true', mode: 'sync' },
+          { event: 'prompt.submit', command: '/bin/true', mode: 'sync' },
+        ]),
+      },
+    });
+    expect(hooks.find(h => h.event === 'session.start')?.mode).toBe('async');
+    expect(hooks.find(h => h.event === 'prompt.submit')?.mode).toBe('sync');
+  });
+
+  it('never runs a sync gate hook a second time as a fire-and-forget notification', async () => {
+    // emitHookEventLocal, NOT emitHookEvent: this test process inherits
+    // BOTMUX_SESSION_ID/BOTMUX_LARK_APP_ID from the botmux session running it,
+    // so emitHookEvent takes the forward-to-daemon branch and spawns nothing
+    // locally — the assertion would pass no matter what the dedup filter did.
+    // (Verified: mutating away `hook.mode !== 'sync'` left the old version green.)
+    const marker = join(tmpDir, 'notify-ran');
+    const dup = `${marker}.dup`;
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('gate-once.js', `
+        import { writeFileSync, existsSync } from 'node:fs';
+        writeFileSync(existsSync(${JSON.stringify(marker)}) ? ${JSON.stringify(dup)} : ${JSON.stringify(marker)}, 'x');
+        console.log(JSON.stringify({ decision: 'allow' }));
+      `),
+    }]);
+    await evaluatePromptGate('prompt.submit', {});
+    expect(existsSync(marker)).toBe(true);
+
+    emitHookEventLocal('prompt.submit', {});
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(existsSync(dup)).toBe(false);
+  });
+
+  it('still runs async hooks on a gate event (the dedup filter is sync-only)', async () => {
+    const ran = join(tmpDir, 'async-on-gate-event');
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'async',
+      command: writeHook('async-notify.js', `
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(ran)}, 'x');
+      `),
+    }]);
+    emitHookEventLocal('prompt.submit', {});
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(existsSync(ran)).toBe(true);
+  });
+
+  it('captures stdout only for sync hooks', async () => {
+    const talker: HookConfig = {
+      event: 'prompt.submit',
+      command: writeHook('talker.js', `console.log('some output'); process.exit(0);`),
+    };
+    const captured = await runHookCommandForTest(talker, { event: 'prompt.submit' }, { captureStdout: true });
+    expect(captured.stdout).toContain('some output');
+
+    const ignored = await runHookCommandForTest(talker, { event: 'prompt.submit' });
+    expect(ignored.stdout ?? '').toBe('');
   });
 });
