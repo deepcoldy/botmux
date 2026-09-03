@@ -9,6 +9,7 @@ import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-re
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
+import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -1068,8 +1069,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'info', content: '该操作已执行过' } };
   }
   if (value?.action && (value.action === OVERLOAD_ACTION_CLEAN_STOPPED || value.action === OVERLOAD_ACTION_SUSPEND_IDLE) && larkAppId) {
-    const owner = getOwnerOpenId(larkAppId);
-    if (!operatorOpenId || operatorOpenId !== owner) {
+    if (!operatorOpenId || !isBotAdmin(larkAppId, operatorOpenId)) {
       logger.info(`Overload action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
       return { toast: { type: 'error', content: '仅管理员可操作' } };
     }
@@ -1116,8 +1116,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // owner 强闸门 + 按 bundleId 分开的一次性 nonce 核销（可分别重启 Arc/Chrome/Edge，
   // 各一次）。重启在本机 daemon 直接执行（浏览器就跑在本机），不跨 daemon 扇出。
   if (value?.action === OVERLOAD_ACTION_RESTART_BROWSER && larkAppId) {
-    const owner = getOwnerOpenId(larkAppId);
-    if (!operatorOpenId || operatorOpenId !== owner) {
+    if (!operatorOpenId || !isBotAdmin(larkAppId, operatorOpenId)) {
       logger.info(`Overload browser-restart blocked for non-owner: ${operatorOpenId}`);
       return { toast: { type: 'error', content: '仅管理员可操作' } };
     }
@@ -1199,9 +1198,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     || value.action === 'grant_set_quota'
   ) && larkAppId) {
     const loc = localeForBot(larkAppId);
-    const owner = getOwnerOpenId(larkAppId);
-    // owner 强闸门：必须是当前 app 的 owner 本人（比 canOperate 更严）
-    if (!operatorOpenId || operatorOpenId !== owner) {
+    // 管理员强闸门：必须是当前 app 的管理员（owner 或 co-owner / allowedUsers）
+    if (!operatorOpenId || !isBotAdmin(larkAppId, operatorOpenId)) {
       logger.info(`Grant action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
       return { toast: { type: 'error', content: t('card.grant.toast_owner_only', undefined, loc) } };
     }

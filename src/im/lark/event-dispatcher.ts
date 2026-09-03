@@ -47,6 +47,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
+import { resolveGrantApprover } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
   chatQuotaKey,
@@ -1868,6 +1869,7 @@ function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
   return (bot.config.allowedUsers?.length ?? 0) > 0
     || (bot.config.allowedChatGroups?.length ?? 0) > 0
     || (bot.config.globalGrants?.length ?? 0) > 0
+    || !!bot.config.ownerOpenId
     // p2pOpen 也是一次显式的权限边界声明：配了它 = 进入限制态。否则「只配 p2pOpen、
     // 没配 allowedUsers」会 fall through 到 open 模式，把**群聊**和 **canOperate** 一起
     // 放开（陌生人能 /restart /cd），与 p2pOpen「只开私聊 talk」的语义正好相反。
@@ -1900,7 +1902,7 @@ export function evaluateTalk(
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
   const allowedUsers = bot.resolvedAllowedUsers;
-  if (senderOpenId && allowedUsers.includes(senderOpenId)) return { allowed: true, reason: 'allowedUser' };
+  if (senderOpenId && (allowedUsers.includes(senderOpenId) || bot.config.ownerOpenId === senderOpenId)) return { allowed: true, reason: 'allowedUser' };
   // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
   // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
   // 命中会话群时无论表不表态，都不再回落 oncall 腿。
@@ -2096,7 +2098,7 @@ export function canOperate(
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
   // 用原始配置判定（hasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
   if (!hasConfiguredAllowlist(bot)) return true;
-  return !!senderOpenId && allowedUsers.includes(senderOpenId);
+  return !!senderOpenId && (allowedUsers.includes(senderOpenId) || bot.config.ownerOpenId === senderOpenId);
 }
 
 /**
@@ -2155,6 +2157,7 @@ async function maybeSendGrantRequestCard(
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  const approverPromise = resolveGrantApprover(larkAppId, chatId, message).catch(() => undefined);
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
@@ -2167,6 +2170,7 @@ async function maybeSendGrantRequestCard(
     : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
   const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
   const name = mentionName ?? observedName ?? profileName ?? shortRequester;
+  const approver = (await approverPromise) ?? owner;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
   const botConfig = getBot(larkAppId).config;
   const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
@@ -2181,7 +2185,7 @@ async function maybeSendGrantRequestCard(
   );
   const card = buildGrantCard(
     {
-      ownerOpenId: owner,
+      ownerOpenId: approver,
       targets: [{ openId: requesterOpenId, name: String(name) }],
       chatId,
       nonce,

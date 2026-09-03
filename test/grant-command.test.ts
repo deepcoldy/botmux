@@ -268,6 +268,17 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     expect(content).toContain('owner');                 // owner_only message text
   });
 
+  it('co-owner: can also execute /grant and card reflects co-owner', async () => {
+    const bot = getBot('b1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_coowner'];
+    const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_coowner');
+    expect(handled).toBe(true);
+    const [, , cardStr, msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType).toBe('interactive');
+    const card = JSON.parse(cardStr);
+    expect(card.body.elements[0].content).toContain('ou_coowner');
+  });
+
   it('unrelated message is not intercepted', async () => {
     const msg = { message_id: 'om_y', chat_id: 'oc_1', content: JSON.stringify({ text: '@_user_1 帮我看下代码' }), mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' }] };
     expect(await tryHandleGrantCommand('b1', msg, 'ou_owner')).toBe(false);

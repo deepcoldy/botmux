@@ -2435,7 +2435,12 @@ export function getBotUploadClient(larkAppId: string): Lark.Client {
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
-  return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
+    return bot.config.ownerOpenId;
+  }
+  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
 /** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
