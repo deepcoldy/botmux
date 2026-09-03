@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
-import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -9,7 +9,6 @@ import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js'
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
-import { removeStatuslineDir } from './statusline-snapshot.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -23,15 +22,10 @@ import {
   type StatementLike,
 } from './sqlite-compat.js';
 import type { Session } from '../types.js';
-import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
-import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
-let migratedCodexInstanceConfig: string | undefined;
-let resolveGroupDefaultModels: ((chatId: string) => Session['groupDefaultModels']) | undefined;
 // Only the store-owning daemon process may create/import the SQLite store.
 // Workers spawned from a NEWER dist by a still-running OLDER daemon must not
 // bootstrap a .db while that daemon keeps writing JSON — the mixed upgrade
@@ -49,17 +43,6 @@ export class SessionStoreUnavailableError extends Error {
 
   constructor(readonly loadError: Error) {
     super(`session store is unavailable: ${loadError.message}`);
-  }
-}
-
-/** A nonblocking owned-store mutation could not acquire SQLite's write lock.
- * Callers may retry after yielding the event loop; no transaction or cache
- * mutation was published. */
-export class SessionStoreBusyError extends Error {
-  override readonly name = 'SessionStoreBusyError';
-
-  constructor(readonly storeError: unknown) {
-    super(`session store is busy: ${storeError instanceof Error ? storeError.message : String(storeError)}`);
   }
 }
 
@@ -241,8 +224,7 @@ interface OwnSqliteStore {
   db: SqliteDatabaseLike;
   selectRow: SqliteStatementLike;
   selectAll: SqliteStatementLike;
-  updateExact: SqliteStatementLike;
-  insertNew: SqliteStatementLike;
+  upsert: SqliteStatementLike;
 }
 let ownStore: OwnSqliteStore | undefined;
 
@@ -253,49 +235,16 @@ function isTransientStoreContentionError(err: unknown): boolean {
   return /database is locked|SQLITE_BUSY|SQLITE_LOCKED|file-lock timeout/i.test(message);
 }
 
-/** Run one owned-row write transaction, optionally borrowing busy_timeout=0.
- *
- * BEGIN intentionally sits outside the transaction-body try/finally: when
- * BEGIN itself fails there is no transaction to roll back, so the original
- * SQLITE_BUSY error cannot be hidden by a spurious ROLLBACK failure.
- */
-function runOwnedWriteTransaction<T>(
-  store: OwnSqliteStore,
-  nonblocking: boolean,
-  operation: () => T,
-): T {
-  if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
-  try {
-    let committed = false;
-    store.db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = operation();
-      store.db.exec('COMMIT');
-      committed = true;
-      return result;
-    } finally {
-      if (!committed) {
-        try { store.db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
-      }
-    }
-  } catch (error) {
-    if (nonblocking && isTransientStoreContentionError(error)) {
-      throw new SessionStoreBusyError(error);
-    }
-    throw error;
-  } finally {
-    if (nonblocking) store.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-  }
-}
-
 function attachOwnStore(path: string): OwnSqliteStore {
   const db = openDbForOwnStore(path);
   ownStore = {
     db,
     selectRow: db.prepare('SELECT row FROM sessions WHERE session_id = ?'),
     selectAll: db.prepare('SELECT session_id, row FROM sessions'),
-    updateExact: db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ? AND row = ?'),
-    insertNew: db.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?) ON CONFLICT(session_id) DO NOTHING'),
+    upsert: db.prepare(
+      'INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?) '
+      + 'ON CONFLICT(session_id) DO UPDATE SET status = excluded.status, row = excluded.row',
+    ),
   };
   return ownStore;
 }
@@ -594,25 +543,11 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
-  opts: { strict?: boolean } = {},
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      if (opts.strict) throw new Error(`malformed active session store in ${ref.path}`);
-      return [];
-    }
-    const out: Session[] = [];
-    for (const value of Object.values(parsed as Record<string, unknown>)) {
-      if (!value || typeof value !== 'object' || (value as { status?: unknown }).status !== 'active') continue;
-      const session = value as Partial<Session>;
-      if (typeof session.sessionId !== 'string') {
-        if (opts.strict) throw new Error(`malformed active session row in ${ref.path}: invalid session object`);
-        continue;
-      }
-      out.push(session as Session);
-    }
-    return out;
+    if (!parsed || typeof parsed !== 'object') return [];
+    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
   }
   const db = openDbForRead(ref.path);
   try {
@@ -633,17 +568,7 @@ function readStoreActiveRows(
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
     for (const r of rows) {
-      try {
-        const session = JSON.parse(r.row) as Session;
-        if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
-          throw new Error('invalid session object');
-        }
-        out.push(session);
-      } catch (err) {
-        if (opts.strict) {
-          throw new Error(`malformed active session row in ${ref.path}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+      try { out.push(JSON.parse(r.row) as Session); } catch { /* skip unparseable row */ }
     }
     return out;
   } finally {
@@ -719,14 +644,8 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
  * an old daemon can spawn workers from a newer dist during the upgrade window,
  * and only the daemon itself may flip the on-disk engine.
  */
-export function init(appId?: string, opts: {
-  owner?: boolean;
-  occupancy?: OccupancyHolder;
-  groupDefaultModels?: (chatId: string) => Session['groupDefaultModels'];
-} = {}): void {
-  migratedCodexInstanceConfig = undefined;
+export function init(appId?: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
   currentAppId = appId;
-  resolveGroupDefaultModels = opts.groupDefaultModels;
   sqliteBootstrapAllowed = opts.owner !== false;
   loaded = false;
   sessions = new Map();
@@ -1479,39 +1398,6 @@ function load(): void {
 function loadForWrite(): void {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
-  migrateCodexInstanceBindings();
-}
-
-/** Migrate all recoverable rows before first admission/restore, not just active ones. */
-function migrateCodexInstanceBindings(): void {
-  const bot = configuredCodexInstanceBot(currentAppId);
-  if (!sqliteBootstrapAllowed || !ownStore || !bot?.codexInstancePool) return;
-  const configKey = JSON.stringify([bot.codexInstancePool, bot.cliId, bot.cliRuntime, bot.cliPathOverride, bot.codexAuthSync]);
-  if (migratedCodexInstanceConfig === configKey) return;
-  const changes: Session[] = [];
-  ownStore.db.exec('BEGIN IMMEDIATE');
-  try {
-   for (const durable of readOwnStoreAllRows(ownStore).map(([, row]) => row)) {
-    const binding = legacyCodexInstanceBinding(durable, bot, botHomePath(dirname(config.session.dataDir), bot.larkAppId));
-    if (!binding) continue;
-    const cliId = durable.cliId ?? bot.cliId;
-    const next: Session = { ...durable, cliInstanceBinding: binding, cliId, agentFrozen: true,
-      reasoningEffort: durable.agentFrozen ? durable.reasoningEffort : durable.reasoningEffort ?? bot.reasoningEffort,
-      cliRuntime: durable.cliRuntime ?? snapshotCliRuntime(resolveCliRuntime({ cliId,
-        cliRuntime: durable.agentFrozen || durable.cliPathOverride ? undefined : bot.cliRuntime,
-        cliPathOverride: durable.cliPathOverride ?? (durable.agentFrozen || bot.cliRuntime ? undefined : bot.cliPathOverride),
-        context: 'legacy Codex instance migration' })) };
-    changes.push(next);
-   }
-    for (const next of changes) persistRow(next);
-    ownStore.db.exec('COMMIT');
-  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
-  migratedCodexInstanceConfig = configKey;
-  for (const next of changes) {
-    const cached = sessions.get(next.sessionId);
-    if (cached) Object.assign(cached, next);
-    else sessions.set(next.sessionId, next);
-  }
 }
 
 function readOwnStoreAllRows(store: OwnSqliteStore): [string, Session][] {
@@ -1760,7 +1646,7 @@ function persistRow(session: Session): void {
   if (Number(result.changes) !== 1) throw new Error('Session changed concurrently; routing write refused');
 }
 
-function buildNewSession(
+export function createSession(
   chatId: string,
   rootMessageId: string,
   title: string,
@@ -1768,6 +1654,7 @@ function buildNewSession(
   scope?: 'thread' | 'chat',
   intent: { source?: SessionCreationSource; inherit?: Session } = {},
 ): Session {
+  loadForWrite();
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
   const initial = intent.inherit ? {
@@ -1787,94 +1674,33 @@ function buildNewSession(
     creationSource: source,
     ...initial,
   };
-  if (chatType !== 'p2p' && scope !== 'chat') {
-    const models = resolveGroupDefaultModels?.(chatId);
-    if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
-  }
-  return session;
-}
-
-export function createSession(
-  chatId: string,
-  rootMessageId: string,
-  title: string,
-  chatType?: 'group' | 'p2p',
-  scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
-): Session {
-  loadForWrite();
-  const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
   persistRow(session);
   sessions.set(session.sessionId, session);
   logger.info(`Created session ${session.sessionId} (thread: ${rootMessageId})`);
   return session;
 }
 
-/**
- * Create one session and mutate a fixed set of existing owned sessions in the
- * same transaction. The new row is invisible to the cache until COMMIT.
- *
- * This is deliberately separate from createSession(): callers that publish a
- * child whose safety metadata lives on its parent must not leave a crash
- * window in which the child is durable but the parent-side authority is not.
- */
-export function createSessionWithOwnedMutation<T>(
-  args: {
-    chatId: string;
-    rootMessageId: string;
-    title: string;
-    chatType?: 'group' | 'p2p';
-    scope?: 'thread' | 'chat';
-    intent?: { source?: SessionCreationSource; inherit?: Session };
-    ownedSessionIds: readonly string[];
-    /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
-     * event loop behind the connection's normal busy_timeout. */
-    nonblocking?: boolean;
-  },
-  mutate: (fresh: Map<string, Session>, created: Session) => T,
-): { session: Session; result: T; rows: Map<string, Session> } {
+/** Create the target-side dispatch session with its durable owner marker in one row write. */
+export function createDispatchLaunchSession(input: {
+  dispatchId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType: 'group' | 'p2p';
+  workingDir: string;
+  larkAppId: string;
+}): Session {
   loadForWrite();
-  const unique = [...new Set(args.ownedSessionIds)];
-  if (unique.length !== args.ownedSessionIds.length) {
-    throw new Error('duplicate session id in atomic session creation');
-  }
-  const store = ownStore;
-  if (!store) {
-    throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
-  }
-  const created = buildNewSession(
-    args.chatId,
-    args.rootMessageId,
-    args.title,
-    args.chatType,
-    args.scope,
-    args.intent,
-  );
-  const fresh = new Map<string, Session>();
-  let result!: T;
-  runOwnedWriteTransaction(store, args.nonblocking === true, () => {
-    for (const sessionId of unique) {
-      const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
-      if (!hit) throw new Error(`atomic session creation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
-    }
-    result = mutate(fresh, created);
-    for (const row of fresh.values()) persistRow(row);
-    persistRow(created);
-  });
-  for (const [sessionId, row] of fresh) {
-    const cached = sessions.get(sessionId);
-    if (cached) {
-      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
-      Object.assign(cached, structuredClone(row));
-      fresh.set(sessionId, cached);
-    } else {
-      sessions.set(sessionId, row);
-    }
-  }
-  sessions.set(created.sessionId, created);
-  logger.info(`Created session ${created.sessionId} (thread: ${args.rootMessageId})`);
-  return { session: created, result, rows: fresh };
+  const session: Session = {
+    sessionId: randomUUID(), dispatchLaunchId: input.dispatchId, chatId: input.chatId,
+    chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
+    title: input.title, status: 'active', createdAt: new Date().toISOString(),
+    workingDir: input.workingDir, larkAppId: input.larkAppId,
+  };
+  sessions.set(session.sessionId, session);
+  persistRow(session);
+  logger.info(`Created dispatch launch session ${session.sessionId} (thread: ${input.rootMessageId})`);
+  return session;
 }
 
 export function getSession(sessionId: string): Session | undefined {
@@ -2348,8 +2174,6 @@ export function closeSession(
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
-    // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
-    removeStatuslineDir(config.session.dataDir, sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
@@ -2420,71 +2244,8 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
 
 export function updateSession(session: Session): void {
   loadForWrite();
-  try { persistRow(session); }
-  catch (error) {
-    const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
-    if (row) {
-      const durable = JSON.parse(row.row) as Session;
-      const cached = sessions.get(session.sessionId);
-      for (const target of new Set([session, cached].filter((s): s is Session => !!s))) {
-        for (const key of Object.keys(target)) delete (target as unknown as Record<string, unknown>)[key];
-        Object.assign(target, durable);
-      }
-    }
-    throw error;
-  }
-  const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
-  if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
-}
-
-/**
- * Mutate a fixed set of owned session rows inside one SQLite transaction.
- *
- * The callback receives fresh cloned rows, never the process cache. Cache and
- * caller-visible objects are updated only after COMMIT, so a failed coordinator
- * election cannot publish half of a multi-row authority transition in memory.
- */
-export function mutateOwnedSessionsAtomically<T>(
-  sessionIds: readonly string[],
-  mutate: (fresh: Map<string, Session>) => T,
-  options: {
-    /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
-     * event loop behind the connection's normal busy_timeout. */
-    nonblocking?: boolean;
-  } = {},
-): { result: T; rows: Map<string, Session> } {
-  loadForWrite();
-  const unique = [...new Set(sessionIds)];
-  if (unique.length !== sessionIds.length) {
-    throw new Error('duplicate session id in atomic session mutation');
-  }
-  const store = ownStore;
-  if (!store) {
-    throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
-  }
-  const fresh = new Map<string, Session>();
-  let result!: T;
-  runOwnedWriteTransaction(store, options.nonblocking === true, () => {
-    for (const sessionId of unique) {
-      const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
-      if (!hit) throw new Error(`atomic session mutation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
-    }
-    result = mutate(fresh);
-    for (const row of fresh.values()) persistRow(row);
-  });
-  for (const [sessionId, row] of fresh) {
-    const cached = sessions.get(sessionId);
-    if (cached) {
-      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
-      Object.assign(cached, structuredClone(row));
-      fresh.set(sessionId, cached);
-    } else {
-      sessions.set(sessionId, row);
-    }
-  }
-  return { result, rows: fresh };
+  persistRow(session);
 }
 
 /**
@@ -2563,7 +2324,6 @@ export function persistActiveRemoteLineageExact(
 
 export function listSessions(): Session[] {
   load();
-  migrateCodexInstanceBindings();
   return [...sessions.values()];
 }
 
@@ -2577,29 +2337,7 @@ export function listSessions(): Session[] {
 export function listSessionsStrict(): Session[] {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
-  migrateCodexInstanceBindings();
   return [...sessions.values()];
-}
-
-/** Read-only configuration-change guard; unlike display snapshots, malformed rows fail closed. */
-export function readBotSessionsStrict(appId: string, dataDir = config.session.dataDir): Session[] {
-  const result: Session[] = [];
-  for (const id of [undefined, appId]) {
-    const ref = resolveStoreFile(id, dataDir);
-    if (!existsSync(ref.path)) continue;
-    if (ref.kind === 'json') {
-      const parsed = JSON.parse(readFileSync(ref.path, 'utf8')) as Record<string, Session>;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid session store');
-      result.push(...Object.values(parsed).filter(s => id === appId || s.larkAppId === appId));
-    } else {
-      const db = openDbForRead(ref.path);
-      try {
-        const rows = db.prepare('SELECT row FROM sessions').all() as { row: string }[];
-        result.push(...rows.map(row => JSON.parse(row.row) as Session).filter(s => id === appId || s.larkAppId === appId));
-      } finally { db.close(); }
-    }
-  }
-  return result;
 }
 
 /**
@@ -2634,35 +2372,6 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
-}
-
-export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
-  return findActiveSessionsMatching(s => s.workingDir === workingDir);
-}
-
-/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
-export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
-  load();
-  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
-  const target = resolve(workingDir);
-  const matches: Session[] = [];
-  const targetReal = realpathSync(target);
-  const matchesDir = (session: Session) => {
-    if (session.status !== 'active' || !session.workingDir) return false;
-    let candidate: string;
-    try { candidate = realpathSync(resolve(session.workingDir)); }
-    catch { candidate = resolve(session.workingDir); }
-    const rel = relative(targetReal, candidate);
-    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-  };
-  for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
-  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
-    if (ref.appId === currentAppId) continue;
-    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
-      if (matchesDir(session)) matches.push(session);
-    }
-  }
-  return matches;
 }
 
 /**
