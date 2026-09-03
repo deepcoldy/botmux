@@ -10356,7 +10356,7 @@ export function forkWorker(
     );
     if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
       ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
-        titlePrompt ? ds.session.title : undefined,
+        titlePrompt,
         bot.botName ? [{ name: bot.botName }] : undefined,
         ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
       );

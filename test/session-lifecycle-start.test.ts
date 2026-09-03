@@ -3511,20 +3511,21 @@ describe('session.start lifecycle integration', () => {
   it.each([
     ['codex'],
     ['traex'],
-  ] as const)('passes the persisted Lark topic title to a fresh %s worker before its first prompt', (cliId) => {
+  ] as const)('derives a fresh %s native title from the untruncated first prompt', (cliId) => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
+    const titlePrompt = '帮我看下https://example.com/product/alpha/content/videoTag 这个页面的接口你能打开吗？我这访问一直报错，看起来访问到sample.api.service这，像是权限服务报错。';
     const ds = makeDs({
       session: {
         ...makeDs().session,
         cliId,
-        title: '@TestBot 排查这个 TTP logid',
-        nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+        title: '@TestBot 帮我看下https://example.com/product/alp',
+        nativeSessionTitle: '[BotMux·Lark] @TestBot 帮我看下https://example.com/product/alp',
       },
     });
     forkWorker(ds, `
 <botmux_routing>routing instructions</botmux_routing>
 <user_message>
-@TestBot 排查这个 TTP logid 的失败原因
+@TestBot ${titlePrompt}
 </user_message>
 `, false);
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3532,9 +3533,10 @@ describe('session.start lifecycle integration', () => {
 
     expect(init).toEqual(expect.objectContaining({
       type: 'init',
-      nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
-      nativeSessionTitlePrompt: '排查这个 TTP logid 的失败原因',
+      nativeSessionTitle: `[BotMux·Lark] ${titlePrompt}`,
+      nativeSessionTitlePrompt: titlePrompt,
     }));
+    expect(init.nativeSessionTitle).toContain('/product/alpha/content/videoTag');
   });
 
   it.each([

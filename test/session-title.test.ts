@@ -65,10 +65,10 @@ describe('buildBotmuxLarkNativeSessionTitle', () => {
     )).toBe('[BotMux·Lark] 排查这个 logid');
   });
 
-  it('limits the complete title to 100 characters with an ellipsis', () => {
-    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(200));
+  it('limits the complete title to 200 characters with an ellipsis', () => {
+    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(300));
 
-    expect(Array.from(title)).toHaveLength(100);
+    expect(Array.from(title)).toHaveLength(200);
     expect(title.startsWith('[BotMux·Lark] ')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
   });

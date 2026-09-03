@@ -1259,6 +1259,21 @@ describe('pi buildArgs', () => {
     expect(adapter.altScreen).toBe(true);
   });
 
+  it('passes botmux native titles through Pi launch-time --name', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      nativeSessionTitle: '  [BotMux·Lark] Fix login flow  ',
+      initialPrompt: 'hello pi',
+    });
+    expect(args.slice(2)).toEqual([
+      '--session-id', 'sess-pi',
+      '--name', '[BotMux·Lark] Fix login flow',
+      'hello pi',
+    ]);
+    expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
+  });
+
   it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
     // Pi's `stopReason:"error"` is per-REQUEST and its loop retries inside the
     // same turn, so the transcript alone cannot say when a turn ended. The
@@ -2550,7 +2565,7 @@ describe('buildResumeCommand', () => {
 });
 
 describe('native session rename capability', () => {
-  it('is declared only by the verified Codex-family, Claude Code, and Grok adapters', () => {
+  it('is declared only by verified adapters', () => {
     expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
     expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('TraeX 标题'))
@@ -2559,6 +2574,8 @@ describe('native session rename capability', () => {
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
       .toBe('/rename 新标题');
+    expect(createPiAdapter('/bin/pi').buildSessionRenameCommand?.('Pi 标题'))
+      .toBe('/name Pi 标题');
 
     expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
     expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();

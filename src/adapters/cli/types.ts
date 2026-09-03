@@ -138,6 +138,9 @@ export interface CliAdapter {
      *  and a resumeSessionId; adapters whose CLI lacks the primitive ignore it. */
     forkSession?: boolean;
     initialPrompt?: string;
+    /** CLI-native display/session title prepared by botmux. Adapters with a
+     *  launch-time title flag may consume it; others should ignore it. */
+    nativeSessionTitle?: string;
     botName?: string;
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
