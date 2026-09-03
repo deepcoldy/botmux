@@ -1620,6 +1620,163 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return JSON.parse(cardJson);
   }
 
+  // ─── /quote picker: re-render actions (select / page / search) ────────
+  // Same stateless-card contract as the /relay picker above: every callback
+  // value carries the full state, so we recompute it from the action and
+  // re-render. The 话题 list itself is re-scanned each time rather than
+  // cached — a 话题 that received a message since the card was rendered
+  // should sort up, and a scan is one API call.
+  if (value?.action && larkAppId && ['quote_select', 'quote_page', 'quote_search'].includes(value.action as string)) {
+    const loc = localeForBot(larkAppId);
+    const chatId = value.chat_id as string | undefined;
+    const rootId = value.root_id as string | undefined;
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (!chatId || !rootId || !operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    if (invokerOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_not_invoker', undefined, loc) } };
+    }
+
+    let nextSearch = (value.search as string) ?? '';
+    let nextPage = Number(value.page ?? 0) || 0;
+    let nextSelected: string | undefined = (value.selected as string) || undefined;
+    if (value.action === 'quote_search') {
+      nextSearch = String((action as any)?.input_value ?? '').trim();
+      nextPage = 0;
+      // A new search means the user changed their mind about what they want;
+      // carrying the old selection forward would leave a confirm button
+      // pointing at a 话题 that may not even be in the new result set.
+      nextSelected = undefined;
+    } else if (value.action === 'quote_page') {
+      nextPage = Number(value.page ?? 0) || 0;
+    } else if (value.action === 'quote_select') {
+      nextSelected = value.container_id as string;
+    }
+
+    const { collectQuoteTopics } = await import('../../services/quote-topic-picker.js');
+    const { buildQuotePickerCard } = await import('./card-builder.js');
+    // Re-use the exclusion the first render computed. Recomputing it here
+    // would silently narrow it: this path only has `root_id`, not the
+    // invoking message's `thread_id`, so a real 话题 would reappear in its own
+    // picker after the first click.
+    const excludeIds = (value.exclude_ids as string) ?? '';
+    let topics;
+    try {
+      topics = await collectQuoteTopics(larkAppId, chatId, excludeIds ? excludeIds.split(',') : []);
+    } catch (err) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc) } };
+    }
+    const cardJson = buildQuotePickerCard(
+      topics, chatId, rootId,
+      invokerOpenId ?? operatorOpenId,
+      loc,
+      { selectedContainerId: nextSelected, searchQuery: nextSearch, page: nextPage },
+      (value.follow_up as string) ?? '',
+      (value.visibility as 'private' | 'public') ?? 'public',
+      excludeIds,
+    );
+    return JSON.parse(cardJson);
+  }
+
+  // ─── /quote picker: confirm — read the 话题 into the session ───────────
+  if (value?.action === 'quote_confirm' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const chatId = value.chat_id as string | undefined;
+    const rootId = value.root_id as string | undefined;
+    const containerId = value.container_id as string | undefined;
+    const containerKind = (value.container_kind as 'thread' | 'root') ?? 'thread';
+    const topicTitle = (value.title as string) || containerId || '';
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (!chatId || !rootId || !containerId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_not_invoker', undefined, loc) } };
+    }
+    const ds = activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!ds) {
+      return { toast: { type: 'error', content: t('card.quote.toast_no_session', undefined, loc) } };
+    }
+    // Refuse while the worker is mid-turn. Injecting now would either be
+    // dropped by the worker or queue behind the running turn and surface much
+    // later with no visible connection to this click — both read as "the
+    // button did nothing".
+    const busy = !!ds.worker && !ds.worker.killed
+      && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited';
+    if (busy) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
+
+    const { listMessagesByThreadId, listThreadMessages } = await import('./client.js');
+    const { renderQuoteTranscript, QUOTE_TRANSCRIPT_MAX_MESSAGES } = await import('../../services/quote-transcript.js');
+    const { takeQuoteFollowUp } = await import('../../services/quote-topic-picker.js');
+    let raw: any[];
+    try {
+      // A thread container is addressed directly by its omt_ id; a 普通群
+      // reply chain has no thread and is walked by its root message instead.
+      // Fetch one message more than we will render so the header can report
+      // an accurate "N total" for a 话题 that overflows the cap.
+      raw = containerKind === 'thread'
+        ? await listMessagesByThreadId(larkAppId, containerId, QUOTE_TRANSCRIPT_MAX_MESSAGES + 1)
+        : await listThreadMessages(larkAppId, chatId, containerId, QUOTE_TRANSCRIPT_MAX_MESSAGES + 1);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] /quote read failed: ${err instanceof Error ? err.message : err}`);
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc) } };
+    }
+    const followUp = takeQuoteFollowUp(value.follow_up as string | undefined);
+    const transcript = renderQuoteTranscript(raw, topicTitle, followUp);
+    if (transcript.rendered === 0) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_empty_topic', undefined, loc) } };
+    }
+
+    const { buildFollowUpCliInput } = await import('../../core/session-manager.js');
+    const turnId = cardMessageId ?? `quote-${Date.now()}`;
+    const cliInput = buildFollowUpCliInput(transcript.text, ds.session.sessionId, {
+      isAdoptMode: false,
+      cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId,
+      cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride,
+      locale: loc,
+      larkAppId,
+      chatId: ds.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      sessionBackendType: ds.session.backendType,
+      turnId,
+    });
+    let accepted = false;
+    try {
+      if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
+      else {
+        // Cold session: fork a worker with the transcript as its opening
+        // input, matching how retry_last_task revives a dead worker.
+        forkWorker(ds, cliInput, ds.hasHistory);
+        accepted = true;
+      }
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!accepted) {
+      return { toast: { type: 'error', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
+    ds.lastScreenStatus = 'working';
+    logger.info(`[${tag(ds)}] /quote injected topic ${containerId} (${transcript.rendered} msgs, dropped ${transcript.dropped})`);
+    // Replace the picker with a plain receipt. Leaving the card live would
+    // invite a second click that re-injects the same transcript.
+    await sessionReply(
+      rootId,
+      transcript.dropped > 0
+        ? t('cmd.quote.injected_truncated', {
+            title: topicTitle,
+            total: transcript.rendered + transcript.dropped,
+            count: transcript.rendered,
+            dropped: transcript.dropped,
+          }, loc)
+        : t('cmd.quote.injected', { title: topicTitle, count: transcript.rendered }, loc),
+    );
+    if (cardMessageId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
     'config_toggle', 'config_set', 'config_quota', 'config_quota_open',

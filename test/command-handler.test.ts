@@ -699,10 +699,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 36 = master 的 35 条（含 /forklist、/cot、/cli）+ /retry。
+    // 37 = master 的 35 条（含 /forklist、/cot、/cli）+ /retry + /quote。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(36);
+    expect(DAEMON_COMMANDS.size).toBe(37);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {

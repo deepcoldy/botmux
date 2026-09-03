@@ -4455,6 +4455,59 @@ export async function handleCommand(
         break;
       }
 
+      // ─── /quote：把本群另一个话题读进当前会话 ──────────────────────────
+      //
+      // 补的是飞书本身的缺口：飞书的「引用」只能引单条消息，没有「引用整个话题」
+      // 的入口，所以用户想让 bot 看隔壁话题聊了什么时，无从指认。/quote 弹一张
+      // 本群话题的选择卡，点一个就把那个话题的聊天记录读进当前会话。
+      //
+      // 能读到哪些话题，完全由「本 bot 在不在这个群」决定——话题里有没有 bot、
+      // 是不是别的 bot 的话题都无所谓，因为读的是群容器，不是会话。群外的话题
+      // 飞书自己会用 230002 拒掉，不需要在这里再造一层权限模型。
+      case '/quote': {
+        const appId = ds?.larkAppId ?? larkAppId;
+        const chatId = ds?.chatId;
+        if (!appId || !chatId) {
+          await sessionReply(rootId, t('cmd.quote.no_chat', undefined, loc));
+          break;
+        }
+        const operatorOpenId = message.senderId;
+        if (!operatorOpenId) {
+          await sessionReply(rootId, t('cmd.relay.no_sender', undefined, loc));
+          break;
+        }
+        // 跟在命令后面的文字是「读完顺手做的事」（一轮模式）。它不进卡片
+        // payload——飞书对 action value 有大小限制，指令长了要么撑爆卡片要么
+        // 被悄悄截断，而被截断的指令比没有指令更危险。这里只把它寄存在 daemon
+        // 里，卡片带一个短 token。
+        const followUpText = message.content.replace(/^\/quote\s*/i, '').trim();
+        const { collectQuoteTopics, stashQuoteFollowUp } = await import('../services/quote-topic-picker.js');
+        // 排除「当前所在话题」——把自己引进自己只会让上下文重复一遍。
+        // 两个 id 都要给：真话题按 thread_id（omt_）分桶，普通群回复链按根消息
+        // id（om_）分桶，而会话只记了 rootMessageId。只给后者的话，真话题永远
+        // 排不掉——它的桶键根本不是这个 id。chat-scope 会话不属于任何话题，两个
+        // 都是空。
+        const currentContainerIds = ds?.session.scope === 'chat'
+          ? []
+          : [ds?.session.rootMessageId, message.threadId];
+        let topics;
+        try {
+          topics = await collectQuoteTopics(appId, chatId, currentContainerIds);
+        } catch (err) {
+          logger.warn(`[${logTag}] /quote topic scan failed: ${err instanceof Error ? err.message : err}`);
+          await sessionReply(rootId, t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc));
+          break;
+        }
+        const followUpToken = followUpText ? stashQuoteFollowUp(followUpText) : '';
+        const { buildQuotePickerCard } = await import('../im/lark/card-builder.js');
+        const card = buildQuotePickerCard(
+          topics, chatId, rootId, operatorOpenId, loc, undefined, followUpToken, 'public',
+          currentContainerIds.filter(Boolean).join(','),
+        );
+        await sessionReply(rootId, card, 'interactive');
+        break;
+      }
+
       case '/term': {
         // Existing-session path. New topics route /term via handleTermLinkCommand
         // at the router (daemon.ts) so no phantom worker=null session is created.
@@ -4553,6 +4606,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.quote', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),

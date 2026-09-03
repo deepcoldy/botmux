@@ -1772,6 +1772,20 @@ export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Pro
   return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
 }
 
+/** List a 话题 by its thread id (`omt_…`) directly, skipping the message.get
+ *  round-trip `listThreadMessages` needs to resolve one from a root message.
+ *
+ *  The /quote picker already has the thread id: `im/v1/messages` returns
+ *  `thread_id` on every 话题 message, so grouping the chat tail by that field
+ *  yields the id for free. Going back through `listThreadMessages` would spend
+ *  an extra API call re-deriving what we already know — and would fail for a
+ *  话题 whose root message has been withdrawn (message.get 404s, and the
+ *  by-root_id fallback scan can't see the 话题 either, since its replies carry
+ *  `thread_id` but no `root_id` pointing at the missing root). */
+export async function listMessagesByThreadId(larkAppId: string, threadId: string, pageSize: number = 50): Promise<any[]> {
+  return listByThread(getBotClient(larkAppId), threadId, pageSize);
+}
+
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   const c = getBotClient(larkAppId);
 
