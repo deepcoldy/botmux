@@ -136,7 +136,10 @@ describe('claim-botmux-bin --binary — global botmux points at the compiled bin
     expect(r.status).toBe(0);
 
     const content = readFileSync(r.wrapper, 'utf-8');
-    expect(content).toContain(`exec "${real}"`);
+    // Compare against the fully resolved path: on macOS `mkdtemp` hands back
+    // `/var/folders/…` while `/var` itself is a symlink to `/private/var`, so
+    // the resolved target the wrapper stores is not string-equal to `real`.
+    expect(content).toContain(`exec "${realpathSync(real)}"`);
     // The symlink path must NOT survive into the wrapper.
     expect(content).not.toContain(link);
     // And it still execs — resolving must not break the exec itself.

@@ -180,7 +180,10 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
  * stand-in binary at a DIFFERENT path — i.e. it only ever exercised the npm
  * layout, where the launcher and the platform binary are separate files.
  */
-describe('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
+// prepareDirectSandbox returns null off Linux (bwrap DIRECT mode), so on macOS
+// every overlayTargets() call is vacuously [] — the "skips" case passes for the
+// wrong reason and the "still overlays" case can only fail. Linux-only by design.
+describe.skipIf(process.platform !== 'linux')('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
   function overlayTargets(trusted: string): string[] {
     const root = mkdtempSync(join(tmpdir(), 'sbx-overlay-'));
     const proj = join(root, 'proj');
