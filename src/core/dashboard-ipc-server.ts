@@ -4994,7 +4994,8 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 // Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
 // name），但至少要带一个：
 //   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
-//         'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）| 'off'
+//         'chat-tag'（应用租户身份，无需用户授权，但飞书尚未开放该能力，权限
+//         目录里搜不到该 scope）| 'off'
 //   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
 //         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
 // 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。

@@ -5176,8 +5176,8 @@ function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem)
 /** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的
  *  授权 UI（PR review：授权行必须与实际 tagMode 一致）。
  *  - feed-group（默认）：个人侧边栏分组，需一次 OAuth → 显示状态徽标 + 一键授权
- *  - chat-tag：应用租户身份打企业群标签，无需用户授权（部分租户权限目录无该
- *    scope）→ 不显示授权按钮
+ *  - chat-tag：应用租户身份打企业群标签，无需用户授权（但飞书尚未开放该能力，
+ *    im:tag scope 在权限目录里搜不到）→ 不显示授权按钮
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
