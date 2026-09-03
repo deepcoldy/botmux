@@ -873,6 +873,10 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
 
 /** Push the shared "output body" elements (usage-limit notice + screenshot) used
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+/** Smallest built-in Feishu card font (10px): the fallback notice is a
+ *  footnote, one step below the 12px usage line. */
+const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
+
 function pushStreamBody(
   elements: any[],
   opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
@@ -1171,7 +1175,7 @@ export function buildStreamingCard(
   if (modelFallbackNotice) {
     elements.push({
       tag: 'markdown',
-      text_size: 'notation_small_v2',
+      text_size: MODEL_FALLBACK_NOTICE_TEXT_SIZE,
       content: `<font color='grey'>${modelFallbackNotice}</font>`,
     });
   }

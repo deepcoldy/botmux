@@ -83,7 +83,7 @@ function noticeIn(card: any): string | undefined {
 describe('cardModelFallbackNotice: copy', () => {
   it('renders the refusal notice with friendly names, category and switch-back hint (zh)', () => {
     expect(cardModelFallbackNotice(REFUSAL, 'zh')).toBe(
-      '⚠️ 安全管控触发，已自动降级：Fable 5.1 → Opus 4.8（cyber）· 后续都在 Opus 4.8 上跑，回复 /model fable 可切回',
+      '⚠️ 安全管控降级：Fable 5.1 → Opus 4.8（cyber）· /model fable 切回',
     );
   });
 
@@ -95,7 +95,7 @@ describe('cardModelFallbackNotice: copy', () => {
       fallbackModel: 'claude-opus-4-8[1m]',
       trigger: 'overloaded',
     }, 'zh')).toBe(
-      '⚠️ 模型不可用，已自动切换：Fable 5.1 → Opus 4.8（overloaded）· 回复 /model fable 可切回',
+      '⚠️ 模型不可用已切换：Fable 5.1 → Opus 4.8（overloaded）· /model fable 切回',
     );
   });
 
@@ -106,7 +106,7 @@ describe('cardModelFallbackNotice: copy', () => {
       originalModel: 'claude-fable-5-1[1m]',
       fallbackModel: 'claude-opus-4-8[1m]',
     }, 'zh')).toBe(
-      '⚠️ 因用量额度限制，已自动切换：Fable 5.1 → Opus 4.8 · 回复 /model fable 可切回',
+      '⚠️ 额度限制已切换：Fable 5.1 → Opus 4.8 · /model fable 切回',
     );
   });
 
@@ -114,23 +114,20 @@ describe('cardModelFallbackNotice: copy', () => {
     const en = (['refusal', 'unavailable', 'consent'] as const)
       .map(kind => cardModelFallbackNotice({ ...REFUSAL, kind }, 'en')!);
     expect(en[0]).toBe(
-      '⚠️ Safety guardrails tripped — auto-downgraded: Fable 5.1 → Opus 4.8 (cyber) · '
-      + 'this session keeps running on Opus 4.8; reply /model fable to switch back',
+      '⚠️ Safety fallback: Fable 5.1 → Opus 4.8 (cyber) · /model fable to switch back',
     );
     expect(en[1]).toBe(
-      '⚠️ Model unavailable — auto-switched: Fable 5.1 → Opus 4.8 (refusal) · '
-      + 'reply /model fable to switch back',
+      '⚠️ Model unavailable: Fable 5.1 → Opus 4.8 (refusal) · /model fable to switch back',
     );
     expect(en[2]).toBe(
-      '⚠️ Usage quota limit — auto-switched: Fable 5.1 → Opus 4.8 · '
-      + 'reply /model fable to switch back',
+      '⚠️ Quota fallback: Fable 5.1 → Opus 4.8 · /model fable to switch back',
     );
     for (const line of en) expect(line).not.toMatch(/[一-鿿]/);
   });
 
   it('drops the reason when the record carries none', () => {
     expect(cardModelFallbackNotice({ ...REFUSAL, apiRefusalCategory: undefined }, 'zh'))
-      .toBe('⚠️ 安全管控触发，已自动降级：Fable 5.1 → Opus 4.8 · 后续都在 Opus 4.8 上跑，回复 /model fable 可切回');
+      .toBe('⚠️ 安全管控降级：Fable 5.1 → Opus 4.8 · /model fable 切回');
   });
 
   it('names known Claude models and keeps an unknown id verbatim', () => {
@@ -138,7 +135,7 @@ describe('cardModelFallbackNotice: copy', () => {
       cardModelFallbackNotice({ ...REFUSAL, kind: 'consent', originalModel, fallbackModel }, 'zh')!;
     expect(label('claude-opus-5', 'claude-haiku-4-5-20251001')).toContain('Opus 5 → Haiku 4.5');
     expect(label('claude-sonnet-5', 'claude-opus-4-8[1m]')).toContain('Sonnet 5 → Opus 4.8');
-    expect(label('claude-opus-5', 'claude-opus-5')).toContain('回复 /model opus 可切回');
+    expect(label('claude-opus-5', 'claude-opus-5')).toContain('/model opus 切回');
     // Unrecognised id: raw form is kept and the alias falls back to it.
     const custom = label('internal-model-x', 'claude-opus-5');
     expect(custom).toContain('internal-model-x → Opus 5');
@@ -187,7 +184,7 @@ describe('cardModelFallbackNotice: copy', () => {
 describe('buildStreamingCard: model-fallback notice placement', () => {
   it('adds the notice when the usage snapshot carries a fallback', () => {
     const card = build({ usage: { context: null, tokens: null, modelFallback: REFUSAL }, locale: 'zh' });
-    expect(noticeIn(card)).toContain('安全管控触发，已自动降级');
+    expect(noticeIn(card)).toContain('安全管控降级');
   });
 
   it('renders nothing once the fallback is cleared', () => {
@@ -206,8 +203,8 @@ describe('buildStreamingCard: model-fallback notice placement', () => {
     const elements = card.elements as any[];
     const last = elements[elements.length - 1];
     expect(last.tag).toBe('markdown');
-    expect(last.text_size).toBe('notation_small_v2');
-    expect(last.content).toMatch(/^<font color='grey'>⚠️ 安全管控触发，已自动降级：.*<\/font>$/);
+    expect(last.text_size).toBe('x-small');
+    expect(last.content).toMatch(/^<font color='grey'>⚠️ 安全管控降级：.*<\/font>$/);
     // Below the button rows and below the usage line, never above them.
     expect(elements.findIndex(e => e.tag === 'action')).toBeGreaterThanOrEqual(0);
     expect(elements.findIndex(e => e.tag === 'action')).toBeLessThan(elements.length - 1);
@@ -229,13 +226,13 @@ describe('buildStreamingCard: model-fallback notice placement', () => {
     });
     const contents = markdownContents(card);
     const limitIdx = contents.findIndex(c => c.includes('使用限额'));
-    const fallbackIdx = contents.findIndex(c => c.includes('已自动降级'));
+    const fallbackIdx = contents.findIndex(c => c.includes('安全管控降级'));
     expect(limitIdx).toBeGreaterThanOrEqual(0);
     expect(fallbackIdx).toBeGreaterThan(limitIdx);
   });
 
   it('follows the card locale', () => {
     const card = build({ usage: { context: null, tokens: null, modelFallback: REFUSAL }, locale: 'en' });
-    expect(noticeIn(card)).toContain('Safety guardrails tripped');
+    expect(noticeIn(card)).toContain('Safety fallback');
   });
 });
