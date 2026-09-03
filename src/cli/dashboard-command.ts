@@ -64,40 +64,48 @@ function legacyEnsureRouteMissing(result: DashboardResult): boolean {
  * 都靠「取第一行」拿链接（`botmux dashboard | head -1`）。往后追加行可以，动第一行
  * 不行。
  *
- * ─── 绑定中心化平台后，链接里不再带 token ──────────────────────────────────
- * `localUrl` 有值 **就等于**「远程基址已生效」这一位（平台绑定 + 远程访问，或
- * 自建反代 `BOTMUX_PUBLIC_URL`，见 dashboard-url.ts:buildDashboardUrls —— 只有
- * 那种情况才会额外给出本地直连形态）。所以不必另读一遍配置就能判断。
+ * ─── 只有「中心平台托管」才去 token（判据的收窄，别改回 localUrl）────────────
+ * `localUrl` 有值只说明「有某种远程基址」，而 `remotePublicBase()` 有**三个**来源，
+ * 认证方式完全不同：
+ *   ① 中心平台 `platformMachineBaseUrl()`（远程访问开 + 已绑定）—— 平台在反代时
+ *      注入身份并先把浏览器送去 SSO，`request-identity.ts` 对该身份恒把
+ *      `presentedToken` 压成 undefined。**token 既无效也不需要** ⟹ 该去。
+ *   ② 自建反代 `BOTMUX_PUBLIC_URL`（如 nginx）—— 只是把请求转到本机 dashboard，
+ *      **没有任何人注入身份**。
+ *   ③ Devbox 短链 `devboxDashboardBaseUrl()`（merlin 隧道）—— 同 ②。
+ * ②③ 下 token 仍是唯一凭证：实测无凭证请求（带 `X-Forwarded-*` 反代头）拿 401，
+ * 带 `?t=` 才 302 放行；而 401 上的登录出口由 `buildPlatformDashboardLoginUrl()`
+ * 生成，它**第一行就是 `if (!isRemoteAccessEnabled()) return undefined`** 并要求
+ * 读到 `platform.json` ——②③ 都拿不到出口。所以对 ②③ 去 token 等于把唯一入口堵死，
+ * 只有 ① 可以去。
  *
- * 这种情况下 token **对访问毫无贡献、只剩泄漏价值**：走平台子域进来的请求由平台
- * 注入身份，`request-identity.ts` 对 `platform-dashboard` 身份恒把
- * `presentedToken` 压成 undefined，实测带 `?t=` 依旧 401（`x-botmux-auth-scope:
- * workbench`）；平台边缘更是先把浏览器 302 去 SSO 登录。真人 owner 是被平台认出来
- * 的，不是靠这段 token。既然如此，就别把它印在一条会被复制、转发、截图的链接上。
- *
- * 反过来，**未绑定平台时 token 不能去**：那时 `http://ip:port/` 只是静态壳，SPA
- * 探 `/api/settings` 拿 401，而 401 上的 `x-botmux-login-url` 由
- * `buildPlatformDashboardLoginUrl()` 生成、未绑定时返回 undefined —— 登录浮层没有
- * 出口，去掉 token 等于把唯一入口堵死。所以 `localUrl === undefined` 分支原样保留。
+ * 这是**我自己第一版的真实缺陷**：当时用 `localUrl !== undefined` 当「平台已生效」
+ * 的等价判据，把 ②③ 一起判成可以去 token。留此注释是为了别再简化回去。
  *
  * ⚠️ 无凭证形态必须用 hash 路由 `/#/agent-workbench`，不能用 `/workbench`：后者
  * 不在 `decideDashboardAuth` 的静态壳白名单里，token-free 访问实测 401（平台身份
  * 下也一样），会给出一条打不开的链接。有 token 时才用无 fragment 的 `/workbench`。
  *
  * @param showLocalTokenLink 用户是否显式递了 {@link DASHBOARD_LOCAL_TOKEN_FLAG}
+ * @param platformHosted 这条链接是否由中心平台托管（即上文 ①）。注入而非在此直接
+ *   读配置：本函数要保持纯函数以便测试，且 `cli.ts` 已有同款判据的先例
+ *   （`ensureDevboxDashboardExportForCurrentPort` 的 `remoteBaseConfigured`）。
+ *   默认 false = 保守：**拿不准就保留 token**，宁可多留一次凭证也不给死链。
  */
 export function formatDashboardSuccessLines(
   result: Extract<DashboardResult, { ok: true }>,
   showLocalTokenLink = false,
+  platformHosted = false,
 ): string[] {
-  const remoteBacked = result.localUrl !== undefined;
-  // 平台/反代已生效 ⇒ 主链接去掉 token；否则原样（token 是唯一入口）。
-  const primary = remoteBacked ? stripDashboardToken(result.url) ?? result.url : result.url;
+  // 只有中心平台托管时 token 才是多余的。fail-safe 方向是「保留」：判据取不到时
+  // 留着 token 只是维持现状，去掉却可能让 owner 完全进不去。
+  const dropToken = platformHosted && result.localUrl !== undefined;
+  const primary = dropToken ? stripDashboardToken(result.url) ?? result.url : result.url;
   const lines = [primary];
 
   // 工作台入口跟着主链接的凭证形态走：带 token 用无 fragment 的 `/workbench`，
   // 不带 token 必须用 hash 形态（`/workbench` token-free 是 401 死链）。
-  const workbench = remoteBacked ? workbenchSpaUrl(primary) : workbenchEntryUrl(primary);
+  const workbench = dropToken ? workbenchSpaUrl(primary) : workbenchEntryUrl(primary);
   if (workbench) lines.push(`工作台: ${workbench}`);
 
   if (result.localUrl) {

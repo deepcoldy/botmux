@@ -3336,6 +3336,21 @@ async function dashboardMemberComingUp(): Promise<boolean | null> {
 }
 
 /**
+ * 这台机器的 Dashboard 链接是否由**中心平台**托管（远程访问开 + 已绑定）。
+ *
+ * 只有这一种远程形态会由平台注入身份并先走 SSO，因此也只有它可以把 `?t=` 从链接里
+ * 摘掉（见 `cli/dashboard-command.ts:formatDashboardSuccessLines`）。自建反代
+ * `BOTMUX_PUBLIC_URL` 与 Devbox 短链虽然同样是「远程基址」，但没有人注入身份，
+ * token 仍是唯一凭证 —— 对它们摘 token 会摘成死链。
+ *
+ * 判据与 `ensureDevboxDashboardExportForCurrentPort` 的 `remoteBaseConfigured`
+ * 同源，区别是这里**不**把反代算进来。
+ */
+function dashboardLinkIsPlatformHosted(): boolean {
+  return Boolean(isRemoteAccessEnabled() && platformMachineBaseUrl());
+}
+
+/**
  * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
  * via /__cli/current (non-rotating) so an already-shared URL is preserved.
  * Retries since the dashboard process boots after the daemon; if it still isn't
@@ -3368,7 +3383,9 @@ async function printDashboardHintWithRetry(): Promise<void> {
       // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
       // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
       // 这段输出会被大模型读进上下文，所以第一行之外的安全提示也一起给。
-      const [primary, ...rest] = formatDashboardSuccessLines(last);
+      const [primary, ...rest] = formatDashboardSuccessLines(
+        last, false, dashboardLinkIsPlatformHosted(),
+      );
       console.log(`   面板: botmux dashboard (${primary})`);
       for (const line of rest) console.log(`   ${line}`);
       return;
@@ -3426,7 +3443,9 @@ async function cmdDashboard(args: string[]): Promise<void> {
     // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、本地直连
     // 兜底（默认隐藏，带 token）、以及给 AI 读的安全提示。绑定中心化平台后首行不再
     // 带 token —— 行顺序与首行契约见 formatDashboardSuccessLines。
-    for (const line of formatDashboardSuccessLines(r, execution.showLocalTokenLink)) console.log(line);
+    for (const line of formatDashboardSuccessLines(
+      r, execution.showLocalTokenLink, dashboardLinkIsPlatformHosted(),
+    )) console.log(line);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');

@@ -6,8 +6,8 @@
 botmux dashboard          # 获取当前 URL；尚无 token 时创建第一个
 botmux dashboard current  # 同一操作的显式写法
 botmux dashboard rotate   # 轮换 token 并输出新 URL
-# 未绑定中心化平台时的输出: http://<lan-ip>:7891/?t=<token>
-# 已绑定中心化平台时的输出: https://m-<machineId>.<平台域名>/   ← 不带 token
+# 已绑定中心化平台: https://m-<machineId>.<平台域名>/          ← 不带 token
+# 其余情况(局域网 / 自建反代 / Devbox 短链): …/?t=<token>      ← 带 token
 ```
 
 > 这是**轮换式登录 token**：一条 URL 会一直有效，直到 `botmux dashboard rotate` 生成新 token、让旧 URL 失效；token 会持久化、`botmux restart` 后仍有效。裸命令/current 会复用这个 token，尚无 token 时创建第一个。成功访问 `?t=` 只是把同一 token 写进 cookie，不消费/作废它，轮换前同一 URL 可重复登录——所以分享链接≈分享登录态，注意保管。默认端口 `7891`，可用 `BOTMUX_DASHBOARD_PORT` 改。
@@ -16,8 +16,11 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 | 状态 | 主链接形态 | 为什么 |
 |---|---|---|
-| 已绑定中心化平台（或配了 `BOTMUX_PUBLIC_URL` 反代） | `https://m-<machineId>.<平台域名>/` —— **不带 token** | 走平台子域时身份由平台注入，`?t=` 会被服务端压制成无效（带上也是 401），token 对访问零贡献、只剩泄漏风险。真人 owner 是被平台 SSO 认出来的 |
-| 未绑定平台（纯局域网 `ip:port`） | `http://<lan-ip>:7891/?t=<token>` —— **带 token** | 此时 token 是唯一入口：去掉它就只剩一个静态壳，而平台登录出口在未绑定时不存在 |
+| **已绑定中心化平台**（远程访问开 + 已 bind） | `https://m-<machineId>.<平台域名>/` —— **不带 token** | 走平台子域时身份由平台注入并先过 SSO，`?t=` 会被服务端压制成无效（带上也是 401），token 对访问零贡献、只剩泄漏风险。真人 owner 是被平台认出来的 |
+| 自建反代 `BOTMUX_PUBLIC_URL` / Devbox 短链 | `https://<你的域名>/?t=<token>` —— **带 token** | 这两条只是把请求反代到本机 dashboard，**没有人注入身份**，token 仍是唯一凭证；且平台登录出口在未绑定时不存在，去掉就进不去了 |
+| 未配任何远程基址（纯局域网 `ip:port`） | `http://<lan-ip>:7891/?t=<token>` —— **带 token** | 同上：去掉后只剩一个静态壳 |
+
+⚠️ 判据是「**是否由中心平台托管**」，不是「有没有远程基址」—— 后者会把自建反代和 Devbox 短链一起误判成可以去 token，而那两条路去掉 token 会变成打不开的死链。取不到判据时一律**保留** token（少去一次只是维持现状，多去一次可能让 owner 完全进不去）。
 
 绑定平台后，那条带 token 的本地直连链接**默认不再打印**（它是平台异常时的兜底）。确实需要用 `ip:port + token` 方式管理时，加一个刻意起得很长的参数即可取回——参数名会在命令输出里提示，只给人看，不进 `--help`：这是为了避免 AI 顺手带上它、把 token 带进思考过程或聊天记录。
 

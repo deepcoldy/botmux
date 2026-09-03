@@ -350,12 +350,12 @@ describe('formatDashboardSuccessLines', () => {
   // ─── 绑定中心化平台 / 自建反代后：主链接不带 token ────────────────────────
   // `localUrl` 有值就是「远程基址已生效」这一位（见 dashboard-url.ts）。走平台时
   // token 被 request-identity 压制成 undefined、对访问零贡献，只剩泄漏价值。
-  it('REMOTE-BACKED: strips ?t= from the primary link and from the workbench entry', () => {
+  it('PLATFORM-HOSTED: strips ?t= from the primary link and from the workbench entry', () => {
     const lines = formatDashboardSuccessLines({
       ok: true,
       url: 'https://m-abc.platform.test/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
-    });
+    }, false, true);
 
     expect(lines[0]).toBe('https://m-abc.platform.test/');
     // 无凭证形态必须走 hash 路由：`/workbench` 不在静态壳白名单里，token-free
@@ -365,24 +365,66 @@ describe('formatDashboardSuccessLines', () => {
     expect(lines.join('\n')).not.toContain('tok-abc');
   });
 
-  it('REMOTE-BACKED: hides the token-bearing local link behind the explicit flag', () => {
+  it('PLATFORM-HOSTED: hides the token-bearing local link behind the explicit flag', () => {
     const result = {
       ok: true as const,
       url: 'https://m-abc.platform.test/?t=tok-abc',
       localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
     };
 
-    const hidden = formatDashboardSuccessLines(result);
+    const hidden = formatDashboardSuccessLines(result, false, true);
     const local = hidden.find(l => l.includes('本地直连'));
     // 该行仍在（人需要知道存在这条路），但链接本体不打印，且提示了参数名。
     expect(local).toBeDefined();
     expect(local).not.toContain('tok-abc');
     expect(local).toContain(DASHBOARD_LOCAL_TOKEN_FLAG);
 
-    const shown = formatDashboardSuccessLines(result, true);
+    const shown = formatDashboardSuccessLines(result, true, true);
     expect(shown).toContain('本地直连(平台异常时可用): http://10.0.0.7:7891/?t=tok-abc');
     // 显式索取时也要挨一句警告。
     expect(shown.join('\n')).toContain('等同管理员密码');
+  });
+
+  // ─── 回归：判据必须是「中心平台托管」，不是「有远程基址」 ──────────────────
+  // 第一版用 `localUrl !== undefined` 当「平台已生效」的等价判据，这是错的：
+  // `remotePublicBase()` 有三个来源，只有中心平台会注入身份 + 走 SSO。自建反代
+  // (BOTMUX_PUBLIC_URL) 与 Devbox 短链同样会产生 localUrl，但没有人注入身份 ——
+  // 实测那两条路 token-free 请求拿 401、带 ?t= 才 302，而 401 上的登录出口由
+  // `buildPlatformDashboardLoginUrl()` 生成，它要求 remoteAccess + platform.json，
+  // 反代/短链都拿不到 ⟹ 去掉 token 等于把唯一入口堵死。
+  it('REVERSE-PROXY / DEVBOX: keeps the token even though localUrl exists', () => {
+    // 形态与平台托管**完全一致**（有 localUrl），唯一区别是 platformHosted=false。
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'https://botmux.mycorp.example/?t=tok-abc',
+      localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    }, false, false);
+
+    // token 必须留着 —— 它是这条路上唯一的凭证。
+    expect(lines[0]).toBe('https://botmux.mycorp.example/?t=tok-abc');
+    // 有 token ⇒ 工作台用无 fragment 的 /workbench（它会 302，不是死链）。
+    expect(lines[1]).toBe('工作台: https://botmux.mycorp.example/workbench?t=tok-abc');
+  });
+
+  // fail-safe 方向：判据取不到时保留 token。少一次「去 token」只是维持现状；
+  // 多一次却可能让 owner 完全进不去。
+  it('defaults to KEEPING the token when platformHosted is not supplied', () => {
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'https://m-abc.platform.test/?t=tok-abc',
+      localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    });
+    expect(lines[0]).toContain('?t=tok-abc');
+  });
+
+  // platformHosted=true 但没有 localUrl（理论上不该出现：平台托管必然有本地兜底）。
+  // 仍要 fail-safe：宁可留 token，也不要凭一个不自洽的输入去摘凭证。
+  it('keeps the token when platformHosted is claimed but there is no localUrl', () => {
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'http://10.0.0.7:7891/?t=tok-abc',
+    }, false, true);
+    expect(lines[0]).toBe('http://10.0.0.7:7891/?t=tok-abc');
   });
 
   it('always appends the AI-facing safety hint, naming both leak conditions', () => {

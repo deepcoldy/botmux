@@ -151,10 +151,11 @@ export async function cmdBind(
       path: '/__cli/current',
     });
     if (cur.ok) {
-      // 刚绑完平台 ⇒ 主链接不带 token（token 在平台身份下被压制成无效，只剩泄漏
-      // 价值）；本地直连那条带 token，默认隐藏。与 `botmux dashboard` 同一套收敛，
-      // 见 cli/dashboard-command.ts:formatDashboardSuccessLines。
-      const [primary, ...rest] = formatDashboardSuccessLines(cur);
+      // 刚 bind 成功、platform.json 已落盘 ⇒ 必然是**中心平台托管**，所以主链接可以
+      // 去掉 token（平台注入身份，token 在那条路上已被压制成无效，只剩泄漏价值）。
+      // 本地直连那条仍带 token，默认隐藏。与 `botmux dashboard` 同一套收敛，判据的
+      // 收窄理由见 cli/dashboard-command.ts:formatDashboardSuccessLines。
+      const [primary, ...rest] = formatDashboardSuccessLines(cur, false, true);
       console.log(`  面板: ${primary}`);
       for (const line of rest) console.log(`  ${line}`);
     } else {
