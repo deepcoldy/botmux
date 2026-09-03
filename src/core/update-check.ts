@@ -150,26 +150,66 @@ export function registryPackumentUrl(base: string): string {
 /**
  * Read `npm config get registry` (honors user/global/project .npmrc and
  * NPM_CONFIG_REGISTRY). Async spawn — the dashboard must not block on npm CLI
- * startup (~0.5-1s) — with a hard kill at 5s. Always resolves: '' on any
- * failure so the caller can fall back to the public registry.
+ * startup (~0.5-1s). Exported for tests only.
+ *
+ * Hang-hardened for wrapper shims (nvm, corp-managed npm): a shim may spawn a
+ * long-lived grandchild that inherits the stdout pipe. Killing only the shim
+ * then leaves the grandchild holding the pipe, 'close' never fires, and the
+ * promise would hang forever — pinning the module's in-flight guard and
+ * killing every later version check in the process. Two bounds instead:
+ * (1) shim exited but the pipe is still held → the output is already ours,
+ *     settle after a grace period WITHOUT killing the grandchild (it may be a
+ *     legitimate resident process the shim started for unrelated reasons);
+ * (2) npm itself hung → kill the whole process group (taskkill /T on Windows).
  */
-function spawnNpmConfigRegistry(): Promise<string> {
+export function spawnNpmConfigRegistry(): Promise<string> {
   return new Promise(resolve => {
     let child;
+    let killTimer: NodeJS.Timeout | undefined;
+    let graceTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = (value: string): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve(value);
+    };
     try {
       child = spawn('npm', ['config', 'get', 'registry'], {
         stdio: ['ignore', 'pipe', 'ignore'],
         shell: process.platform === 'win32', // resolve npm.cmd on Windows
+        // Own process group (POSIX): a timeout kill then reaches the shim's
+        // descendants too, not just the shim itself.
+        detached: process.platform !== 'win32',
+        windowsHide: true,
       });
     } catch {
       resolve('');
       return;
     }
     let out = '';
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already exited */ } }, 5_000);
     child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    child.on('error', () => { clearTimeout(timer); resolve(''); });
-    child.on('close', () => { clearTimeout(timer); resolve(out); });
+    child.on('error', () => settle(''));
+    // (2) The child itself is hung. Kill the group; 'exit' follows, and (1)
+    // below settles even if a setsid-style escapee still holds the pipe.
+    killTimer = setTimeout(() => {
+      try {
+        if (child.pid === undefined) return;
+        if (process.platform === 'win32') {
+          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        } else {
+          process.kill(-child.pid, 'SIGKILL');
+        }
+      } catch { /* already gone */ }
+    }, 5_000).unref();
+    // (1) npm exited but 'close' hasn't fired → a grandchild holds the pipe.
+    // We already have the output; stop waiting instead of hanging forever.
+    child.on('exit', () => {
+      graceTimer = setTimeout(() => settle(out), 1_000).unref();
+    });
+    // Normal path: all stdio closed right after exit — settle immediately.
+    child.on('close', () => settle(out));
   });
 }
 

@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   parseVersion,
   isStableVersion,
@@ -14,6 +17,7 @@ import {
   registryLatestUrl,
   registryPackumentUrl,
   resolveNpmRegistryBase,
+  spawnNpmConfigRegistry,
 } from '../src/core/update-check.js';
 
 describe('parseVersion', () => {
@@ -202,6 +206,40 @@ describe('resolveNpmRegistryBase cache policy', () => {
     // 3. A successful read IS cached — a later config change is not re-read.
     expect(await resolveNpmRegistryBase(async () => 'https://other.example.com/')).toBe('https://cache-check.example.com/');
   });
+});
+
+describe('spawnNpmConfigRegistry hang resistance', () => {
+  // Real-spawn regression test for the wrapper-shim hang: the shim prints the
+  // value and exits, leaving a 60s grandchild holding the inherited stdout
+  // pipe — 'close' never fires. On the pre-fix code this promise hangs until
+  // the vitest timeout (red); the exit-grace settle resolves ~1s after the
+  // shim exits with the full output (green).
+  (process.platform === 'win32' ? it.skip : it)('settles when a shim leaves a pipe-holding grandchild', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-npm-shim-'));
+    const shim = join(dir, 'npm');
+    const pidFile = join(dir, 'grandchild.pid');
+    writeFileSync(shim, '#!/bin/sh\n'
+      + 'echo "https://hang-check.example.com"\n'
+      + 'sleep 60 &\n'
+      + `echo $! > "${pidFile}"\n`
+      + 'exit 0\n', { mode: 0o755 });
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${dir}:${oldPath}`;
+    let grandchildPid: number | undefined;
+    try {
+      const started = Date.now();
+      const raw = await spawnNpmConfigRegistry();
+      const elapsed = Date.now() - started;
+      expect(raw).toBe('https://hang-check.example.com\n');
+      // Grace path (~1s), not the 5s kill path and not a hang.
+      expect(elapsed).toBeLessThan(4_000);
+      grandchildPid = Number(readFileSync(pidFile, 'utf8').trim()) || undefined;
+    } finally {
+      process.env.PATH = oldPath;
+      try { if (grandchildPid) process.kill(grandchildPid, 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('rollback versions', () => {
