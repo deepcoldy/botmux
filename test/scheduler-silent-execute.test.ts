@@ -149,6 +149,7 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 }));
 
 import { executeScheduledTask, rememberLastCliInput } from '../src/core/session-manager.js';
+import { recordDispatchInputCommit } from '../src/core/dispatch.js';
 import { sessionKey } from '../src/core/types.js';
 
 const APP = 'cli_app_test';
@@ -262,6 +263,9 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(ds.silentScheduledTurns).toBeUndefined();
     expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
     expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    // Unit-level check: dispatch receipts require a live worker generation.
+    ds.session.workerGeneration = 1;
+    expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
   });
 });
 
