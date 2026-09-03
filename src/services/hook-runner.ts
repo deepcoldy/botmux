@@ -420,9 +420,12 @@ async function runHookCommand(
       if (stderr.length > 2_000) stderr = stderr.slice(-2_000);
     });
 
-    // Keep the HEAD of stdout, not the tail: the verdict JSON is the whole
-    // document, so a hook that prints its verdict then dumps debug noise must
-    // still parse. (stderr keeps the tail — there the last error matters most.)
+    // Keep the HEAD of stdout, not the tail. parseHookVerdict requires the
+    // WHOLE of stdout to be one JSON object, so verdict-then-debug-noise does
+    // NOT parse — it falls back to the exit code. Keeping the head means the
+    // verdict is at least intact for diagnosis in that case, and a hook that
+    // only prints its verdict is unaffected. (stderr keeps the tail instead:
+    // there the last error is what matters.)
     child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', chunk => {
       if (stdout.length < STDOUT_CAPTURE_LIMIT) stdout += String(chunk);
@@ -583,7 +586,9 @@ export type PromptGateDecision = {
   fromError?: boolean;
 };
 
-const GATE_ALLOW: PromptGateDecision = { allowed: true };
+// Frozen: this single instance is handed to every allow path, so an in-place
+// mutation by a future caller would silently corrupt every later verdict.
+const GATE_ALLOW: PromptGateDecision = Object.freeze({ allowed: true });
 /** 拒绝原因回显给用户前的长度上限——hook 的 stderr/stdout 不该变成刷屏面。 */
 const GATE_REASON_LIMIT = 300;
 
@@ -705,15 +710,6 @@ export async function evaluatePromptGate(
   }
 }
 
-/** 该事件当前是否配了 sync hook——调用方用它避开无谓的 payload 组装。 */
-export function hasSyncGateHooks(event: HookEvent): boolean {
-  try {
-    if (!isGateEvent(event)) return false;
-    return loadHookConfigs().some(hook => hook.event === event && hook.mode === 'sync');
-  } catch {
-    return false;
-  }
-}
 
 const HOOK_FORWARD_FETCH_TIMEOUT_MS = 2_000;
 

@@ -137,6 +137,7 @@ Stdout must be a **whole JSON object** to count as a verdict. Printing an ordina
 - **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
   ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
 - **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
+- **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks and workflow-generated prompts do not** — those are automation the operator pre-authorized, not external input. Do not read the gate as "everything reaching the CLI was checked".
 - A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
 
 ## Practical: Auto-Update Skills with session.start

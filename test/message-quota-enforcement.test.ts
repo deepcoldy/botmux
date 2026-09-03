@@ -513,6 +513,52 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
     ));
   });
 
+  it('建群前扣费点也把正文交给同步校验闸（出生轮不得内容双盲）', async () => {
+    // Review 发现的阻断项：建群前扣费点调 enforceMessageQuotaForCliInput 时
+    // 不传 opts，而改写后的那一轮带 alreadyAuthorizedAndCharged 提前 return，
+    // 于是 p2pMode='group' 下**每个会话群的第一条消息**（正是开场 prompt）
+    // 闸只拿到元信息 —— sender 级规则仍在，内容级规则全盲。
+    const dir = mkdtempSync(join(tmpdir(), 'birth-gate-'));
+    const seen = join(dir, 'seen.json');
+    const script = join(dir, 'gate.js');
+    writeFileSync(script, `
+      import { writeFileSync } from 'node:fs';
+      let input = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', c => { input += c; });
+      process.stdin.on('end', () => {
+        const p = JSON.parse(input);
+        writeFileSync(${JSON.stringify(seen)}, JSON.stringify({
+          hasContent: typeof p.content === 'string' && p.content.length > 0,
+          content: p.content ?? null,
+        }));
+        console.log(JSON.stringify({ decision: 'allow' }));
+      });
+    `);
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: `${process.execPath} ${script}`,
+      timeoutMs: 5000,
+    }]);
+
+    try {
+      // handleNewTopic 会一路走到 forkWorker（本套件没有初始化 WorkerPool），
+      // 那发生在闸之后 —— 我们只关心闸看到了什么，所以吞掉这个下游错误。
+      await handleNewTopic(dmEvent('帮我 SENTINEL_BIRTH 一下', 'om_birth_gate'), dmCtx('om_birth_gate'))
+        .catch((err: any) => {
+          if (!/WorkerPool not initialised/.test(String(err?.message ?? err))) throw err;
+        });
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+        hasContent: true,
+        content: expect.stringContaining('SENTINEL_BIRTH'),
+      });
+    } finally {
+      delete process.env.BOTMUX_HOOKS_JSON;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('/help 不扣额度、也不触发建群（命令本来不进 CLI）', async () => {
     await handleNewTopic(dmEvent('/help', 'om_help'), dmCtx('om_help'));
 

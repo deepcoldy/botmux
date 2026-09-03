@@ -17442,6 +17442,8 @@ async function startInitialPassthroughSession(args: {
   messageId: string;
   replyRootId?: string;
   parsed: LarkMessage;
+  /** 本轮附件元信息，转给 prompt.submit 校验闸（内容不在此传）。 */
+  promptResources?: MessageResource[];
   cmd: string;
   commandContent: string;
   senderOpenId?: string;
@@ -17476,12 +17478,15 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
+    parsed, promptResources, cmd, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, { promptContent: commandContent || parsed.content })) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
+    promptContent: commandContent || parsed.content,
+    promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
+  })) {
     return;
   }
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
@@ -17813,6 +17818,24 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const quotaTeamTrustUnionId = (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot')
       ? quotaSenderUnionId
       : undefined;
+    // 出生轮的闸也必须看到正文与附件，否则 p2pMode='group' 下**每个会话群的
+    // 第一条消息**（正是开场 prompt）只按元信息判定：sender 级规则还在，内容级
+    // 规则（DLP / 高危指令 / .env 拦截）全盲。改写后的那一轮带
+    // alreadyAuthorizedAndCharged 提前 return，不会补上这一课。
+    //
+    // 这里用**一次性 numberer** 单独解析一遍：parseEventMessage 是纯函数（无网络
+    // 无磁盘无共享状态），而 numberer 的计数器是闭包私有的，所以这次解析不会扰动
+    // 下面 17874 行那次真正的解析（图片/文件编号仍从 1 开始）。解析失败不能拖垮
+    // 收信主路——退回只给元信息，与本次改动前的行为一致。
+    let birthPromptContent: string | undefined;
+    let birthPromptAttachments: Array<{ type: string; name: string }> | undefined;
+    try {
+      const preview = parseEventMessage(data, createImgNumberer());
+      birthPromptContent = preview.parsed.content;
+      birthPromptAttachments = preview.resources.map(r => ({ type: r.type, name: r.name }));
+    } catch (err) {
+      logger.debug(`[hooks:${larkAppId}] birth-turn prompt preview failed, gating on metadata only: ${err}`);
+    }
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -17822,6 +17845,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaTeamTrustUnionId,
       quotaSenderUnionId,
       chatType,
+      undefined,
+      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
     )) return;
     quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
@@ -18129,6 +18154,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId,
           chatType,
@@ -19597,6 +19623,7 @@ async function handleThreadReplyAdmitted(
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId: threadChatId,
           chatType: ctxChatType,
