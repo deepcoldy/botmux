@@ -3295,7 +3295,7 @@ describe('automateOpenPlatformSetup', () => {
 
     // 锁生产链路：走**真实默认 manifest**（不注入 scopeManifest）+ 已授权集合。
     // 这是维护者复审揪出的空白——之前 3 例都注入空 manifest，恰好绕开了唯一有意义
-    // 的那条路径（默认 171+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
+    // 的那条路径（默认 169+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
     // 永不触发）。这里用「manifest 全部已授权」模拟「配置本就齐全」的重启自检。
     const defaultManifest = JSON.parse(
       readFileSync(join(fileURLToPath(new URL('../src/setup/lark-scopes.json', import.meta.url))), 'utf-8'),
