@@ -17,6 +17,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
+import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary } from './core/cli-identity.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -14293,6 +14294,36 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  // Trigger-user CLI auth: shadow the governed tools with wrappers that source
+  // the identity the daemon publishes per turn. The dir is per SESSION and
+  // prepended only for a bot that enabled the policy — a wrapper in the shared
+  // ~/.botmux/bin would shadow lark-cli for every bot on this machine, and for
+  // the operator's own shell, neither of which asked for it.
+  //
+  // The real binary is resolved from the PATH we are about to hand the child,
+  // with the wrapper dir excluded, so a wrapper can never resolve to itself.
+  const triggerUserAuthPolicy = cfg.triggerUserAuth;
+  if (triggerUserAuthPolicy?.enabled && process.env.SESSION_DATA_DIR) {
+    const wrapperDir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    let installedAny = false;
+    for (const tool of triggerUserAuthPolicy.tools) {
+      try {
+        const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
+        if (!real) {
+          log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+          continue;
+        }
+        installIdentityWrapper(wrapperDir, tool, real);
+        installedAny = true;
+        log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
+      } catch (e) {
+        // A missing wrapper means the tool keeps its previous behavior; it must
+        // not stop the session from starting.
+        log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
+      }
+    }
+    if (installedAny) childEnv.PATH = prependBotmuxBin(wrapperDir, childEnv.PATH);
+  }
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.

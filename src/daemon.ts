@@ -286,6 +286,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
+import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -301,7 +302,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3470,6 +3471,14 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
+  // turn. This is the per-message acceptance point — every inbound turn passes
+  // through here before reaching the worker — so it is the one place that can
+  // guarantee no turn runs with the previous sender's credentials still on disk.
+  // Withholding is the safe direction, hence it precedes the reaction bookkeeping
+  // and its early returns (card-on sessions return below, but their turns need
+  // the identity refreshed just the same).
+  await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3514,6 +3523,58 @@ export async function noteTurnReceived(
     return;
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+/**
+ * Publish the acting CLI identity for one turn, and tell the sender when they
+ * need to authorize.
+ *
+ * The sender comes from the daemon's own per-turn record (`replyTargets`, via
+ * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
+ * are daemon-owned: a worker contributes only a turn id and can never choose
+ * which human that id denotes.
+ *
+ * The "please authorize" notice is sent at most once per session per tool. A
+ * repeat on every turn would be noise, and the sender already has the link.
+ */
+async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  let botConfig;
+  try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
+  if (!botConfig.triggerUserAuth?.enabled) return;
+
+  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId
+    ?? ds.session.lastCallerOpenId;
+
+  const outcomes = await publishTurnCliIdentity({
+    botConfig,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId,
+  });
+
+  const needsAuth = outcomes.filter(o => o.state === 'needs-authorization');
+  if (!needsAuth.length) return;
+  const notified = (ds.triggerUserAuthNotified ??= new Set<string>());
+  const fresh = needsAuth.filter(o => !notified.has(o.tool));
+  if (!fresh.length) return;
+  for (const o of fresh) notified.add(o.tool);
+
+  const loc = localeForBot(ds.larkAppId);
+  const tools = fresh.map(o => o.tool).join(' / ');
+  try {
+    await sessionReply(
+      sessionAnchorId(ds),
+      tr('trigger_user_auth.needs_login', { tools }, loc),
+      'text',
+      ds.larkAppId,
+      turnId,
+    );
+  } catch (err) {
+    logger.debug(
+      `[trigger-user-auth] could not deliver the authorize notice: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 async function sessionReply(

@@ -401,6 +401,7 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': '等待中',
   'cmd.status.fallback_no_session': '当前话题没有活跃的会话。\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ 无法获取应用凭证',
+  'trigger_user_auth.needs_login': '🔐 这一步要用你自己的权限，但你还没授权过 {tools}。发一条 /login 完成授权后重试；本次会话里这条提示只出现一次。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',
   'cmd.login.step2': '2. 授权后浏览器会跳到一个「打不开 / 无法访问此网站（ERR_CONNECTION_REFUSED）」的页面——这是正常的（回调地址是本机 127.0.0.1，daemon 在远端故连不上）',

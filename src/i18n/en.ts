@@ -402,6 +402,7 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': 'idle',
   'cmd.status.fallback_no_session': 'No active session in this topic.\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
+  'trigger_user_auth.needs_login': '🔐 This step runs as you, but you have not authorized {tools} yet. Send /login to authorize, then retry. This notice appears once per session.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',
   'cmd.login.step2': '2. After authorizing, the browser redirects to a page that fails to load ("This site can\'t be reached / ERR_CONNECTION_REFUSED") — this is expected (the callback points at 127.0.0.1, but the daemon runs remotely).',
