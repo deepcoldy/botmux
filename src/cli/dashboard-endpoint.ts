@@ -41,7 +41,20 @@ export type DashboardFailReason =
   | 'wrong-service';
 
 export type DashboardResult =
-  | { ok: true; url: string; localUrl?: string }
+  | {
+    ok: true;
+    url: string;
+    localUrl?: string;
+    /**
+     * Does `url` route through the CENTRAL PLATFORM? Reported by the dashboard
+     * process that built the URL — the only process that knows, and therefore
+     * the only honest source. A CLI that re-derives it from its own config can
+     * disagree (config caches, or a caller that hardcodes it: `bind.ts` did,
+     * and stripped tokens into dead links). Absent on older dashboards, where
+     * it parses as `false` — fail-safe, since false only means "keep the token".
+     */
+    platformHosted?: boolean;
+  }
   | { ok: false; reason: DashboardFailReason; detail?: string };
 
 type FetchImpl = typeof fetch;
@@ -153,12 +166,21 @@ export async function requestDashboardAt(opts: {
     }
     // reload-binding 不返回 url，200 即成功（仅用于「捅一下 daemon 重连」）
     if (path === '/__cli/reload-binding') return { ok: true, url: '' };
-    let body: { url?: string; localUrl?: string } = {};
-    try { body = JSON.parse(raw) as { url?: string; localUrl?: string }; } catch { body = {}; }
+    let body: { url?: string; localUrl?: string; platformHosted?: unknown } = {};
+    try {
+      body = JSON.parse(raw) as { url?: string; localUrl?: string; platformHosted?: unknown };
+    } catch { body = {}; }
     if (!body.url) return { ok: false, reason: 'http-error', detail: 'malformed response (no url)' };
-    // localUrl is present only when the dashboard link routes through the central
-    // platform — a direct host:port fallback for when the platform is down.
-    return { ok: true, url: body.url, localUrl: body.localUrl };
+    // localUrl is present only when the dashboard link routes through a remote
+    // base — a direct host:port fallback for when that base is down.
+    // platformHosted must be strictly `true` to count: a missing field (older
+    // dashboard) or any non-boolean must not be read as "safe to strip".
+    return {
+      ok: true,
+      url: body.url,
+      localUrl: body.localUrl,
+      platformHosted: body.platformHosted === true,
+    };
   } catch {
     // Includes the abort and a body that never completes: for our purposes a
     // stalled port is indistinguishable from a dead one, and both must let the

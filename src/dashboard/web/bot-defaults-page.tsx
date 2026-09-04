@@ -61,7 +61,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
@@ -120,6 +120,14 @@ type JsonResponse = {
 };
 
 type RuntimeMode = 'official' | 'legacy' | 'custom';
+type NativePolicyMode = 'passthrough' | 'custom';
+type NativeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+type NativePolicyErrors = { model: string | null; effort: string | null };
+
+function nativePolicyModeFrom(policy: { mode?: unknown } | undefined): NativePolicyMode {
+  return policy?.mode === 'custom' ? 'custom' : 'passthrough';
+}
+
 type RuntimeDraft = {
   mode: RuntimeMode;
   id: string;
@@ -2060,6 +2068,12 @@ export function BotAgentSection(props: {
   const [modelBackendVariant, setModelBackendVariant] = useState<'' | 'standard' | 'max'>(bot.modelBackendVariant ?? '');
   const [modelBackendVariantTouched, setModelBackendVariantTouched] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
+  const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
+  const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
+  const [nativeEffort, setNativeEffort] = useState<'' | NativeEffort>(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
+  const [nativePolicyTouched, setNativePolicyTouched] = useState(false);
+  const [nativePolicyErrors, setNativePolicyErrors] = useState<NativePolicyErrors>({ model: null, effort: null });
   // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
   // the runner default (10 min). `touched` gates whether a save sends the field
   // at all: an untouched field is omitted so the daemon preserves the exact
@@ -2092,6 +2106,12 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
+    setNativeModel(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
+    setNativeEffortMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
+    setNativeEffort(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
+    setNativePolicyTouched(false);
+    setNativePolicyErrors({ model: null, effort: null });
     setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
     setTurnTimeoutTouched(false);
     setTurnTimeoutError(null);
@@ -2109,6 +2129,7 @@ export function BotAgentSection(props: {
     bot.model,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
     bot.dshRuntime,
     runtimeConfigKey,
@@ -2193,6 +2214,7 @@ export function BotAgentSection(props: {
   async function saveAgent(): Promise<void> {
     setAgentStatus(null);
     setRuntimeStatus(null);
+    setNativePolicyErrors({ model: null, effort: null });
     let cliRuntime: CliRuntimeConfig | null | undefined;
     if (runtimeTouched) cliRuntime = null;
     if (runtimeTouched && cliKey === 'codex' && runtimeDraft.mode === 'custom') {
@@ -2237,8 +2259,30 @@ export function BotAgentSection(props: {
       setTurnTimeoutError(null);
       turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
     }
+    const trimmedNativeModel = nativeModel.trim();
+    if (cliKey === 'traex') {
+      const nextNativePolicyErrors: NativePolicyErrors = {
+        model: nativeModelMode === 'custom' && !trimmedNativeModel ? tr('botDefaults.nativeSubagentModelRequired') : null,
+        effort: nativeEffortMode === 'custom' && !nativeEffort ? tr('botDefaults.nativeSubagentReasoningEffortRequired') : null,
+      };
+      if (nextNativePolicyErrors.model || nextNativePolicyErrors.effort) {
+        setNativePolicyErrors(nextNativePolicyErrors);
+        setAgentStatus({ text: `✗ ${tr('botDefaults.nativeSubagentIncomplete')}` });
+        return;
+      }
+    }
     setAgentBusy(true);
     try {
+      const nativeSubagentRuntime = nativeModelMode === 'passthrough' && nativeEffortMode === 'passthrough'
+        ? null
+        : {
+            ...(nativeModelMode === 'custom'
+              ? { model: { mode: 'custom' as const, value: trimmedNativeModel } }
+              : {}),
+            ...(nativeEffortMode === 'custom'
+              ? { reasoningEffort: { mode: 'custom' as const, value: nativeEffort } }
+              : {}),
+          };
       const body = {
         cliId: cliKey,
         model,
@@ -2253,6 +2297,7 @@ export function BotAgentSection(props: {
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
+        ...(cliKey === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
@@ -2296,6 +2341,7 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
@@ -2312,6 +2358,12 @@ export function BotAgentSection(props: {
         setTurnTimeoutError(null);
         setDshRuntimeTouched(false);
         setRuntimeTouched(false);
+        setNativePolicyTouched(false);
+        const savedNativePolicy = res.body.nativeSubagentRuntime;
+        setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
+        setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
+        setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
+        setNativeEffort(savedNativePolicy?.reasoningEffort?.mode === 'custom' ? savedNativePolicy.reasoningEffort.value : '');
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
           if (probe && typeof probe.version === 'string') {
@@ -2379,13 +2431,22 @@ export function BotAgentSection(props: {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
       const summary = parseAgentSwitchSummary(res.body);
       if (res.ok && res.body.ok) {
+        const savedNativePolicy = res.body.nativeSubagentRuntime;
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime ?? null,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
+          nativeSubagentRuntime: savedNativePolicy ?? undefined,
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
+        setReasoningEffort(res.body.reasoningEffort ?? '');
+        setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
+        setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
+        setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
+        setNativeEffort(savedNativePolicy?.reasoningEffort?.mode === 'custom' ? savedNativePolicy.reasoningEffort.value : '');
+        setNativePolicyTouched(false);
         const note = [
           summary.residual > 0 ? tr('botDefaults.agentClosedResidual', { count: summary.residual }) : '',
           residualIdText(summary, tr),
@@ -2440,10 +2501,48 @@ export function BotAgentSection(props: {
     () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
     [cliKey, isCodexSelection, model],
   );
+  const nativeReasoningEffortOptions = useMemo(
+    () => nativeModelMode === 'custom'
+      ? reasoningEffortsForCliModel('traex', nativeModel)
+      : CODEX_REASONING_EFFORTS,
+    [nativeModel, nativeModelMode],
+  );
 
   useEffect(() => {
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
   }, [reasoningEffort, reasoningEffortOptions]);
+  useEffect(() => {
+    if (nativeModelMode !== 'custom') {
+      if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));
+      return;
+    }
+    if (nativePolicyErrors.model && nativeModel.trim()) {
+      setNativePolicyErrors(current => ({ ...current, model: null }));
+    }
+  }, [nativeModel, nativeModelMode, nativePolicyErrors.model]);
+  useEffect(() => {
+    if (nativeEffortMode !== 'custom') {
+      if (nativePolicyErrors.effort) setNativePolicyErrors(current => ({ ...current, effort: null }));
+      return;
+    }
+    if (nativePolicyErrors.effort && nativeEffort) {
+      setNativePolicyErrors(current => ({ ...current, effort: null }));
+    }
+  }, [nativeEffort, nativeEffortMode, nativePolicyErrors.effort]);
+  useEffect(() => {
+    if (
+      cliKey === 'traex'
+      && nativePolicyTouched
+      && nativeEffortMode === 'custom'
+      && nativeEffort
+      && !nativeReasoningEffortOptions.includes(nativeEffort)
+    ) {
+      setNativeEffortMode('passthrough');
+      setNativeEffort('');
+      setNativePolicyTouched(true);
+      setNativePolicyErrors(current => ({ ...current, effort: null }));
+    }
+  }, [cliKey, nativeEffort, nativeEffortMode, nativePolicyTouched, nativeReasoningEffortOptions]);
   // Old dashboard payloads can omit agentSelectionKey while still carrying a
   // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
   // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
@@ -2795,6 +2894,96 @@ export function BotAgentSection(props: {
               ]}
               onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
             />
+          </div>
+        </div>
+      )}
+      {cliKey === 'traex' && (
+        <div className="bd-codex-runtime" data-native-subagent-runtime="">
+          <div className="bd-runtime-heading">
+            <FieldTitle help={tr('botDefaults.nativeSubagentHelp')}>{tr('botDefaults.nativeSubagentTitle')}</FieldTitle>
+          </div>
+          <div className="bd-row">
+            <div className="bd-field">
+              <span>{tr('botDefaults.nativeSubagentModel')}</span>
+              <DropdownField
+                dataInput="nativeSubagentModelMode"
+                ariaLabel={tr('botDefaults.nativeSubagentModel')}
+                value={nativeModelMode}
+                disabled={agentBusy}
+                options={[
+                  { value: 'passthrough', label: tr('botDefaults.nativeSubagentPassthrough') },
+                  { value: 'custom', label: tr('botDefaults.nativeSubagentCustom') },
+                ]}
+                onChange={next => { setNativeModelMode(next as NativePolicyMode); setNativePolicyTouched(true); }}
+              />
+            </div>
+            {nativeModelMode === 'custom' ? (
+              <label>
+                <span>{tr('botDefaults.nativeSubagentCustomModel')}</span>
+                <ModelPickerField
+                  value={nativeModel}
+                  onChange={next => {
+                    setNativeModel(next);
+                    setNativePolicyTouched(true);
+                    if (nativePolicyErrors.model && next.trim()) {
+                      setNativePolicyErrors(current => ({ ...current, model: null }));
+                    }
+                  }}
+                  options={modelCandidates}
+                  disabled={agentBusy}
+                  busy={detectingModels}
+                  dataInput="nativeSubagentModel"
+                  ariaLabel={tr('botDefaults.nativeSubagentCustomModel')}
+                  defaultLabel={tr('botDefaults.modelPickerDefault')}
+                  customLabel={tr('botDefaults.modelPickerCustom')}
+                  menuClassName="bd-field-menu"
+                />
+                {nativePolicyErrors.model ? (
+                  <small className="hint-warn" data-native-subagent-error="">{nativePolicyErrors.model}</small>
+                ) : null}
+              </label>
+            ) : null}
+          </div>
+          <div className="bd-row">
+            <div className="bd-field">
+              <span>{tr('botDefaults.nativeSubagentReasoningEffort')}</span>
+              <DropdownField
+                dataInput="nativeSubagentReasoningEffortMode"
+                ariaLabel={tr('botDefaults.nativeSubagentReasoningEffort')}
+                value={nativeEffortMode}
+                disabled={agentBusy}
+                options={[
+                  { value: 'passthrough', label: tr('botDefaults.nativeSubagentPassthrough') },
+                  { value: 'custom', label: tr('botDefaults.nativeSubagentCustom') },
+                ]}
+                onChange={next => { setNativeEffortMode(next as NativePolicyMode); setNativePolicyTouched(true); }}
+              />
+            </div>
+            {nativeEffortMode === 'custom' ? (
+              <div className="bd-field">
+                <span>{tr('botDefaults.nativeSubagentCustomReasoningEffort')}</span>
+                <DropdownField
+                  dataInput="nativeSubagentReasoningEffort"
+                  ariaLabel={tr('botDefaults.nativeSubagentCustomReasoningEffort')}
+                  value={nativeEffort}
+                  disabled={agentBusy}
+                  options={nativeReasoningEffortOptions.map(value => ({
+                    value,
+                    label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
+                  }))}
+                  onChange={next => {
+                    setNativeEffort(next as NativeEffort);
+                    setNativePolicyTouched(true);
+                    if (nativePolicyErrors.effort && next) {
+                      setNativePolicyErrors(current => ({ ...current, effort: null }));
+                    }
+                  }}
+                />
+                {nativePolicyErrors.effort ? (
+                  <small className="hint-warn" data-native-subagent-error="">{nativePolicyErrors.effort}</small>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       )}

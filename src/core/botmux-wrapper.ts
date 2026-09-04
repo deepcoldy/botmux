@@ -6,8 +6,19 @@
  * platform-sensitive bits (PATH delimiter, Windows `.cmd` wrapper) live in one
  * pure, unit-tested place instead of being duplicated as inline string concat.
  */
+import { realpathSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
+
+const BOTMUX_WRAPPER_BASENAME = 'botmux';
+const NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME = 'botmux-native-subagent-runtime-hook';
+
+function wrapperFilename(
+  basenameWithoutExtension: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32' ? `${basenameWithoutExtension}.cmd` : basenameWithoutExtension;
+}
 
 /**
  * SINGLE SOURCE OF TRUTH for the `botmux` wrapper bin dir (codex P1). The daemon
@@ -31,6 +42,33 @@ export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env)
     return join(env.SESSION_DATA_DIR, 'bin');
   }
   return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
+}
+
+/**
+ * Stable daemon-updated wrapper path. Derive it from the same single source of
+ * truth used by daemon.writePidFile(), including the dedicated core-only bin.
+ * Canonicalize the directory so a symlinked lexical HOME still lands on the path
+ * that a full bwrap session actually binds. BOTMUX_BIN_PATH is an MCP gateway
+ * override, not a wrapper-write location, and therefore is intentionally ignored.
+ */
+export function resolveStableBotmuxWrapperPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const lexicalDir = resolveBotmuxWrapperBinDir(env);
+  let canonicalDir = lexicalDir;
+  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
+  return join(canonicalDir, wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform));
+}
+
+export function resolveNativeSubagentRuntimeHookWrapperPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const lexicalDir = resolveBotmuxWrapperBinDir(env);
+  let canonicalDir = lexicalDir;
+  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
+  return join(canonicalDir, wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform));
 }
 
 /**
@@ -94,24 +132,44 @@ export function botmuxWrapperFiles(
   if (standalone) {
     const binaryPath = nodePath;
     const files: BotmuxWrapperFile[] = [
-      { name: 'botmux', content: `#!/bin/sh\nexec "${binaryPath}" "$@"\n`, mode: 0o755 },
+      { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec "${binaryPath}" "$@"\n`, mode: 0o755 },
+      {
+        name: NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME,
+        content: `#!/bin/sh\nexec "${binaryPath}" native-subagent-runtime-hook "$@"\n`,
+        mode: 0o755,
+      },
     ];
     if (platform === 'win32') {
       files.push({
-        name: 'botmux.cmd',
+        name: wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform),
         content: `@echo off\r\n"${binaryPath}" %*\r\n`,
+        mode: 0o755,
+      });
+      files.push({
+        name: wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform),
+        content: `@echo off\r\n"${binaryPath}" native-subagent-runtime-hook %*\r\n`,
         mode: 0o755,
       });
     }
     return files;
   }
   const files: BotmuxWrapperFile[] = [
-    { name: 'botmux', content: `#!/bin/sh\nexec node "${cliScript}" "$@"\n`, mode: 0o755 },
+    { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec node "${cliScript}" "$@"\n`, mode: 0o755 },
+    {
+      name: NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME,
+      content: `#!/bin/sh\nexec node "${cliScript}" native-subagent-runtime-hook "$@"\n`,
+      mode: 0o755,
+    },
   ];
   if (platform === 'win32') {
     files.push({
-      name: 'botmux.cmd',
+      name: wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform),
       content: `@echo off\r\n"${nodePath}" "${cliScript}" %*\r\n`,
+      mode: 0o755,
+    });
+    files.push({
+      name: wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform),
+      content: `@echo off\r\n"${nodePath}" "${cliScript}" native-subagent-runtime-hook %*\r\n`,
       mode: 0o755,
     });
   }

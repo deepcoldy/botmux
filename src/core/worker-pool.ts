@@ -109,7 +109,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../serv
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
-const DAEMON_BOOT_ID = randomUUID();
+const DAEMON_BOOT_ID = randomBytes(32).toString('base64url');
 const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
@@ -12822,7 +12822,25 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
-        ds.managedTurnOrigin = undefined;
+        // The live-send capability dies with this backend. Preserve the
+        // worker-generation policy capability only while this local worker is
+        // still eligible for same-worker crash recovery. Branches that cannot
+        // restart in place start with no authority, and crash-loop protection
+        // clears this temporary policy-only state before parking below.
+        const mayRestartLocalWorker = !(msg.codexAppActiveWriter === true
+          && effectiveCliId === 'codex-app')
+          && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds)
+          && !worker.killed;
+        ds.managedTurnOrigin = mayRestartLocalWorker && ds.managedTurnOrigin?.policyCapability
+          ? {
+              capability: randomBytes(32).toString('hex'),
+              ...(ds.managedTurnOrigin.originChannelId
+                ? { originChannelId: ds.managedTurnOrigin.originChannelId }
+                : {}),
+              policyCapability: ds.managedTurnOrigin.policyCapability,
+            }
+          : undefined;
         // The worker/CLI generation ended. Disable an outstanding stuck-warning
         // card before any replacement worker can be attached; otherwise a late
         // click could inject its keys into the replacement CLI.
@@ -12965,6 +12983,7 @@ function setupWorkerHandlers(
         restartCounts.set(key, rc);
 
         if (rc.count > 3) {
+          ds.managedTurnOrigin = undefined;
           logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working"
@@ -13047,6 +13066,8 @@ function setupWorkerHandlers(
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
           ds.workerReady = false;
           ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+        } else {
+          ds.managedTurnOrigin = undefined;
         }
         break;
       }
@@ -13267,7 +13288,15 @@ function setupWorkerHandlers(
         // from clearing a capability already rotated for turn N+1.
         if (ds.managedTurnOrigin?.turnId === msg.turnId
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
-          ds.managedTurnOrigin = undefined;
+          ds.managedTurnOrigin = ds.managedTurnOrigin.policyCapability
+            ? {
+                capability: randomBytes(32).toString('hex'),
+                ...(ds.managedTurnOrigin.originChannelId
+                  ? { originChannelId: ds.managedTurnOrigin.originChannelId }
+                  : {}),
+                policyCapability: ds.managedTurnOrigin.policyCapability,
+              }
+            : undefined;
         }
         // Settle this turn's native CoT message, if one is live. Cosmetic and
         // self-catching — must never delay or fail the terminal path
@@ -13592,6 +13621,9 @@ function setupWorkerHandlers(
                 sessionId: msg.sessionId,
                 channelId: msg.originChannelId,
                 capability: msg.capability,
+                ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),
+                larkAppId: ds.larkAppId,
+                bootInstanceId: getDaemonBootId(),
                 ...(Number.isSafeInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65_535
                   ? { ipcPort }
                   : {}),
@@ -13610,6 +13642,7 @@ function setupWorkerHandlers(
         const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
         ds.managedTurnOrigin = {
           capability: msg.capability,
+          ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
@@ -13634,27 +13667,50 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
-        // Same-worker IPC is ordered, but token-match as well so a delayed
-        // revoke can never clear authority already rotated by the next turn.
-        if (msg.capability
-          && ds.managedTurnOrigin?.capability
-          && ds.managedTurnOrigin.capability !== msg.capability) {
-          logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
-          break;
-        }
+        // Same-worker IPC is ordered, but exact-match both authorities so a
+        // delayed revoke can never clear a token already rotated by the next
+        // turn. Live-send and policy authority are independent: a stale token
+        // for one must not block a matching revoke for the other.
+        const origin = ds.managedTurnOrigin;
+        if (!origin) break;
         if (msg.originChannelId
-          && ds.managedTurnOrigin?.originChannelId
-          && ds.managedTurnOrigin.originChannelId !== msg.originChannelId) {
+          && origin.originChannelId
+          && origin.originChannelId !== msg.originChannelId) {
           logger.warn(`[${t}] Ignored managed_turn_origin_revoked for a different pane channel`);
           break;
         }
-        if (!msg.capability && ds.managedTurnOrigin
-          && (ds.managedTurnOrigin.turnId !== msg.turnId
-            || ds.managedTurnOrigin.dispatchAttempt !== msg.dispatchAttempt)) {
+        const unboundLiveRevoke = !msg.capability && !msg.policyCapability;
+        if (unboundLiveRevoke
+          && (origin.turnId !== msg.turnId
+            || origin.dispatchAttempt !== msg.dispatchAttempt)) {
           logger.warn(`[${t}] Ignored unbound stale managed turn origin revoke`);
           break;
         }
-        ds.managedTurnOrigin = undefined;
+        const revokeLive = unboundLiveRevoke
+          || (msg.capability !== undefined && origin.capability === msg.capability);
+        const revokePolicy = msg.policyCapability !== undefined
+          && origin.policyCapability === msg.policyCapability;
+        if (msg.capability !== undefined && !revokeLive) {
+          logger.warn(`[${t}] Ignored stale live capability in managed turn origin revoke`);
+        }
+        if (msg.policyCapability !== undefined && !revokePolicy) {
+          logger.warn(`[${t}] Ignored stale policy capability in managed turn origin revoke`);
+        }
+        if (!revokeLive && !revokePolicy) break;
+        if (revokeLive) {
+          ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
+            ? {
+                capability: randomBytes(32).toString('hex'),
+                ...(msg.originChannelId ?? origin.originChannelId
+                  ? { originChannelId: msg.originChannelId ?? origin.originChannelId }
+                  : {}),
+                policyCapability: origin.policyCapability,
+              }
+            : undefined;
+          break;
+        }
+        const { policyCapability: _revokedPolicyCapability, ...liveOrigin } = origin;
+        ds.managedTurnOrigin = liveOrigin;
         break;
       }
 

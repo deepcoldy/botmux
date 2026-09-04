@@ -6,10 +6,27 @@
 botmux dashboard          # 获取当前 URL；尚无 token 时创建第一个
 botmux dashboard current  # 同一操作的显式写法
 botmux dashboard rotate   # 轮换 token 并输出新 URL
-# 输出: http://<lan-ip>:7891/?t=<token>
+# 已绑定中心化平台: https://m-<machineId>.<平台域名>/          ← 不带 token
+# 其余情况(局域网 / 自建反代 / Devbox 短链): …/?t=<token>      ← 带 token
 ```
 
 > 这是**轮换式登录 token**：一条 URL 会一直有效，直到 `botmux dashboard rotate` 生成新 token、让旧 URL 失效；token 会持久化、`botmux restart` 后仍有效。裸命令/current 会复用这个 token，尚无 token 时创建第一个。成功访问 `?t=` 只是把同一 token 写进 cookie，不消费/作废它，轮换前同一 URL 可重复登录——所以分享链接≈分享登录态，注意保管。默认端口 `7891`，可用 `BOTMUX_DASHBOARD_PORT` 改。
+
+### 链接里什么时候带 token
+
+| 状态 | 主链接形态 | 为什么 |
+|---|---|---|
+| **已绑定中心化平台**（远程访问开 + 已 bind） | `https://m-<machineId>.<平台域名>/` —— **不带 token** | 走平台子域时身份由平台注入并先过 SSO，`?t=` 会被服务端压制成无效（带上也是 401），token 对访问零贡献、只剩泄漏风险。真人 owner 是被平台认出来的 |
+| 自建反代 `BOTMUX_PUBLIC_URL` / Devbox 短链 | `https://<你的域名>/?t=<token>` —— **带 token** | 这两条只是把请求反代到本机 dashboard，**没有人注入身份**，token 仍是唯一凭证；且平台登录出口在未绑定时不存在，去掉就进不去了 |
+| 未配任何远程基址（纯局域网 `ip:port`） | `http://<lan-ip>:7891/?t=<token>` —— **带 token** | 同上：去掉后只剩一个静态壳 |
+
+⚠️ 判据是「**是否由中心平台托管**」，不是「有没有远程基址」—— 后者会把自建反代和 Devbox 短链一起误判成可以去 token，而那两条路去掉 token 会变成打不开的死链。
+
+这个判据由 **dashboard 进程在 `/__cli/*` 响应里如实标注**（`platformHosted` 字段），CLI 不自己推断：只有 dashboard 知道它实际用了哪条基址，调用方各自推断会与它不一致。字段缺失（旧版 dashboard）或不是严格 `true` 时一律**保留** token —— 少去一次只是维持现状，多去一次可能让 owner 完全进不去。
+
+绑定平台后，那条带 token 的本地直连链接**默认不再打印**（它是平台异常时的兜底）。确实需要用 `ip:port + token` 方式管理时，加一个刻意起得很长的参数即可取回——参数名会在命令输出里提示，只给人看，不进 `--help`：这是为了避免 AI 顺手带上它、把 token 带进思考过程或聊天记录。
+
+⚠️ **Dashboard 链接等同管理员凭证**：只发给 owner 本人，不要在多人群里发带 `?t=` 的链接（聊天记录会长期留存、可被转发截图）。给别人指路时只说「在服务器上运行 `botmux dashboard`」，让对方自己取。命令输出末尾也钉了一段给 AI 读的安全提示，让模型在决定「要不要把这条链接发出去」时就能读到这条规则。怀疑泄漏时 `botmux dashboard rotate`，所有旧链接当场失效。
 
 ![Dashboard Groups 面板](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300739_dash-groups.png)
 <p class="cap">Groups 面板：chat × bot 矩阵，一眼看清哪个群里有哪些机器人</p>

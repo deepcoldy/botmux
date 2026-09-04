@@ -264,6 +264,7 @@ async function runNodeImpl(
     let manifestCandidate: { size: number; mtimeMs: number; firstSeenMs: number } | undefined;
     let webPort: number | undefined;
     let token: string | undefined;
+    let viewToken: string | undefined;
     let cancelRequested = false;
     let initSent = false;
     let goalSent = false;
@@ -279,6 +280,7 @@ async function runNodeImpl(
         sessionId,
         ...(webPort !== undefined ? { webPort } : {}),
         ...(token ? { token } : {}),
+        ...(viewToken ? { viewToken } : {}),
       };
     }
 
@@ -405,6 +407,7 @@ async function runNodeImpl(
         case 'ready':
           webPort = event.port;
           token = event.token;
+          viewToken = event.viewToken;
           notifySessionReady();
           try {
             sendInit();

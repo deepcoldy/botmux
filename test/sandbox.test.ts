@@ -62,6 +62,37 @@ describe('credential-only managed-origin carve-out', () => {
     expect(args).not.toContain(`${parent}/origin-${'b'.repeat(64)}`);
   });
 
+  it('groups sibling private directories by parent so one tmpfs does not mask another', () => {
+    const parent = '/srv/botmux/data/read-isolation';
+    const ownA = `${parent}/origin-${'a'.repeat(64)}`;
+    const ownB = `${parent}/origin-${'b'.repeat(64)}`;
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/srv/botmux/device-authority'],
+      hideFiles: ['/srv/botmux/.dashboard-secret'],
+      privateReadonlyDirectories: [
+        { parent, directory: ownB },
+        { parent, directory: ownA },
+        { parent, directory: ownA },
+      ],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    const parentTmpfs = args
+      .map((value, index) => value === '--tmpfs' && args[index + 1] === parent ? index : -1)
+      .filter(index => index >= 0);
+    const binds = args
+      .map((value, index) => value === '--ro-bind'
+        && args[index + 1].startsWith(`${parent}/origin-`)
+        && args[index + 1] === args[index + 2]
+        ? args[index + 1]
+        : null)
+      .filter((value): value is string => value !== null);
+    expect(parentTmpfs).toHaveLength(1);
+    expect(binds).toEqual([ownA, ownB]);
+    expect(parentTmpfs[0]).toBeLessThan(args.indexOf('--chdir'));
+  });
+
   it('rejects a private directory outside the hidden parent', () => {
     expect(() => buildCredentialOnlySandboxArgs({
       hideDirectories: ['/srv/botmux/device-authority'],

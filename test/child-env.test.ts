@@ -261,16 +261,15 @@ describe('stripDashboardH5Env()', () => {
     expect(stripAt).toBeGreaterThan(dotenvAt);
   });
 
-  it('is also called by index-supervisor.ts after its own wholesale dotenv (source pin)', () => {
-    // index-supervisor.ts dotenv-loads the same ~/.botmux/.env wholesale as
-    // index-daemon.ts, and resolveFleetDaemonEnv() spreads this process's env
-    // into every supervised member — an unstripped secret would sit in this
-    // long-lived process and ride into every bot daemon and the dashboard.
+  it('is called by index-supervisor.ts without wholesale dotenv loading (source pin)', () => {
+    // The supervisor scrubs any inherited H5 credentials before it seeds the
+    // fleet, but deliberately does NOT wholesale-load ~/.botmux/.env: doing so
+    // would place dashboard-only secrets in a long-lived parent of every bot.
+    // The dashboard remains the only entry that loads those settings from disk.
     const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
-    const dotenvAt = src.indexOf('dotenvConfig(');
     const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
-    expect(dotenvAt).toBeGreaterThan(-1);
-    expect(stripAt).toBeGreaterThan(dotenvAt);
+    expect(stripAt).toBeGreaterThan(-1);
+    expect(src).not.toContain('dotenvConfig(');
   });
 
   it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {

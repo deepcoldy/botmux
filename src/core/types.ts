@@ -520,6 +520,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Session-lifetime runtime-policy lookup authority. */
+    policyCapability?: string;
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;

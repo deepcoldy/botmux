@@ -4,14 +4,17 @@ import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-e
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 
 /**
- * Every key resolves to '' unless a source sets it, except the dashboard bind
- * host whose historical default lands in resolveDaemonEnv itself. Built from
+ * Every key resolves to '' unless a source sets it, except the terminal and
+ * dashboard bind hosts whose historical defaults land in resolveDaemonEnv. Built from
  * DAEMON_ENV_KEYS so the exact-shape assertions below keep working (and keep
  * being exact) as the list grows.
  */
 function expected(overrides: Partial<Record<string, string>> = {}): Record<string, string> {
   return {
     ...Object.fromEntries(DAEMON_ENV_KEYS.map(key => [key, ''])),
+    WEB_HOST: '0.0.0.0',
+    BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
+    BOTMUX_WORKER_HOST: '',
     BOTMUX_DASHBOARD_HOST: '0.0.0.0',
     ...overrides,
   };
@@ -21,7 +24,12 @@ describe('resolveDaemonEnv()', () => {
   it('clears inherited settings when restart comes from a botmux session', () => {
     expect(resolveDaemonEnv({
       BOTMUX_SESSION_ID: 'session-1',
+      WEB_HOST: '127.0.0.1',
       WEB_EXTERNAL_HOST: '10.255.64.131',
+      WEB_EXTERNAL_PORT: '9000',
+      BOTMUX_WEB_PROXY_BASE_PORT: '8800',
+      BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
+      BOTMUX_WORKER_HOST: '::',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: '10.255.64.131',
       BOTMUX_DASHBOARD_HOST: '10.255.64.131',
       BOTMUX_DASHBOARD_PORT: '9999',
@@ -36,11 +44,21 @@ describe('resolveDaemonEnv()', () => {
   it('reloads explicit settings from .env for a session-origin restart', () => {
     expect(resolveDaemonEnv({
       BOTMUX_SESSION_ID: 'session-1',
+      WEB_HOST: '127.0.0.1',
       WEB_EXTERNAL_HOST: 'stale.example.com',
+      WEB_EXTERNAL_PORT: '9000',
+      BOTMUX_WEB_PROXY_BASE_PORT: '8800',
+      BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
+      BOTMUX_WORKER_HOST: '::',
       BOTMUX_DASHBOARD_HOST: '0.0.0.0',
       BOTMUX_DASHBOARD_PORT: '7891',
     }, [
+      'WEB_HOST=0.0.0.0',
       'WEB_EXTERNAL_HOST=relay.example.com',
+      'WEB_EXTERNAL_PORT=9100',
+      'BOTMUX_WEB_PROXY_BASE_PORT=8900',
+      'BOTMUX_WORKER_HTTP_HOST=127.0.0.2',
+      'BOTMUX_WORKER_HOST=::1',
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
@@ -51,7 +69,12 @@ describe('resolveDaemonEnv()', () => {
       // only the .env snapshot can keep web-terminal links on the proxy domain.
       'BOTMUX_PUBLIC_URL=http://botmux.example.com',
     ].join('\n'))).toEqual(expected({
+      WEB_HOST: '0.0.0.0',
       WEB_EXTERNAL_HOST: 'relay.example.com',
+      WEB_EXTERNAL_PORT: '9100',
+      BOTMUX_WEB_PROXY_BASE_PORT: '8900',
+      BOTMUX_WORKER_HTTP_HOST: '127.0.0.2',
+      BOTMUX_WORKER_HOST: '',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
       BOTMUX_DASHBOARD_HOST: '127.0.0.1',
       BOTMUX_DASHBOARD_PORT: '7991',
@@ -63,14 +86,24 @@ describe('resolveDaemonEnv()', () => {
 
   it('keeps ordinary shell overrides ahead of .env', () => {
     expect(resolveDaemonEnv({
+      WEB_HOST: '127.0.0.2',
       WEB_EXTERNAL_HOST: 'shell.example.com',
+      WEB_EXTERNAL_PORT: '9200',
+      BOTMUX_WEB_PROXY_BASE_PORT: '8200',
+      BOTMUX_WORKER_HTTP_HOST: '127.0.0.3',
+      BOTMUX_WORKER_HOST: '::2',
       BOTMUX_DASHBOARD_HOST: '127.0.0.2',
       BOTMUX_DASHBOARD_PORT: '7992',
       BOTMUX_DAEMON_IPC_BASE_PORT: '7993',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://shell.proxy.example.com',
     }, [
+      'WEB_HOST=0.0.0.0',
       'WEB_EXTERNAL_HOST=file.example.com',
+      'WEB_EXTERNAL_PORT=9100',
+      'BOTMUX_WEB_PROXY_BASE_PORT=8900',
+      'BOTMUX_WORKER_HTTP_HOST=127.0.0.2',
+      'BOTMUX_WORKER_HOST=::1',
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
@@ -78,7 +111,12 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=true',
       'BOTMUX_PUBLIC_URL=http://file.proxy.example.com',
     ].join('\n'))).toEqual(expected({
+      WEB_HOST: '127.0.0.2',
       WEB_EXTERNAL_HOST: 'shell.example.com',
+      WEB_EXTERNAL_PORT: '9200',
+      BOTMUX_WEB_PROXY_BASE_PORT: '8200',
+      BOTMUX_WORKER_HTTP_HOST: '127.0.0.3',
+      BOTMUX_WORKER_HOST: '',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
       BOTMUX_DASHBOARD_HOST: '127.0.0.2',
       BOTMUX_DASHBOARD_PORT: '7992',
@@ -90,7 +128,12 @@ describe('resolveDaemonEnv()', () => {
 
   it('lets an ordinary shell explicitly clear persisted settings', () => {
     expect(resolveDaemonEnv({
+      WEB_HOST: '',
       WEB_EXTERNAL_HOST: '',
+      WEB_EXTERNAL_PORT: '',
+      BOTMUX_WEB_PROXY_BASE_PORT: '   ',
+      BOTMUX_WORKER_HTTP_HOST: '',
+      BOTMUX_WORKER_HOST: '   ',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: '   ',
       BOTMUX_DASHBOARD_HOST: '',
       BOTMUX_DASHBOARD_PORT: '   ',
@@ -98,7 +141,12 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DASHBOARD_PUBLIC_READONLY: '',
       BOTMUX_PUBLIC_URL: '',
     }, [
+      'WEB_HOST=0.0.0.0',
       'WEB_EXTERNAL_HOST=file.example.com',
+      'WEB_EXTERNAL_PORT=9100',
+      'BOTMUX_WEB_PROXY_BASE_PORT=8900',
+      'BOTMUX_WORKER_HTTP_HOST=127.0.0.2',
+      'BOTMUX_WORKER_HOST=::1',
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
@@ -107,15 +155,51 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_PUBLIC_URL=http://file.proxy.example.com',
     ].join('\n'))).toEqual(expected());
   });
+
+  it('normalizes the legacy worker host alias into the canonical fleet snapshot', () => {
+    expect(resolveDaemonEnv({
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
+      BOTMUX_WORKER_HOST: '::',
+    }, 'BOTMUX_WORKER_HOST=127.0.0.4')).toEqual(expected({
+      BOTMUX_WORKER_HTTP_HOST: '127.0.0.4',
+      BOTMUX_WORKER_HOST: '',
+    }));
+  });
+
+  it.each([
+    {
+      name: 'keeps an inherited legacy alias ahead of the persisted legacy alias for a shell start',
+      inherited: { BOTMUX_WORKER_HOST: '::2' },
+      file: 'BOTMUX_WORKER_HOST=::1',
+      want: '::2',
+    },
+    {
+      name: 'lets an empty persisted canonical key shadow an inherited legacy alias for a shell start',
+      inherited: { BOTMUX_WORKER_HOST: '::2' },
+      file: 'BOTMUX_WORKER_HTTP_HOST=\nBOTMUX_WORKER_HOST=::1',
+      want: '0.0.0.0',
+    },
+    {
+      name: 'lets an empty persisted canonical key shadow the persisted legacy alias for a session restart',
+      inherited: { BOTMUX_SESSION_ID: 'session-1', BOTMUX_WORKER_HOST: '::2' },
+      file: 'BOTMUX_WORKER_HTTP_HOST=\nBOTMUX_WORKER_HOST=::1',
+      want: '0.0.0.0',
+    },
+  ])('$name', ({ inherited, file, want }) => {
+    const resolved = resolveDaemonEnv(inherited, file);
+
+    expect(resolved.BOTMUX_WORKER_HTTP_HOST).toBe(want);
+    expect(resolved.BOTMUX_WORKER_HOST).toBe('');
+  });
 });
 
-describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () => {
-  // `botmux-dashboard` is its own PM2 app. Non-secret dashboard settings reach
-  // it via the env block baked from this list; the Feishu H5 login family
+describe('DAEMON_ENV_KEYS carries only non-secret fleet settings', () => {
+  // `botmux-dashboard` is its own supervised member. Non-secret dashboard
+  // settings reach it via the fleet env resolved from this list; the H5 family
   // (APP_SECRET included) deliberately does NOT — the dashboard entry point
   // (index-dashboard.ts) dotenv-loads ~/.botmux/.env itself, so the credential
-  // never enters the SHARED env block that every bot daemon receives and that
-  // persists on disk in ~/.botmux/ecosystem.config.json.
+  // never enters the SHARED env block that every bot daemon receives.
   it('excludes every H5 var — the family flows through index-dashboard.ts dotenv, not this block', () => {
     for (const key of DASHBOARD_H5_ENV_KEYS) {
       expect(DAEMON_ENV_KEYS as readonly string[], key).not.toContain(key);
@@ -125,7 +209,7 @@ describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () =>
   it('keeps every var resolveDashboardH5AuthConfig reads OFF the whitelist (drift guard)', () => {
     // Scrape the single consumer's source: an H5 knob added to h5-auth.ts and
     // then "helpfully" whitelisted here would put a credential-family key back
-    // into the shared baked block. Also sweep the whole prefix so no future
+    // into the shared fleet block. Also sweep the whole prefix so no future
     // DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
     const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
     const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
@@ -139,9 +223,8 @@ describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () =>
   });
 
   it('emits no H5 key even when the inherited env AND .env are fully populated', () => {
-    // The isolation red line: resolveDaemonEnv's output IS the ecosystem env
-    // block (cli.ts ecosystemConfig), shared by the dashboard and every bot
-    // daemon and written to ~/.botmux/ecosystem.config.json. Flood both
+    // The isolation red line: resolveDaemonEnv's output is merged into the env
+    // shared by the supervisor, dashboard, and every bot daemon. Flood both
     // sources with the complete named family plus a future prefix knob; none
     // may surface, for a shell-origin or a session-origin restart alike.
     const floodedEnv = {

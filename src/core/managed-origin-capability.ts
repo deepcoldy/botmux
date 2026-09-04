@@ -15,6 +15,21 @@ export interface ManagedOriginCapabilityClaim {
   sessionId: string;
   channelId?: string;
   capability: string;
+  policyCapability?: string;
+  larkAppId?: string;
+  bootInstanceId?: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  /** Current daemon port, host-written on every capability rotation. */
+  ipcPort?: number;
+}
+
+export interface ManagedOriginPolicyCapabilityClaim {
+  sessionId: string;
+  channelId?: string;
+  policyCapability: string;
+  larkAppId?: string;
+  bootInstanceId?: string;
   turnId?: string;
   dispatchAttempt?: number;
   /** Current daemon port, host-written on every capability rotation. */
@@ -389,6 +404,8 @@ export function hasManagedOriginIsolationMarker(
       domain?: unknown;
       sessionId?: unknown;
       channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
     };
     return parsed.domain === 'botmux.read-isolation-origin.v1'
       && parsed.sessionId === sessionId
@@ -574,19 +591,28 @@ export function readManagedOriginCapability(
       sessionId?: unknown;
       token?: unknown;
       capability?: unknown;
+      policyCapability?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
       ipcPort?: unknown;
       channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
     };
-    if (!relay && parsed.sessionId !== sessionId) return null;
-    if (!relay && parsed.channelId !== channelId) return null;
+    if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId) return null;
+    if (channelId && parsed.channelId !== channelId) return null;
+    const policyCapability = typeof parsed.policyCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(parsed.policyCapability)
+      ? parsed.policyCapability
+      : undefined;
     const capability = typeof parsed.capability === 'string'
       ? parsed.capability
       : parsed.token;
-    if (typeof capability !== 'string' || !/^[a-f0-9]{32,128}$/i.test(capability)) {
-      return null;
-    }
+    const validatedCapability = typeof capability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(capability)
+      ? capability
+      : undefined;
+    if (!validatedCapability) return null;
     const turnId = typeof parsed.turnId === 'string'
       && parsed.turnId.length > 0
       && parsed.turnId.length <= 256
@@ -602,10 +628,107 @@ export function readManagedOriginCapability(
       && parsed.ipcPort > 0 && parsed.ipcPort <= 65_535
       ? parsed.ipcPort
       : undefined;
+    const parsedChannelId = typeof parsed.channelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.channelId)
+      ? parsed.channelId
+      : undefined;
+    if (relay && channelId && parsedChannelId !== channelId) return null;
+    const larkAppId = typeof parsed.larkAppId === 'string'
+      && parsed.larkAppId.length > 0 && parsed.larkAppId.length <= 256
+      ? parsed.larkAppId
+      : undefined;
+    const bootInstanceId = typeof parsed.bootInstanceId === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(parsed.bootInstanceId)
+      ? parsed.bootInstanceId
+      : undefined;
     return {
       sessionId,
-      ...(!relay && channelId ? { channelId } : {}),
-      capability,
+      capability: validatedCapability,
+      ...(parsedChannelId ? { channelId: parsedChannelId } : {}),
+      ...(policyCapability ? { policyCapability } : {}),
+      ...(larkAppId ? { larkAppId } : {}),
+      ...(bootInstanceId ? { bootInstanceId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(ipcPort !== undefined ? { ipcPort } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read only the session-lifetime runtime-policy lookup authority. This is a
+ * distinct credential from the live send capability and is intentionally kept
+ * out of the legacy reader so old call sites do not silently widen to an
+ * optional send token contract.
+ */
+export function readManagedOriginPolicyCapability(
+  dataDir: string,
+  sessionId: string | undefined,
+  relayDir?: string,
+  channelId?: string,
+): ManagedOriginPolicyCapabilityClaim | null {
+  if (!sessionId) return null;
+  const relay = !!relayDir;
+  if (!relay && !channelId) return null;
+  const path = relay
+    ? join(relayDir!, RELAY_ORIGIN_CAPABILITY_BASENAME)
+    : managedOriginCapabilityPath(dataDir, sessionId, channelId!);
+  try {
+    const body = readManagedOriginAuthorityFile(path, 8 * 1024);
+    if (!body) return null;
+    const parsed = JSON.parse(body) as {
+      sessionId?: unknown;
+      policyCapability?: unknown;
+      turnId?: unknown;
+      dispatchAttempt?: unknown;
+      ipcPort?: unknown;
+      channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
+    };
+    if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId) return null;
+    if (channelId && parsed.channelId !== channelId) return null;
+    const policyCapability = typeof parsed.policyCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(parsed.policyCapability)
+      ? parsed.policyCapability
+      : undefined;
+    if (!policyCapability) return null;
+    const turnId = typeof parsed.turnId === 'string'
+      && parsed.turnId.length > 0
+      && parsed.turnId.length <= 256
+      ? parsed.turnId
+      : undefined;
+    const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+      && Number.isSafeInteger(parsed.dispatchAttempt)
+      && parsed.dispatchAttempt > 0
+      ? parsed.dispatchAttempt
+      : undefined;
+    const ipcPort = typeof parsed.ipcPort === 'number'
+      && Number.isSafeInteger(parsed.ipcPort)
+      && parsed.ipcPort > 0 && parsed.ipcPort <= 65_535
+      ? parsed.ipcPort
+      : undefined;
+    const parsedChannelId = typeof parsed.channelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.channelId)
+      ? parsed.channelId
+      : undefined;
+    if (relay && channelId && parsedChannelId !== channelId) return null;
+    const larkAppId = typeof parsed.larkAppId === 'string'
+      && parsed.larkAppId.length > 0 && parsed.larkAppId.length <= 256
+      ? parsed.larkAppId
+      : undefined;
+    const bootInstanceId = typeof parsed.bootInstanceId === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(parsed.bootInstanceId)
+      ? parsed.bootInstanceId
+      : undefined;
+    return {
+      sessionId,
+      policyCapability,
+      ...(parsedChannelId ? { channelId: parsedChannelId } : {}),
+      ...(larkAppId ? { larkAppId } : {}),
+      ...(bootInstanceId ? { bootInstanceId } : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(ipcPort !== undefined ? { ipcPort } : {}),

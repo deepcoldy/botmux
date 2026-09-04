@@ -132,7 +132,7 @@ export const DASHBOARD_H5_ENV_KEYS = [
  *  - core/maintenance.ts detachedRestartEnv(): the detached `botmux restart`
  *    the DASHBOARD spawns (update/restart button) inherits the dashboard's env,
  *    which legitimately holds the secrets; the restart driver does not need
- *    them and must not carry them toward pm2.
+ *    them and must not carry them toward the fleet supervisor.
  * redactChildEnv() keeps its own equivalent strip as the second line of
  * defense at every CLI-child boundary (PTY/tmux pane unset/one-shot).
  */

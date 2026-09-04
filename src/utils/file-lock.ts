@@ -1023,7 +1023,7 @@ export function withFileLockSync<T>(
       }
     }
 
-    if (Date.now() - start > maxWaitMs) {
+    if (Date.now() - start >= maxWaitMs) {
       throw new FileLockTimeoutError(lockPath, holder?.pid, lockAgeMs);
     }
     sleepSync(RETRY_BASE_MS + Math.random() * RETRY_BASE_MS);

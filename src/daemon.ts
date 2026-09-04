@@ -20,7 +20,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
-import { buildDashboardUrls } from './core/dashboard-url.js';
+import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
@@ -403,7 +403,6 @@ import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.j
 import { persistV3StartIntent } from './workflows/v3/start-intent.js';
 import {
   createWorkflowDaemonIpcNonceStore,
-  generateWorkflowDaemonBootInstanceId,
   loadWorkflowDaemonIpcSecret,
   signWorkflowDaemonIpcResponse,
   verifyWorkflowDaemonIpcRequest,
@@ -3964,6 +3963,7 @@ function writePidFile(): void {
     // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
     for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
       const wrapper = join(BOTMUX_BIN_DIR, file.name);
+      const isMainWrapper = file.name === 'botmux' || file.name === 'botmux.cmd';
       // NEVER overwrite the running executable. install.sh installs the compiled
       // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
       // the daemon replaced its own 94MB executable with a 47-byte script on every
@@ -3974,7 +3974,7 @@ function writePidFile(): void {
       // `botmux` on PATH, so there is nothing a wrapper needs to add.
       let isRunningBinary = false;
       try {
-        isRunningBinary = realpathSync(wrapper) === realpathSync(process.execPath);
+        isRunningBinary = isMainWrapper && realpathSync(wrapper) === realpathSync(process.execPath);
       } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
       if (isRunningBinary) {
         logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
@@ -21491,7 +21491,18 @@ function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
 
 /** Build the current dashboard URL (active token, not a rotation) from the
  *  dashboard process's persisted `.dashboard-port` / `.dashboard-token`. Falls
- *  back to a token-less base URL if the dashboard hasn't published a token yet. */
+ *  back to a token-less base URL if the dashboard hasn't published a token yet.
+ *
+ *  ⚠️ 这条 URL 的消费者是**飞书卡片**（重启报告 DM、CLI 运行时更新提醒），也就是
+ *  一条**永久聊天记录**：可转发、可截图、可被搜索。所以中心平台托管时必须把
+ *  `?t=` 摘掉 —— 走平台子域时身份由平台注入 + SSO，token 已被
+ *  `dashboard/request-identity.ts` 压制成无效（带上也是 401），对访问零贡献、
+ *  只剩泄漏价值。判据与 `cli/dashboard-command.ts:formatDashboardSuccessLines`
+ *  同源：**只有中心平台**这一条腿可以摘，自建反代 `BOTMUX_PUBLIC_URL` 与 Devbox
+ *  短链没有人注入身份、token 仍是唯一凭证，对它们摘会摘成死链。
+ *
+ *  同理平台托管时**不返回 `localUrl`**：那一条恒定带 token，是给终端里的 owner 当
+ *  平台异常兜底用的（`botmux dashboard` 有显式参数可取），不该主动推进聊天记录。 */
 function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   try {
     const dir = join(homedir(), '.botmux');
@@ -21500,10 +21511,15 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
     const tok = loadPersistedToken(join(dir, '.dashboard-token')) ?? '';
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
-    // platform dashboard instead of an unreachable local host:port. In that case
-    // localUrl carries the direct host:port fallback so the owner can still reach
-    // the dashboard if the platform is down.
-    return buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined });
+    // platform dashboard instead of an unreachable local host:port.
+    // `buildDashboardUrls` itself reports whether the base it chose is the
+    // platform's, so nothing here re-derives that bit (a caller that did — and
+    // got it wrong — is what this guard exists for). The narrowing lives in
+    // core/dashboard-url.ts so it is unit-testable: daemon.ts exports nothing a
+    // test can reach.
+    return reportDashboardUrls(
+      buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined }),
+    );
   } catch {
     return {};
   }
@@ -21856,7 +21872,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     pid: process.pid,
     processStartIdentity: daemonProcessStartIdentity,
     startedAt: Date.now(),
-    bootInstanceId: generateWorkflowDaemonBootInstanceId(),
+    bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
     lastHeartbeat: Date.now(),
     // Dashboard create-group only consumes app-scoped open_ids — publish ONLY

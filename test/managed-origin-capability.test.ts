@@ -19,6 +19,7 @@ import {
   managedOriginRootLocatorPath,
   readManagedOriginAuthorityFile,
   readManagedOriginCapability,
+  readManagedOriginPolicyCapability,
   readManagedOriginRootLocator,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
@@ -53,6 +54,7 @@ describe('managed origin capability transport', () => {
       sessionId,
       channelId: G1,
       capability: 'ab'.repeat(32),
+      policyCapability: 'cd'.repeat(32),
       turnId: 'turn-1',
       dispatchAttempt: 2,
     }));
@@ -60,6 +62,7 @@ describe('managed origin capability transport', () => {
       sessionId,
       channelId: G1,
       capability: 'ab'.repeat(32),
+      policyCapability: 'cd'.repeat(32),
       turnId: 'turn-1',
       dispatchAttempt: 2,
     });
@@ -67,6 +70,13 @@ describe('managed origin capability transport', () => {
     expect(readManagedOriginCapability(dir, 'another-session', undefined, G1)).toBeNull();
     expect(readManagedOriginCapability(dir, sessionId, undefined, G2)).toBeNull();
     expect(readManagedOriginCapability(dir, sessionId)).toBeNull();
+    expect(readManagedOriginPolicyCapability(dir, sessionId, undefined, G1)).toEqual({
+      sessionId,
+      channelId: G1,
+      policyCapability: 'cd'.repeat(32),
+      turnId: 'turn-1',
+      dispatchAttempt: 2,
+    });
     expect(hasMatchingManagedOriginCapability(
       dir,
       sessionId,
@@ -139,13 +149,60 @@ describe('managed origin capability transport', () => {
     const relay = join(dir, 'relay');
     mkdirSync(relay);
     const relayPath = join(relay, RELAY_ORIGIN_CAPABILITY_BASENAME);
-    writeFileSync(relayPath, JSON.stringify({ token: 'ef'.repeat(32) }), { mode: 0o600 });
+    writeFileSync(relayPath, JSON.stringify({
+      token: 'ef'.repeat(32),
+      policyCapability: 'ab'.repeat(32),
+    }), { mode: 0o600 });
     expect(readManagedOriginCapability(dir, 'session-a', relay)).toEqual({
       sessionId: 'session-a',
       capability: 'ef'.repeat(32),
+      policyCapability: 'ab'.repeat(32),
+    });
+    expect(readManagedOriginPolicyCapability(dir, 'session-a', relay)).toEqual({
+      sessionId: 'session-a',
+      policyCapability: 'ab'.repeat(32),
     });
     writeFileSync(relayPath, JSON.stringify({ token: 'not-a-capability' }), { mode: 0o600 });
     expect(readManagedOriginCapability(dir, 'session-a', relay)).toBeNull();
+    expect(readManagedOriginPolicyCapability(dir, 'session-a', relay)).toBeNull();
+  });
+
+  it('keeps the legacy reader fail-closed for policy-only claims while the policy reader accepts them', () => {
+    const dir = makeDir();
+    const relay = join(dir, 'relay');
+    mkdirSync(relay);
+    const relayPath = join(relay, RELAY_ORIGIN_CAPABILITY_BASENAME);
+    writeFileSync(relayPath, JSON.stringify({
+      policyCapability: 'ab'.repeat(32),
+      turnId: 'turn-policy',
+      dispatchAttempt: 3,
+      ipcPort: 4310,
+    }), { mode: 0o600 });
+
+    expect(readManagedOriginCapability(dir, 'session-a', relay)).toBeNull();
+    expect(readManagedOriginPolicyCapability(dir, 'session-a', relay)).toEqual({
+      sessionId: 'session-a',
+      policyCapability: 'ab'.repeat(32),
+      turnId: 'turn-policy',
+      dispatchAttempt: 3,
+      ipcPort: 4310,
+    });
+  });
+
+  it('reads daemon routing identity from a host-owned channel claim', () => {
+    const dir = makeDir();
+    const path = managedOriginCapabilityPath(dir, 'session-a', G1);
+    replaceManagedOriginCapabilityFile(path, JSON.stringify({
+      sessionId: 'session-a', channelId: G1, capability: 'ef'.repeat(32),
+      larkAppId: 'app-a', bootInstanceId: 'B'.repeat(43), ipcPort: 4310,
+      turnId: 'turn-a', dispatchAttempt: 2,
+    }));
+
+    expect(readManagedOriginCapability(dir, 'session-a', undefined, G1)).toEqual({
+      sessionId: 'session-a', channelId: G1, capability: 'ef'.repeat(32),
+      larkAppId: 'app-a', bootInstanceId: 'B'.repeat(43), ipcPort: 4310,
+      turnId: 'turn-a', dispatchAttempt: 2,
+    });
   });
 
   it('refuses a symlink capability leaf instead of following it', () => {

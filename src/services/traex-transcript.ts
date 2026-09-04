@@ -329,6 +329,7 @@ function abortErrorCode(reason: unknown): string {
 }
 
 function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
+  if (entry?.type !== 'turn_context') return undefined;
   const settings = entry?.payload?.collaboration_mode?.settings;
   const model = entry?.payload?.model ?? settings?.model;
   const reasoningEffort = entry?.payload?.reasoning_effort

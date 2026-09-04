@@ -41,7 +41,7 @@ import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
-import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
 import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
@@ -2511,6 +2511,45 @@ describe('traex automation trust flags', () => {
       resume: false,
     });
     expect(args.join(' ')).not.toContain('model_backend_variant');
+  });
+
+  it('renders the process hook command as a TOML-safe string', () => {
+    const config = traexNativeSubagentHookConfig('/opt/botmux "quoted"');
+    expect(config).toContain('command="/opt/botmux \\"quoted\\""');
+  });
+
+  it.each([false, true])('adds one process-scoped native subagent hook for resume=%s', (resume) => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-hook',
+      resume,
+      resumeSessionId: resume ? 'native-session' : undefined,
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    const overrides = args.filter(arg => arg.startsWith('hooks.PreToolUse='));
+    expect(overrides).toEqual([
+      'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[{type="command",command="/opt/botmux hook runtime"}]}]',
+    ]);
+    expect(args[args.indexOf(overrides[0]) - 1]).toBe('-c');
+  });
+
+  it('does not attach the native subagent hook to the remote viewer', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-hook-viewer',
+      resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9876',
+      remoteThreadId: 'thread-1',
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    expect(args.join(' ')).not.toContain('hooks.PreToolUse');
+  });
+
+  it('does not attach the Trae-only hook argument to another adapter', () => {
+    const args = createCodexAdapter('/bin/codex').buildArgs({
+      sessionId: 'codex-hook',
+      resume: false,
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    expect(args.join(' ')).not.toContain('hooks.PreToolUse');
   });
 
   it('injects structured reasoning effort as a TraeX launch config', () => {

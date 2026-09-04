@@ -147,13 +147,13 @@ import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, 
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
-import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
 import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
+  DASHBOARD_LOCAL_TOKEN_FLAG,
   dashboardComingUpFromState,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
@@ -162,7 +162,11 @@ import {
   formatDashboardUnreachable,
   shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
-import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import {
+  globalInstallUpdateLockTarget,
+  installLatestBotmuxSync,
+  prepareRestartDriverContext,
+} from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -200,6 +204,7 @@ import {
   managedOriginLegacyIsolationProbeAccess,
   readManagedOriginRootLocator,
   readManagedOriginCapability,
+  readManagedOriginPolicyCapability,
 } from './core/managed-origin-capability.js';
 import {
   attestManagedOrigin,
@@ -215,6 +220,19 @@ import {
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import {
+  NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  generateNativeSubagentRuntimeNonce,
+  nativeSubagentRuntimeCapabilityHeaders,
+  nativeSubagentRuntimeHostChallengeHeaders,
+  readBoundedNativeSubagentRuntimeResponse,
+  readNativeSubagentRuntimeResponseProof,
+  verifyNativeSubagentRuntimeResponse,
+} from './core/native-subagent-runtime-ipc-auth.js';
+import {
+  normalizeNativeSubagentRuntimePolicy,
+  rewriteNativeSubagentSpawnInput,
+} from './services/native-subagent-runtime-policy.js';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
@@ -242,7 +260,6 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
-  bindRestartLeaseTo,
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
   removeRestartIntentAttemptTo,
@@ -2599,18 +2616,7 @@ interface RestartLifecycleFlags {
 
 
 async function cmdRestart(): Promise<void> {
-  const restartLeaseId = process.env.BOTMUX_RESTART_LEASE_ID;
-  const restartLeaseDir = process.env.BOTMUX_RESTART_LEASE_DIR;
-  delete process.env.BOTMUX_RESTART_LEASE_ID;
-  delete process.env.BOTMUX_RESTART_LEASE_DIR;
-  if (restartLeaseId) {
-    if (!restartLeaseDir) throw new Error('restart driver lease directory is missing');
-    let bound = false;
-    withFileLockSync(globalInstallUpdateLockTargetIn(restartLeaseDir), () => {
-      bound = bindRestartLeaseTo(restartLeaseDir, restartLeaseId, process.pid, Date.now());
-    });
-    if (!bound) throw new Error('failed to bind restart driver lease');
-  }
+  const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -2652,7 +2658,7 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const r = restartFleet();
+        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
         if (r.stop.action === 'timeout') {
           throw new Error(
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
@@ -3373,9 +3379,14 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
     if (last.ok) {
-      console.log(`   面板: botmux dashboard (${last.url})`);
-      // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
-      if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
+      // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
+      // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
+      // 这段输出会被大模型读进上下文，所以第一行之外的安全提示也一起给。
+      // 是否摘 token 由 dashboard 在响应里如实标注（result.platformHosted），
+      // CLI 不自己推断——自己推断过一次就出过缺陷（见 dashboard-command.ts）。
+      const [primary, ...rest] = formatDashboardSuccessLines(last);
+      console.log(`   面板: botmux dashboard (${primary})`);
+      for (const line of rest) console.log(`   ${line}`);
       return;
     }
     const keepWaiting = shouldKeepWaitingForDashboard({
@@ -3404,8 +3415,9 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const rawAction = args[0]?.toLowerCase();
-  const resolvesEndpoint = args.length <= 1
+  const positional = args.filter(arg => arg !== DASHBOARD_LOCAL_TOKEN_FLAG);
+  const rawAction = positional[0]?.toLowerCase();
+  const resolvesEndpoint = positional.length <= 1
     && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
     && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
   if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
@@ -3427,9 +3439,12 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
-    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
-    for (const line of formatDashboardSuccessLines(r)) console.log(line);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、本地直连
+    // 兜底（默认隐藏，带 token）、以及给 AI 读的安全提示。绑定中心化平台后首行不再
+    // 带 token —— 行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r, execution.showLocalTokenLink)) {
+      console.log(line);
+    }
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');
@@ -8346,6 +8361,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     replyLayout = undefined;
   }
 
+  const sessionIdSource = sessionIdArg
+    ? 'arg'
+    : ancestorCtx?.sessionId
+      ? 'ancestor'
+      : process.env.BOTMUX_SESSION_ID
+        ? 'env'
+        : 'none';
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
@@ -8379,7 +8401,23 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
 
-  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  if (!s) {
+    console.error(
+      '[botmux send diagnostic] session_lookup_miss'
+      + ` sessionId=${sid}`
+      + ` source=${sessionIdSource}`
+      + ` dataDir=${sendDataDir}`
+      + ` envSessionId=${process.env.BOTMUX_SESSION_ID ?? '-'}`
+      + ` envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ?? '-'}`
+      + ` originSessionId=${originSessionId ?? '-'}`
+      + ` loadedSessions=${sessions.size}`
+      + ` relayDir=${relayDir ? 'present' : 'absent'}`
+      + ` readIsolation=${isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'}`
+      + ` capability=${isolatedCapabilityCtx ? 'present' : 'absent'}`,
+    );
+    console.error(`未找到 session ${sid}`);
+    process.exit(1);
+  }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
   if (replyLayout && !replyStyle.layout) {
@@ -12077,6 +12115,229 @@ async function cmdUserPromptHook(): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
+
+const NATIVE_SUBAGENT_HOOK_STDIN_MAX_BYTES = 256 * 1024;
+const NATIVE_SUBAGENT_HOOK_STDIN_TIMEOUT_MS = 750;
+const NATIVE_SUBAGENT_DIAGNOSTIC_MAX_CHARS = 512;
+
+function nativeSubagentDiagnostic(message: string): void {
+  process.stderr.write(`[native-subagent-runtime-hook] ${message}`
+    .slice(0, NATIVE_SUBAGENT_DIAGNOSTIC_MAX_CHARS) + '\n');
+}
+
+async function readNativeSubagentHookStdin(): Promise<string | undefined> {
+  return await new Promise<string | undefined>(resolveRead => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      process.stdin.off('data', onData);
+      process.stdin.off('end', onEnd);
+      process.stdin.off('error', onError);
+    };
+    const finish = (value: string | undefined, diagnostic?: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (diagnostic) nativeSubagentDiagnostic(diagnostic);
+      if (value === undefined) process.stdin.destroy();
+      resolveRead(value);
+    };
+    const onData = (raw: Buffer | string) => {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      size += chunk.length;
+      if (size > NATIVE_SUBAGENT_HOOK_STDIN_MAX_BYTES) {
+        finish(undefined, 'stdin exceeded size limit; allowing spawn');
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => finish(Buffer.concat(chunks, size).toString('utf8'));
+    const onError = () => finish(undefined, 'stdin read failed; allowing spawn');
+    const timer = setTimeout(
+      () => finish(undefined, 'stdin read timed out; allowing spawn'),
+      NATIVE_SUBAGENT_HOOK_STDIN_TIMEOUT_MS,
+    );
+    process.stdin.on('data', onData);
+    process.stdin.once('end', onEnd);
+    process.stdin.once('error', onError);
+  });
+}
+
+async function writeNativeSubagentHookDirective(value: unknown): Promise<void> {
+  await new Promise<void>(resolveWrite => {
+    process.stdout.write(JSON.stringify(value), () => resolveWrite());
+  });
+}
+
+/** TraeCode PreToolUse(spawn_agent) hook. Transport/protocol failures are
+ * fail-open, but an explicit overload response from the selected trusted or
+ * protected daemon destination is fail-closed so quota pressure cannot bypass
+ * a configured runtime policy. */
+async function cmdNativeSubagentRuntimeHook(): Promise<void> {
+  const stdinText = await readNativeSubagentHookStdin();
+  if (stdinText === undefined) return;
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(stdinText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
+    payload = parsed;
+  } catch {
+    nativeSubagentDiagnostic('malformed hook input; allowing spawn');
+    return;
+  }
+  if (payload.hook_event_name !== 'PreToolUse' || payload.tool_name !== 'spawn_agent') return;
+  if (!payload.tool_input || typeof payload.tool_input !== 'object' || Array.isArray(payload.tool_input)) {
+    nativeSubagentDiagnostic('invalid spawn input; allowing spawn');
+    return;
+  }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID?.trim();
+  if (!sessionId || !larkAppId) return;
+  try {
+    let hostSecret: string | undefined;
+    if (!process.env.BOTMUX_SEND_RELAY) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* isolated */ }
+    }
+    let policyClaim: ReturnType<typeof readManagedOriginPolicyCapability> = null;
+    if (!hostSecret) {
+      const originChannelId = process.env.BOTMUX_ORIGIN_CHANNEL_ID;
+      if (!originChannelId) return;
+      policyClaim = readManagedOriginPolicyCapability(
+        resolveDataDir(), sessionId, undefined, originChannelId,
+      );
+      if (!policyClaim) return;
+    }
+    let daemon: DaemonDescriptorLite | null = null;
+    if (hostSecret) {
+      try { daemon = findDaemon(larkAppId); } catch { /* unavailable */ }
+    }
+    // A capability file is host-written and read-only inside isolation; its port
+    // outranks the inherited compatibility fallback. Mutable discovery data is
+    // deliberately not consulted on this path.
+    const ipcPort = hostSecret
+      ? resolveDaemonIpcPort(daemon?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT)
+      : policyClaim?.ipcPort;
+    if (!ipcPort) return;
+    const targetLarkAppId = hostSecret ? daemon?.larkAppId : policyClaim?.larkAppId;
+    const targetBootInstanceId = hostSecret ? daemon?.bootInstanceId : policyClaim?.bootInstanceId;
+    if (targetLarkAppId !== larkAppId || !targetBootInstanceId) return;
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/native-subagent-runtime`;
+    const requestNonce = generateNativeSubagentRuntimeNonce();
+    const policyHeaders = hostSecret
+      ? nativeSubagentRuntimeHostChallengeHeaders({
+          larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId, nonce: requestNonce,
+        })
+      : nativeSubagentRuntimeCapabilityHeaders({
+          capability: policyClaim!.policyCapability,
+          method: 'POST',
+          path,
+          port: ipcPort,
+          sessionId,
+          larkAppId: targetLarkAppId,
+          bootInstanceId: targetBootInstanceId,
+          nonce: requestNonce,
+        });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    timeout.unref?.();
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...policyHeaders },
+      body: '{}',
+      signal: controller.signal,
+    } satisfies RequestInit;
+    let response: Response;
+    let raw: string;
+    try {
+      response = hostSecret
+        ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+        : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+      if (response.status !== 429 && !response.ok) {
+        void response.body?.cancel().catch(() => {});
+        return;
+      }
+      raw = await readBoundedNativeSubagentRuntimeResponse(response, { signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+    const responseBinding = {
+      requestNonce, method: 'POST', path, port: ipcPort, status: response.status, raw,
+      sessionId, larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId,
+    };
+    const responseAuthenticated = hostSecret
+      ? verifyNativeSubagentRuntimeResponse({
+          key: hostSecret,
+          requestNonce: responseBinding.requestNonce,
+          method: responseBinding.method,
+          path: responseBinding.path,
+          port: responseBinding.port,
+          status: responseBinding.status,
+          body: responseBinding.raw,
+          sessionId: responseBinding.sessionId,
+          larkAppId: responseBinding.larkAppId,
+          bootInstanceId: responseBinding.bootInstanceId,
+          signature: response.headers.get(NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.responseSignature),
+        })
+      : false;
+    const proofAuthenticated = !hostSecret && policyClaim?.channelId
+      ? readNativeSubagentRuntimeResponseProof({
+          dataDir: resolveDataDir(),
+          channelId: policyClaim.channelId,
+          nonce: requestNonce,
+          response: {
+            method: 'POST', path, port: ipcPort, status: response.status, body: raw, sessionId,
+            larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId,
+          },
+        })
+      : false;
+    if (hostSecret ? !responseAuthenticated : !proofAuthenticated) {
+      nativeSubagentDiagnostic('daemon response authentication failed; allowing spawn');
+      return;
+    }
+    if (response.status === 429) {
+      nativeSubagentDiagnostic('policy service overloaded; denying spawn');
+      await writeNativeSubagentHookDirective({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'Native subagent runtime policy is temporarily overloaded; retry spawn_agent',
+        },
+      });
+      return;
+    }
+    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; policy?: unknown };
+    if (data.ok !== true) return;
+    if (data.invalidPolicy === true) {
+      nativeSubagentDiagnostic('daemon rejected invalid stored policy; allowing spawn');
+      return;
+    }
+    const normalized = normalizeNativeSubagentRuntimePolicy(data.policy);
+    if (!normalized.ok || !normalized.value) {
+      if (!normalized.ok) nativeSubagentDiagnostic('daemon returned invalid policy; allowing spawn');
+      return;
+    }
+    const rewritten = rewriteNativeSubagentSpawnInput(
+      payload.tool_input as Record<string, unknown>,
+      normalized.value,
+    );
+    if (rewritten.kind !== 'rewritten') return;
+    await writeNativeSubagentHookDirective({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        updatedInput: rewritten.input,
+      },
+    });
+  } catch {
+    nativeSubagentDiagnostic('policy lookup failed; allowing spawn');
+  }
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -13959,6 +14220,10 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case 'native-subagent-runtime-hook': {
+    await cmdNativeSubagentRuntimeHook();
     break;
   }
   case 'workflow': {

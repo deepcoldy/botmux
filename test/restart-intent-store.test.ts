@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withFileLockSync } from '../src/utils/file-lock.js';
 import {
   clearRestartIntentTo,
   writeRestartIntentTo,
@@ -9,6 +10,7 @@ import {
   bindRestartLeaseTo,
   claimRestartLeaseTo,
   clearRestartLeaseTo,
+  clearRestartLeaseToLocked,
   hasActiveRestartLeaseTo,
   writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
@@ -16,6 +18,7 @@ import {
   claimRestartIntentForReportTo,
   hasPreparedRestartIntentTo,
   removeRestartIntentAttemptTo,
+  RESTART_LEASE_MAX_MS,
   restartIntentPathIn,
 } from '../src/services/restart-intent-store.js';
 
@@ -79,6 +82,63 @@ describe('restart-intent store', () => {
     const dead = claimRestartLeaseTo(dir, T0 + 31 * 60_000);
     expect(bindRestartLeaseTo(dir, dead!, 99_999_999, T0 + 31 * 60_000)).toBe(true);
     expect(hasActiveRestartLeaseTo(dir, T0 + 31 * 60_000)).toBe(false);
+  });
+
+  it('rejects binding a provisional restart lease after its claim window expires', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0);
+    expect(leaseId).toEqual(expect.any(String));
+
+    expect(bindRestartLeaseTo(dir, leaseId!, process.pid, T0 + 60_001)).toBe(false);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 60_001)).toBe(false);
+  });
+
+  it('rejects a future-dated provisional restart lease instead of extending its claim window', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0 + 30_000);
+    expect(leaseId).toEqual(expect.any(String));
+
+    expect(hasActiveRestartLeaseTo(dir, T0)).toBe(false);
+    expect(bindRestartLeaseTo(dir, leaseId!, process.pid, T0)).toBe(false);
+  });
+
+  it('keeps an identity-bound lease active across small clock rollback without exceeding its max window', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0);
+    expect(leaseId).toEqual(expect.any(String));
+    expect(bindRestartLeaseTo(dir, leaseId!, process.pid, T0)).toBe(true);
+
+    expect(hasActiveRestartLeaseTo(dir, T0 - 1)).toBe(true);
+    expect(claimRestartLeaseTo(dir, T0 - 1)).toBeNull();
+
+    expect(hasActiveRestartLeaseTo(dir, Number.NaN)).toBe(false);
+    expect(hasActiveRestartLeaseTo(dir, T0 - RESTART_LEASE_MAX_MS - 1)).toBe(false);
+    expect(hasActiveRestartLeaseTo(dir, T0 + RESTART_LEASE_MAX_MS + 1)).toBe(false);
+  });
+
+  it('rejects binding an already-bound restart lease a second time', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0);
+    expect(leaseId).toEqual(expect.any(String));
+    expect(bindRestartLeaseTo(dir, leaseId!, process.pid, T0 + 1)).toBe(true);
+
+    expect(bindRestartLeaseTo(dir, leaseId!, process.pid + 1, T0 + 2)).toBe(false);
+  });
+
+  it('clears a lease generation through the shared claim/bind lock', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0);
+    expect(leaseId).toEqual(expect.any(String));
+
+    expect(clearRestartLeaseToLocked(dir, leaseId!, join(dir, 'npm-global-update'))).toBe(true);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 1)).toBe(false);
+  });
+
+  it('leaves the lease for TTL cleanup instead of throwing when the shared lock is busy', () => {
+    const leaseId = claimRestartLeaseTo(dir, T0);
+    const lockTarget = join(dir, 'npm-global-update');
+    expect(leaseId).toEqual(expect.any(String));
+
+    const cleared = withFileLockSync(lockTarget, () =>
+      clearRestartLeaseToLocked(dir, leaseId!, lockTarget));
+
+    expect(cleared).toBe(false);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 1)).toBe(true);
   });
 
   it('writeManualIntentIfAbsent writes a manual intent when none exists', () => {

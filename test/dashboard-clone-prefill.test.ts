@@ -106,3 +106,17 @@ describe('clone 目录形态：源目录不能被目标的默认值遮蔽', () =
     expect(effectiveDir(bot)).toBe('~');
   });
 });
+
+describe('clone native subagent runtime policy', () => {
+  it('copies the policy as behavior configuration', () => {
+    const nativeSubagentRuntime = {
+      model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom', value: 'high' },
+    };
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', nativeSubagentRuntime },
+      { larkAppId: 'cli_target', larkAppSecret: 'target-secret' },
+    );
+    expect(cloned.nativeSubagentRuntime).toEqual(nativeSubagentRuntime);
+  });
+});

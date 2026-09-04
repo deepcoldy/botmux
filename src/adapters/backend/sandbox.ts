@@ -95,6 +95,7 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  const privateReadonlyByParent = new Map<string, string[]>();
   for (const entry of input.privateReadonlyDirectories ?? []) {
     const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
     const directory = assertCredentialIsolationPath(
@@ -104,10 +105,18 @@ export function buildCredentialOnlySandboxArgs(input: {
     if (!directory.startsWith(`${parent}/`)) {
       throw new Error(`private readonly directory must be below its parent: ${directory}`);
     }
-    // Hide every sibling channel first, then expose only the owning directory.
+    const existing = privateReadonlyByParent.get(parent) ?? [];
+    if (!existing.includes(directory)) existing.push(directory);
+    privateReadonlyByParent.set(parent, existing);
+  }
+  for (const parent of [...privateReadonlyByParent.keys()].sort()) {
+    // Hide every sibling channel first, then expose only the owning directories.
     // A directory bind (rather than a file bind) observes the worker's atomic
     // rename-based capability rotations without pinning the old inode.
-    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+    args.push('--tmpfs', parent);
+    for (const directory of privateReadonlyByParent.get(parent)!.sort()) {
+      args.push('--ro-bind', directory, directory);
+    }
   }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
@@ -780,8 +789,9 @@ export function prepareDirectSandbox(opts: {
     const target = resolve(rawTarget);
     try {
       if (!lstatSync(target).isFile()) continue;
+      const resolvedTarget = realpathSync(target);
       // Compare resolved paths: either side may be reached through a symlink.
-      if (selfExec !== undefined && realpathSync(target) === selfExec) continue;
+      if (selfExec !== undefined && resolvedTarget === selfExec) continue;
       args.push('--ro-bind', shim, target);
     } catch { /* missing/stale config target — PATH shim remains available */ }
   }

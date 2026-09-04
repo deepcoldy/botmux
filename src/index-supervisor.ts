@@ -7,10 +7,8 @@
 // Same boot hygiene as index-daemon: scrub any session-scoped env a parent may
 // have leaked, so children don't inherit a stale identity.
 
-import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, readFileSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import {
   scrubClaudeSessionMarkerEnv,
@@ -20,18 +18,17 @@ import {
   scrubWorkflowWorkerEnv,
   stripDashboardH5Env,
 } from './utils/child-env.js';
+import { scrubDetachedRestartEnvRefresh } from './core/restart-env-refresh.js';
 
 installStdioEpipeGuard();
 
 const configDir = join(homedir(), '.botmux');
-const globalEnv = join(configDir, '.env');
-dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
-// The dotenv load above pulls in ~/.botmux/.env WHOLESALE, same as
-// index-daemon.ts — including the Dashboard-only Feishu H5 login family. The
-// supervisor is not that family's consumer (the dashboard reloads it itself
-// via index-dashboard.ts), and resolveFleetDaemonEnv() below spreads this
-// process's env into every supervised member, so an unstripped secret would
+// The supervisor deliberately does NOT wholesale-load ~/.botmux/.env: that file
+// carries the Dashboard-only Feishu H5 login family, and the supervisor is not
+// its consumer (the dashboard reloads it itself via index-dashboard.ts). Any
+// INHERITED copy still has to go, because resolveFleetDaemonEnv() below spreads
+// this process's env into every supervised member — an unstripped secret would
 // sit in this long-lived process for its whole life and ride into every bot
 // daemon (which then strips it again at its own boot).
 //
@@ -54,6 +51,7 @@ scrubClaudeSessionMarkerEnv(process.env);
 scrubWorkflowWorkerEnv(process.env);
 scrubInvokerTerminalEnv(process.env);
 process.env.TERM = 'xterm-256color';
+scrubDetachedRestartEnvRefresh(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');

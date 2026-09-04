@@ -41,6 +41,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { stripComments } from './helpers/bun-leg-selectors.js';
 
 const REAL_ARGV1 = process.argv[1];
 function asCompiledBinary() { process.argv[1] = '/$bunfs/root/cli.js'; }
@@ -221,5 +222,47 @@ describe('sandbox shim overlay — install.sh layout (shim path === exec target)
     writeFileSync(launcher, '#!/bin/sh\nexec /somewhere/botmux "$@"\n', { mode: 0o755 });
     chmodSync(launcher, 0o755);
     expect(overlayTargets(launcher)).toEqual([launcher]);
+  });
+
+  it('still overlays the stable main wrapper path so gateway/default botmux keeps relay mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-stable-wrapper-'));
+    const stable = join(dir, 'botmux');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    expect(overlayTargets(stable)).toEqual([stable]);
+  });
+
+  it('still overlays the dedicated native hook wrapper if someone explicitly trusts that path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-native-hook-wrapper-'));
+    const stable = join(dir, 'botmux');
+    const nativeHook = join(dir, 'botmux-native-subagent-runtime-hook');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(nativeHook, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    chmodSync(nativeHook, 0o755);
+    expect(overlayTargets(nativeHook)).toEqual([nativeHook]);
+  });
+
+  it('still overlays a separate configured gateway launcher', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-gateway-wrapper-'));
+    const stable = join(dir, 'stable-botmux');
+    const gateway = join(dir, 'configured-gateway');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(gateway, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    chmodSync(gateway, 0o755);
+    expect(overlayTargets(gateway)).toEqual([gateway]);
+  });
+
+  it('SOURCE PIN: worker trusts exactly the default gateway entry, not the dedicated native hook wrapper', () => {
+    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
+    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
+    expect(callStart).toBeGreaterThanOrEqual(0);
+    const callEnd = src.indexOf('      });', callStart);
+    expect(callEnd).toBeGreaterThan(callStart);
+    const callRegion = stripComments(src.slice(callStart, callEnd));
+    expect(callRegion).toContain('trustedBotmuxCommandPaths: [defaultGatewayEntry().command],');
+    expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
+    expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
   });
 });

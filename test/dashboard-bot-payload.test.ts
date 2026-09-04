@@ -10,11 +10,13 @@ describe('dashboard bot payload helpers', () => {
         cliId: 'codex',
         cliRuntime: { id: 'vendor-codex', executable: 'vendor-codex' },
         model: 'gpt-5',
+        modelBackendVariant: 'max',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
       },
       {},
     );
     const editableFields = [
-      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'agentSelectionKey', 'online',
+      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'modelBackendVariant', 'agentSelectionKey', 'online',
       'displayName', 'larkBotName',
       'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
       'autoboundChatCount', 'brandLabel',
@@ -33,11 +35,24 @@ describe('dashboard bot payload helpers', () => {
       'envelopeInjection', 'codexAuthSync',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
       'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
+      'nativeSubagentRuntime',
       'sessionOwnerReminder',
       'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env',
       'riff', 'skills',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('exposes native subagent policy only in private Bot Defaults payloads', () => {
+    const nativeSubagentRuntime = {
+      model: { mode: 'custom' as const, value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom' as const, value: 'ultra' as const },
+    };
+    const descriptor = { larkAppId: 'app_traex', cliId: 'traex', nativeSubagentRuntime };
+
+    expect(botDefaultsPayload(descriptor, {})).toMatchObject({ nativeSubagentRuntime });
+    expect(botDefaultsPayload(descriptor, undefined, 'offline')).toMatchObject({ nativeSubagentRuntime });
+    expect(botSummaryPayload(descriptor)).not.toHaveProperty('nativeSubagentRuntime');
   });
 
   it('normalizes the Codex auth policy to the upgrade-compatible shared default', () => {
