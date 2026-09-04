@@ -134,12 +134,12 @@ describe('tryHandleInviteCommand — 拦截与闸门', () => {
     expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(false);
   });
 
-  it('non-owner: replies owner_only, never calls addBotToChat', async () => {
+  it('non-admin: replies owner_only, never calls addBotToChat', async () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     expect(await tryHandleInviteCommand('b1', inviteMessage(), 'ou_intruder')).toBe(true);
     expect(addBotMock).not.toHaveBeenCalled();
     expect(replyMock).toHaveBeenCalled();
-    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('owner');
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('管理员');
   });
 
   it('another bot addressed (I am not mentioned): intercepted but fully silent', async () => {

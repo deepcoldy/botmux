@@ -65,6 +65,7 @@ import {
   registerBot,
   getBot,
   getAllBots,
+  getConfiguredOwnerOpenId,
   getOwnerOpenId,
   getDashboardAdminOpenIds,
   findOncallChat,
@@ -4097,10 +4098,7 @@ function notifyAllowedUsersResolveFailure(
   // captured at setup — a raw ou_ that never needs resolving, so it survives
   // the contact-API outage. Appended (not replacing) so a partial resolve still
   // reaches every recovered owner too.
-  let staticOwner: string | undefined;
-  try {
-    staticOwner = getBot(larkAppId).config.ownerOpenId;
-  } catch { /* bot gone mid-flight — nothing to fall back to */ }
+  const staticOwner = getConfiguredOwnerOpenId(larkAppId);
   if (staticOwner && staticOwner.startsWith('ou_') && !unique.includes(staticOwner)) {
     unique.push(staticOwner);
   }
@@ -5479,8 +5477,9 @@ export const __testOnly_clearPendingRepoStateForNotifierAdopt = clearPendingRepo
 export const __testOnly_adoptCodexNotifierEvent = adoptCodexNotifierEvent;
 
 const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
-  getExpectedOwnerOpenId: larkAppId =>
-    getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId),
+  // Authorization must use the resolved runtime owner only. The raw fallback
+  // used by notification delivery is intentionally not available here.
+  getExpectedOwnerOpenId: getOwnerOpenId,
   getEventRecord: (larkAppId, eventId) => codexNotifierStore(larkAppId).get(eventId),
   readConfig: () => readGlobalConfig().codexNotifier,
   openAppThread: openCodexAppThread,
@@ -6121,6 +6120,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           const hasAllowlist = (bot.config.allowedUsers?.length ?? 0) > 0
             || (bot.config.allowedChatGroups?.length ?? 0) > 0
             || (bot.config.globalGrants?.length ?? 0) > 0
+            || !!bot.config.ownerOpenId
             || bot.config.p2pOpen === true;
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
@@ -21399,7 +21399,8 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
     const bot = getBot(larkAppId);
     const resolved = (bot.resolvedAllowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
     if (resolved) return resolved;
-    return (bot.config.allowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
+    return getConfiguredOwnerOpenId(larkAppId)
+      ?? (bot.config.allowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
   } catch {
     return undefined;
   }
@@ -21591,7 +21592,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!budget) return;
       const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
       if (alert) {
-        const ownerOpenId = bot?.config?.ownerOpenId;
+        const ownerOpenId = getConfiguredOwnerOpenId(record.larkAppId);
         if (ownerOpenId) {
           sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
             .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));

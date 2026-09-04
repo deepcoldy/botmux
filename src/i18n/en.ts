@@ -111,8 +111,8 @@ export const messages: Record<string, string> = {
   'card.grant.duration_permanent': 'Never',
   'card.grant.quota_label': 'Message quota',
   'card.grant.quota_placeholder': 'Blank means unlimited',
-  'card.grant.note': 'Access is revoked when either limit is reached. Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
-  'card.grant.toast_owner_only': 'Only the owner can do this',
+  'card.grant.note': 'Access is revoked when either limit is reached. Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (bot admins).',
+  'card.grant.toast_owner_only': 'Only a bot admin can do this',
   'card.grant.toast_expired': 'This request has expired',
   'card.grant.toast_bad_limit': 'Invalid grant limit',
   'card.grant.toast_bad_quota': 'Enter a whole-number message quota from 1 to 1000, or leave it blank for unlimited',
@@ -137,13 +137,13 @@ export const messages: Record<string, string> = {
   'cmd.grant_restricted': '⚠️ This grant only allows plain conversation — commands like {cmd} are not permitted. Ask the owner to lift the restriction.',
 
   // /grant, /revoke command replies
-  'cmd.grant.owner_only': 'Only the owner can use /grant.',
+  'cmd.grant.owner_only': 'Only a bot admin can use /grant.',
   'cmd.grant.usage': 'Usage: @bot /grant @someone [N] (let them talk to me in this chat — you can @ several people/bots at once; with a number, grants an N-message quota) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
   'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the card default.',
   'cmd.grant.chat_done': '✅ Everyone in this chat can now talk to me (just @-mention me). Sensitive ops still limited to allowedUsers.',
   'cmd.grant.chat_already': 'ℹ️ This chat is already open to talk; nothing to do.',
   'cmd.grant.chat_failed': '⚠️ Grant failed: {reason}',
-  'cmd.revoke.owner_only': 'Only the owner can use /revoke.',
+  'cmd.revoke.owner_only': 'Only a bot admin can use /revoke.',
   'cmd.revoke.usage': 'Usage: @bot /revoke @someone (revoke their talk access in this chat — you can @ several people/bots at once) | @bot /revoke (revoke the whole-chat talk grant).',
   'cmd.revoke.chat_done': '✅ Revoked the whole-chat talk grant for this chat.',
   'cmd.revoke.chat_none': 'ℹ️ This chat has no whole-chat talk grant.',
@@ -161,7 +161,7 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_failed': '⚠️ {name} — revoke failed: {reason}',
 
   // /invite (pull an out-of-chat bot into this chat, owner only)
-  'cmd.invite.owner_only': '⚠️ Only the owner can use /invite.',
+  'cmd.invite.owner_only': '⚠️ Only a bot admin can use /invite.',
   'cmd.invite.p2p': '⚠️ Bots cannot be added in a DM — use /invite inside a group chat.',
   'cmd.invite.usage': 'Usage: @me /invite @bot-to-add (multiple allowed), or @me /invite --app cli_xxx',
   'cmd.invite.header': '🤝 /invite results:',

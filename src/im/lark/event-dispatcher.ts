@@ -47,6 +47,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
+import { resolveGrantApprover } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
   chatQuotaKey,
@@ -1868,6 +1869,7 @@ function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
   return (bot.config.allowedUsers?.length ?? 0) > 0
     || (bot.config.allowedChatGroups?.length ?? 0) > 0
     || (bot.config.globalGrants?.length ?? 0) > 0
+    || !!bot.config.ownerOpenId
     // p2pOpen 也是一次显式的权限边界声明：配了它 = 进入限制态。否则「只配 p2pOpen、
     // 没配 allowedUsers」会 fall through 到 open 模式，把**群聊**和 **canOperate** 一起
     // 放开（陌生人能 /restart /cd），与 p2pOpen「只开私聊 talk」的语义正好相反。
@@ -2155,6 +2157,7 @@ async function maybeSendGrantRequestCard(
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  const approverPromise = resolveGrantApprover(larkAppId, chatId, message).catch(() => undefined);
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
@@ -2167,6 +2170,7 @@ async function maybeSendGrantRequestCard(
     : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
   const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
   const name = mentionName ?? observedName ?? profileName ?? shortRequester;
+  const approver = (await approverPromise) ?? owner;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
   const botConfig = getBot(larkAppId).config;
   const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
@@ -2181,7 +2185,7 @@ async function maybeSendGrantRequestCard(
   );
   const card = buildGrantCard(
     {
-      ownerOpenId: owner,
+      ownerOpenId: approver,
       targets: [{ openId: requesterOpenId, name: String(name) }],
       chatId,
       nonce,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, getConfiguredOwnerOpenId, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
 import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
@@ -157,6 +157,45 @@ describe('bot-registry grant additions', () => {
   it('getOwnerOpenId undefined when no resolved ou_', () => {
     registerBot({ larkAppId: 'a3', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com'] });
     expect(getOwnerOpenId('a3')).toBeUndefined();
+  });
+
+  it('getOwnerOpenId prioritizes explicit ownerOpenId while it remains allowed', () => {
+    const bot = registerBot({
+      larkAppId: 'a4',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_first', 'ou_owner_explicit', 'ou_second'];
+    expect(getOwnerOpenId('a4')).toBe('ou_owner_explicit');
+  });
+
+  it('falls back to the resolved allowlist after explicit owner removal', () => {
+    const bot = registerBot({
+      larkAppId: 'a5',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getOwnerOpenId('a5')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a5')).toEqual(['ou_second']);
+  });
+
+  it('keeps raw explicit owner available only for DM fallback', () => {
+    const bot = registerBot({
+      larkAppId: 'a6',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getConfiguredOwnerOpenId('a6')).toBe('ou_owner_explicit');
+    expect(getOwnerOpenId('a6')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a6')).toEqual(['ou_second']);
   });
 
   it('parses messageQuota.defaultLimit only when a positive integer', () => {

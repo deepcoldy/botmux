@@ -309,4 +309,14 @@ describe('card-handler grant actions', () => {
     const [, , , entries] = recordObservedMock.mock.calls.at(-1)!;
     expect(entries).toEqual([{ openId: 'ou_bot2', name: 'Codex' }]);  // 真人 ou_human 被剔除
   });
+
+  it('co-owner in allowedUsers (not first owner) can also grant access', async () => {
+    const { registry, pending, handler } = await fresh();
+    const bot = registry.getBot('h1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_coowner'];
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const res = await handler.handleCardAction(action('grant_chat', { operator: 'ou_coowner', nonce }), deps, 'h1');
+    expect(res?.toast?.type).toBeUndefined();
+    expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
+  });
 });

@@ -163,6 +163,7 @@
 
 | 字段 | 说明 |
 |------|------|
+| `ownerOpenId` | 显式指定该 bot 的主管理员 `ou_xxx`。它只有在仍存在于 `allowedUsers` 的解析结果中时才参与运行时权限判定；被移除或解析失败后权限会跟随解析出的 allowlist，原始值仅用于解析失败时的 DM 兜底。未指定时默认取解析出的首个 `ou_xxx` 用户。当配置了多位管理员时，群内授权申请卡会优先 @ 当前群内的管理员（避免 ping 群外人员） |
 | `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
