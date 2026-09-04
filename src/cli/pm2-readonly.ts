@@ -2,15 +2,37 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LinuxPm2GodProcess } from '../core/pm2-lifecycle-owner.js';
+import { isStandaloneBinary, resolveEntrySpawn } from '../core/self-spawn.js';
 
 const ABSENT_EXIT_CODE = 3;
 
-function helperArgs(pkgRoot: string, modeArgs: string[]): string[] {
+function nodeHelperArgs(pkgRoot: string, modeArgs: string[]): string[] {
   const built = join(pkgRoot, 'dist', 'cli', 'pm2-readonly-client.js');
   if (import.meta.url.includes('/dist/cli/pm2-readonly.js') && existsSync(built)) {
     return [built, ...modeArgs];
   }
   return ['--import', 'tsx', join(pkgRoot, 'src', 'cli', 'pm2-readonly-client.ts'), ...modeArgs];
+}
+
+/** Resolve the isolated observer across both runtime shapes.
+ *
+ * A compiled binary has no physical dist/ or src/ helper to hand to a child.
+ * Re-enter the binary through a statically-dispatched hidden entry instead;
+ * this also makes Bun trace and embed pm2-readonly-client in the module graph.
+ */
+export function resolveReadonlyPm2Spawn(input: {
+  pkgRoot: string;
+  modeArgs: string[];
+  nodePath?: string;
+}): { command: string; args: string[] } {
+  if (isStandaloneBinary()) {
+    const resolved = resolveEntrySpawn('pm2-readonly-client', join(input.pkgRoot, 'dist'));
+    return { command: resolved.command, args: [...resolved.args, ...input.modeArgs] };
+  }
+  return {
+    command: input.nodePath ?? process.execPath,
+    args: nodeHelperArgs(input.pkgRoot, input.modeArgs),
+  };
 }
 
 function readonlyEnv(
@@ -37,7 +59,12 @@ export function captureReadonlyPm2Jlist(input: {
   env?: NodeJS.ProcessEnv;
   expectedGod?: LinuxPm2GodProcess;
 }): string {
-  const result = spawnSync(input.nodePath ?? process.execPath, helperArgs(input.pkgRoot, ['jlist']), {
+  const helper = resolveReadonlyPm2Spawn({
+    pkgRoot: input.pkgRoot,
+    modeArgs: ['jlist'],
+    nodePath: input.nodePath,
+  });
+  const result = spawnSync(helper.command, helper.args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     env: readonlyEnv(input.home, input.expectedGod, { ...process.env, ...(input.env ?? {}) }),
@@ -59,7 +86,12 @@ export function printReadonlyPm2Status(input: {
   nodePath?: string;
   expectedGod?: LinuxPm2GodProcess;
 }): void {
-  const result = spawnSync(input.nodePath ?? process.execPath, helperArgs(input.pkgRoot, ['status']), {
+  const helper = resolveReadonlyPm2Spawn({
+    pkgRoot: input.pkgRoot,
+    modeArgs: ['status'],
+    nodePath: input.nodePath,
+  });
+  const result = spawnSync(helper.command, helper.args, {
     stdio: 'inherit',
     env: readonlyEnv(input.home, input.expectedGod),
     timeout: 15_000,
@@ -77,9 +109,14 @@ export function spawnReadonlyPm2Logs(input: {
   nodePath?: string;
   expectedGod?: LinuxPm2GodProcess;
 }): ChildProcess {
+  const helper = resolveReadonlyPm2Spawn({
+    pkgRoot: input.pkgRoot,
+    modeArgs: ['logs', input.target, input.lines],
+    nodePath: input.nodePath,
+  });
   return spawn(
-    input.nodePath ?? process.execPath,
-    helperArgs(input.pkgRoot, ['logs', input.target, input.lines]),
+    helper.command,
+    helper.args,
     { stdio: 'inherit', env: readonlyEnv(input.home, input.expectedGod) },
   );
 }

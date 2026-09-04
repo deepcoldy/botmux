@@ -17,6 +17,8 @@
  *                       `unknown` sentinel. Compiled mode has no package.json on
  *                       disk, so every version read failed and 3.18.0-canary.2
  *                       shipped printing `botmux vunknown`.
+ *   1d. PM2 observer   — the hidden read-only helper is dispatched with the
+ *                       correct argv contract and its PM2 dependency embedded.
  *   2. self-spawn     — the `__supervisor` hidden entry re-execs THIS binary
  *                       (the /$bunfs argv[1] path), starts a fleet, and the
  *                       supervisor stays alive.
@@ -35,7 +37,7 @@
  * Exit 0 = all checks passed; non-zero + a diagnostic on the first failure.
  */
 
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -217,6 +219,26 @@ try {
 } catch (err) {
   fail('selfcheck', err instanceof Error ? err.message : String(err));
 }
+
+// ── 1d. PM2 observer: the hidden helper really executes ──────────────────────
+// Probe the entry directly instead of relying on plugin discovery: with no PM2
+// God, pluginPm2Query() correctly short-circuits before spawning the helper.
+// Exit 3 proves all three compiled-only links are live: the CLI dispatched the
+// hidden token, removed it so `jlist` remained argv[2], and embedded PM2 itself.
+// The broken binary prints help and exits 0; a missing dispatcher hangs in the
+// self-spawn park; a missing argv splice or PM2 bundle exits 1.
+const readonlyProbe = spawnSync(binary, ['__pm2-readonly-client', 'jlist'], {
+  cwd: home, env: childEnv, encoding: 'utf-8', timeout: 25_000,
+});
+if (readonlyProbe.status !== 3) {
+  const detail = readonlyProbe.error?.message
+    ?? String(readonlyProbe.stderr || readonlyProbe.stdout || `status ${readonlyProbe.status}`).trim();
+  fail('pm2-readonly-helper', `expected absent exit 3, got ${readonlyProbe.status}: ${detail}`);
+}
+if (existsSync(join(home, '.botmux', 'pm2', 'pm2.pid'))) {
+  fail('pm2-readonly-helper', 'read-only jlist unexpectedly started a PM2 God');
+}
+console.log('smoke: ✅ pm2 read-only helper — hidden entry returned absent without daemonizing');
 
 // ── 2/3. self-spawn + dashboard boots and reaches online ─────────────────────
 // `__supervisor` is the hidden self-re-exec entry: under a compiled binary this

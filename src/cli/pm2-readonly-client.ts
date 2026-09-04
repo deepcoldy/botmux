@@ -7,15 +7,17 @@
  * calls Client.start/connect, so a status/logs race cannot create a new God in
  * the observer's cgroup.
  */
-import { createRequire } from 'node:module';
+import pm2Module from 'pm2';
 import {
   inspectLinuxPm2GodOwnership,
   revalidateLinuxPm2GodProcess,
   type LinuxPm2GodProcess,
 } from '../core/pm2-lifecycle-owner.js';
 
-const require = createRequire(import.meta.url);
-const pm2 = require('pm2') as any;
+// This must stay a static import. createRequire(import.meta.url) works from the
+// npm/source tree but Bun cannot discover that dependency while compiling the
+// hidden helper into the standalone executable.
+const pm2 = pm2Module as any;
 const mode = process.argv[2];
 const target = process.argv[3] || 'all';
 const lines = Number.parseInt(process.argv[4] || '50', 10);
