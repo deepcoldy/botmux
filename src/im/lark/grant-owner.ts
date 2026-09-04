@@ -2,7 +2,8 @@
  * 授权卡处置人（approver / owner）解析与管理员判定。
  *
  * 核心设计：
- * 1. 管理员（owner / co-owners）：取 bot 配置的 static ownerOpenId 与 resolvedAllowedUsers 中的全部 ou_。
+ * 1. 管理员（owner / co-owners）：只取 resolvedAllowedUsers 中已解析出的 ou_。
+ *    raw ownerOpenId 仅用于解析失败时的 DM 兜底，不得绕过 allowlist 闸门。
  * 2. 群内授权申请卡（maybeSendGrantRequestCard / requestGrantForAskClicker）：
  *    若群里有管理员，优先 @ 当前群内的管理员（按配置优先级排序）；
  *    避免在群 A 里触发授权时，@ 了一个根本不在本群的管理员打扰对方，导致群内可见的管理员反而收不到提醒。
@@ -15,23 +16,13 @@ import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 
 /**
- * 获取 bot 的所有管理员 open_id 候选列表（保持优先级顺序）：
- * 1. 配置中显式指定的 ownerOpenId（若为 ou_）
- * 2. resolvedAllowedUsers 中的所有 ou_ 用户（已通过飞书联系人真实性校验，保持 fail-closed）
+ * 获取 bot 的所有管理员 open_id 候选列表（保持 allowlist 优先级顺序）。
+ * 只有 resolvedAllowedUsers 中已解析出的 ou_ 才能成为管理员，保持 fail-closed。
  */
 export function getBotAdminOpenIds(larkAppId: string): string[] {
   try {
     const bot = getBot(larkAppId);
-    const out: string[] = [];
-    if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
-      out.push(bot.config.ownerOpenId);
-    }
-    for (const u of (bot.resolvedAllowedUsers ?? [])) {
-      if (typeof u === 'string' && u.startsWith('ou_') && !out.includes(u)) {
-        out.push(u);
-      }
-    }
-    return out;
+    return [...new Set((bot.resolvedAllowedUsers ?? []).filter(u => typeof u === 'string' && u.startsWith('ou_')))];
   } catch {
     return [];
   }
@@ -94,7 +85,8 @@ export interface ResolveGrantApproverDeps {
  * 决定在特定会话中，授权申请卡应该 @ 哪位管理员处置。
  *
  * 策略：
- * 1. 获取该 bot 的所有管理员候选人（按配置顺序：ownerOpenId、resolvedAllowedUsers 等）。
+ * 1. 获取该 bot 的所有管理员候选人（按 resolvedAllowedUsers 配置顺序；显式
+ *    ownerOpenId 只有仍在该解析结果中时才提升优先级）。
  * 2. 若只有一个管理员（或无群 chatId / 非群聊），直接取该唯一/全局管理员（零额外网络开销）。
  * 3. 若为群聊且有多个候选管理员：
  *    - 优先检查传入 message 中的 mentions，若直接包含了某位候选管理员，且其在群中，立即可用；
@@ -118,8 +110,9 @@ export async function resolveGrantApprover(
   const fallbackOwner = owner ?? candidates[0];
   if (!fallbackOwner) return undefined;
 
-  // 只有一个候选人或非群聊，无需网络往返，直接返回
-  const isLarkChat = chatId && (chatId.startsWith('oc_') || deps.listChatMemberOpenIds !== undefined);
+  // 只有一个候选人或非群聊，无需网络往返，直接返回。测试依赖不能改变
+  // 生产判据，否则测试会覆盖生产永远走不到的分支。
+  const isLarkChat = typeof chatId === 'string' && chatId.startsWith('oc_');
   if (candidates.length <= 1 || !isLarkChat) {
     return fallbackOwner;
   }
