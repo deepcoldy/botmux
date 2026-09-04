@@ -17304,10 +17304,15 @@ body.touch.has-token #terminal .xterm{
   padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
 #mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
+/* A long press on a bar key must repeat that key (see the repeat handler below),
+   never raise the iOS selection handles / callout menu. user-select alone is not
+   enough in a WKWebView — the -webkit- pair is what suppresses both, same as the
+   xterm content area above. */
 #mobile-bar-keys button{
   flex:none;min-width:44px;height:34px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;white-space:nowrap}
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
@@ -17320,7 +17325,8 @@ body.touch.has-token #terminal .xterm{
 #mobile-bar-row button{
   flex:none;width:42px;min-height:42px;height:42px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
-  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
 #mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-input-bar button:disabled,#mobile-input-bar textarea:disabled{opacity:.45;cursor:not-allowed}
 #mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
@@ -17381,7 +17387,7 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
       <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="输入命令…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
       <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
     </div>
-    <button id="mobile-send" type="submit">发送</button>
+    <button id="mobile-send" type="submit">上屏</button>
   </div>
 </form>
 <div id="status" class="err">connecting...</div>
@@ -18385,9 +18391,17 @@ if(isTouch&&hasToken){(function(){
     if(payload&&!sendInput(payload))return false;
     mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
 
+  // Buffer mode types the text into the CLI's own input box WITHOUT submitting
+  // (the payload ends in a newline, which a TUI treats as "insert", not "run"),
+  // so the button is labelled 上屏 there and the user presses the Enter key once
+  // the text looks right. Live mode's button really does submit (it appends a
+  // carriage return), so it keeps 发送 — same reason the mode button spells out
+  // the extra Enter step.
   function setMode(m){mode=m;bar.setAttribute('data-mode',m);
     modeBtn.textContent=m===LIVE?'实时':'缓冲';
-    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入，点击切换为实时');}
+    sendBtn.textContent=m===LIVE?'发送':'上屏';
+    sendBtn.setAttribute('aria-label',m===LIVE?'发送并执行':'把文本送上终端，随后按 Enter 执行');
+    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入（上屏后需按 Enter 提交），点击切换为实时');}
   var measuredBarHeight=-1;
   function measureBar(){
     var rect=bar.getBoundingClientRect?bar.getBoundingClientRect():null;
@@ -18415,6 +18429,9 @@ if(isTouch&&hasToken){(function(){
 
   // shortcut keys row
   var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
+  // Keys whose effect is safe to apply repeatedly while the finger stays down.
+  var REPEATABLE={bs:1,left:1,right:1,up:1,down:1};
+  var REPEAT_DELAY=450,REPEAT_EVERY=60;
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
     btn.addEventListener('click',function(){btn.blur();
@@ -18428,7 +18445,37 @@ if(isTouch&&hasToken){(function(){
           navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
         }else{showKeyboard();}
         return;}
-      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});})(keyBtns[i]);}
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});
+    // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
+    // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
+    // repeating Enter would fire the command several times, repeating Ctrl-C
+    // would spray interrupts. The first hit still comes from the click handler
+    // above (so a plain tap keeps working, mouse included); this only adds the
+    // follow-up ticks after the finger has stayed down past REPEAT_DELAY.
+    if(REPEATABLE[btn.getAttribute('data-sk')]){
+      var holdT=null,holdIv=null;
+      var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
+      btn.addEventListener('pointerdown',function(){
+        stopHold();
+        holdT=setTimeout(function(){
+          holdIv=setInterval(function(){
+            // Stop as soon as this key can no longer be pressed — either the bar
+            // was disabled (write permission lost / socket dropped mid-hold) or
+            // the send itself was refused — instead of spinning until release.
+            if(btn.disabled){stopHold();return;}
+            var seq=sk[btn.getAttribute('data-sk')];
+            var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
+            if(!ok)stopHold();
+          },REPEAT_EVERY);
+        },REPEAT_DELAY);
+      });
+      // pointerup fires on release, pointercancel when the gesture is stolen
+      // (scroll/system), pointerleave when the finger slides off the button.
+      ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
+        btn.addEventListener(ev,stopHold);
+      });
+    }
+  })(keyBtns[i]);}
 
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
