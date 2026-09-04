@@ -836,10 +836,10 @@ export const messages: Record<string, string> = {
   'ai.routing.feedback_response_kind': 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).',
   'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
   // replyDelivery=transcript (core/reply-delivery.ts): the daemon forwards the
-  // final reply from the transcript, so intro / usage_send are reworded; the
-  // remaining usage_* lines are reused unchanged.
-  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
-  'ai.routing.usage_send_transcript': '- Use `botmux send "message"` only for mid-turn progress pushes, attachments (images/files), or @mentions that hand work to another bot',
+  // final reply from the transcript, so the system prompt never mentions
+  // botmux send — intro is replaced by this line and only usage_helpers /
+  // usage_silence are kept (see shared-hints.ts).
+  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'If you still have content for the user, keep using `botmux send`; otherwise make the final reply just BOTMUX_NOTHING_TO_SEND.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
@@ -867,13 +867,12 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'Respond to messages addressed to you at least once via `botmux send` (run it in Bash, not print/echo) — never stay silent; what and how many times to send is your call. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'A successful `botmux send` (exit code 0) means it reached the user; ending a turn with no visible terminal text is normal. If you see a note like "your previous response had no visible output, please continue and produce a user-visible response", that is a false alarm from the underlying CLI — do NOT resend unless `botmux send` itself errored.',
-  // replyDelivery=transcript shell-hints variant: intro / how_to_send /
-  // when_to_send are reworded around "the final reply is auto-forwarded"; the
-  // other paragraphs (commands_are_shell / heredoc / helpers / mention_gate) are
-  // reused as-is.
+  // replyDelivery=transcript shell-hints variant: only the reworded intro /
+  // when_to_send plus helpers; the whole block never mentions botmux send
+  // (commands_are_shell / how_to_send / heredoc / mention_gate are not injected,
+  // see shared-hints.ts).
   'ai.shell.intro_transcript': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output; your final assistant message is automatically forwarded back to Lark by botmux.',
-  'ai.shell.how_to_send_transcript': 'Do not call `botmux send` for normal replies, even if older prompt text says replies must use it. Only for mid-turn progress pushes, attachments, or @mentions that hand work to another bot, run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`, video previews with `--videos /path.mp4 --video-covers /cover.png`.',
-  'ai.shell.when_to_send_transcript': 'Answer messages addressed to you directly in your final assistant message — never stay silent; whether and how often to `botmux send` mid-turn is your call. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
+  'ai.shell.when_to_send_transcript': 'Answer messages addressed to you directly in your final assistant message — never stay silent. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -1581,7 +1580,6 @@ export const messages: Record<string, string> = {
   'cmd.cot.status_on': '🧠 Thinking-process messages: ON (master switch on + this chat not muted). /cot off to mute this chat.',
   'cmd.cot.status_chat_off': '🔕 Thinking-process messages: muted for this chat. /cot on to restore.',
   'cmd.cot.status_master_off': '🔕 Thinking-process messages: bot-level master switch is off. Enable via /botconfig set thinkingCard on (this chat is not individually muted).',
-  'cmd.cot.status_result_off': '📄 Tool output: off (the bubble keeps only thinking paragraphs and tool node titles). /botconfig set thinkingCardToolResult on to restore.',
   'cmd.cot.fail': '⚠️ Operation failed: {reason}',
   'cmd.cot.show_now': '🧠 Summoned this turn\'s thinking bubble (with everything accumulated so far; reverts when the turn ends).',
   'cmd.cot.show_armed': '🧠 No thinking in flight — the next turn will show the bubble once, then revert.',

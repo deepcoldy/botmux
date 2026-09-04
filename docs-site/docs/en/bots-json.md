@@ -240,13 +240,13 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
 | `thinkingCardToolResult` | Boolean, default `true` (on). Whether tool nodes in the native thinking bubble (bot-level master switch `thinkingCard`, default on) carry the command output / file content code block. `false` keeps only thinking paragraphs and tool node titles (tool · command / path) and degrades the result to a single `✓ Done` line (a tool node only leaves the “running” state once a result event arrives, so the event cannot simply be dropped), matching Claude Code's own UI; toggle via `/botconfig set thinkingCardToolResult off` or the dashboard card sub-switch, effective immediately |
-| `replyDelivery` | `"send"` (default) or `"transcript"`. How the final reply reaches Feishu: `send` = the model must run `botmux send` itself; `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, so the model only needs `botmux send` for mid-turn pushes, attachments, or cross-bot @. Only `transcript` is persisted; absent or `send` stays byte-for-byte identical to historical behavior |
+| `replyDelivery` | `"transcript"` or `"send"`; the default depends on the CLI: `claude-code` defaults to `transcript`, every other CLI to `send`. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
 
 ### `replyDelivery: "transcript"`
 
-Setting `transcript` changes three things for that bot's sessions:
+`claude-code` defaults to `transcript`; the other supported CLIs need it set explicitly. Once active it changes three things for that bot's sessions:
 
-1. **The system prompt is reworded** to "the final reply is forwarded automatically" and no longer asks the model to `botmux send` at the end of every turn;
+1. **The system prompt never mentions `botmux send`**: the intro becomes "your final assistant message is automatically forwarded back to Lark by botmux — just answer directly"; the heredoc rule, the @ decision gate, the attachment usage and the `<identity>` rule "collaboration requires `botmux send --mention`" are all dropped, leaving only `botmux history` / `botmux bots list` and the `BOTMUX_NOTHING_TO_SEND` silence sentinel. For the cases that genuinely need `botmux send` (attachments, cross-bot @) the model can discover the built-in skill (`botmux-send` under `--plugin-dir`) on its own;
 2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
 3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
 
@@ -255,13 +255,16 @@ Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex
 Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
 
 ```text
-/botconfig set replyDelivery transcript
-/botconfig unset replyDelivery
+/botconfig set replyDelivery transcript   # enable explicitly on the other supported CLIs
+/botconfig set replyDelivery send         # put claude-code back on the old behavior (model runs botmux send itself)
+/botconfig unset replyDelivery            # back to the CLI default
 ```
 
 - **Two activation points**: the per-turn envelope (reminder / wrapper / `<sender/>`) applies from the next turn; the system prompt is injected at spawn time, so a running session needs `/restart` to pick up the new value, while new sessions use it directly.
 - **Observability cost**: the bare-text shape of a solo session has no `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes such sessions as botmux's own (the same class of cost as `senderTag: false`).
 - The dashboard "Reply Delivery → Transcript reply mode" toggle saves this field; it is disabled with an explanation when the current CLI does not support it.
+
+### `senderTag: false`
 
 With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
 

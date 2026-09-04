@@ -1255,12 +1255,14 @@ function buildNewTopicBlocks(
     // the routing block above and the system-prompt identity path in
     // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
     // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
-    // transcript + solo（bare）同样只留 name/open_id：solo 会话里没有别的 bot 可路由。
+    // transcript（含 solo）同样只留 name/open_id：short_routing 整句是「协作必须
+    // botmux send --mention」，transcript 模式的提示不再提 send；solo 会话更没有
+    // 别的 bot 可路由。
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      ...(noTransport || bare
+      ...(noTransport || replyDelivery === 'transcript'
         ? []
         : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',

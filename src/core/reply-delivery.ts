@@ -4,12 +4,14 @@
  * 纯函数层：不 import im/lark，不碰 daemon 状态，daemon / session-manager /
  * worker-pool 都从这里取同一套判定，避免三处各写一份白名单。
  *
- * - `send`（缺省）：模型必须自己 `botmux send`，系统提示与每轮 reminder 都这么要求。
+ * - `send`：模型必须自己 `botmux send`，系统提示与每轮 reminder 都这么要求。
  * - `transcript`：daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡
- *   （bridge fallback 升为主通道）；系统提示改口、不注入每轮 reminder；solo 会话
- *   去掉 `<user_message>` 壳与 `<sender/>`。
+ *   （bridge fallback 升为主通道）；系统提示不再提及 `botmux send`、不注入每轮
+ *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 所有判定 fail-closed：拿不准就回到 `send` / 非 solo，行为等于今天。
+ * 缺省值按 CLI 走（`defaultReplyDeliveryFor`）：claude-code 缺省 `transcript`，其余
+ * 缺省 `send`；bots.json 显式写 `send` / `transcript` 才覆盖。所有判定 fail-closed：
+ * 拿不准就回到 `send` / 非 solo。
  */
 import { getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { isStructuredBridgeFallbackActive } from '../services/structured-bridge-clis.js';
@@ -26,15 +28,23 @@ export function supportsTranscriptReplyDelivery(cliId: string | undefined): bool
   return isStructuredBridgeFallbackActive(cliId, false);
 }
 
+/** 未显式配置时的缺省投递方式：claude-code 的最终回复由 daemon 从转写自动转发
+ *  （transcript），模型不再被教「botmux send」；其它 CLI 保持 send。 */
+export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  return cliId === 'claude-code' ? 'transcript' : 'send';
+}
+
 const warnedUnsupported = new Set<string>();
 
-/** 运行时生效值：配置为 transcript 但当前 CLI 不支持时回落 send（每个 bot+cli
- *  组合只 warn 一次，避免每轮刷日志）。 */
+/** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
+ *  transcript 但当前 CLI 不支持时回落 send（每个 bot+cli 组合只 warn 一次，避免
+ *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。 */
 export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: string | undefined): ReplyDelivery {
   if (!larkAppId) return 'send';
-  let configured: ReplyDelivery;
+  let configured: ReplyDelivery | undefined;
   try { configured = resolveReplyDelivery(larkAppId); } catch { return 'send'; }
-  if (configured !== 'transcript') return 'send';
+  const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);
+  if (wanted !== 'transcript') return 'send';
   if (supportsTranscriptReplyDelivery(cliId)) return 'transcript';
   const key = `${larkAppId}:${cliId ?? ''}`;
   if (!warnedUnsupported.has(key)) {

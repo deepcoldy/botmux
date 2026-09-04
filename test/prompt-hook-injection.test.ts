@@ -59,8 +59,10 @@ vi.mock('../src/im/lark/client.js', () => ({
 const getBotMock = vi.fn(() => ({
   config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
 }));
-// core/reply-delivery.ts 读 per-bot replyDelivery 的入口；缺省 'send' 让既有用例不变。
-const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' => 'send');
+// core/reply-delivery.ts 读 per-bot replyDelivery 的入口。本文件的 hook 注入用例都以
+// **显式 send** 为前提（claude-code 未配置时缺省已是 transcript、不注入 reminder——
+// 见下方 transcript 用例），所以 mock 缺省返回显式 'send' 而非 undefined。
+const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' | undefined => 'send');
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
   getAllBots: vi.fn(() => []),
@@ -278,17 +280,18 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
 
   // ─── replyDelivery=transcript：续轮不注入 reminder，sidecar 不再承载它 ────────
 
-  it('auto + transcript + whiteboard：sidecar 只含 whiteboard，reminder 两边都没有', () => {
+  it('auto + transcript + whiteboard：sidecar 含 whiteboard 与 sender，reminder 两边都没有', () => {
     replyDeliveryMock.mockReturnValue('transcript');
     try {
       const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_t' }));
-      expect(result.content).toContain('<user_message>\n帮我修个 bug\n</user_message>');
-      expect(result.content).toContain('<sender ');
+      // hook 模式下 PTY 文本只剩用户正文，外壳与 sender/mentions 都进 sidecar。
+      expect(result.content).toBe('帮我修个 bug');
       expect(result.content).not.toContain('<botmux_reminder>');
       expect(result.content).not.toContain('<whiteboard');
       const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
       expect(envelope).toBeDefined();
       expect(envelope).toContain('<whiteboard');
+      expect(envelope).toContain('<sender ');
       expect(envelope).not.toContain('<botmux_reminder>');
       // 白板末句改口：不再要求「仍必须 botmux send」。
       expect(envelope).toContain('用户可见结论写进最终回复即可');
@@ -298,13 +301,33 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     }
   });
 
-  it('auto + transcript 无 whiteboard：envelope 为空 → 回退 inline 且不写 sidecar', () => {
+  it('auto + transcript 无 whiteboard：envelope 只剩 sender，仍走 hook（reminder 两边都没有）', () => {
     replyDeliveryMock.mockReturnValue('transcript');
     try {
       const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe('帮我修个 bug');
       expect(result.content).not.toContain('<botmux_reminder>');
-      expect(result.content).toContain('<user_message>');
-      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toContain('<sender ');
+      expect(envelope).not.toContain('<botmux_reminder>');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('未显式配置 + claude-code：缺省即 transcript，与显式 transcript 字节相同（无 reminder）', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    let explicit: string;
+    try {
+      explicit = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined })).content;
+    } finally {
+      replyDeliveryMock.mockReturnValue(undefined);
+    }
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe(explicit);
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
     } finally {
       replyDeliveryMock.mockReturnValue('send');
     }

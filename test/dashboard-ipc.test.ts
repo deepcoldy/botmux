@@ -1909,37 +1909,40 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
   });
   const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
 
-  it('claude-code: GET 默认 send/supported，PUT transcript 落盘，PUT send 删 key', async () => {
+  it('claude-code: GET 生效值缺省 transcript（CLI 默认），PUT send / transcript 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      // send：显式落盘（claude-code 退回旧行为的唯一方式）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+      const afterOff = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOff).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
 
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
       expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
       expect(getBot(appId).config.replyDelivery).toBe('transcript');
-      const after = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(after).toMatchObject({ replyDelivery: 'transcript', replyDeliverySupported: true });
 
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
-      expect('replyDelivery' in persisted(configPath)).toBe(false);
-      expect(getBot(appId).config.replyDelivery).toBeUndefined();
-
-      // '' / 未知值同样清回默认。
+      // '' / 未知值删 key，回 CLI 缺省（claude-code = transcript）。
       const cleared = await put(base, '');
       expect(cleared.status).toBe(200);
-      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
     });
   });
 
-  it('cursor: GET 报 unsupported，PUT transcript 4xx reply_delivery_unsupported 且不落盘', async () => {
+  it('cursor: GET 缺省 send/unsupported，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
     await withBot('cursor', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
 
       const rejected = await put(base, 'transcript');
       expect(rejected.status).toBe(400);
@@ -1947,10 +1950,11 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
       expect('replyDelivery' in persisted(configPath)).toBe(false);
       expect(getBot(appId).config.replyDelivery).toBeUndefined();
 
-      // send 在不支持的 CLI 上仍可写（no-op 清除），不报错。
+      // send 在不支持的 CLI 上仍可写，同样显式落盘。
       const send = await put(base, 'send');
       expect(send.status).toBe(200);
-      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
     });
   });
 

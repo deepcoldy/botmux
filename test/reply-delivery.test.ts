@@ -6,9 +6,10 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
-// registry 只 mock 本模块用到的两个读取口；其它导出不需要。
+// registry 只 mock 本模块用到的两个读取口；其它导出不需要。resolveReplyDelivery 缺省
+// undefined = bots.json 未显式配置，由 effectiveReplyDelivery 按 CLI 补缺省。
 vi.mock('../src/bot-registry.js', () => ({
-  resolveReplyDelivery: vi.fn(() => 'send'),
+  resolveReplyDelivery: vi.fn((): 'send' | 'transcript' | undefined => undefined),
   getOwnerOpenId: vi.fn(() => undefined),
 }));
 
@@ -16,6 +17,7 @@ import { getOwnerOpenId, resolveReplyDelivery } from '../src/bot-registry.js';
 import {
   computeSoloSession,
   computeSoloSessionForBot,
+  defaultReplyDeliveryFor,
   effectiveReplyDelivery,
   supportsTranscriptReplyDelivery,
   type SoloSessionInput,
@@ -107,39 +109,68 @@ describe('supportsTranscriptReplyDelivery', () => {
   }
 });
 
+describe('defaultReplyDeliveryFor', () => {
+  const cases: Array<[string | undefined, 'send' | 'transcript']> = [
+    ['claude-code', 'transcript'],
+    ['codex', 'send'],
+    ['hermes', 'send'],
+    ['cursor', 'send'],
+    ['codex-app', 'send'],
+    [undefined, 'send'],
+    ['', 'send'],
+  ];
+  for (const [cliId, expected] of cases) {
+    it(`${cliId ?? '(undefined)'} → ${expected}`, () => {
+      expect(defaultReplyDeliveryFor(cliId)).toBe(expected);
+    });
+  }
+});
+
 describe('effectiveReplyDelivery', () => {
   beforeEach(() => {
     vi.mocked(resolveReplyDelivery).mockReset();
-    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
   });
 
-  it('未配置 → send', () => {
-    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('send');
-  });
-
-  it('配置 transcript + claude-code → transcript', () => {
-    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+  it('未配置 + claude-code → transcript（CLI 缺省）', () => {
     expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('transcript');
     expect(resolveReplyDelivery).toHaveBeenCalledWith('app_a');
   });
 
-  it('配置 transcript + codex → transcript', () => {
+  it('未配置 + codex → send（CLI 缺省）', () => {
+    expect(effectiveReplyDelivery('app_a', 'codex')).toBe('send');
+  });
+
+  it('未配置 + cursor → send', () => {
+    expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('send');
+  });
+
+  it('显式 send + claude-code → send（退回旧行为）', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('send');
+  });
+
+  it('显式 transcript + claude-code → transcript', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('transcript');
+  });
+
+  it('显式 transcript + codex → transcript', () => {
     vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
     expect(effectiveReplyDelivery('app_a', 'codex')).toBe('transcript');
   });
 
-  it('配置 transcript + cursor → 回落 send', () => {
+  it('显式 transcript + cursor → 回落 send', () => {
     vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('send');
   });
 
-  it('无 larkAppId → send，且不查 registry', () => {
-    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+  it('无 larkAppId → send（即使是 claude-code），且不查 registry', () => {
     expect(effectiveReplyDelivery(undefined, 'claude-code')).toBe('send');
     expect(resolveReplyDelivery).not.toHaveBeenCalled();
   });
 
-  it('registry 抛错 → fail-closed send', () => {
+  it('registry 抛错 → fail-closed send（claude-code 也不补缺省）', () => {
     vi.mocked(resolveReplyDelivery).mockImplementation(() => { throw new Error('boom'); });
     expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('send');
   });

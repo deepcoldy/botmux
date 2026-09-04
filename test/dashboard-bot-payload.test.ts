@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'substituteMode', 'feedback', 'replyStyle',
       'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
-      'envelopeInjection', 'replyDelivery', 'replyDeliverySupported', 'codexAuthSync',
+      'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
       'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
       'nativeSubagentRuntime',
@@ -261,16 +261,17 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ envelopeInjection: 'off' });
   });
 
-  it('projects reply delivery mode + CLI support so the dashboard toggle survives refresh', () => {
+  it('projects reply delivery effective value + CLI default + CLI support so the dashboard toggle survives refresh', () => {
     const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
+    // 纯投影：daemon 没给就回 send（生效值与缺省值都由 daemon 端算，这里不重复 CLI 判断）。
     expect(botDefaultsPayload(daemon, {}))
-      .toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
-    expect(botDefaultsPayload(daemon, { replyDelivery: 'transcript', replyDeliverySupported: true }))
-      .toMatchObject({ replyDelivery: 'transcript', replyDeliverySupported: true });
-    expect(botDefaultsPayload(daemon, { replyDelivery: 'send', replyDeliverySupported: 'yes' }))
-      .toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
-    expect(botDefaultsPayload(daemon, { replyDelivery: 'invalid' }))
-      .toMatchObject({ replyDelivery: 'send' });
+      .toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true }))
+      .toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: 'yes' }))
+      .toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'invalid', replyDeliveryDefault: 'invalid' }))
+      .toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send' });
   });
 
   it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {

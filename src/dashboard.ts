@@ -7280,7 +7280,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
     // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
-    // the `send` default). 最终回复投递方式的 per-bot 开关。
+    // the CLI default: claude-code=transcript, others=send). 最终回复投递方式的
+    // per-bot 开关；'send' 与 'transcript' 都显式落盘。
     let mBotReplyDelivery: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotReplyDelivery = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-delivery$/))) {
       const appId = decodeURIComponent(mBotReplyDelivery[1]);
