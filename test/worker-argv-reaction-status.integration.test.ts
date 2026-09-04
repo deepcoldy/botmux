@@ -61,6 +61,52 @@ async function waitForScreenUpdates(
   );
 }
 
+/** Wait until the screen_update stream has SETTLED on idle: the newest update is
+ *  idle and stays idle across a quiet window.
+ *
+ *  Why this exists instead of `waitForScreenUpdates(..., u => u.status === 'idle')`:
+ *  on an argv-baked first turn the worker legitimately publishes
+ *  `working -> idle -> working -> idle`. The middle idle is the startup-window
+ *  false idle that the worker itself rejects and re-arms (see `src/worker.ts`,
+ *  "re-arming idle detector"), so "an idle has been seen" and "the turn ended
+ *  idle" are different statements. Waiting for the first idle while asserting on
+ *  the LAST update only agrees while every trailing update happens to arrive in
+ *  one IPC batch: locally all three land in the same millisecond, so the poll
+ *  always observes the settled tail and the test passes. Under CI contention that
+ *  batch splits, the poll can wake between the re-armed `working` and the final
+ *  `idle`, and the tail assertion reads `working` -- a CI-only failure with no
+ *  product-side cause. Settling on the tail removes the dependency on delivery
+ *  batching and is strictly stronger: a transient idle is followed by the re-armed
+ *  `working` well inside the quiet window, so it can no longer end the wait. */
+async function waitForSettledIdle(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  logs: string[],
+  quietMs = 500,
+): Promise<Array<Extract<WorkerToDaemon, { type: 'screen_update' }>>> {
+  const deadline = Date.now() + 10_000;
+  let idleSince: number | undefined;
+  while (Date.now() < deadline) {
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    if (updates.at(-1)?.status === 'idle') {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= quietMs) return updates;
+    } else {
+      idleSince = undefined;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before the screen settled idle\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(
+    `timed out waiting for the screen to settle idle: ${JSON.stringify(messages)}\n${logs.join('')}`,
+  );
+}
+
 async function waitForLog(child: ChildProcess, logs: string[], needle: string): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
@@ -445,18 +491,7 @@ setInterval(() => {}, 1_000);
 
     appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
 
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
   }, 20_000);
@@ -765,19 +800,9 @@ setInterval(() => {}, 1_000);
     await waitForPromptReady(child, messages, logs);
 
     // prompt_ready is sent before the seed's working→idle pair; wait for the
-    // seed's idle to land instead of counting raw updates.
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    // screen to settle idle instead of counting raw updates — the seed's idle is
+    // not necessarily the last update (see waitForSettledIdle).
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 30_000);

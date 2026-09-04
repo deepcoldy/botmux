@@ -2540,7 +2540,238 @@ function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p
   };
 }
 
+// ─── /quote picker (pick a 话题 in this chat to read into the session) ───────
+//
+// Structurally a slimmed-down sibling of the /relay picker above: same
+// search-input + interactive_container rows + paginator + confirm shape, so the
+// two feel like one family. It stays a separate builder rather than a
+// parameterization of buildRelayPickerCard because the two disagree on almost
+// everything that matters — what an entry IS (a 话题 in this chat vs. a session
+// elsewhere), what selecting one DOES (read messages vs. move a live session),
+// and which states are reachable (a 话题 is never "running"). Folding them
+// together would mean threading a mode flag through every branch of a 300-line
+// function to save a layout that is a dozen lines of JSON.
+
+export interface QuotePickerEntry {
+  /** Opaque container id for the 话题 (`omt_…`) or reply chain (`om_…`). */
+  containerId: string;
+  containerKind: 'thread' | 'root';
+  title: string;
+  starterName?: string;
+  lastMessageAt?: number;
+}
+
+export interface QuotePickerState {
+  searchQuery?: string;
+  page?: number;
+  selectedContainerId?: string;
+}
+
+const QUOTE_PICKER_PAGE_SIZE = 5;
+const QUOTE_SEARCH_FIELD = 'quote_search';
+
+/** Case-insensitive substring match over title + starter name. Empty query
+ *  matches everything. */
+export function quotePickerFilter(entries: QuotePickerEntry[], query: string | undefined): QuotePickerEntry[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter(e => `${e.title} ${e.starterName ?? ''}`.toLowerCase().includes(q));
+}
+
+/**
+ * Render the 话题 picker.
+ *
+ * `followUpToken` is the handle for a one-round `/quote <指令>` invocation; it
+ * rides in every button value so the confirm click can recover the parked
+ * instruction. Empty string means two-round mode (read, acknowledge, wait).
+ */
+export function buildQuotePickerCard(
+  entries: QuotePickerEntry[],
+  chatId: string,
+  rootId: string,
+  invokerOpenId: string,
+  locale?: Locale,
+  state?: QuotePickerState,
+  followUpToken: string = '',
+  visibility: 'private' | 'public' = 'public',
+  /** Container ids of the 话题 the invoker is already in, comma-joined. Baked
+   *  into every value so a re-render excludes exactly what the first render
+   *  did — the re-render path resolves the session from `root_id` alone and
+   *  cannot otherwise recover the invoking message's `thread_id`, so without
+   *  this the current 话题 would reappear in the list after the first click. */
+  excludeIds: string = '',
+): string {
+  const searchQuery = state?.searchQuery ?? '';
+  const requestedPage = state?.page ?? 0;
+  const selectedContainerId = state?.selectedContainerId;
+  const elements: any[] = [];
+
+  const filtered = quotePickerFilter(entries, searchQuery);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / QUOTE_PICKER_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const start = page * QUOTE_PICKER_PAGE_SIZE;
+  const visible = filtered.slice(start, start + QUOTE_PICKER_PAGE_SIZE);
+
+  // Full state on every interactive value — the card is stateless on Lark's
+  // side, so each callback has to carry everything needed to re-render.
+  // `invoker_open_id` pins the card to whoever summoned it (the handler
+  // refuses clicks from anyone else), so a passer-by can't repoint it.
+  const stateValue = {
+    chat_id: chatId,
+    root_id: rootId,
+    invoker_open_id: invokerOpenId,
+    follow_up: followUpToken,
+    exclude_ids: excludeIds,
+    visibility,
+    search: searchQuery,
+    page,
+    selected: selectedContainerId ?? '',
+  };
+
+  elements.push({
+    tag: 'input',
+    name: QUOTE_SEARCH_FIELD,
+    placeholder: { tag: 'plain_text', content: t('card.quote.search_placeholder', undefined, locale) },
+    default_value: searchQuery,
+    width: 'fill',
+    behaviors: [
+      { type: 'callback', value: { action: 'quote_search', ...stateValue, selected: '' } },
+    ],
+  });
+  elements.push({ tag: 'hr' });
+
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.quote.empty', undefined, locale) });
+    return JSON.stringify(wrapQuoteCard(elements, locale));
+  }
+  if (filtered.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    return JSON.stringify(wrapQuoteCard(elements, locale));
+  }
+
+  const labelStarter = t('card.quote.field_starter', undefined, locale);
+  const labelTime    = t('card.quote.field_time',    undefined, locale);
+  const selectedTag  = t('card.quote.selected_tag',  undefined, locale);
+  const hasValidSelection = !!(selectedContainerId && filtered.some(e => e.containerId === selectedContainerId));
+
+  visible.forEach((e) => {
+    const isSelected = e.containerId === selectedContainerId;
+    const lines: string[] = [
+      isSelected ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\`` : `**${escapeMd(e.title)}**`,
+    ];
+    if (e.starterName) lines.push(`${labelStarter}: ${escapeMd(e.starterName)}`);
+    // No message count: the chat container returns only 话题 ROOTS, never
+    // their replies, so any number we could show here would be 1 — which
+    // reads as "this 话题 has one message" and is wrong for every 话题 that
+    // has replies. The real count is reported after reading, where it is
+    // actually known.
+    if (e.lastMessageAt) lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
+    elements.push({
+      tag: 'interactive_container',
+      width: 'fill',
+      padding: '8px 12px',
+      background_style: isSelected ? 'laser' : 'default',
+      has_border: true,
+      border_color: isSelected ? 'blue-500' : 'grey-200',
+      corner_radius: '8px',
+      behaviors: [
+        { type: 'callback', value: { action: 'quote_select', container_id: e.containerId, container_kind: e.containerKind, ...stateValue } },
+      ],
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  });
+
+  if (totalPages > 1) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'default',
+      columns: [
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.quote.btn_prev_page', undefined, locale) },
+            type: 'default',
+            disabled: page === 0,
+            behaviors: [{ type: 'callback', value: { action: 'quote_page', ...stateValue, page: Math.max(0, page - 1) } }],
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
+          elements: [{
+            tag: 'markdown', text_align: 'center',
+            content: t('card.quote.page_indicator', { current: page + 1, total: totalPages }, locale),
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.quote.btn_next_page', undefined, locale) },
+            type: 'default',
+            disabled: page === totalPages - 1,
+            behaviors: [{ type: 'callback', value: { action: 'quote_page', ...stateValue, page: Math.min(totalPages - 1, page + 1) } }],
+          }],
+        },
+      ],
+    });
+  }
+
+  elements.push({ tag: 'hr' });
+  if (hasValidSelection) {
+    const selected = filtered.find(e => e.containerId === selectedContainerId)!;
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [{
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: {
+            tag: 'plain_text',
+            content: t(followUpToken ? 'card.quote.btn_confirm_with_task' : 'card.quote.btn_confirm', undefined, locale),
+          },
+          type: 'primary',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'quote_confirm',
+              container_id: selected.containerId,
+              container_kind: selected.containerKind,
+              // Echoed back so the confirm handler can name the 话题 in its
+              // reply without re-scanning the chat to recover the title.
+              title: selected.title,
+              ...stateValue,
+            },
+          }],
+        }],
+      }],
+    });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='grey'>${t('card.quote.hint_pick_first', undefined, locale)}</font>`,
+    });
+  }
+
+  return JSON.stringify(wrapQuoteCard(elements, locale));
+}
+
+function wrapQuoteCard(elements: any[], locale?: Locale): any {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.quote.title', undefined, locale) },
+      template: 'blue',
+    },
+    body: { direction: 'vertical', elements },
+  };
+}
+
 // ─── /adopt picker (V2: search + card list + pagination) ────────────────────
+
 //
 // Replaces the two legacy select_static dropdowns. Unifies the two adopt
 // sources — live processes (tmux/zellij/herdr) and disk-resumable history —

@@ -53,6 +53,46 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('发送失败: ${describeSendFailure(err)}');
   });
 
+  it('prints only whitelisted session lookup diagnostics before send exits missing-session', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+
+    expect(cmdSend).toContain('[botmux send diagnostic] session_lookup_miss');
+    expect(cmdSend).toContain('source=${sessionIdSource}');
+    expect(cmdSend).toContain('dataDir=${sendDataDir}');
+    expect(cmdSend).toContain('envSessionId=${process.env.BOTMUX_SESSION_ID ??');
+    expect(cmdSend).toContain('envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ??');
+    expect(cmdSend).toContain('originSessionId=${originSessionId ??');
+    expect(cmdSend).toContain('loadedSessions=${sessions.size}');
+    expect(cmdSend).toContain("relayDir=${relayDir ? 'present' : 'absent'}");
+    expect(cmdSend).toContain('readIsolation=${isolatedSendRequired ?');
+    expect(cmdSend).toContain("capability=${isolatedCapabilityCtx ? 'present' : 'absent'}");
+
+    const diagnosticStart = cmdSend.indexOf('session_lookup_miss');
+    expect(diagnosticStart).toBeGreaterThanOrEqual(0);
+    const missingSessionAt = cmdSend.indexOf('未找到 session', diagnosticStart);
+    expect(missingSessionAt).toBeGreaterThan(diagnosticStart);
+    const diagnosticBlock = cmdSend.slice(diagnosticStart, missingSessionAt);
+
+    expect([...diagnosticBlock.matchAll(/\$\{([^}]*)\}/g)].map(m => m[1].trim())).toEqual([
+      'sid',
+      'sessionIdSource',
+      'sendDataDir',
+      "process.env.BOTMUX_SESSION_ID ?? '-'",
+      "process.env.BOTMUX_LARK_APP_ID ?? '-'",
+      "originSessionId ?? '-'",
+      'sessions.size',
+      "relayDir ? 'present' : 'absent'",
+      "isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'",
+      "isolatedCapabilityCtx ? 'present' : 'absent'",
+    ]);
+    expect([...diagnosticBlock.matchAll(/process\.env(\.[A-Za-z0-9_]+)?/g)].map(m => m[0])).toEqual([
+      'process.env.BOTMUX_SESSION_ID',
+      'process.env.BOTMUX_LARK_APP_ID',
+    ]);
+  });
+
   it('parses and relays an explicit layout before building the canonical reply card', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);

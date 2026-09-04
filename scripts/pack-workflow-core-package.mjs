@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseNpmPackJson } from './parse-npm-pack-json.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageDir = join(repoRoot, 'packages', 'workflow-core');
@@ -22,9 +23,7 @@ if (result.status !== 0) {
   process.stderr.write(result.stderr);
   process.exit(result.status ?? 1);
 }
-const jsonStart = result.stdout.search(/^\[\s*$/m);
-if (jsonStart < 0) throw new Error(`npm pack returned no JSON:\n${result.stdout}`);
-const packed = JSON.parse(result.stdout.slice(jsonStart));
+const packed = parseNpmPackJson(result.stdout);
 const filename = packed[0]?.filename;
 if (!filename) throw new Error(`npm pack returned no filename: ${result.stdout}`);
 console.log(resolve(outputDir, filename));

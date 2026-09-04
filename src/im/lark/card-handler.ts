@@ -8,7 +8,7 @@ import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
-import { canOperate, canTalk } from './event-dispatcher.js';
+import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -1661,6 +1661,246 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return JSON.parse(cardJson);
   }
 
+  // ─── /quote picker: re-render actions (select / page / search) ────────
+  // Same stateless-card contract as the /relay picker above: every callback
+  // value carries the full state, so we recompute it from the action and
+  // re-render. The 话题 list itself is re-scanned each time rather than
+  // cached — a 话题 that received a message since the card was rendered
+  // should sort up, and a scan is one API call.
+  if (value?.action && larkAppId && ['quote_select', 'quote_page', 'quote_search'].includes(value.action as string)) {
+    const loc = localeForBot(larkAppId);
+    const chatId = value.chat_id as string | undefined;
+    const rootId = value.root_id as string | undefined;
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (!chatId || !rootId || !operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    if (invokerOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_not_invoker', undefined, loc) } };
+    }
+
+    let nextSearch = (value.search as string) ?? '';
+    let nextPage = Number(value.page ?? 0) || 0;
+    let nextSelected: string | undefined = (value.selected as string) || undefined;
+    if (value.action === 'quote_search') {
+      nextSearch = String((action as any)?.input_value ?? '').trim();
+      nextPage = 0;
+      // A new search means the user changed their mind about what they want;
+      // carrying the old selection forward would leave a confirm button
+      // pointing at a 话题 that may not even be in the new result set.
+      nextSelected = undefined;
+    } else if (value.action === 'quote_page') {
+      nextPage = Number(value.page ?? 0) || 0;
+    } else if (value.action === 'quote_select') {
+      nextSelected = value.container_id as string;
+    }
+
+    const { collectQuoteTopics } = await import('../../services/quote-topic-picker.js');
+    const { buildQuotePickerCard } = await import('./card-builder.js');
+    // Re-use the exclusion the first render computed. Recomputing it here
+    // would silently narrow it: this path only has `root_id`, not the
+    // invoking message's `thread_id`, so a real 话题 would reappear in its own
+    // picker after the first click.
+    const excludeIds = (value.exclude_ids as string) ?? '';
+    let topics;
+    try {
+      topics = await collectQuoteTopics(larkAppId, chatId, excludeIds ? excludeIds.split(',') : []);
+    } catch (err) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc) } };
+    }
+    const cardJson = buildQuotePickerCard(
+      topics, chatId, rootId,
+      invokerOpenId ?? operatorOpenId,
+      loc,
+      { selectedContainerId: nextSelected, searchQuery: nextSearch, page: nextPage },
+      (value.follow_up as string) ?? '',
+      (value.visibility as 'private' | 'public') ?? 'public',
+      excludeIds,
+    );
+    return JSON.parse(cardJson);
+  }
+
+  // ─── /quote picker: confirm — read the 话题 into the session ───────────
+  if (value?.action === 'quote_confirm' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const chatId = value.chat_id as string | undefined;
+    const rootId = value.root_id as string | undefined;
+    const containerId = value.container_id as string | undefined;
+    const containerKind = (value.container_kind as 'thread' | 'root') ?? 'thread';
+    const topicTitle = (value.title as string) || containerId || '';
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (!chatId || !rootId || !containerId) {
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    // Invoker pin, fail-closed. A missing operator must be refused, not waved
+    // through: the re-render branch already requires `operatorOpenId`, and this
+    // is the branch that actually triggers a CLI turn, so it cannot be the
+    // laxer of the two.
+    if (!operatorOpenId || (invokerOpenId && invokerOpenId !== operatorOpenId)) {
+      return { toast: { type: 'error', content: t('card.quote.toast_not_invoker', undefined, loc) } };
+    }
+    const ds = activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!ds) {
+      return { toast: { type: 'error', content: t('card.quote.toast_no_session', undefined, loc) } };
+    }
+    // Re-check permission AT CLICK TIME. The repo's invariant is that every card
+    // action able to trigger a CLI turn re-evaluates authorization on click
+    // (`voice_summary` below is the pattern) — and this branch reaches
+    // `sendWorkerInput` / `forkWorker`. Without it, authorization revoked between
+    // summoning the picker and clicking confirm would still go through, within
+    // the follow-up token's 30-minute lifetime.
+    //
+    // Listing 'quote_confirm' in the `isSensitive` array further down does NOT
+    // cover this: every exit of this branch returns, so control never reaches
+    // that check. The entry looked like a gate while being unreachable — worse
+    // than a known gap, because a reader assumes it is enforced. It is kept
+    // there only so a future refactor that moves this branch below the check
+    // inherits the gate.
+    //
+    // Same predicate as the command entry, not a bare `canOperate`:
+    // `canRunDaemonCommand` = canOperate ∪ (cmd ∈ canTalkDaemonCommands && canTalk),
+    // and `/quote` is eligible for that list, so an owner may hand it to
+    // talk-only users. A hard `canOperate` here would let such a bot render the
+    // picker and then refuse every confirm — worse than today.
+    //   • union_id → undefined: card callbacks don't carry one; the team-trust
+    //     leg then declines, which is the fail-closed direction.
+    //   • ds.chatType → MUST be passed: per canRunDaemonCommand's contract the
+    //     p2pOpen leg is inert when chatType is omitted, so omitting it would
+    //     reproduce the same "renders but never confirms" failure for p2pOpen
+    //     bots in DMs. `chatType` is a required DaemonSession field and `ds` is
+    //     already in hand.
+    if (!canRunDaemonCommand(
+      larkAppId, ds.chatId, operatorOpenId,
+      /*senderUnionId*/ undefined, '/quote',
+      /*memberUnionId*/ undefined, ds.chatType,
+    )) {
+      logger.info(`[${tag(ds)}] quote_confirm blocked for unauthorized user: ${operatorOpenId}`);
+      return { toast: { type: 'warning', content: t('card.quote.toast_need_auth', undefined, loc) } };
+    }
+    // Refuse while the worker is mid-turn. Injecting now would either be
+    // dropped by the worker or queue behind the running turn and surface much
+    // later with no visible connection to this click — both read as "the
+    // button did nothing".
+    const busy = !!ds.worker && !ds.worker.killed
+      && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited';
+    if (busy) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
+    // Protected-state gate, BEFORE the fetch and before the follow-up token is
+    // consumed. The busy check above only reads `worker` + `lastScreenStatus`,
+    // and every protected mutation state (pendingRepoSetup / queued activation
+    // tail / queued backlog / an open Codex-App ledger) looks *idle* in both of
+    // those fields — so without this a click during one of them would reach the
+    // cold-fork branch, be refused there, and still report success.
+    // Same gate retry_last_task / retry_turn / voice_summary put in front of
+    // their own fork paths.
+    if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
+
+    const { listMessagesByThreadId, listThreadMessages } = await import('./client.js');
+    const { renderQuoteTranscript, QUOTE_TRANSCRIPT_MAX_MESSAGES } = await import('../../services/quote-transcript.js');
+    const { takeQuoteFollowUp } = await import('../../services/quote-topic-picker.js');
+    // Ask for one more than we render. That extra item is a HAS-MORE probe, not
+    // a count: if it comes back full we know the 话题 is longer than the cap but
+    // NOT by how much, so the renderer must not print a total (see fetchCapped).
+    const fetchLimit = QUOTE_TRANSCRIPT_MAX_MESSAGES + 1;
+    let raw: any[];
+    try {
+      // A thread container is addressed directly by its omt_ id; a 普通群
+      // reply chain has no thread and is walked by its root message instead.
+      raw = containerKind === 'thread'
+        ? await listMessagesByThreadId(larkAppId, containerId, fetchLimit)
+        : await listThreadMessages(larkAppId, chatId, containerId, fetchLimit);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] /quote read failed: ${err instanceof Error ? err.message : err}`);
+      return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc) } };
+    }
+    const followUp = takeQuoteFollowUp(value.follow_up as string | undefined);
+    const transcript = renderQuoteTranscript(raw, topicTitle, followUp, raw.length >= fetchLimit);
+    if (transcript.rendered === 0) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_empty_topic', undefined, loc) } };
+    }
+
+    const { buildFollowUpCliInput } = await import('../../core/session-manager.js');
+    const turnId = cardMessageId ?? `quote-${Date.now()}`;
+    const cliInput = buildFollowUpCliInput(transcript.text, ds.session.sessionId, {
+      isAdoptMode: false,
+      cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId,
+      cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride,
+      locale: loc,
+      larkAppId,
+      chatId: ds.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      sessionBackendType: ds.session.backendType,
+      turnId,
+    });
+    let accepted = false;
+    try {
+      if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
+      // Cold session: fork a worker with the transcript as its opening input,
+      // matching how retry_last_task revives a dead worker. `forkWorker` throws
+      // on refusal rather than returning a flag, so acceptance is claimed only
+      // after it returns — the earlier `accepted = true` before the call would
+      // have reported success for a fork that never happened, with the
+      // one-shot follow-up token already consumed and no retry affordance.
+      else {
+        forkWorker(ds, cliInput, ds.hasHistory);
+        accepted = true;
+      }
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!accepted) {
+      return { toast: { type: 'error', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
+    // Turn bookkeeping — the same set retry_last_task arms. Without it this
+    // injected turn is invisible to the card lifecycle: no fresh streaming card
+    // (the first screen_update PATCHes the PREVIOUS turn's card), a stale
+    // currentTurnTitle in the card and dashboard, and `retry_last_task` would
+    // replay whatever ran before the quote.
+    //
+    // rememberLastCliInput is load-bearing beyond `lastCliInput`: it is the ONLY
+    // place in the repo that clears `suppressRecoveryCard`, the flag a
+    // post-restart recovered session carries to stay quiet. A session that is
+    // only ever driven through /quote would keep that flag forever — final text
+    // answers still arrive, but its streaming card is permanently dead with no
+    // visible cause and no way for the user to revive it.
+    rememberLastCliInput(ds, transcript.text, cliInput);
+    ds.lastScreenStatus = 'working';
+    ds.streamCardPending = true;
+    ds.currentTurnId = turnId;
+    ds.currentTurnTitle = topicTitle.slice(0, 50);
+    ds.currentImageKey = undefined;
+    persistStreamCardState(ds);
+    logger.info(`[${tag(ds)}] /quote injected topic ${containerId} (${transcript.rendered} msgs, dropped ${transcript.dropped}${transcript.totalUnknown ? ', total unknown' : ''})`);
+    // Replace the picker with a plain receipt. Leaving the card live would
+    // invite a second click that re-injects the same transcript.
+    //
+    // Three receipts, not two: when the fetch itself was capped the real total
+    // is unknown, and the "共 N 条" wording would state a number derived from
+    // the fetch limit. A confident wrong number is believed more readily than
+    // an admitted unknown.
+    await sessionReply(
+      rootId,
+      transcript.dropped === 0
+        ? t('cmd.quote.injected', { title: topicTitle, count: transcript.rendered }, loc)
+        : transcript.totalUnknown
+          ? t('cmd.quote.injected_truncated_unknown', {
+              title: topicTitle,
+              count: transcript.rendered,
+            }, loc)
+          : t('cmd.quote.injected_truncated', {
+              title: topicTitle,
+              total: transcript.rendered + transcript.dropped,
+              count: transcript.rendered,
+              dropped: transcript.dropped,
+            }, loc),
+    );
+    if (cardMessageId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
     'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
@@ -2028,7 +2268,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`

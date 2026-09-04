@@ -48,12 +48,12 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--silent]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 
 ### 查看
 
@@ -270,7 +270,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 export const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -473,6 +473,24 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 安全边界与上面的 \`send --card-file/--card-json\` **完全相同**：只允许纯展示元素 + open_url 按钮，任何回调控件都会被拒绝。Bot 身份从会话上下文解析，不提供 \`--bot\` 类显式指定；飞书本身也禁止跨应用 patch 别人的卡片。
 
 成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
+
+#### 原生打字机流式更新：\`botmux card stream\`
+
+需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
+STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
+
+# write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
+\`\`\`
+
+如果同一任务需要跟随较新的用户输入，先用当前完整卡片内容发出新卡，再调用 \`stream reanchor --stream-id <旧流> --message-id <新卡>\`。Botmux 会在新流就绪后拒绝旧流的迟到写入、迁移已绑定的运行状态，并尽力撤回旧消息。成功输出会返回新的 \`messageId\` / \`streamId\`，调用方必须立即更新自己的持久化状态。是否跟随新输入由调用 Skill 决定，Core 不自动撤回任意卡片。
+
+多行内容也可用 \`--content-file -\` 从 stdin 读取。核心命令只负责 transport、会话归属、顺序与幂等；阶段、公开工作摘要、工具事件和 UI 语义应由机器人自己的 Skill 决定。不要把模型私有原始 CoT 写进卡片，只展示可公开、可验证的工作摘要。
 
 ### @mention 其他机器人协作
 

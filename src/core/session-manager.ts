@@ -71,6 +71,7 @@ import {
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -698,8 +699,12 @@ export async function getAvailableBots(
 /** XML-escape a string for use as element text content or attribute value.
  *  Covers the five XML-mandated entities; sufficient for our use case
  *  (paths, names, open_ids, bot identifiers) since we never embed raw user
- *  input in attribute values. */
-function xmlEscape(s: string): string {
+ *  input in attribute values.
+ *
+ *  Exported for `/quote`, which embeds genuinely untrusted content (message
+ *  bodies and display names from a Feishu 话题) inside a `<quoted_topic>`
+ *  fence. Reuse this rather than adding a third private copy. */
+export function xmlEscape(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -3292,6 +3297,17 @@ export async function executeScheduledTask(
   }
   const larkAppId = bot.config.larkAppId;
 
+  // --follow-active: keep the last landing point while a human holds it open;
+  // otherwise re-target to where a human spoke most recently (persisting the
+  // new landing point); with no human-active topic, stay in the landing point
+  // if it is still open (bot-only); with nothing open, run this fire as
+  // new-topic.
+  // Runs before position/scope resolution so the rest of the fire path sees
+  // an ordinary retained-topic / new-topic task.
+  const taskBeforeFollowActive = task;
+  task = applyFollowActive(task);
+  const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
+
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
   // Prefer the explicit three-state position, with scope/deliver fallbacks for
@@ -3358,6 +3374,11 @@ export async function executeScheduledTask(
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
+      // Follow-active step 4: the fresh topic becomes the landing point, so the
+      // next fire stays here (step 3) instead of opening one more topic. A
+      // silent fresh topic has no real root yet (deferred until the first
+      // `botmux send`), so it is not recorded and the next fire re-resolves.
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.
@@ -3420,10 +3441,16 @@ export async function executeScheduledTask(
     }
   } else {
     // thread-scope path (existing logic)
-    const isCrossThread =
-      !!task.creatorRootMessageId &&
-      !!task.rootMessageId &&
-      task.creatorRootMessageId !== task.rootMessageId;
+    // A follow-active task moves its landing point by design, so "creator root
+    // ≠ landing root" would read as cross-thread forever after the first move
+    // (a notice into the closed creation topic on every fire, and no banner in
+    // the topic it actually landed in). For those, only a different CHAT is
+    // "somewhere else"; inside the creator's chat the fire is in-thread.
+    const isCrossThread = task.followActive === true
+      ? (!!task.creatorRootMessageId && !!task.creatorChatId && task.creatorChatId !== task.chatId)
+      : (!!task.creatorRootMessageId &&
+        !!task.rootMessageId &&
+        task.creatorRootMessageId !== task.rootMessageId);
 
     if (isCrossThread) {
       if (!silent) {

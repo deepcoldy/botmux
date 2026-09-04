@@ -56,7 +56,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -85,6 +85,8 @@ import {
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { CardStreamStore } from './services/card-stream-store.js';
+import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -403,7 +405,6 @@ import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.j
 import { persistV3StartIntent } from './workflows/v3/start-intent.js';
 import {
   createWorkflowDaemonIpcNonceStore,
-  generateWorkflowDaemonBootInstanceId,
   loadWorkflowDaemonIpcSecret,
   signWorkflowDaemonIpcResponse,
   verifyWorkflowDaemonIpcRequest,
@@ -495,6 +496,7 @@ import {
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
+  stampHumanActivity,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
@@ -4009,6 +4011,7 @@ function writePidFile(): void {
     // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
     for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
       const wrapper = join(BOTMUX_BIN_DIR, file.name);
+      const isMainWrapper = file.name === 'botmux' || file.name === 'botmux.cmd';
       // NEVER overwrite the running executable. install.sh installs the compiled
       // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
       // the daemon replaced its own 94MB executable with a 47-byte script on every
@@ -4019,7 +4022,7 @@ function writePidFile(): void {
       // `botmux` on PATH, so there is nothing a wrapper needs to add.
       let isRunningBinary = false;
       try {
-        isRunningBinary = realpathSync(wrapper) === realpathSync(process.execPath);
+        isRunningBinary = isMainWrapper && realpathSync(wrapper) === realpathSync(process.execPath);
       } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
       if (isRunningBinary) {
         logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
@@ -4095,11 +4098,18 @@ function writeDaemonDescriptor(d: DaemonDescriptor): void {
   atomicWriteFileSync(fp, JSON.stringify(d), { mode: 0o600 });
 }
 
-function removeDaemonDescriptor(larkAppId: string): void {
+function removeDaemonDescriptor(larkAppId: string, ownBootInstanceId: string): void {
   const fp = join(DAEMON_REGISTRY_DIR, `${larkAppId}.json`);
-  if (existsSync(fp)) {
-    try { unlinkSync(fp); } catch { /* ignore */ }
-  }
+  if (!existsSync(fp)) return;
+  try {
+    // Restart overlap: the successor may already have republished this file
+    // while we were still tearing down. Its descriptor is not ours to remove —
+    // unlinking it would hide a live daemon from IPC discovery for up to one
+    // heartbeat while its occupancy lease says the store is held.
+    const current = JSON.parse(readFileSync(fp, 'utf-8')) as { bootInstanceId?: unknown };
+    if (typeof current.bootInstanceId === 'string' && current.bootInstanceId !== ownBootInstanceId) return;
+  } catch { /* unreadable: treat as ours */ }
+  try { unlinkSync(fp); } catch { /* ignore */ }
 }
 
 /**
@@ -17482,6 +17492,7 @@ async function startInitialPassthroughSession(args: {
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = resolvedSenderIsBot;
   session.lastMessageAt = new Date(now).toISOString();
+  if (!resolvedSenderIsBot) stampHumanActivity(session, now);
   session.scope = scope;
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
@@ -18439,6 +18450,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   session.ownerOpenId = ownerOpenIdForSession;
   session.ownerUnionId = ownerUnionIdForSession;
   session.creatorOpenId = senderOpenId;
+  if (!isBotSenderType && !isForeignBotSender) stampHumanActivity(session, now);
   session.lastCallerOpenId = senderOpenId;
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
@@ -19907,7 +19919,7 @@ async function handleThreadReplyAdmitted(
   // where the caller is often not the session owner).
   const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
-    markSessionActivity(ds);
+    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
@@ -20292,6 +20304,7 @@ async function handleThreadReplyAdmitted(
     session.quoteTargetSenderOpenId = senderOId;
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
+    if (parsed.senderType === 'user' && !isForeignBot) stampHumanActivity(session, now);
     session.scope = scope;
     fillNativeTopicId(session, scope, parsed.threadId);
     const groupChatName = await groupChatNamePromise;
@@ -21840,7 +21853,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
-  sessionStore.init(cfg.larkAppId);
+  sessionStore.init(cfg.larkAppId, {
+    occupancy: { bootId: getDaemonBootId(), pid: process.pid },
+  });
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -21954,7 +21969,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     pid: process.pid,
     processStartIdentity: daemonProcessStartIdentity,
     startedAt: Date.now(),
-    bootInstanceId: generateWorkflowDaemonBootInstanceId(),
+    bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
     lastHeartbeat: Date.now(),
     // Dashboard create-group only consumes app-scoped open_ids — publish ONLY
@@ -22096,6 +22111,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
     }
   };
+  const cardRuntimeStatusBridge = new CardRuntimeStatusBridge(
+    config.session.dataDir,
+    new CardStreamStore(config.session.dataDir),
+    {
+      updateContent: input => updateCardStreamElementContent(
+        input.larkAppId,
+        input.cardId,
+        input.elementId,
+        input.content,
+        input.sequence,
+        input.uuid,
+      ),
+      patchElement: input => patchCardStreamElement(
+        input.larkAppId,
+        input.cardId,
+        input.elementId,
+        input.partialElement,
+        input.sequence,
+        input.uuid,
+      ),
+    },
+  );
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -22127,6 +22164,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
+    onScreenStatus(ds, context) {
+      return cardRuntimeStatusBridge.publish({
+        sessionId: ds.session.sessionId,
+        larkAppId: ds.larkAppId,
+        status: context.status,
+      }).then(() => undefined);
+    },
     onQueuedActivationSubmitted,
     async onTurnTerminal(ds, terminal, context) {
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
@@ -22363,19 +22407,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /healthz AND the public control routes (trigger/result/insight) return 503,
   // so riff never triggers into a racing durable restore (codex P1).
 
-  // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-store load under the store's cross-process write exclusion
-  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
-  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
-  // either observes this descriptor and delegates, or it already holds the
-  // write exclusion; in the latter case this load waits and sees its atomic
-  // mutation. Never load a stale cache in an unadvertised startup window.
+  // Publish the IPC descriptor after bind, then first-load the session store
+  // under BEGIN IMMEDIATE (a plain SELECT would not wait for an in-flight
+  // offline writer). Occupancy is claimed in that same load transaction —
+  // the descriptor is discovery only. An offline writer either sees the
+  // lease and yields, or already holds the write exclusion; in the latter
+  // case this load waits and sees its atomic mutation.
+  //
+  // The first load may already have happened above (the idempotency reconcile
+  // reads the store), so the claim inside it can predate this point by the
+  // whole reconcile; claim again now rather than waiting for the first tick.
+  // The claim doubles as renew, so a lease lost to an overlapping boot is
+  // re-acquired on the next tick once that boot releases or lapses.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   sessionStore.listSessions();
+  let occupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined;
+  const claimOccupancy = (): void => {
+    let next: typeof occupancyState;
+    try {
+      next = sessionStore.claimOccupancyLease({ bootId: getDaemonBootId(), pid: process.pid });
+    } catch (err) {
+      next = 'error';
+      if (occupancyState !== 'error') {
+        logger.warn(`[occupancy] lease claim failed (retrying each heartbeat): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (next !== occupancyState) {
+      if (next === 'displaced') {
+        const holder = (() => { try { return sessionStore.readOccupancyLease(cfg.larkAppId); } catch { return undefined; } })();
+        logger.warn(`[occupancy] session store is held by another live daemon boot${holder ? ` (pid ${holder.ownerPid})` : ''}; this process runs without the lease and retries each heartbeat`);
+      } else if (next === 'held' && occupancyState !== undefined) {
+        logger.info('[occupancy] session store lease acquired');
+      }
+    }
+    occupancyState = next;
+  };
+  claimOccupancy();
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    claimOccupancy();
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -23284,7 +23356,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
-    removeDaemonDescriptor(cfg.larkAppId);
+    // Keep the occupancy lease for the whole teardown: workers still settle
+    // rows into this cache and persist them below. Extend it once here (the
+    // heartbeat is stopped) and release it only at the very end, so an offline
+    // writer cannot slip a commit under a write-back that is still coming.
+    claimOccupancy();
+    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
@@ -23456,6 +23533,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // SIGTERM we want anything learned since the last flush to land.
     flushIdentityCacheSync();
 
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* exit handler retries */ }
     removePidFile();
     process.exit(gracefulProcessExitCode());
       },
@@ -23497,7 +23575,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
-    removeDaemonDescriptor(cfg.larkAppId);
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
+    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and
     // idempotent — safe to call here as a belt-and-suspenders save.

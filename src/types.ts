@@ -389,6 +389,12 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Last input from a HUMAN sender (senderType 'user', not a peer bot)
+   *  routed into this session. Unlike `lastMessageAt` it ignores bot turns
+   *  and scheduled fires, so `schedule add --follow-active` can pick the
+   *  topic where a person most recently spoke without being dragged along by
+   *  a bot's own output. */
+  lastHumanMessageAt?: string;
   closedAt?: string;
   /** Last cumulative token usage persisted at close time. Dashboard list
    *  reads this durable snapshot without rescanning historical transcripts. */
@@ -1007,6 +1013,21 @@ export interface ScheduledTask {
    *  and fresh-topic schedules; a silent fresh topic is created lazily by the
    *  first successful `botmux send`. */
   silent?: boolean;
+  /** `--follow-active`: resolve the target topic at fire time instead of
+   *  pinning one at creation. `rootMessageId` records the last landing point
+   *  (the creation topic until the first fire). Each fire: (1) that topic is
+   *  still open (an active session exists under its root, any bot) AND a
+   *  human has spoken in it → fire there; (2) otherwise → the thread-scope
+   *  session in `chatId` whose `lastHumanMessageAt` is newest, looked up
+   *  across every bot's session store because "where the person is" is a
+   *  property of the person, not of the bot that owns the task (this lands
+   *  inside the person's live session, so the task's own workingDir does not
+   *  apply there); (3) no human-active topic anywhere but the landing point
+   *  is still open (bot-only, e.g. the fresh topic this task opened) → stay;
+   *  (4) nothing open → this fire opens a fresh top-level topic, which then
+   *  becomes the landing point. Only meaningful with executionPosition
+   *  'topic'. */
+  followActive?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -1407,12 +1428,12 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
    * has already published a fresh token. */
-  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   | {
       type: 'codex_app_dispatch_transition';
       sessionId: string;

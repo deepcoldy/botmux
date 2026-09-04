@@ -49,6 +49,10 @@ describe('worker → codex buildArgs wiring (source lock)', () => {
     expect(call).toContain('remoteThreadId,');
   });
 
+  it('passes the prepared native session title into launch args consumers', () => {
+    expect(call).toContain('nativeSessionTitle: cfg.nativeSessionTitle,');
+  });
+
   it('engages RPC (which sets remoteWsUrl/remoteThreadId) BEFORE the spawn that reads them', () => {
     // The module vars are populated inside engageCodexRpc; spawnCli (→ buildArgs)
     // must run after, or the fields would always be undefined at the call site.

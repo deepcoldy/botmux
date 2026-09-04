@@ -447,7 +447,7 @@ type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
  *
  * Daemon up: send the command, so the row that persists is the daemon's own.
  * Daemon down: publish the row here, under the store's write exclusion and the
- * liveness re-probe in {@link mutateSessionRowWhenUnowned}.
+ * occupancy re-check in {@link mutateSessionRowWhenUnowned}.
  *
  * Both paths are compare-and-set against `boardId`. Deletion has already
  * removed the board from the index by the time this runs, so the daemon's

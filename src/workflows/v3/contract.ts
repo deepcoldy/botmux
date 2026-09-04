@@ -180,7 +180,10 @@ export interface BotSnapshot {
 export interface WorkerSessionInfo {
   sessionId: string;
   webPort?: number;
+  /** Private write capability. May return to the runtime result, never journal it. */
   token?: string;
+  /** Per-worker-boot read capability used by card terminal links. */
+  viewToken?: string;
 }
 
 export interface RunNodeRequest {

@@ -43,7 +43,8 @@ let cachedSnapshot: GroupsSnapshot = emptyGroupsSnapshot;
 let cachedAt = 0;
 let inFlight: Promise<GroupsSnapshot> | null = null;
 let requestSeq = 0;
-let latestRequestSeq = 0;
+let latestSuccessfulRequestSeq = 0;
+let cacheEpoch = 0;
 
 function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
   return {
@@ -55,6 +56,18 @@ function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
 export function primeGroupsSnapshotCache(snapshot: GroupsSnapshot): void {
   cachedSnapshot = snapshot;
   cachedAt = Date.now();
+}
+
+export function __testOnly_resetGroupsSnapshotCache(): void {
+  cacheEpoch += 1;
+  cachedSnapshot = emptyGroupsSnapshot;
+  cachedAt = 0;
+  inFlight = null;
+  requestSeq = 0;
+  latestSuccessfulRequestSeq = 0;
+  cachedNames = emptyGroupsSnapshot;
+  cachedNamesAt = 0;
+  namesInFlight = null;
 }
 
 // ─── 名称/头像专用轻量缓存（与上面的完整矩阵缓存**完全分离**）──────────────
@@ -91,19 +104,22 @@ export async function fetchGroupsNamesSnapshot(
   if (!options.force && cachedNamesAt > 0 && now - cachedNamesAt <= cacheMs) return cachedNames;
   if (!options.force && namesInFlight) return namesInFlight;
 
+  const epoch = cacheEpoch;
   const request = (async () => {
     const r = await fetch('/api/groups?view=names');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);
-    cachedNames = snapshot;
-    cachedNamesAt = Date.now();
+    if (epoch === cacheEpoch) {
+      cachedNames = snapshot;
+      cachedNamesAt = Date.now();
+    }
     return snapshot;
   })();
 
   if (!options.force) {
     namesInFlight = request.finally(() => {
-      namesInFlight = null;
+      if (epoch === cacheEpoch) namesInFlight = null;
     });
     return namesInFlight;
   }
@@ -117,19 +133,22 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   if (!options.force && inFlight) return inFlight;
 
   const seq = ++requestSeq;
-  latestRequestSeq = seq;
+  const epoch = cacheEpoch;
   const request = (async () => {
     const r = await fetch(options.force ? '/api/groups?refresh=1' : '/api/groups');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);
-    if (seq === latestRequestSeq) primeGroupsSnapshotCache(snapshot);
+    if (epoch === cacheEpoch && seq > latestSuccessfulRequestSeq) {
+      primeGroupsSnapshotCache(snapshot);
+      latestSuccessfulRequestSeq = seq;
+    }
     return snapshot;
   })();
 
   if (!options.force) {
     inFlight = request.finally(() => {
-      inFlight = null;
+      if (epoch === cacheEpoch) inFlight = null;
     });
     return inFlight;
   }

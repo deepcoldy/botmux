@@ -99,7 +99,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -231,7 +231,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -245,6 +245,18 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import {
+  NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS,
+  createNativeSubagentRuntimeNonceStore,
+  type NativeSubagentRuntimeNonceStore,
+  nativeSubagentRuntimeHostRequestNonce,
+  nativeSubagentRuntimeRequestNonce,
+  signNativeSubagentRuntimeResponse,
+  verifyNativeSubagentRuntimeCapabilityRequest,
+  writeNativeSubagentRuntimeResponseProof,
+} from './native-subagent-runtime-ipc-auth.js';
+import { normalizeNativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import {
@@ -303,6 +315,7 @@ const routes: Route[] = [];
  * write-link handlers consult this marker so they do not verify (and consume)
  * the same one-shot nonce twice. */
 const trustedHostRequests = new WeakSet<IncomingMessage>();
+const trustedHostRequestSecrets = new WeakMap<IncomingMessage, string>();
 export function isTrustedHostIpcRequest(req: IncomingMessage): boolean {
   return trustedHostRequests.has(req);
 }
@@ -728,6 +741,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/prompt-ctx\/claim$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/native-subagent-runtime$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // A sandboxed report cannot read the host HMAC secret. This narrow route
@@ -797,6 +811,19 @@ export function armCoreOnlyReadinessGate(): void { coreOnlyReadinessGate = true;
 export function setCoreOnlyReady(): void { coreOnlyReady = true; }
 /** @internal test-only: reset the core-only readiness gate between cases. */
 export function __testOnly_resetCoreOnlyReadiness(): void { coreOnlyReadinessGate = false; coreOnlyReady = false; }
+/** @internal test-only: clear shared attestation/runtime nonce and proof counters. */
+export function __testOnly_resetManagedOriginRuntimeAuthState(): void {
+  managedOriginOutstandingProofs.clear();
+  managedOriginPreauthInFlight = 0;
+  nativeSubagentRuntimePreauthInFlight = 0;
+  nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+}
+/** @internal test-only: override runtime nonce-store behavior for capacity tests. */
+export function __testOnly_setNativeSubagentRuntimeNonceStore(
+  store: NativeSubagentRuntimeNonceStore | null,
+): void {
+  nativeSubagentRuntimeNonceStore = store ?? createNativeSubagentRuntimeNonceStore();
+}
 /** True when the readiness gate is armed (core-only) but restore hasn't finished.
  *  The server-level gate returns 503 for the public control routes in this state,
  *  and /healthz reports 'starting' — a barrier so riff can't trigger into a racing
@@ -1231,6 +1258,200 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
   const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
   if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   jsonRes(res, 200, { ok: true, envelope });
+});
+
+/** Return only the live bot's normalized native-subagent policy. The session
+ * identity is selected by the authenticated URL/capability pair; body bot ids
+ * are deliberately ignored so callers cannot read another bot's config. */
+const NATIVE_SUBAGENT_RUNTIME_BODY_MAX_BYTES = 2 * 1024;
+const NATIVE_SUBAGENT_RUNTIME_BODY_TIMEOUT_MS = 1_000;
+const NATIVE_SUBAGENT_RUNTIME_MAX_PREAUTH_IN_FLIGHT = 128;
+let nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+let nativeSubagentRuntimePreauthInFlight = 0;
+
+function nativeSubagentRuntimeJsonRes(input: {
+  req: IncomingMessage;
+  res: ServerResponse;
+  sessionId: string;
+  status: number;
+  body: unknown;
+  authKind: 'host' | 'capability';
+  requestNonce: string;
+  key?: string;
+}): void {
+  const path = new URL(input.req.url ?? '/', 'http://localhost').pathname;
+  const port = input.req.socket.localPort;
+  if (!port) return jsonRes(input.res, 503, { ok: false, error: 'policy_unavailable' });
+  const raw = JSON.stringify(input.body);
+  const responseBinding = {
+    requestNonce: input.requestNonce,
+    method: input.req.method ?? 'POST',
+    path,
+    port,
+    status: input.status,
+    body: raw,
+    sessionId: input.sessionId,
+    larkAppId: cachedLarkAppId,
+    bootInstanceId: getDaemonBootId(),
+  } as const;
+  const responseHeaders: Record<string, string> = { 'content-type': 'application/json' };
+  if (input.authKind === 'host') {
+    if (!input.key) return jsonRes(input.res, 503, { ok: false, error: 'policy_unavailable' });
+    responseHeaders[NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.responseSignature] =
+      signNativeSubagentRuntimeResponse({ ...responseBinding, key: input.key });
+    input.res.writeHead(input.status, responseHeaders);
+    input.res.end(raw);
+    return;
+  }
+
+  const ds = findActiveBySessionId(input.sessionId);
+  const channelId = ds?.managedTurnOrigin?.originChannelId;
+  if (!channelId) {
+    logger.warn('[native-subagent-runtime] missing origin channel; returning unsigned proof_unavailable');
+    return jsonRes(input.res, 409, { ok: false, error: 'proof_unavailable' });
+  }
+  const outstanding = managedOriginOutstandingProofs.get(input.sessionId) ?? 0;
+  if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
+    logger.warn('[native-subagent-runtime] proof capacity exhausted; returning unsigned too_many_attestations');
+    return jsonRes(input.res, 429, { ok: false, error: 'too_many_attestations' });
+  }
+  let proofPath: string;
+  try {
+    proofPath = writeNativeSubagentRuntimeResponseProof({
+      dataDir: config.session.dataDir, channelId, nonce: input.requestNonce,
+      response: responseBinding,
+    });
+  } catch (error) {
+    logger.warn(`[native-subagent-runtime] could not write response proof: ${error}`);
+    return jsonRes(input.res, 409, { ok: false, error: 'proof_unavailable' });
+  }
+  managedOriginOutstandingProofs.set(input.sessionId, outstanding + 1);
+  const cleanupTimer = setTimeout(() => {
+    try { unlinkSync(proofPath); } catch { /* expired/already gone */ }
+    const remaining = (managedOriginOutstandingProofs.get(input.sessionId) ?? 1) - 1;
+    if (remaining > 0) managedOriginOutstandingProofs.set(input.sessionId, remaining);
+    else managedOriginOutstandingProofs.delete(input.sessionId);
+  }, NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS + 1_000);
+  cleanupTimer.unref?.();
+  input.res.writeHead(input.status, responseHeaders);
+  input.res.end(raw);
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req, res, params) => {
+  // Trusted-host requests were authenticated by the server-wide gate before
+  // dispatch. Capability requests are still anonymous until their bounded body
+  // and signature have been verified, so cap that slow-body phase globally.
+  const preauthLimited = !trustedHostRequestSecrets.has(req);
+  if (preauthLimited
+    && nativeSubagentRuntimePreauthInFlight >= NATIVE_SUBAGENT_RUNTIME_MAX_PREAUTH_IN_FLIGHT) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 429, { ok: false, error: 'too_many_native_runtime_requests' });
+  }
+  if (preauthLimited) nativeSubagentRuntimePreauthInFlight += 1;
+  let body: Record<string, unknown>;
+  try {
+    body = await readBoundedJsonBody<Record<string, unknown>>(
+      req,
+      NATIVE_SUBAGENT_RUNTIME_BODY_MAX_BYTES,
+      NATIVE_SUBAGENT_RUNTIME_BODY_TIMEOUT_MS,
+    );
+  } catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(
+      res,
+      err instanceof IpcBodyTooLargeError
+        ? 413
+        : err instanceof IpcBodyTimeoutError
+          ? 408
+          : 400,
+      {
+        ok: false,
+        error: err instanceof IpcBodyTooLargeError
+          ? 'body_too_large'
+          : err instanceof IpcBodyTimeoutError
+            ? 'body_timeout'
+            : 'bad_json',
+      },
+    );
+  } finally {
+    if (preauthLimited) nativeSubagentRuntimePreauthInFlight -= 1;
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+  const port = req.socket.localPort;
+  if (!port) return jsonRes(res, 503, { ok: false, error: 'policy_unavailable' });
+  const hostSecret = trustedHostRequestSecrets.get(req);
+  const daemonIdentity = { larkAppId: cachedLarkAppId, bootInstanceId: getDaemonBootId() };
+  const hostNonce = hostSecret
+    ? nativeSubagentRuntimeHostRequestNonce(req.headers, daemonIdentity)
+    : undefined;
+  let responseAuth: {
+    authKind: 'host' | 'capability';
+    key: string;
+    requestNonce: string;
+  };
+  if (hostSecret) {
+    if (!hostNonce) return jsonRes(res, 403, { ok: false, error: 'response_challenge_required' });
+    responseAuth = { authKind: 'host', key: hostSecret, requestNonce: hostNonce };
+  } else {
+    const liveOrigin = ds?.managedTurnOrigin;
+    const policyCapability = liveOrigin?.policyCapability;
+    if (!ds || !policyCapability) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    const verified = verifyNativeSubagentRuntimeCapabilityRequest({
+      capability: policyCapability,
+      headers: req.headers,
+      remoteAddress: req.socket.remoteAddress,
+      nonceStore: nativeSubagentRuntimeNonceStore,
+      method: req.method ?? 'POST',
+      path,
+      port,
+      sessionId: params.sessionId,
+      ...daemonIdentity,
+    });
+    if (!verified.ok) {
+      if (verified.reason === 'capacity_exceeded') {
+        return nativeSubagentRuntimeJsonRes({
+          req,
+          res,
+          sessionId: params.sessionId,
+          status: 429,
+          body: { ok: false, error: 'native_runtime_overloaded' },
+          authKind: 'capability',
+          key: policyCapability,
+          requestNonce: nativeSubagentRuntimeRequestNonce(req.headers) ?? '',
+        });
+      }
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    responseAuth = {
+      authKind: 'capability',
+      key: policyCapability,
+      requestNonce: verified.nonce,
+    };
+  }
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+
+  let runtimeState;
+  try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
+  catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  if (runtimeState.status === 'invalid') {
+    return nativeSubagentRuntimeJsonRes({
+      req, res, sessionId: params.sessionId, status: 200,
+      body: { ok: true, invalidPolicy: true }, ...responseAuth,
+    });
+  }
+  nativeSubagentRuntimeJsonRes({
+    req, res, sessionId: params.sessionId, status: 200,
+    body: {
+      ok: true,
+      ...(runtimeState.status === 'valid' ? { policy: runtimeState.policy } : {}),
+    },
+    ...responseAuth,
+  });
 });
 
 // `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
@@ -2895,6 +3116,7 @@ export interface ScheduleRow {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
   feishuChatLink: string;
 }
 
@@ -2922,6 +3144,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
+    followActive: t.followActive === true ? true : undefined,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -2979,6 +3202,15 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'silent' });
     }
     silent = b.silent;
+  }
+  // followActive — if present, must be boolean; topic-only (scheduler.addTask
+  // rejects the rest with follow_active_requires_topic).
+  let followActive = false;
+  if (b.followActive !== undefined) {
+    if (typeof b.followActive !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'followActive' });
+    }
+    followActive = b.followActive;
   }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
@@ -3041,6 +3273,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
+      followActive: followActive || undefined,
     });
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
@@ -4017,6 +4250,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
   let turnTimeoutMs: number | null = null;
@@ -4042,6 +4276,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.modelBackendVariant
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
+    nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
+      ? normalizedNativeSubagentRuntime.value ?? null
+      : null;
     turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
       && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
       ? cfg.turnTimeoutMs
@@ -4126,6 +4364,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     model,
     modelBackendVariant,
     reasoningEffort,
+    nativeSubagentRuntime,
     turnTimeoutMs,
     dshRuntime,
     agentSelectionKey,
@@ -4617,8 +4856,17 @@ ipcRoute('PUT', '/api/bot-description', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
+  let body: {
+    cliId?: unknown;
+    model?: unknown;
+    modelBackendVariant?: unknown;
+    reasoningEffort?: unknown;
+    nativeSubagentRuntime?: unknown;
+    turnTimeoutMs?: unknown;
+    cliRuntime?: unknown;
+    dshRuntime?: unknown;
+  };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -4649,6 +4897,33 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
+  const nativeSubagentRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'nativeSubagentRuntime');
+  let requestedNativeSubagentRuntime: BotConfig['nativeSubagentRuntime'];
+  if (selected.cliId === 'traex' && nativeSubagentRuntimeFieldPresent && body.nativeSubagentRuntime !== null) {
+    const normalized = normalizeNativeSubagentRuntimePolicy(body.nativeSubagentRuntime);
+    if (!normalized.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_native_subagent_runtime',
+        message: normalized.error,
+      });
+    }
+    requestedNativeSubagentRuntime = normalized.value;
+    const customModel = requestedNativeSubagentRuntime?.model?.mode === 'custom'
+      ? requestedNativeSubagentRuntime.model.value
+      : undefined;
+    const customEffort = requestedNativeSubagentRuntime?.reasoningEffort?.mode === 'custom'
+      ? requestedNativeSubagentRuntime.reasoningEffort.value
+      : undefined;
+    if (customModel && customEffort
+        && !cliModelSupportsReasoningEffort('traex', customModel, customEffort)) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_native_subagent_runtime',
+        message: `模型 ${customModel} 不支持子代理思考强度 ${customEffort}`,
+      });
+    }
+  }
   // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
   // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
   // field is optional in the body, so distinguish absent (preserve) from
@@ -4784,6 +5059,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       error?: 'reasoning_effort_not_supported_by_model';
       nextReasoningEffort?: typeof reasoningEffort;
       nextModelBackendVariant?: 'standard' | 'max';
+      nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
     const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
       ? entry.modelBackendVariant
@@ -4829,6 +5105,24 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
       else delete entry.reasoningEffort;
     }
+    let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
+    if (selected.cliId !== 'traex') {
+      delete entry.nativeSubagentRuntime;
+      nextNativeSubagentRuntimeState = { status: 'absent' };
+    } else if (nativeSubagentRuntimeFieldPresent) {
+      if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
+      else delete entry.nativeSubagentRuntime;
+      nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
+        ? { status: 'valid', policy: requestedNativeSubagentRuntime }
+        : { status: 'absent' };
+    } else {
+      const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
+      nextNativeSubagentRuntimeState = !normalized.ok
+        ? { status: 'invalid' }
+        : normalized.value
+          ? { status: 'valid', policy: normalized.value }
+          : { status: 'absent' };
+    }
     // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
     // field value writes/clears it, absence preserves the current value.
     if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
@@ -4858,7 +5152,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
       delete entry.backendType;
     }
-    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant } };
+    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
@@ -4881,6 +5175,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       : undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    updateBotNativeSubagentRuntime(
+      larkAppId,
+      r.result.nextNativeSubagentRuntimeState ?? { status: 'absent' },
+    );
     // Mirror the entry write: non-dsh clears it, dsh with an explicit field
     // takes the parsed value, dsh without the field preserves the existing one.
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
@@ -4909,6 +5207,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       selectionKey,
@@ -5988,6 +6287,7 @@ export function startIpcServer(opts: {
           : { ok: false as const, reason: 'secret_unavailable' };
         if (auth.ok) {
           trustedHostRequests.add(req);
+          trustedHostRequestSecrets.set(req, secret!);
         } else if (!capabilityRoute) {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }

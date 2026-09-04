@@ -80,9 +80,16 @@ describe('botmuxWrapperFiles — standalone (compiled binary) form', () => {
 
   it('windows .cmd form also targets the binary, never node', () => {
     const files = botmuxWrapperFiles(BUNFS_CLI, BINARY, 'win32', true);
-    expect(files.map(f => f.name)).toEqual(['botmux', 'botmux.cmd']);
+    expect(files.map(f => f.name)).toEqual([
+      'botmux',
+      'botmux-native-subagent-runtime-hook',
+      'botmux.cmd',
+      'botmux-native-subagent-runtime-hook.cmd',
+    ]);
     const cmd = files.find(f => f.name === 'botmux.cmd')!;
+    const nativeHookCmd = files.find(f => f.name === 'botmux-native-subagent-runtime-hook.cmd')!;
     expect(cmd.content).toBe(`@echo off\r\n"${BINARY}" %*\r\n`);
+    expect(nativeHookCmd.content).toBe(`@echo off\r\n"${BINARY}" native-subagent-runtime-hook %*\r\n`);
     expect(cmd.content).not.toContain('$bunfs');
   });
 
@@ -165,5 +172,8 @@ describe('daemon wrapper write — refuses to clobber the running executable', (
     expect(region).toContain('realpathSync(wrapper) === realpathSync(process.execPath)');
     // It must `continue` (skip this file), not fall through to the write.
     expect(region).toMatch(/isRunningBinary\s*\)\s*\{[\s\S]{0,400}?continue;/);
+    // The skip guard must apply only to the main wrapper path. The dedicated
+    // native-hook sibling still has to be written in standalone install layout.
+    expect(region).toContain("file.name === 'botmux' || file.name === 'botmux.cmd'");
   });
 });

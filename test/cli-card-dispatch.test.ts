@@ -336,6 +336,7 @@ describe('card patch --help', () => {
   it('prints the card command usage with the patch subcommand on `card --help` / no subcommand', () => {
     expect(CARD_COMMAND_USAGE).toContain('botmux card');
     expect(CARD_COMMAND_USAGE).toContain('patch');
+    expect(CARD_COMMAND_USAGE).toContain('stream');
     expect(CARD_COMMAND_USAGE).toContain('--message-id');
     expect(CARD_COMMAND_USAGE).toContain('原地更新');
   });

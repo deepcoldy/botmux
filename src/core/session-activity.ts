@@ -8,14 +8,38 @@ import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
 import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
-export function markSessionActivity(ds: DaemonSession, at: number = Date.now()): void {
+/**
+ * Stamp `lastHumanMessageAt` on a session that is being created by a human
+ * message, before it has a DaemonSession. The caller persists the session.
+ */
+export function stampHumanActivity(session: Session, at: number): void {
+  session.lastHumanMessageAt = new Date(at).toISOString();
+}
+
+export function markSessionActivity(
+  ds: DaemonSession,
+  at: number = Date.now(),
+  opts: { human?: boolean } = {},
+): void {
   ds.lastMessageAt = at;
   const iso = new Date(at).toISOString();
+  let dirty = false;
   if (ds.session.lastMessageAt !== iso) {
     ds.session.lastMessageAt = iso;
-    sessionStore.updateSession(ds.session);
+    dirty = true;
   }
+  // Human-only clock, kept separately so a bot's own turns (and scheduled
+  // fires) never count as "someone is here" — see Session.lastHumanMessageAt.
+  if (opts.human) {
+    ds.lastHumanMessageAt = at;
+    if (ds.session.lastHumanMessageAt !== iso) {
+      ds.session.lastHumanMessageAt = iso;
+      dirty = true;
+    }
+  }
+  if (dirty) sessionStore.updateSession(ds.session);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {

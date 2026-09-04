@@ -4,6 +4,7 @@ import { normalizeUsageDisplay } from '../bot-registry.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -18,7 +19,9 @@ export interface DashboardBotDescriptor {
   cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
@@ -66,7 +69,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     ...(bot.dshProfile ? { dshProfile: bot.dshProfile } : {}),

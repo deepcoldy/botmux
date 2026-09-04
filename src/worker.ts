@@ -400,7 +400,8 @@ import {
   installHook,
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
-import { hookCommandFor } from './adapters/hook-command.js';
+import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
+import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
@@ -1262,6 +1263,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
+      appServerConfig: cfg.cliId === 'traex'
+        ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
+        : undefined,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1537,6 +1541,7 @@ let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox 
 let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
+let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
@@ -2852,6 +2857,7 @@ function currentGatewayTrustedTurnIdentity() {
 
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+  const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -2863,7 +2869,19 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     ...(sandboxRelayOutbox
       ? [{
           path: join(sandboxRelayOutbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
-          body: JSON.stringify({ token: capability.token }),
+          body: JSON.stringify({
+            sessionId,
+            ...(readIsolationOriginChannelId ? { channelId: readIsolationOriginChannelId } : {}),
+            token: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
+            ...(capability.turnId ? { turnId: capability.turnId } : {}),
+            ...(capability.dispatchAttempt !== undefined
+              ? { dispatchAttempt: capability.dispatchAttempt }
+              : {}),
+            ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
+          }),
         }]
       : []),
     ...(readIsolationOriginChannelId
@@ -2877,6 +2895,9 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             sessionId,
             channelId: readIsolationOriginChannelId,
             capability: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
             ...(capability.turnId ? { turnId: capability.turnId } : {}),
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
@@ -2913,11 +2934,13 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   }
 
   sandboxRelayCapability = capability;
+  sandboxPolicyCapability = policyCapability;
   if (sessionId) {
     send({
       type: 'managed_turn_origin',
       sessionId,
       capability: capability.token,
+      policyCapability,
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2950,17 +2973,21 @@ function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
+  opts: { revokePolicy?: boolean } = {},
 ): void {
   // Clear local authority before queuing daemon IPC. A forked/delayed process
   // can otherwise win the small window between terminal publication and
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
+  const revokedPolicyCapability = opts.revokePolicy ? sandboxPolicyCapability : null;
+  if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
     send({
       type: 'managed_turn_origin_revoked',
       sessionId,
       ...(revoked ? { capability: revoked.token } : {}),
+      ...(revokedPolicyCapability ? { policyCapability: revokedPolicyCapability } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2987,6 +3014,7 @@ function revokeManagedTurnOriginForRestart(): void {
     revoked,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
+    { revokePolicy: false },
   );
 }
 
@@ -3000,7 +3028,7 @@ function revokeManagedTurnOriginForTerminal(
   if (!revoked
     || revoked.turnId !== turnId
     || revoked.dispatchAttempt !== dispatchAttempt) return;
-  completeManagedTurnOriginRevocation(revoked, turnId, dispatchAttempt);
+  completeManagedTurnOriginRevocation(revoked, turnId, dispatchAttempt, { revokePolicy: false });
 }
 function authorizeManagedSend(
   claim: { capability?: string },
@@ -13186,6 +13214,10 @@ async function spawnCli(
     if (!path) return '';
     try { return realpathSync(path); } catch { return path; }
   };
+  const botmuxInstallRoot = canonicalPolicyPath(dirname(dirname(fileURLToPath(import.meta.url))));
+  const nativeHookProtocolToken = cfg.cliId === 'traex' && !remoteWsUrl
+    ? 'native-subagent-runtime-hook.v1'
+    : '';
   const darwinIsolationPolicyDigest = process.platform === 'darwin'
     ? isolationPanePolicyDigest({
         readIsolation: willReadIsolate,
@@ -13211,15 +13243,18 @@ async function spawnCli(
     : undefined;
   const managedOriginChannelRequired = willReadIsolate
     || credentialOnlySeatbelt
-    || credentialOnlyBwrap;
+    || credentialOnlyBwrap
+    || sandboxRequested;
   const managedOriginChannelPolicyDigest = (willReadIsolate || willWriteSandbox)
     ? darwinIsolationPolicyDigest
     : managedOriginChannelRequired
       ? createHash('sha256').update(JSON.stringify({
-          domain: 'botmux.credential-origin-channel.v1',
+          domain: 'botmux.credential-origin-channel.v2',
           platform: process.platform,
           configuredBotmuxHome: canonicalPolicyPath(configuredBotmuxHome),
           defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
+          botmuxInstallRoot,
+          nativeHookProtocolToken,
         })).digest('hex')
       : undefined;
 
@@ -13622,6 +13657,21 @@ async function spawnCli(
     : null;
   if (readIsolationOriginChannelId) {
     persistentPaneOriginChannelId = readIsolationOriginChannelId;
+    ensureManagedOriginCapabilityLeafSafe(managedOriginCapabilityPath(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    ));
+    ensureManagedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
+    sweepManagedOriginAttestationProofs(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
   }
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
@@ -14103,6 +14153,7 @@ async function spawnCli(
     // fork from, so a fresh session is spawned instead.
     forkSession: cfg.forkSession === true && effectiveResume,
     initialPrompt: preparedInitialPrompt,
+    nativeSessionTitle: cfg.nativeSessionTitle,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
@@ -14136,6 +14187,11 @@ async function spawnCli(
     // RPC viewer branch actually triggers and never carries the bypass flags.
     remoteWsUrl,
     remoteThreadId,
+    // The remote TUI is only a viewer; its app-server received the same hook in
+    // engageCodexRpc. Plain Trae TUI processes own the model and get it here.
+    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
+      ? nativeSubagentRuntimeHookCommand()
+      : undefined,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -14598,7 +14654,6 @@ async function spawnCli(
     // This module compiles to <checkout>/dist/worker.js, so `../../` from here is
     // the checkout root. Exposed readOnly so `botmux` + claude hooks can exec
     // `node <checkout>/dist/cli.js`.
-    const botmuxInstallRoot = canonical(dirname(dirname(fileURLToPath(import.meta.url))));
     // A development worktree may share dependencies through a node_modules
     // symlink. Seatbelt resolves that link before matching policy rules, so the
     // checkout grant alone does not cover the canonical dependency tree.
@@ -14679,16 +14734,6 @@ async function spawnCli(
       if (dataRootProbe !== 'host_accessible') {
         throw new Error('[read-isolation] locator-selected data-root probe is unavailable or unsafe');
       }
-      ensureManagedOriginAttestationDirectory(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
-      sweepManagedOriginAttestationProofs(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
     }
     readIsolationOriginCapabilityFile = process.platform === 'darwin'
       ? managedOriginCapabilityPath(
@@ -14736,6 +14781,18 @@ async function spawnCli(
           }
         } catch { /* absent authority root */ }
       }
+    }
+    if (process.platform === 'linux' && readIsolationOriginChannelId) {
+      mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(
+        isolationRuntimeDataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
+      mandatoryReadOnlyPaths.push(managedOriginAttestationDirectory(
+        isolationRuntimeDataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
     }
     if (mcpRuntimeManifest) {
       mandatoryDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
@@ -15247,10 +15304,15 @@ async function spawnCli(
       cfg.sessionId,
       readIsolationOriginChannelId!,
     );
+    const attestationDirectory = managedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId!,
+    );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
       [...rules.denyPaths.map(canonical), canonical(profileDir)],
-      [canonical(originDirectory)],
+      [canonical(originDirectory), canonical(attestationDirectory)],
       [],
       [canonical(profileDir)],
       rules.denyRegexes,
@@ -15347,14 +15409,24 @@ async function spawnCli(
     const credentialSandbox = prepareCredentialOnlySandbox({
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
-      privateReadonlyDirectories: [{
-        parent: realpathSync(panePolicyDir),
-        directory: realpathSync(managedOriginCapabilityDirectory(
-          isolationRuntimeDataDir,
-          cfg.sessionId,
-          readIsolationOriginChannelId!,
-        )),
-      }],
+      privateReadonlyDirectories: [
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginCapabilityDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginAttestationDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+      ],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,
@@ -16088,13 +16160,15 @@ async function spawnCli(
     stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
     const exitedDispatchAttempt = currentBotmuxDispatchAttempt;
-    // Fail closed as soon as this CLI generation ends. The Node worker may
-    // stay alive for auto-restart/crash diagnostics, but an old sandbox relay
-    // token or explicit IM origin must not remain usable in that interval.
+    // Fail closed for the ended backend generation's live-send authority. The
+    // Node worker may stay alive for daemon-driven crash recovery, so its
+    // generation-scoped policy authority remains valid until killCli() performs
+    // an actual worker teardown.
     completeManagedTurnOriginRevocation(
       sandboxRelayCapability,
       exitedTurnId,
       exitedDispatchAttempt,
+      { revokePolicy: false },
     );
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     if (lastInitConfig?.cliId === 'codex-app' && codexAppControlFatal) {
@@ -16377,6 +16451,9 @@ function restoreMojoLivePatchAfterRespawn(): void {
 
 function killCli(opts: {
   preservePending?: boolean;
+  /** An intentional in-worker CLI restart replaces only the live backend. The
+   * surviving Node worker keeps its generation-scoped policy authority. */
+  preservePolicyCapability?: boolean;
   /** The replacement worker reuses this logical session's sandbox tree. Stop
    * this worker's watcher but leave the tree/mountpoints for that replacement. */
   preserveSandbox?: boolean;
@@ -16434,6 +16511,7 @@ function killCli(opts: {
     sandboxRelayCapability,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
+    { revokePolicy: !opts.preservePolicyCapability },
   );
   // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
   // remove the per-session sandbox tree. In the fs-policy model the CLI writes
@@ -16579,7 +16657,10 @@ async function restartCliProcess(
         ));
         return;
       }
-      killCli({ preservePending: opts.preservePending });
+      killCli({
+        preservePending: opts.preservePending,
+        preservePolicyCapability: true,
+      });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
@@ -17115,6 +17196,8 @@ function getTerminalHtml(
 <head>
 <meta charset="utf-8">
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="lk-config" content="{&quot;showBottomNavBar&quot;:false}">
+<meta name="format-detection" content="telephone=no">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
@@ -17204,6 +17287,53 @@ body.touch #terminal .xterm-screen *{
   background:rgba(224,175,104,0.12);border:1px solid rgba(224,175,104,0.35);border-radius:4px;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
 #login-banner.show{display:inline-block}
+/* ── Mobile input bar (ported from woof's #mobile-input-form) ──
+   On touch devices the floating right-edge toolbar is hidden and this bar
+   replaces it: a scrollable row of shortcut/navigation keys
+   plus a persistent input row with two modes:
+     • live   : keystrokes are diff'd to ANSI sequences and sent as you type
+     • buffer : text accumulates, sent wholesale on 发送/Enter
+   Lives at the bottom; the terminal resizes above it via --mobile-bar-h. */
+body.touch #toolbar-shell{display:none!important}
+#mobile-input-bar{display:none}
+body.touch.has-token #mobile-input-bar{
+  display:flex;flex-direction:column;position:fixed;left:0;right:0;bottom:0;z-index:60;
+  padding:6px max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));
+  border-top:1px solid #2a2b3d;background:#0f0f14;
+  transform:translateY(calc(0px - var(--keyboard-inset,0px)));transition:transform .12s ease}
+body.touch.has-token #terminal .xterm{
+  padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
+#mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#mobile-bar-keys::-webkit-scrollbar{display:none}
+#mobile-bar-keys button{
+  flex:none;min-width:44px;height:34px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
+#mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
+#mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+#mobile-input{
+  flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
+  padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
+  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  -webkit-text-size-adjust:100%;text-size-adjust:100%}
+#mobile-input::placeholder{color:#565f89}
+#mobile-bar-row button{
+  flex:none;width:42px;min-height:42px;height:42px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+#mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-input-bar button:disabled,#mobile-input-bar textarea:disabled{opacity:.45;cursor:not-allowed}
+#mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
+#mobile-mode{min-width:48px;border-radius:8px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
+/* live mode: the textarea holds the IME draft but the typed text is already in
+   the terminal, so render the textarea transparent to avoid double-vision. */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:transparent;caret-color:transparent}
+#mobile-live-hint{display:none;position:absolute;inset:0;pointer-events:none;align-items:center;
+  padding:0 56px 0 14px;color:#565f89;font:12px -apple-system,sans-serif;white-space:nowrap;overflow:hidden}
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-live-hint{display:flex}
+/* live mode: the hint replaces the placeholder — hide both to avoid overlap */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input::placeholder{color:transparent}
 </style>
 </head>
 <body>
@@ -17232,6 +17362,29 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     </div>
   </div>
 </div>
+<form id="mobile-input-bar" autocomplete="off" data-mode="buffer" aria-label="手机输入">
+  <div id="mobile-bar-keys">
+    <button type="button" data-sk="paste">Paste</button>
+    <button type="button" data-sk="ctrlc">Ctrl+C</button>
+    <button type="button" data-sk="esc">Esc</button>
+    <button type="button" data-sk="tab">Tab</button>
+    <button type="button" data-sk="left" title="左移" aria-label="左移">←</button>
+    <button type="button" data-sk="right" title="右移" aria-label="右移">→</button>
+    <button id="mobile-up" type="button" data-sk="up" title="上移" aria-label="上移">↑</button>
+    <button id="mobile-down" type="button" data-sk="down" title="下移" aria-label="下移">↓</button>
+    <button id="mobile-bs" type="button" data-sk="bs" title="删除终端字符" aria-label="删除终端字符">⌫</button>
+    <button type="button" data-sk="enter">Enter</button>
+    <button type="button" data-sk="stab">Shift+Tab</button>
+  </div>
+  <div id="mobile-bar-row">
+    <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
+    <div id="mobile-input-wrap">
+      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="输入命令…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
+      <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
+    </div>
+    <button id="mobile-send" type="submit">发送</button>
+  </div>
+</form>
 <div id="status" class="err">connecting...</div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
@@ -17351,6 +17504,7 @@ function _wbPostWrite(){
   // 发），嵌入方据此把上一条连接的结论清掉，而不是继续显示一个过期的判定。
   try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
 }
+var _wbMobileWriteState=null;
 function _wbSetWsWrite(v){
   var changed=wsHasWrite!==v;
   wsHasWrite=v;
@@ -17363,6 +17517,7 @@ function _wbSetWsWrite(v){
       else if(v===true)_wb.classList.remove('show');
     }
   }
+  if(_wbMobileWriteState)_wbMobileWriteState(v);
   _wbPostWrite();
 }
 // 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
@@ -17660,6 +17815,10 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // Guard against a hung CONNECTING state (proxy/network black hole): if the
+  // socket never opens, close it so onclose retries instead of leaving the
+  // user staring at "connecting" forever.
+  var openTimer=setTimeout(function(){try{ws.close()}catch(e){}},10000);
   // 新连接 = 新的一次鉴权。上一条连接拿到的权限说明不了这一条，先退回未知（并把这
   // 个「未知」上抛给嵌入方），等这条连接自己的首帧说话。
   _wbFirstFrame=true;
@@ -17671,7 +17830,7 @@ if(typeof ResizeObserver!=='undefined'){
   // restart). If we never re-send our real grid, the PTY stays 160 while this
   // xterm renders narrower, and Claude's height-relative redraws drift a row
   // (status-line update bleeds into the line below). Always re-assert size.
-  ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
+  ws.onopen=function(){clearTimeout(openTimer);el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     // 带外控制帧只可能是**本连接的第一帧**，而且必须整帧精确匹配（见页面顶部
     // _wbDecodeWriteFrame 那段注释）。首帧一旦消费掉，这条连接上之后的每一个字节
@@ -18174,6 +18333,140 @@ if(!${isTmuxMode && !isPipeMode}){
   _tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
   _tTerm.addEventListener('touchcancel',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
 }
+
+// ── Mobile input bar (ported from woof mobile_live_input + #mobile-input-form) ──
+// Two modes drive the SAME ws {type:'input'} channel the shortcut toolbar uses:
+//   • buffer : textarea text is sent wholesale on 发送/Enter (default, safest)
+//   • live   : each keystroke is diff'd to ANSI cursor/backspace/insert sequences
+//              via a grapheme-aware mirror, so Chinese IME and fast typing work.
+// Read-only sessions never show it (no token ⇒ no body.has-token).
+if(isTouch&&hasToken){(function(){
+  document.body.classList.add('has-token');
+  var bar=document.getElementById('mobile-input-bar');
+  var ta=document.getElementById('mobile-input');
+  var modeBtn=document.getElementById('mobile-mode');
+  var sendBtn=document.getElementById('mobile-send');
+  var hint=document.getElementById('mobile-live-hint');
+  var LIVE='live',BUFFER='buffer';
+  var mode=BUFFER;
+  var controls=bar.querySelectorAll('button,textarea');
+
+  function setWriteState(v){
+    var disabled=v!==true;
+    for(var ci=0;ci<controls.length;ci++)controls[ci].disabled=disabled;
+    bar.setAttribute('aria-disabled',disabled?'true':'false');
+  }
+  _wbMobileWriteState=setWriteState;
+
+  // ── grapheme-aware edit-sequence mirror (from woof mobile_live_input.js) ──
+  var CL='\\x1b[D',CR='\\x1b[C',BS='\\x7f';
+  function graphs(s){s=String(s||'');
+    if(typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'){
+      return Array.from(new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(s),function(p){return p.segment});}
+    return Array.from(s);}
+  function editSeq(prev,next){
+    var b=graphs(prev),a=graphs(next),pre=0;
+    while(pre<b.length&&pre<a.length&&b[pre]===a[pre])pre++;
+    var suf=0;
+    while(suf<b.length-pre&&suf<a.length-pre&&b[b.length-1-suf]===a[a.length-1-suf])suf++;
+    var rem=b.length-pre-suf,ins=a.slice(pre,a.length-suf).join('');
+    return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
+  var mirror={sent:'',held:'',composing:false};
+  function sendInput(seq){if(!seq||wsHasWrite!==true||!ws_||ws_.readyState!==1)return false;
+    try{ws_.send(JSON.stringify({type:'input',data:seq}));return true;}catch(e){return false;}}
+  function syncMirror(v){mirror.held=String(v||'');
+    if(mirror.composing||mirror.held===mirror.sent)return true;
+    var seq=editSeq(mirror.sent,mirror.held);
+    if(!sendInput(seq))return false;
+    mirror.sent=mirror.held;return true;}
+  function sendLiveKey(key){
+    mirror.held=String(ta.value||'');
+    if(mirror.composing||wsHasWrite!==true)return false;
+    var payload=editSeq(mirror.sent,mirror.held)+(key||'');
+    if(payload&&!sendInput(payload))return false;
+    mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
+
+  function setMode(m){mode=m;bar.setAttribute('data-mode',m);
+    modeBtn.textContent=m===LIVE?'实时':'缓冲';
+    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入，点击切换为实时');}
+  var measuredBarHeight=-1;
+  function measureBar(){
+    var rect=bar.getBoundingClientRect?bar.getBoundingClientRect():null;
+    var height=Math.ceil((rect&&rect.height)||bar.offsetHeight||0);
+    if(height===measuredBarHeight)return;
+    measuredBarHeight=height;
+    document.documentElement.style.setProperty('--mobile-bar-h',height+'px');
+    onViewportResize();}
+  function resizeTa(){ta.style.height='42px';
+    if(ta.value)ta.style.height=Math.min(Math.max(ta.scrollHeight,42),120)+'px';
+    measureBar();}
+  function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
+
+  function sendBuffered(appendEnter){
+    var text=ta.value;
+    var payload=appendEnter?text+'\\n':text;
+    if(!payload)return;
+    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
+    ta.value='';resizeTa();
+    if(mode===LIVE){mirror.sent=mirror.held='';}
+    showKeyboard();}
+  function sendLiveCommit(appendEnter){
+    if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+
+  // shortcut keys row
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
+  var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
+  for(var i=0;i<keyBtns.length;i++){(function(btn){
+    btn.addEventListener('click',function(){btn.blur();
+      var act=btn.getAttribute('data-sk');
+      if(act==='paste'){
+        // Commit pending live text before the async clipboard result lands.
+        if(mode===LIVE&&!sendLiveKey(''))return;
+        // Read the clipboard and send as terminal input. Async API; fall back
+        // to focusing the textarea so the user can long-press paste.
+        if(navigator.clipboard&&navigator.clipboard.readText){
+          navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
+        }else{showKeyboard();}
+        return;}
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});})(keyBtns[i]);}
+
+  modeBtn.addEventListener('click',function(){modeBtn.blur();
+    // switching away from live flushes pending held text
+    if(mode===LIVE&&!sendLiveKey(''))return;
+    setMode(mode===LIVE?BUFFER:LIVE);
+    if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+    showKeyboard();});
+
+  bar.addEventListener('submit',function(e){e.preventDefault();submit();});
+
+  ta.addEventListener('compositionstart',function(){mirror.composing=true;},{capture:true,passive:true});
+  ta.addEventListener('compositionend',function(){mirror.composing=false;
+    if(mode===LIVE)syncMirror(ta.value);},{capture:true,passive:true});
+  ta.addEventListener('input',function(){
+    resizeTa();
+    if(mode===LIVE&&!mirror.composing)syncMirror(ta.value);});
+  ta.addEventListener('keydown',function(e){
+    // live mode intercepts nav keys so they go to the terminal, not the textarea
+    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
+      e.preventDefault();
+      sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
+
+  setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
+  if(typeof ResizeObserver!=='undefined'){
+    try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
+  }
+  // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
+  document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
+  // keep the bar above the software keyboard using visualViewport when available
+  if(window.visualViewport){
+    var vkT=0;
+    window.visualViewport.addEventListener('resize',function(){clearTimeout(vkT);vkT=setTimeout(function(){
+      var vv=window.visualViewport;var inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);
+      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');onViewportResize();},120);});
+  }
+})();}
 </script>
 </body>
 </html>`;
@@ -19903,6 +20196,7 @@ function teardownSandboxBestEffort(): void {
   sandboxCleanup = null;
   unlinkManagedOriginCapabilityFiles();
   sandboxRelayCapability = null;
+  sandboxPolicyCapability = null;
   if (seatbeltProfilePath) { try { unlinkSync(seatbeltProfilePath); } catch { /* */ } seatbeltProfilePath = null; }
 }
 // Under pm2 the worker's stdout/stderr are pipes; a broken pipe (e.g. log

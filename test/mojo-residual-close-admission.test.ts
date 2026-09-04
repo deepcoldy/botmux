@@ -51,6 +51,11 @@ import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import type { TerminationOutcome } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';
 
+/** The fake `mojo` is a bash script spawned per turn; under a loaded parallel
+ *  vitest run its first stdout line can take well over vi.waitFor's 1s default
+ *  (observed on macOS: green alone, red in the full suite). Budget, not a sleep. */
+const SESSION_ID_WAIT_MS = 15_000;
+
 let binDir: string;
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-residual-')); });
 afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
@@ -74,7 +79,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-residual","
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-residual'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-residual'), { timeout: SESSION_ID_WAIT_MS });
 
     // Force the one terminal verdict that routes to a residual close. Stubbing the
     // quiescence result (rather than faking a Darwin host) keeps this runnable on
@@ -141,7 +146,7 @@ exit 0`);
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-clean'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-clean'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => {
       expect((backend as unknown as { child: unknown }).child).toBeNull();
     }, { timeout: 10_000 });

@@ -2,14 +2,15 @@
 title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-09-01（rebase 到 origin/master@7bd2e974；基线含 #852 / #1073 / #1093）
+updated: 2026-09-02（绝对基线 origin/master@82054f7b；#1051 已合入；Stage 1 occupancy 落地）
 topic: session-virtual-actor
 status: active
-baseline: origin/master@7bd2e974（含已合入的 #852、#1073 导入 WAL 空壳、#1093 中毒库恢复）；#1051 删除 daemon 侧 JSON 写路径（进行中）
+baseline: origin/master@82054f7b（含已合入的 #852、#1073、#1093、#1051）
 references:
   - PR #846（会话行唯一写入入口）
   - PR #852（per-bot SQLite + JSON 导入 + 混合窗口；已合入 master）
-  - PR #1051（删除 daemon 侧 JSON 写路径 + 行级持久化；进行中）
+  - PR #1051（删除 daemon 侧 JSON 写路径 + 行级持久化；已合入 master）
+  - Stage 1 occupancy（库内 `occupancy` 租约；本轮落地）
   - #831 / feat/virtual_actor_stage2（不合入；SessionRuntime 只覆盖部分写点的失败记录）
 ---
 
@@ -88,8 +89,8 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 相对终态仍缺：
 
-- **occupancy 存在旁路文件里。** `utils/daemon-discovery.ts` 的 `findOnlineDaemon` 读 `dashboard-daemons/*.json` 心跳（90s 过期），写入目标却是会话行。SQLite 锁只串行化写者，不能判断「另一进程是否仍持有将要 `persistRow` 的内存缓存」。在租约写入 SQLite 之前，必须保留 `abortIf` 双次探测。
-- **两套 apply。** daemon 使用 `updateSession` / `persistRow`；其它进程使用 `services/session-offline-write.ts` 的 `mutateSessionRowWhenUnowned`（心跳探测 + `mutateSessionRowOffline`）。后者是第二套权威，不是「临时 host 执行同一套命令」。#1051 已把它收敛成一份实现，删除时只有一个入口。
+- **occupancy 已在同库 `occupancy` 表。** 租约在 `BEGIN IMMEDIATE` 内判定，有效租约一票否决离线写；`findOnlineDaemon` 不再是唯一所有权来源。没有有效租约（缺行 / 过期 / 不可读）时心跳仍参与判定——这是升级窗口（只写会话行、不写 occupancy 的 daemon，含回滚后的旧构建）。删除该回落的条件与 Stage 0 JSON 读路径相同。
+- **两套 apply。** daemon 使用 `updateSession` / `persistRow`；其它进程使用 `services/session-offline-write.ts` 的 `mutateSessionRowWhenUnowned`（库内租约 + `mutateSessionRowOffline`）。后者仍是第二套权威，不是「临时 host 执行同一套命令」。删除时只有一个入口。
 - **没有 per-session turn。** 进程内仍依赖多处独立的 fence。
 - **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。删除这些分支的条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。磁盘上的冻结 JSON 文件可以保留。
 
@@ -99,7 +100,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 从会话行已在 SQLite 起重新划分。旧 Step 1–5（摘取缺陷 / 唯一写入入口 / 换引擎 / 按痛点加事务 / 归档）只记录已完成工作，不再当路线图。
 
-### Stage 0 — 删除 daemon JSON 写路径【进行中：#1051】
+### Stage 0 — 删除 daemon JSON 写路径【#1051 已合入；收尾：JSON 读路径】
 
 **目标**：daemon 只写 SQLite；JSON → SQLite 导入正确；运行时更新走行级 upsert。
 
@@ -130,22 +131,21 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 删除条件满足之前，#1051 保留 db-else-json：升级窗口内 `botmux send` 必须仍能读到会话。这不是终态要求。
 
-### Stage 1 — Occupancy 写入 SQLite
+### Stage 1 — Occupancy 写入 SQLite【已落地】
 
 **目标**：occupancy 与会话行在同一事务中读写。这是 grain directory（哪个进程持有激活），不是 actor 框架。
 
-实现要点：
+已落地：
 
-1. 库内保存占位：`owner_pid` / `boot_id` / `lease_until`（或等价的 SQLite 锁会话）。第一版粒度可以 per-bot（与当前 daemon 进程同构）；表结构不要排除将来改为 per-session。
-2. daemon 在首次 `load()` 的同一事务里写入占位。现状是先写 descriptor 文件再 `load()`，两者不在同一原子操作中。
-3. 非当前 host 的写入：`BEGIN IMMEDIATE` → 读租约 → 租约有效则中止并走 IPC（或等待）；租约过期才进入 Stage 2 的短生命周期激活。探测与写入在同一事务内完成。
-4. 租约按心跳续期。90s 过期已有实现，只是心跳文件与会话行不在同一事务。
+1. 同库表 `occupancy(scope, owner_pid, boot_id, lease_until)`。v1 只有 `scope='bot'`；主键是 `scope`，不排除将来 `session:<id>`。
+2. 拥有 store 的 daemon 在首次 `load()` 的 `BEGIN IMMEDIATE` 事务里领取占位（`init(..., { occupancy })`）。领取是有条件的：别的 boot 的租约只有在过期、或其 `owner_pid` 已不存在时才会被接管；仍然存活的前任保留所有权，后任记 warn 并在心跳里重试。领取失败（如只读库）只记 error，不阻止快照加载。descriptor 文件仍写，只作 IPC 发现。
+3. 非当前 host 的 SQLite 写入：`BEGIN IMMEDIATE` → 读租约 → 有效则中止；没有有效租约时再看心跳（`abortIf`）；两者都不在场才允许现有离线 apply（不在本进程领取租约——那是 Stage 2）。
+4. 领取与续期是同一条语句（`claimOccupancyLease`），随 descriptor 心跳每 30s 执行，首次 load 之后立即执行一次（reconcile 可能已经提前触发过 load）。TTL 与心跳 staleness 共用 `DAEMON_HEARTBEAT_STALE_MS`（90s）。优雅关停期间租约一直持有到 `process.exit` 前才按 `boot_id` 释放——teardown 中 worker 仍在写回缓存；`exit` handler 兜底。
+5. 所有权调用点：`mutateSessionRowWhenUnowned`、CLI close / abandon / prune、whiteboard 离线解绑。`findOnlineDaemon` 用于 IPC 地址、dashboard 展示，以及无有效租约时的心跳回落。已经**应答**的 daemon（任何 HTTP 状态）始终权威：它的拒绝是终态，不因租约状态回落到离线写；只有连接失败时才用 `isOccupancyHeld` 区分「daemon 在但不可达」与「descriptor 是残留」。
 
-验收：`findOnlineDaemon` **不再作为所有权判断**（仍可用于发现 IPC 地址）。#1051 已把 CLI 私有的那份心跳探测并进 `utils/daemon-discovery.ts`，所以验收只需盯住这一个实现的调用点——`services/session-offline-write.ts` 的 `abortIf`、`cli.ts` 的 close / abandon / prune、`whiteboard-store` 的解绑。`dashboard/registry.ts` 读同一批心跳文件，但只用于展示和路由，不参与所有权判断。
+**心跳回落（不是长期双协议）**：没有有效租约时，仍用心跳判断「未写 occupancy 的 daemon 是否在线」——包括未升级的 #1051 daemon，也包括新构建崩溃留下过期行后回滚运行的旧构建。有效租约存在时心跳不再能放行（心跳陈旧也中止）。删除该回落的条件与 Stage 0 JSON 读路径相同（fleet 自动重启落地，或 2026-11-26 复核）。
 
-长期同时使用心跳探测和库内租约不算完成。仅用 `BEGIN IMMEDIATE` 替换心跳探测也不算完成：锁不能表示「另一进程仍持有待写回的内存缓存」。禁止 daemon 未运行时提交 close / abandon 也不算完成：产品语义保留，实现改为获取租约后在本进程 apply。
-
-#852 之后，这一 stage 的架构收益最大。不做它，turn 队列和单一 apply 无法约束 CLI / dashboard 进程。
+仅用 `BEGIN IMMEDIATE` 替换心跳探测不算完成（已用租约表达「另一进程仍持有内存缓存」）。禁止 daemon 未运行时提交 close / abandon 也不算完成：产品语义保留，Stage 2 改为获取租约后在本进程 apply。
 
 ### Stage 2 — 单一 apply 路径
 
@@ -154,7 +154,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - CLI、dashboard 只发送命令。daemon 运行中：经 IPC 进入当前激活。daemon 未运行：宿主 CLI / supervisor 获取租约，在本进程调用 **同一模块** 的 apply，然后释放租约。
 - 沙盒内的 CLI 没有租约能力（§1）：它只发命令，daemon 不在时明确失败。别把它和宿主 CLI 当成同一类调用方。
 - 删除 `mutateSessionRowWhenUnowned` / `mutateSessionRowOffline` 作为对外权威写入的语义（若仍存在，只能是短生命周期激活的内部实现，不再是第二条公共写协议）。
-- `abortIf` + `findOnlineDaemon` 的所有权探测随 Stage 1 删除。
+- `abortIf` + `findOnlineDaemon` 已从唯一所有权来源降为无有效租约时的回落；该回落随升级窗口关闭一并删。
 - daemon 持有激活时，其它进程不得直接更新会话行。
 
 这一步才把「daemon 未运行仍能修改会话」做成与终态一致的实现。若只完成 Stage 1、CLI 仍作为另一套权威写 SQLite，需要理解的协议几乎没有减少。
@@ -185,7 +185,7 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
 
 ## 4. #1051 与终态的关系
 
-**Stage 0 中收益最大的部分已经覆盖，应当合入；不要在本 PR 做 Stage 1。** 增补仅限 Stage 0 缺口。
+**#1051 已合入 master。** Stage 0 主体完成；不要回头在后续 PR 里把 occupancy 和 JSON 读路径删除搅在一起。
 
 已覆盖：
 
@@ -197,26 +197,27 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
 - 删除白板：daemon 运行中 IPC 解绑，未运行时离线写，两侧都对板 id 比对；无法解绑的会话计入返回。sqlite 离线写打开前拒绝缺文件。
 - 离线写与 daemon 发现各收敛成一份实现（见 §3 Stage 0 缺口）。Stage 1 / Stage 2 的删除面因此只剩一个入口。
 
-本 PR 明确不做、也不应做：
+#1051 明确没做、也不该做的（现仍成立）：
 
-- occupancy（Stage 1）。与「删除 JSON 写路径」风险和范围都不同。
-- 跨进程改为只读 SQLite。在升级窗口关闭前删除 JSON 回落，会让窗口内的 `botmux send` 失败。删除条件见 Stage 0，不是本 PR 的前置。
+- 跨进程改为只读 SQLite。在升级窗口关闭前删除 JSON 回落，会让窗口内的 `botmux send` 失败。删除条件见 Stage 0。
 
-合入后的实际状态：daemon 只写 SQLite；其它进程在升级窗口内仍可能读 JSON；occupancy 仍在心跳文件；apply 仍有两套——daemon 的 `updateSession`，和 `mutateSessionRowWhenUnowned` 这一个离线入口。之后按 Stage 1 → 2 → 3 推进。
+合入 #1051 后的状态：daemon 只写 SQLite；其它进程在升级窗口内仍可能读 JSON。Stage 1 之后：occupancy 在同库租约；apply 仍有两套——daemon 的 `updateSession`，和 `mutateSessionRowWhenUnowned` 这一个离线入口。之后按 Stage 2 → 3 推进。
 
 ## 5. 建议顺序
 
 ```
-现在          #1051 合入        删除条件满足          occupancy      单一 apply       turn
- |               |          (fleet 落地 / 复核点)         |              |              |
- |-- Stage 0 ----+-- Stage 0 收尾 -----|                  |              |              |
- |  (本 PR)      |  删除 JSON 读路径   |----- Stage 1 -----+-- Stage 2 ---+-- Stage 3 ---|
+#1051 合入     Stage 1 落地     删除条件满足          单一 apply       turn
+    |               |        (fleet 落地 / 复核点)         |              |
+    +-- Stage 0 ----+-- Stage 0 收尾 -----|                |              |
+    |  JSON 写删除  |  删 JSON 读 / 缺行回落               |              |
+    +-- Stage 1 ----+----------------------+-- Stage 2 ----+-- Stage 3 ---|
+       occupancy
 ```
 
 - **#1051**：删除 daemon JSON 写路径；含白板解绑的 compare-and-set、离线写打开前拒绝缺文件、离线写与 daemon 发现各收敛成一份实现。
+- **Stage 1**：occupancy 写入 SQLite；有效租约一票否决，`findOnlineDaemon` 降为无有效租约时的回落。回落的删除条件见上。
 - **删除 JSON 读路径**：条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。fleet 实现不在本文范围。
-- **下一个架构主 PR**：Stage 1 occupancy。先写能失败的测试覆盖「读心跳文件与写会话行之间的窗口」，合入后 `findOnlineDaemon` 不再用于所有权判断。
-- **再下一个**：Stage 2，daemon 未运行时获取租约并执行同一 apply，删除第二套对外写协议。这一阶段减少的概念最多。
+- **下一个架构主 PR**：Stage 2，daemon 未运行时获取租约并执行同一 apply，删除第二套对外写协议。这一阶段减少的概念最多。
 - **Stage 3**：按已有证据把分散 fence 收进 per-session 队列。不设「迁完全部写点」的完成门。
 
 `closeSession` 的字段级回滚已在 #1051 替换。`admitQueuedActivationTail`、async tail-admission、generation / exit 上无保护的写入归 Stage 3。`initial-user-turn` 在落盘失败时仅更新内存：有复现再进入 Stage 2 或 3，不单独开事务修复轨道。

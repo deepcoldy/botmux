@@ -45,6 +45,10 @@ import {
 } from './im/lark/reply-card-style.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
+  normalizeNativeSubagentRuntimePolicy,
+  type NativeSubagentRuntimePolicy,
+} from './services/native-subagent-runtime-policy.js';
+import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
@@ -1462,6 +1466,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Native TraeCode spawn_agent model/effort override policy. */
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -2098,6 +2104,10 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
+  /** In-memory parser outcome for nativeSubagentRuntime. Invalid persisted input
+   * is intentionally omitted from `config`, so this bounded marker is the only
+   * authoritative way to distinguish it from an absent policy after startup. */
+  nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
   /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
    *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
    *  "appSecret or clientAssertionProvider is required" on an empty secret. An
@@ -2119,10 +2129,17 @@ export interface BotState {
   rawAllowedUserResolution: Map<string, string>;
 }
 
+export type NativeSubagentRuntimeConfigState =
+  | { status: 'absent' }
+  | { status: 'valid'; policy: NativeSubagentRuntimePolicy }
+  | { status: 'invalid' };
+
 const bots = new Map<string, BotState>();
+let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
 
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
+  parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
   loadedConfigProvenance = undefined;
   oncallChatCache = null;
@@ -2282,6 +2299,22 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
+  const normalizedRuntime = cfg.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
+    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
+      ? { status: 'invalid' }
+      : !normalizedRuntime.ok
+        ? { status: 'invalid' }
+        : normalizedRuntime.value
+          ? { status: 'valid', policy: normalizedRuntime.value }
+          : { status: 'absent' };
+  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
+  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
+    ? nativeSubagentRuntimeState.policy
+    : undefined;
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -2312,6 +2345,7 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   const state: BotState = {
     config: cfg,
+    nativeSubagentRuntimeState,
     client,
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
@@ -2325,6 +2359,29 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** Publish the persisted native-subagent policy and its diagnostic metadata as
+ * one synchronous registry operation. Call only after the corresponding
+ * bots.json mutation commits; no request can observe a half-updated snapshot. */
+export function updateBotNativeSubagentRuntime(
+  larkAppId: string,
+  next: NativeSubagentRuntimeConfigState,
+): void {
+  const bot = getBot(larkAppId);
+  const result = next.status === 'valid'
+    ? normalizeNativeSubagentRuntimePolicy(next.policy)
+    : undefined;
+  if (result && (!result.ok || !result.value)) {
+    throw new Error('native subagent runtime registry update requires a valid policy');
+  }
+  const normalized: NativeSubagentRuntimeConfigState = next.status === 'valid'
+    ? { status: 'valid', policy: result!.value! }
+    : { status: next.status };
+  bot.config.nativeSubagentRuntime = normalized.status === 'valid'
+    ? normalized.policy
+    : undefined;
+  bot.nativeSubagentRuntimeState = normalized;
 }
 
 export function getBot(larkAppId: string): BotState {
@@ -3271,6 +3328,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
+      entry.nativeSubagentRuntime,
+    );
+    if (!normalizedNativeSubagentRuntime.ok) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] nativeSubagentRuntime ignored: ${normalizedNativeSubagentRuntime.error}`,
+      );
+    }
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
@@ -3310,7 +3375,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // 非法/缺字段返回 null。
     const budget = parseBudgetConfig(entry.budget);
 
-    configs.push({
+    const config: BotConfig = {
       larkAppId: entry.larkAppId,
       // apiOnly bots may omit the secret (never used — no Feishu connection);
       // fall back to '' so downstream env plumbing stays a string. Feishu image
@@ -3361,6 +3426,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      nativeSubagentRuntime: entryCliId === 'traex' && normalizedNativeSubagentRuntime.ok
+        ? normalizedNativeSubagentRuntime.value
+        : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexBrowser,
@@ -3542,7 +3610,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       voice,
       pricing,
       budget: budget ?? undefined,
-    });
+    };
+    const nativeSubagentRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
+      entryCliId !== 'traex' || (normalizedNativeSubagentRuntime.ok && !normalizedNativeSubagentRuntime.value)
+        ? 'absent'
+        : normalizedNativeSubagentRuntime.ok
+          ? 'valid'
+          : 'invalid';
+    parsedNativeSubagentRuntimeStatus.set(config, nativeSubagentRuntimeStatus);
+    configs.push(config);
   }
 
   return configs;

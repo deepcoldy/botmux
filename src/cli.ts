@@ -145,6 +145,24 @@ import {
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
+import {
+  buildCardStreamSuccessOutput,
+  CARD_STREAM_USAGE,
+  cardMessageRouteFromDetail,
+  cardStreamArgsWantHelp,
+  executeCardStreamFinish,
+  executeCardStreamOpen,
+  executeCardStreamReanchor,
+  executeCardStreamSnapshot,
+  executeCardStreamWrite,
+  mapCardStreamError,
+  parseCardStreamArgs,
+  readCardStreamContent,
+} from './cli/card-stream-dispatch.js';
+import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.js';
+import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
+import { CardStreamStore } from './services/card-stream-store.js';
+import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -204,6 +222,7 @@ import {
   managedOriginLegacyIsolationProbeAccess,
   readManagedOriginRootLocator,
   readManagedOriginCapability,
+  readManagedOriginPolicyCapability,
 } from './core/managed-origin-capability.js';
 import {
   attestManagedOrigin,
@@ -219,6 +238,19 @@ import {
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import {
+  NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  generateNativeSubagentRuntimeNonce,
+  nativeSubagentRuntimeCapabilityHeaders,
+  nativeSubagentRuntimeHostChallengeHeaders,
+  readBoundedNativeSubagentRuntimeResponse,
+  readNativeSubagentRuntimeResponseProof,
+  verifyNativeSubagentRuntimeResponse,
+} from './core/native-subagent-runtime-ipc-auth.js';
+import {
+  normalizeNativeSubagentRuntimePolicy,
+  rewriteNativeSubagentSpawnInput,
+} from './services/native-subagent-runtime-policy.js';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
@@ -254,7 +286,7 @@ import {
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot } from './services/session-store.js';
-import { mutateSessionRowWhenUnowned } from './services/session-offline-write.js';
+import { isOccupancyHeld, mutateSessionRowWhenUnowned } from './services/session-offline-write.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -3585,8 +3617,7 @@ function loadSessions(): Map<string, SessionData> {
 /** Offline-only narrow session mutation. Callers must prefer the owning daemon
  * while it is available; the shared helper rereads the exact row under the
  * store's write exclusion (so a stale CLI snapshot can never be written back)
- * and re-evaluates the daemon-liveness probe inside it, at entry and again
- * before publication. */
+ * and re-evaluates occupancy inside that exclusion. */
 function mutateSessionOffline(
   session: SessionData,
   mutate: (current: SessionData) => boolean,
@@ -3597,6 +3628,13 @@ function mutateSessionOffline(
     current => mutate(current as unknown as SessionData),
     { dataDir: resolveDataDir() },
   ) as unknown as SessionData | undefined;
+}
+
+/** Is this bot's store held by a live host (occupancy lease, or a fresh
+ *  heartbeat while no live lease exists)? Same data dir as the store access
+ *  above. Never throws. */
+function occupancyHeld(larkAppId: string): boolean {
+  return isOccupancyHeld(larkAppId, { dataDir: resolveDataDir() });
 }
 
 type OfflineAbandonResult =
@@ -3613,14 +3651,10 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
   const originalPid = adoptedCliPid(current);
   const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
   if (ownedWorkerPid) {
-    // Narrow the unavoidable descriptor race: do not signal a worker after an
-    // owning daemon has become visible. The locked write below repeats this.
-    if (current.larkAppId) {
-      try {
-        if (findDaemon(current.larkAppId)) {
-          return { ok: false, error: 'owning_daemon_became_available' };
-        }
-      } catch { /* still offline */ }
+    // Narrow the unavoidable occupancy race: do not signal a worker after an
+    // owning daemon has claimed the row. The locked write below repeats this.
+    if (current.larkAppId && occupancyHeld(current.larkAppId)) {
+      return { ok: false, error: 'owning_daemon_became_available' };
     }
     if (isProcessAlive(ownedWorkerPid)) {
       const signalled = killProcess(ownedWorkerPid);
@@ -3750,24 +3784,35 @@ async function postOwningDaemonSessionMutation(
   if (!daemon) return 'unavailable';
   let secret: string;
   try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
-  const res = await fetchDaemonIpc(
-    daemon.ipcPort,
-    `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
-    {
-      method: 'POST',
-      ...(body
-        ? {
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          }
-        : {}),
-    },
-    secret,
-  );
-  if (suffix === 'prune' && res.status === 409) return 'refused';
-  if (!res.ok) {
-    throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
+  let res: Awaited<ReturnType<typeof fetchDaemonIpc>>;
+  try {
+    res = await fetchDaemonIpc(
+      daemon.ipcPort,
+      `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
+      {
+        method: 'POST',
+        ...(body
+          ? {
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            }
+          : {}),
+      },
+      secret,
+    );
+  } catch (err) {
+    // No answer on the advertised port. A held store means the daemon is up
+    // but unreachable — surface that; otherwise the descriptor is a leftover
+    // and the offline path may proceed.
+    if (occupancyHeld(session.larkAppId)) {
+      throw new Error(`连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return 'unavailable';
   }
+  if (suffix === 'prune' && res.status === 409) return 'refused';
+  // A daemon that ANSWERED is alive and authoritative whatever the lease says:
+  // its rejection is terminal, never a licence to write behind it.
+  if (!res.ok) throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
   return 'applied';
 }
 
@@ -3817,11 +3862,16 @@ async function abandonSessionAuthoritatively(
             : { ok: true, mode: 'daemon' };
         }
         // Surface the daemon's own rejection reason (e.g. origin_unproven) and
-        // never fall back to a partial local kill: a fresh descriptor means the
-        // daemon may still hold authoritative in-memory state.
+        // never fall back to a partial local kill: a daemon that answered is
+        // alive and holds authoritative in-memory state, whatever the lease
+        // or heartbeat file say.
         return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
       } catch (err) {
-        return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
+        // No answer. Only when nothing holds the store (no live lease, no fresh
+        // heartbeat) is the descriptor/injected port a leftover we may bypass.
+        if (occupancyHeld(session.larkAppId)) {
+          return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
+        }
       }
     }
   }
@@ -6122,6 +6172,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
+       --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule remove <id>                 删除任务
@@ -6170,6 +6221,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                        原地更新之前用 send --card-file/--card-json 发出的自定义卡片
                        （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
                        卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
+  card stream open|write|snapshot|reanchor|bind-runtime|unbind-runtime|finish ...
+                       CardKit 原生文本流式更新与 daemon 运行状态绑定；详见 botmux card stream --help
   bots list                            列出当前群聊中的机器人（含 open_id）
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
@@ -6655,7 +6708,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       const prompt = t.prompt ?? '';
       const chatId = t.chatId ?? '—';
       const rootId = t.rootMessageId ?? '—';
-      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}`);
+      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}${t.followActive ? ' ↷跟随活跃话题' : ''}`);
       console.log(`   prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
       console.log(`   chat: ${chatId.slice(0, 12)}…   thread: ${rootId.slice(0, 16)}…`);
       console.log(`   next: ${next}   last: ${last}${t.lastStatus === 'error' ? ' ❌' : ''}`);
@@ -6665,9 +6718,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent']);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--lark-app-id APP] [--workdir DIR] [--silent]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -6694,6 +6747,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
     const wantsTopLevel = rest.includes('--top-level');
     const wantsTopic = rest.includes('--topic');
+    const wantsFollowActive = rest.includes('--follow-active');
+    // --follow-active is a refinement of topic execution: the task starts in
+    // the current (or --root-msg-id) topic and re-targets at every fire.
+    if (wantsFollowActive && (wantsNewTopic || wantsTopLevel)) {
+      console.error('--follow-active 只在话题下执行时有意义，不能与 --top-level / --new-topic 同时使用。');
+      process.exit(1);
+    }
     if ([wantsNewTopic, wantsTopLevel, wantsTopic].filter(Boolean).length > 1) {
       console.error('--top-level、--topic 与 --new-topic 只能选择一个。');
       process.exit(1);
@@ -6714,14 +6774,16 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       ? 'new-topic'
       : wantsTopLevel
         ? 'top-level'
-        : wantsTopic
+        : wantsTopic || wantsFollowActive
           ? 'topic'
           : cur?.chatType === 'p2p'
             ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
             : 'top-level';
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
-      console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
+      console.error(wantsFollowActive
+        ? '--follow-active 需要一个起始话题：从 Lark 话题会话中运行，或传 --root-msg-id <ROOT_MESSAGE_ID>。'
+        : '话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
       process.exit(1);
     }
     const topicTitle = argValue(rest, '--topic-title');
@@ -6768,6 +6830,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         topicTitle,
         deliver,
         silent,
+        followActive: wantsFollowActive ? true : undefined,
       });
     } catch (err) {
       // Sandboxed sessions can only write their OWN bot's store — a cross-bot
@@ -6786,6 +6849,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
+    if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     return;
   }
@@ -8347,6 +8411,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     replyLayout = undefined;
   }
 
+  const sessionIdSource = sessionIdArg
+    ? 'arg'
+    : ancestorCtx?.sessionId
+      ? 'ancestor'
+      : process.env.BOTMUX_SESSION_ID
+        ? 'env'
+        : 'none';
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
@@ -8380,7 +8451,23 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
 
-  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  if (!s) {
+    console.error(
+      '[botmux send diagnostic] session_lookup_miss'
+      + ` sessionId=${sid}`
+      + ` source=${sessionIdSource}`
+      + ` dataDir=${sendDataDir}`
+      + ` envSessionId=${process.env.BOTMUX_SESSION_ID ?? '-'}`
+      + ` envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ?? '-'}`
+      + ` originSessionId=${originSessionId ?? '-'}`
+      + ` loadedSessions=${sessions.size}`
+      + ` relayDir=${relayDir ? 'present' : 'absent'}`
+      + ` readIsolation=${isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'}`
+      + ` capability=${isolatedCapabilityCtx ? 'present' : 'absent'}`,
+    );
+    console.error(`未找到 session ${sid}`);
+    process.exit(1);
+  }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
   if (replyLayout && !replyStyle.layout) {
@@ -10060,7 +10147,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
-// ─── Card subcommand (patch a previously-sent custom card in place) ───
+// ─── Card subcommands (whole-card patch + native CardKit streaming) ───
 
 async function cmdCard(rest: string[]): Promise<void> {
   const sub = rest[0] ?? '';
@@ -10068,13 +10155,233 @@ async function cmdCard(rest: string[]): Promise<void> {
     console.log(CARD_COMMAND_USAGE);
     return;
   }
-  if (sub !== 'patch') {
+  if (sub !== 'patch' && sub !== 'stream') {
     console.error(
       `未知 card 子命令: ${sub}\n` +
-      `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
+      '可用: patch | stream',
     );
     process.exit(2);
   }
+
+  if (sub === 'stream') {
+    const args = rest.slice(1);
+    if (args.length === 0 || cardStreamArgsWantHelp(args)) {
+      console.log(CARD_STREAM_USAGE);
+      return;
+    }
+    assertTurnTransportOrExit('card stream');
+    await registerSelfFromCredFile();
+
+    if (args[0] === 'bind-runtime' || args[0] === 'unbind-runtime') {
+      const runtimeParsed = parseCardRuntimeStatusArgs(args);
+      if (!runtimeParsed.ok) {
+        console.error(`botmux card stream: ${runtimeParsed.error}`);
+        process.exit(2);
+      }
+      try {
+        const { sid, larkAppId, session } = await resolveSessionAppId(runtimeParsed.sessionId);
+        assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream runtime');
+        const { patchCardStreamElement, updateCardStreamElementContent } = await import('./im/lark/client.js');
+        const streamStore = new CardStreamStore(resolveDataDir());
+        const runtimeBridge = new CardRuntimeStatusBridge(resolveDataDir(), streamStore, {
+          updateContent: input => updateCardStreamElementContent(
+            input.larkAppId,
+            input.cardId,
+            input.elementId,
+            input.content,
+            input.sequence,
+            input.uuid,
+          ),
+          patchElement: input => patchCardStreamElement(
+            input.larkAppId,
+            input.cardId,
+            input.elementId,
+            input.partialElement,
+            input.sequence,
+            input.uuid,
+          ),
+        });
+        const authority = { sessionId: sid, larkAppId, chatId: session.chatId };
+        if (runtimeParsed.operation === 'bind-runtime') {
+          await runtimeBridge.bind({
+            streamId: runtimeParsed.streamId,
+            authority,
+            statusElementId: runtimeParsed.statusElementId,
+            imageElementId: runtimeParsed.imageElementId,
+            activeImageKey: runtimeParsed.activeImageKey,
+            inactiveImageKey: runtimeParsed.inactiveImageKey,
+            labels: runtimeParsed.labels,
+          });
+          console.log(JSON.stringify({
+            success: true,
+            operation: 'bind-runtime',
+            streamId: runtimeParsed.streamId,
+            sessionId: sid,
+          }));
+        } else {
+          const unbound = await runtimeBridge.unbind(runtimeParsed.streamId, authority);
+          console.log(JSON.stringify({
+            success: true,
+            operation: 'unbind-runtime',
+            streamId: runtimeParsed.streamId,
+            sessionId: sid,
+            unbound,
+          }));
+        }
+      } catch (err) {
+        const mapped = mapCardStreamError(err);
+        console.error(`botmux card stream: ${mapped.error}`);
+        process.exit(mapped.exitCode);
+      }
+      return;
+    }
+
+    const parsed = parseCardStreamArgs(args);
+    if (!parsed.ok) {
+      console.error(`botmux card stream: ${parsed.error}`);
+      process.exit(2);
+    }
+    const contentInput = parsed.operation === 'write'
+      ? readCardStreamContent(parsed.content, parsed.contentFile)
+      : undefined;
+    if (contentInput && !contentInput.ok) {
+      console.error(`botmux card stream: ${contentInput.error}`);
+      process.exit(contentInput.exitCode);
+    }
+
+    const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+    assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream');
+    const store = new CardStreamStore(resolveDataDir());
+    const authority = { sessionId: sid, larkAppId, chatId: session.chatId };
+    const currentTurnId = session.currentReplyTarget?.turnId ?? session.quoteTargetId;
+
+    if (parsed.operation === 'snapshot') {
+      const outcome = await executeCardStreamSnapshot({ store }, {
+        streamId: parsed.streamId,
+        authority,
+        readUsage: () => readCardStreamUsageSnapshot(session, larkAppId),
+        currentTurnId,
+      });
+      if (!outcome.ok) {
+        console.error(`botmux card stream: ${outcome.error}`);
+        process.exit(outcome.exitCode);
+      }
+      console.log(buildCardStreamSuccessOutput(outcome, sid));
+      return;
+    }
+
+    const {
+      deleteMessage,
+      getMessageDetail,
+      patchCardStreamElement,
+      resolveCardKitId,
+      updateCardStreamElementContent,
+      updateCardStreamingSettings,
+    } = await import('./im/lark/client.js');
+    const runtimeBridge = new CardRuntimeStatusBridge(resolveDataDir(), store, {
+      updateContent: input => updateCardStreamElementContent(
+        input.larkAppId,
+        input.cardId,
+        input.elementId,
+        input.content,
+        input.sequence,
+        input.uuid,
+      ),
+      patchElement: input => patchCardStreamElement(
+        input.larkAppId,
+        input.cardId,
+        input.elementId,
+        input.partialElement,
+        input.sequence,
+        input.uuid,
+      ),
+    });
+    const deps = {
+      store,
+      getMessageRoute: async (appId: string, messageId: string) =>
+        cardMessageRouteFromDetail(
+          await getMessageDetail(appId, messageId, { userCardContent: false }),
+          messageId,
+        ),
+      resolveCardId: resolveCardKitId,
+      updateSettings: async (input: {
+        larkAppId: string;
+        cardId: string;
+        streamingMode: boolean;
+        sequence: number;
+        uuid: string;
+        summary?: string;
+        print?: { frequencyMs: number; step: number; strategy: 'fast' };
+      }) => updateCardStreamingSettings(input.larkAppId, input.cardId, input),
+      updateElementContent: async (input: {
+        larkAppId: string;
+        cardId: string;
+        elementId: string;
+        content: string;
+        sequence: number;
+        uuid: string;
+      }) => updateCardStreamElementContent(
+        input.larkAppId,
+        input.cardId,
+        input.elementId,
+        input.content,
+        input.sequence,
+        input.uuid,
+      ),
+      moveRuntimeBinding: (previousStreamId: string, currentStreamId: string) =>
+        runtimeBridge.reanchor(previousStreamId, currentStreamId, authority),
+      deleteMessage,
+    };
+    const outcome = parsed.operation === 'open'
+      ? await executeCardStreamOpen(deps, {
+          binding: {
+            ...authority,
+            messageId: parsed.messageId,
+            ...(currentTurnId ? { anchorTurnId: currentTurnId } : {}),
+          },
+          sessionRoute: {
+            chatId: session.chatId,
+            rootMessageId: session.rootMessageId,
+            scope: session.scope,
+          },
+          summary: parsed.summary,
+        })
+      : parsed.operation === 'reanchor'
+        ? await executeCardStreamReanchor(deps, {
+            streamId: parsed.streamId,
+            authority,
+            nextBinding: {
+              ...authority,
+              messageId: parsed.messageId,
+              ...(currentTurnId ? { anchorTurnId: currentTurnId } : {}),
+            },
+            sessionRoute: {
+              chatId: session.chatId,
+              rootMessageId: session.rootMessageId,
+              scope: session.scope,
+            },
+            summary: parsed.summary,
+          })
+      : parsed.operation === 'write'
+        ? await executeCardStreamWrite(deps, {
+            streamId: parsed.streamId,
+            authority,
+            elementId: parsed.elementId,
+            content: contentInput!.content,
+          })
+        : await executeCardStreamFinish(deps, {
+            streamId: parsed.streamId,
+            authority,
+            summary: parsed.summary,
+          });
+    if (!outcome.ok) {
+      console.error(`botmux card stream: ${outcome.error}`);
+      process.exit(outcome.exitCode);
+    }
+    console.log(buildCardStreamSuccessOutput(outcome, sid));
+    return;
+  }
+
   const args = rest.slice(1);
   // Help wins over the missing-arg validation and the transport gates below.
   if (cardPatchArgsWantHelp(args)) {
@@ -12078,6 +12385,229 @@ async function cmdUserPromptHook(): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
+
+const NATIVE_SUBAGENT_HOOK_STDIN_MAX_BYTES = 256 * 1024;
+const NATIVE_SUBAGENT_HOOK_STDIN_TIMEOUT_MS = 750;
+const NATIVE_SUBAGENT_DIAGNOSTIC_MAX_CHARS = 512;
+
+function nativeSubagentDiagnostic(message: string): void {
+  process.stderr.write(`[native-subagent-runtime-hook] ${message}`
+    .slice(0, NATIVE_SUBAGENT_DIAGNOSTIC_MAX_CHARS) + '\n');
+}
+
+async function readNativeSubagentHookStdin(): Promise<string | undefined> {
+  return await new Promise<string | undefined>(resolveRead => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      process.stdin.off('data', onData);
+      process.stdin.off('end', onEnd);
+      process.stdin.off('error', onError);
+    };
+    const finish = (value: string | undefined, diagnostic?: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (diagnostic) nativeSubagentDiagnostic(diagnostic);
+      if (value === undefined) process.stdin.destroy();
+      resolveRead(value);
+    };
+    const onData = (raw: Buffer | string) => {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      size += chunk.length;
+      if (size > NATIVE_SUBAGENT_HOOK_STDIN_MAX_BYTES) {
+        finish(undefined, 'stdin exceeded size limit; allowing spawn');
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => finish(Buffer.concat(chunks, size).toString('utf8'));
+    const onError = () => finish(undefined, 'stdin read failed; allowing spawn');
+    const timer = setTimeout(
+      () => finish(undefined, 'stdin read timed out; allowing spawn'),
+      NATIVE_SUBAGENT_HOOK_STDIN_TIMEOUT_MS,
+    );
+    process.stdin.on('data', onData);
+    process.stdin.once('end', onEnd);
+    process.stdin.once('error', onError);
+  });
+}
+
+async function writeNativeSubagentHookDirective(value: unknown): Promise<void> {
+  await new Promise<void>(resolveWrite => {
+    process.stdout.write(JSON.stringify(value), () => resolveWrite());
+  });
+}
+
+/** TraeCode PreToolUse(spawn_agent) hook. Transport/protocol failures are
+ * fail-open, but an explicit overload response from the selected trusted or
+ * protected daemon destination is fail-closed so quota pressure cannot bypass
+ * a configured runtime policy. */
+async function cmdNativeSubagentRuntimeHook(): Promise<void> {
+  const stdinText = await readNativeSubagentHookStdin();
+  if (stdinText === undefined) return;
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(stdinText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
+    payload = parsed;
+  } catch {
+    nativeSubagentDiagnostic('malformed hook input; allowing spawn');
+    return;
+  }
+  if (payload.hook_event_name !== 'PreToolUse' || payload.tool_name !== 'spawn_agent') return;
+  if (!payload.tool_input || typeof payload.tool_input !== 'object' || Array.isArray(payload.tool_input)) {
+    nativeSubagentDiagnostic('invalid spawn input; allowing spawn');
+    return;
+  }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID?.trim();
+  if (!sessionId || !larkAppId) return;
+  try {
+    let hostSecret: string | undefined;
+    if (!process.env.BOTMUX_SEND_RELAY) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* isolated */ }
+    }
+    let policyClaim: ReturnType<typeof readManagedOriginPolicyCapability> = null;
+    if (!hostSecret) {
+      const originChannelId = process.env.BOTMUX_ORIGIN_CHANNEL_ID;
+      if (!originChannelId) return;
+      policyClaim = readManagedOriginPolicyCapability(
+        resolveDataDir(), sessionId, undefined, originChannelId,
+      );
+      if (!policyClaim) return;
+    }
+    let daemon: DaemonDescriptorLite | null = null;
+    if (hostSecret) {
+      try { daemon = findDaemon(larkAppId); } catch { /* unavailable */ }
+    }
+    // A capability file is host-written and read-only inside isolation; its port
+    // outranks the inherited compatibility fallback. Mutable discovery data is
+    // deliberately not consulted on this path.
+    const ipcPort = hostSecret
+      ? resolveDaemonIpcPort(daemon?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT)
+      : policyClaim?.ipcPort;
+    if (!ipcPort) return;
+    const targetLarkAppId = hostSecret ? daemon?.larkAppId : policyClaim?.larkAppId;
+    const targetBootInstanceId = hostSecret ? daemon?.bootInstanceId : policyClaim?.bootInstanceId;
+    if (targetLarkAppId !== larkAppId || !targetBootInstanceId) return;
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/native-subagent-runtime`;
+    const requestNonce = generateNativeSubagentRuntimeNonce();
+    const policyHeaders = hostSecret
+      ? nativeSubagentRuntimeHostChallengeHeaders({
+          larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId, nonce: requestNonce,
+        })
+      : nativeSubagentRuntimeCapabilityHeaders({
+          capability: policyClaim!.policyCapability,
+          method: 'POST',
+          path,
+          port: ipcPort,
+          sessionId,
+          larkAppId: targetLarkAppId,
+          bootInstanceId: targetBootInstanceId,
+          nonce: requestNonce,
+        });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    timeout.unref?.();
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...policyHeaders },
+      body: '{}',
+      signal: controller.signal,
+    } satisfies RequestInit;
+    let response: Response;
+    let raw: string;
+    try {
+      response = hostSecret
+        ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+        : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+      if (response.status !== 429 && !response.ok) {
+        void response.body?.cancel().catch(() => {});
+        return;
+      }
+      raw = await readBoundedNativeSubagentRuntimeResponse(response, { signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+    const responseBinding = {
+      requestNonce, method: 'POST', path, port: ipcPort, status: response.status, raw,
+      sessionId, larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId,
+    };
+    const responseAuthenticated = hostSecret
+      ? verifyNativeSubagentRuntimeResponse({
+          key: hostSecret,
+          requestNonce: responseBinding.requestNonce,
+          method: responseBinding.method,
+          path: responseBinding.path,
+          port: responseBinding.port,
+          status: responseBinding.status,
+          body: responseBinding.raw,
+          sessionId: responseBinding.sessionId,
+          larkAppId: responseBinding.larkAppId,
+          bootInstanceId: responseBinding.bootInstanceId,
+          signature: response.headers.get(NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.responseSignature),
+        })
+      : false;
+    const proofAuthenticated = !hostSecret && policyClaim?.channelId
+      ? readNativeSubagentRuntimeResponseProof({
+          dataDir: resolveDataDir(),
+          channelId: policyClaim.channelId,
+          nonce: requestNonce,
+          response: {
+            method: 'POST', path, port: ipcPort, status: response.status, body: raw, sessionId,
+            larkAppId: targetLarkAppId, bootInstanceId: targetBootInstanceId,
+          },
+        })
+      : false;
+    if (hostSecret ? !responseAuthenticated : !proofAuthenticated) {
+      nativeSubagentDiagnostic('daemon response authentication failed; allowing spawn');
+      return;
+    }
+    if (response.status === 429) {
+      nativeSubagentDiagnostic('policy service overloaded; denying spawn');
+      await writeNativeSubagentHookDirective({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'Native subagent runtime policy is temporarily overloaded; retry spawn_agent',
+        },
+      });
+      return;
+    }
+    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; policy?: unknown };
+    if (data.ok !== true) return;
+    if (data.invalidPolicy === true) {
+      nativeSubagentDiagnostic('daemon rejected invalid stored policy; allowing spawn');
+      return;
+    }
+    const normalized = normalizeNativeSubagentRuntimePolicy(data.policy);
+    if (!normalized.ok || !normalized.value) {
+      if (!normalized.ok) nativeSubagentDiagnostic('daemon returned invalid policy; allowing spawn');
+      return;
+    }
+    const rewritten = rewriteNativeSubagentSpawnInput(
+      payload.tool_input as Record<string, unknown>,
+      normalized.value,
+    );
+    if (rewritten.kind !== 'rewritten') return;
+    await writeNativeSubagentHookDirective({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        updatedInput: rewritten.input,
+      },
+    });
+  } catch {
+    nativeSubagentDiagnostic('policy lookup failed; allowing spawn');
+  }
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -13960,6 +14490,10 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case 'native-subagent-runtime-hook': {
+    await cmdNativeSubagentRuntimeHook();
     break;
   }
   case 'workflow': {

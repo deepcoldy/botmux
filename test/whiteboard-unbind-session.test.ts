@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { seedPersistedSessionRows, readPersistedSessionRows } from './helpers/session-store-disk.js';
+import { seedPersistedSessionRows, readPersistedSessionRows, seedOccupancyLease } from './helpers/session-store-disk.js';
 
 const ipc = vi.hoisted(() => ({
   daemon: null as { larkAppId: string; ipcPort: number } | null,
@@ -110,6 +110,21 @@ describe('deleteWhiteboard session unbind', () => {
     // (nothing failed) — and the offline path must not try to overrule it.
     expect(result).toMatchObject({ clearedSessions: 0, unresolvedSessions: 0 });
     expect(ipc.fetches).toHaveLength(1);
+    expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
+  });
+
+  it('leaves the row unresolved when a live occupancy lease exists even if no daemon is visible', async () => {
+    const board = createWhiteboard({ id: 'delete_lease', title: 't', larkAppId: 'app1', chatId: 'c1' });
+    seedBoundSession('app1', board.id);
+    seedOccupancyLease(tempDir, 'app1', {
+      ownerPid: 7,
+      bootId: 'boot-live',
+      leaseUntil: Date.now() + 60_000,
+    });
+
+    const result = await deleteWhiteboard(board.id);
+    expect(result).toMatchObject({ clearedSessions: 0, unresolvedSessions: 1 });
+    expect(ipc.fetches).toEqual([]);
     expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
   });
 

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
@@ -103,6 +104,39 @@ CREATE INDEX IF NOT EXISTS idx_sessions_root_message_id ON sessions(root_message
 CREATE INDEX IF NOT EXISTS idx_sessions_chat_scope ON sessions(chat_id, scope, status);
 `;
 
+/** Per-bot occupancy (grain directory). v1 uses a single `bot` row; the
+ *  primary key is `scope` so a later per-session grain can add
+ *  `session:<id>` without a migration that excludes that shape. */
+export const OCCUPANCY_SCOPE_BOT = 'bot';
+/** Lease TTL. Shares the descriptor-heartbeat staleness window so the two
+ *  ownership signals (lease, heartbeat fallback) lapse on one schedule. */
+export const OCCUPANCY_LEASE_MS = DAEMON_HEARTBEAT_STALE_MS;
+
+const OCCUPANCY_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS occupancy (
+  scope TEXT PRIMARY KEY,
+  owner_pid INTEGER NOT NULL,
+  boot_id TEXT NOT NULL,
+  lease_until INTEGER NOT NULL
+);
+`;
+
+export type OccupancyHolder = {
+  bootId: string;
+  pid: number;
+};
+
+export type OccupancyLease = {
+  scope: string;
+  ownerPid: number;
+  bootId: string;
+  leaseUntil: number;
+};
+
+/** Identity used by the owning daemon to claim/renew/release occupancy.
+ *  Set by `init()`; `owner: false` never claims. */
+let occupancyHolder: OccupancyHolder | undefined;
+
 let sqliteForcedUnavailable = false;
 /** Simulate a runtime without a SQLite engine. The real probe lives in
  *  sqlite-compat (Node: node:sqlite / Bun: bun:sqlite); tests flip this
@@ -151,6 +185,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec(SESSIONS_SCHEMA_SQL);
+  db.exec(OCCUPANCY_SCHEMA_SQL);
   return db;
 }
 
@@ -206,6 +241,158 @@ function attachOwnStore(path: string): OwnSqliteStore {
     ),
   };
   return ownStore;
+}
+
+function readOccupancyInTxn(db: SqliteDatabaseLike): OccupancyLease | undefined {
+  try {
+    const hit = db.prepare(
+      'SELECT scope, owner_pid, boot_id, lease_until FROM occupancy WHERE scope = ?',
+    ).get(OCCUPANCY_SCOPE_BOT) as { scope: string; owner_pid: number; boot_id: string; lease_until: number } | undefined;
+    if (!hit) return undefined;
+    return {
+      scope: hit.scope,
+      ownerPid: Number(hit.owner_pid),
+      bootId: String(hit.boot_id),
+      leaseUntil: Number(hit.lease_until),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/no such table/i.test(message)) return undefined;
+    throw err;
+  }
+}
+
+/** True when a lease row is present and still inside its TTL. */
+export function occupancyLeaseIsActive(
+  lease: OccupancyLease | undefined,
+  now: number = Date.now(),
+): boolean {
+  return !!lease && lease.leaseUntil > now;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but is not ours to signal — still alive.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export type OccupancyClaimResult =
+  /** This process holds the lease (claimed, taken over, or renewed). */
+  | 'held'
+  /** Another live boot holds it; the row was left untouched. */
+  | 'displaced'
+  /** No attached own store (not the owner, or the load failed). */
+  | 'unavailable';
+
+/**
+ * Take or extend the bot-scope lease for `holder` inside the caller's write
+ * transaction. A foreign row is taken over only once it has expired or its
+ * owner process is gone; a live foreign lease is never overwritten, so an
+ * overlapping predecessor (restart before its teardown finished) keeps
+ * ownership until it releases or lapses. Claim and renew are the same
+ * statement: a process that lost its lease re-acquires it on the next tick
+ * instead of running unowned for the rest of its life.
+ */
+function claimOccupancyInTxn(
+  db: SqliteDatabaseLike,
+  holder: OccupancyHolder,
+  now: number,
+): 'held' | 'displaced' {
+  const current = readOccupancyInTxn(db);
+  if (current
+      && current.bootId !== holder.bootId
+      && current.ownerPid !== holder.pid
+      && occupancyLeaseIsActive(current, now)
+      && processAlive(current.ownerPid)) {
+    return 'displaced';
+  }
+  db.prepare(
+    'INSERT INTO occupancy (scope, owner_pid, boot_id, lease_until) VALUES (?, ?, ?, ?) '
+    + 'ON CONFLICT(scope) DO UPDATE SET owner_pid = excluded.owner_pid, '
+    + 'boot_id = excluded.boot_id, lease_until = excluded.lease_until',
+  ).run(OCCUPANCY_SCOPE_BOT, holder.pid, holder.bootId, now + OCCUPANCY_LEASE_MS);
+  return 'held';
+}
+
+/** Runs inside load()'s snapshot transaction. A failed claim must not turn a
+ *  loadable store into a boot failure (a read-only store served reads before
+ *  occupancy existed): log it, let the snapshot commit, and leave the retry
+ *  to the heartbeat tick's claimOccupancyLease. */
+function claimOccupancyOnLoad(db: SqliteDatabaseLike, now: number): void {
+  if (!sqliteBootstrapAllowed || !occupancyHolder) return;
+  try {
+    if (claimOccupancyInTxn(db, occupancyHolder, now) === 'displaced') {
+      logger.warn(
+        `Session store ${getDbPath()} occupancy is held by another live daemon boot; `
+        + 'this process starts without the lease and retries on its heartbeat',
+      );
+    }
+  } catch (err) {
+    logger.error(`Failed to claim session store occupancy on load: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * SQLite ownership: a live lease blocks the write outright. Without a live
+ * lease (row absent or expired) `abortIf` — the descriptor-heartbeat probe —
+ * still decides. That fallback is the upgrade window: a daemon that writes
+ * SQLite but not occupancy (a pre-Stage-1 build, or a rollback after a newer
+ * build crashed and left a stale row) is visible only by heartbeat. Either
+ * signal fails closed; only "no live lease AND no fresh heartbeat" lets an
+ * offline writer publish.
+ */
+function sqliteOccupancyBlocksWrite(
+  lease: OccupancyLease | undefined,
+  now: number,
+  abortIf?: () => boolean,
+): boolean {
+  return occupancyLeaseIsActive(lease, now) || !!abortIf?.();
+}
+
+/** Point-read the bot-scope lease. JSON stores and pre-occupancy DBs → undefined. */
+export function readOccupancyLease(
+  larkAppId: string,
+  dataDir: string = config.session.dataDir,
+): OccupancyLease | undefined {
+  const ref = resolveStoreFile(larkAppId, dataDir);
+  if (ref.kind !== 'sqlite' || !existsSync(ref.path)) return undefined;
+  const db = openDbForRead(ref.path);
+  try {
+    return readOccupancyInTxn(db);
+  } finally {
+    db.close();
+  }
+}
+
+/** Claim or extend this process's lease (daemon heartbeat tick, and once right
+ *  after the first load). Takeover rules: see claimOccupancyInTxn. */
+export function claimOccupancyLease(opts: { bootId: string; pid: number; now?: number }): OccupancyClaimResult {
+  if (!ownStore || loadFailure || !sqliteBootstrapAllowed) return 'unavailable';
+  const db = ownStore.db;
+  const now = opts.now ?? Date.now();
+  let committed = false;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = claimOccupancyInTxn(db, { bootId: opts.bootId, pid: opts.pid }, now);
+    db.exec('COMMIT');
+    committed = true;
+    return result;
+  } finally {
+    if (!committed) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+  }
+}
+
+/** Drop this process's lease. Other holders are left untouched. */
+export function releaseOccupancyLease(opts: { bootId: string }): boolean {
+  if (!ownStore) return false;
+  const result = ownStore.db.prepare(
+    'DELETE FROM occupancy WHERE scope = ? AND boot_id = ?',
+  ).run(OCCUPANCY_SCOPE_BOT, opts.bootId);
+  return Number(result.changes) > 0;
 }
 
 function sessionStatusText(value: unknown): string {
@@ -349,7 +536,7 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 /** The active rows of one store, optionally narrowed by an indexed hint. */
 function readStoreActiveRows(
   ref: StoreFileRef,
-  hint?: { rootMessageId?: string; chatScopeChatId?: string },
+  hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
@@ -367,6 +554,10 @@ function readStoreActiveRows(
     if (hint?.chatScopeChatId !== undefined) {
       sql += " AND chat_id = ? AND scope = 'chat'";
       params.push(hint.chatScopeChatId);
+    }
+    if (hint?.threadScopeChatId !== undefined) {
+      sql += " AND chat_id = ? AND (scope IS NULL OR scope <> 'chat')";
+      params.push(hint.threadScopeChatId);
     }
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
@@ -447,12 +638,13 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
  * an old daemon can spawn workers from a newer dist during the upgrade window,
  * and only the daemon itself may flip the on-disk engine.
  */
-export function init(appId?: string, opts: { owner?: boolean } = {}): void {
+export function init(appId?: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
   loaded = false;
   sessions = new Map();
   loadFailure = undefined;
+  occupancyHolder = sqliteBootstrapAllowed ? opts.occupancy : undefined;
   if (ownStore) {
     try { ownStore.db.close(); } catch { /* already closed */ }
     ownStore = undefined;
@@ -1144,6 +1336,10 @@ function load(): void {
   try {
     store = attachOwnStore(dbFp);
   } catch (err) {
+    // Schema DDL is a real write on a store that predates a table (the
+    // occupancy CREATE on first boot after upgrade) and can wait out an
+    // offline writer's BEGIN IMMEDIATE — retryable, not a corrupt store.
+    if (isTransientStoreContentionError(err)) throw err;
     // Unreadable/corrupt .db: fail-closed for every write gate.
     logger.error(`Failed to load sessions: ${err}`);
     loadFailure = err instanceof Error ? err : new Error(String(err));
@@ -1152,17 +1348,24 @@ function load(): void {
     return;
   }
   sessions = new Map();
-  // 排他读：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照。纯 SELECT 不被
-  // 写事务排斥——若一个已通过双 abortIf 探测、正持有 IMMEDIATE 的离线 CLI
-  // 尚未 commit，普通读会把它提交前的旧行读进终身缓存，随后的行写回就会
-  // 覆盖掉 CLI 的提交。daemon 先发布 descriptor 再首次 load：新来的写者在
-  // 探测处让位，已持锁的写者让本读取等到它 commit 之后。
+  // 排他读 + 占位：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照，并在同一
+  // 事务写入 occupancy。纯 SELECT 不被写事务排斥——若一个已通过探测、正持有
+  // IMMEDIATE 的离线 CLI 尚未 commit，普通读会把它提交前的旧行读进终身缓存，
+  // 随后的行写回就会覆盖掉 CLI 的提交。descriptor 文件仍用于 IPC 发现，所有权
+  // 以本事务里的租约为准。
   try {
     store.db.exec('BEGIN IMMEDIATE');
+    let committed = false;
     try {
       for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
+      claimOccupancyOnLoad(store.db, Date.now());
+      // COMMIT publishes the claim. Its failure must surface (a cache marked
+      // loaded over a silently rolled-back lease would run unowned), so it is
+      // not swallowed the way a SELECT-only transaction's used to be.
+      store.db.exec('COMMIT');
+      committed = true;
     } finally {
-      try { store.db.exec('COMMIT'); } catch { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+      if (!committed) { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
     }
   } catch (err) {
     // Lock contention (SQLITE_BUSY after busy_timeout) must NOT become
@@ -2131,6 +2334,28 @@ export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
 }
 
 /**
+ * Cross-store lookup: every active thread-scope session in `chatId`, across
+ * all bots. Backs `schedule add --follow-active`: at fire time the scheduler
+ * needs "the topic in this chat where a human most recently spoke", and that
+ * person may have been talking to a different bot — the bot boundary is a
+ * property of the daemon layout, not of the human, so the lookup must not
+ * stop at the current store.
+ *
+ * Chat-scope sessions are excluded (they have no topic to land in), as are
+ * rows whose rootMessageId is missing or equals the chat id.
+ */
+export function findActiveThreadSessionsByChat(chatId: string): Session[] {
+  return findActiveSessionsMatching(
+    s => s.chatId === chatId
+      && s.scope !== 'chat'
+      && typeof s.rootMessageId === 'string'
+      && s.rootMessageId.length > 0
+      && s.rootMessageId !== chatId,
+    { threadScopeChatId: chatId },
+  );
+}
+
+/**
  * Count active sessions across every bot's on-disk session store. A pure disk
  * read (no in-memory state) so it's correct at daemon startup regardless of
  * which bot owns this process — used by the restart-report DM after a restart.
@@ -2331,16 +2556,23 @@ export function readSessionRowCopiesAcrossStores(
  * still on JSON — and hands the FRESH copy to `mutate`, never publishing the
  * caller's possibly-stale snapshot.
  *
- * `abortIf` is evaluated at entry (inside the exclusion) and re-evaluated
- * immediately before publication; returning true abandons the mutation with
- * `undefined` (callers pass a daemon-liveness probe so an owning daemon that
- * appears mid-flight stays authoritative and the store is left untouched).
- * SQLite's own locking does NOT replace this probe: it orders writers, but
+ * SQLite ownership is the occupancy row read in this same `BEGIN IMMEDIATE`
+ * transaction. A live lease aborts the write. Without one (row absent or
+ * expired) `abortIf` — the descriptor-heartbeat probe, also a test hook —
+ * still decides; that is the upgrade window for daemons that write SQLite
+ * but not occupancy. `abortIf` is evaluated at entry and again immediately
+ * before publication (the lease row itself cannot change under this
+ * transaction). JSON stores use `abortIf` only (no occupancy table).
+ * SQLite's own locking does NOT replace occupancy: it orders writers, but
  * cannot detect that a daemon holding a stale in-memory cache has come alive.
  *
  * Returns the fresh row — mutated when `mutate` returned true, otherwise
  * unmodified (so `() => false` is an exclusion-ordered fresh read) — or
- * undefined when the row is absent or `abortIf` aborted.
+ * undefined when the row is absent, `abortIf` aborted, or the store's write
+ * lock could not be taken (another writer holds `BEGIN IMMEDIATE` past
+ * busy_timeout). Lock contention is the same clean yield as a held lease:
+ * the caller must not publish, and the CLI must not throw a stack. Other
+ * errors (missing engine, corrupt file) still surface.
  */
 export function mutateSessionRowOffline(
   target: { sessionId: string; larkAppId?: string },
@@ -2356,26 +2588,34 @@ export function mutateSessionRowOffline(
     // plant an empty store: that would make the daemon's import gate skip the
     // one-shot JSON import and silently drop every pre-SQLite row.
     if (!existsSync(ref.path)) return undefined;
-    const db = openDbForOwnStore(ref.path);
+    let db: SqliteDatabaseLike | undefined;
     let inTxn = false;
     try {
+      // openDbForOwnStore (schema ensure) and BEGIN IMMEDIATE both take the
+      // write lock. Contention here is "someone else is publishing", not a
+      // broken store — same abort as a live occupancy row.
+      db = openDbForOwnStore(ref.path);
       db.exec('BEGIN IMMEDIATE');
       inTxn = true;
-      if (options.abortIf?.()) return undefined;
+      const lease = readOccupancyInTxn(db);
+      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return undefined;
       const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
         .get(target.sessionId) as { row: string } | undefined;
       if (!hit) return undefined;
       const current = JSON.parse(hit.row) as Session;
       if (!mutate(current)) return current;
-      if (options.abortIf?.()) return undefined;
+      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return undefined;
       db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
         .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
       db.exec('COMMIT');
       inTxn = false;
       return current;
+    } catch (err) {
+      if (isTransientStoreContentionError(err)) return undefined;
+      throw err;
     } finally {
-      if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-      db.close();
+      if (inTxn) { try { db?.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+      try { db?.close(); } catch { /* already closed */ }
     }
   }
 
@@ -2410,7 +2650,7 @@ export function mutateSessionRowOffline(
 
 function findActiveSessionsMatching(
   predicate: (s: Session) => boolean,
-  hint?: { rootMessageId?: string; chatScopeChatId?: string },
+  hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
 ): Session[] {
   load();
   const matches: Session[] = [];

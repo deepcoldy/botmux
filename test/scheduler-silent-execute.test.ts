@@ -26,7 +26,14 @@ import type { DaemonSession } from '../src/core/types.js';
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
 let sessionSeq = 0;
+const findActiveThreadSessionsByChatMock = vi.fn((_chatId: string): Session[] => []);
+const scheduleStoreUpdateTaskMock = vi.fn();
+vi.mock('../src/services/schedule-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/schedule-store.js')>()),
+  updateTask: (...a: any[]) => scheduleStoreUpdateTaskMock(...a),
+}));
 vi.mock('../src/services/session-store.js', () => ({
+  findActiveThreadSessionsByChat: (chatId: string) => findActiveThreadSessionsByChatMock(chatId),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -149,6 +156,7 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 }));
 
 import { executeScheduledTask, rememberLastCliInput } from '../src/core/session-manager.js';
+import { recordDispatchInputCommit } from '../src/core/dispatch.js';
 import { sessionKey } from '../src/core/types.js';
 
 const APP = 'cli_app_test';
@@ -193,6 +201,9 @@ beforeEach(() => {
   sendWorkerInputMock.mockReturnValue(true);
   sendMessageMock.mockClear();
   replyMessageMock.mockClear();
+  findActiveThreadSessionsByChatMock.mockReset();
+  findActiveThreadSessionsByChatMock.mockImplementation(() => []);
+  scheduleStoreUpdateTaskMock.mockClear();
   getChatModeMock.mockClear();
   getChatModeMock.mockResolvedValue('group');
   getMessageThreadIdMock.mockClear();
@@ -262,6 +273,9 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(ds.silentScheduledTurns).toBeUndefined();
     expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
     expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    // Unit-level check: dispatch receipts require a live worker generation.
+    ds.session.workerGeneration = 1;
+    expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
   });
 });
 
@@ -511,6 +525,72 @@ describe('executeScheduledTask — cross-target notice', () => {
         true,
       );
     });
+  });
+});
+
+describe('executeScheduledTask — follow-active landing', () => {
+  const humanHeld = (rootMessageId: string): Session => ({
+    sessionId: `held-${rootMessageId}`, chatId: CHAT, rootMessageId, title: 'held', scope: 'thread',
+    status: 'active', createdAt: '2026-01-01T00:00:00.000Z', lastHumanMessageAt: '2026-01-01T09:00:00.000Z',
+  });
+
+  it('a moved landing point inside the creator chat is in-thread: banner there, no notice to the old topic', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: CHAT, creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(replyMessageMock).toHaveBeenCalledTimes(1);
+    expect(replyMessageMock.mock.calls[0][1]).toBe(ROOT);
+    expect(getMessageThreadIdMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))?.session.rootMessageId).toBe(ROOT);
+  });
+
+  it('control: the same shape without followActive is cross-thread — notice to the creator topic, no banner', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic',
+      creatorChatId: CHAT, creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
+    });
+    expect(replyMessageMock.mock.calls.map(c => c[1])).not.toContain(ROOT);
+  });
+
+  it('a follow-active task created from another chat still notifies its creator there', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: 'oc_creator_chat', creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
+    });
+    expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
+  });
+
+  it('a bot-only landing point yields to the topic where a human is: fires there and persists it', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [
+      { ...humanHeld(ROOT), lastHumanMessageAt: undefined },
+      humanHeld('om_human_topic'),
+    ]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: CHAT, creatorRootMessageId: ROOT,
+    }), active, refreshCliVersion);
+
+    expect(active.get(sessionKey('om_human_topic', APP))).toBeTruthy();
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+    expect(replyMessageMock.mock.calls.map(c => c[1])).toEqual(['om_human_topic']);
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith('task0001', { rootMessageId: 'om_human_topic' }, APP);
   });
 });
 

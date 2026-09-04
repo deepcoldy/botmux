@@ -138,6 +138,9 @@ export interface CliAdapter {
      *  and a resumeSessionId; adapters whose CLI lacks the primitive ignore it. */
     forkSession?: boolean;
     initialPrompt?: string;
+    /** CLI-native display/session title prepared by botmux. Adapters with a
+     *  launch-time title flag may consume it; others should ignore it. */
+    nativeSessionTitle?: string;
     botName?: string;
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
@@ -199,6 +202,9 @@ export interface CliAdapter {
      *  instead of a drop-prone tmux paste. Both are set together or neither. */
     remoteWsUrl?: string;
     remoteThreadId?: string;
+    /** TraeCode only: process-scoped PreToolUse command for native spawn_agent.
+     *  The worker supplies this for every managed model-owning Trae process. */
+    nativeSubagentRuntimeHookCommand?: string;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees

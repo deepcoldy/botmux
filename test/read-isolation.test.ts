@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { stripComments } from './helpers/bun-leg-selectors.js';
 import {
   evaluateReadIsolationGate,
   evaluateCredentialOnlyIsolationGate,
@@ -26,6 +27,7 @@ import {
   normalizeIsolationPath,
   shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
+import { managedOriginAttestationDirectory, managedOriginCapabilityDirectory } from '../src/core/managed-origin-capability.js';
 
 describe('CLI data redirect gate', () => {
   const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
@@ -206,6 +208,19 @@ describe('mandatory device credential isolation', () => {
       expect(isCredentialIsolationReservedBasename(name), name).toBe(true);
     }
   });
+
+  it('credential-only Seatbelt must expose both capability and attestation dirs read-only while keeping profileDir write-denied', async () => {
+    const workerSource = await import('node:fs/promises').then(fs =>
+      fs.readFile(new URL('../src/worker.ts', import.meta.url), 'utf8'));
+    const strippedWorkerSource = stripComments(workerSource);
+    const capabilityDir = managedOriginCapabilityDirectory('/tmp/botmux-data', 'session-a', G1);
+    const attestationDir = managedOriginAttestationDirectory('/tmp/botmux-data', 'session-a', G1);
+    expect(strippedWorkerSource).toContain('[canonical(originDirectory), canonical(attestationDirectory)]');
+    expect(strippedWorkerSource).toContain('const attestationDirectory = managedOriginAttestationDirectory(');
+    expect(strippedWorkerSource).toContain('canonical(profileDir)');
+    expect(capabilityDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/origin-[a-f0-9]{64}$/);
+    expect(attestationDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/attest-[a-f0-9]{64}$/);
+  });
 });
 
 
@@ -338,6 +353,69 @@ describe('isolatedPaneReattachSafe', () => {
     ), {
       requiredCapabilities: ['credential', 'read'],
       requireOriginChannel: true,
+    })).toBe(false);
+  });
+
+  it('binds Linux warm reattach to the managed-origin digest so install-root or native-hook protocol changes cold-spawn', () => {
+    const linuxDigestA = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/a'],
+      readWriteExtraPaths: ['/native-hook-protocol/v1'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const linuxDigestB = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/b'],
+      readWriteExtraPaths: ['/native-hook-protocol/v1'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const linuxDigestProtocolBump = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/a'],
+      readWriteExtraPaths: ['/native-hook-protocol/v2'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const marker = isolationPaneMarkerContent('linux-fresh', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: false,
+      writeSandbox: false,
+      policyDigest: linuxDigestA,
+    });
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestA,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestB,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestProtocolBump,
     })).toBe(false);
   });
 });
@@ -879,27 +957,28 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
 
 describe('worker capability carve-out ordering', () => {
   const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+  const strippedSource = stripComments(source);
 
   it('publishes each child-visible capability before the sandbox starts', () => {
-    const macPathAt = source.indexOf("readIsolationOriginCapabilityFile = process.platform === 'darwin'");
-    const macPublishAt = source.indexOf(
+    const macPathAt = strippedSource.indexOf("readIsolationOriginCapabilityFile = process.platform === 'darwin'");
+    const macPublishAt = strippedSource.indexOf(
       'publishSandboxRelayCapability({ failClosed: true })',
       macPathAt,
     );
-    const policyAt = source.indexOf('const fsPolicyCtx = {', macPublishAt);
+    const policyAt = strippedSource.indexOf('const fsPolicyCtx = {', macPublishAt);
     expect(macPathAt).toBeGreaterThanOrEqual(0);
     expect(macPublishAt).toBeGreaterThan(macPathAt);
     expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(source).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
+    expect(strippedSource).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
 
-    const credentialPathAt = source.indexOf(
+    const credentialPathAt = strippedSource.indexOf(
       'if (readIsolationOriginChannelId && !sandboxRequested)',
     );
-    const credentialPublishAt = source.indexOf(
+    const credentialPublishAt = strippedSource.indexOf(
       'publishSandboxRelayCapability({ failClosed: true })',
       credentialPathAt,
     );
-    const credentialWrapperAt = source.indexOf(
+    const credentialWrapperAt = strippedSource.indexOf(
       'if (!willReattachPersistent && credentialOnlyBwrap)',
       credentialPublishAt,
     );
@@ -907,33 +986,33 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
     expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
 
-    const relayAt = source.indexOf('sandboxRelayOutbox = sbx.outbox');
-    const relayPublishAt = source.indexOf('publishSandboxRelayCapability();', relayAt);
+    const relayAt = strippedSource.indexOf('sandboxRelayOutbox = sbx.outbox');
+    const relayPublishAt = strippedSource.indexOf('publishSandboxRelayCapability();', relayAt);
     expect(relayAt).toBeGreaterThan(policyAt);
     expect(relayPublishAt).toBeGreaterThan(relayAt);
-    expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
+    expect(strippedSource).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
   });
 
   it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
-    const regexAt = source.indexOf('sessionMcpGatewayPathRegex(gatewaySocketRoot)');
-    const denyAt = source.indexOf('mandatoryDenyRegexes.push(', regexAt - 80);
-    const allowAt = source.indexOf(
+    const regexAt = strippedSource.indexOf('sessionMcpGatewayPathRegex(gatewaySocketRoot)');
+    const denyAt = strippedSource.indexOf('mandatoryDenyRegexes.push(', regexAt - 80);
+    const allowAt = strippedSource.indexOf(
       'mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
       regexAt,
     );
-    const profileAt = source.indexOf('const fsPolicyCtx = {', allowAt);
+    const profileAt = strippedSource.indexOf('const fsPolicyCtx = {', allowAt);
     expect(regexAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeLessThanOrEqual(regexAt);
     expect(allowAt).toBeGreaterThan(denyAt);
     expect(profileAt).toBeGreaterThan(allowAt);
-    expect(source).toContain('mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath');
+    expect(strippedSource).toContain('mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath');
   });
 
   it('carves back only the prepared Pi session prompt directory after masking the shared root', () => {
-    expect(source).toContain('readonlyRoots: keepExisting([');
-    expect(source).toContain('...piInitialPromptReadonlyRoots,');
-    expect(source).not.toContain(
+    expect(strippedSource).toContain('readonlyRoots: keepExisting([');
+    expect(strippedSource).toContain('...piInitialPromptReadonlyRoots,');
+    expect(strippedSource).not.toContain(
       'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
     );
   });
@@ -947,24 +1026,24 @@ describe('worker capability carve-out ordering', () => {
     // output into readonlyRoots.
     // The call site passes the merged child/per-bot env so env-driven adapters
     // (e.g. ebsd's repository root) resolve against bot config, not daemon env.
-    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.({')
-    expect(source).toContain('}) ?? [])].map(expandTildeLexical),');
+    expect(strippedSource).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.({')
+    expect(strippedSource).toContain('}) ?? [])].map(expandTildeLexical),');
   });
 
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
-    const gateAt = source.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
-    const adoptAt = source.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
-    const wrapperAt = source.indexOf('if (cfg.wrapperCli && cfg.wrapperCli.trim())');
-    const credentialWrapperAt = source.indexOf('if (!willReattachPersistent && credentialOnlySeatbelt)');
-    const spawnAt = source.indexOf('backend.spawn(spawnBin, spawnArgs, {');
+    const gateAt = strippedSource.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
+    const adoptAt = strippedSource.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
+    const wrapperAt = strippedSource.indexOf('if (cfg.wrapperCli && cfg.wrapperCli.trim())');
+    const credentialWrapperAt = strippedSource.indexOf('if (!willReattachPersistent && credentialOnlySeatbelt)');
+    const spawnAt = strippedSource.indexOf('backend.spawn(spawnBin, spawnArgs, {');
     expect(gateAt).toBeGreaterThanOrEqual(0);
     expect(gateAt).toBeLessThan(adoptAt);
     expect(credentialWrapperAt).toBeGreaterThan(wrapperAt);
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
-    expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
-    expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
-    expect(source).toContain('exactCapabilities: true');
+    expect(strippedSource).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
+    expect(strippedSource).toContain('isCredentialIsolationReservedBasename(name)');
+    expect(strippedSource).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(strippedSource).toContain('exactCapabilities: true');
   });
 });
 

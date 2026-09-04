@@ -88,6 +88,7 @@ export function canonicalScheduleInput(t: {
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
 }): unknown {
   return {
     name: t.name,
@@ -121,6 +122,7 @@ export function canonicalScheduleInput(t: {
     // `silent: false`/absent normalizes to undefined (dropped by
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
+    followActive: t.followActive === true ? true : undefined,
   };
 }
 
@@ -275,6 +277,7 @@ function migrate(raw: any): ScheduledTask | null {
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
+    followActive: raw.followActive === true ? true : undefined,
   };
 }
 
@@ -483,6 +486,7 @@ export function createTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
 }): ScheduledTask {
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
@@ -542,6 +546,7 @@ export function createTask(params: {
       // explicit executionPosition field before reaching the store.
       deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -565,7 +570,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive'
   >>,
   appId?: string,
 ): void {

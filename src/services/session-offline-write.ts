@@ -4,27 +4,62 @@
  * A session row has one authority at a time: while the owning bot's daemon is
  * up it holds the row in memory and will `persistRow` over anything written
  * behind its back, so every other process must send it a command instead.
- * Only when no daemon answers for that bot may another process publish the row
- * itself — and the liveness probe still has to be re-evaluated inside the
- * store's write exclusion, so a daemon that comes up between the caller's
- * check and the commit wins.
+ * Only when no daemon holds the SQLite occupancy lease — and no fresh
+ * descriptor heartbeat says one is up — may another process publish the row
+ * itself. The lease is read inside the store's write exclusion, so a daemon
+ * that claims between the caller's check and the commit wins.
  *
  * `sessionStore.mutateSessionRowOffline` implements the exclusion and the
- * re-probe; this wrapper supplies the probe, so no caller has to remember to
- * pass one (and so the probe and the store read resolve the SAME data dir).
+ * in-txn occupancy read. This wrapper supplies the heartbeat probe that still
+ * decides when no live lease exists (the upgrade window: a daemon that writes
+ * SQLite but not occupancy), and keeps the probe and the store read on the
+ * SAME data dir.
  * Stage 2 of `docs/design/2026-08-12-session-restage-store-first.md` deletes
- * both: the offline write becomes a lease plus the daemon's own apply.
+ * the offline write: it becomes a lease plus the daemon's own apply.
  */
 import { config } from '../config.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
-import { mutateSessionRowOffline } from './session-store.js';
+import {
+  mutateSessionRowOffline,
+  occupancyLeaseIsActive,
+  readOccupancyLease,
+  type OccupancyLease,
+} from './session-store.js';
 import type { Session } from '../types.js';
+
+function legacyHeartbeatHeld(larkAppId: string, dataDir: string): boolean {
+  try { return !!findOnlineDaemon(larkAppId, dataDir); }
+  catch { return false; /* unreadable registry → treat as offline */ }
+}
+
+/**
+ * Whether this bot's store is held by a live host.
+ *
+ * A live occupancy lease is the authority. Without one (row absent, expired,
+ * or unreadable) the descriptor heartbeat still counts — the upgrade window
+ * for daemons that write SQLite but not occupancy, including a rollback that
+ * runs behind a stale row a crashed newer build left. Never throws: callers
+ * sit inside IPC error handlers, and an unreadable store (sandbox read-only
+ * grant, corrupt file, no SQLite engine) must not replace their own error.
+ */
+export function isOccupancyHeld(
+  larkAppId: string,
+  options: { dataDir?: string; now?: number } = {},
+): boolean {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const now = options.now ?? Date.now();
+  let lease: OccupancyLease | undefined;
+  try { lease = readOccupancyLease(larkAppId, dataDir); }
+  catch { lease = undefined; /* unreadable store → the heartbeat decides */ }
+  return occupancyLeaseIsActive(lease, now) || legacyHeartbeatHeld(larkAppId, dataDir);
+}
 
 /**
  * Mutate one exact row only while its owning daemon is absent.
  *
  * Returns the fresh row (mutated when `mutate` returned true), or undefined
- * when the row is missing or a daemon holds it. A row with no `larkAppId` is a
+ * when the row is missing, a daemon holds it, or the store write lock could
+ * not be taken. A row with no `larkAppId` is a
  * pre-per-bot legacy row in the flat store: no daemon owns one — daemons all
  * run per-bot stores — so there is nothing to probe and the write proceeds.
  */
@@ -42,10 +77,7 @@ export function mutateSessionRowWhenUnowned(
       dataDir,
       ...(larkAppId
         ? {
-            abortIf: () => {
-              try { return !!findOnlineDaemon(larkAppId, dataDir); }
-              catch { return false; /* unreadable registry → treat as offline */ }
-            },
+            abortIf: () => legacyHeartbeatHeld(larkAppId, dataDir),
           }
         : {}),
     },

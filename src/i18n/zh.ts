@@ -208,6 +208,35 @@ export const messages: Record<string, string> = {
   'card.codex_app_thread.placeholder_select': '选择 Codex App 对话',
   'card.codex_app_thread.updated_unknown': '未知时间',
 
+  // ─── /quote picker card（引用本群其他话题）────────────────────────────────
+  'card.quote.title': '💬 选择要读取的话题',
+  'card.quote.empty': '本群最近的消息里没有找到其他话题。\n（只扫描群聊最近若干条消息，很久以前的话题可能不在范围内。）',
+  'card.quote.empty_filtered': '没有匹配「{query}」的话题，请换个关键词。',
+  'card.quote.search_placeholder': '🔍 搜索话题（标题 / 发起人）',
+  'card.quote.field_starter': '发起人',
+  'card.quote.field_time': '活跃',
+  'card.quote.selected_tag': '已选中',
+  'card.quote.hint_pick_first': '点击上方任意话题以选中，然后再点确认按钮读取。',
+  'card.quote.btn_confirm': '读取这个话题',
+  'card.quote.btn_confirm_with_task': '读取并执行我的指令',
+  'card.quote.btn_prev_page': '← 上一页',
+  'card.quote.btn_next_page': '下一页 →',
+  'card.quote.page_indicator': '第 {current} / {total} 页',
+  'card.quote.toast_need_auth': '你还没有本机器人的使用授权，无法读取话题。请联系管理员授权后再试。',
+  'card.quote.toast_not_invoker': '这张菜单是别人召唤的，请自己发 /quote 召唤一张。',
+  'card.quote.toast_failed': '读取话题失败：{error}',
+  'card.quote.toast_no_session': '当前话题没有活跃会话，无法把内容读进去。',
+  'card.quote.toast_empty_topic': '这个话题里没有可读取的文本消息。',
+  'card.quote.toast_busy': '会话正在处理上一条消息，请等它空闲后再读取。',
+  // 文案只承诺代码真正检查的东西：这里只判 chatId 是否解析得到（p2p 也有真实
+  // chatId，因此进不了这条分支）。单聊不会报错，只是没有话题，最终落到
+  // card.quote.empty。原文案写「只能在群聊里使用」，是代码没有实现的承诺。
+  'cmd.quote.no_chat': '⚠️ /quote 需要在能定位到会话的聊天里使用（当前拿不到 chat 信息）。',
+  'cmd.quote.injected': '📖 已把话题「{title}」的 {count} 条消息读进本会话。',
+  'cmd.quote.injected_truncated': '📖 已把话题「{title}」读进本会话：共 {total} 条，因长度限制只放入最近 {count} 条（较早的 {dropped} 条未包含）。',
+  // 取数本身被上限截断时用这条：真实总条数拿不到，绝不能报一个由取数上限推出的数字。
+  'cmd.quote.injected_truncated_unknown': '📖 已把话题「{title}」读进本会话：该话题超过 {count} 条，只放入了最近 {count} 条，更早的未包含（更早的条数未知）。',
+
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 选择要接力到本群的会话',
   'card.relay.title_p2p': '📋 选择要接力到本单聊的会话',
@@ -682,6 +711,7 @@ export const messages: Record<string, string> = {
   'cmd.retry.success': '🔁 已重新提交上一条失败的任务（错误码：{errorCode}），请等待执行。',
   'cmd.retry.submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
   'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新；开了私密卡片则改发仅授权人可见的静态快照）。`/card off｜on` 控制本群是否出流式卡；`/card pin off｜on｜status` 控制当前群的流式卡片置顶开关',
+  'help.quote': '/quote [指令] - 选择本群另一个话题，把它的聊天记录读进当前会话（飞书只能引用单条消息，这里能引整个话题）。不带指令时读完只确认、等你下一条；带指令则读完直接执行',
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
   'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',

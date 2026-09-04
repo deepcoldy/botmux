@@ -45,6 +45,31 @@ botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 
 You can also flip an existing task between "original thread" and "new topic each run" from the **Delivery** column toggle on the dashboard's Schedules page.
 
+## Follow the Active Topic
+
+A topic-pinned task keeps firing into the topic it was created in; once that topic is closed and the conversation has moved on, reminders land where nobody is looking — and re-lighting a closed topic is one more topic session to carry. `--follow-active` makes the task re-resolve its target **at every fire**.
+
+```bash
+# Created from inside a topic session: that topic is the starting point
+botmux schedule add "every 30m" "check the service, alert only on failure" --follow-active
+
+# Or give the starting point explicitly
+botmux schedule add "每日9:00" "standup reminder" --follow-active --root-msg-id om_xxx
+```
+
+Tried in order at every fire:
+
+1. **The last landing point is still open and a human has spoken in it** (some bot still holds an active session under that topic, and that session has seen a human message) ⇒ fire there, even if the person spoke elsewhere more recently. Until the first fire, the last landing point is the creation topic.
+2. **Otherwise** (closed; or open but only bots ever wrote there) ⇒ fire into the topic in this chat where a **human most recently spoke**, and record it as the new landing point. Only human messages count — bot replies and scheduled-task output are ignored, otherwise a task firing every 30 minutes would keep its own topic "most active" and follow itself forever. The lookup spans every bot: where the person is, is a property of the person, not of one bot. Note that this fire is injected into the person's live session, so the task's own `--workdir` does not apply there; the session's working directory is used.
+3. **No open topic with human activity in this chat, but the last landing point is still open** (e.g. the topic step 4 opened, with only the task writing in it) ⇒ stay there; no new topic is opened.
+4. **Nothing open at all** ⇒ this fire opens a fresh top-level topic, exactly like `--new-topic`, and records it as the new landing point — the next fire stays in it under step 3, and once the person replies there it is held under step 1.
+
+Step 1 requiring a human is deliberate: a topic the task opened itself must not pin the task, so a bot-only landing point yields to any topic where a person is. If the session records cannot be read (e.g. sqlite temporarily unavailable) the task does not move and keeps its last landing point. A silent task reaching step 4 gets a deferred topic (created by the first `botmux send`), which is not recorded; the next fire re-resolves.
+
+Cross-topic notice: a plain topic-pinned task that fires somewhere other than its creation topic posts a "delivered to …" notice back into the creation topic. A follow-active task moves by design, so it posts that notice only when it fires into a **different chat**; a move within the same chat just posts the "task started" banner in the topic it landed in.
+
+`--follow-active` only makes sense for topic execution and cannot be combined with `--top-level` / `--new-topic`. Tasks of this kind show a `↷跟随活跃话题` marker in `schedule list`.
+
 ## Management
 
 ```bash

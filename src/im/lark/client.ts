@@ -1151,6 +1151,121 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
   });
 }
 
+export interface CardStreamingSettings {
+  streamingMode: boolean;
+  sequence: number;
+  uuid: string;
+  summary?: string;
+  /** Applied when opening a stream. Omitted when only finalizing it. */
+  print?: {
+    frequencyMs: number;
+    step: number;
+    strategy: 'fast';
+  };
+}
+
+/** Convert a sent interactive message into its CardKit entity id. */
+export async function resolveCardKitId(larkAppId: string, messageId: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'resolveCardKitId');
+  return executeWithLarkGate(larkAppId, 'resolveCardKitId', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await c.cardkit.v1.card.idConvert({ data: { message_id: messageId } });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
+    }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to resolve CardKit id: ${res.msg} (code: ${res.code})`);
+    }
+    const cardId = res.data?.card_id;
+    if (!cardId) throw new Error('CardKit id conversion returned no card_id');
+    return cardId;
+  });
+}
+
+/** Enable/finalize native CardKit streaming without replacing the whole card. */
+export async function updateCardStreamingSettings(
+  larkAppId: string,
+  cardId: string,
+  settings: CardStreamingSettings,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
+    const c = getBotClient(larkAppId);
+    const config: Record<string, unknown> = {
+      streaming_mode: settings.streamingMode,
+      ...(settings.summary !== undefined ? { summary: { content: settings.summary } } : {}),
+      ...(settings.print ? {
+        streaming_config: {
+          print_frequency_ms: { default: settings.print.frequencyMs },
+          print_step: { default: settings.print.step },
+          print_strategy: settings.print.strategy,
+        },
+      } : {}),
+    };
+    const res: any = await c.cardkit.v1.card.settings({
+      path: { card_id: cardId },
+      data: {
+        settings: JSON.stringify({ config }),
+        sequence: settings.sequence,
+        uuid: settings.uuid,
+      },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to update CardKit streaming settings: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
+/** Replace one text element's full content using CardKit's typewriter API. */
+export async function updateCardStreamElementContent(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  content: string,
+  sequence: number,
+  uuid: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardStreamElementContent');
+  return executeWithLarkGate(larkAppId, 'updateCardStreamElementContent', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: elementId },
+      data: { content, sequence, uuid },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to stream CardKit element content: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
+/** Patch properties on one existing CardKit element without replacing the card. */
+export async function patchCardStreamElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  partialElement: Record<string, unknown>,
+  sequence: number,
+  uuid: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.cardkit.v1.cardElement.patch({
+      path: { card_id: cardId, element_id: elementId },
+      data: { partial_element: JSON.stringify(partialElement), sequence, uuid },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to patch CardKit element: ${res.msg} (code: ${res.code})`);
+    }
+  });
+}
+
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
@@ -1655,6 +1770,20 @@ export async function resolveUserUnionId(larkAppId: string, openId: string): Pro
 
 export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
   return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
+}
+
+/** List a 话题 by its thread id (`omt_…`) directly, skipping the message.get
+ *  round-trip `listThreadMessages` needs to resolve one from a root message.
+ *
+ *  The /quote picker already has the thread id: `im/v1/messages` returns
+ *  `thread_id` on every 话题 message, so grouping the chat tail by that field
+ *  yields the id for free. Going back through `listThreadMessages` would spend
+ *  an extra API call re-deriving what we already know — and would fail for a
+ *  话题 whose root message has been withdrawn (message.get 404s, and the
+ *  by-root_id fallback scan can't see the 话题 either, since its replies carry
+ *  `thread_id` but no `root_id` pointing at the missing root). */
+export async function listMessagesByThreadId(larkAppId: string, threadId: string, pageSize: number = 50): Promise<any[]> {
+  return listByThread(getBotClient(larkAppId), threadId, pageSize);
 }
 
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
