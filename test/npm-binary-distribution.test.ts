@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
 import { detectGlobalInstallManager } from '../src/utils/global-install.js';
+import { parseNpmPackJson } from '../scripts/parse-npm-pack-json.mjs';
 
 const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
 
@@ -19,8 +20,9 @@ const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
  * probe means the same thing on every npm major that ships it.
  */
 function parseNpmPackReport(stdout: string, packageName: string): { files: Array<{ path: string }> } {
-  const parsed = JSON.parse(stdout);
-  return Array.isArray(parsed) ? parsed[0] : parsed[packageName];
+  const rows = parseNpmPackJson(stdout) as Array<{ name?: string; files: Array<{ path: string }> }>;
+  const named = rows.find(row => row?.name === packageName);
+  return named ?? rows[0];
 }
 
 function runNodeScript(script: string, env: NodeJS.ProcessEnv) {
@@ -145,6 +147,8 @@ describe('package.json — lockfile safety and packaging', () => {
     expect(parseNpmPackReport(JSON.stringify([{ name: 'botmux', files }]), 'botmux').files).toEqual(files);
     // Object-keyed-by-name shape: npm 12+ — MEASURED on npm 12.0.1.
     expect(parseNpmPackReport(JSON.stringify({ botmux: { name: 'botmux', files } }), 'botmux').files).toEqual(files);
+    // Banner before the object (workflow-core scripts used to scan only for `^[`).
+    expect(parseNpmPackReport('notice\n{ "botmux": { "name": "botmux", "files": [] } }\n', 'botmux').files).toEqual([]);
   });
 
   it('declares no entry point that the tarball does not contain', () => {

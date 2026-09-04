@@ -45,6 +45,15 @@ async function waitFor(
   throw new Error(`timed out waiting for ${description}\n${harness.logs.join('')}`);
 }
 
+function launchCountEquals(harness: Harness, expected: string): boolean {
+  try {
+    return readFileSync(harness.launchCount!, 'utf8') === expected;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
 function origins(harness: Harness): Origin[] {
   return harness.messages.filter((message): message is Origin => message.type === 'managed_turn_origin');
 }
@@ -194,7 +203,7 @@ describe('worker restart policy capability lifecycle', () => {
     harness.child.send({ type: 'restart', attemptId: 'natural-crash-recovery' } satisfies DaemonToWorker);
     await waitFor(
       harness,
-      () => readFileSync(harness.launchCount!, 'utf8') === '2',
+      () => launchCountEquals(harness, '2'),
       'replacement process launch after natural crash',
     );
     harness.child.send({ type: 'session_ready', source: 'resume' } satisfies DaemonToWorker);
@@ -256,7 +265,7 @@ describe('worker restart policy capability lifecycle', () => {
     harness.child.send({ type: 'restart', attemptId: 'kill-cli' } satisfies DaemonToWorker);
     await waitFor(
       harness,
-      () => readFileSync(harness.launchCount!, 'utf8') === '2'
+      () => launchCountEquals(harness, '2')
         && revokesSince(harness, restartMessageIndex).length >= 2,
       'intentional restart teardown and replacement launch after killCli',
       30_000,
