@@ -38,8 +38,13 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
   return cliId === 'codex' || cliId === 'codex-app';
 }
 
+/** Backend variants are currently a TraeX-only launch capability. */
+export function isBackendVariantCliId(cliId: string | undefined): boolean {
+  return cliId === 'traex';
+}
+
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
-  return isCodexReasoningCliId(cliId) || cliId === 'grok' || cliId === 'traex';
+  return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId);
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {

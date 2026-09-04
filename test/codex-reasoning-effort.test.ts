@@ -5,6 +5,7 @@ import {
   cliModelSupportsReasoningEffort,
   codexModelSupportsReasoningEffort,
   codexReasoningEffortsForModel,
+  isBackendVariantCliId,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
 } from '../src/services/codex-reasoning-effort.js';
@@ -26,6 +27,12 @@ describe('Codex model-aware reasoning efforts', () => {
   });
 });
 describe('Grok model-aware reasoning efforts', () => {
+  it('limits backend variants to TraeX', () => {
+    expect(isBackendVariantCliId('traex')).toBe(true);
+    expect(isBackendVariantCliId('codex')).toBe(false);
+    expect(isBackendVariantCliId(undefined)).toBe(false);
+  });
+
   it('treats grok as a configurable reasoning CLI', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
     expect(isConfigurableReasoningCliId('codex')).toBe(true);

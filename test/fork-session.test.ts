@@ -580,4 +580,17 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
     expect(cfg.modelBackendVariant).toBeUndefined();
   });
+
+  it('repairs a stale backend variant from a frozen non-TraeX session', () => {
+    const ds = makeSourceDs({
+      cliId: 'codex',
+      agentFrozen: true,
+      modelBackendVariant: 'max',
+    });
+
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+
+    expect(cfg.modelBackendVariant).toBeUndefined();
+    expect(ds.session.modelBackendVariant).toBeUndefined();
+  });
 });
