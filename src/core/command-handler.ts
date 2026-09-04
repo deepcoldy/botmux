@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -46,7 +46,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -1068,6 +1068,36 @@ async function applyAllowedUsersSet(
  * `/botconfig` —— owner/allowedUsers 远程改本 bot 运营字段。sessionless：只认 larkAppId，
  * 不需活跃会话。严格 admin 闸（拒绝开放模式 bot），写盘 + 内存热更新，无需重启。
  */
+/**
+ * `/status` lines describing whose credentials the CLI is acting with.
+ *
+ * Answers the question a shared bot actually raises: "is it using MY permissions
+ * right now?" Reports only about the ASKING person — the roster of who else
+ * authorized is not something a group member should learn from /status, and
+ * `/login status` already covers "did I authorize".
+ *
+ * Empty when the policy is off: the answer would then be "the machine's login",
+ * which is the historical behavior and not something /status has ever claimed.
+ */
+function triggerUserAuthStatusLines(
+  botCfg: BotConfig,
+  senderOpenId: string | undefined,
+): string[] {
+  const policy = botCfg.triggerUserAuth;
+  if (!policy?.enabled || !policy.tools.length) return [];
+  const brand = normalizeBrand(botCfg.brand);
+  const authorized = senderOpenId
+    ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
+    : undefined;
+  const who = authorized
+    ? `${authorized.userName ?? '你'}（已授权）`
+    : '未授权 —— 发 /login 授权后本 bot 才会以你的身份调用';
+  return [
+    `Trigger-user auth: ${policy.tools.join(' / ')}`,
+    `  你的身份: ${who}`,
+  ];
+}
+
 async function handleConfigCommand(
   message: LarkMessage,
   rootId: string,
@@ -2627,6 +2657,11 @@ export async function handleCommand(
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
+            // Trigger-user auth: whose credentials this session's CLI calls are
+            // using RIGHT NOW. Shown only when the policy is on — otherwise the
+            // answer is "the machine's", which is the historical behavior and
+            // not something /status has ever claimed to report.
+            ...triggerUserAuthStatusLines(botCfg, message.senderId),
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {

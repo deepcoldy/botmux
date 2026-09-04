@@ -6555,6 +6555,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Trigger-user CLI auth: per-bot switch + status. Proxied to that bot's
+    // daemon, which owns the shared validation path (/botconfig uses the same).
+    let mBotTriggerUserAuth: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTriggerUserAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuth[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    let mBotTriggerUserAuthStatus: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBotTriggerUserAuthStatus = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth-status$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuthStatus[1]);
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth-status`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
     // `{ riff: string }` (raw JSON text; '' = clear).
     let mBotRiff: RegExpMatchArray | null;

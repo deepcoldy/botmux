@@ -151,6 +151,11 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Trigger-user CLI auth policy, verbatim (no secrets in it — just which
+    // tools and what to do when the sender has not authorized).
+    triggerUserAuth: (j?.triggerUserAuth && typeof j.triggerUserAuth === 'object')
+      ? j.triggerUserAuth
+      : null,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',

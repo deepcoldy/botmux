@@ -6742,6 +6742,22 @@ dialog.onboarding-dialog::backdrop {
   border: 1px solid var(--border-soft);
 }
 
+/* Trigger-user auth: tool checkboxes sit inline with their label, and the two
+   boundary advisories read as warnings rather than as ordinary help text — an
+   operator must not skim past "the agent can read other people's tokens". */
+.bd-inline-check { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; font-size: 12px; }
+.bd-inline-check input { margin: 0; }
+.bd-section-note[data-trigger-user-auth-token-advisory],
+.bd-section-note[data-trigger-user-auth-mcp-advisory] {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
+}
+
 /* ── Sandbox directory whitelist tree ── */
 .bd-sbx-tree { margin-top: 10px; max-height: 380px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; font-size: 13px; }
 .bd-sbx-row { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; padding: 2px 0; min-width: 0; }

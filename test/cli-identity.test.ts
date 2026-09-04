@@ -268,7 +268,7 @@ describe('renderGitAskpassScript / installGitAskpass', () => {
   it('answers the username prompt with git\'s expected sentinel', () => {
     const p = join(dir, 'askpass');
     writeFileSync(p, renderGitAskpassScript('/bin/false'));
-    expect(runAskpass(p, "Username for 'https://code.byted.org': ")).toBe('x-access-token');
+    expect(runAskpass(p, "Username for 'https://git.example.com': ")).toBe('x-access-token');
   });
 
   // Parses the real bytedcli response shape: {"status":…,"data":{"jwt":"…"}}.
@@ -278,7 +278,7 @@ describe('renderGitAskpassScript / installGitAskpass', () => {
     chmodSync(stub, 0o755);
     const p = join(dir, 'askpass');
     writeFileSync(p, renderGitAskpassScript(stub));
-    expect(runAskpass(p, "Password for 'https://x@code.byted.org': ")).toBe('a.b.c');
+    expect(runAskpass(p, "Password for 'https://x@git.example.com': ")).toBe('a.b.c');
   });
 
   // No credentials must produce an empty answer, which git reports as an auth

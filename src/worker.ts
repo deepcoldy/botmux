@@ -19,6 +19,7 @@ import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled } from './core/cli-identity.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -14367,6 +14368,17 @@ async function spawnCli(
     // would be worse than both.
     const protection = tokenStoreProtection(sandboxRequested);
     if (protection.advisory) log(`[trigger-user-auth] NOTE ${protection.advisory}`);
+    // An MCP server with its own app credentials never execs a wrapped CLI, so
+    // this policy does not reach it: the agent can still act under an identity
+    // unrelated to the current sender. Warn rather than block — a self-configured
+    // client has legitimate uses and botmux does not own it — but do not stay
+    // silent, or the operator will believe the boundary is complete.
+    try {
+      const selfCredentialed = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+      if (selfCredentialed) log(`[trigger-user-auth] NOTE ${selfCredentialed}`);
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not scan MCP configs: ${(e as Error).message}`);
+    }
   }
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the

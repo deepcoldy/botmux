@@ -232,7 +232,9 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { tokenStoreProtection } from '../services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
@@ -5597,6 +5599,54 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, body.codexAuthSync);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
+});
+
+// PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
+// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
+// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
+// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { triggerUserAuth?: unknown };
+  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  const spec = findConfigField('triggerUserAuth');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  // '' is the store's "clear" sentinel; anything else goes through the shared
+  // JSON coercion so a malformed policy is rejected the same way here as it is
+  // from chat.
+  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
+    ? ''
+    : JSON.stringify(body.triggerUserAuth);
+  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true });
+});
+
+// GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
+// 边界提示（token 存储保护程度、自带凭证的 MCP server）。
+// 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const policy = cfg.triggerUserAuth ?? null;
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
+    // as the same OS user as botmux and can read other people's token files.
+    const protection = tokenStoreProtection(cfg.sandbox === true);
+    const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    jsonRes(res, 200, {
+      ok: true,
+      policy,
+      authorizedCount,
+      tokenStoreEnforced: protection.enforced,
+      ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
+      ...(mcpAdvisory ? { mcpAdvisory } : {}),
+    });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
