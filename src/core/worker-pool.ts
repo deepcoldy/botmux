@@ -386,7 +386,18 @@ export function getDaemonStreamingCardUsageSnapshot(
  * tail of the transcript.
  *
  * The rules, in order:
- *   b) a switch record with a NEW uuid replaces whatever we held;
+ *   a) a message from a DIFFERENT Claude session drops what we held first. The
+ *      notice belongs to one Claude conversation; `/repo`, `/adopt` and a
+ *      resume onto another native session all replace it, and carrying the old
+ *      record across shows a warning about a conversation the user has left —
+ *      or, when the new session's real model happens to equal the old
+ *      `fallbackModel`, a warning nothing can ever clear. State persisted
+ *      before the binding existed carries no session id and is likewise
+ *      dropped: it cannot be shown to belong here, and the same message's seed
+ *      re-establishes it when it does.
+ *   b) a switch record with a NEW uuid replaces whatever we held (and is
+ *      stamped with the message's Claude session); `fallback: null` — the
+ *      newest session-scoped record is NOT a live Fable fallback — clears.
  *   c) a serving model that disagrees with the held `fallbackModel` clears it —
  *      that "Claude answered on a different model" is the ONLY evidence of a
  *      switch back. Ordering matters: a `servingModel` arriving in the same
@@ -395,16 +406,28 @@ export function getDaemonStreamingCardUsageSnapshot(
  *      a message that runs both rules and lands back where it started costs no
  *      write and no card patch.
  *
- * Everything else — a missing record, a restarted worker, a transcript window
- * too short to reach the switch — leaves the state exactly as it was. Absence
- * of evidence is never evidence of a switch back.
+ * Everything else — a missing record, a restarted worker on the SAME Claude
+ * session, a transcript window too short to reach the switch — leaves the state
+ * exactly as it was. Absence of evidence is never evidence of a switch back.
  */
 export function mergeModelFallbackObservation(
   current: ModelFallbackState | undefined,
-  msg: { fallback?: ModelFallbackState; servingModel?: string },
+  msg: { claudeSessionId?: string; fallback?: ModelFallbackState | null; servingModel?: string },
 ): { next: ModelFallbackState | undefined; changed: boolean } {
   let next = current;
-  if (msg.fallback && next?.uuid !== msg.fallback.uuid) next = msg.fallback;
+  if (next && msg.claudeSessionId && next.claudeSessionId !== msg.claudeSessionId) {
+    next = undefined;
+  }
+  if (msg.fallback === null) {
+    next = undefined;
+  } else if (msg.fallback) {
+    const incoming = msg.claudeSessionId
+      ? { ...msg.fallback, claudeSessionId: msg.claudeSessionId }
+      : msg.fallback;
+    if (next?.uuid !== incoming.uuid || next?.claudeSessionId !== incoming.claudeSessionId) {
+      next = incoming;
+    }
+  }
   if (msg.servingModel && next) {
     const serving = normalizeClaudeModelId(msg.servingModel);
     if (serving && serving !== normalizeClaudeModelId(next.fallbackModel)) {
@@ -416,8 +439,14 @@ export function mergeModelFallbackObservation(
   // disagrees with it runs both rules and lands back on "no notice" — where we
   // started — so persisting and patching the card for it would be a wasted
   // Feishu edit on every worker start of an already-switched-back session.
-  // Same uuid identity the persist dirty-check uses.
-  return { next, changed: current?.uuid !== next?.uuid };
+  // Same identity the persist dirty-check uses: uuid AND Claude session, so an
+  // upgrade that only stamps the session id onto pre-existing state still
+  // persists it once.
+  return {
+    next,
+    changed: current?.uuid !== next?.uuid
+      || current?.claudeSessionId !== next?.claudeSessionId,
+  };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -11208,9 +11237,13 @@ function setupWorkerHandlers(
   // waiting for the new worker to re-seed loses it whenever the switch record
   // has scrolled out of the bounded tail scan (a long session), and nothing
   // ever brings it back. So only a role switch AWAY from claude-code clears it
-  // — that worker would never send a correcting observation of its own.
+  // — that worker would never send a correcting observation of its own. And it
+  // must be cleared on DISK as well: leaving the mirror on Session.modelFallback
+  // means a daemon restart (or any card rebuilt without a live worker) revives
+  // the notice on a session that is no longer running Claude at all.
   if (sessionCliId(ds, getBot(ds.larkAppId).config) !== 'claude-code') {
     ds.modelFallback = undefined;
+    persistStreamCardState(ds);
   }
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
@@ -12160,10 +12193,25 @@ function setupWorkerHandlers(
         // other CLI has no business moving this state.
         if (effectiveCliId !== 'claude-code') break;
         const merged = mergeModelFallbackObservation(ds.modelFallback, msg);
-        if (!merged.changed) break;
-        ds.modelFallback = merged.next;
-        persistStreamCardState(ds);
-        scheduleActiveRuntimePatch(ds);
+        if (merged.changed) {
+          ds.modelFallback = merged.next;
+          persistStreamCardState(ds);
+        }
+        // The card's usage line shows ds.activeModel, and Claude Code never
+        // emits `active_runtime` — so without this the line renders the LAUNCH
+        // model (ds.session.model) forever, even while an automatic fallback
+        // has the session answering on something else. The serving model is a
+        // per-reply observation of the real thing, so it is the runtime model:
+        // same "only write when it changed, then patch" semantics as the
+        // active_runtime handler. Effort is untouched — Claude reports none,
+        // and a blank one would erase what another channel wrote.
+        let runtimeChanged = false;
+        const servingModel = normalizeClaudeModelId(msg.servingModel);
+        if (servingModel && ds.activeModel !== servingModel) {
+          ds.activeModel = servingModel;
+          runtimeChanged = true;
+        }
+        if (merged.changed || runtimeChanged) scheduleActiveRuntimePatch(ds);
         break;
       }
 

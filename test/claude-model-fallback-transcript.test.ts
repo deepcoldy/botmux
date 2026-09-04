@@ -1,8 +1,9 @@
 /**
  * Claude Code writes a `type:"system"` record whenever it automatically
- * switches the session model. These tests cover the parse (including the
- * product's "Fable originals only" scope), the bridge tracker's dedupe /
- * local-scope / serving-model reporting, and the cold-start tail scan.
+ * switches the session model. These tests cover the parse (every session-scoped
+ * record, with the product's "Fable originals only" scope carried as a flag),
+ * the bridge tracker's Claude-session binding / dedupe / local-scope /
+ * serving-model reporting, and the cold-start tail scan.
  *
  * The tracker reports OBSERVED FACTS only — it never decides whether the
  * notice should still show. That decision lives in the daemon
@@ -58,6 +59,11 @@ const REFUSAL_RECORD = {
   sessionId: 'a9bc732e-0000-0000-0000-000000000000',
 };
 
+/** The Claude session id the tracker binds to in these tests (the jsonl's
+ *  basename in production; any stable string here). */
+const SID = 'a9bc732e-0000-0000-0000-000000000000';
+const OTHER_SID = 'b0000000-1111-1111-1111-111111111111';
+
 function assistant(model: string, extra: Record<string, unknown> = {}): TranscriptEvent {
   return {
     type: 'assistant',
@@ -104,6 +110,8 @@ describe('parseClaudeModelFallbackEvent', () => {
       originalModel: 'claude-fable-5-1[1m]',
       fallbackModel: 'claude-opus-4-8[1m]',
       scope: 'session',
+      fable: true,
+      neutralizedByFork: false,
       trigger: 'refusal',
       apiRefusalCategory: 'cyber',
       observedAt: REFUSAL_RECORD.timestamp,
@@ -163,33 +171,58 @@ describe('parseClaudeModelFallbackEvent', () => {
   });
 
   describe('Fable gate (product scope)', () => {
-    it('ignores a switch whose original model is not Fable', () => {
-      // Opus 5 → Opus 4.8 is a routine safety downgrade; surfacing it would
-      // put a warning on sessions that never asked for Fable.
+    it('P2-2: parses a non-Fable switch, flagged fable:false rather than dropped', () => {
+      // Opus 5 → Opus 4.8 is a routine safety downgrade; surfacing it would put
+      // a warning on sessions that never asked for Fable. But DROPPING it at
+      // parse time let the backward tail scan walk straight past it and
+      // resurrect an older Fable record — a notice the session had already left
+      // behind. The record must survive the parse so it can stop the scan.
       for (const originalModel of ['claude-opus-5', 'claude-opus-5[1m]', 'claude-sonnet-4-5']) {
         expect(parseClaudeModelFallbackEvent({
           ...REFUSAL_RECORD,
           originalModel,
-        } as TranscriptEvent), originalModel).toBeUndefined();
+        } as TranscriptEvent), originalModel).toMatchObject({
+          uuid: REFUSAL_RECORD.uuid,
+          scope: 'session',
+          fable: false,
+        });
       }
     });
 
     it('accepts every Fable spelling', () => {
       for (const originalModel of ['claude-fable-5[1m]', 'claude-fable-5-1', 'Claude-Fable-5-1[1M]']) {
-        expect(parseClaudeModelFallbackEvent({
+        const rec = parseClaudeModelFallbackEvent({
           ...REFUSAL_RECORD,
           originalModel,
-        } as TranscriptEvent)?.originalModel, originalModel).toBe(originalModel);
+        } as TranscriptEvent);
+        expect(rec?.originalModel, originalModel).toBe(originalModel);
+        expect(rec?.fable, originalModel).toBe(true);
       }
+    });
+  });
+
+  describe('P2-2: neutralizedByFork', () => {
+    it('flags a record a fork copied over', () => {
+      expect(parseClaudeModelFallbackEvent({
+        ...REFUSAL_RECORD,
+        neutralizedByFork: true,
+      } as TranscriptEvent)).toMatchObject({ fable: true, neutralizedByFork: true });
+    });
+
+    it('reads a missing flag as not neutralised', () => {
+      expect(parseClaudeModelFallbackEvent(REFUSAL_RECORD as TranscriptEvent)?.neutralizedByFork)
+        .toBe(false);
     });
   });
 });
 
 describe('modelFallbackStateOf', () => {
-  it('drops the transcript-only scope field', () => {
+  it('drops the transcript-only parse bookkeeping', () => {
     const rec = parseClaudeModelFallbackEvent(REFUSAL_RECORD as TranscriptEvent)!;
     const state = modelFallbackStateOf(rec);
     expect(state).not.toHaveProperty('scope');
+    expect(state).not.toHaveProperty('fable');
+    expect(state).not.toHaveProperty('neutralizedByFork');
     expect(state).toMatchObject({ uuid: REFUSAL_RECORD.uuid, kind: 'refusal' });
   });
 });
@@ -224,16 +257,32 @@ describe('normalizeClaudeModelId', () => {
 });
 
 describe('ClaudeModelFallbackTracker', () => {
-  it('reports a new switch record once, without a serving model', () => {
+  /** A tracker already bound to a Claude session — every observe() below
+   *  reports against it, exactly as the worker's router leaves it. */
+  function bound(claudeSessionId = SID): ClaudeModelFallbackTracker {
     const tracker = new ClaudeModelFallbackTracker();
+    tracker.bind(claudeSessionId);
+    return tracker;
+  }
+
+  it('reports a new switch record once, without a serving model', () => {
+    const tracker = bound();
     const observed = tracker.observe([REFUSAL_RECORD as TranscriptEvent]);
     expect(observed?.fallback).toMatchObject({ uuid: REFUSAL_RECORD.uuid, kind: 'refusal' });
     expect(observed?.fallback).not.toHaveProperty('scope');
+    expect(observed?.fallback).not.toHaveProperty('fable');
     expect(observed).not.toHaveProperty('servingModel');
   });
 
+  it('stamps every observation with the bound Claude session', () => {
+    const tracker = bound();
+    expect(tracker.boundClaudeSessionId).toBe(SID);
+    expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])?.claudeSessionId).toBe(SID);
+    expect(tracker.observe([assistant('claude-opus-4-8')])?.claudeSessionId).toBe(SID);
+  });
+
   it('says nothing on a re-drain of the same record (uuid dedupe)', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([REFUSAL_RECORD as TranscriptEvent]);
     expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toBeNull();
   });
@@ -244,7 +293,7 @@ describe('ClaudeModelFallbackTracker', () => {
     // but the replies preceding it are still stale: without a reset on the dup
     // the worker would report the pre-switch model and the daemon would read it
     // as a switch back and clear a notice that is still current.
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([assistant('claude-fable-5-1'), REFUSAL_RECORD as TranscriptEvent]);
     expect(tracker.observe([
       assistant('claude-fable-5-1'),
@@ -255,33 +304,58 @@ describe('ClaudeModelFallbackTracker', () => {
       assistant('claude-fable-5-1'),
       REFUSAL_RECORD as TranscriptEvent,
       assistant('claude-opus-4-8'),
-    ])).toEqual({ servingModel: 'claude-opus-4-8' });
+    ])).toEqual({ claudeSessionId: SID, servingModel: 'claude-opus-4-8' });
   });
 
   it('ignores a sub-agent (scope local) fallback entirely', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     expect(tracker.observe([{ ...REFUSAL_RECORD, scope: 'local' } as TranscriptEvent])).toBeNull();
   });
 
-  it('ignores a non-Fable switch entirely (Fable gate)', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+  it('P2-2: reports a non-Fable switch as fallback:null, not silence', () => {
+    // "The newest session-scoped record is not a Fable fallback" is POSITIVE
+    // evidence that no notice applies — the shape that lets the daemon drop an
+    // older Fable notice the user has already moved past.
+    const tracker = bound();
+    expect(tracker.observe([
+      { ...REFUSAL_RECORD, originalModel: 'claude-opus-5' } as TranscriptEvent,
+    ])).toEqual({ claudeSessionId: SID, fallback: null });
+    // Deduped like any other record: the same one re-drained says nothing.
     expect(tracker.observe([
       { ...REFUSAL_RECORD, originalModel: 'claude-opus-5' } as TranscriptEvent,
     ])).toBeNull();
   });
 
+  it('P2-2: reports a fork-neutralised record as fallback:null', () => {
+    const tracker = bound();
+    expect(tracker.observe([
+      { ...REFUSAL_RECORD, neutralizedByFork: true } as TranscriptEvent,
+    ])).toEqual({ claudeSessionId: SID, fallback: null });
+  });
+
+  it('P2-2: a newer non-Fable switch supersedes a live Fable notice', () => {
+    const tracker = bound();
+    expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])?.fallback)
+      .toMatchObject({ uuid: REFUSAL_RECORD.uuid });
+    expect(tracker.observe([{
+      ...REFUSAL_RECORD,
+      uuid: 'opus-downgrade',
+      originalModel: 'claude-opus-5',
+    } as TranscriptEvent])).toEqual({ claudeSessionId: SID, fallback: null });
+  });
+
   it('reports the first serving model it sees, then only on change', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     expect(tracker.observe([assistant('claude-fable-5-1')]))
-      .toEqual({ servingModel: 'claude-fable-5-1' });
+      .toEqual({ claudeSessionId: SID, servingModel: 'claude-fable-5-1' });
     expect(tracker.observe([assistant('claude-fable-5-1')])).toBeNull();
     expect(tracker.observe([assistant('claude-opus-4-8')]))
-      .toEqual({ servingModel: 'claude-opus-4-8' });
+      .toEqual({ claudeSessionId: SID, servingModel: 'claude-opus-4-8' });
     expect(tracker.observe([assistant('claude-opus-4-8')])).toBeNull();
   });
 
   it('treats a context-suffix difference as the same serving model', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([assistant('claude-opus-4-8')]);
     expect(tracker.observe([assistant('claude-opus-4-8[1m]')])).toBeNull();
   });
@@ -289,7 +363,7 @@ describe('ClaudeModelFallbackTracker', () => {
   it('drops a reply written BEFORE the switch in the same batch', () => {
     // Otherwise the daemon would see "fallback to opus" + "serving fable" in one
     // message and clear the notice the instant it appeared.
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     const observed = tracker.observe([
       assistant('claude-fable-5-1'),
       REFUSAL_RECORD as TranscriptEvent,
@@ -299,25 +373,124 @@ describe('ClaudeModelFallbackTracker', () => {
   });
 
   it('reports a reply written AFTER the switch in the same batch', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     expect(tracker.observe([
       REFUSAL_RECORD as TranscriptEvent,
       assistant('claude-opus-4-8'),
     ])).toEqual({
+      claudeSessionId: SID,
       fallback: expect.objectContaining({ uuid: REFUSAL_RECORD.uuid }),
       servingModel: 'claude-opus-4-8',
     });
   });
 
   it('reports the switch-back reply that lets the daemon clear', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([REFUSAL_RECORD as TranscriptEvent, assistant('claude-opus-4-8')]);
     expect(tracker.observe([assistant('claude-fable-5-1')]))
-      .toEqual({ servingModel: 'claude-fable-5-1' });
+      .toEqual({ claudeSessionId: SID, servingModel: 'claude-fable-5-1' });
+  });
+
+  describe('P1-1: a switch resets the serving-model dedupe', () => {
+    it('reports the switch-back reply even when one drain carries the whole story', () => {
+      // The bug: Fable was already the reported serving model, so when a single
+      // drain carried "fell off Fable → Opus answered → user switched back →
+      // Fable answered", the batch's closing Fable read as "unchanged" and was
+      // swallowed. The daemon then got the fallback with NO clearing evidence
+      // and the notice hung forever.
+      const tracker = bound();
+      expect(tracker.observe([assistant('claude-fable-5-1')]))
+        .toEqual({ claudeSessionId: SID, servingModel: 'claude-fable-5-1' });
+      expect(tracker.observe([
+        REFUSAL_RECORD as TranscriptEvent,
+        assistant('claude-opus-4-8'),
+        assistant('claude-fable-5-1'),
+      ])).toEqual({
+        claudeSessionId: SID,
+        fallback: expect.objectContaining({ uuid: REFUSAL_RECORD.uuid }),
+        servingModel: 'claude-fable-5-1',
+      });
+    });
+
+    it('re-reports an unchanged serving model right after a switch', () => {
+      // Narrower form of the same rule: the first serving model observed AFTER
+      // a switch always ships, even when its value is old news.
+      const tracker = bound();
+      tracker.observe([assistant('claude-opus-4-8')]);
+      expect(tracker.observe([
+        { ...REFUSAL_RECORD, fallbackModel: 'claude-opus-4-8[1m]' } as TranscriptEvent,
+        assistant('claude-opus-4-8'),
+      ])).toMatchObject({ servingModel: 'claude-opus-4-8' });
+    });
+
+    it('resets the dedupe for a fallback:null record too', () => {
+      const tracker = bound();
+      tracker.observe([assistant('claude-fable-5-1')]);
+      expect(tracker.observe([
+        { ...REFUSAL_RECORD, uuid: 'opus-downgrade', originalModel: 'claude-opus-5' } as TranscriptEvent,
+        assistant('claude-fable-5-1'),
+      ])).toEqual({
+        claudeSessionId: SID,
+        fallback: null,
+        servingModel: 'claude-fable-5-1',
+      });
+    });
+  });
+
+  describe('P1-3: binding to a Claude session', () => {
+    it('drops uuid dedupe and serving-model memory when the session changes', () => {
+      const tracker = bound();
+      tracker.observe([REFUSAL_RECORD as TranscriptEvent, assistant('claude-opus-4-8')]);
+      expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toBeNull();
+
+      expect(tracker.bind(OTHER_SID)).toBe(true);
+      expect(tracker.boundClaudeSessionId).toBe(OTHER_SID);
+      // Same record, new conversation: reported again, under the new session.
+      expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toEqual({
+        claudeSessionId: OTHER_SID,
+        fallback: expect.objectContaining({ uuid: REFUSAL_RECORD.uuid }),
+      });
+      // …and so is a serving model identical to the one the old session had.
+      expect(tracker.observe([assistant('claude-opus-4-8')]))
+        .toEqual({ claudeSessionId: OTHER_SID, servingModel: 'claude-opus-4-8' });
+    });
+
+    it('is a no-op when the same session is re-bound', () => {
+      const tracker = bound();
+      tracker.observe([REFUSAL_RECORD as TranscriptEvent]);
+      expect(tracker.bind(SID)).toBe(false);
+      expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toBeNull();
+    });
+
+    it('seed binds and ALWAYS publishes, even on an empty scan', () => {
+      // The empty message is how the daemon learns which Claude session the
+      // worker moved to — the only way state belonging to a different one can
+      // be dropped. It is never a claim that a notice is stale.
+      writeFileSync(path, '', 'utf8');
+      const tracker = bound();
+      expect(tracker.seed(path, OTHER_SID)).toEqual({ claudeSessionId: OTHER_SID });
+      expect(tracker.boundClaudeSessionId).toBe(OTHER_SID);
+      expect(tracker.seed(join(dir, 'nope.jsonl'), OTHER_SID))
+        .toEqual({ claudeSessionId: OTHER_SID });
+    });
+
+    it('seed re-finds a record already deduped under another session', () => {
+      // A → B → resume A: the tail scan is what restores A's notice, and it can
+      // only do that because binding back to A cleared B's dedupe state.
+      appendLine(REFUSAL_RECORD);
+      const tracker = bound();
+      expect(tracker.seed(path, SID)?.fallback?.uuid).toBe(REFUSAL_RECORD.uuid);
+      expect(tracker.seed(path, SID)).toEqual({ claudeSessionId: SID }); // deduped
+      tracker.bind(OTHER_SID);
+      expect(tracker.seed(path, SID)).toEqual({
+        claudeSessionId: SID,
+        fallback: expect.objectContaining({ uuid: REFUSAL_RECORD.uuid }),
+      });
+    });
   });
 
   it('ignores <synthetic>, sidechain and API-error replies', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([REFUSAL_RECORD as TranscriptEvent, assistant('claude-opus-4-8')]);
     expect(tracker.observe([
       assistant('<synthetic>'),
@@ -327,7 +500,7 @@ describe('ClaudeModelFallbackTracker', () => {
   });
 
   it('reports a second, different switch', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     tracker.observe([REFUSAL_RECORD as TranscriptEvent]);
     expect(tracker.observe([{
       ...REFUSAL_RECORD,
@@ -338,7 +511,7 @@ describe('ClaudeModelFallbackTracker', () => {
   });
 
   it('reports nothing for an events batch with nothing in it', () => {
-    const tracker = new ClaudeModelFallbackTracker();
+    const tracker = bound();
     expect(tracker.observe([])).toBeNull();
     expect(tracker.observe([{ type: 'user', uuid: 'u1' } as TranscriptEvent])).toBeNull();
   });
@@ -347,30 +520,41 @@ describe('ClaudeModelFallbackTracker', () => {
     appendLine({ type: 'user', uuid: 'u1' });
     appendLine(REFUSAL_RECORD);
     appendLine(assistant('claude-opus-4-8'));
-    const tracker = new ClaudeModelFallbackTracker();
-    expect(tracker.seed(path)).toEqual({
+    const tracker = bound();
+    expect(tracker.seed(path, SID)).toEqual({
+      claudeSessionId: SID,
       fallback: expect.objectContaining({ uuid: REFUSAL_RECORD.uuid }),
       servingModel: 'claude-opus-4-8',
     });
     // Idempotent: a second seed (lazy baseline) and a re-drain of the same
-    // line both report nothing new.
-    expect(tracker.seed(path)).toBeNull();
+    // line both report nothing new beyond the session id.
+    expect(tracker.seed(path, SID)).toEqual({ claudeSessionId: SID });
     expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])).toBeNull();
   });
 
-  it('reports NOTHING when the tail scan finds nothing', () => {
-    // The critical invariant: a short window / fresh transcript must never be
-    // turned into a message, because any message the daemon receives could only
-    // make it drop a notice it is rightly holding.
+  it('carries no fallback / servingModel when the tail scan finds nothing', () => {
+    // The critical invariant is unchanged: a short window / fresh transcript
+    // must never produce a shape the daemon can read as "cleared". It publishes
+    // the session id and NOTHING else, and the daemon leaves same-session state
+    // alone.
     writeFileSync(path, '', 'utf8');
-    expect(new ClaudeModelFallbackTracker().seed(path)).toBeNull();
-    expect(new ClaudeModelFallbackTracker().seed(join(dir, 'nope.jsonl'))).toBeNull();
+    for (const p of [path, join(dir, 'nope.jsonl')]) {
+      const seeded = bound().seed(p, SID);
+      expect(seeded, p).toEqual({ claudeSessionId: SID });
+      expect(seeded, p).not.toHaveProperty('fallback');
+    }
   });
 
   it('seeds a bare serving model when the window holds no switch record', () => {
     appendLine(assistant('claude-fable-5-1'));
-    expect(new ClaudeModelFallbackTracker().seed(path))
-      .toEqual({ servingModel: 'claude-fable-5-1' });
+    expect(bound().seed(path, SID))
+      .toEqual({ claudeSessionId: SID, servingModel: 'claude-fable-5-1' });
+  });
+
+  it('P2-2: seeds fallback:null when the newest record is not a Fable fallback', () => {
+    appendLine(REFUSAL_RECORD);
+    appendLine({ ...REFUSAL_RECORD, uuid: 'opus-downgrade', originalModel: 'claude-opus-5' });
+    expect(bound().seed(path, SID)).toEqual({ claudeSessionId: SID, fallback: null });
   });
 });
 
@@ -415,10 +599,34 @@ describe('readLatestClaudeModelFallback', () => {
     expect(readLatestClaudeModelFallback(path).fallback?.uuid).toBe(REFUSAL_RECORD.uuid);
   });
 
-  it('skips a non-Fable switch and keeps looking for a Fable one', () => {
+  it('P2-2: stops at a newer non-Fable switch and reports null, not the older Fable one', () => {
+    // Walking past it (the old behaviour) resurrected a notice the session had
+    // already left behind: the user switched off Fable, Claude recorded a
+    // routine Opus 5 → Opus 4.8 downgrade, and the scan reached back over it to
+    // the stale Fable record.
     appendLine(REFUSAL_RECORD);
     appendLine({ ...REFUSAL_RECORD, originalModel: 'claude-opus-5', uuid: 'opus-downgrade' });
+    expect(readLatestClaudeModelFallback(path)).toEqual({ fallback: null });
+  });
+
+  it('P2-2: stops at a fork-neutralised record and reports null', () => {
+    // 2.1.259+ copies the parent's refusal record into the fork with
+    // neutralizedByFork:true. It applies to the parent, never here.
+    appendLine({ ...REFUSAL_RECORD, neutralizedByFork: true });
+    expect(readLatestClaudeModelFallback(path)).toEqual({ fallback: null });
+  });
+
+  it('P2-2: still reports the record when it is the newest and genuinely live', () => {
+    appendLine({ ...REFUSAL_RECORD, originalModel: 'claude-opus-5', uuid: 'opus-downgrade' });
+    appendLine(REFUSAL_RECORD);
     expect(readLatestClaudeModelFallback(path).fallback?.uuid).toBe(REFUSAL_RECORD.uuid);
+  });
+
+  it('P2-2: distinguishes "no evidence" from "positive no-notice"', () => {
+    // Absent vs null is the whole point: absent leaves the daemon's state
+    // alone, null clears it.
+    appendLine({ type: 'user', uuid: 'u1' });
+    expect(readLatestClaudeModelFallback(path)).not.toHaveProperty('fallback');
   });
 
   it('returns nothing for a missing, empty, or fallback-free transcript', () => {

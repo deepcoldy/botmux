@@ -390,9 +390,11 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
-   *  without a live worker keeps the notice; cleared with the other
-   *  worker-generation runtime facts on respawn and re-seeded by the new
-   *  worker's bridge start. */
+   *  without a live worker keeps the notice. Unlike the other runtime facts it
+   *  is NOT owned by a worker generation and survives every respawn: it is
+   *  bound to a Claude session id instead, and only positive evidence moves it
+   *  — a reply served by a different model, a newer switch record, a message
+   *  from another Claude session, or a role switch away from claude-code. */
   modelFallback?: ModelFallbackState;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;

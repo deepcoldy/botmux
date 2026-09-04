@@ -64,6 +64,11 @@ export interface TranscriptEvent {
   originalModel?: string;
   fallbackModel?: string;
   apiRefusalCategory?: string;
+  /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
+   *  a FORKED session: the record is history the fork inherited, and the switch
+   *  it describes does NOT apply to this conversation. Treated as positive
+   *  evidence of "no notice here", exactly like a non-Fable switch. */
+  neutralizedByFork?: boolean;
 }
 
 /**
@@ -106,9 +111,32 @@ const MODEL_FALLBACK_KIND_BY_SUBTYPE: Record<string, ClaudeModelFallbackKind> = 
 /** One parsed model-switch record. `scope: 'local'` is a sub-agent /
  *  side-question fallback: the main session model did NOT change, so surfacing
  *  it would mislead. Builds that predate the field omit it and read as
- *  'session'. */
+ *  'session'.
+ *
+ *  EVERY session-scoped switch parses, including the ones that must NOT raise a
+ *  notice — `fable: false` (a routine Opus 5 → Opus 4.8 downgrade) and
+ *  `neutralizedByFork` (a record a fork inherited). Dropping those at parse time
+ *  was a bug: the backward tail scan would step straight over the newest record
+ *  and resurrect an OLDER Fable one, so a notice the user had already left
+ *  behind came back. They are positive evidence of "no notice", which only the
+ *  newest record can express — see {@link noticeFromSessionRecord}. */
 export interface ClaudeModelFallbackRecord extends ModelFallbackState {
   scope: 'session' | 'local';
+  /** The configured model this switch fell OFF was a Fable one. Only a fall off
+   *  Fable is a product-visible notice. */
+  fable: boolean;
+  /** The record was copied into a fork and does not apply here. */
+  neutralizedByFork: boolean;
+}
+
+/** Product state the NEWEST session-scoped record implies: the record itself
+ *  when it is a live Fable fallback, or `null` when it says positively that no
+ *  notice applies here (fell off a non-Fable model, or a fork neutralised it).
+ *  `null` is evidence, not absence — the daemon clears on it. */
+function noticeFromSessionRecord(
+  rec: ClaudeModelFallbackRecord,
+): ClaudeModelFallbackRecord | null {
+  return rec.fable && !rec.neutralizedByFork ? rec : null;
 }
 
 /** Normalise a model id for comparison: drop a trailing context-window suffix
@@ -121,8 +149,10 @@ export function normalizeClaudeModelId(value: string | undefined): string | unde
 }
 
 /** True when a model id names a Fable model, whatever its case or context
- *  suffix (`claude-fable-5-1[1m]`, `Claude-Fable-5[1M]`, …). The single place
- *  the product's "Fable only" scope is expressed. */
+ *  suffix (`claude-fable-5-1[1m]`, `Claude-Fable-5[1M]`, …). The single
+ *  PREDICATE behind the product's "Fable only" scope: the parse records its
+ *  verdict on each switch as `fable`, and noticeFromSessionRecord is the only
+ *  place that turns it into "show / do not show". */
 export function isFableModelId(value: string | undefined): boolean {
   return normalizeClaudeModelId(value)?.startsWith('claude-fable') === true;
 }
@@ -142,12 +172,6 @@ export function parseClaudeModelFallbackEvent(
   const originalModel = typeof ev.originalModel === 'string' ? ev.originalModel.trim() : '';
   const fallbackModel = typeof ev.fallbackModel === 'string' ? ev.fallbackModel.trim() : '';
   if (!uuid || !originalModel || !fallbackModel) return undefined;
-  // PRODUCT DECISION: only a fall *off Fable* is surfaced. Claude Code also
-  // records ordinary safety downgrades between non-Fable models (Opus 5 →
-  // Opus 4.8), which are routine and must stay invisible. Gating here rather
-  // than at each call site means observe() / the tail scan / every future
-  // consumer inherits the scope for free.
-  if (!isFableModelId(originalModel)) return undefined;
   const trigger = typeof ev.trigger === 'string' ? ev.trigger.trim() : '';
   const apiRefusalCategory = typeof ev.apiRefusalCategory === 'string'
     ? ev.apiRefusalCategory.trim()
@@ -159,6 +183,13 @@ export function parseClaudeModelFallbackEvent(
     originalModel,
     fallbackModel,
     scope: ev.scope === 'local' ? 'local' : 'session',
+    // PRODUCT DECISION: only a fall *off Fable* is surfaced. Claude Code also
+    // records ordinary safety downgrades between non-Fable models (Opus 5 →
+    // Opus 4.8), which are routine and must stay invisible. Recorded as a flag
+    // rather than a parse rejection so the newest record still terminates the
+    // tail scan — see {@link ClaudeModelFallbackRecord}.
+    fable: isFableModelId(originalModel),
+    neutralizedByFork: ev.neutralizedByFork === true,
     ...(trigger ? { trigger } : {}),
     ...(apiRefusalCategory ? { apiRefusalCategory } : {}),
     ...(observedAt ? { observedAt } : {}),
@@ -178,10 +209,11 @@ export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | un
   return model;
 }
 
-/** Drop the transcript-only `scope` field: what ships to the daemon and gets
- *  persisted is the product state, not our parse bookkeeping. */
+/** Drop the transcript-only parse bookkeeping (`scope`, `fable`,
+ *  `neutralizedByFork`): what ships to the daemon and gets persisted is the
+ *  product state. */
 export function modelFallbackStateOf(rec: ClaudeModelFallbackRecord): ModelFallbackState {
-  const { scope: _scope, ...state } = rec;
+  const { scope: _scope, fable: _fable, neutralizedByFork: _neutralized, ...state } = rec;
   return state;
 }
 
@@ -194,15 +226,23 @@ const CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES = 4 * 1024 * 1024;
  *  worker's cold start: baseline cursors straight to EOF, so a switch recorded
  *  before `--resume` / a daemon restart is never drained again.
  *
- *  Scans BACKWARD and stops at the newest session-scoped switch record; the
- *  serving model is therefore only collected from records NEWER than it (an
- *  assistant reply written before the switch says nothing about what serves
+ *  Scans BACKWARD and stops at the newest session-scoped switch record — the
+ *  newest one DECIDES, whatever it says. When it is a live Fable fallback it is
+ *  returned; when it fell off a non-Fable model or a fork neutralised it, the
+ *  scan returns `fallback: null`, which is positive evidence that no notice
+ *  applies. Stepping over such a record to keep hunting for an older Fable one
+ *  (the previous behaviour) resurrects a notice the session already left
+ *  behind. `fallback` absent means the window simply held no session-scoped
+ *  record — no evidence either way.
+ *
+ *  The serving model is only collected from records NEWER than that stop point
+ *  (an assistant reply written before the switch says nothing about what serves
  *  now). With no switch record in the window the serving model is simply the
  *  window's newest one — still useful, because the daemon compares it against
  *  the fallback IT persisted. A non-newline-terminated tail is excluded via
  *  baselineJsonlCursor. */
 export function readLatestClaudeModelFallback(path: string): {
-  fallback?: ClaudeModelFallbackRecord;
+  fallback?: ClaudeModelFallbackRecord | null;
   servingModel?: string;
 } {
   if (!path || !existsSync(path)) return {};
@@ -210,10 +250,10 @@ export function readLatestClaudeModelFallback(path: string): {
   try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
   if (completeEnd <= 0) return {};
 
-  let fallback: ClaudeModelFallbackRecord | undefined;
+  let fallback: ClaudeModelFallbackRecord | null | undefined;
   let servingModel: string | undefined;
   const emit = () => ({
-    ...(fallback ? { fallback } : {}),
+    ...(fallback !== undefined ? { fallback } : {}),
     ...(servingModel ? { servingModel } : {}),
   });
   const consider = (line: string): boolean => {
@@ -224,7 +264,7 @@ export function readLatestClaudeModelFallback(path: string): {
     const rec = parseClaudeModelFallbackEvent(ev);
     if (rec) {
       if (rec.scope === 'local') return false;
-      fallback = rec;
+      fallback = noticeFromSessionRecord(rec);
       return true;
     }
     if (!servingModel) servingModel = servingModelFromAssistantEvent(ev);
@@ -276,33 +316,75 @@ const MODEL_FALLBACK_SEEN_UUIDS_MAX = 256;
  *  its transcript window is bounded and it is younger than the session — so it
  *  says what it saw and the daemon, which holds the persisted state, merges:
  *
- *   - `fallback` — a switch record it had not reported before;
+ *   - `claudeSessionId` — WHICH Claude conversation these facts are about. The
+ *     state is per Claude session: `/repo`, `/adopt` and a resume onto another
+ *     native session all replace it, and state carried over from the previous
+ *     one is either a notice for a conversation this session is no longer
+ *     having or (worse) one that can never be cleared. Always present.
+ *   - `fallback` — a switch record it had not reported before, or `null` when
+ *     the newest session-scoped record is positive evidence that NO notice
+ *     applies (fell off a non-Fable model, or neutralised by a fork).
  *   - `servingModel` — the model serving the MAIN thread, whenever that value
- *     changed since its last report.
+ *     changed since its last report. Not gated on Fable: it also drives the
+ *     card's usage line, since Claude never emits `active_runtime`.
  *
- *  Absence of a field means "nothing new observed", never "cleared". */
+ *  An ABSENT `fallback` / `servingModel` means "nothing new observed", never
+ *  "cleared" — only `fallback: null`, or a `claudeSessionId` that disagrees
+ *  with the held state, clears. */
 export interface ModelFallbackObservation {
-  fallback?: ModelFallbackState;
+  claudeSessionId: string;
+  fallback?: ModelFallbackState | null;
   servingModel?: string;
 }
 
-/** Running model-fallback observer for one Claude bridge. Owns the record-uuid
- *  dedupe (the same record is re-drained after a truncation or a jsonl switch)
- *  and the "only report the serving model when it changed" rule, so the worker
- *  is left with nothing but "did I see anything worth sending". */
+/** Running model-fallback observer for ONE Claude session. Owns the record-uuid
+ *  dedupe (the same record is re-drained after a truncation or a jsonl switch),
+ *  the "only report the serving model when it changed" rule, and the binding to
+ *  the Claude session id all of that describes — so the worker is left with
+ *  nothing but "did I see anything worth sending". */
 export class ClaudeModelFallbackTracker {
+  /** Claude session (jsonl basename) every remembered fact belongs to. Empty
+   *  until the first {@link bind}. */
+  private claudeSessionId = '';
   private readonly seenUuids = new Set<string>();
   /** Last serving model reported to the daemon, normalised. `undefined` = none
-   *  reported yet in this worker's lifetime, so the first one always ships. */
+   *  reported yet for the bound session, so the first one always ships. */
   private reportedServingModel: string | undefined;
+
+  get boundClaudeSessionId(): string {
+    return this.claudeSessionId;
+  }
+
+  /** Bind to `claudeSessionId`, returning true when that was a SWITCH. A
+   *  different id means the bridge moved to another Claude conversation
+   *  (`/repo`, `/adopt`, a resume onto another native session, an in-pane
+   *  `/clear`): every uuid we deduped and every serving model we reported
+   *  describes the old one, so all of it is dropped. Without this the new
+   *  session inherits the old one's notice, and — when its real model happens
+   *  to equal the old fallback — the serving-model dedupe swallows the very
+   *  observation that would have cleared it, leaving a false notice that
+   *  survives restarts. */
+  bind(claudeSessionId: string): boolean {
+    if (claudeSessionId === this.claudeSessionId) return false;
+    this.claudeSessionId = claudeSessionId;
+    this.reset();
+    return true;
+  }
+
+  /** Forget everything remembered about the bound session. */
+  reset(): void {
+    this.seenUuids.clear();
+    this.reportedServingModel = undefined;
+  }
 
   /** Fold newly-drained events in, newest last, and return what the daemon has
    *  not been told yet (or null when there is nothing new). `scope:"local"`
    *  records are skipped outright: a sub-agent fell back on its own and the
-   *  main session model is untouched. Non-Fable switches never even parse (see
-   *  {@link parseClaudeModelFallbackEvent}). */
+   *  main session model is untouched. A session-scoped record that is NOT a
+   *  live Fable fallback still counts — it reports `fallback: null`, the
+   *  positive "no notice here" the daemon clears on. */
   observe(events: readonly TranscriptEvent[]): ModelFallbackObservation | null {
-    let fallback: ClaudeModelFallbackRecord | undefined;
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
     let servingModel: string | undefined;
     for (const ev of events) {
       const rec = parseClaudeModelFallbackEvent(ev);
@@ -318,8 +400,8 @@ export class ClaudeModelFallbackTracker {
         // "Claude answered on a different model".
         servingModel = undefined;
         if (this.seenUuids.has(rec.uuid)) continue;
-        this.rememberUuid(rec.uuid);
-        fallback = rec;
+        this.acceptSwitch(rec.uuid);
+        fallback = noticeFromSessionRecord(rec);
         continue;
       }
       const serving = servingModelFromAssistantEvent(ev);
@@ -328,30 +410,58 @@ export class ClaudeModelFallbackTracker {
     return this.report(fallback, servingModel);
   }
 
-  /** Recover what the transcript tail can show at bridge start (see
-   *  {@link readLatestClaudeModelFallback}) and report it verbatim. A scan that
-   *  finds nothing reports nothing — a short window is not evidence that the
-   *  daemon's persisted notice is stale. */
-  seed(path: string): ModelFallbackObservation | null {
+  /** Bind to `claudeSessionId` and report what the transcript tail can show
+   *  (see {@link readLatestClaudeModelFallback}).
+   *
+   *  ALWAYS returns an observation, even when the scan found nothing at all.
+   *  The empty one is not a claim that the daemon's notice is stale — it is the
+   *  worker declaring WHICH Claude session it is now bridging, which is the
+   *  only way state left over from a different one can be dropped. The daemon
+   *  ignores an empty message whose `claudeSessionId` matches what it holds, so
+   *  a plain worker restart still costs nothing. */
+  seed(path: string, claudeSessionId: string): ModelFallbackObservation {
+    this.bind(claudeSessionId);
     const seeded = readLatestClaudeModelFallback(path);
-    let fallback: ClaudeModelFallbackRecord | undefined;
-    if (seeded.fallback && !this.seenUuids.has(seeded.fallback.uuid)) {
-      this.rememberUuid(seeded.fallback.uuid);
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
+    if (seeded.fallback === null) {
+      // No uuid to dedupe on, and none needed: re-sending the same "no notice"
+      // is a no-op at the daemon (it lands on the state it already holds).
+      fallback = null;
+    } else if (seeded.fallback && !this.seenUuids.has(seeded.fallback.uuid)) {
+      this.acceptSwitch(seeded.fallback.uuid);
       fallback = seeded.fallback;
     }
-    return this.report(fallback, seeded.servingModel);
+    return this.report(fallback, seeded.servingModel)
+      ?? { claudeSessionId: this.claudeSessionId };
+  }
+
+  /** Take a session-scoped switch record we had not seen before.
+   *
+   *  Resetting `reportedServingModel` here is what keeps a switch BACK visible:
+   *  one drain can carry the whole story (fall off Fable → an Opus reply → the
+   *  user switches back → a Fable reply). Without the reset the batch's closing
+   *  Fable equals the model reported before the fall, gets deduped as
+   *  "unchanged", and the daemon receives the fallback with no clearing
+   *  evidence — a notice that hangs forever. The first serving model observed
+   *  after a switch must always ship, even when its value is old news. */
+  private acceptSwitch(uuid: string): void {
+    this.rememberUuid(uuid);
+    this.reportedServingModel = undefined;
   }
 
   private report(
-    fallback: ClaudeModelFallbackRecord | undefined,
+    fallback: ClaudeModelFallbackRecord | null | undefined,
     servingModel: string | undefined,
   ): ModelFallbackObservation | null {
     const normalized = normalizeClaudeModelId(servingModel);
     const servingChanged = normalized !== undefined && normalized !== this.reportedServingModel;
     if (servingChanged) this.reportedServingModel = normalized;
-    if (!fallback && !servingChanged) return null;
+    if (fallback === undefined && !servingChanged) return null;
     return {
-      ...(fallback ? { fallback: modelFallbackStateOf(fallback) } : {}),
+      claudeSessionId: this.claudeSessionId,
+      ...(fallback !== undefined
+        ? { fallback: fallback === null ? null : modelFallbackStateOf(fallback) }
+        : {}),
       ...(servingChanged && servingModel ? { servingModel } : {}),
     };
   }

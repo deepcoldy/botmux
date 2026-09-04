@@ -30,6 +30,9 @@ vi.mock('../src/services/session-store.js', async importOriginal => ({
 const { getDaemonStreamingCardUsageSnapshot, mergeModelFallbackObservation } = await import('../src/core/worker-pool.js');
 const { persistStreamCardState } = await import('../src/core/session-manager.js');
 
+const SID = 'a9bc732e-0000-0000-0000-000000000000';
+const OTHER_SID = 'b0000000-1111-1111-1111-111111111111';
+
 const FALLBACK: ModelFallbackState = {
   uuid: 'u-refusal',
   kind: 'refusal',
@@ -37,6 +40,9 @@ const FALLBACK: ModelFallbackState = {
   fallbackModel: 'claude-opus-4-8[1m]',
   apiRefusalCategory: 'cyber',
 };
+
+/** The same record as it looks once bound to a Claude session. */
+const BOUND: ModelFallbackState = { ...FALLBACK, claudeSessionId: SID };
 
 function makeSession(modelFallback?: ModelFallbackState): DaemonSession {
   return {
@@ -72,6 +78,17 @@ describe('getDaemonStreamingCardUsageSnapshot: model fallback', () => {
       expect(getDaemonStreamingCardUsageSnapshot(makeSession()), mode)
         .not.toHaveProperty('modelFallback');
     }
+  });
+
+  it('P1-4: the usage line shows the serving model, not the launch config', () => {
+    // Claude never emits `active_runtime`, so ds.activeModel used to stay empty
+    // and the usage line rendered ds.session.model (`claude-fable-5-1`) even
+    // while a fallback was answering. The model_fallback handler now writes the
+    // observed serving model there; this is the half the user actually sees.
+    const ds = makeSession(BOUND);
+    expect(getDaemonStreamingCardUsageSnapshot(ds).model).toBe('claude-fable-5-1');
+    ds.activeModel = 'claude-opus-4-8';
+    expect(getDaemonStreamingCardUsageSnapshot(ds).model).toBe('claude-opus-4-8');
   });
 });
 
@@ -109,6 +126,25 @@ describe('persistStreamCardState: model fallback', () => {
     persistStreamCardState(ds);
     expect(updateSession).toHaveBeenCalledTimes(1);
     expect(ds.session.modelFallback?.uuid).toBe('u-second');
+  });
+
+  it('P1-3: rewrites the store when only the Claude session changed', () => {
+    // Same record, different conversation (and the pre-binding upgrade path,
+    // where the id is stamped onto state that had none). Comparing uuids alone
+    // would leave the persisted mirror unbound forever.
+    const ds = makeSession(FALLBACK);
+    persistStreamCardState(ds);
+    updateSession.mockClear();
+    ds.modelFallback = BOUND;
+    persistStreamCardState(ds);
+    expect(updateSession).toHaveBeenCalledTimes(1);
+    expect(ds.session.modelFallback?.claudeSessionId).toBe(SID);
+  });
+
+  it('P1-3: persists the Claude session id so it survives a daemon restart', () => {
+    const ds = makeSession(BOUND);
+    persistStreamCardState(ds);
+    expect(ds.session.modelFallback).toEqual(BOUND);
   });
 });
 
@@ -182,6 +218,85 @@ describe('mergeModelFallbackObservation', () => {
   it('never clears on a serving model when no record is held', () => {
     expect(mergeModelFallbackObservation(undefined, { servingModel: 'claude-fable-5-1' }))
       .toEqual({ next: undefined, changed: false });
+  });
+
+  describe('P1-3: state is bound to one Claude session', () => {
+    it('stamps the incoming record with the message Claude session', () => {
+      expect(mergeModelFallbackObservation(undefined, {
+        claudeSessionId: SID,
+        fallback: FALLBACK,
+      })).toEqual({ next: BOUND, changed: true });
+    });
+
+    it('drops state from another Claude session before anything else', () => {
+      // /repo, /adopt and a resume onto another native session all replace the
+      // Claude conversation. Carrying the old record across shows a warning
+      // about a conversation the user has left.
+      expect(mergeModelFallbackObservation(BOUND, { claudeSessionId: OTHER_SID }))
+        .toEqual({ next: undefined, changed: true });
+    });
+
+    it('drops it even when the empty message carries no evidence at all', () => {
+      // The mandatory seed after a rebind is usually empty — that IS the
+      // evidence: "the bridge is on a different conversation now".
+      const merged = mergeModelFallbackObservation(BOUND, { claudeSessionId: OTHER_SID });
+      expect(merged.next).toBeUndefined();
+      expect(merged.changed).toBe(true);
+    });
+
+    it('leaves the state alone for an empty message on the SAME session', () => {
+      // A plain worker restart re-seeds and finds nothing; that must not clear.
+      expect(mergeModelFallbackObservation(BOUND, { claudeSessionId: SID }))
+        .toEqual({ next: BOUND, changed: false });
+    });
+
+    it('replaces old-session state with the record in the same message', () => {
+      // A→B→resume A: the seed for A carries both the session id and the record
+      // its tail scan recovered.
+      const other = { ...FALLBACK, uuid: 'u-other', claudeSessionId: OTHER_SID };
+      expect(mergeModelFallbackObservation(other, {
+        claudeSessionId: SID,
+        fallback: FALLBACK,
+      })).toEqual({ next: BOUND, changed: true });
+    });
+
+    it('does not clear on a serving model from a different session', () => {
+      // Rule (a) runs first, so the stale record is gone before rule (c) could
+      // read a foreign session reply as a switch back.
+      expect(mergeModelFallbackObservation(BOUND, {
+        claudeSessionId: OTHER_SID,
+        servingModel: 'claude-opus-4-8',
+      })).toEqual({ next: undefined, changed: true });
+    });
+
+    it('stamps the session onto pre-binding state and persists that once', () => {
+      // Upgrade path: state persisted before the binding existed carries no
+      // session id, so it cannot be shown to belong here — but the same
+      // message's own record re-establishes it, and `changed` must report the
+      // stamping so the mirror on disk is rewritten.
+      const merged = mergeModelFallbackObservation(FALLBACK, {
+        claudeSessionId: SID,
+        fallback: FALLBACK,
+      });
+      expect(merged).toEqual({ next: BOUND, changed: true });
+    });
+  });
+
+  describe('P2-2: fallback:null is positive "no notice" evidence', () => {
+    it('clears the held record', () => {
+      expect(mergeModelFallbackObservation(BOUND, { claudeSessionId: SID, fallback: null }))
+        .toEqual({ next: undefined, changed: true });
+    });
+
+    it('costs nothing when there is no notice to clear', () => {
+      expect(mergeModelFallbackObservation(undefined, { claudeSessionId: SID, fallback: null }))
+        .toEqual({ next: undefined, changed: false });
+    });
+
+    it('is not the same as an absent fallback, which changes nothing', () => {
+      expect(mergeModelFallbackObservation(BOUND, { claudeSessionId: SID, fallback: undefined }))
+        .toEqual({ next: BOUND, changed: false });
+    });
   });
 
   it('holds the notice through anything short of a different serving model', () => {

@@ -1309,6 +1309,14 @@ export interface ModelFallbackState {
   /** Refusal category (`cyber`, `bio`, …). */
   apiRefusalCategory?: string;
   observedAt?: string;
+  /** Claude session (transcript jsonl basename) this switch happened in. The
+   *  notice is per Claude conversation, not per botmux session: `/repo`,
+   *  `/adopt` and a resume onto another native session all replace it, and a
+   *  record carried across that boundary is either a warning about a
+   *  conversation the user is no longer having or one nothing can ever clear.
+   *  Absent on state persisted by builds that predate the binding; the next
+   *  worker's mandatory seed re-establishes it. */
+  claudeSessionId?: string;
 }
 
 /** Messages sent from Worker to Daemon */
@@ -1368,15 +1376,24 @@ export type WorkerToDaemon =
       reasoningEffort: string | null;
     }
   /** OBSERVED FACTS about Claude Code's automatic model switching — never a
-   * decision. `fallback` is a switch record this worker had not reported yet
-   * (already filtered to `scope:"session"` and to Fable originals);
-   * `servingModel` is the model serving the MAIN thread, sent whenever it
-   * changed since the worker's last report. The daemon holds the state and
-   * merges: a new record replaces, and ONLY a serving model different from the
-   * held `fallbackModel` clears. An absent field means "nothing new observed" —
-   * a worker restart or a too-short transcript window must never read as
-   * "cleared". */
-  | { type: 'model_fallback'; fallback?: ModelFallbackState; servingModel?: string }
+   * decision. `claudeSessionId` (always present) says WHICH Claude conversation
+   * they are about; `fallback` is a `scope:"session"` switch record this worker
+   * had not reported yet, or `null` when the newest such record is positive
+   * evidence that no notice applies (a non-Fable original, or one a fork
+   * neutralised); `servingModel` is the model serving the MAIN thread, sent
+   * whenever it changed since the worker's last report — it also drives the
+   * card's usage line, because Claude never emits `active_runtime`. The daemon
+   * holds the state and merges: a message from a different Claude session drops
+   * what it held first, a new record replaces, `fallback: null` clears, and a
+   * serving model different from the held `fallbackModel` clears. An ABSENT
+   * field means "nothing new observed" — a worker restart or a too-short
+   * transcript window must never read as "cleared". */
+  | {
+      type: 'model_fallback';
+      claudeSessionId: string;
+      fallback?: ModelFallbackState | null;
+      servingModel?: string;
+    }
   | { type: 'native_session_title_generated'; title: string }
   | {
     type: 'claude_exit';
