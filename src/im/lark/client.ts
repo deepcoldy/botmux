@@ -1352,7 +1352,20 @@ export async function getMessageThreadId(
   }
 }
 
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+/**
+ * Download an image/file attached to a message.
+ *
+ * App token first, user token only as a fallback — a bot that can already read
+ * the resource needs nobody's personal credentials, so most downloads never
+ * touch a user token at all.
+ *
+ * `senderOpenId` names whose token to use for that fallback. It is the person
+ * who SENT the attachment, which is the naturally correct choice: they can see
+ * what they just posted. Passing nobody keeps the pre-existing behavior (any
+ * token authorized for this bot), which is what the paths without a per-turn
+ * sender still rely on.
+ */
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1381,7 +1394,13 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Fallback: User Token from botmux OAuth (/login)
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+  // With trigger-user auth on, use the SENDER's own token: they posted this
+  // attachment, so their credentials are the right ones and the download is
+  // attributed to them. Without a sender (or with the policy off) this keeps the
+  // historical bot-level lookup.
+  const userToken = bot.config.triggerUserAuth?.enabled
+    ? await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId)
+    : await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (!userToken) {
     throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
