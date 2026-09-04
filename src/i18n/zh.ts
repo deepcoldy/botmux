@@ -797,9 +797,9 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
-  'ai.followup.reminder': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND',
-  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
-  'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
+  'ai.followup.reminder': '发给你的消息至少用 `botmux send` 回应一次,别沉默;`botmux send` 是唯一用户可见回复通道,禁止用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND',
+  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:`botmux send` 是唯一用户可见回复通道,不得用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.followup.reminder_no_resend': '发给你的消息至少用 `botmux send` 回应一次,别沉默;`botmux send` 是唯一用户可见回复通道,禁止用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
