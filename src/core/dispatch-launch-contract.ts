@@ -103,6 +103,11 @@ export interface CanonicalDispatchLaunchKickoff {
 export interface DispatchLaunchPolicyV1 {
   schemaVersion: typeof DISPATCH_LAUNCH_POLICY_SCHEMA_VERSION;
   enabled: boolean;
+  /**
+   * Same-host source daemons trusted to request launches and attest the optional
+   * human caller union_id. The target accepts that testimony only through the
+   * authenticated dispatch-launch IPC transport; it is not a bot-trust claim.
+   */
   allowedSourceAppIds: string[];
   allowedModels: string[];
   allowedReasoningEfforts: CodexReasoningEffort[];
@@ -128,7 +133,12 @@ export interface DispatchLaunchPrepareRequestV1 {
     larkAppId: string;
     sessionId: string;
     turnId: string;
-    /** Cross-app stable caller identity; source-app open_id is intentionally not transported. */
+    /**
+     * Source-daemon testimony about the human behind this bot-triggered turn.
+     * The target may accept it only after same-host IPC authentication and an
+     * allowedSourceAppIds policy match. It MUST NOT be used as the source bot's
+     * union_id for bot-talk/team trust; source-app open_id is not transported.
+     */
     callerUnionId?: string;
   };
   targetLarkAppId: string;
@@ -190,6 +200,7 @@ interface DispatchLaunchOperationBaseV1 {
   sourceLarkAppId: string;
   sourceSessionId: string;
   sourceTurnId: string;
+  /** Frozen source testimony; never a target-verified bot identity. */
   callerUnionId?: string;
   targetLarkAppId: string;
   chatId: string;
@@ -264,7 +275,7 @@ export interface DispatchLaunchAdmissionReceiptV1 {
   sourceLarkAppId: string;
   sourceSessionId: string;
   sourceTurnId: string;
-  /** Cross-app stable caller identity; never substitute an app-scoped open_id. */
+  /** Frozen source testimony accepted through the allowed source app trust anchor. */
   callerUnionId?: string;
   /** Target-app-scoped identity resolved from live chat membership. */
   sourceOpenId?: string;

@@ -141,11 +141,20 @@ describe('dispatch launch IPC request verifier', () => {
     await expect(verify(makeRequest({
       headers: { 'content-length': String(DISPATCH_LAUNCH_IPC_BODY_LIMIT_BYTES + 1) },
     }))).resolves.toEqual({ ok: false, reason: 'body_too_large', httpStatus: 413 });
+    const streamedOversize = Buffer.alloc(DISPATCH_LAUNCH_IPC_BODY_LIMIT_BYTES + 1, 0x61);
+    await expect(verify(makeRequest({ body: streamedOversize, signedBody: streamedOversize })))
+      .resolves.toEqual({ ok: false, reason: 'body_too_large', httpStatus: 413 });
     await expect(verify(makeRequest({
       headers: { 'content-length': '2', 'transfer-encoding': 'chunked' },
     }))).resolves.toEqual({ ok: false, reason: 'body_length_mismatch', httpStatus: 400 });
     const invalid = Buffer.from([0xc3, 0x28]);
     await expect(verify(makeRequest({ body: invalid, signedBody: invalid }))).resolves
       .toEqual({ ok: false, reason: 'body_not_utf8', httpStatus: 400 });
+  });
+
+  it('rejects timestamps outside the accepted clock window', async () => {
+    await expect(verify(makeRequest({
+      headers: { [DISPATCH_LAUNCH_IPC_HEADERS.timestamp]: String(NOW - 60_001) },
+    }))).resolves.toEqual({ ok: false, reason: 'timestamp_out_of_window', httpStatus: 401 });
   });
 });
