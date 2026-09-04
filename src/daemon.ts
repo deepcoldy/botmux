@@ -3475,10 +3475,17 @@ export async function noteTurnReceived(
   // turn. This is the per-message acceptance point — every inbound turn passes
   // through here before reaching the worker — so it is the one place that can
   // guarantee no turn runs with the previous sender's credentials still on disk.
-  // Withholding is the safe direction, hence it precedes the reaction bookkeeping
-  // and its early returns (card-on sessions return below, but their turns need
-  // the identity refreshed just the same).
-  await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  // It precedes the reaction bookkeeping and its early returns: a card-on session
+  // returns below, but its turns need the identity refreshed just the same.
+  //
+  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
+  // here would yield a microtask before the bookkeeping below on every turn of
+  // every bot, reordering concurrent turns that the single-flight paths depend
+  // on. A feature that is off must not perturb timing at all, so the await only
+  // happens once a bot has actually opted in.
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3537,6 +3544,13 @@ export async function noteTurnReceived(
  * The "please authorize" notice is sent at most once per session per tool. A
  * repeat on every turn would be noise, and the sender already has the link.
  */
+/** Whether this session's bot opted into trigger-user CLI auth. Synchronous so a
+ *  bot that has not opted in adds no await boundary to the turn path at all. */
+function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }

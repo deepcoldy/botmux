@@ -1848,11 +1848,13 @@ describe('handleCommand', () => {
         LARK_APP_ID,
       );
 
+      // 第五参 = 下这条订阅命令的人：订阅是他建立的，之后的评论读写按他的权限走。
       expect(generateAuthUrl).toHaveBeenCalledWith(
         LARK_APP_ID,
         'secret-1',
         'feishu',
         DOC_COMMENT_OAUTH_SCOPES,
+        'ou_sender',
       );
       expect(subscribeDocFile).not.toHaveBeenCalled();
       expect(putDocSubscription).not.toHaveBeenCalled();
@@ -1928,11 +1930,13 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('文档权限');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
+      // 第五参 = 下这条订阅命令的人：订阅是他建立的，之后的评论读写按他的权限走。
       expect(generateAuthUrl).toHaveBeenCalledWith(
         LARK_APP_ID,
         'secret-1',
         'feishu',
         DOC_COMMENT_OAUTH_SCOPES,
+        'ou_sender',
       );
     });
 
@@ -4603,8 +4607,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
 
-      // brand 第三参：测试 bot 未配 brand → normalizeBrand → 'feishu'
-      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu');
+      // brand 第三参：测试 bot 未配 brand → normalizeBrand → 'feishu'。
+      // 第五参是发起人 open_id：token 代表一个人而不是一个 bot，不带它的话同一个
+      // bot 里第二个人 /login 会覆盖第一个人，之后所有人都在用最后那个人的权限。
+      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', [], 'ou_sender');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('飞书用户授权');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
