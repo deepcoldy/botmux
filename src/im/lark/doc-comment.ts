@@ -513,7 +513,12 @@ export async function getDocComment(
     const data = ensureOk(res, '获取评论');
     const raw = Array.isArray(data?.items) ? data.items[0] : undefined;
     if (!raw) return null;
-    return await hydrateTruncatedReplies(larkAppId, file, normalizeComment(raw));
+    // 事件链路：与本函数的 batch_query 主请求保持同一身份优先级（user-first），
+    // 不要一半 user-first 一半 tenant-first。补全失败降级，下游有 `!trigger` 兜底。
+    return await hydrateTruncatedReplies(larkAppId, file, normalizeComment(raw), {
+      onTruncated: 'degrade',
+      preferTenant: false,
+    });
   } catch (err) {
     logger.warn(`[doc-comment] getDocComment ${commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
     return null;
@@ -523,27 +528,50 @@ export async function getDocComment(
 /**
  * 补全被截断的回复串。
  *
- * ⚠️ 飞书的 `batch_query` / `GET /comments` **对每条评论的 `reply_list.replies`
- * 分页**，实测一页只给 5 条，并在评论对象顶层（不是 reply_list 里）挂
- * `has_more: true`。这层分页没有任何参数可以调大，也不能靠 page_size 绕过。
+ * ⚠️ 飞书**对每条评论的 `reply_list.replies` 分页**，`has_more` 挂在评论对象
+ * 顶层（不是 reply_list 里），没有参数可以调大，也不能靠 page_size 绕过。
+ *
+ * 实测（33 条评论、单串最长 11 条回复的真实文档）两个端点表现**并不一样**：
+ *   • `POST .../comments/batch_query` —— 截断，一页只给 5 条并置 has_more=true
+ *   • `GET  .../comments`            —— 未见截断，11 条的串也完整返回
+ * 事件链路走 batch_query，所以是它踩了这个坑。`listDocComments` 走 GET，目前
+ * 观察不到截断，但 `has_more` 是文档化字段、飞书随时可能对它也生效，故两条
+ * 链路都接上补全（GET 那条实际是防御性的，正常不会真的发请求）。
  *
  * 吃下这个截断的后果是**长评论串会永久静默失联**：事件带着第 6 条以后的
  * reply_id 打进来，在只有 5 条的 replies 里 find 不到，触发回复解析出错的那条
  * → @ 判定、自触发过滤、turnId 去重全部基于错误的回复，最终每一条新评论都被
  * 当成重复回合丢弃。
  *
- * 因此 `has_more` 为真时改用专用端点 `GET /comments/{id}/replies` 翻全量（该
- * 端点分页正常、局部评论也支持）。拉失败就退回截断结果——半个 thread 好过没有。
+ * 因此 `has_more` 为真时改用专用端点 `GET /comments/{id}/replies` 翻全量。
+ * 实测确认该端点与 `reply_list.replies` **同序（create_time 升序）**、跨页拼接
+ * 后仍升序、前 N 条与截断结果逐字节一致 —— 上层 priorReplies / trigger 依赖
+ * 这个顺序，换端点不能破坏它。
+ *
+ * `onTruncated` 决定补全失败时的行为，**两条链路语义不同，必须由调用方选**：
+ * - 事件链路（getDocComment）传 'degrade'：退回截断结果。下游 `!trigger` 有
+ *   兜底告警，且事件链路本来就没有游标可污染。
+ * - 轮询链路（listDocComments）传 'throw'：**绝不能**降级。游标是按拿到的
+ *   回复算的，降级会让 `latestDocCommentPollCursor` 用截断的 5 条推游标；一旦
+ *   某轮补全成功把游标推到第 11 条、下一轮补全失败只看到 5 条，
+ *   `docCommentRepliesAfterCursor` 返回空，这轮新来的第 12 条就永久不投了
+ *   （游标已在 11，而截断响应里永远看不到 12）。抛错让 daemon 的 per-sub
+ *   try/catch 跳过这一轮、游标不动、下轮重试，才是正确语义。
  */
+/** 单条评论回复串的翻页上限。纯粹是死循环保险，正常 thread 远够用。 */
+const MAX_REPLY_PAGES = 50;
+
 async function hydrateTruncatedReplies(
   larkAppId: string,
   file: ResolvedDocFile,
   comment: DocComment,
+  opts: { onTruncated: 'degrade' | 'throw'; preferTenant: boolean },
 ): Promise<DocComment> {
   if (!comment.hasMoreReplies || !comment.commentId) return comment;
   try {
     const replies: DocComment['replies'] = [];
     let pageToken: string | undefined;
+    let pages = 0;
     do {
       const res = await driveApiCall(larkAppId, {
         method: 'GET',
@@ -554,19 +582,30 @@ async function hydrateTruncatedReplies(
           page_size: 50,
           page_token: pageToken,
         },
-        preferTenant: true,
+        preferTenant: opts.preferTenant,
       });
       const data = ensureOk(res, '拉取评论回复');
       if (Array.isArray(data?.items)) replies.push(...data.items.map(normalizeReply));
       pageToken = data?.has_more === true && typeof data?.page_token === 'string' && data.page_token
         ? data.page_token
         : undefined;
+      // 服务端若返回恒定 page_token 会把这里变成死循环，而且是嵌在
+      // 「每条评论 × 每个订阅」的两层循环里，足以把整个 poller 卡死。
+      if (pages++ >= MAX_REPLY_PAGES) {
+        throw new Error(`回复分页超过 ${MAX_REPLY_PAGES} 页上限（comment=${comment.commentId.slice(0, 12)}），疑似游标未推进`);
+      }
     } while (pageToken);
-    if (replies.length === 0) return comment;
+    // 空数组是**合法应答**（整串回复都被删了），不能和「没拉到」混为一谈。
+    // 但也不敢直接拿它覆盖已有的 5 条，故保留旧值并留痕，让线上能分辨。
+    if (replies.length === 0) {
+      logger.warn(`[doc-comment] hydrate returned 0 replies for ${comment.commentId.slice(0, 12)} (截断结果有 ${comment.replies.length} 条)；保留截断结果`);
+      return comment;
+    }
     logger.info(`[doc-comment] hydrated truncated thread comment=${comment.commentId.slice(0, 12)} ${comment.replies.length} → ${replies.length} replies`);
     return { ...comment, replies, hasMoreReplies: false };
   } catch (err) {
-    // 补全失败不致命：返回截断结果，调用方的「找不到触发回复」告警会暴露问题。
+    if (opts.onTruncated === 'throw') throw err;
+    // 事件链路降级：返回截断结果，下游 `!trigger` 的告警会暴露问题。
     logger.warn(`[doc-comment] hydrate replies for ${comment.commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
     return comment;
   }
@@ -631,11 +670,20 @@ export async function listDocComments(
       ? data.page_token
       : undefined;
   } while (pageToken);
-  // 串行补全：一篇文档可能有几十条评论，Promise.all 会把补全请求一次性打出去撞
-  // 飞书限流。补全只在 has_more 的评论上真正发请求，串行开销可接受。
+  // 串行补全，且只在 has_more 的评论上真正发请求。GET /comments 实测不截断，
+  // 所以这里通常一个补全请求都不会发；Promise.all 只会在真出现批量截断时把
+  // 请求一次性打出去撞限流（/replies 限 100 次/分，poll 每 5s 一轮），得不偿失。
+  // 注：真出现「一篇文档几十条串都被截断」时，本轮 poll 会明显变慢（有
+  // docCommentPollRunning 互斥，不会重入，但会拖慢游标推进）。届时应改成只补全
+  // 游标之后可能有新回复的评论 —— 留待后续 PR。
   const hydrated: DocComment[] = [];
   for (const comment of comments) {
-    hydrated.push(await hydrateTruncatedReplies(larkAppId, file, comment));
+    // 轮询链路：与本函数的列表主请求同为 tenant-first；补全失败必须抛错，
+    // 降级会让游标按截断的回复数推进并永久漏投后续回复（见 hydrateTruncatedReplies）。
+    hydrated.push(await hydrateTruncatedReplies(larkAppId, file, comment, {
+      onTruncated: 'throw',
+      preferTenant: true,
+    }));
   }
   return hydrated;
 }

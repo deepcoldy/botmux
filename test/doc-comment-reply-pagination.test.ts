@@ -35,7 +35,8 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), error: vi.fn(), info: mocks.info, warn: mocks.warn },
 }));
 
-import { getDocComment } from '../src/im/lark/doc-comment.js';
+import { getDocComment, listDocComments } from '../src/im/lark/doc-comment.js';
+import { docCommentRepliesAfterCursor, latestDocCommentPollCursor } from '../src/core/doc-comment-poller.js';
 
 const FILE = { fileToken: 'DocToken1234567890123456', fileType: 'docx' };
 const COMMENT_ID = '7681622822925421500';
@@ -176,5 +177,109 @@ describe('handleDocCommentEvent 触发回复解析（源码形状）', () => {
     expect(region).toContain('return;');
     // 告警要带上「回复串是否被截断」，否则线上无法区分是分页截断还是别的原因。
     expect(region).toContain('comment.hasMoreReplies');
+  });
+});
+
+/**
+ * 轮询链路（listDocComments）的补全语义，与事件链路**故意不同**：这里补全失败
+ * 必须抛错，绝不能降级返回截断结果。
+ */
+describe('listDocComments: 轮询链路补全失败必须抛错', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset();
+    mocks.resolveUserToken.mockReset().mockResolvedValue(null);
+    mocks.warn.mockReset();
+    mocks.info.mockReset();
+  });
+
+  function listResponse(items: unknown[]) {
+    return { code: 0, data: { items, has_more: false } };
+  }
+
+  it('补全成功时把截断的评论补齐（轮询链路也接上了，不只事件链路）', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    const all11 = Array.from({ length: 11 }, (_, i) => reply(`reply-${i + 1}`, `msg ${i + 1}`, 1788500000 + i + 1));
+
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      if (opts.url.includes('/replies')) return { code: 0, data: { items: all11, has_more: false } };
+      throw new Error(`unexpected ${opts.url}`);
+    });
+
+    const comments = await listDocComments('app-test', FILE);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].replies).toHaveLength(11);
+    expect(comments[0].hasMoreReplies).toBe(false);
+  });
+
+  it('补全失败时抛错，不返回截断结果', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      throw new Error('replies endpoint down');
+    });
+
+    await expect(listDocComments('app-test', FILE)).rejects.toThrow();
+  });
+
+  /**
+   * 回归：补全失败若降级返回截断结果，游标会按截断的回复数推进，后续回复永久漏投。
+   *
+   * 复现序列（游标是**全文档所有回复拉平后**的单一游标，见 flattenDocCommentReplies）：
+   *   轮 1：补全成功 → 看到 11 条 → 游标推到 reply-11
+   *   轮 2：补全失败 →（若降级）只看到 5 条 → 全部 ≤ 游标 → fresh 为空
+   *          此时新到的 reply-12 在截断响应里根本不存在，且游标已在 11 不会回退
+   *          → reply-12 永久不投
+   * 抛错则 daemon 的 per-sub try/catch 跳过本轮、游标不动、下轮重试。
+   */
+  it('回归：补全失败必须让整轮 poll 失败，而不是让游标基于 5 条回复推进', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    const all11 = Array.from({ length: 11 }, (_, i) => reply(`reply-${i + 1}`, `msg ${i + 1}`, 1788500000 + i + 1));
+
+    // 轮 1：补全成功，游标推到最后一条。
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      if (opts.url.includes('/replies')) return { code: 0, data: { items: all11, has_more: false } };
+      throw new Error(`unexpected ${opts.url}`);
+    });
+    const round1 = await listDocComments('app-test', FILE);
+    const cursor = latestDocCommentPollCursor(round1)!;
+    expect(cursor.replyId).toBe('reply-11');
+
+    // 轮 2：补全失败。抛错 ⇒ 调用方拿不到任何 comments，游标不动。
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      throw new Error('replies endpoint down');
+    });
+    await expect(listDocComments('app-test', FILE)).rejects.toThrow();
+
+    // 反证：若当初降级返回了截断的 5 条，游标之后就什么都看不到了 ——
+    // 而真实新回复 reply-12 恰恰在那个看不见的区间里，于是永久漏投。
+    const degraded = [{ ...round1[0], replies: round1[0].replies.slice(0, 5) }];
+    expect(docCommentRepliesAfterCursor(degraded, cursor)).toHaveLength(0);
+  });
+
+  it('分页游标不推进时不会死循环，超过页数上限抛错', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    let calls = 0;
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      calls++;
+      // 恒定 page_token：服务端 bug 的典型形态。
+      return { code: 0, data: { items: [reply('reply-x', 'x', 1788500099)], has_more: true, page_token: 'stuck' } };
+    });
+
+    await expect(listDocComments('app-test', FILE)).rejects.toThrow(/页上限|游标未推进/);
+    expect(calls).toBeLessThan(200); // 有界，不是死循环
   });
 });
