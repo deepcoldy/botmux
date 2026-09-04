@@ -42,10 +42,12 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+    daemonRequest: vi.fn(async () => ({ status: 200, raw: '', body: { sessions: [] } })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -112,12 +114,18 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
+    getChatModeStrict: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
 });
+
+vi.mock('../src/daemon-internal-client-wrapper.js', () => ({
+  createDaemonClientFor: vi.fn(() => ({ request: mocks.daemonRequest })),
+}));
 
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
@@ -525,6 +533,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.sendEphemeralCard.mockResolvedValue('om_ephemeral');
+    mocks.daemonRequest.mockResolvedValue({ status: 200, raw: '', body: { sessions: [] } });
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
@@ -641,6 +650,75 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` is available at canTalk level without creating a session', async (_label, reply) => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_sessions_root' : 'om_sessions_new';
+    const messageId = reply ? 'om_sessions_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_talk_only' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    await vi.waitFor(() => expect(repliedText()).toContain('本群话题'));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('regular-group top-level `/sessions` stays top-level even after new-topic routing', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_sessions_regular_group_top';
+    const data = makeEventData(messageId, '/sessions');
+
+    await handleNewTopic(data, {
+      ...makeCtx(messageId, messageId),
+      regularGroupTopLevel: true,
+    });
+
+    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage.mock.calls[0]?.[1]).toBe(CHAT);
+    expect(String(mocks.sendMessage.mock.calls[0]?.[2])).toContain('本群话题');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` still denies a sender without canTalk', async (_label, reply) => {
+    const rootId = reply ? 'om_sessions_denied_root' : 'om_sessions_denied_new';
+    const messageId = reply ? 'om_sessions_denied_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_stranger' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
   });
 
   it('pinned cwd + bare `/t` seeds the thread without creating an empty Session', async () => {

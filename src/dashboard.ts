@@ -332,6 +332,7 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import { createLazyTopicLinkBackfill } from './dashboard/lazy-topic-link-backfill.js';
 import {
   buildDashboardSummary,
   parseDashboardSummaryRows,
@@ -583,6 +584,25 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
+const lazyTopicLinkBackfill = createLazyTopicLinkBackfill({
+  resolve: async (larkAppId, sessionId) => {
+    const daemon = registry.getByAppId(larkAppId);
+    if (!daemon) return false;
+    try {
+      const response = await fetchDaemonIpc(
+        daemon.ipcPort,
+        `/api/sessions/${encodeURIComponent(sessionId)}/resolve-thread-id`,
+        { method: 'POST', signal: AbortSignal.timeout(5_000) },
+      );
+      if (!response.ok) return false;
+      const body = await response.json() as { ok?: boolean; status?: string };
+      return body.ok === true && body.status !== 'unresolved';
+    } catch (error) {
+      logger.debug(`[dashboard] lazy topic link backfill ${larkAppId}/${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  },
+});
 const aggregator = new Aggregator();
 /**
  * P1-13：一个会话的预览目标失效时的收口动作（本进程侧）。
@@ -3995,6 +4015,7 @@ const server = createServer(async (req, res) => {
           : s;
       }), groupsMatrixSnapshot.peekPresentation());
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
+      lazyTopicLinkBackfill.trigger(browserSessions);
       return jsonRes(res, 200, {
         sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
