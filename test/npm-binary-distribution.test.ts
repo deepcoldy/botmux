@@ -149,6 +149,13 @@ describe('package.json — lockfile safety and packaging', () => {
     expect(parseNpmPackReport(JSON.stringify({ botmux: { name: 'botmux', files } }), 'botmux').files).toEqual(files);
     // Banner before the object (workflow-core scripts used to scan only for `^[`).
     expect(parseNpmPackReport('notice\n{ "botmux": { "name": "botmux", "files": [] } }\n', 'botmux').files).toEqual([]);
+    // CI leftover: `prepare` reprints `[workflow-core] built …` into pack stdout.
+    // The opener `[` must NOT be taken as the JSON array (this is what broke the
+    // build job after the first dual-shape helper).
+    expect(parseNpmPackReport(
+      '[workflow-core] built 9 exports in /tmp/dist\n[\n  {"name":"botmux","filename":"x.tgz","files":[]}\n]\n',
+      'botmux',
+    )).toEqual({ name: 'botmux', filename: 'x.tgz', files: [] });
   });
 
   it('declares no entry point that the tarball does not contain', () => {
