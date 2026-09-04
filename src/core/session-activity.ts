@@ -5,9 +5,10 @@
 // restart, so user-visible activity time must also be persisted on Session.
 import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import { composeRowFromActive } from './dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
 import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
 export function markSessionActivity(ds: DaemonSession, at: number = Date.now()): void {
   ds.lastMessageAt = at;
@@ -100,12 +101,20 @@ export function publishLastInputFromBotPatch(ds: DaemonSession): void {
  * from publishing a misleading patch.
  */
 export function publishNativeTopicLinkPatch(ds: DaemonSession): boolean {
-  const feishuThreadLink = composeRowFromActive(ds).feishuThreadLink;
+  return publishNativeTopicLinkPatchForSession(ds.session, () => composeRowFromActive(ds).feishuThreadLink);
+}
+
+/** Also supports closed and persisted-active rows, which have no DaemonSession. */
+export function publishNativeTopicLinkPatchForSession(session: Session, activeLink?: () => string | undefined): boolean {
+  const feishuThreadLink = activeLink?.()
+    ?? (session.status === 'closed'
+      ? composeRowFromClosed(session).feishuThreadLink
+      : composeRowFromPersistedActive(session).feishuThreadLink);
   if (!feishuThreadLink) return false;
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
-      sessionId: ds.session.sessionId,
+      sessionId: session.sessionId,
       patch: { feishuThreadLink },
     },
   });

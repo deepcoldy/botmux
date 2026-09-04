@@ -103,7 +103,9 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
+import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
@@ -1168,6 +1170,46 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
     });
   }
   jsonRes(res, 404, { error: 'not_found' });
+});
+
+const topicIdResolveInFlight = new Map<string, Promise<{ ok: boolean; status: string }>>();
+const topicIdResolveCooldownUntil = new Map<string, number>();
+const TOPIC_ID_RESOLVE_COOLDOWN_MS = 5 * 60_000;
+
+ipcRoute('POST', '/api/sessions/:sessionId/resolve-thread-id', async (_req, res, params) => {
+  const sessionId = params.sessionId;
+  const existing = topicIdResolveInFlight.get(sessionId);
+  if (existing) return jsonRes(res, 200, await existing);
+  const task = (async () => {
+    const session = findOwnedSessionRecord(sessionId);
+    if (!session) return { ok: false, status: 'not_found' };
+    if (session.scope !== 'thread' || !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId)) {
+      return { ok: true, status: 'ineligible' };
+    }
+    if (isNativeTopicId(session.larkThreadId)) return { ok: true, status: 'already_present' };
+    if ((topicIdResolveCooldownUntil.get(sessionId) ?? 0) > Date.now()) return { ok: true, status: 'unresolved' };
+    let nativeId: string | null;
+    try {
+      nativeId = await getMessageThreadId(session.larkAppId || cachedLarkAppId, session.rootMessageId);
+    } catch {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: false, status: 'unresolved' };
+    }
+    // Re-read after the remote call: a normal inbound event may have filled it.
+    const current = findOwnedSessionRecord(sessionId);
+    if (!current) return { ok: false, status: 'not_found' };
+    if (isNativeTopicId(current.larkThreadId)) return { ok: true, status: 'already_present' };
+    if (!fillNativeTopicId(current, 'thread', nativeId)) {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: true, status: 'unresolved' };
+    }
+    sessionStore.updateSession(current);
+    publishNativeTopicLinkPatchForSession(current);
+    topicIdResolveCooldownUntil.delete(sessionId);
+    return { ok: true, status: 'resolved' };
+  })();
+  topicIdResolveInFlight.set(sessionId, task);
+  try { return jsonRes(res, 200, await task); } finally { topicIdResolveInFlight.delete(sessionId); }
 });
 
 /** Low-frequency card-display read used by `botmux send`. Keeping the
