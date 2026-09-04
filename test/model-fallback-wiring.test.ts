@@ -188,7 +188,7 @@ describe('model-fallback wiring (source lock)', () => {
 
   describe('P1-3: the state is bound to a Claude session', () => {
     it('re-seeds at every bind/switch of the primary path', () => {
-      // Four places move bridgeJsonlPath. Each must re-declare which Claude
+      // Five places move bridgeJsonlPath. Each must re-declare which Claude
       // conversation the worker is now on, or the daemon keeps showing (or can
       // never clear) a notice that belongs to the previous one.
       const SEED = 'seedModelFallbackFromTranscript();';
@@ -197,10 +197,19 @@ describe('model-fallback wiring (source lock)', () => {
         ['lazy baseline', sliceBetween(worker, 'if (!bridgeBaselineDone) {', '\n  }\n')],
         ['fingerprint switch', sliceBetween(worker, 'function bridgeApplyFingerprintSwitch(', '\n}\n')],
         ['rotation switch', sliceBetween(worker, 'function performRotationSwitch(', '\n}\n')],
+        // The pid resolver is the fifth: it swaps the path and cursors to 0
+        // WITHOUT draining, so nothing else here would rebind the tracker until
+        // the new transcript happens to hold something observable.
+        ['pid-resolver switch', sliceBetween(worker, 'function maybeFollowSessionRotationViaPid(', '\nfunction bridgeIngest(')],
       ] as const) {
         expect(slice, `${name} does not re-seed the fallback tracker`).toContain(SEED);
       }
-      expect(worker.match(/seedModelFallbackFromTranscript\(\);/g)).toHaveLength(4);
+      expect(worker.match(/seedModelFallbackFromTranscript\(\);/g)).toHaveLength(5);
+      // Guard against a SIXTH switch site appearing unnoticed: three of the six
+      // assignments are startBridgeWatcher's own (initial bind + the pid-file
+      // and fd-probe adjustments it makes before its single seed); the other
+      // three are the fingerprint, fd-rotation and pid-resolver switches above.
+      expect(worker.match(/\bbridgeJsonlPath = /g)).toHaveLength(6);
     });
 
     it('the seed ALWAYS publishes, even when the scan found nothing', () => {

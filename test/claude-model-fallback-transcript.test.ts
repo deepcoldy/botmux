@@ -344,6 +344,58 @@ describe('ClaudeModelFallbackTracker', () => {
     } as TranscriptEvent])).toEqual({ claudeSessionId: SID, fallback: null });
   });
 
+  describe('P2-2: the NEWEST record in the batch decides, even when deduped', () => {
+    // A drain from offset 0 (a fingerprint/rotation switch onto this file, or
+    // drainTranscript's truncation re-read) replays the WHOLE file. The newest
+    // switch record in it is routinely one we already reported, while an older
+    // one that predates this worker's baseline has never been seen. Letting the
+    // unseen older record win would resurrect exactly the notice the newest one
+    // retired — the P2-2 bug, back through the P1-2 drains.
+    const DOWNGRADE = {
+      ...REFUSAL_RECORD,
+      uuid: 'opus-downgrade',
+      originalModel: 'claude-opus-5',
+      fallbackModel: 'claude-opus-4-8',
+    } as TranscriptEvent;
+
+    it('an already-reported non-Fable record still buries an older unseen Fable one', () => {
+      const tracker = bound();
+      expect(tracker.observe([DOWNGRADE])).toEqual({ claudeSessionId: SID, fallback: null });
+      // The replay: older Fable record first, the deduped newest one last.
+      expect(tracker.observe([
+        REFUSAL_RECORD as TranscriptEvent,
+        assistant('claude-opus-4-8'),
+        DOWNGRADE,
+      ])?.fallback ?? undefined).toBeUndefined();
+    });
+
+    it('an already-reported Fable record is not replaced by an older one', () => {
+      const older = { ...REFUSAL_RECORD, uuid: 'older-fable' } as TranscriptEvent;
+      const tracker = bound();
+      expect(tracker.observe([REFUSAL_RECORD as TranscriptEvent])?.fallback)
+        .toMatchObject({ uuid: REFUSAL_RECORD.uuid });
+      expect(tracker.observe([older, REFUSAL_RECORD as TranscriptEvent])?.fallback ?? undefined)
+        .toBeUndefined();
+    });
+
+    it('a switch-path replay after the seed reports no stale record', () => {
+      // Exactly what bridgeApplyFingerprintSwitch / performRotationSwitch do:
+      // seed the new path's tail first, then fold the same file's events in
+      // from offset 0.
+      appendLine(REFUSAL_RECORD);
+      appendLine(assistant('claude-opus-4-8'));
+      appendLine({ ...REFUSAL_RECORD, uuid: 'newer-fable' });
+      const tracker = new ClaudeModelFallbackTracker();
+      expect(tracker.seed(path, SID).fallback).toMatchObject({ uuid: 'newer-fable' });
+      const replay = tracker.observe([
+        REFUSAL_RECORD as TranscriptEvent,
+        assistant('claude-opus-4-8'),
+        { ...REFUSAL_RECORD, uuid: 'newer-fable' } as TranscriptEvent,
+      ]);
+      expect(replay?.fallback ?? undefined).toBeUndefined();
+    });
+  });
+
   it('reports the first serving model it sees, then only on change', () => {
     const tracker = bound();
     expect(tracker.observe([assistant('claude-fable-5-1')]))

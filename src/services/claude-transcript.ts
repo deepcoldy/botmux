@@ -382,7 +382,10 @@ export class ClaudeModelFallbackTracker {
    *  records are skipped outright: a sub-agent fell back on its own and the
    *  main session model is untouched. A session-scoped record that is NOT a
    *  live Fable fallback still counts — it reports `fallback: null`, the
-   *  positive "no notice here" the daemon clears on. */
+   *  positive "no notice here" the daemon clears on.
+   *
+   *  Whatever the batch holds, the NEWEST session-scoped record in it decides:
+   *  an older one is only reported when no newer record follows it here. */
   observe(events: readonly TranscriptEvent[]): ModelFallbackObservation | null {
     let fallback: ClaudeModelFallbackRecord | null | undefined;
     let servingModel: string | undefined;
@@ -399,7 +402,16 @@ export class ClaudeModelFallbackTracker {
         // reset would let one of those older replies reach the daemon as
         // "Claude answered on a different model".
         servingModel = undefined;
-        if (this.seenUuids.has(rec.uuid)) continue;
+        if (this.seenUuids.has(rec.uuid)) {
+          // Already reported — but it is still the record that DECIDES, so an
+          // OLDER one earlier in the same batch must not outlive it. A drain
+          // from offset 0 (a jsonl switch, a truncation re-read) replays the
+          // whole file, and the older record is unseen whenever it predates
+          // this worker's baseline: without this reset the batch would report
+          // it and resurrect a notice the newest record already retired.
+          fallback = undefined;
+          continue;
+        }
         this.acceptSwitch(rec.uuid);
         fallback = noticeFromSessionRecord(rec);
         continue;
