@@ -66,6 +66,40 @@ export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
   bytedcli: { supportsBotIdentity: false },
 };
 
+/**
+ * How well the on-disk token store is actually protected for this session.
+ *
+ * An honest report, not a reassurance. Botmux stores each person's token as a
+ * 0600 file owned by the OS user — but the agent's CLI runs as that same OS
+ * user, so without the file sandbox it can simply read every token file in
+ * `~/.botmux/data/`. The per-person storage still fixes attribution and the
+ * overwrite bug, and the wrapper still injects only the current sender's
+ * credentials; what is missing is any barrier against an agent that goes
+ * looking on its own.
+ *
+ * With the sandbox on, the whole data dir is deny-by-default and only this
+ * session's own identity file is granted — the boundary is then enforced by the
+ * OS rather than by convention.
+ *
+ * Callers surface this so an operator can decide; it deliberately does not gate
+ * the feature. Refusing to run without a sandbox would push people away from a
+ * change that is an improvement either way, and claiming isolation we do not
+ * have would be worse than both.
+ */
+export function tokenStoreProtection(sandboxEnabled: boolean): {
+  enforced: boolean;
+  advisory?: string;
+} {
+  if (sandboxEnabled) return { enforced: true };
+  return {
+    enforced: false,
+    advisory:
+      'token 文件按人隔离，但未开启文件沙盒：agent 与 botmux 跑在同一个系统用户下，'
+      + '有能力直接读取 ~/.botmux/data/ 里其他人的 token 文件。'
+      + '归因与覆盖问题已解决；要让隔离由操作系统强制，请为本 bot 开启 sandbox。',
+  };
+}
+
 export class TriggerUserAuthConfigError extends Error {
   constructor(message: string) {
     super(message);

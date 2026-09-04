@@ -22,6 +22,7 @@ import {
   unauthorizedOutcomeFor,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
+  tokenStoreProtection,
 } from '../src/services/trigger-user-auth.js';
 
 describe('parseTriggerUserAuthConfig', () => {
@@ -136,5 +137,24 @@ describe('unauthorizedOutcomeFor', () => {
     for (const tool of TRIGGER_USER_AUTH_TOOLS) {
       expect(unauthorizedOutcomeFor(config, tool)).toBe('fail');
     }
+  });
+});
+
+// An honest report, not a reassurance. Botmux keeps each token 0600, but the
+// agent runs as the SAME OS user, so without the file sandbox it can read every
+// person's token file directly. Per-person storage still fixes attribution and
+// the overwrite bug; only the sandbox makes the isolation OS-enforced.
+describe('tokenStoreProtection', () => {
+  it('reports enforced only when the file sandbox is on', () => {
+    expect(tokenStoreProtection(true)).toEqual({ enforced: true });
+  });
+
+  it('admits the gap when there is no sandbox, and names the fix', () => {
+    const report = tokenStoreProtection(false);
+    expect(report.enforced).toBe(false);
+    expect(report.advisory).toContain('sandbox');
+    // It must say what an agent can actually do, not just that something is
+    // "less secure" — an operator cannot weigh a vague warning.
+    expect(report.advisory).toContain('同一个系统用户');
   });
 });
