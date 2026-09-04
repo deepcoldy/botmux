@@ -114,6 +114,22 @@ export interface HerdrTraexPluginRuntimeConfig {
   ref: string;
 }
 
+/** Startup-only handoff for a local companion process.
+ *
+ * This is deliberately a path, not a secret value: Botmux does not read,
+ * validate, log, or fall back to the Dashboard/internal HMAC secret. */
+export interface CompanionStartupConfig {
+  secretFile: string | undefined;
+}
+
+/** The sole supported private secret-file configuration input. */
+export const COMPANION_SECRET_FILE_ENV = 'BOTMUX_COMPANION_SECRET_FILE';
+
+/** Resolve the fixed scoped startup handoff without touching the secret file. */
+export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.env): CompanionStartupConfig {
+  return { secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]) };
+}
+
 /**
  * Current-chat bot discovery via Lark `/members/bots`.
  *
@@ -274,6 +290,10 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
+  // A local companion process consumes this typed handoff. Keep it separate
+  // from dashboard/daemon HMAC configuration: there is intentionally no
+  // default path and therefore no credential reuse.
+  companion: resolveCompanionStartupConfig(),
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input

@@ -24,6 +24,7 @@ import {
 } from '../src/utils/child-env.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
 describe('applySessionOwnerEnv()', () => {
@@ -88,6 +89,13 @@ describe('redactChildEnv()', () => {
     }
     // Behavior knob, not an identity marker — must survive.
     expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('removes the companion secret-file path from child env', () => {
+    const out = redactChildEnv({ [COMPANION_SECRET_FILE_ENV]: '/run/secrets/botmux/companion', KEEP: 'v' });
+    expect(COMPANION_SECRET_FILE_ENV in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_SECRET_FILE_ENV);
     expect(out.KEEP).toBe('v');
   });
 
