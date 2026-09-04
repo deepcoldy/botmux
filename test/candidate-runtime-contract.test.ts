@@ -3,6 +3,8 @@ import { execFile, execFileSync } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -528,6 +530,86 @@ process.exit(result.status ?? 1);
     });
     expect(evidence.transitions.map((transition: { status: string }) => transition.status))
       .toEqual(['starting', 'ready', 'accepted', 'responded']);
+  });
+
+  it('links the host byte-cli credential store into the isolated HOME', () => {
+    const { root, contract } = fixture();
+    const hostHome = join(root, 'host-home');
+    mkdirSync(join(hostHome, '.byte_cli', 'auth'), { recursive: true });
+    writeFileSync(join(hostHome, '.byte_cli', 'auth', 'user_jwt_cn.json'), '{"jwt":"fixture"}\n');
+
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-credential-seed',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    const link = join(runtime.home, '.byte_cli', 'auth');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(realpathSync(link)).toBe(realpathSync(join(hostHome, '.byte_cli', 'auth')));
+    expect(readFileSync(join(link, 'user_jwt_cn.json'), 'utf8')).toContain('fixture');
+
+    // Resume is idempotent: the same binding validates instead of conflicting.
+    const resumed = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-credential-seed',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    expect(lstatSync(join(resumed.home, '.byte_cli', 'auth')).isSymbolicLink()).toBe(true);
+  });
+
+  it('skips credential seeding when the host store is absent and never destroys live state', () => {
+    const { root, contract } = fixture();
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-credential-absent',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: join(root, 'no-such-host-home'),
+    }, botmuxIdentity(contract));
+    expect(existsSync(join(runtime.home, '.byte_cli'))).toBe(false);
+
+    // A legacy home with a live (non-empty) local auth directory is kept.
+    mkdirSync(join(runtime.home, '.byte_cli', 'auth'), { recursive: true });
+    writeFileSync(join(runtime.home, '.byte_cli', 'auth', 'local.json'), '{}\n');
+    const hostHome = join(root, 'host-home-2');
+    mkdirSync(join(hostHome, '.byte_cli', 'auth'), { recursive: true });
+    prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-credential-absent',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    const link = join(runtime.home, '.byte_cli', 'auth');
+    expect(lstatSync(link).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(link, 'local.json'), 'utf8')).toBe('{}\n');
+  });
+
+  it('replaces an empty legacy auth directory with the host credential link', () => {
+    const { root, contract } = fixture();
+    const hostHome = join(root, 'host-home-3');
+    mkdirSync(join(hostHome, '.byte_cli', 'auth'), { recursive: true });
+    const legacyHome = join(root, 'candidate-runtime', 'session-credential-legacy', 'home');
+    mkdirSync(join(legacyHome, '.byte_cli', 'auth'), { recursive: true });
+
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-credential-legacy',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    expect(runtime.home).toBe(legacyHome);
+    expect(lstatSync(join(runtime.home, '.byte_cli', 'auth')).isSymbolicLink()).toBe(true);
   });
 
   it('keeps probe state errors non-fatal across a second turn and a replay attempt', () => {

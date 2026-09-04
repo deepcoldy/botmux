@@ -12,6 +12,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  rmdirSync,
   statSync,
   symlinkSync,
 } from 'node:fs';
@@ -731,6 +732,7 @@ export function prepareCandidateCocoHome(input: {
   sessionId: string;
   authFile?: string;
   cocoCacheRoot?: string;
+  credentialHome?: string;
 }, botmuxIdentity: CandidateBotmuxIdentityOptions = {}): {
   home: string;
   traeHome: string;
@@ -760,6 +762,7 @@ export function prepareCandidateCocoHome(input: {
     copyFileSync(authFile, target);
     chmodSync(target, 0o600);
   }
+  linkEmployeeCredentialAuth(home, input.credentialHome);
   // The transcript bridge intentionally shares Coco's cache only. It contains
   // the long-lived Session event stream that BotMux must drain; Memory and
   // Skills live under TRAE_HOME and remain isolated above.
@@ -790,12 +793,49 @@ export function prepareCandidateCocoHome(input: {
   };
 }
 
+// Employee evidence skills (argos-log / tce-query) authenticate through
+// byte-cli, which resolves its credential store as $HOME/.byte_cli/auth. The
+// host store is maintained by the credential vault and rotates hourly, so the
+// isolated HOME gets a symlink to the host auth directory — rotation
+// propagates without re-seeding, and executor log writes stay local. A
+// pre-existing real auth directory (legacy session homes created before
+// seeding existed) is replaced only when empty; a non-empty one is left
+// untouched so live session state is never destroyed mid-flight.
+function linkEmployeeCredentialAuth(home: string, hostHome: string = homedir()): void {
+  const hostAuth = join(hostHome, '.byte_cli', 'auth');
+  if (!existsSync(hostAuth) || !lstatSync(hostAuth).isDirectory()) return;
+  const target = join(home, '.byte_cli');
+  const link = join(target, 'auth');
+  let existing: ReturnType<typeof lstatSync> | null = null;
+  try {
+    existing = lstatSync(link);
+  } catch {
+    existing = null;
+  }
+  if (existing) {
+    if (existing.isSymbolicLink()) {
+      if (realpathSync(link) !== realpathSync(hostAuth)) {
+        throw new Error(`Candidate credential binding conflicts at ${link}`);
+      }
+      return;
+    }
+    if (existing.isDirectory() && readdirSync(link).length === 0) {
+      rmdirSync(link);
+    } else {
+      return;
+    }
+  }
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  symlinkSync(hostAuth, link, 'dir');
+}
+
 export function prepareCandidateRuntimeHome(input: {
   contract: CandidateRuntimeContract;
   dataDir: string;
   sessionId: string;
   authFile?: string;
   cocoCacheRoot?: string;
+  credentialHome?: string;
 }, botmuxIdentity: CandidateBotmuxIdentityOptions = {}): {
   home: string;
   runtimeHome: string;
@@ -833,6 +873,7 @@ export function prepareCandidateRuntimeHome(input: {
     copyFileSync(authFile, target);
     chmodSync(target, 0o600);
   }
+  linkEmployeeCredentialAuth(home, input.credentialHome);
   return {
     home,
     runtimeHome,
