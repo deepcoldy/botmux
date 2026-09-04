@@ -626,7 +626,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -648,7 +648,10 @@ export async function downloadResources(larkAppId: string, messageId: string, re
     const savePath = join(dir, res.name);
     try {
       const resMessageId = res.messageId ?? messageId;
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
+      // Whose token backs the user-token fallback: the person who sent the
+      // attachment. They can see what they just posted, and the download is
+      // attributed to them rather than to whoever happens to be logged in.
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.

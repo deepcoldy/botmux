@@ -18294,7 +18294,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources, senderOpenId);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -19879,11 +19879,14 @@ async function handleThreadReplyAdmitted(
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  // Same value the turn record below is built from; read here because the
+  // user-token fallback for a download should use the SENDER's own credentials.
+  const inboundSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   let attachments: LarkAttachment[];
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
     if (attachments.length > 0) {
       parsed.attachments = attachments;
@@ -19896,7 +19899,7 @@ async function handleThreadReplyAdmitted(
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
-  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const callerOpenId = inboundSenderOpenId;
   if (ds) {
     markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
