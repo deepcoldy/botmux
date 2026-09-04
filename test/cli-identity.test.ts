@@ -27,6 +27,8 @@ import {
   sessionIdentityPath,
   installIdentityWrapper,
   identityWrapperInstalled,
+  renderGitAskpassScript,
+  installGitAskpass,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -248,5 +250,68 @@ describe('installIdentityWrapper', () => {
     const binDir = join(dir, 'bin');
     expect(installIdentityWrapper(binDir, 'bytedcli', null)).toBeNull();
     expect(identityWrapperInstalled(binDir, 'bytedcli')).toBe(false);
+  });
+});
+
+// Git over HTTPS to Codebase authenticates with a Codebase JWT, which git mints
+// via GIT_ASKPASS and which reads none of the identity env vars. Without this
+// helper, work pushed on someone's behalf would carry the machine's identity —
+// and "who opened this MR" is the attribution that matters most.
+describe('renderGitAskpassScript / installGitAskpass', () => {
+  function runAskpass(scriptPath: string, prompt: string): string {
+    return execFileSync('/bin/sh', [scriptPath, prompt], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin' },
+    });
+  }
+
+  it('answers the username prompt with git\'s expected sentinel', () => {
+    const p = join(dir, 'askpass');
+    writeFileSync(p, renderGitAskpassScript('/bin/false'));
+    expect(runAskpass(p, "Username for 'https://code.byted.org': ")).toBe('x-access-token');
+  });
+
+  // Parses the real bytedcli response shape: {"status":…,"data":{"jwt":"…"}}.
+  it('extracts the JWT for the password prompt', () => {
+    const stub = join(dir, 'bytedcli-stub.sh');
+    writeFileSync(stub, '#!/bin/sh\nprintf \'%s\' \'{"status":"success","data":{"jwt":"a.b.c"},"error":null}\'\n');
+    chmodSync(stub, 0o755);
+    const p = join(dir, 'askpass');
+    writeFileSync(p, renderGitAskpassScript(stub));
+    expect(runAskpass(p, "Password for 'https://x@code.byted.org': ")).toBe('a.b.c');
+  });
+
+  // No credentials must produce an empty answer, which git reports as an auth
+  // failure — not a shell error that looks like a botmux bug.
+  it('answers empty when no JWT can be minted', () => {
+    const stub = join(dir, 'failing.sh');
+    writeFileSync(stub, '#!/bin/sh\nexit 1\n');
+    chmodSync(stub, 0o755);
+    const p = join(dir, 'askpass');
+    writeFileSync(p, renderGitAskpassScript(stub));
+    expect(runAskpass(p, 'Password: ')).toBe('');
+  });
+
+  // Pointing at the WRAPPED bytedcli is what makes git inherit the per-turn
+  // identity — a helper aimed at the real binary would silently use the
+  // machine's own SSO session instead.
+  it('installs pointing at the wrapped bytedcli, not the real binary', () => {
+    const binDir = join(dir, 'bin');
+    const path = installGitAskpass(binDir, true);
+    expect(path).toBe(join(binDir, 'botmux-git-askpass'));
+    expect(readFileSync(path!, 'utf8')).toContain(join(binDir, 'bytedcli'));
+    expect(statSync(path!).mode & 0o777).toBe(0o755);
+  });
+
+  it('installs nothing when bytedcli is not wrapped for this session', () => {
+    expect(installGitAskpass(join(dir, 'bin'), false)).toBeNull();
+  });
+
+  // A JWT in a remote URL would persist in .git/config and leak into any error
+  // message git prints.
+  it('never embeds the token in a URL or writes it to disk', () => {
+    const script = renderGitAskpassScript('/usr/local/bin/bytedcli');
+    expect(script).not.toMatch(/https:\/\/\S*\$/);
+    expect(script).not.toMatch(/>\s*\/tmp|>\s*\$TMPDIR|tee /);
   });
 });

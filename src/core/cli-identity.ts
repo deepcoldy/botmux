@@ -279,6 +279,66 @@ export function installIdentityWrapper(
 }
 
 /**
+ * Git credential helper, so a push is attributed to the person who asked for it.
+ *
+ * `git` over HTTPS to Codebase authenticates with a Codebase JWT, which is
+ * derived from the acting ByteCloud identity. It does not read any of the env
+ * vars above, so without this a commit pushed on someone's behalf would carry
+ * the machine's identity — and "who opened this MR" is exactly the attribution
+ * this feature exists to fix.
+ *
+ * The script asks the WRAPPED `bytedcli` for the token, which means it inherits
+ * the per-turn identity for free: no second credential path to keep in sync, and
+ * nothing here needs to know whose turn it is.
+ *
+ * `GIT_ASKPASS` is called once for the username and once for the password, with
+ * the prompt text as $1 — matching on "Username" is git's own contract.
+ *
+ * Deliberately: the JWT is fetched fresh per invocation and never written to
+ * disk, never placed in a URL, and never logged. A JWT embedded in a remote URL
+ * would persist in `.git/config` and in any error message git prints.
+ */
+export function renderGitAskpassScript(bytedcliPath: string): string {
+  return [
+    '#!/bin/sh',
+    '# botmux trigger-user git credential helper — generated, do not edit.',
+    '# Answers git\'s username/password prompts with a Codebase JWT minted for the',
+    '# CURRENT acting identity, so a push is attributed to the person who asked.',
+    'case "$1" in',
+    '  *Username*) printf %s x-access-token ;;',
+    // -j keeps the output machine-readable. The response shape is
+    // `{"status":…,"data":{"jwt":"…"}}` (verified against bytedcli 0.x), and the
+    // token goes straight to git on stdout without touching disk.
+    `  *) ${shellSingleQuote(bytedcliPath)} -j auth get-codebase-jwt-token 2>/dev/null \\`,
+    '       | sed -n \'s/.*"jwt"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' ;;',
+    'esac',
+    '',
+  ].join('\n');
+}
+
+/** Filename of the git askpass helper inside a session's wrapper dir. */
+export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
+
+/**
+ * Install the git askpass helper next to the tool wrappers.
+ *
+ * Points at the WRAPPED bytedcli (inside `binDir`) rather than the real binary,
+ * so the identity file is consulted on every git operation just as it is for a
+ * direct `bytedcli` call.
+ *
+ * Returns the helper path, or null when bytedcli is not wrapped for this session
+ * — without it there is no way to mint a JWT, and a helper that always failed
+ * would turn "no credentials" into an opaque git error.
+ */
+export function installGitAskpass(binDir: string, wrappedBytedcliInstalled: boolean): string | null {
+  if (!wrappedBytedcliInstalled) return null;
+  mkdirSync(binDir, { recursive: true });
+  const path = join(binDir, GIT_ASKPASS_BASENAME);
+  atomicWriteFileSync(path, renderGitAskpassScript(join(binDir, 'bytedcli')), { mode: 0o755 });
+  return path;
+}
+
+/**
  * Locate the real tool binary, skipping any botmux wrapper.
  *
  * `which` would happily return our own wrapper once it is on PATH, producing a
