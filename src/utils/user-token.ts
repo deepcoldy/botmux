@@ -202,18 +202,23 @@ function tokenMatches(t: TokenStore, appId: string, brand: Brand): boolean {
  *
  * 不传 `openId`（bot 级取，旧行为）：per-app 文件 → 旧单文件，都过
  * {@link tokenMatches} 校验（文件名 + 内容双重把关）。
+ *
+ * `allowUnattributed` 是给「owner 个人功能」开的一道窄口子（见
+ * {@link resolveOwnerUserToken}），普通按人取绝不能打开。
  */
 function loadTokenForApp(
   appId: string,
   brand: Brand,
   openId?: string,
+  allowUnattributed = false,
 ): { token: TokenStore; source: string } | null {
   if (isUsableOpenId(openId)) {
     const perPerson = loadTokenFromPath(tokenPathForApp(appId, openId));
     if (perPerson && tokenMatches(perPerson, appId, brand) && perPerson.openId === openId) {
       return { token: perPerson, source: 'botmux' };
     }
-    return null;
+    if (!allowUnattributed) return null;
+    // 落到下面的 per-app / legacy 查找。
   }
   const perApp = loadTokenFromPath(tokenPathForApp(appId));
   if (perApp && tokenMatches(perApp, appId, brand)) return { token: perApp, source: 'botmux' };
@@ -303,6 +308,49 @@ async function refreshToken(
 // ─── Public API: resolve token ────────────────────────────────────────────────
 
 /**
+ * Owner 个人功能专用的 token 解析（目前只有飞书「消息分组」标签）。
+ *
+ * 这类功能操作的是 owner 自己的收件箱侧边栏，bot 没有收件箱，所以它天然只能用
+ * owner 本人的 token。与 {@link resolveUserToken} 的严格按人取相比，这里额外接受
+ * **未标注归属的旧 per-app 文件**：升级前这些文件事实上就是 owner 自己 /login 写
+ * 的，拒绝它们会让存量安装的标签功能在升级后静默失效。
+ *
+ * 这道口子只对 owner 开：ownerOpenId 由 bot 配置决定，不来自消息，所以不存在
+ * 「借用别人凭证」的路径。任何按消息发送者取凭证的地方都必须用
+ * {@link resolveUserToken}。
+ */
+export async function resolveOwnerUserToken(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  ownerOpenId?: string,
+): Promise<string | null> {
+  return resolveTokenFrom(loadTokenForApp(appId, brand, ownerOpenId, true), appId, appSecret, brand);
+}
+
+/** {@link resolveUserToken} / {@link resolveOwnerUserToken} 共用的过期与刷新处理。 */
+async function resolveTokenFrom(
+  loaded: { token: TokenStore; source: string } | null,
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+): Promise<string | null> {
+  if (!loaded) return null;
+  const { token } = loaded;
+
+  if (isValid(token.expires_at)) return token.access_token;
+
+  // access_token expired — try refresh
+  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
+    const refreshed = await refreshToken(token, appId, appSecret, brand);
+    if (refreshed) return refreshed.access_token;
+  }
+
+  logger.debug('[user-token] Token expired and refresh_token also expired');
+  return null;
+}
+
+/**
  * Resolve a valid User Access Token.
  *
  * `openId` 给定时按人取：只接受属于那个人的 token，取不到就返回 null（调用方负责
@@ -320,23 +368,7 @@ export async function resolveUserToken(
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  const loaded = loadTokenForApp(appId, brand, openId);
-  if (!loaded) return null;
-
-  const { token } = loaded;
-
-  if (isValid(token.expires_at)) {
-    return token.access_token;
-  }
-
-  // access_token expired — try refresh
-  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand);
-    if (refreshed) return refreshed.access_token;
-  }
-
-  logger.debug('[user-token] Token expired and refresh_token also expired');
-  return null;
+  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand);
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
@@ -485,10 +517,12 @@ export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleR
 export function getFeedGroupAuthStatus(
   appId: string,
   brand: Brand = 'feishu',
-  openId?: string,
+  ownerOpenId?: string,
 ): { authorized: boolean; expiresAt?: string } {
   try {
-    const loaded = loadTokenForApp(appId, brand, openId);
+    // 与 resolveOwnerUserToken 同一条口径：优先 owner 自己的文件，回落到未标注归属
+    // 的旧 per-app 文件，否则存量安装升级后徽标会莫名变成「未授权」。
+    const loaded = loadTokenForApp(appId, brand, ownerOpenId, true);
     if (!loaded) return { authorized: false };
     const token = loaded.token;
     const scopes = (token.scope ?? '').split(/\s+/);

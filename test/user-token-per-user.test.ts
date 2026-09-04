@@ -179,3 +179,34 @@ describe('listAuthorizedUsers', () => {
     expect(listAuthorizedUsers('cli_nobody', 'feishu')).toEqual([]);
   });
 });
+
+describe('resolveOwnerUserToken — the one narrow fallback', () => {
+  beforeEach(() => { files.clear(); });
+
+  // Feed-group labels live in the OWNER's own sidebar; a bot has no inbox, so
+  // this call can only ever mean "as the owner". Existing installs stored the
+  // owner's token in the unattributed per-app file, and refusing it would make
+  // the label feature silently stop working right after an upgrade.
+  it('accepts an unattributed per-app file as the owner', async () => {
+    files.set(perAppPath(APP), tokenFor({ access_token: 'TOK_OLD_OWNER', appId: APP, brand: 'feishu' }));
+    const { resolveOwnerUserToken, resolveUserToken } = await fresh();
+    expect(await resolveOwnerUserToken(APP, 'sec', 'feishu', ALICE)).toBe('TOK_OLD_OWNER');
+    // The strict per-person path still refuses it — the fallback is owner-only.
+    expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBeNull();
+  });
+
+  it('prefers the owner\'s own file over the unattributed one', async () => {
+    files.set(perAppPath(APP), tokenFor({ access_token: 'TOK_OLD', appId: APP, brand: 'feishu' }));
+    files.set(perUserPath(APP, ALICE), tokenFor({ access_token: 'TOK_ALICE', appId: APP, brand: 'feishu', openId: ALICE }));
+    const { resolveOwnerUserToken } = await fresh();
+    expect(await resolveOwnerUserToken(APP, 'sec', 'feishu', ALICE)).toBe('TOK_ALICE');
+  });
+
+  // The fallback widens WHICH FILE counts as the owner's, never WHOSE identity
+  // may be borrowed: another named person's file is still off limits.
+  it('never falls back to a different named person', async () => {
+    files.set(perUserPath(APP, BOB), tokenFor({ access_token: 'TOK_BOB', appId: APP, brand: 'feishu', openId: BOB }));
+    const { resolveOwnerUserToken } = await fresh();
+    expect(await resolveOwnerUserToken(APP, 'sec', 'feishu', ALICE)).toBeNull();
+  });
+});

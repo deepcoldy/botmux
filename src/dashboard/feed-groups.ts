@@ -1,6 +1,6 @@
 import type { BotConfig } from '../bot-registry.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
-import { resolveUserToken } from '../utils/user-token.js';
+import { resolveOwnerUserToken } from '../utils/user-token.js';
 
 export const FEED_GROUP_SCOPES = ['im:feed_group_v1:read', 'im:feed_group_v1:write'] as const;
 
@@ -27,13 +27,14 @@ type ApiEnvelope = {
 };
 
 async function userApi(
-  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>,
+  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand' | 'ownerOpenId'>,
   path: string,
   init: RequestInit,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, unknown>> {
   const brand = normalizeBrand(bot.brand);
-  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, brand);
+  // 「消息分组」只存在于某个人的收件箱里 —— 始终用 owner 本人的 token。
+  const token = await resolveOwnerUserToken(bot.larkAppId, bot.larkAppSecret, brand, bot.ownerOpenId);
   if (!token) throw new FeedGroupApiError('尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。', 'user_login_required', 401);
   const response = await fetchImpl(`${larkHosts(brand).openApi}${path}`, {
     ...init,
