@@ -224,11 +224,16 @@ export const messages: Record<string, string> = {
   'card.quote.toast_no_session': 'No active session here to read the topic into.',
   'card.quote.toast_empty_topic': 'That topic has no readable text messages.',
   'card.quote.toast_busy': 'The session is still working on the previous message; try again once it is idle.',
-  'card.quote.toast_reading': 'Reading the topic…',
-  'cmd.quote.no_chat': '⚠️ /quote only works in a group chat.',
-  'cmd.quote.reading': '📖 Reading topic "{title}"…',
+  // Promise only what the code checks: this branch fires when no chatId could
+  // be resolved. A p2p chat HAS a real chatId, so it never lands here — a DM
+  // simply has no 话题 and falls through to card.quote.empty. The former
+  // wording ("only works in a group chat") was an unimplemented promise.
+  'cmd.quote.no_chat': '⚠️ /quote needs a chat it can resolve a session in (no chat info available here).',
   'cmd.quote.injected': '📖 Read {count} messages from topic "{title}" into this session.',
   'cmd.quote.injected_truncated': '📖 Read topic "{title}" into this session: {total} messages total, only the latest {count} included due to length ({dropped} older ones omitted).',
+  // Used when the FETCH itself hit the cap: the real total is unavailable, so
+  // never print a number derived from the fetch limit.
+  'cmd.quote.injected_truncated_unknown': '📖 Read topic "{title}" into this session: it has more than {count} messages; only the latest {count} were included (the number of older ones is unknown).',
 
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 Pick a session to relay into this chat',

@@ -160,7 +160,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist', '/quote']);
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -4504,7 +4504,20 @@ export async function handleCommand(
           topics, chatId, rootId, operatorOpenId, loc, undefined, followUpToken, 'public',
           currentContainerIds.filter(Boolean).join(','),
         );
-        await sessionReply(rootId, card, 'interactive');
+        // 回在用户敲 /quote 的地方，而不是 sessionReply 决定的落点。chat-scope
+        // 群里 sessionReply 会把卡片发到群顶层（或当前 turn 的话题），都可能不是
+        // 用户发命令的位置——/relay 为同一问题自建了 replyAtInvocation（见该分支
+        // 注释里的线上反馈）。这里用引用回复钉在命令消息上：卡片上的按钮回调靠
+        // value 里的 chat_id/root_id 定位，与消息落点无关，所以钉住是安全的。
+        try {
+          const { replyMessage } = await import('../im/lark/client.js');
+          await replyMessage(appId, message.messageId, card, 'interactive', /*replyInThread*/ false);
+        } catch (err) {
+          // 命令消息被撤回等情况下 reply 会失败——回落到 sessionReply，宁可落点
+          // 不理想也要把卡片发出去。
+          logger.warn(`[${logTag}] /quote reply-at-invocation failed (${err instanceof Error ? err.message : err}); falling back to sessionReply`);
+          await sessionReply(rootId, card, 'interactive');
+        }
         break;
       }
 

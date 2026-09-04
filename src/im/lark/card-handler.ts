@@ -1707,25 +1707,38 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (busy) {
       return { toast: { type: 'warning', content: t('card.quote.toast_busy', undefined, loc) } };
     }
+    // Protected-state gate, BEFORE the fetch and before the follow-up token is
+    // consumed. The busy check above only reads `worker` + `lastScreenStatus`,
+    // and every protected mutation state (pendingRepoSetup / queued activation
+    // tail / queued backlog / an open Codex-App ledger) looks *idle* in both of
+    // those fields — so without this a click during one of them would reach the
+    // cold-fork branch, be refused there, and still report success.
+    // Same gate retry_last_task / retry_turn / voice_summary put in front of
+    // their own fork paths.
+    if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+      return { toast: { type: 'warning', content: t('card.quote.toast_busy', undefined, loc) } };
+    }
 
     const { listMessagesByThreadId, listThreadMessages } = await import('./client.js');
     const { renderQuoteTranscript, QUOTE_TRANSCRIPT_MAX_MESSAGES } = await import('../../services/quote-transcript.js');
     const { takeQuoteFollowUp } = await import('../../services/quote-topic-picker.js');
+    // Ask for one more than we render. That extra item is a HAS-MORE probe, not
+    // a count: if it comes back full we know the 话题 is longer than the cap but
+    // NOT by how much, so the renderer must not print a total (see fetchCapped).
+    const fetchLimit = QUOTE_TRANSCRIPT_MAX_MESSAGES + 1;
     let raw: any[];
     try {
       // A thread container is addressed directly by its omt_ id; a 普通群
       // reply chain has no thread and is walked by its root message instead.
-      // Fetch one message more than we will render so the header can report
-      // an accurate "N total" for a 话题 that overflows the cap.
       raw = containerKind === 'thread'
-        ? await listMessagesByThreadId(larkAppId, containerId, QUOTE_TRANSCRIPT_MAX_MESSAGES + 1)
-        : await listThreadMessages(larkAppId, chatId, containerId, QUOTE_TRANSCRIPT_MAX_MESSAGES + 1);
+        ? await listMessagesByThreadId(larkAppId, containerId, fetchLimit)
+        : await listThreadMessages(larkAppId, chatId, containerId, fetchLimit);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote read failed: ${err instanceof Error ? err.message : err}`);
       return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc) } };
     }
     const followUp = takeQuoteFollowUp(value.follow_up as string | undefined);
-    const transcript = renderQuoteTranscript(raw, topicTitle, followUp);
+    const transcript = renderQuoteTranscript(raw, topicTitle, followUp, raw.length >= fetchLimit);
     if (transcript.rendered === 0) {
       return { toast: { type: 'warning', content: t('card.quote.toast_empty_topic', undefined, loc) } };
     }
@@ -1746,9 +1759,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
+      // Cold session: fork a worker with the transcript as its opening input,
+      // matching how retry_last_task revives a dead worker. `forkWorker` throws
+      // on refusal rather than returning a flag, so acceptance is claimed only
+      // after it returns — the earlier `accepted = true` before the call would
+      // have reported success for a fork that never happened, with the
+      // one-shot follow-up token already consumed and no retry affordance.
       else {
-        // Cold session: fork a worker with the transcript as its opening
-        // input, matching how retry_last_task revives a dead worker.
         forkWorker(ds, cliInput, ds.hasHistory);
         accepted = true;
       }
@@ -1758,20 +1775,48 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!accepted) {
       return { toast: { type: 'error', content: t('card.quote.toast_busy', undefined, loc) } };
     }
+    // Turn bookkeeping — the same set retry_last_task arms. Without it this
+    // injected turn is invisible to the card lifecycle: no fresh streaming card
+    // (the first screen_update PATCHes the PREVIOUS turn's card), a stale
+    // currentTurnTitle in the card and dashboard, and `retry_last_task` would
+    // replay whatever ran before the quote.
+    //
+    // rememberLastCliInput is load-bearing beyond `lastCliInput`: it is the ONLY
+    // place in the repo that clears `suppressRecoveryCard`, the flag a
+    // post-restart recovered session carries to stay quiet. A session that is
+    // only ever driven through /quote would keep that flag forever — final text
+    // answers still arrive, but its streaming card is permanently dead with no
+    // visible cause and no way for the user to revive it.
+    rememberLastCliInput(ds, transcript.text, cliInput);
     ds.lastScreenStatus = 'working';
-    logger.info(`[${tag(ds)}] /quote injected topic ${containerId} (${transcript.rendered} msgs, dropped ${transcript.dropped})`);
+    ds.streamCardPending = true;
+    ds.currentTurnId = turnId;
+    ds.currentTurnTitle = topicTitle.slice(0, 50);
+    ds.currentImageKey = undefined;
+    persistStreamCardState(ds);
+    logger.info(`[${tag(ds)}] /quote injected topic ${containerId} (${transcript.rendered} msgs, dropped ${transcript.dropped}${transcript.totalUnknown ? ', total unknown' : ''})`);
     // Replace the picker with a plain receipt. Leaving the card live would
     // invite a second click that re-injects the same transcript.
+    //
+    // Three receipts, not two: when the fetch itself was capped the real total
+    // is unknown, and the "共 N 条" wording would state a number derived from
+    // the fetch limit. A confident wrong number is believed more readily than
+    // an admitted unknown.
     await sessionReply(
       rootId,
-      transcript.dropped > 0
-        ? t('cmd.quote.injected_truncated', {
-            title: topicTitle,
-            total: transcript.rendered + transcript.dropped,
-            count: transcript.rendered,
-            dropped: transcript.dropped,
-          }, loc)
-        : t('cmd.quote.injected', { title: topicTitle, count: transcript.rendered }, loc),
+      transcript.dropped === 0
+        ? t('cmd.quote.injected', { title: topicTitle, count: transcript.rendered }, loc)
+        : transcript.totalUnknown
+          ? t('cmd.quote.injected_truncated_unknown', {
+              title: topicTitle,
+              count: transcript.rendered,
+            }, loc)
+          : t('cmd.quote.injected_truncated', {
+              title: topicTitle,
+              total: transcript.rendered + transcript.dropped,
+              count: transcript.rendered,
+              dropped: transcript.dropped,
+            }, loc),
     );
     if (cardMessageId) deleteMessage(larkAppId, cardMessageId);
     return;
@@ -2144,7 +2189,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`

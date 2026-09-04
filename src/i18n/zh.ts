@@ -227,11 +227,14 @@ export const messages: Record<string, string> = {
   'card.quote.toast_no_session': '当前话题没有活跃会话，无法把内容读进去。',
   'card.quote.toast_empty_topic': '这个话题里没有可读取的文本消息。',
   'card.quote.toast_busy': '会话正在处理上一条消息，请等它空闲后再读取。',
-  'card.quote.toast_reading': '正在读取话题…',
-  'cmd.quote.no_chat': '⚠️ /quote 只能在群聊里使用。',
-  'cmd.quote.reading': '📖 正在读取话题「{title}」…',
+  // 文案只承诺代码真正检查的东西：这里只判 chatId 是否解析得到（p2p 也有真实
+  // chatId，因此进不了这条分支）。单聊不会报错，只是没有话题，最终落到
+  // card.quote.empty。原文案写「只能在群聊里使用」，是代码没有实现的承诺。
+  'cmd.quote.no_chat': '⚠️ /quote 需要在能定位到会话的聊天里使用（当前拿不到 chat 信息）。',
   'cmd.quote.injected': '📖 已把话题「{title}」的 {count} 条消息读进本会话。',
   'cmd.quote.injected_truncated': '📖 已把话题「{title}」读进本会话：共 {total} 条，因长度限制只放入最近 {count} 条（较早的 {dropped} 条未包含）。',
+  // 取数本身被上限截断时用这条：真实总条数拿不到，绝不能报一个由取数上限推出的数字。
+  'cmd.quote.injected_truncated_unknown': '📖 已把话题「{title}」读进本会话：该话题超过 {count} 条，只放入了最近 {count} 条，更早的未包含（更早的条数未知）。',
 
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 选择要接力到本群的会话',

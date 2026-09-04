@@ -699,8 +699,12 @@ export async function getAvailableBots(
 /** XML-escape a string for use as element text content or attribute value.
  *  Covers the five XML-mandated entities; sufficient for our use case
  *  (paths, names, open_ids, bot identifiers) since we never embed raw user
- *  input in attribute values. */
-function xmlEscape(s: string): string {
+ *  input in attribute values.
+ *
+ *  Exported for `/quote`, which embeds genuinely untrusted content (message
+ *  bodies and display names from a Feishu 话题) inside a `<quoted_topic>`
+ *  fence. Reuse this rather than adding a third private copy. */
+export function xmlEscape(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
