@@ -50,6 +50,7 @@ describe('daemon discovery', () => {
       ipcPort: 7956,
       bootInstanceId,
       workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
       pid: 123,
@@ -61,6 +62,7 @@ describe('daemon discovery', () => {
       ipcPort: 7956,
       bootInstanceId,
       workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
     })]);

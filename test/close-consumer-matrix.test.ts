@@ -162,6 +162,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '
       + 'rather than closed.',
   },
+  'daemon.ts::cancelSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Authenticated dispatch-launch cancel has no direct UI surface; the '
+      + 'background wrapper logs any refusal or residual remote session.',
+  },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',
     why: 'Typed consumer: refusal never claims fail-closed, residual uses the '
