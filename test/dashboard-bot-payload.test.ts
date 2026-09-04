@@ -7,14 +7,15 @@ describe('dashboard bot payload helpers', () => {
       {
         larkAppId: 'app_contract',
         botName: 'BotContract',
-        cliId: 'codex',
+        cliId: 'traex',
         cliRuntime: { id: 'vendor-codex', executable: 'vendor-codex' },
-        model: 'gpt-5',
+        model: 'GPT-5.6-Sol',
+        modelBackendVariant: 'max',
       },
       {},
     );
     const editableFields = [
-      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'agentSelectionKey', 'online',
+      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'modelBackendVariant', 'agentSelectionKey', 'online',
       'displayName', 'larkBotName',
       'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
       'autoboundChatCount', 'brandLabel',

@@ -2630,7 +2630,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2641,6 +2641,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
+      modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
       turnTimeoutMs: b.turnTimeoutMs,
       dshRuntime: b.dshRuntime,
@@ -2651,12 +2652,12 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2664,6 +2665,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
+    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
     dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
@@ -6253,6 +6255,14 @@ const server = createServer(async (req, res) => {
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
+            // New daemons return explicit null when TraeX inherits its default.
+            // Keep that authoritative instead of reviving a stale bots.json
+            // fallback; older daemons omit the field and retain compatibility.
+            modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
+              ? (j.modelBackendVariant === 'standard' || j.modelBackendVariant === 'max'
+                ? j.modelBackendVariant
+                : undefined)
+              : d.modelBackendVariant,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
             turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
             dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
