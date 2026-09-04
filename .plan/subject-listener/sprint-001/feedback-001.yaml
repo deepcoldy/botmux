@@ -1,0 +1,73 @@
+feedback_NO: '001'
+pass: false
+score: 95
+
+baseline: 'f5fa07bff21174d0678b688cda8784018d538de9'
+
+bugs:
+  - bug: '同一 createTime 且 messageId 不同的候选会无条件覆盖已有 Subject 游标'
+    detail: 'commitSubjectListenerCursor 只拒绝 createTime 更小的候选；时间相等时缺少可证明的消息顺序，却把 om_already_committed 覆盖为 om_unknown_order。'
+    problem_maybe: 'src/services/subject-listener-cursor-store.ts 的单调提交条件只判断 compare(...) < 0。'
+    expect: 'createTime 相等且 messageId 不同时保留当前游标；宁可下一轮重复读取，也不能在无顺序证据时覆盖到潜在旧消息。'
+
+scenarios_result:
+  - id: S-1
+    name: '未被 @ 的消息按已提交游标获得连续飞书上下文'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 6 skipped；只包含游标后且不晚于 trigger 的消息，事件原文去重补尾。'
+  - id: S-2
+    name: '冷启动或游标丢失时使用最近 N 条消息兜底'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 2 passed, 5 skipped；cold_start/cursor_lost 均只交付最后 N 条。'
+  - id: S-3
+    name: 'Subject 静默成功时不留下任何群内辅助痕迹'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 7 skipped；无 reply/card/reaction，nothing_to_send 提交游标。'
+  - id: S-4
+    name: '明确 @ 当前 Bot 时绕过 Subject 并保证可见反馈'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 7 skipped；matcher 绕过 Subject，普通静默终态发送自动回执。'
+  - id: S-5
+    name: 'Subject 执行失败时不越过未成功处理的消息'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: failed/cancelled/ambiguous 共 3 个终态，均不推进游标且不泄漏失败卡。'
+
+exit_criteria_result:
+  - id: EC-1
+    pass: true
+    verification_output: 'PASS: e2e 1 passed；未 @ → 飞书快照 → 静默终态 → 游标提交 → 下一条从游标继续。'
+  - id: EC-2
+    pass: false
+    verification_output: 'FAIL: unit 14 passed, 1 failed；失败项为同 createTime 的无序候选覆盖已有游标。'
+  - id: EC-3
+    pass: true
+    verification_output: 'PASS: bun run build。'
+
+rubrics_result:
+  - id: R-1
+    score: 30
+    max_score: 35
+    verification_output: '上下文增量、触发上界、事件补尾、N 条兜底通过；同时间戳游标单调边界失败。'
+  - id: R-2
+    score: 35
+    max_score: 35
+    verification_output: 'Subject 静默/可见回复/失败终态/@ 隔离全部通过。'
+  - id: R-3
+    score: 20
+    max_score: 20
+    verification_output: 'PASS: message-listener/event-dispatcher/bridge-final-output-retry 共 443 tests。'
+  - id: R-4
+    score: 10
+    max_score: 10
+    verification_output: 'PASS: bun run build；git diff --check。'
+
+anti_false_completion:
+  pass: true
+  detail: 'Subject 已接入 matcher、飞书读取、worker lifecycle 和输出/静默提交路径；e2e 驱动真实模块组合，不以纯类型或完全 mock 的关键服务代替行为。'
+
+next_action: 'generator 仅修复同 createTime 且 messageId 不同的提交条件，随后重跑 context unit、EC-2、build 和回归。'

@@ -47,6 +47,36 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
   return fc.expanded ? 'screenshot' : 'hidden';
 }
 
+/**
+ * One ambient Subject turn is kept exact to its inbound Lark message. The
+ * dispatcher owns the per-(bot, chat) FIFO and hands this latch to the daemon;
+ * worker lifecycle evidence settles it only after the exact turn is done.
+ */
+export type SubjectListenerTurnOutcome = 'succeeded' | 'failed';
+
+export interface SubjectListenerCompletionGate {
+  /** Set only after a DaemonSession has durably claimed this turn. */
+  claimed: boolean;
+  settle: (outcome: SubjectListenerTurnOutcome) => void;
+}
+
+export interface SubjectListenerTurnState {
+  chatId: string;
+  candidateCursor: {
+    messageId: string;
+    createTime: string;
+  };
+  completion: SubjectListenerCompletionGate;
+  /** Positive delivery/silence evidence has already advanced the cursor. */
+  cursorCommitted?: boolean;
+  /** The chat FIFO was released; metadata remains briefly for trailing IPC. */
+  settled?: boolean;
+  /** Bounded compatibility wait for completed terminals whose final output may
+   * still be materialising asynchronously. */
+  ambiguousSettleTimer?: ReturnType<typeof setTimeout>;
+  pruneTimer?: ReturnType<typeof setTimeout>;
+}
+
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
  *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
@@ -318,6 +348,11 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** Turn-exact ambient Subject lifecycle. Unlike disableStreamingCard this is
+   * not a session switch: a later explicit @ reply in the same session remains
+   * fully visible. Entries are retained briefly after settle so trailing
+   * screen/terminal IPC cannot leak an auxiliary card or reaction. */
+  subjectListenerTurns?: Map<string, SubjectListenerTurnState>;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn

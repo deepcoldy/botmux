@@ -77,6 +77,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
+import type { SubjectListenerCompletionGate } from '../../core/types.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -2289,6 +2290,11 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** Ambient Subject only: dispatcher-owned per-(bot, chat) FIFO latch. The
+   * daemon marks it claimed after a concrete turn is registered; worker
+   * lifecycle evidence later settles it. Never present on explicit @ or legacy
+   * prompt-listener traffic. */
+  subjectListenerCompletion?: SubjectListenerCompletionGate;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
   /** Set by the session-group birth flow (p2pMode='group') after it has
@@ -2367,7 +2373,13 @@ const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
 
 function enabledMessageListenerChatIds(bot: BotState): string[] {
   return Object.entries(bot.config.messageListeners ?? {})
-    .filter(([, listener]) => listener?.enabled === true && !!listener.prompt?.trim())
+    .filter(([, listener]) => {
+      if (listener?.enabled !== true) return false;
+      const behavior = listener.behavior ?? 'prompt';
+      if (behavior === 'subject') return true;
+      if (behavior === 'prompt') return !!listener.prompt?.trim();
+      return false;
+    })
     .map(([chatId]) => chatId);
 }
 
@@ -2442,13 +2454,57 @@ async function dispatchHumanMessageViaHandlers(
   payload: PendingForwardTopicPayload,
   capMs?: number,
 ): Promise<void> {
-  await serializeByAnchor(payload.ctx.anchor, () => {
+  const dispatch = () => serializeByAnchor(payload.ctx.anchor, () => {
     const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
     return ownsSession
       ? handlers.handleThreadReply(payload.data, payload.ctx)
       : handlers.handleNewTopic(payload.data, payload.ctx);
   }, capMs);
+  if (payload.ctx.messageListener?.behavior !== 'subject') {
+    await dispatch();
+    return;
+  }
+
+  const laneKey = `${larkAppId}\u0000${payload.ctx.chatId}`;
+  const predecessor = subjectListenerDispatchLanes.get(laneKey) ?? Promise.resolve();
+  let resolveCompletion!: (outcome: import('../../core/types.js').SubjectListenerTurnOutcome) => void;
+  const completed = new Promise<import('../../core/types.js').SubjectListenerTurnOutcome>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  let settled = false;
+  const completion: SubjectListenerCompletionGate = {
+    claimed: false,
+    settle: (outcome) => {
+      if (settled) return;
+      settled = true;
+      resolveCompletion(outcome);
+    },
+  };
+  payload.ctx.subjectListenerCompletion = completion;
+  const run = predecessor.then(async () => {
+    try {
+      await dispatch();
+    } catch (err) {
+      completion.settle('failed');
+      throw err;
+    }
+    // Any fail-closed path before DaemonSession registration must release the
+    // FIFO; claimed turns are settled later by their exact worker lifecycle.
+    if (!completion.claimed) completion.settle('failed');
+    await completed;
+  });
+  const laneTail = run.then(() => undefined, () => undefined);
+  subjectListenerDispatchLanes.set(laneKey, laneTail);
+  void laneTail.finally(() => {
+    if (subjectListenerDispatchLanes.get(laneKey) === laneTail) {
+      subjectListenerDispatchLanes.delete(laneKey);
+    }
+  });
+  await run;
 }
+
+/** Per bot + group, independent of conversational session/message anchors. */
+const subjectListenerDispatchLanes = new Map<string, Promise<void>>();
 
 async function dispatchPolledMessageListenerMatch(input: {
   larkAppId: string;
@@ -2526,14 +2582,22 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       });
       if (!match) continue;
 
-      await dispatchPolledMessageListenerMatch({
+      const dispatch = dispatchPolledMessageListenerMatch({
         larkAppId,
         handlers,
         data,
         match,
         chatId,
         messageId,
-      }).catch(err => logger.error(`Error handling polled message listener event: ${err}`));
+      });
+      if (match.behavior === 'subject') {
+        // Queue the ambient turn and keep scanning/claiming the rest of this
+        // poll page. Its per-chat lane owns full-turn ordering; blocking the
+        // global poller here would starve every other configured chat.
+        void dispatch.catch(err => logger.error(`Error handling polled Subject listener event: ${err}`));
+      } else {
+        await dispatch.catch(err => logger.error(`Error handling polled message listener event: ${err}`));
+      }
     }
   }
 }
@@ -3439,14 +3503,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             `[message-listener:${larkAppId}] matched bot-sender chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
-          await dispatchHumanMessage(listenerRoutingContext({
+          const dispatch = dispatchHumanMessage(listenerRoutingContext({
             data,
             match: botMessageListener,
             chatId,
             messageId,
             chatType,
             larkAppId,
-          })).catch(err => logger.error(`Error handling bot message listener event: ${err}`));
+          }));
+          if (botMessageListener.behavior === 'subject') {
+            // Do not hold the Lark WS acknowledgement for the full ambient
+            // model turn; the independent Subject lane remains ordered.
+            void dispatch.catch(err => logger.error(`Error handling bot Subject listener event: ${err}`));
+          } else {
+            await dispatch.catch(err => logger.error(`Error handling bot message listener event: ${err}`));
+          }
           return;
         }
         // Foreign bot: only route on @mention of us — with one exception.

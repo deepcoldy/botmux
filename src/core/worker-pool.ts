@@ -25,6 +25,7 @@ import {
   markMessageListenerRunPreviewReplied,
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
+import { commitSubjectListenerCursor } from '../services/subject-listener-cursor-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
@@ -783,6 +784,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   if (isDocNativeSession(ds)) return true;
+  if (isSubjectListenerTurn(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -793,6 +795,148 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
       || isSubstituteTurn(ds, turnId);
   } catch { return false; }
 }
+
+const SUBJECT_LISTENER_AMBIGUOUS_SETTLE_MS = 30_000;
+const SUBJECT_LISTENER_TURN_RETAIN_MS = 60_000;
+
+/** Register the exact ambient turn after its DaemonSession wins routing. */
+export function registerSubjectListenerTurn(
+  ds: DaemonSession,
+  turnId: string,
+  input: {
+    chatId: string;
+    candidateCursor: { messageId: string; createTime: string };
+    completion: import('./types.js').SubjectListenerCompletionGate;
+  },
+): void {
+  if (!turnId || !input.candidateCursor.messageId || !/^\d+$/.test(input.candidateCursor.createTime)) {
+    throw new Error('Invalid Subject listener turn metadata');
+  }
+  const turns = ds.subjectListenerTurns ?? (ds.subjectListenerTurns = new Map());
+  const previous = turns.get(turnId);
+  if (previous && !previous.settled) {
+    throw new Error(`Subject listener turn already registered: ${turnId}`);
+  }
+  if (previous?.ambiguousSettleTimer) clearTimeout(previous.ambiguousSettleTimer);
+  if (previous?.pruneTimer) clearTimeout(previous.pruneTimer);
+  input.completion.claimed = true;
+  turns.set(turnId, {
+    chatId: input.chatId,
+    candidateCursor: { ...input.candidateCursor },
+    completion: input.completion,
+  });
+}
+
+/** Turn-exact presentation gate. With no event turn id, consult only the turn
+ * currently waiting for a streaming card; an old Subject turn must not hush a
+ * later explicit @ turn that happens to reuse the same session. */
+export function isSubjectListenerTurn(ds: DaemonSession, turnId?: string): boolean {
+  const exactTurnId = turnId ?? ds.streamCardPendingTurnId ?? ds.currentTurnId;
+  return !!exactTurnId && ds.subjectListenerTurns?.has(exactTurnId) === true;
+}
+
+function commitSubjectListenerTurnCursor(
+  ds: DaemonSession,
+  turnId: string,
+  evidence: 'explicit_reply' | 'final_output' | 'nothing_to_send',
+): boolean {
+  const state = ds.subjectListenerTurns?.get(turnId);
+  if (!state) return false;
+  if (state.cursorCommitted) return true;
+  try {
+    commitSubjectListenerCursor(
+      config.session.dataDir,
+      ds.larkAppId,
+      state.chatId,
+      state.candidateCursor,
+    );
+    state.cursorCommitted = true;
+    logger.info(
+      `[${tag(ds)}] Subject cursor committed turn=${turnId.substring(0, 12)} `
+      + `message=${state.candidateCursor.messageId.substring(0, 12)} evidence=${evidence}`,
+    );
+    return true;
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Subject cursor commit failed turn=${turnId.substring(0, 12)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+function settleSubjectListenerTurn(ds: DaemonSession, turnId: string): void {
+  const state = ds.subjectListenerTurns?.get(turnId);
+  if (!state || state.settled) return;
+  state.settled = true;
+  if (state.ambiguousSettleTimer) {
+    clearTimeout(state.ambiguousSettleTimer);
+    state.ambiguousSettleTimer = undefined;
+  }
+  if (ds.streamCardPendingTurnId === turnId) {
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+  }
+  state.completion.settle(state.cursorCommitted ? 'succeeded' : 'failed');
+  const timer = setTimeout(() => {
+    if (ds.subjectListenerTurns?.get(turnId) !== state) return;
+    ds.subjectListenerTurns.delete(turnId);
+    if (ds.subjectListenerTurns.size === 0) ds.subjectListenerTurns = undefined;
+  }, SUBJECT_LISTENER_TURN_RETAIN_MS);
+  timer.unref?.();
+  state.pruneTimer = timer;
+}
+
+/** Fail-close an armed Subject turn before a worker can produce terminal IPC. */
+export function failSubjectListenerTurn(ds: DaemonSession, turnId: string): void {
+  settleSubjectListenerTurn(ds, turnId);
+}
+
+function scheduleAmbiguousSubjectListenerSettlement(ds: DaemonSession, turnId: string): void {
+  const state = ds.subjectListenerTurns?.get(turnId);
+  if (!state || state.settled || state.ambiguousSettleTimer) return;
+  const timer = setTimeout(() => {
+    if (ds.subjectListenerTurns?.get(turnId) !== state || state.settled) return;
+    logger.warn(
+      `[${tag(ds)}] Subject completed without positive output evidence; `
+      + `releasing without cursor advance turn=${turnId.substring(0, 12)}`,
+    );
+    settleSubjectListenerTurn(ds, turnId);
+  }, SUBJECT_LISTENER_AMBIGUOUS_SETTLE_MS);
+  timer.unref?.();
+  state.ambiguousSettleTimer = timer;
+}
+
+function handleSubjectListenerTerminal(
+  ds: DaemonSession,
+  terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+): void {
+  const state = ds.subjectListenerTurns?.get(terminal.turnId);
+  if (!state || state.settled) return;
+  if (terminal.status === 'completed' && terminal.outputDisposition === 'nothing_to_send') {
+    commitSubjectListenerTurnCursor(ds, terminal.turnId, 'nothing_to_send');
+    settleSubjectListenerTurn(ds, terminal.turnId);
+    return;
+  }
+  if (state.cursorCommitted || terminal.status !== 'completed') {
+    settleSubjectListenerTurn(ds, terminal.turnId);
+    return;
+  }
+  // A completed terminal can precede an asynchronously hydrated final_output.
+  // Keep the chat FIFO closed briefly; no output by the deadline is ambiguous
+  // and intentionally leaves the cursor unchanged.
+  scheduleAmbiguousSubjectListenerSettlement(ds, terminal.turnId);
+}
+
+function settleUnfinishedSubjectListenerTurns(ds: DaemonSession): void {
+  for (const [turnId, state] of ds.subjectListenerTurns ?? []) {
+    if (!state.settled) settleSubjectListenerTurn(ds, turnId);
+  }
+}
+
+export const __testOnly_commitSubjectListenerTurnCursor = commitSubjectListenerTurnCursor;
+export const __testOnly_settleSubjectListenerTurn = settleSubjectListenerTurn;
+export const __testOnly_handleSubjectListenerTerminal = handleSubjectListenerTerminal;
 
 function silentTurnReactions(ds: DaemonSession): boolean {
   try {
@@ -9514,6 +9658,7 @@ export function auxUiSuppressedFor(
     // Bot deregistered — fail closed.
     return true;
   }
+  if (isSubjectListenerTurn(ds, turnId)) return true;
   if (isSilentScheduledTurn(ds, turnId)) return true;
   if (ds.session.vcMeetingReceiver) return true;
   // Durable ledger: an attempt at or below the armed watermark is a replay whose
@@ -11233,6 +11378,7 @@ function setupWorkerHandlers(
     // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
     // still updated before these guards, so the terminal view is unaffected.
     if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
+    if (isSubjectListenerTurn(ds, turnId)) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
     // Plan B: a VC meeting agent is an ordinary chat-scope session, so the live
     // STREAMING CARD is no longer gated here at all — it surfaces through the
@@ -12877,6 +13023,10 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to reconcile CLI exit generation ${workerGeneration}: ${err.message}`);
         }
+        // A CLI exit without an exact turn_terminal is an ambiguous Subject
+        // boundary. Release the chat FIFO but never manufacture cursor success;
+        // a previously observed visible reply remains valid positive evidence.
+        settleUnfinishedSubjectListenerTurns(ds);
         // onCliExit may persist/reconcile durable state and therefore yield.
         // A transfer, repo replacement, or worker replacement that won during
         // that await owns all later lifecycle decisions. Never restart/kill its
@@ -13243,6 +13393,10 @@ function setupWorkerHandlers(
       }
 
       case 'explicit_reply_observed': {
+        // Emitted only after `botmux send` has obtained a provider message id.
+        // This is positive visible-output evidence, but the per-chat Subject
+        // FIFO remains held until the exact turn reaches a terminal boundary.
+        commitSubjectListenerTurnCursor(ds, msg.turnId, 'explicit_reply');
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
@@ -13571,6 +13725,7 @@ function setupWorkerHandlers(
             error: msg.errorCode ?? msg.status,
           });
         }
+        handleSubjectListenerTerminal(ds, msg);
         try {
           await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
         } catch (err: any) {
@@ -14014,6 +14169,10 @@ function setupWorkerHandlers(
         const dedupeKey = finalOutputDedupeKey(ds, msg);
         if (ds.lastBridgeEmittedUuid === dedupeKey) {
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
+          if (msg.turnFailed !== true
+            && commitSubjectListenerTurnCursor(ds, msg.turnId, 'final_output')) {
+            settleSubjectListenerTurn(ds, msg.turnId);
+          }
           break;
         }
         // Worker pops the turn off its queue right after emit, so it will
@@ -14037,7 +14196,14 @@ function setupWorkerHandlers(
           msg,
           t,
           0,
-          undefined,
+          (_owned) => {
+            if (ds.subjectListenerTurns?.has(msg.turnId)) {
+              // The exact Lark send path marks cursorCommitted before invoking
+              // this callback. Any other completion (closed/stale/gave-up)
+              // releases the lane without advancing the cursor.
+              settleSubjectListenerTurn(ds, msg.turnId);
+            }
+          },
           ownsLifecycleMutation,
         );
         break;
@@ -14194,6 +14360,7 @@ function setupWorkerHandlers(
           patch: { webPort: null, workerPid: null },
         },
       });
+      settleUnfinishedSubjectListenerTurns(ds);
     }
     if (!transferRetirement) {
       try {
@@ -14893,6 +15060,12 @@ function deliverFinalOutput(
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // The provider accepted a fresh user-visible reply. Commit before the
+      // ownership recheck: a concurrent session close cannot erase the fact
+      // that Lark already received this output.
+      if (msg.turnFailed !== true) {
+        commitSubjectListenerTurnCursor(ds, msg.turnId, 'final_output');
+      }
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {

@@ -1,0 +1,81 @@
+feedback_NO: '002'
+pass: true
+score: 100
+
+baseline: 'f5fa07bff21174d0678b688cda8784018d538de9'
+fixed_from:
+  - feedback-001.yaml
+
+bugs: []
+
+scenarios_result:
+  - id: S-1
+    name: '未被 @ 的消息按已提交游标获得连续飞书上下文'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 6 skipped；游标后增量、trigger 上界和事件补尾均正确。'
+  - id: S-2
+    name: '冷启动或游标丢失时使用最近 N 条消息兜底'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 2 passed, 5 skipped；cold_start/cursor_lost 均只交付最后 N 条。'
+  - id: S-3
+    name: 'Subject 静默成功时不留下任何群内辅助痕迹'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 7 skipped；无 reply/card/reaction，nothing_to_send 提交游标。'
+  - id: S-4
+    name: '明确 @ 当前 Bot 时绕过 Subject 并保证可见反馈'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 7 skipped；明确 @ 绕过 Subject，普通静默终态仍发送自动回执。'
+  - id: S-5
+    name: 'Subject 执行失败时不越过未成功处理的消息'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: failed/cancelled/ambiguous 共 3 个终态，均不推进游标。'
+
+exit_criteria_result:
+  - id: EC-1
+    pass: true
+    verification_output: 'PASS: e2e 1 passed；未 @ → 飞书快照 → 静默 → 游标提交 → 下一条增量读取。'
+  - id: EC-2
+    pass: true
+    verification_output: 'PASS: 2 files, 15 tests；所有 must-pass Scenario 及同时间戳单调边界通过。'
+  - id: EC-3
+    pass: true
+    verification_output: 'PASS: bun run build。'
+
+rubrics_result:
+  - id: R-1
+    score: 35
+    max_score: 35
+    verification_output: 'PASS: 飞书增量、触发上界、事件补尾、N 条兜底、Bot+群隔离及严格单调游标。'
+  - id: R-2
+    score: 35
+    max_score: 35
+    verification_output: 'PASS: Subject 静默/可见回复/失败终态/@ 隔离全部通过。'
+  - id: R-3
+    score: 20
+    max_score: 20
+    verification_output: 'PASS: message-listener/event-dispatcher/bridge-final-output-retry 共 443 tests。'
+  - id: R-4
+    score: 10
+    max_score: 10
+    verification_output: 'PASS: bun run build；修复纳入 index 后 git diff --check 与 git diff --cached --check。'
+
+anti_false_completion:
+  pass: true
+  detail: '主链路 e2e 组合 matcher、飞书快照、可信协议、worker 静默终态、持久化游标与下一轮增量读取；不是纯类型或存在性检查。'
+
+verification_commands:
+  - 'bun x vitest run --project unit test/subject-listener-context.test.ts -t "连续飞书上下文"'
+  - 'bun x vitest run --project unit test/subject-listener-context.test.ts -t "消息兜底"'
+  - 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "静默成功"'
+  - 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "明确 @"'
+  - 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "执行失败"'
+  - 'bun x vitest run --project e2e test/subject-listener-runtime.e2e.ts'
+  - 'bun x vitest run --project unit test/subject-listener-context.test.ts test/subject-listener-runtime.test.ts'
+  - 'bun x vitest run --project unit test/message-listener.test.ts test/event-dispatcher.test.ts test/bridge-final-output-retry.test.ts'
+  - 'bun run build'
+  - 'git diff --check && git diff --cached --check'

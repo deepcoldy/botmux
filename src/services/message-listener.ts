@@ -1,6 +1,17 @@
-import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
+import {
+  getAllBots,
+  type BotState,
+  type MessageListenerBehavior,
+  type MessageListenerConfig,
+  type MessageListenerSubjectPolicy,
+} from '../bot-registry.js';
 import { extractCardContent, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
+import { BOTMUX_SUBJECT_PROTOCOL } from '../skills/definitions.js';
+import {
+  renderSubjectListenerHistory,
+  type SubjectListenerContextSnapshot,
+} from './subject-listener-context.js';
 import { logger } from '../utils/logger.js';
 
 export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
@@ -8,6 +19,8 @@ export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 export type MessageListenerSenderType = 'user' | 'bot';
 
 export interface MessageListenerMatch {
+  behavior: MessageListenerBehavior;
+  subjectPolicy?: MessageListenerSubjectPolicy;
   name?: string;
   replyCardTitle?: string;
   prompt: string;
@@ -18,11 +31,22 @@ export interface MessageListenerMatch {
   senderOpenId?: string;
   senderName?: string;
   senderType: MessageListenerSenderType;
+  trigger: {
+    messageId: string;
+    createTime?: string;
+  };
 }
 
 export interface MessageListenerPreviewMatch extends MessageListenerMatch {
   messageId: string;
   createTime?: string;
+}
+
+export interface SubjectMessageListenerPromptContext {
+  chatId: string;
+  chatName?: string;
+  chatDescription?: string;
+  snapshot: SubjectListenerContextSnapshot;
 }
 
 export const DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT = 5;
@@ -254,7 +278,7 @@ export function matchesContentPolicy(text: string, policy: MessageListenerConten
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
   const listener = bot.config.messageListeners?.[chatId];
   if (!listener?.enabled) return undefined;
-  if (!listener.prompt?.trim()) return undefined;
+  if ((listener.behavior ?? 'prompt') === 'prompt' && !listener.prompt?.trim()) return undefined;
   return listener;
 }
 
@@ -315,6 +339,8 @@ export function evaluateMessageListener(input: {
   if (!matchesContentPolicy(messageText, listener.contentPolicy)) return undefined;
 
   return {
+    behavior: listener.behavior ?? 'prompt',
+    subjectPolicy: listener.subjectPolicy,
     name: listener.name,
     replyCardTitle: listener.replyCardTitle,
     prompt: listener.prompt,
@@ -325,6 +351,10 @@ export function evaluateMessageListener(input: {
     senderOpenId: input.senderOpenId,
     senderName: input.senderName,
     senderType,
+    trigger: {
+      messageId,
+      ...(input.message?.create_time ? { createTime: String(input.message.create_time) } : {}),
+    },
   };
 }
 
@@ -500,7 +530,14 @@ export function renderMessageListenerInstruction(match: MessageListenerMatch): s
  * `</message_listener>` early and forge a trusted `<instruction>`. `match.prompt`
  * stays raw because it is operator-authored config, not attacker-controlled.
  */
-export function renderMessageListenerPrompt(match: MessageListenerMatch): string {
+export function renderMessageListenerPrompt(
+  match: MessageListenerMatch,
+  subjectContext?: SubjectMessageListenerPromptContext,
+): string {
+  if (match.behavior === 'subject') {
+    if (!subjectContext) throw new Error('Subject listener prompt requires Lark context');
+    return renderSubjectMessageListenerPrompt(match, subjectContext);
+  }
   const observedText = escapeXml(truncateUtf8(match.messageText, MAX_MESSAGE_LISTENER_PROMPT_BYTES));
   return [
     '<message_listener>',
@@ -519,6 +556,39 @@ export function renderMessageListenerPrompt(match: MessageListenerMatch): string
     observedText,
     '  </observed_message>',
     '</message_listener>',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Deterministic Subject turn: trusted protocol/config are kept separate from
+ * the provider-controlled group, sender, and message history envelopes.
+ */
+export function renderSubjectMessageListenerPrompt(
+  match: MessageListenerMatch,
+  context: SubjectMessageListenerPromptContext,
+): string {
+  const scope = match.prompt.trim();
+  return [
+    '<subject_protocol trusted="true">',
+    BOTMUX_SUBJECT_PROTOCOL.trim(),
+    '</subject_protocol>',
+    scope ? '<subject_scope trusted="true">' : '',
+    scope || '',
+    scope ? '</subject_scope>' : '',
+    '<subject_lark_context trusted="false">',
+    '  <chat',
+    `    chat_id="${escapeXml(context.chatId)}"`,
+    context.chatName ? `    name="${escapeXml(context.chatName)}"` : '',
+    '  >',
+    context.chatDescription ? `    ${escapeXml(context.chatDescription)}` : '',
+    '  </chat>',
+    '  <triggering_sender',
+    `    sender_type="${escapeXml(match.senderType)}"`,
+    match.senderOpenId ? `    sender_open_id="${escapeXml(match.senderOpenId)}"` : '',
+    match.senderName ? `    sender_name="${escapeXml(match.senderName)}"` : '',
+    '  />',
+    renderSubjectListenerHistory(context.snapshot),
+    '</subject_lark_context>',
   ].filter(Boolean).join('\n');
 }
 
