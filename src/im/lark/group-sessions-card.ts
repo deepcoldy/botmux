@@ -363,6 +363,7 @@ export async function handleGroupSessionsCardAction(
       const response = await client.request({
         method: 'POST',
         path: `/__daemon/sessions/${encodeURIComponent(row.sessionId)}/resume`,
+        body: { reconcileStreamingCard: true },
       });
       if (response.status !== 200 || (response.body as { ok?: boolean } | undefined)?.ok !== true) {
         const reason = String((response.body as Record<string, unknown> | undefined)?.error ?? `http_${response.status}`);

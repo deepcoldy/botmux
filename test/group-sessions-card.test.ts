@@ -336,6 +336,7 @@ describe('/sessions current-group card', () => {
     expect(request).toHaveBeenCalledWith({
       method: 'POST',
       path: '/__daemon/sessions/session-secret/resume',
+      body: { reconcileStreamingCard: true },
     });
     expect(result.card?.data).toEqual(expect.objectContaining({ elements: expect.any(Array) }));
     expect(JSON.stringify(result.card?.data)).toContain('Active 1 · Closed 0 · Page 1/1');
