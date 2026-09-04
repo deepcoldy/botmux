@@ -244,6 +244,23 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.session.reasoningEffort).toBe('xhigh');
   });
 
+  it('stamps per-turn reasoningEffort onto a claude-code session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
+      botName: 'Claude', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-5', reasoningEffort: 'max' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBe('claude-opus-5');
+    expect(ds?.session.model).toBeUndefined();
+    // max is claude-only (codex tops out the same list but grok/traex do not);
+    // it must survive the trigger gate verbatim.
+    expect(ds?.session.reasoningEffort).toBe('max');
+  });
+
   it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },

@@ -189,6 +189,33 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows the claude-code effort picker with all five levels and no ultra', () => {
+    const claudeCliState = {
+      options: [
+        { id: 'claude-code', label: 'Claude Code' },
+        { id: 'codex', label: 'Codex' },
+      ],
+      ttadkModelDefault: '',
+      ttadkModelSuggestions: [],
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+        sessionFallback: 'claude-code',
+        cliState: claudeCliState,
+        patchBot: () => undefined,
+      }));
+    });
+    // Without the dashboard half of the gate the picker is not rendered at all,
+    // so findByProps throwing is itself the regression signal.
+    const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+    expect(picker.props.value).toBe('xhigh');
+    const values = (picker.props.options as Array<{ value: string }>).map(o => o.value);
+    // max is offered (claude accepts it); ultra is codex/traex-only.
+    expect(values).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
   it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
