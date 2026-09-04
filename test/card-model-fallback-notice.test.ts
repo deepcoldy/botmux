@@ -81,7 +81,7 @@ function noticeIn(card: any): string | undefined {
 }
 
 describe('cardModelFallbackNotice: copy', () => {
-  it('renders the refusal notice with friendly names, category and switch-back hint (zh)', () => {
+  it('renders the refusal notice with friendly names and the refusal category (zh)', () => {
     expect(cardModelFallbackNotice(REFUSAL, 'zh')).toBe(
       '⚠️ 安全管控降级：Fable 5.1 → Opus 4.8（cyber）',
     );
@@ -152,6 +152,55 @@ describe('cardModelFallbackNotice: copy', () => {
     expect(line.length).toBeLessThan(200);
   });
 
+  it('P3-1: keeps a date-suffixed id from reading as a minor version', () => {
+    // `claude-opus-4-20250514` has no minor at all — the date must not be
+    // spliced in as one ("Opus 4.20250514").
+    const label = (id: string) =>
+      cardModelFallbackNotice({ ...REFUSAL, kind: 'consent', fallbackModel: id }, 'zh')!;
+    expect(label('claude-opus-4-20250514')).toContain('→ Opus 4');
+    expect(label('claude-opus-4-20250514')).not.toContain('20250514');
+    expect(label('claude-sonnet-4-20250219')).toContain('→ Sonnet 4');
+    // …while a real one- or two-digit minor still joins, date suffix or not.
+    expect(label('claude-opus-4-8')).toContain('→ Opus 4.8');
+    expect(label('claude-haiku-4-5-20251001')).toContain('→ Haiku 4.5');
+    expect(label('claude-fable-5-1[1m]')).toContain('→ Fable 5.1');
+  });
+
+  describe('P2-4: the reason is single-lined and bounded', () => {
+    const withReason = (reason: string) =>
+      cardModelFallbackNotice({ ...REFUSAL, kind: 'unavailable', trigger: reason }, 'zh')!;
+
+    it('collapses newlines and control characters into one line', () => {
+      const line = withReason('over\nloaded\r\n\tnow');
+      expect(line).toBe('⚠️ 模型不可用，本轮切换：Fable 5.1 → Opus 4.8（over loaded now）');
+      expect(line).not.toMatch(/[\r\n\t]/);
+    });
+
+    it('truncates a long reason to 24 chars with an ellipsis', () => {
+      const line = withReason('z'.repeat(200));
+      expect(line).toContain(`${'z'.repeat(23)}…`);
+      expect(line).not.toContain('z'.repeat(24));
+      expect(line.length).toBeLessThan(80);
+    });
+
+    it('escapes markdown control characters in the reason', () => {
+      expect(withReason('a*b_c`d')).toContain('a\\*b\\_c\\`d');
+    });
+
+    it('drops a reason that is nothing but whitespace', () => {
+      expect(withReason(' \n\t ')).toBe('⚠️ 模型不可用，本轮切换：Fable 5.1 → Opus 4.8');
+    });
+
+    it('applies the same treatment to a multi-line model id', () => {
+      const line = cardModelFallbackNotice({
+        ...REFUSAL,
+        kind: 'consent',
+        originalModel: 'weird\nalias',
+      }, 'zh')!;
+      expect(line).toBe('⚠️ 额度限制已切换：weird alias → Opus 4.8');
+    });
+  });
+
   it('returns null with no fallback or an incomplete one', () => {
     expect(cardModelFallbackNotice(undefined, 'zh')).toBeNull();
     expect(cardModelFallbackNotice({ ...REFUSAL, fallbackModel: '' }, 'zh')).toBeNull();
@@ -172,7 +221,7 @@ describe('buildStreamingCard: model-fallback notice placement', () => {
     expect(cleared.elements.length).toBe(withNotice.elements.length - 1);
   });
 
-  it('is pinned as the last element, in small grey text, below the action rows', () => {
+  it('is pinned as the last element, in small yellow text, below the action rows', () => {
     const card = build({
       usage: { context: { usedTokens: 1000, windowTokens: 1_000_000, percentUsed: 0.1 }, tokens: { in: 1000, out: 50 }, modelFallback: REFUSAL },
       locale: 'zh',

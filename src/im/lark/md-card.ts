@@ -514,11 +514,18 @@ export function cardUsageRuntimeSegment(
 }
 
 /** Friendly Claude model name for card copy: `claude-fable-5-1[1m]` → `Fable 5.1`,
- *  `claude-opus-5` → `Opus 5`. Anything that is not a recognised
- *  `claude-<family>-<major>[-<minor>][-<date>]` id keeps its raw form. */
+ *  `claude-opus-5` → `Opus 5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`.
+ *  Anything that is not a recognised `claude-<family>-<major>[-<minor>][-<date>]`
+ *  id keeps its raw form.
+ *
+ *  The minor is capped at TWO digits on purpose. Date-suffixed ids without a
+ *  minor (`claude-opus-4-20250514`) otherwise let the minor group swallow the
+ *  date and render "Opus 4.20250514"; with the cap the regex backtracks into
+ *  the date branch and the id reads as plain "Opus 4". No real Claude minor has
+ *  ever been longer than two digits. */
 function claudeModelLabel(id: string): string {
   const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
-  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{6,})?$/i.exec(bare);
+  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{6,})?$/i.exec(bare);
   if (!m) return id.trim();
   const family = m[1].toLowerCase();
   return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
@@ -531,21 +538,33 @@ function escapeCardPlainText(value: string): string {
 }
 
 const MODEL_FALLBACK_LABEL_MAX = 32;
+/** Tighter than the model cap: `trigger` / `apiRefusalCategory` are raw
+ *  provider strings that ride in parentheses at the end of an already-full
+ *  line, and unlike a model id nothing about them is worth more than a glance.
+ *  Real values (`overloaded`, `model_not_found`, `cyber`) fit easily. */
+const MODEL_FALLBACK_REASON_MAX = 24;
 
-/** Bound one model-derived token of the notice. Every one of them comes from the
- *  transcript, so the `/model` argument needs the same cap as the display
- *  labels — an unbounded alias would blow up exactly the line those labels are
- *  trimmed to keep short. Real Claude ids are well under the cap (the longest,
- *  `claude-haiku-4-5-20251001`, is 25 chars), so this only ever bites a
- *  pathological id whose `/model` hint could not have worked anyway. */
-function truncateModelToken(value: string): string {
-  return value.length > MODEL_FALLBACK_LABEL_MAX
-    ? `${value.slice(0, MODEL_FALLBACK_LABEL_MAX - 1)}…`
-    : value;
+/** Bound one transcript-derived token of the notice and force it onto ONE line.
+ *  Every token here comes from Claude's own record, so it can carry newlines,
+ *  control characters or an arbitrarily long `/model` alias — any of which
+ *  would break the single-line footnote the notice is. Real values are well
+ *  under the caps (the longest Claude id, `claude-haiku-4-5-20251001`, is 25
+ *  chars), so this only ever bites a pathological value. */
+function compactNoticeToken(value: string, maxLength: number): string {
+  const normalized = value
+    // C0/C1 controls (newlines included) plus the Unicode line/paragraph
+    // separators, flattened to a space before whitespace is collapsed.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}\u2026`
+    : normalized;
+  return escapeCardPlainText(compact);
 }
 
 function fallbackModelText(id: string): string {
-  return escapeCardPlainText(truncateModelToken(claudeModelLabel(id)));
+  return compactNoticeToken(claudeModelLabel(id), MODEL_FALLBACK_LABEL_MAX);
 }
 
 /** One-line notice for a model fallback still in effect, or null when there is
@@ -559,8 +578,14 @@ export function cardModelFallbackNotice(
   const rawReason = fallback.kind === 'refusal'
     ? fallback.apiRefusalCategory
     : fallback.kind === 'unavailable' ? fallback.trigger : undefined;
-  const reason = rawReason
-    ? t('card.model_fallback.reason', { reason: escapeCardPlainText(rawReason) }, locale)
+  // The reason is a raw provider string straight out of the transcript, so it
+  // gets the same one-line + bounded + escaped treatment as the model labels;
+  // a multi-line or novel-length trigger would otherwise wreck the footnote.
+  const compactReason = rawReason
+    ? compactNoticeToken(rawReason, MODEL_FALLBACK_REASON_MAX)
+    : '';
+  const reason = compactReason
+    ? t('card.model_fallback.reason', { reason: compactReason }, locale)
     : t('card.model_fallback.no_reason', undefined, locale);
   return t(`card.model_fallback.${fallback.kind}`, {
     originalModel: fallbackModelText(fallback.originalModel),
