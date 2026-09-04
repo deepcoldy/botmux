@@ -1444,6 +1444,7 @@ describe('P1-7 dual-cookie identity (real requests)', () => {
         legacyCookie: parseCookie(req.headers.cookie),
         activeToken: ACTIVE,
         roleHeader: req.headers['x-botmux-role'],
+        actorHeader: req.headers['x-botmux-actor'],
         platformMachineId: opts.platformMachineId ?? null,
         platformActorScope: (machineId: string) => `scope-${machineId}`,
         legacyAuthSessionId: (token: string) => `legacy-${token}`,

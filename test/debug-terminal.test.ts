@@ -84,6 +84,7 @@ function startHarness(): Promise<{ server: Server; base: string; wsBase: string;
       legacyCookie: parseCookie(req.headers.cookie),
       activeToken: TOKEN,
       roleHeader: req.headers['x-botmux-role'],
+      actorHeader: req.headers['x-botmux-actor'],
       platformMachineId: readPlatformBinding()?.machineId ?? null,
       platformActorScope: (machineId) => `scope-${machineId}`,
       legacyAuthSessionId: () => 'legacy-auth-session',

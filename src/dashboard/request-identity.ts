@@ -37,6 +37,22 @@ export interface DashboardIdentityInput {
   activeToken: string | null;
   /** 中心化平台注入的 `X-Botmux-Role`（仅在已绑定平台时有意义）。 */
   roleHeader: string | string[] | undefined;
+  /**
+   * 中心化平台注入的 `X-Botmux-Actor`：**操作者本人**的租户 union_id。
+   *
+   * 为什么必须有这一维：平台身份原本只由「机器 + 角色」构成，userId 长成
+   * `platform:<machineScope>:owner`，**不含人**。单 owner 时代无所谓，但平台支持
+   * 机器协管者后，同一台机器会有多个人以 owner 角色进来，于是：
+   *   · 审计（control-audit 按 actor.userId 记）分不出谁接管了终端；
+   *   · 终端租约互斥（terminal-control 用 userId + authSessionId 判「同一个登录」）
+   *     会把不同的人误判成同一人，进而**静默复用**彼此的写租约 —— 两个人同时往
+   *     一个终端打字而互不知情。
+   * 把它拼进 userId / authSessionId 就同时修掉这两个问题。
+   *
+   * 信任前提与 roleHeader 完全一致（活跃 cookie 证明请求经过平台反代），因为它们
+   * 由同一个反代注入、且平台在注入前会剥掉客户端伪造的同名头。
+   */
+  actorHeader: string | string[] | undefined;
   /** 已绑定平台的 machineId；未绑定为 null。 */
   platformMachineId: string | null;
   /** machineId → 平台 actor 作用域（HMAC，调用方与 liveness 检查共用同一实现）。 */
@@ -65,10 +81,19 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       : undefined;
     if (platformRole && input.platformMachineId) {
       const machineScope = input.platformActorScope(input.platformMachineId);
+      // 操作者 union_id：数组头（重复注入）视为缺失，与 roleHeader 同一 fail-safe。
+      // 平台未注入时（老版本平台、或免登录只读）退回 machine+role，保持原行为。
+      const rawActor = input.actorHeader;
+      const actor = typeof rawActor === 'string' && rawActor.trim() ? rawActor.trim() : undefined;
+      // union_id 是外部输入，虽经平台注入仍做形状收敛：只留安全字符、限长，
+      // 避免异常值进入审计行与租约 key（它们会被写日志、做字符串比较）。
+      const actorScope = actor && /^[A-Za-z0-9_-]{1,64}$/.test(actor) ? actor : undefined;
+      const subject = actorScope ? `${machineScope}:${actorScope}` : machineScope;
       return {
         kind: 'platform-dashboard',
-        userId: `platform:${machineScope}:${platformRole}`,
-        authSessionId: `${machineScope}:${platformRole}`,
+        // 带上人 → 同机多个协管者在审计里可区分、租约互斥不再误判为同一登录。
+        userId: `platform:${subject}:${platformRole}`,
+        authSessionId: `${subject}:${platformRole}`,
         expiresAt: Number.MAX_SAFE_INTEGER,
         terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',

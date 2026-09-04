@@ -478,6 +478,7 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
     // there is no module-level mirror to compare against any more.
     activeToken: currentDashboardToken(),
     roleHeader: req.headers['x-botmux-role'],
+    actorHeader: req.headers['x-botmux-actor'],
     platformMachineId: readPlatformBinding()?.machineId ?? null,
     platformActorScope: platformDashboardActorScope,
     legacyAuthSessionId: legacyDashboardAuthSessionId,
