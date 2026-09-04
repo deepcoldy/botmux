@@ -328,10 +328,12 @@ describe('card-handler resume receipt', () => {
 
   it('does not repost a live card when streaming cards are disabled for the bot', async () => {
     configureBot({ disableStreamingCard: true });
-    const { handler, resumeSession: mockedResume } = await fresh();
-    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('copilot', 'cli-sess-9');
+    mockedResume.mockResolvedValue({ ok: true, ds });
     const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
-    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
     await receiptDone;
@@ -342,10 +344,12 @@ describe('card-handler resume receipt', () => {
 
   it('does not repost a live card when streaming cards are disabled for the chat', async () => {
     configureBot({ noCardChats: [CHAT_ID] });
-    const { handler, resumeSession: mockedResume } = await fresh();
-    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('copilot', 'cli-sess-9');
+    mockedResume.mockResolvedValue({ ok: true, ds });
     const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
-    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
     await receiptDone;

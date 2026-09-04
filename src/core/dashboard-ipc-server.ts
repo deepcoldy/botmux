@@ -99,13 +99,14 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -2840,6 +2841,8 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
+  const body = await readJsonBody<{ reconcileStreamingCard?: unknown }>(req, 4_096)
+    .catch(() => ({} as { reconcileStreamingCard?: unknown }));
   const sessionId = params.sessionId;
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
@@ -2884,17 +2887,47 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
-    if (ds.scope === 'chat' && ds.chatId) {
-      getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-        .then((mode) => mode === 'topic' && ds.session.rootMessageId
-          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-          : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-        .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
-    } else if (ds.session.rootMessageId) {
-      replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+  const postResumeNotice = async (): Promise<void> => {
+    if (!ds.larkAppId) return;
+    if (!sessionTransportDisabled(ds)) {
+      if (ds.scope === 'chat' && ds.chatId) {
+        await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+          .then((mode) => mode === 'topic' && ds.session.rootMessageId
+            ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+            : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+          .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
+      } else if (ds.session.rootMessageId) {
+        await replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+          .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+      }
     }
+  };
+
+  // `/sessions` resumes from a card outside the original topic, so there is no
+  // clicked in-topic card callback to replace the stale "session closed" card.
+  // Opt in explicitly from that caller: publish the fresh waiting card first,
+  // then withdraw its predecessor. Keep CLI/dashboard resume behavior stable.
+  const staleCardId = ds.streamCardId;
+  const shouldReconcileStreamingCard = body.reconcileStreamingCard === true
+    && ds.scope === 'thread'
+    && !!ds.session.rootMessageId
+    && !!staleCardId
+    && staleCardId !== CARD_POSTING_SENTINEL
+    && botCfg?.privateCard !== true;
+  if (shouldReconcileStreamingCard) {
+    const rootMessageId = ds.session.rootMessageId!;
+    void reconcileResumedStreamingCard(
+      ds,
+      staleCardId,
+      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+    ).then(async (result) => {
+      if (result.status === 'committed') await postResumeNotice();
+    }).catch(async (err) => {
+      logger.warn(`[resume] failed to reconcile original streaming card: ${err instanceof Error ? err.message : String(err)}`);
+      await postResumeNotice();
+    });
+  } else {
+    void postResumeNotice();
   }
 
   // Report the EFFECTIVE action, not the raw request flag: only fork when wake

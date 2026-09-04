@@ -3922,6 +3922,89 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('reposts the live topic card before withdrawing the closed card when requested by /sessions', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-card-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const appId = 'resume-card-app';
+    const registry = new Map<string, any>();
+    let noticeDelivered!: () => void;
+    const noticeDone = new Promise<void>(resolve => { noticeDelivered = resolve; });
+    const replySpy = vi.spyOn(larkClient, 'replyMessage').mockImplementation(async (
+      _larkAppId,
+      _messageId,
+      _content,
+      msgType,
+    ) => {
+      if (msgType === 'interactive') return 'om_fresh_waiting_card';
+      noticeDelivered();
+      return 'om_resume_notice';
+    });
+    const deleteSpy = vi.spyOn(larkClient, 'deleteMessage').mockResolvedValue(true);
+    try {
+      config.session.dataDir = dataDir;
+      registerBot({
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        defaultWorkingDir: '/tmp',
+        workingDir: '/tmp',
+        workingDirs: ['/tmp'],
+      } as any);
+      setLarkAppId(appId);
+      sessionStore.init(appId);
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume_card', 'om_resume_card_root', 'resume topic card', 'group');
+      Object.assign(session, {
+        larkAppId: appId,
+        scope: 'thread',
+        cliId: 'codex',
+        workingDir: '/tmp',
+        streamCardId: 'om_closed_topic_card',
+        streamCardNonce: 'resume-card-nonce',
+      });
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ reconcileStreamingCard: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, sessionId: session.sessionId, wake: false });
+      await noticeDone;
+
+      const resumed = registry.get(sessionKey(session.rootMessageId, appId));
+      expect(resumed?.streamCardId).toBe('om_fresh_waiting_card');
+      expect(sessionStore.getSession(session.sessionId)?.streamCardId).toBe('om_fresh_waiting_card');
+      expect(replySpy).toHaveBeenCalledWith(
+        appId,
+        session.rootMessageId,
+        expect.stringContaining('resume topic card'),
+        'interactive',
+        true,
+      );
+      expect(deleteSpy).toHaveBeenCalledWith(appId, 'om_closed_topic_card');
+      const interactiveCall = replySpy.mock.calls.findIndex(call => call[3] === 'interactive');
+      const noticeCall = replySpy.mock.calls.findIndex(call => call[3] === 'text');
+      expect(interactiveCall).toBeGreaterThanOrEqual(0);
+      expect(noticeCall).toBeGreaterThan(interactiveCall);
+      expect(replySpy.mock.invocationCallOrder[interactiveCall]).toBeLessThan(deleteSpy.mock.invocationCallOrder[0]);
+      expect(deleteSpy.mock.invocationCallOrder[0]).toBeLessThan(replySpy.mock.invocationCallOrder[noticeCall]);
+    } finally {
+      replySpy.mockRestore();
+      deleteSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('Plan B: resumes a closed meeting-agent session as an ordinary chat session (wake=1)', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevConfigDataDir = config.session.dataDir;
