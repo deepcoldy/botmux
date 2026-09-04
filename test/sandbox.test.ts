@@ -207,6 +207,7 @@ describe('validateRelayRequest', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
+      completionProposalFile: 'c.completion-proposal.json',
       attachments: ['a.png'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
@@ -216,6 +217,7 @@ describe('validateRelayRequest', () => {
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
+    expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -349,6 +351,7 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);

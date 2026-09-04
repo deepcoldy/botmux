@@ -56,7 +56,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -508,6 +508,12 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
+import {
+  createCompletionProposalStore,
+  type CompletionProposalRecord,
+} from './core/completion-proposal.js';
+import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
+import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
@@ -5493,12 +5499,114 @@ const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
   logError: message => logger.error(message),
 });
 
+const completionProposalStore = createCompletionProposalStore(config.session.dataDir);
+
+async function readCompletionProposalBaseCard(messageId: string, larkAppId: string): Promise<Record<string, unknown> | undefined> {
+  const detail = await getMessageDetail(larkAppId, messageId);
+  const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
+  if (typeof content !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function patchCompletionProposalRecord(record: CompletionProposalRecord): Promise<void> {
+  if (!record.cardMessageId) return;
+  const base = await readCompletionProposalBaseCard(record.cardMessageId, record.larkAppId);
+  if (!base) return;
+  await updateMessage(
+    record.larkAppId,
+    record.cardMessageId,
+    JSON.stringify(renderCompletionProposalCard(base, record)),
+  );
+}
+
+async function startCompletionProposalContinuation(record: CompletionProposalRecord): Promise<void> {
+  const settled = await runCompletionProposalContinuation(record, {
+    store: completionProposalStore,
+    sessionCanResume: current => {
+      const ds = findActiveBySessionId(current.sessionId);
+      return !!ds && getSessionPersistentBackendType(ds) !== undefined;
+    },
+    dispatch: async ({ record: current, turnId, prompt }) => {
+      const data = {
+        sender: { sender_id: { open_id: current.requesterOpenId }, sender_type: 'user' },
+        message: {
+          message_id: turnId,
+          ...(current.scope === 'thread' ? { root_id: current.anchor } : {}),
+          chat_id: current.chatId,
+          chat_type: current.chatType,
+          message_type: 'text',
+          content: JSON.stringify({ text: prompt }),
+          create_time: String(Date.now()),
+        },
+      };
+      const ctx: RoutingContext = {
+        larkAppId: current.larkAppId,
+        chatId: current.chatId,
+        chatType: current.chatType,
+        messageId: turnId,
+        scope: current.scope,
+        anchor: current.anchor,
+        completionProposalContinuation: true,
+        ingressAdmission: { admitted: false },
+      };
+      await handleThreadReply(data, ctx);
+      return ctx.ingressAdmission?.admitted ? 'admitted' : 'rejected';
+    },
+    publishState: patchCompletionProposalRecord,
+  });
+  logger.info(
+    `[completion-proposal:audit] proposal=${settled.proposalId} by=${settled.decision?.by ?? '-'} `
+    + `decidedAt=${settled.decision?.decidedAt ?? '-'} snapshot=${settled.visibleHash} `
+    + `dispatch=${settled.dispatch?.state ?? '-'}`,
+  );
+}
+
+function scheduleCompletionProposalStartupRecovery(larkAppId: string): void {
+  try {
+    const recovered = completionProposalStore.recoverAtBootstrap(Date.now(), larkAppId);
+    if (recovered.changed.length > 0 || recovered.removed > 0) {
+      logger.warn(
+        `[completion-proposal] recovered ${recovered.changed.length} uncertain/expired record(s); `
+        + `removed ${recovered.removed} retained record(s)`,
+      );
+    }
+    for (const record of recovered.changed) {
+      if (record.cardMessageId) {
+        setTimeout(() => {
+          void patchCompletionProposalRecord(record)
+            .catch(error => logger.warn(`[completion-proposal] failed to patch recovered state: ${error}`));
+        }, 0);
+      }
+    }
+    for (const record of recovered.pending) {
+      setTimeout(() => {
+        void startCompletionProposalContinuation(record)
+          .catch(error => logger.warn(`[completion-proposal] failed to resume accepted proposal: ${error}`));
+      }, 0);
+    }
+  } catch (e) {
+    logger.warn(`[completion-proposal] recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
+  completionProposalDeps: {
+    store: completionProposalStore,
+    loadBaseCard: (messageId, larkAppId) => readCompletionProposalBaseCard(messageId, larkAppId),
+    startContinuation: startCompletionProposalContinuation,
+  },
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -19228,7 +19336,7 @@ async function handleThreadReplyAdmitted(
     resources.push(...extraResources);
   }
 
-  if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);
 
   // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
   // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
@@ -19251,7 +19359,7 @@ async function handleThreadReplyAdmitted(
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
   // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
-  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+  if (!ctx.completionProposalContinuation && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
     const sgEntry = getSessionGroup(ctxChatId);
     if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
       scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
@@ -19305,7 +19413,7 @@ async function handleThreadReplyAdmitted(
     + parsed.content;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  if (!prepared) {
+  if (!prepared && !ctx.completionProposalContinuation) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
     emitHookEvent('thread.reply', {
       larkAppId,
@@ -19829,7 +19937,7 @@ async function handleThreadReplyAdmitted(
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
-    ds.session.quoteTargetId = parsed.messageId;
+    if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
     ds.session.quoteTargetSenderOpenId = callerOpenId;
     ds.session.quoteTargetSenderIsBot = isForeignBot;
     publishLastInputFromBotPatch(ds);
@@ -19899,7 +20007,7 @@ async function handleThreadReplyAdmitted(
     isBotSenderType,
     explicitBotSteer: botSteerDirective.requested,
     substituteTrigger: !!substituteTrigger,
-    controlRewrite: !!threadGrill,
+    controlRewrite: !!threadGrill || !!ctx.completionProposalContinuation,
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -20163,6 +20271,10 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!ds) {
+    if (ctx.completionProposalContinuation) {
+      logger.warn('[completion-proposal] source session disappeared before continuation admission; refusing auto-create');
+      return;
+    }
     // No active session at this anchor — auto-create. This branch is mostly a
     // safety net; the dispatcher routes here only when isSessionOwner() returns
     // true, but races (between check and execution, or session-closed events)
@@ -20486,7 +20598,9 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
         });
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    if (!ctx.completionProposalContinuation) {
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    }
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
     let accepted = false;
@@ -20760,7 +20874,7 @@ async function handleThreadReplyAdmitted(
         logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
       }
     }
-    if (!queuedHasDurableTail) {
+    if (!queuedHasDurableTail && !ctx.completionProposalContinuation) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     }
     let reforkAccepted = true;
@@ -21838,7 +21952,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (e) {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
 
@@ -22631,6 +22744,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       sessionsRestored = true;
     },
   });
+  // Completion Proposal may resume an accepted pending decision immediately.
+  // Schedule it only after restore populated activeSessions; doing this before
+  // the awaited startup I/O deterministically marks every pending record failed.
+  scheduleCompletionProposalStartupRecovery(cfg.larkAppId);
 
   // Close CoT thinking bubbles orphaned by the previous daemon generation
   // (created mid-turn, never settled — their in-memory state died with the

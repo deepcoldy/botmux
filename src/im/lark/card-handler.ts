@@ -83,6 +83,11 @@ import {
   type V3DistillationCardHandlerDeps,
 } from './v3-distillation-card-handler.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
+import {
+  handleCompletionProposalAction,
+  isCompletionProposalAction,
+  type CompletionProposalCardHandlerDeps,
+} from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
@@ -142,6 +147,8 @@ export interface CardHandlerDeps {
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
   v3DistillationDeps?: V3DistillationCardHandlerDeps;
+  /** 标准完成卡里的 requester-only 非阻塞后续提案。 */
+  completionProposalDeps?: CompletionProposalCardHandlerDeps;
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
@@ -1364,6 +1371,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (isCompletionProposalAction(value?.action) && larkAppId) {
+    if (!deps.completionProposalDeps) {
+      return { toast: { type: 'error', content: '该后续动作当前不可用，请直接在话题中继续。' } };
+    }
+    return handleCompletionProposalAction(data, larkAppId, deps.completionProposalDeps);
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {

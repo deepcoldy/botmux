@@ -29,6 +29,7 @@ const BOTMUX_CARD_ACTION_PREFIXES = [
   'close_',
   'codex_',
   'compact_',
+  'completion_',
   'config_',
   'dash_',
   'export_',

@@ -113,7 +113,7 @@ describe('registration loser command handoff', () => {
     expect(end).toBeGreaterThan(start);
     const region = src.slice(start, end);
     expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
-    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
+    expect(region).toContain('if (!prepared && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared && !ctx\.completionProposalContinuation\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

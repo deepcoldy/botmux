@@ -67,7 +67,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
     expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
     expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
-    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
+    expect(cmdSend).toContain('composeFinalCardSections(canonicalCard');
     expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
   });
 
@@ -76,6 +76,25 @@ describe('cmdSend hook context wiring', () => {
     const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
     const relaySend = cliSource.slice(relayStart, relayEnd);
     expect(relaySend).toContain("'--plugin-card-action'");
+  });
+
+  it('keeps completion proposals on the canonical final-card and sandbox outbox paths', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    const sendStart = cliSource.indexOf('async function cmdSend(');
+    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
+    const cmdSend = cliSource.slice(sendStart, sendEnd);
+
+    expect(cliSource).toContain('--completion-proposal-file <path>');
+    expect(relaySend).toContain('completionProposalFile: completionProposalBase');
+    expect(cmdSend).toContain('normalizeCompletionProposalInput(raw)');
+    expect(cmdSend).toContain('participant.isBot === false');
+    expect(cmdSend).toContain("isSuspendableBackendType(s.backendType)");
+    expect(cmdSend).toContain('不能超过 8 KiB');
+    expect(cmdSend).toContain('completionProposalStore.bindMessage(');
+    expect(cmdSend).toContain('completionProposalCardDispatchUuid(completionProposalRecord)');
+    expect(cmdSend).toContain('buildCompletionProposalElement(completionProposalRecord)');
   });
 
   it('strips trailing memory citations before relay and direct-send rendering', () => {

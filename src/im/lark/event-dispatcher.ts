@@ -987,6 +987,8 @@ function cardActionKey(larkAppId: string, data: any): string {
     // duplicate in-flight click on the previous button.
     feedbackResult: value?.result,
     feedbackReason: value?.reason_key,
+    proposalId: value?.proposal_id,
+    proposalDecision: value?.decision,
     rootId: value?.root_id,
     sessionId: value?.session_id,
     // Detail actions can share action labels across rows; include row ids so
@@ -1026,7 +1028,7 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1074,15 +1076,25 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
-      if (!result?.deferredCard) return result;
+      if (!result?.deferredCard && !result?.afterAck) return result;
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the
       // pre-click card, making the expanded follow-up flash and disappear.
-      setTimeout(() => {
-        void patchTimedOutCardActionResult(larkAppId, data, result)
-          .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
-      }, 0);
-      return {};
+      if (result.deferredCard) {
+        setTimeout(() => {
+          void patchTimedOutCardActionResult(larkAppId, data, result)
+            .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
+        }, 0);
+      }
+      if (typeof result.afterAck === 'function') {
+        setTimeout(() => {
+          void Promise.resolve(result.afterAck())
+            .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
+        }, 0);
+      }
+      if (result.deferredCard) return {};
+      const { afterAck: _afterAck, ...response } = result;
+      return response;
     })
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
@@ -2289,6 +2301,11 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** Daemon-minted turn created after a requester accepted a Completion
+   * Proposal. It has no native inbound Lark message, so consumers must not
+   * emit message reactions, quote its synthetic turn id, or run unrelated
+   * inbound-message hooks. */
+  completionProposalContinuation?: true;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
   /** Set by the session-group birth flow (p2pMode='group') after it has

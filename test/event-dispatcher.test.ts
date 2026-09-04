@@ -7257,6 +7257,30 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     );
   });
 
+  it('runs a completion continuation only after returning the empty ACK', async () => {
+    const afterAck = vi.fn();
+    handlers.handleCardAction.mockResolvedValue({
+      deferredCard: { type: 'raw', data: { type: 'proposal-accepted' } },
+      afterAck,
+    });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision: 'accept',
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+  });
+
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
     mockUpdateMessage.mockRejectedValueOnce(new Error('HTTP 400 invalid card'));
     handlers.handleCardAction.mockResolvedValue({ deferredCard: { type: 'raw', data: { type: 'invalid-negative-followup' } } });
@@ -7660,6 +7684,31 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release1();
     release2();
     await Promise.all([firstP, secondP]);
+  });
+
+  it('does not collapse accept and dismiss for one completion proposal without event_id', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'accepted' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'dismissed' }); }) as any);
+    const event = (decision: 'accept' | 'dismiss') => ({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    const accept = capturedHandlers['card.action.trigger'](event('accept'));
+    const dismiss = capturedHandlers['card.action.trigger'](event('dismiss'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([accept, dismiss]);
   });
 
   // Settings counterpart guard — dash_settings_toggle on different fields.

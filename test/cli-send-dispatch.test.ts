@@ -330,6 +330,23 @@ describe('validateVideoAttachments', () => {
 });
 
 describe('normalizeInteractiveCardInput', () => {
+  it('rejects a forged completion proposal callback from a custom card', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '继续处理' },
+        behaviors: [{ type: 'callback', value: {
+          action: 'completion_proposal_decide',
+          proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+          decision: 'accept',
+        } }],
+      }] },
+    }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('callback');
+  });
+
   const card = {
     schema: '2.0',
     body: {

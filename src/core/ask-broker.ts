@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { logger } from '../utils/logger.js';
+import { gateHumanDecisionAttempt } from './human-decision-store.js';
 import {
   askKeyFor,
   dispatchUuidForKey,
@@ -146,6 +147,19 @@ export function setCanTalkChecker(
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
+}
+
+function gateAskDecision(
+  ask: InternalPending | undefined,
+  input: { nonce?: string; by: string; actor?: AskAnswerActor },
+): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
+  const gate = gateHumanDecisionAttempt({
+    exists: !!ask,
+    nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
+    settled: ask?.settled ?? false,
+    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, input.actor),
+  });
+  return gate === 'expired' ? 'stale' : gate;
 }
 
 /** Window during which a settled ask is still queryable so race-losers get a
@@ -477,10 +491,9 @@ export function toggleAsk(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.nonce !== args.nonce) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -528,10 +541,9 @@ export function submitAsk(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.nonce !== args.nonce) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -611,9 +623,9 @@ export function submitCustomReply(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { by: args.by, actor: args.actor });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
 

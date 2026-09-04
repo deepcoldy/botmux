@@ -981,6 +981,7 @@ export interface RelayRequest {
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
+  completionProposalFile?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
@@ -1009,6 +1010,7 @@ export interface ValidatedRelay {
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
+  completionProposalName?: string;
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
@@ -1047,6 +1049,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       ? req.cardFile
       : null;
   if (cardName === null) return { ok: false, error: 'cardFile must be a plain outbox basename' };
+  const completionProposalName = req.completionProposalFile === undefined
+    ? undefined
+    : safeName(req.completionProposalFile)
+      ? req.completionProposalFile
+      : null;
+  if (completionProposalName === null) {
+    return { ok: false, error: 'completionProposalFile must be a plain outbox basename' };
+  }
   const attachmentNames: string[] = [];
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
@@ -1071,6 +1081,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   if (command === 'dispatch' && (
     preparedContentName !== undefined
     || cardName !== undefined
+    || completionProposalName !== undefined
     || attachmentNames.length > 0
     || videoNames.length > 0
     || videoCoverNames.length > 0
@@ -1153,6 +1164,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       contentName: req.contentFile,
       preparedContentName,
       cardName,
+      completionProposalName,
       attachmentNames,
       videoNames,
       videoCoverNames,
@@ -1311,6 +1323,15 @@ export function startOutboxWatcher(
         }
         staged.push(cardPath);
       }
+      let completionProposalPath: string | undefined;
+      if (v.value.completionProposalName) {
+        completionProposalPath = join(staging, `${id}.completion-proposal.json`);
+        if (!materializeOutboxFile(outbox, v.value.completionProposalName, completionProposalPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: completion proposal not a regular file in outbox');
+          continue;
+        }
+        staged.push(completionProposalPath);
+      }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
@@ -1344,6 +1365,9 @@ export function startOutboxWatcher(
         ...(v.value.command === 'dispatch'
           ? ['--brief-file', contentDest]
           : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+        ...(v.value.command === 'send' && completionProposalPath
+          ? ['--completion-proposal-file', completionProposalPath]
+          : []),
         ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
         ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
         ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),

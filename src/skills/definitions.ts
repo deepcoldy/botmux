@@ -474,6 +474,44 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 
 成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
 
+### 完成卡附一个受约束的可选后续
+
+当任务已经结束、但存在一个值得让原请求者决定是否继续的独立后续时，可以把一份 Completion Proposal 附在**同一张标准 final 卡**上。它适合“是否创建修复 MR”“是否把已验证结论沉淀为规范”这类非阻塞二选一；它不是通用 callback，也不能替代需要当场等待答案的 \`botmux ask\`。
+
+先做无副作用的能力探测：
+
+\`\`\`bash
+botmux capabilities --json
+\`\`\`
+
+只有 \`.capabilities.completion_proposal_v1 == true\` 时才传文件。文件必须是 UTF-8 JSON，且只允许 4 个会展示给用户的字符串字段：
+
+\`\`\`json
+{
+  "title": "是否创建修复 MR？",
+  "body": "会整理本次已验证的修复，创建独立分支和 MR；不会自动合并。",
+  "acceptLabel": "创建 MR",
+  "dismissLabel": "暂不创建"
+}
+\`\`\`
+
+\`\`\`bash
+botmux send --response-kind final \\
+  --completion-proposal-file /absolute/task-tmp/completion-proposal.json \\
+  --mention-back <<'EOF'
+修复已完成并通过测试。
+EOF
+\`\`\`
+
+硬边界：
+
+- 只支持当前会话、标准正文 final 卡；不能和自定义卡、语音、跨群、顶层发送等特殊 sink 混用。
+- Core 固定 24 小时有效期，并把提案绑定到本次任务的精确 requester；其他人点击会被拒绝，重复点击按 first-decision-wins 幂等处理。
+- 四个字段是全部授权快照。不要写 prompt、命令、绝对路径、凭证、隐藏 payload 或 URL；点击接受只授权继续处理卡片上可见的内容，Agent 仍会在新 turn 里重跑 Skill、目标、权限和审批检查。
+- 接受会在 ACK 后启动一个新的普通 turn；跳过不会启动 Agent。满意度反馈是任务质量评价，Proposal 是有副作用的后续授权，两者独立并可同时出现在 final 卡。
+- 如果精确 requester、origin turn 或可跨重启恢复的 backend 不可证明，Core 会把内容降级成静态提示，不留下一个以后点不动的按钮。旧 Core 无该 capability 时，调用方应省略参数，并在正文里给静态提示。
+- 自定义 \`--card-file/--card-json\` 永远不能伪造这个回调；需要自定义业务交互时仍应走专门受审计的 Core 能力。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -570,6 +608,8 @@ sandbox dispatch 暂不支持
 | \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
 | \`--card-file <path>\` | 直接发送 interactive card JSON 文件（纯展示 + open_url，交互控件被拒） |
 | \`--card-json <json>\` | 直接发送 interactive card JSON 字符串（纯展示 + open_url，交互控件被拒） |
+| \`--response-kind final\` | 声明当前标准回复是最终答案，允许 Core 挂反馈与受约束完成后续 |
+| \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
