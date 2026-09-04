@@ -95,6 +95,20 @@ type JsonResponse = {
   body: any;
 };
 
+type NativeSlashCommandRow = {
+  command: string;
+  description: { default_value?: string };
+  source: 'botmux' | 'passthrough' | 'adapter' | 'custom' | 'remote';
+  status: 'synced' | 'missing' | 'outdated' | 'unknown' | 'remote-extra';
+  commandId?: string;
+};
+
+type NativeSlashCommandState = {
+  commands: NativeSlashCommandRow[];
+  summary: { total: number; synced: number; missing: number; outdated: number; remoteExtra: number };
+  permissionUrls?: { read?: string; write?: string };
+};
+
 type RuntimeMode = 'official' | 'legacy' | 'custom';
 type RuntimeDraft = {
   mode: RuntimeMode;
@@ -5835,6 +5849,218 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 // Slash 命令权限：把 /botconfig 的 customPassthroughCommands（透传给 CLI）与
 // canTalkDaemonCommands（daemon 命令降到 canTalk）搬到 Dashboard 可视化编辑。
 // 两者都是 stringList immediate 字段，走各自的 PUT 代理路由，空串＝清除回默认。
+export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const [state, setState] = useState<NativeSlashCommandState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  const applyBody = (body: any): void => {
+    if (!Array.isArray(body?.commands) || !body?.summary) return;
+    setState({
+      commands: body.commands as NativeSlashCommandRow[],
+      summary: body.summary,
+      ...(body.permissionUrls ? { permissionUrls: body.permissionUrls } : {}),
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setStatus(null);
+    void sendJson(
+      'GET',
+      `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands`,
+    ).then(res => {
+      if (cancelled) return;
+      applyBody(res.body);
+      if (!res.ok) setStatus({ text: `✗ ${responseErrorText(res)}` });
+    }).catch(error => {
+      if (!cancelled) setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [props.bot.larkAppId, props.bot.cliId, props.bot.cliPathOverride, props.bot.customPassthroughCommands]);
+
+  async function sync(): Promise<void> {
+    setBusy('all');
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/sync`,
+      );
+      applyBody(res.body);
+      if (res.ok && res.body?.report) {
+        const report = res.body.report as { created?: number; updated?: number; failed?: number };
+        setStatus({
+          text: `✓ ${tr('botDefaults.nativeSlashSyncResult', {
+            created: report.created ?? 0,
+            updated: report.updated ?? 0,
+          })}`,
+          ok: true,
+        });
+      } else {
+        const failed = Number(res.body?.report?.failed ?? 0);
+        const prefix = failed > 0 ? `${tr('botDefaults.nativeSlashSyncPartial', { failed })}: ` : '';
+        setStatus({ text: `✗ ${prefix}${responseErrorText(res)}` });
+      }
+    } catch (error) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function syncOne(command: string): Promise<void> {
+    setBusy(`sync:${command}`);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/sync-one`,
+        { command },
+      );
+      applyBody(res.body);
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.nativeSlashSyncOneResult', { command: `/${command}` })}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteOne(command: string): Promise<void> {
+    if (!globalThis.confirm(tr('botDefaults.nativeSlashDeleteConfirm', { command: `/${command}` }))) return;
+    setBusy(`delete:${command}`);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/delete`,
+        { command },
+      );
+      applyBody(res.body);
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.nativeSlashDeleteResult', { command: `/${command}` })}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const sourceLabel: Record<NativeSlashCommandRow['source'], string> = {
+    botmux: tr('botDefaults.nativeSlashSourceBotmux'),
+    passthrough: tr('botDefaults.nativeSlashSourcePassthrough'),
+    adapter: tr('botDefaults.nativeSlashSourceAdapter'),
+    custom: tr('botDefaults.nativeSlashSourceCustom'),
+    remote: tr('botDefaults.nativeSlashSourceRemote'),
+  };
+  const statusLabel: Record<NativeSlashCommandRow['status'], string> = {
+    synced: tr('botDefaults.nativeSlashStatusSynced'),
+    missing: tr('botDefaults.nativeSlashStatusMissing'),
+    outdated: tr('botDefaults.nativeSlashStatusOutdated'),
+    unknown: tr('botDefaults.nativeSlashStatusUnknown'),
+    'remote-extra': tr('botDefaults.nativeSlashStatusRemoteExtra'),
+  };
+
+  return (
+    <div className="bd-subsection bd-native-slash" data-native-slash-commands="">
+      <h4 className="bd-subsection-title">
+        <FieldTitle help={tr('botDefaults.nativeSlashHelp')}>{tr('botDefaults.nativeSlashTitle')}</FieldTitle>
+      </h4>
+      <p className="bd-native-slash-note">{tr('botDefaults.nativeSlashNote')}</p>
+      {state ? (
+        <div className="bd-native-slash-summary" aria-label={tr('botDefaults.nativeSlashSummaryLabel')}>
+          <span>{tr('botDefaults.nativeSlashTotal', { total: state.summary.total })}</span>
+          <span className="ok">{tr('botDefaults.nativeSlashSynced', { synced: state.summary.synced })}</span>
+          {state.summary.missing > 0 ? <span className="warn">{tr('botDefaults.nativeSlashMissing', { missing: state.summary.missing })}</span> : null}
+          {state.summary.outdated > 0 ? <span className="warn">{tr('botDefaults.nativeSlashOutdated', { outdated: state.summary.outdated })}</span> : null}
+          {state.summary.remoteExtra > 0 ? <span>{tr('botDefaults.nativeSlashRemoteExtra', { extra: state.summary.remoteExtra })}</span> : null}
+        </div>
+      ) : null}
+      <div className="actions bd-native-slash-actions">
+        <button
+          type="button"
+          className="primary"
+          data-action="sync-native-slash-commands"
+          disabled={busy !== null || loading || !ui.authed}
+          onClick={() => void sync()}
+        >
+          {busy === 'all' ? tr('botDefaults.nativeSlashSyncing') : tr('botDefaults.nativeSlashSync')}
+        </button>
+        {loading ? <span className="muted">{tr('common.loading')}</span> : null}
+        <StatusSpan status={status} attr={{ 'data-native-slash-status': '' }} />
+      </div>
+      {state?.permissionUrls ? (
+        <div className="bd-native-slash-permissions">
+          <span>{tr('botDefaults.nativeSlashPermissionHint')}</span>
+          {state.permissionUrls.read ? <a href={state.permissionUrls.read} target="_blank" rel="noreferrer">read ↗</a> : null}
+          {state.permissionUrls.write ? <a href={state.permissionUrls.write} target="_blank" rel="noreferrer">write ↗</a> : null}
+        </div>
+      ) : null}
+      {state?.commands.length ? (
+        <div className="bd-native-slash-table" role="table" aria-label={tr('botDefaults.nativeSlashTableLabel')}>
+          <div className="bd-native-slash-row head" role="row">
+            <span role="columnheader">{tr('botDefaults.nativeSlashCommand')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashDescription')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashState')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashAction')}</span>
+          </div>
+          {state.commands.map(command => {
+            const canSync = command.source !== 'remote' && command.status !== 'synced';
+            const canDelete = command.status === 'synced'
+              || command.status === 'outdated'
+              || command.status === 'remote-extra';
+            return (
+              <div className="bd-native-slash-row" role="row" key={`${command.source}:${command.command}`} data-slash-status={command.status}>
+                <span role="cell"><code>/{command.command}</code><small>{sourceLabel[command.source]}</small></span>
+                <span role="cell">{command.description?.default_value ?? ''}</span>
+                <span role="cell" className={`bd-native-slash-state ${command.status}`}>{statusLabel[command.status]}</span>
+                <span role="cell" className="bd-native-slash-row-actions">
+                  {canSync ? (
+                    <button
+                      type="button"
+                      data-action="sync-native-slash-command"
+                      data-command={command.command}
+                      disabled={busy !== null || !ui.authed}
+                      onClick={() => void syncOne(command.command)}
+                    >
+                      {busy === `sync:${command.command}` ? tr('botDefaults.nativeSlashSyncing') : tr('botDefaults.nativeSlashSyncOne')}
+                    </button>
+                  ) : null}
+                  {canDelete ? (
+                    <button
+                      type="button"
+                      className="danger"
+                      data-action="delete-native-slash-command"
+                      data-command={command.command}
+                      disabled={busy !== null || !ui.authed}
+                      onClick={() => void deleteOne(command.command)}
+                    >
+                      {busy === `delete:${command.command}` ? tr('botDefaults.nativeSlashDeleting') : tr('botDefaults.nativeSlashDelete')}
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
@@ -5894,6 +6120,7 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.sectionSlashCommandsHelp')}>{tr('botDefaults.sectionSlashCommands')}</FieldTitle></h3>
+      <NativeSlashCommandRegistration bot={props.bot} />
       <div className="bd-subsection">
         <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
         <textarea

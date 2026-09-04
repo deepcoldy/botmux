@@ -340,6 +340,15 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(entry?.critical).toBe(true);
   });
 
+  it('declares native slash-command read/write scopes as optional capabilities', () => {
+    const slashScopes = BOTMUX_REQUIRED_SCOPES.filter(s => s.name.startsWith('application:app_slash_command:'));
+    expect(slashScopes.map(s => s.name).sort()).toEqual([
+      'application:app_slash_command:read',
+      'application:app_slash_command:write',
+    ]);
+    expect(slashScopes.every(s => !s.critical)).toBe(true);
+  });
+
   it('every required scope exists in lark-scopes.json manifest (no bare names that Lark API would never return)', async () => {
     // Regression: BOTMUX_REQUIRED_SCOPES used bare names `im:chat` /
     // `im:message.group_at_msg` that don't exist in Lark's scope catalog —

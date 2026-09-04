@@ -90,6 +90,11 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
   { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
   { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
+  // Dashboard 的飞书原生 Slash 命令面板按应用读取并增量同步命令清单。
+  // 不使用该面板的部署不应因缺权限阻塞 daemon 启动，故保持 non-critical；
+  // 已缓存开放平台登录态时，现有启动补权流程会静默把它们加入应用版本。
+  { name: 'application:app_slash_command:read', desc: '读取应用 Slash 命令（Dashboard 原生命令面板）', critical: false },
+  { name: 'application:app_slash_command:write', desc: '注册和更新应用 Slash 命令（Dashboard 原生命令面板）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

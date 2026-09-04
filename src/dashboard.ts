@@ -6264,6 +6264,42 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { bots: out });
     }
 
+    // Native Feishu/Lark slash commands are app-scoped, so query/sync through
+    // the selected bot's daemon (and therefore that bot's own SDK client). The
+    // dashboard process never opens bots.json credentials for this operation.
+    let mBotSlash: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBotSlash = url.pathname.match(/^\/api\/bots\/([^/]+)\/slash-commands$/))) {
+      const appId = decodeURIComponent(mBotSlash[1]);
+      const upstream = await proxyToDaemon(appId, '/api/bot-slash-commands', { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'POST' && (mBotSlash = url.pathname.match(/^\/api\/bots\/([^/]+)\/slash-commands\/sync$/))) {
+      const appId = decodeURIComponent(mBotSlash[1]);
+      const upstream = await proxyToDaemon(appId, '/api/bot-slash-commands/sync', { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'POST' && (mBotSlash = url.pathname.match(/^\/api\/bots\/([^/]+)\/slash-commands\/(sync-one|delete)$/))) {
+      const appId = decodeURIComponent(mBotSlash[1]);
+      const action = mBotSlash[2];
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-slash-commands/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     let mBotDef: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotDef = url.pathname.match(/^\/api\/bots\/([^/]+)\/default-oncall$/))) {
       const appId = decodeURIComponent(mBotDef[1]);
