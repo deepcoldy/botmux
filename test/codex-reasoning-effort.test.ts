@@ -30,7 +30,8 @@ describe('Grok model-aware reasoning efforts', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
     expect(isConfigurableReasoningCliId('codex')).toBe(true);
     expect(isConfigurableReasoningCliId('traex')).toBe(true);
-    expect(isConfigurableReasoningCliId('claude-code')).toBe(false);
+    expect(isConfigurableReasoningCliId('claude-code')).toBe(true);
+    expect(isConfigurableReasoningCliId('gemini')).toBe(false);
   });
 
   it('exposes xhigh only for grok-4.6', () => {

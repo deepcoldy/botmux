@@ -23,6 +23,7 @@ import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -362,10 +363,11 @@ export function syncClaudeResumeTargetToCwd(
  *  the spawn-time flag. */
 const CLAUDE_PLUGIN_DIR = join(homedir(), '.botmux', 'claude-plugin');
 
-/** Effort levels Claude Code's `--effort` flag accepts (claude 2.1.259). The
- *  shared `reasoningEffort` type is a superset — `ultra` is a codex/traex level
- *  Claude rejects — so the adapter filters instead of forwarding blindly. */
-const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+/** Effort levels Claude Code's `--effort` flag accepts (claude 2.1.259), taken
+ *  from the same catalog the config gate and the dashboard selector read, so the
+ *  accepted set cannot drift between them. The shared `reasoningEffort` type is a
+ *  superset — `ultra` is a codex/traex level Claude rejects. */
+const CLAUDE_EFFORT_LEVELS = new Set<string>(CLAUDE_REASONING_EFFORTS);
 
 /** Substrings that indicate Claude Code received our submit. We accept either:
  *  - `"role":"user","content":"` — direct submission while idle (the canonical

@@ -53,3 +53,38 @@ describe('claude-code adapter buildArgs — reasoningEffort → --effort', () =>
     expect(args).not.toContain('--effort');
   });
 });
+
+// The adapter test above proves the mechanism; this one proves the path. Before
+// the config gate learned about claude-code, `reasoningEffort` was normalised to
+// undefined while loading bots.json, so the flag could never reach buildArgs no
+// matter how correct the adapter was.
+describe('claude-code reasoningEffort — reachable from bots.json', () => {
+  it('survives config load and reaches buildArgs as --effort', async () => {
+    const { parseBotConfigsFromText } = await import('../src/bot-registry.js');
+    const [bot] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'cli_effort_probe',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      allowedUsers: ['owner@example.com'],
+      reasoningEffort: 'xhigh',
+    }]));
+    expect(bot?.reasoningEffort).toBe('xhigh');
+
+    const args = createClaudeCodeAdapter('/usr/bin/claude')
+      .buildArgs({ ...BASE, reasoningEffort: bot!.reasoningEffort });
+    const i = args.indexOf('--effort');
+    expect(args[i + 1]).toBe('xhigh');
+  });
+
+  it('still drops reasoningEffort for a CLI without reasoning support', async () => {
+    const { parseBotConfigsFromText } = await import('../src/bot-registry.js');
+    const [bot] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'cli_effort_probe2',
+      larkAppSecret: 'secret',
+      cliId: 'gemini',
+      allowedUsers: ['owner@example.com'],
+      reasoningEffort: 'xhigh',
+    }]));
+    expect(bot?.reasoningEffort).toBeUndefined();
+  });
+});

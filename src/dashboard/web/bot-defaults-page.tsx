@@ -2409,11 +2409,11 @@ export function BotAgentSection(props: {
   const isRiff = cliKey === 'riff';
   const isTraex = cliKey === 'traex';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex';
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code';
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
+    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
     [cliKey, isCodexSelection, model],
   );
 

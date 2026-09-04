@@ -729,7 +729,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
-    const unsupportedCli = await loaded({ cliId: 'claude-code' });
+    const unsupportedCli = await loaded({ cliId: 'gemini' });
     const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
     const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
     expect(r1.ok).toBe(false);

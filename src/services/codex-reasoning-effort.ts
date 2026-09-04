@@ -3,6 +3,9 @@ export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
 export const TRAEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 3);
+/** Claude Code's `--effort` accepts low|medium|high|xhigh|max — `ultra` is
+ *  codex/traex-only and Claude answers it with an unknown-value warning. */
+export const CLAUDE_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 5);
 
 export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
 
@@ -39,7 +42,8 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
 }
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
-  return isCodexReasoningCliId(cliId) || cliId === 'grok' || cliId === 'traex';
+  return isCodexReasoningCliId(cliId) || cliId === 'grok' || cliId === 'traex'
+    || cliId === 'claude-code';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -79,6 +83,9 @@ export function reasoningEffortsForCliModel(
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
+  // Claude Code's levels are model-independent (the flag validates the same
+  // five values regardless of which model the session runs).
+  if (cliId === 'claude-code') return CLAUDE_REASONING_EFFORTS;
   return [];
 }
 
