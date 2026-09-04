@@ -212,8 +212,47 @@ describe('Codex-compatible runtime editor', () => {
     const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
     expect(picker.props.value).toBe('xhigh');
     const values = (picker.props.options as Array<{ value: string }>).map(o => o.value);
-    // max is offered (claude accepts it); ultra is codex/traex-only.
+    // opus-5 takes both xhigh and max; ultra is codex/traex-only and never offered.
     expect(values).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it('keeps the claude effort in the save payload instead of blanking it', async () => {
+    // Regression: the selector, its option list and the save payload each had
+    // their own inline CLI predicate. claude-code reached the first two but not
+    // the third, so every save sent reasoningEffort:'' and the daemon read that
+    // explicit empty value as a delete.
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: body.reasoningEffort, selectionKey: 'claude-code' }) } as any;
+    });
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+          sessionFallback: 'claude-code',
+          cliState: {
+            options: [{ id: 'claude-code', label: 'Claude Code' }, { id: 'codex', label: 'Codex' }],
+            ttadkModelDefault: '',
+            ttadkModelSuggestions: [],
+          },
+          patchBot: () => undefined,
+        }));
+      });
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      });
+      const saved = requests.find(r => r.cliId === 'claude-code');
+      expect(saved).toBeTruthy();
+      expect(saved.reasoningEffort).toBe('xhigh');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
   });
 
   it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {

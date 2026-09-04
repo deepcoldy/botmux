@@ -62,6 +62,20 @@ import {
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+
+/** The reasoning-effort selector, its option list and the save payload must all
+ *  agree on which CLIs are configurable — they were three separate inline
+ *  predicates and drifted (claude-code reached the selector but the save path
+ *  still blanked it out). Single source now. */
+function reasoningCatalogKey(cliKey: string): string | undefined {
+  if (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code') return cliKey;
+  if (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) return 'codex';
+  return undefined;
+}
+
+function cliSupportsReasoningEffort(cliKey: string): boolean {
+  return reasoningCatalogKey(cliKey) !== undefined;
+}
 import {
   REPLY_HEADER_COLORS,
   REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
@@ -2219,7 +2233,7 @@ export function BotAgentSection(props: {
         cliId: cliKey,
         model,
         ...(cliKey === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
-        reasoningEffort: (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2409,11 +2423,11 @@ export function BotAgentSection(props: {
   const isRiff = cliKey === 'riff';
   const isTraex = cliKey === 'traex';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code';
+  const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
+    () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
     [cliKey, isCodexSelection, model],
   );
 
