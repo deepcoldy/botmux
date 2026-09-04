@@ -91,6 +91,11 @@ export interface DocComment {
   quote?: string;
   /** 是否为整篇文档的全文评论。 */
   isWhole?: boolean;
+  /**
+   * `replies` 是否被飞书分页截断（评论对象顶层 `has_more`）。
+   * true 表示这里拿到的只是**前几条**回复，不能当作完整 thread 用。
+   */
+  hasMoreReplies?: boolean;
   /** 该评论 thread 下所有回复（飞书把评论建模成 reply_list）。 */
   replies: Array<{
     replyId: string;
@@ -508,11 +513,73 @@ export async function getDocComment(
     const data = ensureOk(res, '获取评论');
     const raw = Array.isArray(data?.items) ? data.items[0] : undefined;
     if (!raw) return null;
-    return normalizeComment(raw);
+    return await hydrateTruncatedReplies(larkAppId, file, normalizeComment(raw));
   } catch (err) {
     logger.warn(`[doc-comment] getDocComment ${commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+}
+
+/**
+ * 补全被截断的回复串。
+ *
+ * ⚠️ 飞书的 `batch_query` / `GET /comments` **对每条评论的 `reply_list.replies`
+ * 分页**，实测一页只给 5 条，并在评论对象顶层（不是 reply_list 里）挂
+ * `has_more: true`。这层分页没有任何参数可以调大，也不能靠 page_size 绕过。
+ *
+ * 吃下这个截断的后果是**长评论串会永久静默失联**：事件带着第 6 条以后的
+ * reply_id 打进来，在只有 5 条的 replies 里 find 不到，触发回复解析出错的那条
+ * → @ 判定、自触发过滤、turnId 去重全部基于错误的回复，最终每一条新评论都被
+ * 当成重复回合丢弃。
+ *
+ * 因此 `has_more` 为真时改用专用端点 `GET /comments/{id}/replies` 翻全量（该
+ * 端点分页正常、局部评论也支持）。拉失败就退回截断结果——半个 thread 好过没有。
+ */
+async function hydrateTruncatedReplies(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  comment: DocComment,
+): Promise<DocComment> {
+  if (!comment.hasMoreReplies || !comment.commentId) return comment;
+  try {
+    const replies: DocComment['replies'] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await driveApiCall(larkAppId, {
+        method: 'GET',
+        path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(comment.commentId)}/replies`,
+        params: {
+          file_type: file.fileType,
+          user_id_type: 'open_id',
+          page_size: 50,
+          page_token: pageToken,
+        },
+        preferTenant: true,
+      });
+      const data = ensureOk(res, '拉取评论回复');
+      if (Array.isArray(data?.items)) replies.push(...data.items.map(normalizeReply));
+      pageToken = data?.has_more === true && typeof data?.page_token === 'string' && data.page_token
+        ? data.page_token
+        : undefined;
+    } while (pageToken);
+    if (replies.length === 0) return comment;
+    logger.info(`[doc-comment] hydrated truncated thread comment=${comment.commentId.slice(0, 12)} ${comment.replies.length} → ${replies.length} replies`);
+    return { ...comment, replies, hasMoreReplies: false };
+  } catch (err) {
+    // 补全失败不致命：返回截断结果，调用方的「找不到触发回复」告警会暴露问题。
+    logger.warn(`[doc-comment] hydrate replies for ${comment.commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
+    return comment;
+  }
+}
+
+function normalizeReply(r: any): DocComment['replies'][number] {
+  return {
+    replyId: r?.reply_id ?? '',
+    userId: r?.user_id,
+    text: elementsToText(r?.content?.elements),
+    mentions: elementsMentions(r?.content?.elements),
+    createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
+  };
 }
 
 function normalizeComment(raw: any): DocComment {
@@ -525,13 +592,9 @@ function normalizeComment(raw: any): DocComment {
     isSolved: raw?.is_solved === true,
     quote: quote || undefined,
     isWhole: raw?.is_whole === true,
-    replies: replies.map((r: any) => ({
-      replyId: r?.reply_id ?? '',
-      userId: r?.user_id,
-      text: elementsToText(r?.content?.elements),
-      mentions: elementsMentions(r?.content?.elements),
-      createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
-    })),
+    // 顶层 has_more 表示**回复串**还有下一页（不是评论列表还有下一页）。
+    hasMoreReplies: raw?.has_more === true,
+    replies: replies.map(normalizeReply),
   };
 }
 
@@ -539,6 +602,10 @@ function normalizeComment(raw: any): DocComment {
  * 列出文档当前可见的全部评论。`/watch-comment --all` 用它做增量轮询：
  * 评论读取优先应用身份，因此不需要 User Token；只有应用身份无权访问文档时才
  * 回退已有的用户授权。
+ *
+ * ⚠️ 两层分页别混淆：外层 `data.has_more` 是**评论列表**还有下一页，每个 item
+ * 自己的 `has_more` 是**该评论的回复串**被截断（见 hydrateTruncatedReplies）。
+ * 只翻外层会让轮询永远看不到长 thread 第 6 条以后的回复。
  */
 export async function listDocComments(
   larkAppId: string,
@@ -564,7 +631,13 @@ export async function listDocComments(
       ? data.page_token
       : undefined;
   } while (pageToken);
-  return comments;
+  // 串行补全：一篇文档可能有几十条评论，Promise.all 会把补全请求一次性打出去撞
+  // 飞书限流。补全只在 has_more 的评论上真正发请求，串行开销可接受。
+  const hydrated: DocComment[] = [];
+  for (const comment of comments) {
+    hydrated.push(await hydrateTruncatedReplies(larkAppId, file, comment));
+  }
+  return hydrated;
 }
 
 // ─── 回评论 ─────────────────────────────────────────────────────────────────────
