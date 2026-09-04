@@ -89,6 +89,55 @@ export interface DashboardIdentityInput {
   h5: DashboardAuthIdentity | null;
 }
 
+/** 平台会注入的三种角色。平台实际只发 owner / guest，teammate 保留兼容。 */
+export const PLATFORM_DASHBOARD_ROLES = ['owner', 'teammate', 'guest'] as const;
+export type PlatformDashboardRole = typeof PLATFORM_DASHBOARD_ROLES[number];
+
+/**
+ * 操作者标识（union_id）的合法形状。**外部输入**，虽经平台注入仍要收敛：
+ * 冒号会破坏 authSessionId 的 `scope:actor:role` 分段、空格与控制字符会污染
+ * 审计行（它们会被写日志、做字符串比较）。
+ */
+const PLATFORM_ACTOR_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function isPlatformDashboardRole(value: string): value is PlatformDashboardRole {
+  return (PLATFORM_DASHBOARD_ROLES as ReadonlyArray<string>).includes(value);
+}
+
+/**
+ * 平台身份的 authSessionId **唯一构造点**：`<machineScope>[:<actor>]:<role>`。
+ *
+ * ⚠️ 这个格式有两个消费方在 dashboard.ts —— 读能力存活判定
+ * （`terminalAuthSessionLive`）与解绑吊销（`syncPlatformBindingRevocation`）。
+ * 它们曾各自硬枚举 `${scope}:owner|teammate|guest` 三个字面量，于是 actor 段一
+ * 加进来就**同时**漏判：协管者的终端只读链接被判成「认证已结束」而 403，解绑后
+ * 协管者已建立的写连接又扫不到、不被断开。构造与识别都收在本模块，就是为了让
+ * 格式只有一个定义点，不会再漂移。
+ */
+export function platformDashboardAuthSessionId(
+  machineScope: string,
+  actor: string | undefined,
+  role: PlatformDashboardRole,
+): string {
+  return actor ? `${machineScope}:${actor}:${role}` : `${machineScope}:${role}`;
+}
+
+/**
+ * 判断某个 authSessionId 是否由本机 `machineScope` 下的平台身份签出
+ * （无论平台有没有注入 actor 段）。`machineScope` 是 base64url HMAC，不含冒号，
+ * 所以按冒号分段是无歧义的。
+ */
+export function isPlatformDashboardAuthSessionId(authSessionId: string, machineScope: string): boolean {
+  const prefix = `${machineScope}:`;
+  if (!authSessionId.startsWith(prefix)) return false;
+  const parts = authSessionId.slice(prefix.length).split(':');
+  // 无 actor（老平台 / 免登录只读）：`<scope>:<role>`
+  if (parts.length === 1) return isPlatformDashboardRole(parts[0]);
+  // 带 actor（协管者）：`<scope>:<actor>:<role>`
+  if (parts.length === 2) return PLATFORM_ACTOR_PATTERN.test(parts[0]) && isPlatformDashboardRole(parts[1]);
+  return false;
+}
+
 /**
  * 身份优先级：legacy 管理 cookie > 平台注入角色 > H5 会话。
  *
@@ -101,8 +150,7 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
   const { activeToken } = input;
   if (activeToken && input.legacyCookie === activeToken) {
     const rawRole = input.roleHeader;
-    const platformRole = input.platformMachineId && typeof rawRole === 'string'
-      && (rawRole === 'owner' || rawRole === 'teammate' || rawRole === 'guest')
+    const platformRole = input.platformMachineId && typeof rawRole === 'string' && isPlatformDashboardRole(rawRole)
       ? rawRole
       : undefined;
     if (platformRole && input.platformMachineId) {
@@ -111,10 +159,8 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       // 平台未注入时（老版本平台、或免登录只读）退回 machine+role，保持原行为。
       const rawActor = input.actorHeader;
       const actor = typeof rawActor === 'string' && rawActor.trim() ? rawActor.trim() : undefined;
-      // union_id 是外部输入，虽经平台注入仍做形状收敛：只留安全字符、限长，
-      // 避免异常值进入审计行与租约 key（它们会被写日志、做字符串比较）。
-      const actorScope = actor && /^[A-Za-z0-9_-]{1,64}$/.test(actor) ? actor : undefined;
-      const subject = actorScope ? `${machineScope}:${actorScope}` : machineScope;
+      const actorScope = actor && PLATFORM_ACTOR_PATTERN.test(actor) ? actor : undefined;
+      const authSessionId = platformDashboardAuthSessionId(machineScope, actorScope, platformRole);
       // 平台授予的能力清单。只认 dashboard:manage 这一项（其余 scope 描述的是平台侧
       // 能力，机器端无对应闸）。数组头视为缺失，与 role / actor 同一 fail-safe。
       const rawScopes = input.scopesHeader;
@@ -127,8 +173,8 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       return {
         kind: 'platform-dashboard',
         // 带上人 → 同机多个协管者在审计里可区分、租约互斥不再误判为同一登录。
-        userId: `platform:${subject}:${platformRole}`,
-        authSessionId: `${subject}:${platformRole}`,
+        userId: `platform:${authSessionId}`,
+        authSessionId,
         expiresAt: Number.MAX_SAFE_INTEGER,
         terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',

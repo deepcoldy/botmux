@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  isPlatformDashboardAuthSessionId,
   resolveDashboardIdentity,
   resolveDashboardRequestGate,
 } from '../src/dashboard/request-identity.js';
@@ -108,6 +109,61 @@ describe('platform actor header', () => {
     expect(resolve('ou_alice', 'owner')?.authSessionId).not.toBe(
       resolve('ou_alice', 'guest')?.authSessionId,
     );
+  });
+
+  /**
+   * 回归：actor 段一加进来就改了 authSessionId 的分段数，而 dashboard.ts 有两个
+   * 消费方（读能力存活判定 `terminalAuthSessionLive`、解绑吊销
+   * `syncPlatformBindingRevocation`）曾各自硬枚举 `${scope}:owner|teammate|guest`
+   * 三个字面量。这组用例把「产出」直接喂回「识别」，钉住两侧不再漂移 —— 上面那些
+   * 只断言字符串长什么样的用例，是抓不到这类漏判的。
+   */
+  describe('authSessionId 的产出与识别必须同源', () => {
+    const SCOPE = `scope-${MACHINE}`;
+
+    it('带 actor 的协管者会话能被认出来 —— 否则终端只读链接 403「认证已结束」', () => {
+      const id = resolve('ou_alice');
+      expect(id?.authSessionId).toBeTruthy();
+      expect(isPlatformDashboardAuthSessionId(id!.authSessionId, SCOPE)).toBe(true);
+    });
+
+    it('不带 actor 的老平台会话同样能被认出来（不回归）', () => {
+      const id = resolve(undefined);
+      expect(isPlatformDashboardAuthSessionId(id!.authSessionId, SCOPE)).toBe(true);
+    });
+
+    it('三种角色 × 有无 actor 六种组合全部可识别', () => {
+      for (const role of ['owner', 'teammate', 'guest'] as const) {
+        for (const actor of ['ou_alice', undefined]) {
+          const id = resolve(actor, role);
+          expect(isPlatformDashboardAuthSessionId(id!.authSessionId, SCOPE), `${role}/${actor}`).toBe(true);
+        }
+      }
+    });
+
+    it('别的机器的 scope 认不出来 —— 解绑吊销不能误伤其它机器的会话', () => {
+      const id = resolve('ou_alice');
+      expect(isPlatformDashboardAuthSessionId(id!.authSessionId, 'scope-other-machine')).toBe(false);
+    });
+
+    it('legacy 与 H5 的 authSessionId 不会被误认成平台身份', () => {
+      expect(isPlatformDashboardAuthSessionId(`legacy-${ACTIVE}`, SCOPE)).toBe(false);
+      expect(isPlatformDashboardAuthSessionId('random-h5-session-id', SCOPE)).toBe(false);
+    });
+
+    it('前缀相同但结构不对的串一律不认（fail closed）', () => {
+      for (const bad of [
+        SCOPE,                              // 只有 scope，没有角色
+        `${SCOPE}:`,                        // 空角色
+        `${SCOPE}:admin`,                   // 不是三种角色之一
+        `${SCOPE}:ou_alice`,                // 有 actor 但没角色
+        `${SCOPE}:ou_alice:admin`,          // 角色非法
+        `${SCOPE}:ou_alice:owner:extra`,    // 段数超了
+        `${SCOPE}-not-a-separator:owner`,   // 前缀只是字面相似
+      ]) {
+        expect(isPlatformDashboardAuthSessionId(bad, SCOPE), bad).toBe(false);
+      }
+    });
   });
 });
 

@@ -413,6 +413,12 @@ export class ControlCsrfTokens {
     return true;
   }
 
+  /** 当前有票据在册的全部认证会话。解绑吊销要按前缀筛平台身份，见
+   *  `TerminalControlManager.authSessionIds`。 */
+  authSessionIds(): string[] {
+    return [...this.hashesByAuthSession.keys()];
+  }
+
   /** 认证结束（logout / 到期 / rotate / 解绑）时作废该会话的全部票据。 */
   revokeAuthSession(authSessionId: string): number {
     const hashes = this.hashesByAuthSession.get(authSessionId);

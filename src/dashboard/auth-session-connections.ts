@@ -85,6 +85,12 @@ export class AuthSessionConnectionRegistry {
     return this.closeAll(this.byAuthSession, authSessionId);
   }
 
+  /** 当前有长连接在册的全部认证会话。解绑吊销要按前缀筛平台身份，见
+   *  `TerminalControlManager.authSessionIds`。 */
+  authSessionIds(): string[] {
+    return [...this.byAuthSession.keys()];
+  }
+
   /**
    * P1-13：预览目标失效（换代 / 关闭 / 端口易主）时，关闭这个业务会话名下的全部
    * 长连接。注销闭包会把它们同时从 authSession 索引里摘掉，两个索引不会漂移。

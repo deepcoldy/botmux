@@ -23,6 +23,7 @@ import {
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import {
+  isPlatformDashboardAuthSessionId,
   resolveDashboardIdentity,
   resolveDashboardRequestGate,
   type DashboardRequestIdentity,
@@ -454,10 +455,11 @@ function terminalAuthSessionLive(authSessionId: string): boolean {
   if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
   const binding = readPlatformBinding();
   if (binding) {
-    const scope = platformDashboardActorScope(binding.machineId);
-    if (authSessionId === `${scope}:owner`
-      || authSessionId === `${scope}:teammate`
-      || authSessionId === `${scope}:guest`) {
+    // ⚠️ 不要在这里硬枚举 `${scope}:owner|teammate|guest`：平台注入
+    // `X-Botmux-Actor` 后，协管者的 authSessionId 多出一段 actor
+    // （`<scope>:<actor>:<role>`），三个字面量会全部落空 → 协管者的终端只读链接
+    // 被判成「认证已结束」而 403。识别交给 request-identity 的同一份格式定义。
+    if (isPlatformDashboardAuthSessionId(authSessionId, platformDashboardActorScope(binding.machineId))) {
       return true;
     }
   }
@@ -516,8 +518,21 @@ function syncPlatformBindingRevocation(): void {
   const current = readPlatformBinding()?.machineId ?? null;
   if (observedPlatformMachineId && observedPlatformMachineId !== current) {
     const scope = platformDashboardActorScope(observedPlatformMachineId);
-    for (const role of ['owner', 'teammate', 'guest'] as const) {
-      endDashboardAuthSession(`${scope}:${role}`);
+    // ⚠️ 不要硬枚举 `${scope}:owner|teammate|guest`：平台注入 `X-Botmux-Actor`
+    // 后协管者的 authSessionId 里含 union_id（`<scope>:<actor>:<role>`），而「有
+    // 哪些人」本进程不可能预先知道 —— 硬枚举扫不到他们，解绑后协管者**已建立的
+    // 写连接不会被断开**，正是本函数要堵的那扇后窗。
+    // 所以反过来做：把四个注册表里在册的认证会话取并集，按本机 scope 筛出平台
+    // 身份逐个吊销。取并集是因为一个会话可能只在其中一个表里有状态（例如只开了
+    // SSE、还没拿写租约）。
+    const observed = new Set<string>([
+      ...terminalControl.authSessionIds(),
+      ...previewInteraction.authSessionIds(),
+      ...authSessionConnections.authSessionIds(),
+      ...controlCsrfTokens.authSessionIds(),
+    ]);
+    for (const authSessionId of observed) {
+      if (isPlatformDashboardAuthSessionId(authSessionId, scope)) endDashboardAuthSession(authSessionId);
     }
   }
   observedPlatformMachineId = current;

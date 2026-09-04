@@ -142,6 +142,12 @@ export class PreviewInteractionManager {
     return count;
   }
 
+  /** 当前持有交互租约的全部认证会话。解绑吊销要按前缀筛平台身份，见
+   *  `TerminalControlManager.authSessionIds`。 */
+  authSessionIds(): string[] {
+    return [...new Set([...this.leases.values()].map(lease => lease.authSessionId))];
+  }
+
   relockAuthSession(authSessionId: string): number {
     let count = 0;
     for (const [key, lease] of [...this.leases]) {

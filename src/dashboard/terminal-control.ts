@@ -414,6 +414,20 @@ export class TerminalControlManager {
     };
   }
 
+  /**
+   * 本管理器当前持有状态的全部认证会话（写租约 + 读 socket 两个索引的并集）。
+   *
+   * 为解绑吊销而加：平台解绑时要关掉这台机器名下**所有**平台身份的连接，但协管者
+   * 的 authSessionId 里含 union_id（`<scope>:<actor>:<role>`），调用方无法把人枚举
+   * 出来，只能反过来遍历「已建立的会话」再按前缀筛。
+   */
+  authSessionIds(): string[] {
+    const ids = new Set<string>();
+    for (const lease of this.leases.values()) ids.add(lease.authSessionId);
+    for (const id of this.readSocketsByAuthSession.keys()) ids.add(id);
+    return [...ids];
+  }
+
   releaseByAuthSession(authSessionId: string): number {
     let released = 0;
     for (const [sessionId, lease] of [...this.leases]) {
