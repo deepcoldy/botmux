@@ -811,3 +811,45 @@ describe('abortCotMessage (worker died without turn_terminal)', () => {
     expect(request).not.toHaveBeenCalled();
   });
 });
+
+describe('superseded turn (type-ahead: next turn starts before the previous one is finalized)', () => {
+  it('finishes the previous live bubble as done when a newer turn\'s thinking arrives', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'))).toBe(true);
+    await flush();
+    const evs = pushedEvents();
+    const finished = evs.filter(e => e.type === 'RUN_FINISHED');
+    // 旧气泡先被按 done 收尾……
+    expect(finished.map(e => e.content)).toEqual([{ threadId: 's1', runId: 'om_t1', status: 'done' }]);
+    // ……且收尾批次在新 turn 的 RUN_STARTED 之前落地。
+    const idxFinishT1 = evs.findIndex(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1');
+    const idxStartT2 = evs.findIndex(e => e.type === 'RUN_STARTED' && e.content.runId === 'om_t2');
+    expect(idxFinishT1).toBeGreaterThan(-1);
+    expect(idxStartT2).toBeGreaterThan(idxFinishT1);
+    // 迟到的 t1 terminal：仍能按 turnId 找到它（返回 true），但不会再发第二个 RUN_FINISHED。
+    expect(finalizeCotMessage(ds, 'om_t1', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1')).toHaveLength(1);
+    // 当前 turn 照常收尾。
+    expect(finalizeCotMessage(ds, 'om_t2', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED').map(e => e.content.runId)).toEqual(['om_t1', 'om_t2']);
+  });
+
+  it('a superseded bubble whose pushes had failed is closed via the explicit complete endpoint', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    // 第二次推送失败 → 该轮 disabled，但气泡已存在。
+    request.mockImplementationOnce(async () => { throw new Error('boom'); });
+    handleCotThinkingUpdate(ds, upd([think('turn one'), think('more')], 'om_t1'));
+    await flush();
+    handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'));
+    await flush();
+    const complete = request.mock.calls.find(([req]) => typeof req.url === 'string' && req.url.includes('/message_cot/complete/'));
+    expect(complete).toBeDefined();
+    expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
+  });
+});

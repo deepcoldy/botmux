@@ -83,6 +83,51 @@ interface CotState {
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
+/** 最近几轮的 state，按 turnId 索引：一个 turn 的 thinking 已经把 `states` 换成
+ *  新 turn 之后，旧 turn 的 turn_terminal 才姗姗来迟时，仍能找到并收尾它自己的气泡，
+ *  而不是因 turnId 不匹配被忽略、让旧气泡永远转圈。有界（RECENT_COT_STATES_MAX）。 */
+const recentStates = new WeakMap<DaemonSession, Map<string, CotState>>();
+const RECENT_COT_STATES_MAX = 8;
+
+function rememberRecentState(ds: DaemonSession, state: CotState): void {
+  let m = recentStates.get(ds);
+  if (!m) { m = new Map(); recentStates.set(ds, m); }
+  m.delete(state.turnId);
+  m.set(state.turnId, state);
+  while (m.size > RECENT_COT_STATES_MAX) {
+    const oldest = m.keys().next().value;
+    if (oldest === undefined) break;
+    m.delete(oldest);
+  }
+}
+
+/**
+ * 新 turn 的 thinking 到来时，上一轮的气泡若还活着（已创建、未收尾），必须在这里
+ * 主动收尾，而不是把 state 一丢了之：丢掉之后没有任何路径会再给它 RUN_FINISHED——
+ * 它自己的 turn_terminal 已经（或将要）因 state 被替换而找不到对象，气泡就永远停在
+ * 「执行中」。实测触发场景：上一轮跑得久，用户 type-ahead 发了下一条，Claude 无缝
+ * 接着跑，两轮之间没有 idle 边沿。
+ *
+ * 下一轮的 thinking 已经出现，本身就证明上一轮结束了，所以按 done 收尾；若上一轮
+ * 曾经推送失败（disabled），走显式 complete 让它停止转圈。
+ */
+function settleSupersededState(ds: DaemonSession, state: CotState): void {
+  if (state.settled) return;
+  if (state.disabled) {
+    if (state.cotId) {
+      state.settled = true;
+      apiComplete(ds, state, 'error')
+        .catch(() => { /* best-effort */ })
+        .finally(() => clearCotOrphanMarker(state));
+    }
+    return;
+  }
+  if (!state.finishStatus) {
+    state.finishStatus = 'done';
+    logger.info(`[cot] superseded by a newer turn, finishing cot=${state.cotId ?? '(creating)'} turn=${state.turnId.substring(0, 24)} as done`);
+    void pump(ds, state);
+  }
+}
 
 // ─── Orphan closure across daemon restarts ─────────────────────────────────
 //
@@ -505,7 +550,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
         ]);
-        logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 12)}`);
+        logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 24)}`);
       }
       const pending = state.pendingEntries;
       state.pendingEntries = undefined;
@@ -527,7 +572,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         ]);
         state.settled = true;
         clearCotOrphanMarker(state);
-        logger.info(`[cot] finished cot=${state.cotId} status=${state.finishStatus}`);
+        logger.info(`[cot] finished cot=${state.cotId} turn=${state.turnId.substring(0, 24)} status=${state.finishStatus}`);
       }
       break;
     }
@@ -563,7 +608,11 @@ export function handleCotThinkingUpdate(
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);
-  if (state && state.turnKey !== key) state = undefined; // superseded turn
+  if (state && state.turnKey !== key) {
+    // superseded turn：先把旧气泡收尾（见 settleSupersededState），再换新 state。
+    settleSupersededState(ds, state);
+    state = undefined;
+  }
   if (state?.disabled) return false;
   if (state?.settled) return true; // late updates after terminal: swallow
   if (!state) {
@@ -576,6 +625,7 @@ export function handleCotThinkingUpdate(
       pumping: false,
     };
     states.set(ds, state);
+    rememberRecentState(ds, state);
   }
   state.pendingEntries = msg.entries;
   void pump(ds, state);
@@ -658,7 +708,11 @@ export function finalizeCotMessage(
   turnId: string,
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous',
 ): boolean {
-  const state = states.get(ds);
+  let state = states.get(ds);
+  // 当前 state 不是这一轮（已被新 turn 替换）时，按 turnId 找最近几轮的 state：
+  // 迟到的 terminal 仍要收尾它自己的气泡（通常 settleSupersededState 已先按 done
+  // 收过，这里靠 finishStatus / settled 幂等）。
+  if (!state || state.turnId !== turnId) state = recentStates.get(ds)?.get(turnId);
   if (!state || state.turnId !== turnId) return false;
   if (state.disabled) {
     // A mid-turn push failure left the bubble unfinished (disabled before
