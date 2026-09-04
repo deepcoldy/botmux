@@ -15,6 +15,9 @@ import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from
 import { join } from 'node:path';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
+// cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
+// dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -745,7 +748,9 @@ export function extractAssistantThinking(event: TranscriptEvent): string {
 
 /** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
  *  contents, long prompts) and results (file reads, command output) can be
- *  hundreds of KB — the bubble only needs a recognisable preview. */
+ *  hundreds of KB — the bubble only needs a recognisable preview.
+ *  args 截断不再影响气泡标题：标题用的 `subject` 在截断之前从完整 input 上
+ *  单独提取（见 extractCotEntries）。 */
 const COT_TOOL_ARGS_MAX_CHARS = 600;
 const COT_TOOL_RESULT_MAX_CHARS = 800;
 
@@ -757,7 +762,11 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
 
 /** Flatten a tool_result block's content (string, or array of text blocks)
@@ -790,9 +799,15 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
+      const subject = boundSubjectForTransport(subjectFromInputObject(block.input));
       let args = '';
       try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
-      entries.push({ kind: 'tool_call', id: block.id, name: block.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) });
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+        ...(subject ? { subject } : {}),
+      });
     } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
       const result = stringifyToolResultContent(block.content);
       entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });

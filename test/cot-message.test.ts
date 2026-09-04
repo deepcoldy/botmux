@@ -431,6 +431,77 @@ describe('handleCotThinkingUpdate', () => {
     expect(args.content.delta).toContain('x'.repeat(500));
   });
 
+  /**
+   * 转写层在 args 截断前从完整 input 提取 `subject`，渲染层优先用它；解析
+   * args 只是给尚未升级、只发 args 的旧世代 worker 的回退。
+   */
+  it('prefers the transcript-provided subject over parsing args', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // args 已被截成解析不出的残片，但 subject 完整。
+      { kind: 'tool_call', id: 'S1', name: 'Bash', args: '{"command":', subject: 'git log --oneline' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title).toContain('git log --oneline');
+    expect(title).not.toContain('{');
+  });
+
+  it('bounds a long subject for the title but resolves the language from its full form', async () => {
+    const ds = makeDs();
+    const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
+    expect(longPath.length).toBeGreaterThan(80);
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'S2', name: 'Read', args: '', subject: longPath },
+      { kind: 'tool_result', id: 'S2', result: 'export const x = 1;' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).not.toContain('.ts');
+    const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(body.language).toBe('typescript');
+  });
+
+  it('thinkingCardToolResult=false drops TOOL_CALL_RESULT but keeps START/ARGS/END', async () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, thinkingCardToolResult: false } } as any);
+    handleCotThinkingUpdate(ds, upd([
+      think('check'),
+      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'R1', result: 'file-a' },
+    ]));
+    await flush();
+    const types = pushedEvents().map(e => e.type);
+    expect(types).toContain('TOOL_CALL_START');
+    expect(types).toContain('TOOL_CALL_ARGS');
+    expect(types).toContain('TOOL_CALL_END');
+    expect(types).not.toContain('TOOL_CALL_RESULT');
+  });
+
+  it('absent thinkingCardToolResult means ON; turning it off mid-turn affects the next batch', async () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: {} } as any);
+    const first = [
+      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'R1', result: 'file-a' },
+    ];
+    handleCotThinkingUpdate(ds, upd(first));
+    await flush();
+    const resultIds = () => pushedEvents().filter(e => e.type === 'TOOL_CALL_RESULT').map(e => e.content.toolCallId);
+    expect(resultIds()).toEqual(['R1']);
+    // 配置改为关闭：累积列表追加的第二批不再带 RESULT，START 照发。
+    vi.mocked(getBot).mockReturnValue({ config: { thinkingCardToolResult: false } } as any);
+    handleCotThinkingUpdate(ds, upd([
+      ...first,
+      { kind: 'tool_call', id: 'R2', name: 'Bash', args: '{"command":"pwd"}' },
+      { kind: 'tool_result', id: 'R2', result: '/root' },
+    ]));
+    await flush();
+    expect(resultIds()).toEqual(['R1']);
+    expect(pushedEvents().filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.toolCallId)).toEqual(['R1', 'R2']);
+  });
+
   it('coalesces bursts to the latest entry list (single in-flight pump)', async () => {
     const ds = makeDs();
     let release: () => void = () => {};

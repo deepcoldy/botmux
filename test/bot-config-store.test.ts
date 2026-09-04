@@ -456,6 +456,31 @@ describe('bot-config store', () => {
     expect(readConfig().thinkingCard).toBeUndefined();
   });
 
+  it('defaultOn boolean (thinkingCardToolResult): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('thinkingCardToolResult')!;
+    expect(spec.defaultOn).toBe(true);
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().thinkingCardToolResult).toBe(false);
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;

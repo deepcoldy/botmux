@@ -22,6 +22,8 @@
  *                                  native Feishu CoT message during turns
  *                                  (bot-level master switch; per-chat opt-out
  *                                  via /cot off)
+ *   • thinkingCardToolResult    — 思考气泡是否附带工具输出代码块（默认 on；
+ *                                  off 时只保留思考段落与工具节点标题）
  *   • senderTag                 — inject the per-turn `<sender>` tag naming who
  *                                  spoke (default on; off drops per-message
  *                                  identity from the prompt)
@@ -61,6 +63,9 @@ export interface BotCardPrefs {
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   thinkingCard: boolean;
+  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 TRUE（缺省 =
+   *  开；只有显式 false 持久化），同 thinkingCard 约定；thinkingCard 关闭时无意义。 */
+  thinkingCardToolResult: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as thinkingCard. Off also drops the cursor anti-echo note (it is
@@ -108,6 +113,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       thinkingCard: c.thinkingCard !== false,
+      thinkingCardToolResult: c.thinkingCardToolResult !== false,
       senderTag: c.senderTag !== false,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
@@ -132,6 +138,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       writableTerminalLinkInCard: false,
       privateCard: false,
       thinkingCard: true,
+      thinkingCardToolResult: true,
       senderTag: true,
       overloadAlert: false,
       botToBotSameDir: true,
@@ -230,6 +237,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     applyDefaultTrue(entry, 'thinkingCard', patch.thinkingCard);
+    applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
@@ -253,6 +261,7 @@ async function updateBotCardPrefsInternal(
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         thinkingCard: entry.thinkingCard !== false,
+        thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
@@ -302,6 +311,10 @@ async function updateBotCardPrefsInternal(
   if (patch.thinkingCard !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.thinkingCard = patch.thinkingCard === false ? false : undefined;
+  }
+  if (patch.thinkingCardToolResult !== undefined) {
+    // 默认 true：只存显式 false，true 时清掉键（回到默认开）。
+    bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
   }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -356,7 +369,7 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
-    `thinkingCard=${r.result.thinkingCard} ` +
+    `thinkingCard=${r.result.thinkingCard} thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +

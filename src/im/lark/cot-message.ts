@@ -35,11 +35,15 @@
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
  *
- * Opt-in per bot via `thinkingCard: true`.
+ * Per-bot master switch `thinkingCard` (default ON — only an explicit false
+ * disables; per-chat opt-out via `/cot off`). `thinkingCardToolResult: false`
+ * additionally drops the TOOL_CALL_RESULT code blocks, see
+ * {@link cotToolResultEnabled}.
  */
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
+import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
@@ -198,6 +202,17 @@ export function cotEnabled(ds: DaemonSession): boolean {
   }
 }
 
+/** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）：bot 级
+ *  `thinkingCardToolResult`，默认 ON，只有显式 false 关闭。每个 entry 现场读
+ *  注册表，改配置下一批推送即生效；读不到 bot 按开处理，保持既有渲染。 */
+export function cotToolResultEnabled(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.thinkingCardToolResult !== false;
+  } catch {
+    return true;
+  }
+}
+
 function ev(eventType: string, content: unknown): CotEvent {
   return { event_type: eventType, content: JSON.stringify(content), timestamp: Date.now() };
 }
@@ -325,12 +340,6 @@ function reasoningId(state: CotState, index: number): string {
   return `reasoning-${state.turnId}-${index + 1}`;
 }
 
-/** Longest tool subject rendered after the category label. The title is a
- *  single unwrapped line in the bubble, so this is a layout bound, not a
- *  data bound — much tighter than COT_TOOL_ARGS_MAX_CHARS (600), which sizes
- *  a payload that turned out never to be rendered at all. */
-const COT_TOOL_TITLE_SUBJECT_MAX_CHARS = 80;
-
 /** Built-in Feishu CoT icon + i18n label key for a CLI tool name. The label
  *  becomes the node's `title` (the bubble shows a readable category like
  *  「执行命令」 instead of `Bash ({"command":…})`; the concrete subject —
@@ -365,78 +374,15 @@ function toolMeta(name: string): { icon: string; labelKey: string } {
  * dropped too, so the title is the only surviving carrier. The args event is
  * still sent — it costs nothing and a future client may render it.
  *
- * `args` is whatever the CLI produced: a JSON object string for Claude
- * (`{"command":…}` / `{"file_path":…}`), but Codex's dominant
- * `custom_tool_call` ships a raw non-JSON script string, which is used as-is.
- * Text that LOOKS like JSON but will not parse is treated as truncated: the
- * priority fields are recovered by regex where possible (the transcript layer
- * hard-cuts args at 600 chars, which mangles Write/Edit payloads whose
- * `content` dwarfs the path, yet leaves the leading `"file_path":"…"` intact),
- * and only a total miss yields ''. Every "no usable subject" path returns ''
- * so the caller keeps the bare category label — exactly the pre-change
- * rendering.
+ * `subject` 由转写层在 args 截断**之前**从完整 input 上提取（cot-subject.ts，
+ * 与本模块共用同一份字段优先级），是首选载体——长命令 / heredoc / 大 content
+ * 的 Write 都不会再丢主题。缺省时回退解析 `args`，兼容只发 args 的旧世代
+ * worker：Claude 的 `{"command":…}` JSON、Codex custom_tool_call 的裸脚本、
+ * 以及被 600 字符截断后靠正则回捞前导字段的 JSON。所有「拿不到主题」的路径
+ * 都返回 ''，调用方保留裸类别标签——即改动前的渲染。
  */
-interface ToolSubject { display: string; full: string }
-
-/** Fields ordered by how well each identifies the call to a human reader.
- *  `command` covers Claude's Bash and Codex's local_shell_call action;
- *  `description`/`prompt` catch sub-agent and task-style calls that carry no
- *  path or command of their own. */
-const COT_SUBJECT_FIELDS = [
-  'command', 'cmd', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'subject',
-  'description', 'prompt',
-] as const;
-
-function toolTitleSubject(args: string): ToolSubject {
-  const none: ToolSubject = { display: '', full: '' };
-  const raw = args.trim();
-  if (raw.length === 0) return none;
-  let subject = raw;
-  if (raw.startsWith('{')) {
-    let parsed: unknown;
-    try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
-    if (parsed && typeof parsed === 'object') {
-      const o = parsed as Record<string, unknown>;
-      const pick = COT_SUBJECT_FIELDS
-        .map(k => o[k])
-        .find(v => (typeof v === 'string' && v.trim().length > 0) || Array.isArray(v));
-      if (pick === undefined) return none;
-      // local_shell_call renders `command` as ["bash","-lc","…"] — the last
-      // element is the script; joining the argv would bury it in boilerplate.
-      subject = Array.isArray(pick)
-        ? String(pick[pick.length - 1] ?? '').trim()
-        : String(pick).trim();
-      if (subject.length === 0) return none;
-    } else {
-      // Truncated JSON: rendering the raw `{"command":` fragment is worse than
-      // rendering nothing, but the leading fields usually survive the cut, so
-      // recover one by regex before giving up.
-      const recovered = recoverSubjectFromTruncatedJson(raw);
-      if (recovered === undefined) return none;
-      subject = recovered;
-    }
-  }
-  // Multi-line scripts must collapse: the title is one unwrapped line.
-  const full = subject.replace(/\s+/g, ' ').trim();
-  if (full.length === 0) return none;
-  const display = full.length > COT_TOOL_TITLE_SUBJECT_MAX_CHARS
-    ? `${full.slice(0, COT_TOOL_TITLE_SUBJECT_MAX_CHARS)}…`
-    : full;
-  return { display, full };
-}
-
-/** Pull the first priority field out of JSON that was cut mid-payload. Only
- *  complete `"key":"value"` pairs match, so a value truncated mid-string is
- *  skipped rather than shown half-rendered. */
-function recoverSubjectFromTruncatedJson(raw: string): string | undefined {
-  for (const key of COT_SUBJECT_FIELDS) {
-    const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
-    if (!m) continue;
-    let value: string;
-    try { value = JSON.parse(`"${m[1]}"`); } catch { continue; } // bad escape → skip
-    if (value.trim().length > 0) return value.trim();
-  }
-  return undefined;
+function toolTitleSubject(entry: { args: string; subject?: string }): ToolSubject {
+  return boundSubjectForTitle(entry.subject || subjectFromArgsString(entry.args));
 }
 
 /** Category label plus the concrete subject when one can be extracted. */
@@ -497,14 +443,15 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
   }
   if (entry.kind === 'tool_call') {
     const meta = toolMeta(entry.name);
-    const subject = toolTitleSubject(entry.args);
+    const subject = toolTitleSubject(entry);
     // A tool_result entry carries only {id, result} — no tool name — so the
     // language has to be resolved here, while the call's name and subject are
     // in hand, and remembered for the matching result. Detection uses the
     // UNTRUNCATED subject: a path longer than the title cap still ends in its
     // extension, which the display string has already lost to the ellipsis.
+    // 工具输出关闭时结果不会发出，语言也无需记。
     const lang = resultLanguage(entry.name, subject.full);
-    if (lang) {
+    if (lang && cotToolResultEnabled(ds)) {
       if (!state.resultLanguages) state.resultLanguages = new Map();
       state.resultLanguages.set(entry.id, lang);
     }
@@ -520,6 +467,9 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       ev('TOOL_CALL_END', { toolCallId: entry.id }),
     ];
   }
+  // 工具输出关闭：不发 TOOL_CALL_RESULT，气泡只剩思考段落与工具节点标题
+  // （与 Claude Code 自身界面一致）。START/ARGS/END 照发，节点仍在时间线上。
+  if (!cotToolResultEnabled(ds)) return [];
   if (entry.result.length === 0) return [];
   const language = state.resultLanguages?.get(entry.id);
   return [
