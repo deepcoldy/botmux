@@ -351,6 +351,14 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
+    // bakes the full first-round prompt into `--prompt <content>`, so a long
+    // routing/role/user prompt blows the tmux limit before OpenCode starts.
+    // Set a conservative 4 KB budget: short prompts keep the reliable
+    // `--prompt` cold-start path; over-limit prompts defer to the normal
+    // post-start input queue (same mechanism Pi/Grok use).
+    maxInitialPromptArgBytes: 4096,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
