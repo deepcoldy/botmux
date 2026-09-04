@@ -216,6 +216,47 @@ describe('Codex-compatible runtime editor', () => {
     expect(values).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
   });
 
+  it.each(['aiden-x-claude', 'cjadk-x-claude', 'ttadk-x-claude'])(
+    'shows and saves effort for the %s wrapper, which resolves to claude-code',
+    async (selectionKey) => {
+      // Gateway entries are selection keys, not CliIds. Matching the raw key
+      // would hide the selector and blank the stored effort on save, even though
+      // the wrapper only swaps the binary — stripWrapperUnsafeArgs drops
+      // --settings / botmux -c / --dangerously-bypass-hook-trust, never --effort.
+      const previousFetch = globalThis.fetch;
+      const requests: any[] = [];
+      (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+        if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+        if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+        const body = JSON.parse(init?.body ?? '{}');
+        requests.push(body);
+        return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', reasoningEffort: body.reasoningEffort, selectionKey }) } as any;
+      });
+      try {
+        let renderer!: TestRenderer.ReactTestRenderer;
+        act(() => {
+          renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+            bot: { larkAppId: 'cli_wrapped', cliId: 'claude-code', agentSelectionKey: selectionKey, model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+            sessionFallback: selectionKey,
+            cliState: {
+              options: [{ id: selectionKey, label: selectionKey }, { id: 'codex', label: 'Codex' }],
+              ttadkModelDefault: '',
+              ttadkModelSuggestions: [],
+            },
+            patchBot: () => undefined,
+          }));
+        });
+        expect(renderer.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('xhigh');
+        await act(async () => {
+          renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        });
+        expect(requests.at(-1)?.reasoningEffort).toBe('xhigh');
+      } finally {
+        (globalThis as any).fetch = previousFetch;
+      }
+    },
+  );
+
   it('keeps the claude effort in the save payload instead of blanking it', async () => {
     // Regression: the selector, its option list and the save payload each had
     // their own inline CLI predicate. claude-code reached the first two but not

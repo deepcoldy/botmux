@@ -62,14 +62,24 @@ import {
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { lookupCliSelection } from '../../setup/cli-selection.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
  *  predicates and drifted (claude-code reached the selector but the save path
- *  still blanked it out). Single source now. */
+ *  still blanked it out). Single source now.
+ *
+ *  The dropdown hands us a *selection key*, which for gateway entries is not a
+ *  CliId: `aiden-x-claude`, `cjadk-x-claude` and `ttadk-x-claude` all resolve to
+ *  `claude-code` (and the `-codex` family likewise). Matching on the raw key
+ *  would hide the selector for every wrapped bot and blank its stored effort on
+ *  save, even though the wrapper only replaces the binary — `stripWrapperUnsafeArgs`
+ *  removes `--settings`, botmux's `-c` overrides and `--dangerously-bypass-hook-trust`,
+ *  never `--effort`. So resolve the key first. */
 function reasoningCatalogKey(cliKey: string): string | undefined {
-  if (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'claude-code') return cliKey;
-  if (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) return 'codex';
+  const cliId = lookupCliSelection(cliKey)?.cliId ?? cliKey;
+  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code') return cliId;
+  if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
   return undefined;
 }
 
