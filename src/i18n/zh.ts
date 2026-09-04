@@ -222,6 +222,7 @@ export const messages: Record<string, string> = {
   'card.quote.btn_prev_page': '← 上一页',
   'card.quote.btn_next_page': '下一页 →',
   'card.quote.page_indicator': '第 {current} / {total} 页',
+  'card.quote.toast_need_auth': '你还没有本机器人的使用授权，无法读取话题。请联系管理员授权后再试。',
   'card.quote.toast_not_invoker': '这张菜单是别人召唤的，请自己发 /quote 召唤一张。',
   'card.quote.toast_failed': '读取话题失败：{error}',
   'card.quote.toast_no_session': '当前话题没有活跃会话，无法把内容读进去。',

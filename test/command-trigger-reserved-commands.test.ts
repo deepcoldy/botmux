@@ -23,4 +23,24 @@ describe('reserved daemon command tables', () => {
   it('keeps EXISTING_SESSION_ONLY_DAEMON_COMMANDS a subset of DAEMON_COMMANDS', () => {
     for (const cmd of EXISTING_SESSION_ONLY_DAEMON_COMMANDS) expect(DAEMON_COMMANDS.has(cmd)).toBe(true);
   });
+
+  // Membership, not just the subset relation above — dropping a member still
+  // satisfies "subset", so the subset test cannot protect any individual entry.
+  //
+  // `/quote` in particular: without it the router falls through to
+  // `sessionStore.createSession` and a first-in-a-new-topic `/quote` builds a
+  // `worker: null` session. confirm then finds that session, cold-forks it with
+  // a FOLLOW-UP input, and `<botmux_routing>` / `<identity>` — generated only by
+  // `buildNewTopicCliInput` — never reach the CLI. `markInitialUserTurnPending`
+  // is not set either, so the next real user message is also treated as a
+  // follow-up and the opening context is unrecoverable. Severity splits by CLI:
+  // adapters with `injectsSessionContext` get those blocks from the spawn-time
+  // system prompt, the rest lose them permanently.
+  //
+  // Being existing-session-only is also the correct semantics: confirm needs a
+  // session to inject into, and `card.quote.toast_no_session` is already the
+  // graceful failure for having none.
+  it('keeps /quote existing-session-only (guards the ghost-session regression)', () => {
+    expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/quote')).toBe(true);
+  });
 });

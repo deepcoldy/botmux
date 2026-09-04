@@ -219,6 +219,7 @@ export const messages: Record<string, string> = {
   'card.quote.btn_prev_page': '← Prev',
   'card.quote.btn_next_page': 'Next →',
   'card.quote.page_indicator': 'Page {current} / {total}',
+  'card.quote.toast_need_auth': 'You are not authorized to use this bot, so the topic cannot be read. Ask an admin to grant access first.',
   'card.quote.toast_not_invoker': 'Someone else summoned this picker — send /quote to get your own.',
   'card.quote.toast_failed': 'Failed to read the topic: {error}',
   'card.quote.toast_no_session': 'No active session here to read the topic into.',

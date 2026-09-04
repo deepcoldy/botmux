@@ -8,7 +8,7 @@ import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
-import { canOperate, canTalk } from './event-dispatcher.js';
+import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -1691,12 +1691,50 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!chatId || !rootId || !containerId) {
       return { toast: { type: 'error', content: t('card.quote.toast_failed', { error: 'missing_value' }, loc) } };
     }
-    if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+    // Invoker pin, fail-closed. A missing operator must be refused, not waved
+    // through: the re-render branch already requires `operatorOpenId`, and this
+    // is the branch that actually triggers a CLI turn, so it cannot be the
+    // laxer of the two.
+    if (!operatorOpenId || (invokerOpenId && invokerOpenId !== operatorOpenId)) {
       return { toast: { type: 'error', content: t('card.quote.toast_not_invoker', undefined, loc) } };
     }
     const ds = activeSessions.get(sessionKey(rootId, larkAppId));
     if (!ds) {
       return { toast: { type: 'error', content: t('card.quote.toast_no_session', undefined, loc) } };
+    }
+    // Re-check permission AT CLICK TIME. The repo's invariant is that every card
+    // action able to trigger a CLI turn re-evaluates authorization on click
+    // (`voice_summary` below is the pattern) — and this branch reaches
+    // `sendWorkerInput` / `forkWorker`. Without it, authorization revoked between
+    // summoning the picker and clicking confirm would still go through, within
+    // the follow-up token's 30-minute lifetime.
+    //
+    // Listing 'quote_confirm' in the `isSensitive` array further down does NOT
+    // cover this: every exit of this branch returns, so control never reaches
+    // that check. The entry looked like a gate while being unreachable — worse
+    // than a known gap, because a reader assumes it is enforced. It is kept
+    // there only so a future refactor that moves this branch below the check
+    // inherits the gate.
+    //
+    // Same predicate as the command entry, not a bare `canOperate`:
+    // `canRunDaemonCommand` = canOperate ∪ (cmd ∈ canTalkDaemonCommands && canTalk),
+    // and `/quote` is eligible for that list, so an owner may hand it to
+    // talk-only users. A hard `canOperate` here would let such a bot render the
+    // picker and then refuse every confirm — worse than today.
+    //   • union_id → undefined: card callbacks don't carry one; the team-trust
+    //     leg then declines, which is the fail-closed direction.
+    //   • ds.chatType → MUST be passed: per canRunDaemonCommand's contract the
+    //     p2pOpen leg is inert when chatType is omitted, so omitting it would
+    //     reproduce the same "renders but never confirms" failure for p2pOpen
+    //     bots in DMs. `chatType` is a required DaemonSession field and `ds` is
+    //     already in hand.
+    if (!canRunDaemonCommand(
+      larkAppId, ds.chatId, operatorOpenId,
+      /*senderUnionId*/ undefined, '/quote',
+      /*memberUnionId*/ undefined, ds.chatType,
+    )) {
+      logger.info(`[${tag(ds)}] quote_confirm blocked for unauthorized user: ${operatorOpenId}`);
+      return { toast: { type: 'warning', content: t('card.quote.toast_need_auth', undefined, loc) } };
     }
     // Refuse while the worker is mid-turn. Injecting now would either be
     // dropped by the worker or queue behind the running turn and surface much
