@@ -9,6 +9,7 @@
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
+import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -125,6 +126,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"],"fallback":"bot-identity"}；tools 省略=全部，fallback 只能是 bot-identity（未授权时降级到 bot 自己的身份）或 none（直接失败），绝不会退回到另一个人的登录态。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。下个会话生效；unset 清除（关闭）' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
@@ -474,7 +476,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -553,6 +555,21 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
             return { ok: false, reason: `invalid_mojo_config: ${normalized.errors.join('; ')}` };
           }
           return { ok: true, value: normalized.value };
+        }
+        if (spec.configKey === 'triggerUserAuth') {
+          // Same SHARED parser as the bots.json door, so the two cannot drift.
+          // A rejected value is surfaced verbatim: an operator reaching for a
+          // "use the machine login" fallback must be told it is refused on
+          // purpose, and a typo'd tool name must not quietly leave the boundary
+          // unenforced while the config looks accepted.
+          try {
+            const config = parseTriggerUserAuthConfig(parsed);
+            return config
+              ? { ok: true, value: config }
+              : { ok: false, reason: 'invalid_json' };
+          } catch (e) {
+            return { ok: false, reason: `invalid_trigger_user_auth: ${(e as Error).message}` };
+          }
         }
         return { ok: true, value: parsed };
       } catch {

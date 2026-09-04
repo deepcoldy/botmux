@@ -16,6 +16,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -1541,6 +1542,14 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
+   * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
+   * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
+   * `bytedcli` run as the person who sent the current message, and a sender who
+   * has not authorized gets the bot's own tenant identity (or a failure, per
+   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   */
+  triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -3078,6 +3087,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    // Malformed input throws instead of degrading to off: an operator who typo'd
+    // a tool name would otherwise believe a credential boundary is enforced
+    // when it is not — worse than not having the feature.
+    let triggerUserAuth;
+    try {
+      triggerUserAuth = parseTriggerUserAuthConfig(entry.triggerUserAuth) ?? undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -3436,6 +3454,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
