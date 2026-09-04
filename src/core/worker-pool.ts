@@ -32,7 +32,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnRe
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
-import { normalizeClaudeModelId } from '../services/claude-transcript.js';
+import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -398,10 +398,14 @@ export function getDaemonStreamingCardUsageSnapshot(
  *   b) a switch record with a NEW uuid replaces whatever we held (and is
  *      stamped with the message's Claude session); `fallback: null` — the
  *      newest session-scoped record is NOT a live Fable fallback — clears.
- *   c) a serving model that disagrees with the held `fallbackModel` clears it —
- *      that "Claude answered on a different model" is the ONLY evidence of a
- *      switch back. Ordering matters: a `servingModel` arriving in the same
- *      message as a `fallback` was observed AFTER it, so (c) runs after (b).
+ *   c) a serving model that is a FABLE model clears it — the notice is "this
+ *      session fell OFF Fable", and the only evidence it is over is Claude
+ *      being observed back on a Fable model. A drift onto a THIRD non-Fable
+ *      model (opus-5 → opus-4-8 across a resume, with no new switch record) is
+ *      still "not on Fable": clearing there would hide the very condition the
+ *      notice exists for. Ordering matters: a `servingModel` arriving in the
+ *      same message as a `fallback` was observed AFTER it, so (c) runs after
+ *      (b).
  *   d) `changed` compares the resulting STATE with the one we came in with, so
  *      a message that runs both rules and lands back where it started costs no
  *      write and no card patch.
@@ -430,7 +434,13 @@ export function mergeModelFallbackObservation(
   }
   if (msg.servingModel && next) {
     const serving = normalizeClaudeModelId(msg.servingModel);
-    if (serving && serving !== normalizeClaudeModelId(next.fallbackModel)) {
+    // Back ON a Fable model is the only switch-back evidence. Answering on a
+    // model that merely differs from the fallback one is not: a silent drift
+    // onto a third non-Fable model (observed in a real transcript — opus-5 →
+    // opus-4-8 across a resume, no new switch record) also "differs", and
+    // clearing on it retires the notice while the session is still off Fable.
+    // Same Fable predicate the parse layer uses to scope the notice.
+    if (serving && isFableModelId(serving)) {
       next = undefined;
     }
   }

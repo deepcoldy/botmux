@@ -14,6 +14,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ModelFallbackState } from '../src/types.js';
+import { ClaudeModelFallbackTracker, type TranscriptEvent } from '../src/services/claude-transcript.js';
 
 const usageDisplay = vi.hoisted(() => ({ mode: 'streaming' as string }));
 const updateSession = vi.hoisted(() => vi.fn());
@@ -177,6 +178,55 @@ describe('mergeModelFallbackObservation', () => {
   it('keeps the notice while the fallback model is still serving', () => {
     expect(mergeModelFallbackObservation(FALLBACK, { servingModel: 'claude-opus-4-8' }))
       .toEqual({ next: FALLBACK, changed: false });
+  });
+
+  it('F1: keeps the notice when the serving model drifts to a THIRD non-Fable model', () => {
+    // Real transcript (be6da26c): fable-5 → opus-5 fallback, then across a
+    // resume the session silently drifted opus-5 → opus-4-8 with NO new switch
+    // record. The session is still off Fable, so "serving differs from the
+    // fallback model" must NOT clear — only a Fable serving model does.
+    expect(mergeModelFallbackObservation(FALLBACK, { servingModel: 'claude-opus-5' }))
+      .toEqual({ next: FALLBACK, changed: false });
+    expect(mergeModelFallbackObservation(FALLBACK, { servingModel: 'claude-sonnet-4-5' }))
+      .toEqual({ next: FALLBACK, changed: false });
+    expect(mergeModelFallbackObservation(FALLBACK, { servingModel: 'claude-haiku-4-5' }))
+      .toEqual({ next: FALLBACK, changed: false });
+  });
+
+  it('F1: clears once the serving model is back on a (different) Fable variant', () => {
+    // A manual /model onto another Fable variant still ends the fall-off-Fable
+    // condition, so the notice clears — not only on the exact original model.
+    expect(mergeModelFallbackObservation(FALLBACK, { servingModel: 'claude-fable-5' }))
+      .toEqual({ next: undefined, changed: true });
+  });
+
+  it('F1: the full tracker→merge pipeline keeps the notice through a third-model drift', () => {
+    // Mirrors the real be6da26c transcript: one fable→opus switch, then the
+    // session silently drifts onto another non-Fable model with no new record.
+    const tracker = new ClaudeModelFallbackTracker();
+    tracker.bind(SID);
+    const switchEvent: TranscriptEvent = {
+      type: 'system', subtype: 'model_consent_fallback', uuid: 'u-drift',
+      sessionId: SID, originalModel: 'claude-fable-5[1m]', fallbackModel: 'claude-opus-5[1m]',
+      timestamp: '2026-08-16T10:44:00.126Z',
+    };
+    const reply = (model: string, uuid: string): TranscriptEvent => ({
+      type: 'assistant', uuid,
+      message: { role: 'assistant', model, content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn' },
+    });
+    let state: ModelFallbackState | undefined;
+    // Batch 1: the switch plus the first fallback-model reply.
+    const obs1 = tracker.observe([switchEvent, reply('claude-opus-5', 'a1')]);
+    if (obs1) state = mergeModelFallbackObservation(state, { ...obs1, claudeSessionId: SID }).next;
+    expect(state?.uuid).toBe('u-drift');
+    // Batch 2: the silent drift onto a THIRD non-Fable model.
+    const obs2 = tracker.observe([reply('claude-opus-4-8', 'a2')]);
+    if (obs2) state = mergeModelFallbackObservation(state, { ...obs2, claudeSessionId: SID }).next;
+    expect(state?.uuid, 'notice survives the third-model drift').toBe('u-drift');
+    // Batch 3: the user switches back to Fable — only now does it clear.
+    const obs3 = tracker.observe([reply('claude-fable-5', 'a3')]);
+    if (obs3) state = mergeModelFallbackObservation(state, { ...obs3, claudeSessionId: SID }).next;
+    expect(state).toBeUndefined();
   });
 
   it('compares serving models across the [1m] context suffix', () => {

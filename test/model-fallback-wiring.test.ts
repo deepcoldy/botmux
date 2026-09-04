@@ -144,6 +144,14 @@ describe('model-fallback wiring (source lock)', () => {
     expect(handler).toContain('ds.session.workerGeneration !== workerGeneration');
     expect(handler).toContain("if (effectiveCliId !== 'claude-code') break;");
     expect(handler).toContain('mergeModelFallbackObservation(ds.modelFallback, msg)');
+    // F2: the gate must fire BEFORE the merge and the state write. A toContain
+    // shape lock is blind to the gate being moved below them, which would let
+    // a non-Claude worker move the state (the worker-side gates make that
+    // unlikely, but this is the daemon's defense-in-depth — keep it load-bearing).
+    expect(handler.indexOf("if (effectiveCliId !== 'claude-code') break;"))
+      .toBeLessThan(handler.indexOf('mergeModelFallbackObservation(ds.modelFallback, msg)'));
+    expect(handler.indexOf('mergeModelFallbackObservation(ds.modelFallback, msg)'))
+      .toBeLessThan(handler.indexOf('ds.modelFallback = merged.next'));
     // State is written and persisted only when the merge actually moved it.
     expect(handler).toMatch(
       /if \(merged\.changed\) \{\s*ds\.modelFallback = merged\.next;\s*persistStreamCardState\(ds\);\s*\}/,
@@ -169,10 +177,14 @@ describe('model-fallback wiring (source lock)', () => {
     expect(generationReset.match(/ds\.modelFallback = undefined;/g)).toHaveLength(1);
   });
 
-  it('clears only on a serving model that disagrees with the held record', () => {
+  it('clears only on a serving model back on a Fable model', () => {
     const merge = sliceBetween(workerPool, 'export function mergeModelFallbackObservation(', '\n}\n');
     expect(merge).toContain('normalizeClaudeModelId(msg.servingModel)');
-    expect(merge).toContain('normalizeClaudeModelId(next.fallbackModel)');
+    // The clear predicate is "back on a Fable model", NOT "differs from the
+    // fallback model": a drift onto a third non-Fable model must keep the
+    // notice (see model-fallback-daemon-state F1 regression).
+    expect(merge).toContain('isFableModelId(serving)');
+    expect(merge).not.toContain('normalizeClaudeModelId(next.fallbackModel)');
     expect(merge).toContain('next = undefined;');
   });
 
