@@ -24,7 +24,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getOwnerOpenId, getBotOpenId } from '../../bot-registry.js';
+import { getBotOpenId } from '../../bot-registry.js';
 import { isBotAdmin } from './grant-owner.js';
 import { config } from '../../config.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
@@ -150,7 +150,6 @@ export async function tryHandleInviteCommand(
   if (!isBotMentioned(larkAppId, message, senderOpenId)) return true;
 
   // owner / admin 强闸门（对齐 /grant）。
-  const owner = getOwnerOpenId(larkAppId);
   if (!senderOpenId || !isBotAdmin(larkAppId, senderOpenId)) {
     await reply('cmd.invite.owner_only');
     return true;

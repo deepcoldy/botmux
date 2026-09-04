@@ -50,14 +50,16 @@ describe('grant-owner', () => {
       expect(isBotAdmin('b_multi', 'ou_stranger')).toBe(false);
     });
 
-    it('fails closed when raw allowedUsers failed contact resolution', () => {
+    it('fails closed when raw owner and allowedUsers failed contact resolution', () => {
       const bot = registerBot({
         larkAppId: 'b_fail_closed',
         larkAppSecret: 's',
         cliId: 'claude-code',
+        ownerOpenId: 'ou_unresolved_cross_app',
         allowedUsers: ['ou_unresolved_cross_app'],
       });
-      // applyAllowedUsersResolve drops unresolved/invalid ou_ from runtime resolvedAllowedUsers
+      // applyAllowedUsersResolve drops unresolved/invalid identities from runtime resolvedAllowedUsers.
+      // The raw owner must not reopen the permission gate.
       bot.resolvedAllowedUsers = [];
 
       expect(getBotAdminOpenIds('b_fail_closed')).toEqual([]);
@@ -124,6 +126,12 @@ describe('grant-owner', () => {
         listChatMemberOpenIds: listMembers,
       });
       expect(approverNoChat).toBe('ou_owner_1');
+      expect(listMembers).not.toHaveBeenCalled();
+
+      const approverNonChat = await resolveGrantApprover('b_dual', 'not-a-chat-id', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(approverNonChat).toBe('ou_owner_1');
       expect(listMembers).not.toHaveBeenCalled();
     });
 

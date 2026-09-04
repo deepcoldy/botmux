@@ -808,6 +808,7 @@ function setupBotState(opts?: {
   /** 整群 talk 授权（owner 在群里裸 `/grant` 写入的 chat_id 列表）。 */
   allowedChatGroups?: string[];
   allowedUsers?: string[];
+  ownerOpenId?: string;
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
@@ -843,6 +844,7 @@ function setupBotState(opts?: {
       // 生产里 config.allowedUsers 是原始配置（启动后 resolvedAllowedUsers 才是解析结果）。
       // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
       allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
+      ownerOpenId: opts?.ownerOpenId,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       allowedChatGroups: opts?.allowedChatGroups,
@@ -5665,6 +5667,18 @@ describe('configured-but-unresolved allowlist stays fail-closed (not fail-open)'
   it('canTalk: configured owner that resolves to empty blocks ordinary talk (not open)', () => {
     setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
     expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+  });
+
+  it('revoking explicit owner from resolved allowlist revokes both talk and operate', () => {
+    setupBotState({
+      ownerOpenId: 'ou_old_owner',
+      configAllowedUsers: ['ou_old_owner', 'ou_new_owner'],
+      allowedUsers: ['ou_new_owner'],
+    });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_old_owner')).toBe(false);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_old_owner')).toBe(false);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_new_owner')).toBe(true);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_new_owner')).toBe(true);
   });
 
   it('truly empty config (no allowlist at all) remains open mode', () => {

@@ -114,8 +114,8 @@ export const messages: Record<string, string> = {
   'card.grant.duration_permanent': '永久',
   'card.grant.quota_label': '消息额度（条）',
   'card.grant.quota_placeholder': '留空不限',
-  'card.grant.note': '有效期或消息额度任一先到即自动收回授权。仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
-  'card.grant.toast_owner_only': '仅 owner 可操作',
+  'card.grant.note': '有效期或消息额度任一先到即自动收回授权。仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（Bot 管理员）。',
+  'card.grant.toast_owner_only': '仅 Bot 管理员可操作',
   'card.grant.toast_expired': '该授权请求已失效',
   'card.grant.toast_bad_limit': '授权限制参数无效',
   'card.grant.toast_bad_quota': '消息额度请输入 1–1000 的整数，留空表示不限',
@@ -140,13 +140,13 @@ export const messages: Record<string, string> = {
   'cmd.grant_restricted': '⚠️ 当前授权仅允许普通对话，不能使用 {cmd} 等命令。如需放开请联系 owner。',
 
   // /grant、/revoke 命令回执
-  'cmd.grant.owner_only': '仅 owner 可使用 /grant。',
+  'cmd.grant.owner_only': '仅 Bot 管理员可使用 /grant。',
   'cmd.grant.usage': '用法：@机器人 /grant @某人 [条数]（授权 ta 在本群与我对话，可一次 @ 多人/多 bot；带数字则给 N 条消息额度）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
   'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则使用卡片默认额度。',
   'cmd.grant.chat_done': '✅ 已授权本群所有成员与我对话（@ 我即可）。敏感操作仍仅限 allowedUsers。',
   'cmd.grant.chat_already': 'ℹ️ 本群已是授权状态，无需重复授权。',
   'cmd.grant.chat_failed': '⚠️ 授权失败：{reason}',
-  'cmd.revoke.owner_only': '仅 owner 可使用 /revoke。',
+  'cmd.revoke.owner_only': '仅 Bot 管理员可使用 /revoke。',
   'cmd.revoke.usage': '用法：@机器人 /revoke @某人（撤销 ta 的本群对话权，可一次 @ 多人/多 bot）｜@机器人 /revoke（撤销本群整群对话授权）。',
   'cmd.revoke.chat_done': '✅ 已撤销本群整群对话授权。',
   'cmd.revoke.chat_none': 'ℹ️ 本群当前没有整群对话授权。',
@@ -164,7 +164,7 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_failed': '⚠️ {name} —— 撤销失败：{reason}',
 
   // /invite（把群外 bot 拉进本群，owner 专用）
-  'cmd.invite.owner_only': '⚠️ 仅 owner 可以使用 /invite。',
+  'cmd.invite.owner_only': '⚠️ 仅 Bot 管理员可以使用 /invite。',
   'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
   'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
   'cmd.invite.header': '🤝 /invite 结果：',

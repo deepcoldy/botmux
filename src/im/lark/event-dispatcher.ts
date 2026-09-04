@@ -1902,7 +1902,7 @@ export function evaluateTalk(
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
   const allowedUsers = bot.resolvedAllowedUsers;
-  if (senderOpenId && (allowedUsers.includes(senderOpenId) || bot.config.ownerOpenId === senderOpenId)) return { allowed: true, reason: 'allowedUser' };
+  if (senderOpenId && allowedUsers.includes(senderOpenId)) return { allowed: true, reason: 'allowedUser' };
   // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
   // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
   // 命中会话群时无论表不表态，都不再回落 oncall 腿。
@@ -2098,7 +2098,7 @@ export function canOperate(
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
   // 用原始配置判定（hasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
   if (!hasConfiguredAllowlist(bot)) return true;
-  return !!senderOpenId && (allowedUsers.includes(senderOpenId) || bot.config.ownerOpenId === senderOpenId);
+  return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 
 /**

@@ -163,7 +163,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
-| `ownerOpenId` | Explicit primary owner `ou_xxx` for this bot. When omitted, defaults to the first resolved `ou_xxx` user in `allowedUsers`. When multiple administrators are configured, grant request cards prioritize @mentioning administrators who are currently present in the chat (avoiding pinging people outside the chat) |
+| `ownerOpenId` | Explicit primary owner `ou_xxx` for this bot. It participates in runtime authorization only while it remains in the resolved `allowedUsers` list; after removal or resolution failure, permissions follow the resolved allowlist, while the raw value is retained only as a DM fallback for resolution failures. When omitted, ownership defaults to the first resolved `ou_xxx` user. When multiple administrators are configured, grant request cards prioritize @mentioning administrators who are currently present in the chat (avoiding pinging people outside the chat) |
 | `allowedUsers` | The operate-permission list. Prefer a **full email**, mobile number, or `on_xxx`; an `ou_xxx` is valid only for the same app that issued it and must never be copied across Bots. When `allowedChatGroups` is configured, at least one is required to serve as owner |
 | `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |

@@ -1635,7 +1635,9 @@ export interface BotConfig {
    *   1. a fail-safe DM recipient for allowedUsers-resolve failure notices, so
    *      the owner is reachable even when the resolve that would have produced
    *      their open_id is the very thing that failed (cold-start race);
-   *   2. an always-available owner anchor for runtime permission checks.
+   *   2. an explicit owner priority, but only while that identity is still
+   *      present in the resolved allowlist. Runtime permissions remain
+   *      fail-closed when the allowlist removes or cannot resolve this entry.
    * Optional: bots created before this field, or via paths without a scanner
    * identity, simply have none and fall back to the resolved allowlist.
    */
@@ -2433,27 +2435,42 @@ export function getBotUploadClient(larkAppId: string): Lark.Client {
   return bot.uploadClient;
 }
 
-/** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
-export function getOwnerOpenId(larkAppId: string): string | undefined {
+/**
+ * Return the raw setup-time owner identity for DM fallback paths only.
+ *
+ * This value is deliberately not an authorization result: it can outlive an
+ * allowlist edit or a transient contact-resolution failure. Callers that gate
+ * runtime actions must use getOwnerOpenId() or the resolved allowlist instead.
+ */
+export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
   if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
     return bot.config.ownerOpenId;
   }
+  return undefined;
+}
+
+/**
+ * Current permission owner: explicit ownerOpenId keeps priority only while it
+ * is still in the resolved allowlist. Once removed or unresolved, ownership
+ * follows the first resolved ou_ entry, matching legacy allowlist semantics.
+ */
+export function getOwnerOpenId(larkAppId: string): string | undefined {
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
+  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+    return configuredOwner;
+  }
   return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
-/** Admins = all resolved allowedUsers + explicit ownerOpenId, matching `/botconfig`'s permission model. */
+/** Admins = only resolved allowedUsers, matching `/botconfig`'s fail-closed permission model. */
 export function getDashboardAdminOpenIds(larkAppId: string): string[] {
   const bot = bots.get(larkAppId);
   if (!bot) return [];
-  const list = [...(bot.resolvedAllowedUsers ?? [])];
-  if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
-    if (!list.includes(bot.config.ownerOpenId)) {
-      list.unshift(bot.config.ownerOpenId);
-    }
-  }
-  return list;
+  return [...(bot.resolvedAllowedUsers ?? [])].filter(u => typeof u === 'string' && u.startsWith('ou_'));
 }
 
 /**

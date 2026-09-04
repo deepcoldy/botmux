@@ -71,7 +71,7 @@ describe('overload card — restart browser action', () => {
       action: { value: { action: OVERLOAD_ACTION_RESTART_BROWSER, bundleId: 'com.google.Chrome', st: JSON.stringify(st) } },
     }, deps, 'cli_alert');
     expect(restartBrowserMock).not.toHaveBeenCalled();
-    expect(JSON.stringify(result)).toContain('仅管理员可操作');
+    expect(JSON.stringify(result)).toContain('仅 owner 可操作');
   });
 
   it('is one-shot per (nonce, bundleId): a second Arc click is rejected, but Chrome still works', async () => {
