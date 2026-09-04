@@ -14431,6 +14431,9 @@ async function spawnCli(
     // Adapters whose CLI filters the environment of the shell commands it runs
     // (codex) re-declare these; the rest ignore them and inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
+    // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
+    replyDelivery: cfg.replyDelivery,
+    solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,

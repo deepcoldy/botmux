@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'substituteMode', 'feedback', 'replyStyle',
       'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
-      'envelopeInjection', 'codexAuthSync',
+      'envelopeInjection', 'replyDelivery', 'replyDeliverySupported', 'codexAuthSync',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
       'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
       'nativeSubagentRuntime',
@@ -259,6 +259,18 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ envelopeInjection: 'auto' });
     expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
       .toMatchObject({ envelopeInjection: 'off' });
+  });
+
+  it('projects reply delivery mode + CLI support so the dashboard toggle survives refresh', () => {
+    const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, {}))
+      .toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'transcript', replyDeliverySupported: true }))
+      .toMatchObject({ replyDelivery: 'transcript', replyDeliverySupported: true });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'send', replyDeliverySupported: 'yes' }))
+      .toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
+    expect(botDefaultsPayload(daemon, { replyDelivery: 'invalid' }))
+      .toMatchObject({ replyDelivery: 'send' });
   });
 
   it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {

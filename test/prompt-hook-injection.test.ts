@@ -59,9 +59,13 @@ vi.mock('../src/im/lark/client.js', () => ({
 const getBotMock = vi.fn(() => ({
   config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
 }));
+// core/reply-delivery.ts 读 per-bot replyDelivery 的入口；缺省 'send' 让既有用例不变。
+const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' => 'send');
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
   getAllBots: vi.fn(() => []),
+  resolveReplyDelivery: (...args: unknown[]) => replyDeliveryMock(...args),
+  getOwnerOpenId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -270,6 +274,40 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  // ─── replyDelivery=transcript：续轮不注入 reminder，sidecar 不再承载它 ────────
+
+  it('auto + transcript + whiteboard：sidecar 只含 whiteboard，reminder 两边都没有', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_t' }));
+      expect(result.content).toContain('<user_message>\n帮我修个 bug\n</user_message>');
+      expect(result.content).toContain('<sender ');
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(result.content).not.toContain('<whiteboard');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toBeDefined();
+      expect(envelope).toContain('<whiteboard');
+      expect(envelope).not.toContain('<botmux_reminder>');
+      // 白板末句改口：不再要求「仍必须 botmux send」。
+      expect(envelope).toContain('用户可见结论写进最终回复即可');
+      expect(envelope).not.toContain('仍必须');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('auto + transcript 无 whiteboard：envelope 为空 → 回退 inline 且不写 sidecar', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(result.content).toContain('<user_message>');
+      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
   });
 });
 

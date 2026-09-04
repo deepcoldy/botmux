@@ -110,6 +110,7 @@ import type {
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -5059,6 +5060,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
+  // 最终回复投递方式 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
+  let replyDelivery: 'send' | 'transcript' = 'send';
+  let replyDeliverySupported = false;
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    if (cfg.replyDelivery === 'transcript') replyDelivery = 'transcript';
+    replyDeliverySupported = supportsTranscriptReplyDelivery(cfg.cliId);
+  } catch { /* default send */ }
   let codexAuthSync: 'shared' | 'isolated' = 'shared';
   try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
@@ -5259,6 +5268,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
     envelopeInjection,
+    replyDelivery,
+    replyDeliverySupported,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
@@ -6306,6 +6317,27 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
+});
+
+// Per-bot 最终回复投递方式 replyDelivery。Body `{ replyDelivery: 'transcript'|'send'|'' }`:
+//   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
+//     模型只在中途推送/附件/跨 bot @ 时才 botmux send；仅 claude-code 与结构化转写
+//     白名单 CLI 支持，其它 CLI 由 store 拒绝（400 reply_delivery_unsupported）
+//   • 'send'/其它 → 模型必须自己 botmux send（历史行为，默认），删 key
+// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
+// 系统提示部分要 /restart 才换新值。
+ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { replyDelivery?: unknown };
+  try { body = await readJsonBody<{ replyDelivery?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('replyDelivery');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const value = body.replyDelivery === 'transcript' ? 'transcript' : null;
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, replyDelivery: value ?? 'send' });
 });
 
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:

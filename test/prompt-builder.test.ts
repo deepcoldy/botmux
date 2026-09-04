@@ -69,6 +69,10 @@ const mockBotConfig: Record<string, unknown> = {
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: mockBotConfig })),
   getAllBots: vi.fn(() => []),
+  // core/reply-delivery.ts 经这两个入口读 per-bot replyDelivery / owner；缺省 'send'
+  // 保证既有用例字节不变。
+  resolveReplyDelivery: vi.fn(() => (mockBotConfig.replyDelivery === 'transcript' ? 'transcript' : 'send')),
+  getOwnerOpenId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -996,5 +1000,138 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
     // Per-message sender attribution survives inline for multi-user buffers.
     expect(body).toContain('open_id="ou_alice"');
     expect(body).toContain('open_id="ou_bob"');
+  });
+});
+
+// ─── replyDelivery=transcript — 信封改口 / solo 去壳 ─────────────────────────
+
+describe('replyDelivery=transcript envelope', () => {
+  const sender = { openId: 'ou_owner', type: 'user' as const, name: 'Owner' };
+  const selfMention = { name: 'Bot', openId: 'ou_bot' };
+  const attachments = [{ type: 'image' as const, path: '/tmp/x.jpg', name: 'x.jpg' }];
+  const mentions = [{ name: 'Bot', openId: 'ou_bot' }, { name: 'Alice', openId: 'ou_alice' }];
+  const base = { larkAppId: 'app_test', chatId: 'oc_1', locale: 'zh' as const, sender };
+
+  afterEach(() => {
+    delete mockBotConfig.replyDelivery;
+    delete mockBotConfig.apiOnly;
+  });
+
+  it('缺省 vs 显式 replyDelivery=send：续轮与首轮字节相同', () => {
+    const followDefault = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
+    const topicDefault = buildNewTopicPrompt(
+      '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    mockBotConfig.replyDelivery = 'send';
+    const followSend = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
+    const topicSend = buildNewTopicPrompt(
+      '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(followSend).toBe(followDefault);
+    expect(topicSend).toBe(topicDefault);
+    // send 模式下 solo 标志是 no-op（solo 只在 transcript 下有意义）。
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention })).toBe(followDefault);
+  });
+
+  it('transcript + claude-code 续轮：不注入 <botmux_reminder>，非 solo 保留壳与 sender', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const out = buildFollowUpContent('继续', 'sess-t1', { ...base, cliId: 'claude-code', attachments, mentions });
+    expect(out).not.toContain('<botmux_reminder>');
+    expect(out).toContain('<user_message>\n继续\n</user_message>');
+    expect(out).toContain('<sender ');
+    expect(out).toContain('<attachments');
+    expect(out).toContain('<mentions>');
+  });
+
+  it('transcript + solo 续轮：裸文本 + [附件]/[@提及] 行，自 @ 被剥、无壳无 sender', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const out = buildFollowUpContent('@Bot 帮我看下', 'sess-t2', {
+      ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention,
+    });
+    expect(out).not.toContain('<botmux_reminder>');
+    expect(out).not.toContain('<user_message>');
+    expect(out).not.toContain('<sender');
+    expect(out).not.toContain('<attachments');
+    expect(out).not.toContain('<mentions>');
+    expect(out.startsWith('帮我看下')).toBe(true);
+    expect(out).toContain('[附件]\n- x.jpg (/tmp/x.jpg)');
+    expect(out).toContain('[@提及]\n- @Alice');
+    expect(out).not.toContain('- @Bot');
+  });
+
+  it('transcript + solo：cursor 的 <sender_note> 随 sender 一起消失', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    // cursor 没有转写采集 → effectiveReplyDelivery 回落 send，信封与 send 逐字相同。
+    const transcript = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    mockBotConfig.replyDelivery = 'send';
+    const send = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    expect(transcript).toBe(send);
+    expect(transcript).toContain('<botmux_reminder>');
+    expect(transcript).toContain('<sender ');
+  });
+
+  it('noTransport 与 transcript 同时：reminder_no_transport 仍在，壳仍在', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    mockBotConfig.apiOnly = true;
+    const out = buildFollowUpContent('继续', 'sess-t4', { ...base, cliId: 'claude-code', solo: true, selfMention });
+    expect(out).toContain('<botmux_reminder>');
+    expect(out).toContain('不要调用 botmux send，不要发飞书');
+    expect(out).toContain('<user_message>');
+    expect(out).not.toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
+  it('transcript 首轮（非注入式 codex）：routing 改口；solo 时 identity 无 <routing_rules> 且去壳', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const build = (solo: boolean) => buildNewTopicPrompt(
+      '@Bot 帮我看下', 'sess-t5', 'codex', undefined, attachments, mentions, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1', solo, selfMention },
+    );
+    const nonSolo = build(false);
+    expect(nonSolo).toContain('<botmux_routing>');
+    expect(nonSolo).toContain('自动转发回飞书');
+    expect(nonSolo).not.toContain('唯一方式');
+    expect(nonSolo).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(nonSolo).toContain('<routing_rules>');
+    expect(nonSolo).toContain('<user_message>');
+    expect(nonSolo).toContain('<sender ');
+    expect(nonSolo).toContain('<mentions>');
+
+    const solo = build(true);
+    expect(solo).toContain('<botmux_routing>');
+    expect(solo).toContain('<identity>');
+    expect(solo).toContain('<name>Bot</name>');
+    expect(solo).not.toContain('<routing_rules>');
+    expect(solo).not.toContain('<user_message>');
+    expect(solo).not.toContain('<sender ');
+    expect(solo).not.toContain('<attachments');
+    expect(solo).not.toContain('<mentions>');
+    expect(solo).toContain('[附件]\n- x.jpg (/tmp/x.jpg)');
+    expect(solo).toContain('[@提及]\n- @Alice');
+    expect(solo).not.toContain('- @Bot');
+  });
+
+  it('buildReforkPrompt 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const makeDs = (soloSession?: boolean): DaemonSession => ({
+      session: {
+        sessionId: 'refork-t', chatId: 'oc_chat', rootMessageId: 'om_root', title: 'topic',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+      } as any,
+      worker: null, workerPort: null, workerToken: null,
+      larkAppId: 'app_test', chatId: 'oc_chat', chatType: 'p2p', scope: 'thread',
+      spawnedAt: 0, cliVersion: '1.0.0', lastMessageAt: 0, hasHistory: true,
+      soloSession,
+    } as DaemonSession);
+    const bare = buildReforkPrompt(makeDs(true), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    expect(bare).not.toContain('<botmux_reminder>');
+    expect(bare).not.toContain('<user_message>');
+    expect(bare).not.toContain('<sender ');
+    expect(bare.startsWith('继续')).toBe(true);
+    const shelled = buildReforkPrompt(makeDs(false), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    expect(shelled).not.toContain('<botmux_reminder>');
+    expect(shelled).toContain('<user_message>\n@Bot 继续\n</user_message>');
+    expect(shelled).toContain('<sender ');
   });
 });

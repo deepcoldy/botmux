@@ -1501,6 +1501,16 @@ export interface BotConfig {
    */
   envelopeInjection?: 'auto' | 'off';
   /**
+   * 最终回复投递方式。`send`（缺省）：模型必须自己执行 `botmux send` 把回复发到
+   * 飞书，系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写
+   * 自动取本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为
+   * 主通道），系统提示改口、不再注入每轮 reminder；solo 会话（私聊 / 仅 owner
+   * 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集的 CLI
+   * 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
+   * 只有显式 `'transcript'` 持久化；系统提示部分需 /restart 生效，逐轮信封立即生效。
+   */
+  replyDelivery?: 'send' | 'transcript';
+  /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
    * explicit `false` disables), so existing prompts stay byte-for-byte.
@@ -2469,6 +2479,12 @@ export function getBotUploadClient(larkAppId: string): Lark.Client {
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Per-bot 最终回复投递方式（默认 `'send'`）。只读内存 registry：worker 通过
+ *  init IPC 拿冻结值，不需要磁盘 mtime 缓存；未注册的 bot 视为默认。 */
+export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' {
+  return bots.get(larkAppId)?.config.replyDelivery === 'transcript' ? 'transcript' : 'send';
 }
 
 /** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
@@ -3532,6 +3548,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      replyDelivery: entry.replyDelivery === 'transcript' ? 'transcript' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,

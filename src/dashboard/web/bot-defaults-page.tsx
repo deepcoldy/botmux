@@ -1179,6 +1179,9 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+                避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
+            <section className="bd-tile"><ReplyDeliverySection bot={bot} patchBot={patchBot} /></section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -4597,6 +4600,62 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
       <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+/** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复），off = send
+ *  （模型自己 botmux send，默认）。当前 CLI 没有转写采集通道时开关禁用并说明。 */
+export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [transcript, setTranscript] = useState(props.bot.replyDelivery === 'transcript');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = props.bot.replyDeliverySupported === true;
+
+  useEffect(() => setTranscript(props.bot.replyDelivery === 'transcript'), [props.bot.replyDelivery]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = transcript;
+    setTranscript(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-delivery`, { replyDelivery: next ? 'transcript' : 'send' });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.replyDelivery === 'transcript';
+        setTranscript(saved);
+        props.patchBot(props.bot.larkAppId, { replyDelivery: saved ? 'transcript' : 'send' });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setTranscript(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setTranscript(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-reply-delivery>
+      <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <ToggleRow
+        checked={transcript}
+        disabled={busy || !supported}
+        dataAction="toggle-reply-delivery"
+        title={tr('botDefaults.replyDeliveryTranscript')}
+        help={tr('botDefaults.replyDeliveryHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">
+        {supported ? tr('botDefaults.replyDeliveryNote') : tr('botDefaults.replyDeliveryUnsupported')}
+      </small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-reply-delivery-status': '' }} />
       </div>
     </section>
   );

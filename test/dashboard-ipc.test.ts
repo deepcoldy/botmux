@@ -1881,6 +1881,19 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
       });
       expect(bogus.status).toBe(400);
       expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
+  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = `test-reply-delivery-${cliId}`;
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, configPath, appId);
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -1888,6 +1901,69 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+  const put = (base: string, replyDelivery: unknown) => fetch(`${base}/api/bot-reply-delivery`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ replyDelivery }),
+  });
+  const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+  it('claude-code: GET 默认 send/supported，PUT transcript 落盘，PUT send 删 key', async () => {
+    await withBot('claude-code', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliverySupported: true });
+
+      const on = await put(base, 'transcript');
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(persisted(configPath).replyDelivery).toBe('transcript');
+      expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const after = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(after).toMatchObject({ replyDelivery: 'transcript', replyDeliverySupported: true });
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+
+      // '' / 未知值同样清回默认。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+    });
+  });
+
+  it('cursor: GET 报 unsupported，PUT transcript 4xx reply_delivery_unsupported 且不落盘', async () => {
+    await withBot('cursor', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+
+      // send 在不支持的 CLI 上仍可写（no-op 清除），不报错。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+    });
+  });
+
+  it('bad JSON body → 400 bad_json', async () => {
+    await withBot('claude-code', async (base) => {
+      const res = await fetch(`${base}/api/bot-reply-delivery`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{not json',
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'bad_json' });
+    });
   });
 });
 

@@ -803,6 +803,66 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
   });
 
+  it('replyDelivery: transcript persists on claude-code; send normalizes to unset', async () => {
+    const { registry, store } = await loaded({ cliId: 'claude-code' });
+    const spec = store.findConfigField('replyDelivery')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(spec.clearable).toBe(true);
+    expect(store.coerceConfigValue(spec, 'TRANSCRIPT')).toEqual({ ok: true, value: 'transcript' });
+    expect(store.coerceConfigValue(spec, 'send')).toEqual({ ok: true, value: 'send' });
+    expect(store.coerceConfigValue(spec, 'auto')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    // 缺省展示为 send（而非 ∅）：/config get 读起来就是当前生效值。
+    const before = store.getConfigSnapshot('app_default');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r1.ok).toBe(true);
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript', effect: 'next-session' });
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+
+    // set send = 默认值 → 删 key，bots.json 保持干净，内存同步为 undefined。
+    const r2 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    expect(readConfig().replyDelivery).toBeUndefined();
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+  });
+
+  it('replyDelivery: transcript persists on structured-bridge CLIs (codex) and unset clears', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r1.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+  });
+
+  it('rejects replyDelivery=transcript for CLIs without transcript capture', async () => {
+    const { registry, store } = await loaded({ cliId: 'cursor' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+
+    // send / unset 在不支持的 CLI 上照样允许（只是 no-op 清除）。
+    const r2 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r2.ok).toBe(true);
+    expect('replyDelivery' in readConfig()).toBe(false);
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;

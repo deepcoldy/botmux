@@ -243,6 +243,28 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
 | `thinkingCardToolResult` | 布尔，默认 `true`（开）。思考气泡（bot 级总开关 `thinkingCard`，默认开）的工具节点是否附带命令输出 / 文件内容代码块。设为 `false` 后气泡只保留思考段落与工具节点标题（工具名 · 命令 / 路径），结果退化成一行 `✓ 已完成`（工具节点在飞书端要收到结果事件才会从「执行中」落定，所以不能干脆不发），与 Claude Code 自身界面一致；`/botconfig set thinkingCardToolResult off` 或 dashboard「卡片」子开关切换，立即生效 |
+| `replyDelivery` | `"send"`（默认）或 `"transcript"`。最终回复怎么送到飞书：`send` = 模型必须自己 `botmux send`；`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，模型只在中途推送、附件、跨 bot @ 时才需要 `botmux send`。只有 `transcript` 会写盘；缺省或 `send` 与历史行为逐字节一致 |
+
+### `replyDelivery: "transcript"`
+
+设成 `transcript` 后对该 bot 的会话有三条效果：
+
+1. **系统提示改口**为「最终回复自动转发」，不再要求模型每轮结束前自己 `botmux send`；
+2. **不再逐轮注入 `<botmux_reminder>`**（每轮 prompt 少一段提醒）；
+3. **solo 会话去壳**：私聊、或只有 owner 和本 bot 两个参与者的 1v1 普通群，每轮消息去掉 `<user_message>` 壳与 `<sender/>` 标签，模型看到的就是裸文本。话题群、多人群、非 owner 发言的一律不算 solo，壳与标签照旧。
+
+支持的 CLI 白名单：`claude-code`，以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`。其它 CLI（如 `cursor`、`gemini`）没有转写采集通道，`/botconfig set` 与 dashboard 都会拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
+
+可由 owner / `allowedUsers` 通过 `/botconfig` 热更新：
+
+```text
+/botconfig set replyDelivery transcript
+/botconfig unset replyDelivery
+```
+
+- **生效时机分两段**：逐轮信封（reminder / 壳 / `<sender/>`）从下一轮起生效；系统提示是 spawn 时注入的，已在跑的会话要 `/restart` 才换新值，新会话直接用新值。
+- **观测代价**：solo 会话的裸文本形态没有 `<user_message>` / `<sender>` 结构，`/adopt` 不再把这类会话识别为 botmux 自产会话（与 `senderTag: false` 同类代价）。
+- dashboard「回复投递 → 转写回复模式」开关保存的就是这个字段；当前 CLI 不支持时开关禁用并说明。
 
 关掉后模型看不到发言人身份：多人会话里无法区分谁说的、也无法按人称呼。适合模型会把标签内容抄进回复正文的 CLI（如 cursor，见 `<sender_note>` 反抄写提示——标签关掉后该提示也一并消失），或不希望把每条消息的身份写进 CLI 记录的场景。
 

@@ -43,6 +43,7 @@ import {
   MIN_CARD_ACTION_ACK_TIMEOUT_MS,
 } from '../core/card-action-ack.js';
 import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
+import { supportsTranscriptReplyDelivery } from '../core/reply-delivery.js';
 
 /**
  * 生效时机：
@@ -68,6 +69,8 @@ export interface ConfigFieldSpec {
   defaultOn?: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
+  /** kind==='enum' 且缺省即某个取值的字段：未设置时 `/config get` 显示该值而非 ∅。 */
+  enumDefault?: string;
   /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
   maxLen?: number;
   /** kind==='number' 的闭区间下界；缺省仍只要求正整数。 */
@@ -118,6 +121,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
+  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: 'send', hint: '最终回复投递方式：send=模型必须 botmux send（默认）｜transcript=从 CLI 转写自动取最终回复发卡，模型只在中途推送/附件/跨 bot @ 时才 send；仅 claude-code 与 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok 支持；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回 send' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
@@ -189,7 +193,7 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
   if (spec.kind === 'json') {
     return value === undefined || value === null ? '∅' : JSON.stringify(value);
   }
-  if (value === undefined || value === null || value === '') return '∅';
+  if (value === undefined || value === null || value === '') return spec.enumDefault ?? '∅';
   return String(value);
 }
 
@@ -270,7 +274,10 @@ async function applyConfigFieldInternal(
   const oldText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
 
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
-  const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
+  // replyDelivery 的 send 就是默认值，同样归一为清除（等价 unset），不落盘。
+  const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null
+    : spec.configKey === 'replyDelivery' && value === 'send' ? null
+    : value;
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
     const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
@@ -304,6 +311,11 @@ async function applyConfigFieldInternal(
     if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
         && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
+    }
+    // transcript 依赖 CLI 有转写采集通道；没有的 CLI 拒绝写入，而不是落盘后运行时静默回落 send。
+    if (spec.configKey === 'replyDelivery' && effective === 'transcript'
+        && !supportsTranscriptReplyDelivery(nextCliId)) {
+      return { write: false, result: 'reply_delivery_unsupported' };
     }
     if (effective === null) {
       delete entry[spec.configKey];

@@ -317,6 +317,74 @@ describe('claude-code buildArgs', () => {
     // Omitting the arg and passing false must be identical (no accidental gate).
     expect(sysDefault).toBe(sysExplicitFalse);
     expect(shellDefault).toBe(shellExplicitFalse);
+    // replyDelivery 缺省与显式 'send' 同样字节相同（transcript 开关的守卫）。
+    expect(buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'send' })).toBe(sysDefault);
+    expect(buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'send', solo: true })).toBe(sysDefault);
+    expect(buildBotmuxShellHints('en', false, 'send').join('\n')).toBe(shellDefault);
+  });
+
+  // ── replyDelivery=transcript：最终回复由 daemon 从转写自动转发，两条注入路径都
+  //    改口为「常规回复不要 botmux send」，但保留哨兵（fallback 的抑制规则）。
+  it('rewords BOTH injection paths for replyDelivery=transcript and keeps the silence sentinel', () => {
+    const sys = buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'transcript' });
+    const shell = buildBotmuxShellHints('en', false, 'transcript').join('\n');
+    for (const prompt of [sys, shell]) {
+      expect(prompt).toContain('automatically forwarded back to Lark');
+      expect(prompt).toContain('Do not call `botmux send` for normal replies');
+      expect(prompt).not.toContain('you MUST reply via');
+      expect(prompt).not.toContain('the only way');
+      // send 仍可用于中途推送 / 附件 / 跨 bot @，且哨兵语义保留。
+      expect(prompt).toContain('botmux send');
+      expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(prompt).toContain("botmux send <<'EOF'");
+      // 以「send 是最终回复」为前提的两条提示不再注入。
+      expect(prompt).not.toContain('--response-kind final');
+      expect(prompt).not.toContain('no visible');
+    }
+    const sysZh = buildBotmuxSystemPromptText({ locale: 'zh', replyDelivery: 'transcript' });
+    const shellZh = buildBotmuxShellHints('zh', false, 'transcript').join('\n');
+    for (const prompt of [sysZh, shellZh]) {
+      expect(prompt).toContain('自动转发回飞书');
+      expect(prompt).not.toContain('必须用 `botmux send`');
+      expect(prompt).not.toContain('唯一方式');
+      expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    }
+    expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
+  });
+
+  it('transcript + solo drops identity routing_rules; transcript alone keeps them; noTransport still wins', () => {
+    const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+    expect(solo).toContain('<name>Bot</name>');
+    expect(solo).toContain('<open_id>ou_x</open_id>');
+    expect(solo).not.toContain('<routing_rules>');
+    const group = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
+    expect(group).toContain('<routing_rules>');
+    expect(group).toContain('botmux send --mention');
+    // noTransport 优先级最高：transcript 标志不改变 no-transport 的折叠输出。
+    const noTransport = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
+    expect(buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true, replyDelivery: 'transcript', solo: true })).toBe(noTransport);
+    expect(buildBotmuxShellHints('en', true, 'transcript')).toEqual(buildBotmuxShellHints('en', true));
+  });
+
+  it('forwards replyDelivery/solo into --append-system-prompt, but v3 goal-mode pins send wording', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+    const prompt = args[args.indexOf('--append-system-prompt') + 1];
+    expect(prompt).toContain('自动转发回飞书');
+    expect(prompt).not.toContain('必须用 `botmux send`');
+    expect(prompt).not.toContain('<routing_rules>');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    const previous = process.env[GOAL_ENV.V3_MARKER];
+    process.env[GOAL_ENV.V3_MARKER] = '1';
+    try {
+      const v3 = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+      const v3Prompt = v3[v3.indexOf('--append-system-prompt') + 1];
+      expect(v3Prompt).toContain('必须用 `botmux send`');
+      expect(v3Prompt).not.toContain('自动转发回飞书');
+      expect(v3Prompt).toContain('<routing_rules>');
+    } finally {
+      if (previous === undefined) delete process.env[GOAL_ENV.V3_MARKER];
+      else process.env[GOAL_ENV.V3_MARKER] = previous;
+    }
   });
 
   it('passes configured model with --model', () => {

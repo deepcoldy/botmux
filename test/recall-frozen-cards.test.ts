@@ -427,8 +427,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
       undefined,
-      // 20th arg: silent-idle label flag — no deliberately-silent turn here.
-      false,
+      // 20th arg: idle-card label ('silent' / 'completed') — neither here.
+      undefined,
       // 21st arg: per-bot dshRuntime — undefined for this Claude fixture (only
       // meaningful for cliId 'dsh', where 'tui' keeps the 🗜️ compact button).
       undefined,
@@ -1054,10 +1054,38 @@ describe('parkStreamCard', () => {
     expect(entry?.displayMode).toBe('screenshot');
     expect(entry?.imageKey).toBe('img_key_xyz');
     expect(entry?.codexServiceTierBadge).toBe('⚡ priority');
+    // 新字段 idleLabel 为准；'silent' 同时写旧字段 silentIdle 供旧版 daemon 读盘。
+    expect(entry?.idleLabel).toBe('silent');
     expect(entry?.silentIdle).toBe(true);
     expect(ds.parkedStreamCardNonce).toBe('nonce_live');
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
+  });
+
+  it("freezes a transcript-delivered turn with idleLabel 'completed' (no legacy silentIdle)", () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_live';
+    ds.streamCardNonce = 'nonce_live';
+    ds.lastScreenContent = 'snapshot text';
+    ds.completedIdleTurnId = 'om_live_turn';
+
+    parkStreamCard(ds);
+
+    const entry = ds.frozenCards?.get('nonce_live');
+    expect(entry?.idleLabel).toBe('completed');
+    expect(entry?.silentIdle).toBeUndefined();
+  });
+
+  it('freezes a plain idle turn with neither idleLabel nor silentIdle', () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_live';
+    ds.streamCardNonce = 'nonce_live';
+
+    parkStreamCard(ds);
+
+    const entry = ds.frozenCards?.get('nonce_live');
+    expect(entry?.idleLabel).toBeUndefined();
+    expect(entry?.silentIdle).toBeUndefined();
   });
 
   it('does not leak a stale Codex tier snapshot into a non-Codex frozen card', () => {

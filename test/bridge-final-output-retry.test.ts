@@ -68,6 +68,10 @@ vi.mock('../src/bot-registry.js', () => ({
   // Reply-card footer usage only renders in 'footer' mode; tests override this
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
+  // Per-bot replyDelivery. Default 'send' = today's behaviour; the transcript
+  // tests below flip it per case. (clearAllMocks resets it to undefined, which
+  // effectiveReplyDelivery also treats as 'send'.)
+  resolveReplyDelivery: vi.fn(() => 'send'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -132,7 +136,8 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
   createMessageListenerRunPreview,
@@ -556,6 +561,117 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('Codex App 共享对话（已同步至飞书）');
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('在 adopted pane 中直接输入');
+  });
+
+  // ─── transcript 模式：最终回复卡投递成功后给本轮打「已完成」标签 ──────────
+  // replyDelivery=transcript 时最终回复由这条 bridge fallback 主投递；成功后
+  // ds.completedIdleTurnId 记住该轮，idle 卡头改「已完成」。send 模式（缺省）
+  // 必须一个字节都不变。
+  describe('transcript replyDelivery → completedIdleTurnId', () => {
+    function armTranscript(): ReturnType<typeof vi.fn> {
+      vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      return sessionReply;
+    }
+
+    it('marks the turn only AFTER the canonical send succeeds', async () => {
+      const sessionReply = armTranscript();
+      const ds = makeDs();
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      // Nothing is marked before the (0ms-deferred) send settles.
+      expect(ds.completedIdleTurnId).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+      expect(ds.completedIdleTurnId).toBe('turn-1');
+    });
+
+    it('a failed send leaves the turn unmarked (retry still pending)', async () => {
+      vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+      const sessionReply = vi.fn(async () => { throw new Error('lark 500'); });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(ds.completedIdleTurnId).toBeUndefined();
+    });
+
+    it("send mode (default replyDelivery) never sets completedIdleTurnId", async () => {
+      vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(ds.completedIdleTurnId).toBeUndefined();
+    });
+
+    it('stale lineage (a newer turn already opened) does not relabel the live card', async () => {
+      armTranscript();
+      const ds = makeDs();
+      // Type-ahead: turn-2 was admitted while turn-1 was still running.
+      ds.currentTurnId = 'turn-2';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+      expect(ds.completedIdleTurnId).toBeUndefined();
+    });
+
+    it('known matching lineage still marks the turn', async () => {
+      armTranscript();
+      const ds = makeDs();
+      ds.currentTurnId = 'turn-1';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(ds.completedIdleTurnId).toBe('turn-1');
+    });
+
+    it("kind 'local-turn' (terminal-local sync) never marks the turn", async () => {
+      const sessionReply = armTranscript();
+      const ds = makeDs();
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(ds.completedIdleTurnId).toBeUndefined();
+    });
+
+    it('a card already settled to idle is re-patched immediately with the completed label', async () => {
+      armTranscript();
+      const ds = makeDs();
+      ds.workerReady = true;
+      ds.streamCardId = 'om_card';
+      ds.lastScreenStatus = 'idle';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(ds.completedIdleTurnId).toBe('turn-1');
+      // idle label is the 20th positional arg of buildStreamingCard.
+      const calls = vi.mocked(buildStreamingCard).mock.calls;
+      expect(calls.some(c => c[19] === 'completed')).toBe(true);
+    });
+
+    it('a card still working is NOT patched; the label rides the next status edge', async () => {
+      armTranscript();
+      const ds = makeDs();
+      ds.workerReady = true;
+      ds.streamCardId = 'om_card';
+      ds.lastScreenStatus = 'working';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(ds.completedIdleTurnId).toBe('turn-1');
+      const calls = vi.mocked(buildStreamingCard).mock.calls;
+      expect(calls.some(c => c[19] === 'completed')).toBe(false);
+    });
   });
 
   it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {

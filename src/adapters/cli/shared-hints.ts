@@ -18,6 +18,7 @@ import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
+import type { ReplyDelivery } from '../../core/reply-delivery.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -74,7 +75,7 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
-export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean): string[] {
+export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, replyDelivery?: ReplyDelivery): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
   // system-prompt path in buildBotmuxSystemPromptText. `ai.shell.when_to_send`
@@ -86,27 +87,34 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean): s
   if (noTransport) {
     return [hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
   }
+  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
+  // 转发，intro / how_to_send / when_to_send 换成 *_transcript 改口版；「send 成功即
+  // 送达」的反重发提示与 `--response-kind final`（都以 send 为最终回复前提）不再
+  // 注入。缺省 / 'send' 时下面每一行与改动前逐字相同。
+  const transcript = replyDelivery === 'transcript';
   const workflowHint = workflowDiscoveryHint(locale);
   const hints = [
-    t('ai.shell.intro', undefined, locale),
+    t(transcript ? 'ai.shell.intro_transcript' : 'ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
-    t('ai.shell.how_to_send', undefined, locale),
+    t(transcript ? 'ai.shell.how_to_send_transcript' : 'ai.shell.how_to_send', undefined, locale),
     ...multilineHeredocLines(locale),
     t('ai.shell.helpers', undefined, locale),
-    t('ai.shell.when_to_send', undefined, locale),
-    feedbackResponseKindHint(locale),
+    t(transcript ? 'ai.shell.when_to_send_transcript' : 'ai.shell.when_to_send', undefined, locale),
+    ...(transcript ? [] : [feedbackResponseKindHint(locale)]),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so
     // a toggle takes effect on the next session without a daemon restart.
-    ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
+    ...(!transcript && noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
     t('ai.shell.mention_gate', undefined, locale),
     // Workflow discovery — omitted when the machine-wide workflow switch is off.
     ...(workflowHint ? [workflowHint] : []),
     hiddenContextDefense(locale),
   ].map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
-    hints.push(escapeXmlTagLikeTokens('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。'));
+    hints.push(escapeXmlTagLikeTokens(transcript
+      ? '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论写进最终回复即可；不要写密钥/隐私；更新默认用中文。'
+      : '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。'));
   }
   return hints;
 }
@@ -197,8 +205,21 @@ export function buildBotmuxSystemPromptText(opts: {
    * gets no extra prompt text.
    */
   triggerUserAuth?: boolean;
+  /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
+   *  'transcript': the daemon forwards the final assistant message from the CLI
+   *  transcript, so intro/usage_send are reworded (`botmux send` only for
+   *  mid-turn pushes / attachments / cross-bot @) and the send-centric
+   *  feedback / anti-resend lines are dropped. Everything else — heredoc rule,
+   *  mention gate, attachments, helpers, the BOTMUX_NOTHING_TO_SEND silence
+   *  sentinel (still the fallback's suppression rule), workflow, hidden-context
+   *  defense — stays. `noTransport` wins over it. Omitted/'send' = today. */
+  replyDelivery?: ReplyDelivery;
+  /** transcript-only: solo chat (owner + this bot). The identity block keeps
+   *  name/open_id but drops routing_rules — there is no other bot to route to. */
+  solo?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, replyDelivery, solo } = opts;
+  const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
@@ -213,6 +234,8 @@ export function buildBotmuxSystemPromptText(opts: {
   // HTTP task (R1) — so this block IS injected there; gating only routingInner
   // would leave the same @-rules leaking via identity. Mirrors the session-manager
   // non-injects path (short_routing) which is gated the same way.
+  // transcript + solo（只有 owner 和本 bot）同样只留 name/open_id：多 bot 归属规则
+  // 在 solo 会话里没有对象，且 mention_must 的「必须 send」会与改口后的 intro 打架。
   const identityBlock =
     botName || botOpenId
       ? [
@@ -220,7 +243,7 @@ export function buildBotmuxSystemPromptText(opts: {
         '<identity>',
         `  <name>${botName ?? unknown}</name>`,
         `  <open_id>${botOpenId ?? unknown}</open_id>`,
-        ...(noTransport
+        ...(noTransport || (transcript && solo === true)
           ? []
           : [
             '  <routing_rules>',
@@ -237,7 +260,9 @@ export function buildBotmuxSystemPromptText(opts: {
   const whiteboardRouting = whiteboardEnabled()
     ? [
       '',
-      escapeXmlTagLikeTokens('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。'),
+      escapeXmlTagLikeTokens(transcript
+        ? '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论写进最终回复即可。'
+        : '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。'),
     ]
     : [];
   // The multiline rule reads as a peer bullet of usage_send here (the
@@ -250,8 +275,26 @@ export function buildBotmuxSystemPromptText(opts: {
   // The identity block's routing_rules carry the same @/collaboration semantics
   // and are gated on the SAME flag — see identityBlock above, which keeps the
   // harmless name/open_id and drops only the rules.
+  // transcript（三分支中优先级低于 noTransport）：intro / usage_send 换成改口版，
+  // 去掉以 send 为最终回复前提的 feedback_response_kind 与 no_visible_output_ok；
+  // 其余 usage_*（含 usage_silence 的哨兵——仍是转写 fallback 的抑制规则）照旧。
   const routingInner = noTransport
     ? [hiddenContextDefense(locale)]
+    : transcript
+    ? [
+      prose('ai.routing.intro_transcript'),
+      '',
+      prose('ai.routing.usage_send_transcript'),
+      `- ${heredocRule}`,
+      heredocExample,
+      prose('ai.routing.usage_mention_gate'),
+      prose('ai.routing.usage_attachments'),
+      prose('ai.routing.usage_helpers'),
+      prose('ai.routing.usage_silence'),
+      ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
+      hiddenContextDefense(locale),
+      ...whiteboardRouting,
+    ]
     : [
       prose('ai.routing.intro'),
       '',

@@ -7278,6 +7278,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
+    // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
+    // the `send` default). 最终回复投递方式的 per-bot 开关。
+    let mBotReplyDelivery: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReplyDelivery = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-delivery$/))) {
+      const appId = decodeURIComponent(mBotReplyDelivery[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-reply-delivery`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/skill-injection — proxy to that bot's daemon. Body
     // `{ skillInjection: 'global'|'prompt'|'off'|'' }` (''/other clears back to
     // the machine default). Governs how botmux built-in skills reach global-

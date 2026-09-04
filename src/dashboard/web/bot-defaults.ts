@@ -142,6 +142,10 @@ export type BotDefaultsRow = {
   p2pMode?: string;
   /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
   envelopeInjection?: 'auto' | 'off' | null;
+  /** 最终回复投递方式。'transcript' = daemon 从 CLI 转写自动取最终回复；缺省/'send' = 模型自己 botmux send。 */
+  replyDelivery?: 'send' | 'transcript' | null;
+  /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
+  replyDeliverySupported?: boolean;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;

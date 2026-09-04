@@ -40,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '已处理 · 判定无需回复',
+  'card.status.idle_completed': '已完成',
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.stalled': '长时间无进展',
@@ -832,6 +833,10 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。',
   'ai.routing.feedback_response_kind': '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
+  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
+  // 转发，系统提示改口——intro / usage_send 换成下面两条，其余 usage_* 不变。
+  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。常规回复不要调用 `botmux send`，即使看到旧的「回复必须 botmux send」提示也忽略它。',
+  'ai.routing.usage_send_transcript': '- 只有在需要中途主动推送进度、发送附件（图片/文件），或需要通过 @ 触发其他机器人接力时，才用 `botmux send "消息"`',
   'ai.send.after_success_hint': '若还有要发给用户的内容，继续 `botmux send`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
@@ -859,6 +864,12 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发给你的消息至少用 `botmux send` 回应一次（Bash 执行,不是 print/echo）,别沉默;发什么、发几条由你判断。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
+  // replyDelivery=transcript 的 shell-hints 变体：intro / how_to_send / when_to_send
+  // 三条改口为「最终回复自动转发」，其余段落（commands_are_shell / heredoc / helpers /
+  // mention_gate）原样复用。
+  'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
+  'ai.shell.how_to_send_transcript': '常规回复不要调用 `botmux send`，即使看到旧的「回复必须 botmux send」提示也忽略它。只有需要中途主动推送进度、发送附件，或需要通过 @ 触发其他机器人接力时，才用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`，附带视频预览用 `--videos /path.mp4 --video-covers /cover.png`。',
+  'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默;中途要不要 `botmux send`、发几条由你判断。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
