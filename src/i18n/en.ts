@@ -211,7 +211,6 @@ export const messages: Record<string, string> = {
   'card.quote.empty_filtered': 'No topic matches "{query}". Try another keyword.',
   'card.quote.search_placeholder': '🔍 Search topics (title / starter)',
   'card.quote.field_starter': 'Started by',
-  'card.quote.field_count': 'Messages',
   'card.quote.field_time': 'Active',
   'card.quote.selected_tag': 'selected',
   'card.quote.hint_pick_first': 'Tap any topic above to select it, then press the button to read it.',

@@ -2558,8 +2558,6 @@ export interface QuotePickerEntry {
   containerKind: 'thread' | 'root';
   title: string;
   starterName?: string;
-  /** Messages seen in the scan window — a lower bound, rendered as "N+". */
-  seenCount: number;
   lastMessageAt?: number;
 }
 
@@ -2652,7 +2650,6 @@ export function buildQuotePickerCard(
   }
 
   const labelStarter = t('card.quote.field_starter', undefined, locale);
-  const labelCount   = t('card.quote.field_count',   undefined, locale);
   const labelTime    = t('card.quote.field_time',    undefined, locale);
   const selectedTag  = t('card.quote.selected_tag',  undefined, locale);
   const hasValidSelection = !!(selectedContainerId && filtered.some(e => e.containerId === selectedContainerId));
@@ -2663,10 +2660,11 @@ export function buildQuotePickerCard(
       isSelected ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\`` : `**${escapeMd(e.title)}**`,
     ];
     if (e.starterName) lines.push(`${labelStarter}: ${escapeMd(e.starterName)}`);
-    // "N+" not "N": seenCount only counts what fell inside the scan window, so
-    // stating it as an exact total would be a quiet lie for any 话题 older than
-    // the scan.
-    lines.push(`${labelCount}: ${e.seenCount}+`);
+    // No message count: the chat container returns only 话题 ROOTS, never
+    // their replies, so any number we could show here would be 1 — which
+    // reads as "this 话题 has one message" and is wrong for every 话题 that
+    // has replies. The real count is reported after reading, where it is
+    // actually known.
     if (e.lastMessageAt) lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
     elements.push({
       tag: 'interactive_container',

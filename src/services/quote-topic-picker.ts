@@ -23,6 +23,13 @@
  * So the group key is `thread_id ?? root_id`, and messages with neither are
  * top-level chatter that belongs to no 话题 — excluded, since there is nothing
  * to "pick".
+ *
+ * NOTE on counts: the chat container returns only a 话题's ROOT message, never
+ * its replies (confirmed live: a 46-message page held 8 `thread_id` messages
+ * for 8 distinct 话题 — exactly one root each). So this scan cannot know how
+ * long a 话题 is, and the picker deliberately shows no message count rather
+ * than a "1+" that would imply the 话题 is a single message. The real count is
+ * reported after reading, where it is actually known.
  */
 import { listChatMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
@@ -38,10 +45,6 @@ export interface QuoteTopicEntry {
   title: string;
   /** Display name of whoever opened the 话题, when Lark resolved one. */
   starterName?: string;
-  /** Number of messages seen in the scanned window — a lower bound, since the
-   *  scan only covers the chat tail. Rendered as "N+ 条" to avoid implying it
-   *  is the true total. */
-  seenCount: number;
   /** Epoch ms of the most recent message seen in this 话题. Sort key. */
   lastMessageAt?: number;
 }
@@ -91,7 +94,15 @@ export function groupChatMessagesIntoTopics(
     /** Oldest message seen, used as the title fallback when the real root
      *  fell outside the scan window. */
     oldestMsg?: any;
-    seenCount: number;
+    /** Oldest HUMAN message seen. Preferred over `oldestMsg` for the title:
+     *  a bot's streaming card renders as "[图片]请升级至最新版本客户端", which
+     *  is identical for every card and tells the reader nothing about which
+     *  conversation the row is. A human line does. */
+    oldestHumanMsg?: any;
+    /** True while every message seen in this bucket is a bot-sent card. Such
+     *  a bucket is a streaming-card reply chain, not a conversation — see the
+     *  filter at the bottom. */
+    allBotCards: boolean;
     lastMessageAt?: number;
   }
   const buckets = new Map<string, Bucket>();
@@ -107,17 +118,24 @@ export function groupChatMessagesIntoTopics(
 
     let b = buckets.get(containerId);
     if (!b) {
-      b = { containerId, containerKind, seenCount: 0 };
+      b = { containerId, containerKind, allBotCards: true };
       buckets.set(containerId, b);
     }
-    b.seenCount++;
+    const isBotCard = m?.sender?.sender_type === 'app' && m?.msg_type === 'interactive';
+    if (!isBotCard) b.allBotCards = false;
+    const isHuman = m?.sender?.sender_type === 'user';
     const createdMs = Number(m?.create_time);
     if (Number.isFinite(createdMs)) {
       if (b.lastMessageAt === undefined || createdMs > b.lastMessageAt) b.lastMessageAt = createdMs;
       const oldestMs = Number(b.oldestMsg?.create_time);
       if (!b.oldestMsg || !Number.isFinite(oldestMs) || createdMs < oldestMs) b.oldestMsg = m;
-    } else if (!b.oldestMsg) {
-      b.oldestMsg = m;
+      if (isHuman) {
+        const oldestHumanMs = Number(b.oldestHumanMsg?.create_time);
+        if (!b.oldestHumanMsg || !Number.isFinite(oldestHumanMs) || createdMs < oldestHumanMs) b.oldestHumanMsg = m;
+      }
+    } else {
+      if (!b.oldestMsg) b.oldestMsg = m;
+      if (isHuman && !b.oldestHumanMsg) b.oldestHumanMsg = m;
     }
     // The opening message: for a thread container it is the one with no
     // root_id; for a root container it is the message whose own id IS the
@@ -128,7 +146,22 @@ export function groupChatMessagesIntoTopics(
 
   const entries: QuoteTopicEntry[] = [];
   for (const b of buckets.values()) {
-    const titleMsg = b.rootMsg ?? b.oldestMsg;
+    // Drop pure bot-card chains. botmux's own streaming cards reply to each
+    // other, which forms a root_id chain indistinguishable from a human reply
+    // thread by structure alone — a live scan of one chat surfaced six of
+    // them, every row reading "[图片]请升级至最新版本客户端". Nobody wants to
+    // quote a card chain, and they crowd the real 话题 off page one.
+    // Deliberately keyed on "EVERY message is a bot card": a chain a human
+    // replied into is a real conversation and stays.
+    if (b.allBotCards) continue;
+    // Title source, in order: the real opening message → the oldest human
+    // line → whatever is oldest. The human fallback matters for a chain whose
+    // root is a bot card: titling it from the root gives every such row the
+    // same useless "[图片]请升级至最新版本客户端", so the picker would show
+    // several identical rows the user cannot tell apart.
+    const rootIsBotCard = b.rootMsg?.sender?.sender_type === 'app' && b.rootMsg?.msg_type === 'interactive';
+    const titleMsg = (rootIsBotCard ? b.oldestHumanMsg : b.rootMsg)
+      ?? b.rootMsg ?? b.oldestHumanMsg ?? b.oldestMsg;
     if (!titleMsg) continue;
     const parsed = parseApiMessage(titleMsg);
     entries.push({
@@ -136,14 +169,22 @@ export function groupChatMessagesIntoTopics(
       containerKind: b.containerKind,
       title: firstLine(parsed.content) || '(无文本内容)',
       ...(parsed.senderName ? { starterName: parsed.senderName } : {}),
-      seenCount: b.seenCount,
       ...(b.lastMessageAt !== undefined ? { lastMessageAt: b.lastMessageAt } : {}),
     });
   }
   // Most recently active 话题 first — that is overwhelmingly what the user
   // means when they say "the other 话题". Undated buckets sink to the bottom.
   entries.sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
-  return entries;
+  // Prefer real 话题 when the chat has any. A 普通群 reply chain is a pair of
+  // messages someone replied to inline — structurally a "topic", but not what
+  // anyone means by 话题, and in a busy group there are as many of them as
+  // there are real 话题 (a live scan of one project group: 21 real 话题, 21
+  // reply chains, interleaved). Mixing them halves the useful density of every
+  // page and buries the 话题 the user is looking for. Chains are kept only as
+  // a fallback for chats that have no real 话题 at all — a 普通群 where inline
+  // replies ARE the only threading available.
+  const realTopics = entries.filter(e => e.containerKind === 'thread');
+  return realTopics.length > 0 ? realTopics : entries;
 }
 
 /** Fetch the chat tail and group it into pickable 话题. */

@@ -56,9 +56,46 @@ describe('groupChatMessagesIntoTopics', () => {
       containerKind: 'thread',
       title: '讨论一下接口格式',
       starterName: '孙晓雪',
-      seenCount: 3,
       lastMessageAt: 300,
     });
+    // No message count is surfaced: the chat container returns only 话题
+    // roots, so any count derived from this scan would be 1 regardless of how
+    // long the 话题 actually is.
+    expect(topics[0]).not.toHaveProperty('seenCount');
+  });
+
+  it('drops pure bot-card reply chains', () => {
+    // botmux streaming cards reply to each other, forming a root_id chain
+    // structurally identical to a human thread. A live scan surfaced six of
+    // these, every row reading "[图片]请升级至最新版本客户端".
+    const botCard = (id: string, rootId?: string, createTime = 100): any => ({
+      message_id: id,
+      ...(rootId ? { root_id: rootId } : {}),
+      msg_type: 'interactive',
+      create_time: String(createTime),
+      body: { content: JSON.stringify({ text: '[卡片]' }) },
+      sender: { id: 'cli_bot', sender_type: 'app', sender_name: 'Devbox-Claude' },
+    });
+    const topics = groupChatMessagesIntoTopics([
+      botCard('om_card_head', undefined, 100),
+      botCard('om_card_1', 'om_card_head', 200),
+      textMsg({ id: 'om_real', text: '真话题', threadId: 'omt_real', createTime: 300 }),
+    ]);
+    expect(topics.map(t => t.containerId)).toEqual(['omt_real']);
+  });
+
+  it('keeps a bot-started chain once a human replies into it', () => {
+    // "Every message is a bot card" is the filter, not "the root is a bot" —
+    // a chain someone actually joined is a real conversation.
+    const topics = groupChatMessagesIntoTopics([
+      {
+        message_id: 'om_card_head', msg_type: 'interactive', create_time: '100',
+        body: { content: JSON.stringify({ text: '[卡片]' }) },
+        sender: { id: 'cli_bot', sender_type: 'app', sender_name: 'Devbox-Claude' },
+      },
+      textMsg({ id: 'om_human', text: '这个报错我看看', rootId: 'om_card_head', createTime: 200, sender: '孙晓雪' }),
+    ]);
+    expect(topics.map(t => t.containerId)).toEqual(['om_card_head']);
   });
 
   it('treats a 普通群 reply chain (root_id, no thread_id) as a root-container topic', () => {
@@ -72,6 +109,28 @@ describe('groupChatMessagesIntoTopics', () => {
     expect(topics).toHaveLength(1);
     expect(topics[0].containerId).toBe('om_head');
     expect(topics[0].containerKind).toBe('root');
+  });
+
+  it('prefers real 话题 and hides reply chains when both exist', () => {
+    // A busy project group has as many inline reply chains as real 话题 (live
+    // scan: 21 and 21, interleaved). Mixing them halves each page's useful
+    // density and buries what the user came for.
+    const topics = groupChatMessagesIntoTopics([
+      textMsg({ id: 'om_chain_head', text: '内联回复串', createTime: 900 }),
+      textMsg({ id: 'om_chain_1', text: '回一句', rootId: 'om_chain_head', createTime: 950 }),
+      textMsg({ id: 'om_topic', text: '真话题', threadId: 'omt_real', createTime: 100 }),
+    ]);
+    expect(topics.map(t => t.containerId)).toEqual(['omt_real']);
+  });
+
+  it('falls back to reply chains for a 普通群 with no real 话题 at all', () => {
+    // In a flat 普通群 an inline reply IS the only threading available, so
+    // hiding chains there would leave the picker permanently empty.
+    const topics = groupChatMessagesIntoTopics([
+      textMsg({ id: 'om_head', text: '这条是链头', createTime: 100 }),
+      textMsg({ id: 'om_c1', text: '回复一', rootId: 'om_head', createTime: 200 }),
+    ]);
+    expect(topics.map(t => t.containerId)).toEqual(['om_head']);
   });
 
   it('excludes flat top-level messages that belong to no 话题', () => {

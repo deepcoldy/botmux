@@ -9,9 +9,9 @@ import { describe, it, expect } from 'vitest';
 import { buildQuotePickerCard, quotePickerFilter, type QuotePickerEntry } from '../src/im/lark/card-builder.js';
 
 const entries: QuotePickerEntry[] = [
-  { containerId: 'omt_a', containerKind: 'thread', title: '接口格式讨论', starterName: '孙晓雪', seenCount: 12, lastMessageAt: Date.now() - 60_000 },
-  { containerId: 'omt_b', containerKind: 'thread', title: 'fork 权限', starterName: '李嘉瑞', seenCount: 3, lastMessageAt: Date.now() - 600_000 },
-  { containerId: 'om_c',  containerKind: 'root',   title: '普通群回复链', seenCount: 2 },
+  { containerId: 'omt_a', containerKind: 'thread', title: '接口格式讨论', starterName: '孙晓雪', lastMessageAt: Date.now() - 60_000 },
+  { containerId: 'omt_b', containerKind: 'thread', title: 'fork 权限', starterName: '李嘉瑞', lastMessageAt: Date.now() - 600_000 },
+  { containerId: 'om_c',  containerKind: 'root',   title: '普通群回复链' },
 ];
 
 function parse(json: string): any { return JSON.parse(json); }
@@ -76,13 +76,6 @@ describe('buildQuotePickerCard', () => {
     expect(allValues(card).every(v => v.exclude_ids === 'om_root,omt_here')).toBe(true);
   });
 
-  it('renders the seen count as a lower bound, never an exact total', () => {
-    const card = buildQuotePickerCard(entries, 'oc_1', 'om_root', 'ou_me');
-    // The scan only covers the chat tail, so "12" would be a quiet lie for a
-    // 话题 older than the window.
-    expect(card).toContain('12+');
-  });
-
   it('renders an empty-state instead of a bare card when no 话题 exist', () => {
     const card = buildQuotePickerCard([], 'oc_1', 'om_root', 'ou_me');
     expect(card).toContain('没有找到其他话题');
@@ -91,7 +84,7 @@ describe('buildQuotePickerCard', () => {
 
   it('paginates and disables the edge buttons', () => {
     const many: QuotePickerEntry[] = Array.from({ length: 12 }, (_, i) => ({
-      containerId: `omt_${i}`, containerKind: 'thread', title: `话题${i}`, seenCount: 1, lastMessageAt: 1000 - i,
+      containerId: `omt_${i}`, containerKind: 'thread', title: `话题${i}`, lastMessageAt: 1000 - i,
     }));
     const first = parse(buildQuotePickerCard(many, 'oc_1', 'om_root', 'ou_me', 'zh', { page: 0 }));
     const pageActions = allValues(first).filter(v => v.action === 'quote_page');

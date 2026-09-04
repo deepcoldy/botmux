@@ -214,7 +214,6 @@ export const messages: Record<string, string> = {
   'card.quote.empty_filtered': '没有匹配「{query}」的话题，请换个关键词。',
   'card.quote.search_placeholder': '🔍 搜索话题（标题 / 发起人）',
   'card.quote.field_starter': '发起人',
-  'card.quote.field_count': '消息数',
   'card.quote.field_time': '活跃',
   'card.quote.selected_tag': '已选中',
   'card.quote.hint_pick_first': '点击上方任意话题以选中，然后再点确认按钮读取。',
