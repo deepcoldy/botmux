@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -13,9 +13,13 @@ import {
   updateTask as updateStoredTask,
 } from '../src/services/schedule-store.js';
 import {
+  activateSchedulePrecondition,
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
+  schedulePreconditionTrustedFileExamplePath,
+  schedulePreconditionTrustedFilesRoot,
+  stageSchedulePrecondition,
 } from '../src/services/schedule-precondition-store.js';
 import {
   createTaskWithOptionalPrecondition,
@@ -64,6 +68,30 @@ function createLegacySixChatTask() {
     chatId: chatIds[0],
     chatIds,
   });
+}
+
+function createLegacyFileTask(path: string, enabled = true, label = 'legacy-file') {
+  const id = `${label}-${enabled ? 'enabled' : 'disabled'}`;
+  const staged = stageSchedulePrecondition(APP_ID, id, {
+    enabled,
+    source: { kind: 'file', path },
+  });
+  const task = createStoredTask({
+    ...createParams('legacy file'),
+    id,
+    parsed: { kind: 'interval', minutes: 60, display: 'every hour' },
+    preconditionRef: staged.preconditionRef,
+  });
+  activateSchedulePrecondition(task, APP_ID);
+  return task;
+}
+
+function createLegacyRelativeFileTask(enabled = true) {
+  return createLegacyFileTask(
+    'scripts/legacy-guard.sh',
+    enabled,
+    'legacy-relative',
+  );
 }
 
 describe('trusted schedule precondition configuration', () => {
@@ -228,18 +256,23 @@ describe('trusted schedule precondition configuration', () => {
   });
 
   it('keeps disabled live-file configuration across edits and legacy replacement', () => {
+    const filePath = join(
+      schedulePreconditionTrustedFilesRoot(),
+      'nested',
+      'does-not-need-to-exist-yet.sh',
+    );
     const created = createTaskWithOptionalPrecondition(
       createParams('file guard'),
       APP_ID,
       {
         enabled: false,
-        source: { kind: 'file', path: './does-not-need-to-exist-yet.sh' },
+        source: { kind: 'file', path: filePath },
       },
     );
     expect(resolveSchedulePrecondition(created, APP_ID)).toEqual({
       kind: 'configured',
       enabled: false,
-      source: { kind: 'file', path: './does-not-need-to-exist-yet.sh' },
+      source: { kind: 'file', path: filePath },
     });
 
     const kept = updateTaskWithOptionalPrecondition(
@@ -266,6 +299,151 @@ describe('trusted schedule precondition configuration', () => {
       enabled: false,
       source: { kind: 'inline', script: 'printf 1' },
     });
+    expect(schedulePreconditionTrustedFilesRoot()).toBe(join(
+      config.session.dataDir,
+      'schedule-preconditions',
+      'trusted-files',
+    ));
+    expect(schedulePreconditionTrustedFileExamplePath()).toBe(join(
+      schedulePreconditionTrustedFilesRoot(),
+      'check-ready.sh',
+    ));
+    expect(existsSync(schedulePreconditionTrustedFilesRoot())).toBe(true);
+  });
+
+  it('rejects relative file paths on create and replace before changing durable state', () => {
+    expect(() => createTaskWithOptionalPrecondition(
+      createParams('relative create'),
+      APP_ID,
+      { enabled: false, source: { kind: 'file', path: 'scripts/guard.sh' } },
+    )).toThrow('Scheduled task precondition file path must be absolute');
+    expect(listTasks(APP_ID)).toEqual([]);
+    expect(existsSync(schedulePreconditionRoot())).toBe(false);
+
+    const created = createTaskWithOptionalPrecondition(createParams('inline before replace'), APP_ID, 'printf 1');
+    const before = getTask(created.id, APP_ID);
+    expect(() => updateTaskWithOptionalPrecondition(
+      created.id,
+      { prompt: 'must not change' },
+      APP_ID,
+      { action: 'replace', source: { kind: 'file', path: './guard.sh' } },
+    )).toThrow('Scheduled task precondition file path must be absolute');
+    expect(getTask(created.id, APP_ID)).toEqual(before);
+    expect(resolveSchedulePrecondition(created, APP_ID)).toMatchObject({
+      kind: 'configured',
+      source: { kind: 'inline', script: 'printf 1' },
+    });
+  });
+
+  it('fails legacy relative files closed at runtime while keeping them manageable', async () => {
+    const legacy = createLegacyRelativeFileTask(true);
+    expect(resolveSchedulePrecondition(legacy, APP_ID)).toEqual({
+      kind: 'configured',
+      enabled: true,
+      source: { kind: 'file', path: 'scripts/legacy-guard.sh' },
+    });
+    const blockedContinuation = vi.fn(async () => undefined);
+    await expect(executeScheduledTaskWithPrecondition(
+      legacy,
+      APP_ID,
+      blockedContinuation,
+    )).rejects.toMatchObject({ code: 'invalid_path' });
+    expect(blockedContinuation).not.toHaveBeenCalled();
+
+    const disabled = updateTaskWithOptionalPrecondition(
+      legacy.id,
+      { prompt: 'edited while keeping the legacy source' },
+      APP_ID,
+      { action: 'set-enabled', enabled: false },
+    );
+    expect(disabled).toMatchObject({ ok: true, preconditionEnabled: false });
+    const disabledContinuation = vi.fn(async () => undefined);
+    await expect(executeScheduledTaskWithPrecondition(
+      disabled.task!,
+      APP_ID,
+      disabledContinuation,
+    )).resolves.toBe('executed');
+    expect(disabledContinuation).toHaveBeenCalledOnce();
+    expect(updateTaskWithOptionalPrecondition(
+      legacy.id,
+      { name: 'ordinary keep remains allowed' },
+      APP_ID,
+      { action: 'keep' },
+    )).toMatchObject({ ok: true });
+
+    expect(() => updateTaskWithOptionalPrecondition(
+      legacy.id,
+      { prompt: 'must not be written by rejected re-enable' },
+      APP_ID,
+      { action: 'set-enabled', enabled: true },
+    )).toThrow('Scheduled task precondition file path must be absolute');
+    expect(getTask(legacy.id, APP_ID)).toMatchObject({
+      name: 'ordinary keep remains allowed',
+      prompt: 'edited while keeping the legacy source',
+    });
+    expect(resolveSchedulePrecondition(getTask(legacy.id, APP_ID)!, APP_ID)).toMatchObject({
+      kind: 'configured', enabled: false,
+    });
+
+    const cleared = updateTaskWithOptionalPrecondition(
+      legacy.id,
+      {},
+      APP_ID,
+      { action: 'clear' },
+    );
+    expect(cleared).toMatchObject({ ok: true, hasPrecondition: false });
+  });
+
+  it('rejects absolute paths outside the trusted root on create, replace, re-enable, and runtime', async () => {
+    const outsidePath = join(tempDir, 'outside-guard.sh');
+    writeFileSync(outsidePath, 'printf 1');
+
+    expect(() => createTaskWithOptionalPrecondition(
+      createParams('outside create'),
+      APP_ID,
+      { enabled: false, source: { kind: 'file', path: outsidePath } },
+    )).toThrow('must be inside the daemon trusted-files directory');
+    expect(listTasks(APP_ID)).toEqual([]);
+    expect(existsSync(schedulePreconditionRoot())).toBe(false);
+
+    const inline = createTaskWithOptionalPrecondition(
+      createParams('inline before outside replace'),
+      APP_ID,
+      'printf 1',
+    );
+    const inlineBefore = getTask(inline.id, APP_ID);
+    expect(() => updateTaskWithOptionalPrecondition(
+      inline.id,
+      { prompt: 'must not change' },
+      APP_ID,
+      { action: 'replace', source: { kind: 'file', path: outsidePath } },
+    )).toThrow('must be inside the daemon trusted-files directory');
+    expect(getTask(inline.id, APP_ID)).toEqual(inlineBefore);
+
+    const legacy = createLegacyFileTask(outsidePath, false, 'legacy-outside');
+    expect(resolveSchedulePrecondition(legacy, APP_ID)).toMatchObject({
+      kind: 'configured',
+      enabled: false,
+      source: { kind: 'file', path: outsidePath },
+    });
+    expect(() => updateTaskWithOptionalPrecondition(
+      legacy.id,
+      { prompt: 'must not change on rejected re-enable' },
+      APP_ID,
+      { action: 'set-enabled', enabled: true },
+    )).toThrow('must be inside the daemon trusted-files directory');
+    expect(getTask(legacy.id, APP_ID)?.prompt).toBe('run the model');
+
+    // Directly persisted legacy records stay parseable, but an enabled one is
+    // rejected before Bash or the model continuation can run.
+    const enabledLegacy = createLegacyFileTask(outsidePath, true, 'legacy-outside-runtime');
+    const continuation = vi.fn(async () => undefined);
+    await expect(executeScheduledTaskWithPrecondition(
+      enabledLegacy,
+      APP_ID,
+      continuation,
+    )).rejects.toMatchObject({ code: 'outside_trusted_directory' });
+    expect(continuation).not.toHaveBeenCalled();
   });
 
   it('supports explicit set-enabled, replace, and clear mutations', () => {
@@ -289,6 +467,7 @@ describe('trusted schedule precondition configuration', () => {
     });
     expect(disabled.task?.preconditionRef).toBe(created.preconditionRef);
 
+    const trustedFilePath = schedulePreconditionTrustedFileExamplePath();
     const replacedAndEnabled = updateTaskWithOptionalPrecondition(
       created.id,
       {},
@@ -296,7 +475,7 @@ describe('trusted schedule precondition configuration', () => {
       {
         action: 'replace',
         enabled: true,
-        source: { kind: 'file', path: '/opt/botmux/ready.sh' },
+        source: { kind: 'file', path: trustedFilePath },
       },
     );
     expect(replacedAndEnabled).toMatchObject({
@@ -308,7 +487,7 @@ describe('trusted schedule precondition configuration', () => {
     expect(resolveSchedulePrecondition(replacedAndEnabled.task!, APP_ID)).toEqual({
       kind: 'configured',
       enabled: true,
-      source: { kind: 'file', path: '/opt/botmux/ready.sh' },
+      source: { kind: 'file', path: trustedFilePath },
     });
 
     const cleared = updateTaskWithOptionalPrecondition(

@@ -19,7 +19,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { config } from '../config.js';
 import type { ScheduledTask } from '../types.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -29,6 +29,8 @@ import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { canonicalScheduleInput } from './schedule-store.js';
 
 const ROOT_DIRECTORY = 'schedule-preconditions';
+const TRUSTED_FILES_DIRECTORY = 'trusted-files';
+const TRUSTED_FILE_EXAMPLE = 'check-ready.sh';
 const RECORD_SCHEMA_VERSION = 2;
 const REF_PATTERN = /^spc_[A-Za-z0-9_-]{43}$/;
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -239,6 +241,23 @@ export function schedulePreconditionRoot(dataDir: string = config.session.dataDi
   return join(dataDir, ROOT_DIRECTORY);
 }
 
+/** Host directory from which file-backed preconditions are allowed to run. */
+export function schedulePreconditionTrustedFilesRoot(
+  dataDir: string = config.session.dataDir,
+): string {
+  // `resolve` makes the value directly copyable in Dashboard even if a test or
+  // embedding caller supplied a relative dataDir. Runtime dataDir is already
+  // absolute, so this does not change the daemon layout.
+  return resolve(schedulePreconditionRoot(dataDir), TRUSTED_FILES_DIRECTORY);
+}
+
+/** Copyable starter path shown by Dashboard and documentation. */
+export function schedulePreconditionTrustedFileExamplePath(
+  dataDir: string = config.session.dataDir,
+): string {
+  return join(schedulePreconditionTrustedFilesRoot(dataDir), TRUSTED_FILE_EXAMPLE);
+}
+
 function ownerDirectory(appId: string, dataDir?: string): string {
   return join(
     schedulePreconditionRoot(dataDir),
@@ -302,6 +321,7 @@ function assertPrivateDirectory(path: string, create: boolean, recursive = false
 export function ensureSchedulePreconditionRoot(dataDir?: string): string {
   const root = schedulePreconditionRoot(dataDir);
   assertPrivateDirectory(root, true, true);
+  assertPrivateDirectory(schedulePreconditionTrustedFilesRoot(dataDir), true);
   return root;
 }
 

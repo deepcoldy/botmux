@@ -10,7 +10,14 @@ vi.mock('../src/dashboard/web/groups-api.js', () => ({
   fetchGroupsNamesSnapshot: vi.fn(),
 }));
 
-const BOTS = [{ larkAppId: 'cli_precondition_layout', botName: 'Precondition test bot' }];
+const TRUSTED_FILE_ROOT = '/var/lib/botmux/schedule-preconditions/trusted-files';
+const TRUSTED_FILE_PATH = `${TRUSTED_FILE_ROOT}/check-ready.sh`;
+const BOTS = [{
+  larkAppId: 'cli_precondition_layout',
+  botName: 'Precondition test bot',
+  scheduleWorkingDir: '/srv/botmux',
+  schedulePreconditionFileRoot: TRUSTED_FILE_ROOT,
+}];
 const CHATS = [{
   chatId: 'oc_precondition_layout',
   name: 'Precondition test chat',
@@ -38,7 +45,7 @@ function savedPrecondition(source: 'inline' | 'file'): NonNullable<FormProps['ed
     ...EDITING,
     preconditionSource: 'file',
     preconditionScript: undefined,
-    preconditionFilePath: 'scripts/check-ready.sh',
+    preconditionFilePath: TRUSTED_FILE_PATH,
   };
 }
 
@@ -62,6 +69,7 @@ describe('schedule precondition compact editor', () => {
   beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.stubGlobal('document', { addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    vi.stubGlobal('fetch', vi.fn());
     vi.mocked(fetchGroupsSnapshot).mockResolvedValue({ bots: BOTS, chats: CHATS });
   });
 
@@ -113,6 +121,8 @@ describe('schedule precondition compact editor', () => {
     const setScript = (value: string) => act(() => inline().props.onChange({ target: { value } }));
     const setFile = (value: string) => act(() => file().props.onChange({ currentTarget: { value } }));
     const setSourceValue = (source: 'inline' | 'file', value: string) => source === 'inline' ? setScript(value) : setFile(value);
+    const testButton = () => root.findAllByType('button')
+      .find(node => String(node.props.className ?? '').includes('schedule-precondition-test-button'))!;
     const submit = () => act(() => root.findByType('form').props.onSubmit({ preventDefault: vi.fn() }));
     const cancel = () => act(() => root.findByProps({ className: 'schedule-form-cancel' }).props.onClick());
     const fillNewRequiredFields = () => {
@@ -129,7 +139,7 @@ describe('schedule precondition compact editor', () => {
     };
     return {
       root, field, toggle, radio, inline, file, setEnabled, setMode, setScript, setFile,
-      setSourceValue, submit, cancel, fillNewRequiredFields,
+      setSourceValue, testButton, submit, cancel, fillNewRequiredFields,
       formDialog, helpDialog: helpDialog!, helpCloseNode, onClose, onSubmit,
     };
   }
@@ -148,7 +158,7 @@ describe('schedule precondition compact editor', () => {
     expect(toolbar.findByType('fieldset').props.className).toBe('schedule-precondition-source');
     expect(form.field().findAllByProps({ className: 'schedule-precondition-remove' })).toHaveLength(0);
     expect(form.field().findAllByProps({ type: 'checkbox' })).toEqual([form.toggle()]);
-    expect(form.field().findAllByProps({ role: 'status' })).toHaveLength(0);
+    expect(form.field().findAllByProps({ className: 'schedule-precondition-status' })).toHaveLength(0);
     expect(form.inline().props.rows).toBe(3);
     expect(form.onSubmit).not.toHaveBeenCalled();
   });
@@ -163,7 +173,7 @@ describe('schedule precondition compact editor', () => {
     expect(form.inline().props.disabled).not.toBe(true);
     form.setScript('printf "ready"');
     expect(form.inline().props.value).toBe('printf "ready"');
-    expect(form.field().findAllByProps({ role: 'status' })).toHaveLength(0);
+    expect(form.field().findAllByProps({ className: 'schedule-precondition-status' })).toHaveLength(0);
 
     form.setEnabled(true);
     expect(form.toggle().props.checked).toBe(true);
@@ -200,14 +210,14 @@ describe('schedule precondition compact editor', () => {
     const form = await renderForm();
     form.setScript('printf "inline draft"');
     form.setMode('file');
-    form.setFile('scripts/draft-ready.sh');
+    form.setFile(`${TRUSTED_FILE_ROOT}/draft-ready.sh`);
     expect(form.radio('file').props.checked).toBe(true);
     expect(form.radio('inline').props.checked).toBe(false);
     form.setMode('inline');
     expect(form.inline().props.value).toBe('printf "inline draft"');
     form.setEnabled(false);
     form.setMode('file');
-    expect(form.file().props.value).toBe('scripts/draft-ready.sh');
+    expect(form.file().props.value).toBe(`${TRUSTED_FILE_ROOT}/draft-ready.sh`);
     expect(form.file().props.disabled).not.toBe(true);
     form.setEnabled(true);
     form.setMode('inline');
@@ -237,9 +247,33 @@ describe('schedule precondition compact editor', () => {
     expect(form.helpCloseNode.focus).toHaveBeenCalledTimes(1);
     expect(textContent(form.root.findByProps({ id: 'schedule-precondition-source-help-title' }))).toBe(tr(titleKey));
     const sourceHelpText = textContent(form.root.findByProps({ className: 'schedule-precondition-source-help' }));
-    expect(sourceHelpText.includes('请仅使用可信脚本')).toBe(source === 'file');
-    expect(textContent(form.field())).not.toContain('请仅使用可信脚本');
-    expect(form.root.findAllByProps({ className: 'schedule-precondition-help-view-only' })).toHaveLength(1);
+    expect(sourceHelpText.includes('模型不可写')).toBe(source === 'file');
+    expect(sourceHelpText).toContain(tr('schedules.form.preconditionTestGuideTitle'));
+    expect(sourceHelpText).toContain('当前未保存的配置');
+    expect(sourceHelpText).toContain('不保存任务、不调用模型');
+    expect(sourceHelpText).not.toContain(EDITING.workingDir);
+    expect(sourceHelpText).not.toContain('脚本内的相对路径');
+    const fileDemo = form.root.findAllByProps({
+      'aria-label': tr('schedules.form.preconditionFileDemoTitle'),
+    });
+    if (source === 'file') {
+      expect(sourceHelpText).toContain('Botmux 已创建');
+      expect(sourceHelpText).toContain('普通 UTF-8 Bash 文件');
+      expect(sourceHelpText).toContain('Dashboard 不会上传文件');
+      expect(sourceHelpText).toContain(TRUSTED_FILE_ROOT);
+      expect(sourceHelpText).toContain(TRUSTED_FILE_PATH);
+      expect(sourceHelpText).toContain('点击“测试前置条件”');
+      expect(form.root.findByProps({ className: 'schedule-precondition-file-steps' }).findAllByType('li'))
+        .toHaveLength(3);
+      expect(fileDemo).toHaveLength(1);
+      expect(textContent(fileDemo[0]!)).toBe(TRUSTED_FILE_PATH);
+      expect(sourceHelpText).not.toContain('/path/to');
+      expect(sourceHelpText).not.toContain('/opt/botmux');
+    } else {
+      expect(fileDemo).toHaveLength(0);
+    }
+    expect(textContent(form.field()).includes(TRUSTED_FILE_ROOT)).toBe(selected === 'file');
+    expect(form.root.findAllByProps({ className: 'schedule-precondition-help-view-only' })).toHaveLength(0);
     expect(form.onSubmit).not.toHaveBeenCalled();
 
     act(() => form.root.findByProps({ className: 'schedule-precondition-help-close' }).props.onClick());
@@ -334,6 +368,158 @@ describe('schedule precondition compact editor', () => {
     expect(form.file().props.id).toBe(fileLabel.props.htmlFor);
     expect(form.file().props.type).toBe('text');
     expect(form.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('validates changed file sources against the selected daemon trusted directory', async () => {
+    const form = await renderForm();
+    form.setMode('file');
+    form.setFile('scripts/check-ready.sh');
+
+    expect(form.file().props['aria-invalid']).toBe(true);
+    expect(textContent(form.field().findByProps({ role: 'alert' })))
+      .toBe(tr('schedules.form.preconditionErrFileAbsolute'));
+    expect(form.testButton().props.disabled).toBe(true);
+    form.submit();
+    expect(form.onSubmit).not.toHaveBeenCalled();
+
+    form.setFile('/srv/botmux/scripts/check-ready.sh');
+    expect(form.file().props['aria-invalid']).toBe(true);
+    expect(textContent(form.field().findByProps({ role: 'alert' })))
+      .toContain(TRUSTED_FILE_ROOT);
+    expect(form.testButton().props.disabled).toBe(true);
+
+    form.setFile(TRUSTED_FILE_PATH);
+    expect(form.file().props['aria-invalid']).toBeUndefined();
+    expect(form.field().findAllByProps({ role: 'alert' })).toHaveLength(0);
+    expect(form.testButton().props.disabled).toBe(false);
+    expect(form.file().props.placeholder).toBe(TRUSTED_FILE_PATH);
+    expect(textContent(form.root.findByProps({ id: 'schedule-precondition-file-help' })))
+      .toContain(TRUSTED_FILE_ROOT);
+  });
+
+  it('keeps an unchanged legacy outside path editable, but blocks testing and re-enabling it', async () => {
+    const legacy = {
+      ...savedPrecondition('file'),
+      preconditionEnabled: false,
+      preconditionFilePath: '/srv/legacy-scripts/check-ready.sh',
+    };
+    const form = await renderForm(legacy);
+
+    expect(form.file().props['aria-invalid']).toBeUndefined();
+    const migration = form.root.findByProps({ id: 'schedule-precondition-file-migration' });
+    expect(migration.props.role).toBe('note');
+    expect(textContent(migration)).toContain('保存其它字段不会改动它');
+    expect(textContent(migration)).toContain(TRUSTED_FILE_ROOT);
+    expect(form.file().props['aria-describedby']).toContain('schedule-precondition-file-migration');
+    expect(form.testButton().props.disabled).toBe(true);
+    form.submit();
+    expect(form.onSubmit).toHaveBeenCalledTimes(1);
+
+    form.setEnabled(true);
+    expect(form.file().props['aria-invalid']).toBe(true);
+    expect(form.testButton().props.disabled).toBe(true);
+    form.submit();
+    expect(form.onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it('tests the unsaved draft without saving and reports pass accessibly', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        ok: true,
+        result: 'pass',
+        additionalPrompt: true,
+        durationMs: 27,
+      }),
+    } as unknown as Response);
+    const form = await renderForm({ ...EDITING, preconditionEnabled: false });
+    form.setScript("printf '1\\n'");
+
+    const button = form.testButton();
+    expect(button.props.type).toBe('button');
+    expect(button.props.disabled).toBe(false);
+    expect(button.props['aria-describedby']).toBe('schedule-precondition-test-warning');
+    expect(textContent(form.root.findByProps({ id: 'schedule-precondition-test-warning' })))
+      .toContain('不会保存配置、调用模型或写入任务执行日志');
+
+    await act(async () => {
+      button.props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = vi.mocked(fetch).mock.calls[0]!;
+    expect(url).toBe('/api/schedules/precondition/test');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(String(init?.body))).toEqual({
+      larkAppId: 'cli_precondition_layout',
+      workingDir: '/srv/botmux',
+      source: { kind: 'inline', script: "printf '1\\n'" },
+    });
+    const result = form.root.findByProps({ className: 'schedule-precondition-test-result is-pass' });
+    expect(result.props.role).toBe('status');
+    expect(result.props['aria-live']).toBe('polite');
+    expect(textContent(result)).toContain(tr('schedules.form.preconditionTestPassedWithPrompt'));
+    expect(textContent(result)).toContain('27 ms');
+    expect(form.onSubmit).not.toHaveBeenCalled();
+
+    form.setScript('printf 0');
+    expect(textContent(form.root.findByProps({ className: 'schedule-precondition-test-result' }))).toBe('');
+  });
+
+  it('shows the complete test error code and exit detail', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        ok: false,
+        result: 'error',
+        errorCode: 'non_zero_exit',
+        error: 'Scheduled task precondition failed with exit code 42',
+        durationMs: 18,
+      }),
+    } as unknown as Response);
+    const form = await renderForm();
+
+    await act(async () => {
+      form.testButton().props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const result = form.root.findByProps({ className: 'schedule-precondition-test-result is-error' });
+    expect(textContent(result)).toContain('non_zero_exit');
+    expect(textContent(result)).toContain('exit code 42');
+    expect(textContent(result)).toContain('18 ms');
+    expect(form.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('keeps testing locked after the draft changes and discards the stale response', async () => {
+    let resolveResponse!: (value: Response) => void;
+    vi.mocked(fetch).mockImplementation(() => new Promise(resolve => { resolveResponse = resolve; }));
+    const form = await renderForm();
+
+    act(() => form.testButton().props.onClick());
+    expect(form.testButton().props.disabled).toBe(true);
+    expect(form.testButton().props['aria-busy']).toBe(true);
+    form.setScript('printf 0');
+    expect(form.testButton().props.disabled).toBe(true);
+
+    await act(async () => {
+      resolveResponse({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({ ok: true, result: 'pass', additionalPrompt: false }),
+      } as unknown as Response);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(form.testButton().props.disabled).toBe(false);
+    expect(textContent(form.root.findByProps({ className: 'schedule-precondition-test-result' }))).toBe('');
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it('retains the warning for an unreadable legacy precondition', async () => {

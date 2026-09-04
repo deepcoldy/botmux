@@ -27517,6 +27517,128 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   min-height: 44px;
 }
 
+#schedule-precondition-file-help {
+  line-height: 1.45;
+}
+
+#schedule-precondition-file-help code {
+  color: var(--text);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow-wrap: anywhere;
+}
+
+.schedule-precondition-migration {
+  margin: 0;
+  padding: 7px 9px;
+  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.schedule-precondition-test {
+  display: grid;
+  gap: 5px;
+  padding-top: 2px;
+}
+
+.schedule-precondition-test-controls {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.schedule-precondition-test-controls .schedule-form-help {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.schedule-precondition-test-button {
+  flex: none;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.schedule-precondition-test-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, var(--surface));
+}
+
+.schedule-precondition-test-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.schedule-precondition-test-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.schedule-precondition-test-button.is-loading {
+  cursor: progress;
+}
+
+.schedule-precondition-test-result {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--border);
+  border-radius: 2px var(--radius-sm) var(--radius-sm) 2px;
+  background: color-mix(in srgb, var(--surface-muted) 62%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.schedule-precondition-test-result:empty {
+  display: none;
+}
+
+.schedule-precondition-test-result small {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.schedule-precondition-test-result.is-pass {
+  border-left-color: var(--success);
+  background: color-mix(in srgb, var(--success) 7%, transparent);
+}
+
+.schedule-precondition-test-result.is-skip {
+  border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+}
+
+.schedule-precondition-test-result.is-error {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+}
+
+@media (max-width: 520px) {
+  .schedule-precondition-test-controls,
+  .schedule-precondition-test-result {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .schedule-precondition-test-button {
+    align-self: flex-start;
+  }
+}
+
 .schedule-precondition-source {
   flex: 1;
   min-width: 0;
@@ -27627,48 +27749,64 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   line-height: 1.55;
 }
 
-.schedule-precondition-path-context {
+.schedule-precondition-file-steps {
   display: grid;
-  gap: 0;
-  margin: 2px 0;
-  overflow: hidden;
+  gap: 10px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.schedule-precondition-file-steps li {
+  min-width: 0;
+  padding-left: 2px;
+}
+
+.schedule-precondition-file-steps li::marker {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.schedule-precondition-file-steps li > strong {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 11px;
+}
+
+.schedule-precondition-path-code,
+.schedule-precondition-root-unavailable {
+  display: block;
+  margin-top: 5px;
+  padding: 7px 9px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
-.schedule-precondition-path-context > div {
+.schedule-precondition-path-code {
+  overflow-x: auto;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  white-space: nowrap;
+}
+
+.schedule-precondition-root-unavailable {
+  border-left: 3px solid var(--warning);
+}
+
+.schedule-precondition-test-guide {
   display: grid;
-  grid-template-columns: minmax(112px, 0.38fr) minmax(0, 1fr);
-  gap: 10px;
-  padding: 7px 9px;
-}
-
-.schedule-precondition-path-context > div + div {
+  gap: 3px;
+  padding-top: 8px;
   border-top: 1px solid var(--border-soft);
 }
 
-.schedule-precondition-path-context dt,
-.schedule-precondition-path-context dd {
-  min-width: 0;
-  margin: 0;
+.schedule-precondition-test-guide > strong {
+  color: var(--text);
   font-size: 11px;
-  line-height: 1.5;
-}
-
-.schedule-precondition-path-context dt {
-  color: var(--text);
-  font-weight: 600;
-}
-
-.schedule-precondition-path-context dd {
-  color: var(--muted);
-}
-
-.schedule-precondition-path-context code {
-  color: var(--text);
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  font-weight: 650;
 }
 
 .schedule-precondition-example-header {
@@ -27716,6 +27854,16 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px;
   line-height: 1.5;
+  white-space: pre;
+}
+
+.schedule-precondition-help-body pre code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  white-space: inherit;
 }
 
 .schedule-precondition-help-dialog {
@@ -27804,6 +27952,8 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
 .schedule-precondition-help-body {
   display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 10px;
   min-height: 0;
   padding: 16px 20px 20px;
@@ -27820,20 +27970,6 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .schedule-precondition-help-body strong {
   color: var(--text);
   font-weight: 650;
-}
-
-.schedule-precondition-help-body .schedule-precondition-help-apply-note,
-.schedule-precondition-help-body .schedule-precondition-help-view-only {
-  padding: 8px 10px;
-  border-left: 3px solid var(--accent);
-  border-radius: 2px var(--radius-sm) var(--radius-sm) 2px;
-  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
-  color: var(--text);
-}
-
-.schedule-precondition-help-body .schedule-precondition-help-view-only {
-  border-left-color: var(--warning);
-  background: color-mix(in srgb, var(--warning) 7%, var(--surface));
 }
 
 /* ── Task-scoped scheduler run logs ─────────────────────────────────────── */

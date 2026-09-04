@@ -7,11 +7,17 @@ import {
   readSync,
   type BigIntStats,
 } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
-import { MAX_SCHEDULE_PRECONDITION_SCRIPT_BYTES } from './schedule-precondition-store.js';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  MAX_SCHEDULE_PRECONDITION_SCRIPT_BYTES,
+  schedulePreconditionRoot,
+  schedulePreconditionTrustedFilesRoot,
+} from './schedule-precondition-store.js';
 
 export type SchedulePreconditionFileErrorCode =
   | 'invalid_path'
+  | 'outside_trusted_directory'
+  | 'unsafe_trusted_directory'
   | 'unreadable_file'
   | 'symbolic_link'
   | 'non_regular_file'
@@ -61,7 +67,16 @@ function fail(code: SchedulePreconditionFileErrorCode, message: string): never {
   throw new SchedulePreconditionFileError(code, message);
 }
 
-function resolvedFilePath(filePath: string, workingDir: string): string {
+export function assertSchedulePreconditionFilePathAbsolute(filePath: string): void {
+  if (!isAbsolute(filePath)) {
+    fail(
+      'invalid_path',
+      'Scheduled task precondition file path must be absolute',
+    );
+  }
+}
+
+function resolveLiteralFilePath(filePath: string): string {
   if (filePath.trim().length === 0 || filePath.includes('\0') || filePath.startsWith('~')) {
     fail(
       'invalid_path',
@@ -69,16 +84,122 @@ function resolvedFilePath(filePath: string, workingDir: string): string {
     );
   }
 
-  // Absolute paths name the scheduler host directly. Relative paths follow the
-  // task's working directory on every trigger, so changing workingDir changes
-  // which condition file is consulted without falling back to daemon cwd.
-  if (!isAbsolute(filePath) && workingDir.trim().length === 0) {
+  // The file is executed by the host daemon rather than inside the model
+  // sandbox. Requiring an explicit host-absolute path removes implicit
+  // workingDir resolution; it does not make the chosen file immutable, so the
+  // configured target must still be trusted and outside model-writable paths.
+  assertSchedulePreconditionFilePathAbsolute(filePath);
+  return resolve(filePath);
+}
+
+function missingPath(error: unknown): boolean {
+  return errnoCode(error) === 'ENOENT';
+}
+
+function lstatIfPresent(
+  path: string,
+  operations: SchedulePreconditionFileOperations,
+): BigIntStats | undefined {
+  try {
+    return operations.lstat(path);
+  } catch (error) {
+    if (missingPath(error)) return undefined;
     fail(
-      'invalid_path',
-      'Scheduled task precondition file needs a valid task working directory',
+      'unsafe_trusted_directory',
+      'Scheduled task precondition trusted-files directory is unavailable or unsafe',
     );
   }
-  return isAbsolute(filePath) ? resolve(filePath) : resolve(workingDir, filePath);
+}
+
+function assertRealDirectory(stat: BigIntStats | undefined): boolean {
+  if (!stat) return false;
+  if (stat.isSymbolicLink()) {
+    fail(
+      'symbolic_link',
+      'Scheduled task precondition source path must not contain symbolic links',
+    );
+  }
+  if (!stat.isDirectory()) {
+    fail(
+      'unsafe_trusted_directory',
+      'Scheduled task precondition trusted-files directory is unavailable or unsafe',
+    );
+  }
+  return true;
+}
+
+function assertPathComponentsSafe(
+  resolvedPath: string,
+  dataDir: string | undefined,
+  operations: SchedulePreconditionFileOperations,
+): void {
+  const storageRoot = resolve(schedulePreconditionRoot(dataDir));
+  const trustedRoot = schedulePreconditionTrustedFilesRoot(dataDir);
+
+  // Missing roots are allowed while a new configuration is being validated;
+  // the daemon/bootstrap write path creates them before accepting the change.
+  // If they exist, neither protected root may be redirected through a symlink.
+  if (!assertRealDirectory(lstatIfPresent(storageRoot, operations))) return;
+  if (!assertRealDirectory(lstatIfPresent(trustedRoot, operations))) return;
+
+  const segments = relative(trustedRoot, resolvedPath).split(sep);
+  let current = trustedRoot;
+  for (let index = 0; index < segments.length; index += 1) {
+    current = join(current, segments[index]);
+    const stat = lstatIfPresent(current, operations);
+    if (!stat) return;
+    if (stat.isSymbolicLink()) {
+      fail(
+        'symbolic_link',
+        'Scheduled task precondition source path must not contain symbolic links',
+      );
+    }
+    if (index < segments.length - 1 && !stat.isDirectory()) {
+      fail(
+        'unreadable_file',
+        'Scheduled task precondition file path has a non-directory parent',
+      );
+    }
+  }
+}
+
+/**
+ * Validate write/runtime authority for a file-backed precondition.
+ *
+ * This is intentionally separate from persisted-record schema validation:
+ * legacy paths must remain readable so they can be disabled, replaced, or
+ * cleared, but they cannot regain execution authority outside this root.
+ */
+export function assertSchedulePreconditionFilePathTrusted(
+  filePath: string,
+  dataDir?: string,
+  operations: SchedulePreconditionFileOperations = defaultOperations,
+): void {
+  const resolvedPath = resolveLiteralFilePath(filePath);
+  const trustedRoot = schedulePreconditionTrustedFilesRoot(dataDir);
+  const relativePath = relative(trustedRoot, resolvedPath);
+  if (
+    relativePath.length === 0
+    || relativePath === '..'
+    || relativePath.startsWith(`..${sep}`)
+    || isAbsolute(relativePath)
+  ) {
+    fail(
+      'outside_trusted_directory',
+      'Scheduled task precondition file path must be inside the daemon trusted-files directory',
+    );
+  }
+  assertPathComponentsSafe(resolvedPath, dataDir, operations);
+}
+
+function resolvedFilePath(
+  filePath: string,
+  dataDir: string | undefined,
+  operations: SchedulePreconditionFileOperations,
+): string {
+  const resolvedPath = resolveLiteralFilePath(filePath);
+  assertSchedulePreconditionFilePathTrusted(filePath, dataDir, operations);
+  return resolvedPath;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -133,10 +254,10 @@ function genericReadError(): SchedulePreconditionFileError {
  */
 export function readSchedulePreconditionFile(
   filePath: string,
-  workingDir: string,
+  _workingDir: string,
   operations: SchedulePreconditionFileOperations = defaultOperations,
 ): string {
-  const resolvedPath = resolvedFilePath(filePath, workingDir);
+  const resolvedPath = resolvedFilePath(filePath, undefined, operations);
 
   let pathBefore: BigIntStats;
   try {
@@ -219,6 +340,10 @@ export function readSchedulePreconditionFile(
         'Scheduled task precondition file changed while being read; retry after file writes finish',
       );
     }
+    // O_NOFOLLOW protects only the leaf on common platforms. Rewalk every
+    // trusted-root component so an ancestor replaced with a symlink during
+    // open/read cannot retain authority even when it reaches the same inode.
+    assertSchedulePreconditionFilePathTrusted(filePath, undefined, operations);
     if (bytesRead > MAX_SCHEDULE_PRECONDITION_SCRIPT_BYTES) {
       fail(
         'file_too_large',

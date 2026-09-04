@@ -11,13 +11,18 @@ import {
   formatScheduleRepeat,
   formatScheduleRunDuration,
   fmtScheduleDate,
+  isSchedulePreconditionAbsolutePath,
+  isSchedulePreconditionPathWithinTrustedRoot,
+  schedulePreconditionFileExamplePath,
   scheduleRunTargetResults,
   scheduleRunHistoryForBackdrop,
   schedulePreconditionEditorInitialState,
-  schedulePreconditionPathExample,
   scheduleExecutionPlacement,
   scheduleTargetChatIds,
 } from '../src/dashboard/web/schedules-page.js';
+
+const TRUSTED_FILE_ROOT = '/srv/botmux-data/schedule-preconditions/trusted-files';
+const TRUSTED_FILE_PATH = `${TRUSTED_FILE_ROOT}/check-ready.sh`;
 
 describe('dashboard schedules React page helpers', () => {
   it('clears the previous Bash source from the browser cache on a live replacement', () => {
@@ -33,14 +38,14 @@ describe('dashboard schedules React page helpers', () => {
       patch: {
         preconditionSource: 'file',
         preconditionScript: null,
-        preconditionFilePath: 'scripts/check-ready.sh',
+        preconditionFilePath: TRUSTED_FILE_PATH,
       },
     });
 
     expect(store.schedules.get('schedule-precondition-live')).toMatchObject({
       preconditionSource: 'file',
       preconditionScript: null,
-      preconditionFilePath: 'scripts/check-ready.sh',
+      preconditionFilePath: TRUSTED_FILE_PATH,
     });
   });
 
@@ -212,13 +217,13 @@ describe('dashboard schedules React page helpers', () => {
       hasPrecondition: true,
       preconditionEnabled: false,
       preconditionSource: 'file',
-      preconditionFilePath: 'scripts/check-ready.sh',
+      preconditionFilePath: TRUSTED_FILE_PATH,
     })).toEqual({
       hasExisting: true,
       enabled: false,
       mode: 'file',
       script: '',
-      filePath: 'scripts/check-ready.sh',
+      filePath: TRUSTED_FILE_PATH,
     });
     expect(schedulePreconditionEditorInitialState({ hasPrecondition: true })).toEqual({
       hasExisting: true,
@@ -259,11 +264,12 @@ describe('dashboard schedules React page helpers', () => {
       initialEnabled: false,
       initialMode: 'file',
       initialScript: '',
-      initialFilePath: 'scripts/check-ready.sh',
+      initialFilePath: TRUSTED_FILE_PATH,
+      trustedFileRoot: TRUSTED_FILE_ROOT,
       enabled: false,
       mode: 'file',
       script: '',
-      filePath: 'scripts/check-ready.sh',
+      filePath: TRUSTED_FILE_PATH,
     })).toEqual({ ok: true, fields: {} });
   });
 
@@ -274,6 +280,7 @@ describe('dashboard schedules React page helpers', () => {
       initialMode: 'inline',
       initialScript: 'printf 1',
       initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
       script: 'printf 1',
       filePath: '',
     } as const;
@@ -302,23 +309,23 @@ describe('dashboard schedules React page helpers', () => {
       ...base,
       enabled: true,
       mode: 'file',
-      filePath: ' scripts/check-ready.sh ',
+      filePath: ` ${TRUSTED_FILE_PATH} `,
     })).toEqual({
       ok: true,
-      fields: { preconditionFilePath: 'scripts/check-ready.sh' },
+      fields: { preconditionFilePath: TRUSTED_FILE_PATH },
     });
     expect(buildSchedulePreconditionFormFields({
       ...base,
       initialEnabled: false,
       initialMode: 'file',
       initialScript: '',
-      initialFilePath: 'scripts/check-ready.sh',
+      initialFilePath: TRUSTED_FILE_PATH,
       enabled: false,
       mode: 'file',
-      filePath: 'scripts/check-next.sh',
+      filePath: `${TRUSTED_FILE_ROOT}/check-next.sh`,
     })).toEqual({
       ok: true,
-      fields: { preconditionFilePath: 'scripts/check-next.sh' },
+      fields: { preconditionFilePath: `${TRUSTED_FILE_ROOT}/check-next.sh` },
     });
     expect(buildSchedulePreconditionFormFields({
       ...base,
@@ -333,6 +340,7 @@ describe('dashboard schedules React page helpers', () => {
       initialMode: 'inline',
       initialScript: '',
       initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
       enabled: true,
       mode: 'inline',
       script: 'printf 1',
@@ -351,7 +359,8 @@ describe('dashboard schedules React page helpers', () => {
           initialEnabled: true,
           initialMode: mode,
           initialScript: mode === 'inline' ? 'printf 1' : '',
-          initialFilePath: mode === 'file' ? 'scripts/check-ready.sh' : '',
+          initialFilePath: mode === 'file' ? TRUSTED_FILE_PATH : '',
+          trustedFileRoot: TRUSTED_FILE_ROOT,
           enabled,
           mode,
           script: value,
@@ -385,6 +394,7 @@ describe('dashboard schedules React page helpers', () => {
       initialMode: 'inline',
       initialScript: '',
       initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
       enabled: true,
       script: '',
       filePath: '',
@@ -401,6 +411,41 @@ describe('dashboard schedules React page helpers', () => {
       .toEqual({ ok: false, error: 'file_tilde' });
     expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: 'bad\0path' }))
       .toEqual({ ok: false, error: 'file_nul' });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: 'scripts/check-ready.sh' }))
+      .toEqual({ ok: false, error: 'file_absolute' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      mode: 'file',
+      filePath: '/srv/botmux/scripts/check-ready.sh',
+    })).toEqual({ ok: false, error: 'file_outside_trusted_root' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      trustedFileRoot: null,
+      mode: 'file',
+      filePath: TRUSTED_FILE_PATH,
+    })).toEqual({ ok: false, error: 'file_root_unavailable' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      mode: 'file',
+      filePath: TRUSTED_FILE_PATH,
+    })).toEqual({
+      ok: true,
+      fields: { preconditionEnabled: true, preconditionFilePath: TRUSTED_FILE_PATH },
+    });
+    expect(isSchedulePreconditionAbsolutePath('/srv/botmux/check-ready.sh')).toBe(true);
+    expect(isSchedulePreconditionAbsolutePath('scripts/check-ready.sh')).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(TRUSTED_FILE_PATH, TRUSTED_FILE_ROOT)).toBe(true);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(TRUSTED_FILE_ROOT, TRUSTED_FILE_ROOT)).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(
+      `${TRUSTED_FILE_ROOT}-other/check-ready.sh`,
+      TRUSTED_FILE_ROOT,
+    )).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(
+      `${TRUSTED_FILE_ROOT}/../outside/check-ready.sh`,
+      TRUSTED_FILE_ROOT,
+    )).toBe(false);
+    expect(schedulePreconditionFileExamplePath(TRUSTED_FILE_ROOT)).toBe(TRUSTED_FILE_PATH);
+    expect(schedulePreconditionFileExamplePath(null)).toBe('');
   });
 
   it('reveals saved Bash sources in an accessible editor without forcing a rewrite', () => {
@@ -475,71 +520,84 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toMatch(
       /<SchedulePreconditionSourceHelp[\s\S]*?<SchedulePreconditionProtocolHelp/,
     );
-    expect(page).toContain('workingDir={preconditionWorkingDir}');
-    expect(page).toContain('workingDir={props.workingDir}');
+    expect(page).not.toContain('workingDir={preconditionWorkingDir}');
+    expect(page).not.toContain('workingDir={props.workingDir}');
+    expect(page).toContain("tr('schedules.form.preconditionTestGuideTitle')");
+    expect(page).toContain("tr('schedules.form.preconditionTestGuide')");
+    expect(page).not.toContain("tr('schedules.form.preconditionTestGuideBoundary')");
     expect(page).not.toContain('id="schedule-precondition-inline-help"');
-    expect(page).not.toContain('id="schedule-precondition-file-help"');
+    expect(page.match(/id="schedule-precondition-file-help"/g)).toHaveLength(1);
     expect(page).not.toContain('className="schedule-precondition-guide"');
     // Only file paths retain validation errors; empty inline scripts remove the gate.
-    expect(page.match(/aria-describedby=\{preconditionError \? 'schedule-precondition-error' : undefined\}/g))
-      .toHaveLength(1);
+    expect(page).toContain("preconditionFileMigrationRequired ? 'schedule-precondition-file-migration' : ''");
+    expect(page).toContain("preconditionErrorText ? 'schedule-precondition-error' : ''");
 
-    expect(zh('schedules.form.preconditionRule')).toContain('stdout）去除首尾空白后严格等于 1');
-    expect(zh('schedules.form.preconditionPromptHelp')).toContain('仅在本次执行中追加到原任务 Prompt');
-    expect(zh('schedules.form.preconditionPromptPrivacy')).toContain('请勿输出密钥');
+    expect(zh('schedules.form.preconditionRule')).toContain('stdout 去除首尾空白后严格等于 1');
+    expect(zh('schedules.form.preconditionPromptHelp')).toContain('只对本次执行生效');
+    expect(zh('schedules.form.preconditionPromptHelp')).toContain('请勿包含密钥');
     expect(zh('schedules.form.preconditionEnableHelp')).toContain('关闭或未配置时不执行前置脚本');
     expect(zh('schedules.form.preconditionInlineHelpOpen')).toContain('直接填写 Bash');
     expect(zh('schedules.form.preconditionFileHelpOpen')).toContain('Bash 文件路径');
-    expect(zh('schedules.form.preconditionHelpViewOnly')).toContain('不会切换配置方式');
-    expect(zh('schedules.form.preconditionHelpApplyNote')).toContain('保存任务后才会生效');
     expect(zh('schedules.form.preconditionUseExample')).toContain('填入');
-    expect(zh('schedules.form.preconditionHelp')).toContain('任务执行根目录');
+    expect(zh('schedules.form.preconditionHelp')).toContain('任务执行目录');
     expect(zh('schedules.form.preconditionHelp')).not.toContain('点击');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('当前未保存的配置');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('完整错误与退出码');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('不保存任务、不调用模型');
 
     expect(en('schedules.form.preconditionRule')).toContain('trimmed stdout is strictly 1');
-    expect(en('schedules.form.preconditionPromptHelp')).toContain('for this run only');
-    expect(en('schedules.form.preconditionPromptPrivacy')).toContain('Do not output secrets');
+    expect(en('schedules.form.preconditionPromptHelp')).toContain('for this run');
+    expect(en('schedules.form.preconditionPromptHelp')).toContain('do not include secrets');
     expect(en('schedules.form.preconditionInlineHelpOpen')).toContain('entering Bash directly');
     expect(en('schedules.form.preconditionFileHelpOpen')).toContain('Bash file paths');
-    expect(en('schedules.form.preconditionHelpViewOnly')).toContain('will not switch');
-    expect(en('schedules.form.preconditionHelp')).toContain('task execution root');
+    expect(en('schedules.form.preconditionHelp')).toContain('execution directory');
+    expect(en('schedules.form.preconditionTestGuide')).toContain('current unsaved configuration');
+    expect(en('schedules.form.preconditionTestGuide')).toContain('does not save');
   });
 
-  it('shows the actual Bash file execution root and concrete path examples', () => {
+  it('uses the daemon trusted root for a complete three-step file configuration demo', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     const zh = createDashboardTranslator('zh');
     const en = createDashboardTranslator('en');
 
-    expect(schedulePreconditionPathExample('/srv/botmux', 'scripts/check-ready.sh'))
-      .toBe('/srv/botmux/scripts/check-ready.sh');
-    expect(schedulePreconditionPathExample('/', 'scripts/check-ready.sh'))
-      .toBe('/scripts/check-ready.sh');
     expect(page).toContain('scheduleWorkingDir?: string | null');
+    expect(page).toContain('schedulePreconditionFileRoot?: string | null');
     expect(page).toContain('editing\n    ? editing.workingDir\n    : selectedBot?.scheduleWorkingDir');
+    expect(page).toContain('selectedBot?.schedulePreconditionFileRoot');
     expect(page).toContain('function SchedulePreconditionSourceHelp');
     expect(page).toContain("source === 'inline'");
-    expect(page).toContain('<dl className="schedule-precondition-path-context">');
-    expect(page).toContain('<dd aria-live="polite">');
-    expect(page).toContain('<code>scripts/check-ready.sh</code> → <code>{relativeFileExample}</code>');
-    expect(page).toContain('<code>.ready</code> → <code>{relativeScriptExample}</code>');
+    expect(page).not.toContain('schedule-precondition-path-context');
+    expect(page).not.toContain('/opt/botmux/check-ready.sh');
+    expect(page).not.toContain('/path/to/');
+    expect(page).toContain('test -f /srv/my-service/ready.flag');
+    expect(page).not.toContain('<code>{workingDir}</code>');
+    expect(page).not.toContain('relativeFileExample');
+    expect(page).not.toContain('relativeScriptExample');
+    expect(page).toContain("tr('schedules.form.preconditionFileDemoTitle')");
+    expect(page).toContain('<code>{fileExamplePath}</code>');
+    expect(page).toContain('className="schedule-precondition-file-steps"');
+    expect(page).toContain('<code className="schedule-precondition-path-code">{trustedFileRoot}</code>');
 
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('daemon 宿主机上的文件路径，不是上传文件');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('请仅使用可信脚本');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('无论路径是绝对还是相对');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('能修改该文件的程序或沙盒内模型都能改变下次执行内容');
-    expect(zh('schedules.form.preconditionWorkingDir')).toContain('相对路径基准');
-    expect(zh('schedules.form.preconditionWorkingDirUnavailable')).toContain('创建任务后重新编辑');
-    expect(zh('schedules.form.preconditionScriptWorkingDirHelp')).toContain('不是 Bash 文件所在目录');
-    expect(zh('schedules.form.preconditionFileRequirements')).toContain('无需执行权限');
-    expect(zh('schedules.form.preconditionFileRequirements')).toContain('符号链接');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('受保护目录内的完整绝对路径');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('不支持相对路径');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('模型不可写');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('每次测试和执行时重新读取');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Botmux 已创建');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('daemon 主机');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('普通 UTF-8 Bash 文件');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Dashboard 不会上传文件');
+    expect(zh('schedules.form.preconditionFileStepEnter')).toContain('完整绝对路径');
+    expect(zh('schedules.form.preconditionFileStepTest')).toContain('测试前置条件');
+    expect(zh('schedules.form.preconditionFileMigration')).toContain('保存其它字段不会改动');
+    expect(zh('schedules.form.preconditionFileMigration')).toContain('测试、重新启用或替换前');
+    expect(zh('schedules.form.preconditionErrFileOutsideTrustedRoot')).toContain('{root}');
 
-    expect(en('schedules.form.preconditionFileHelp')).toContain('does not upload a file');
-    expect(en('schedules.form.preconditionFileHelp')).toContain('use only trusted scripts');
-    expect(en('schedules.form.preconditionFileHelp')).toContain('absolute or relative paths');
-    expect(en('schedules.form.preconditionFileHelp')).toContain('program or sandboxed model that can modify this file');
-    expect(en('schedules.form.preconditionWorkingDirUnavailable')).toContain('reopen it');
-    expect(en('schedules.form.preconditionScriptWorkingDirHelp')).toContain('not the Bash file directory');
-    expect(en('schedules.form.preconditionFileRequirements')).toContain('executable permission is not required');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('protected directory');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('Relative paths');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('cannot be written by the model');
+    expect(en('schedules.form.preconditionFileStepPrepare')).toContain('normal UTF-8 Bash file');
+    expect(en('schedules.form.preconditionFileStepEnter')).toContain('complete absolute path');
+    expect(en('schedules.form.preconditionFileStepTest')).toContain('Test precondition');
   });
 
   it('renders the precondition editor as code with a visible keyboard focus', () => {
@@ -550,11 +608,12 @@ describe('dashboard schedules React page helpers', () => {
     expect(css).toMatch(
       /\.schedule-precondition-toggle input:focus-visible \+ \.switch \{[\s\S]*?outline:/,
     );
+    expect(css).not.toContain('.schedule-precondition-path-context');
     expect(css).toMatch(
-      /\.schedule-precondition-path-context > div \{[\s\S]*?grid-template-columns:/,
+      /\.schedule-precondition-help-body \{[\s\S]*?grid-auto-rows:\s*max-content;[\s\S]*?overflow-y:\s*auto/,
     );
     expect(css).toMatch(
-      /\.schedule-precondition-path-context code \{[\s\S]*?overflow-wrap:\s*anywhere/,
+      /\.schedule-precondition-help-body pre code \{[\s\S]*?display:\s*block;[\s\S]*?white-space:\s*inherit/,
     );
     expect(css).toMatch(
       /\.schedule-precondition-help-trigger:focus-visible \{[\s\S]*?outline:/,

@@ -39,6 +39,7 @@ type ScheduleBotOption = {
   larkAppId: string;
   botName?: string;
   scheduleWorkingDir?: string | null;
+  schedulePreconditionFileRoot?: string | null;
 };
 type ScheduleAction = 'run' | 'pause' | 'resume';
 type ActionFeedback = 'success' | 'error';
@@ -79,12 +80,12 @@ const RUN_ACTION_MIN_PENDING_MS = 1000;
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
-const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f .ready; then
+const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
   printf '1\n'
 else
   printf '0\n'
 fi`;
-const PRECONDITION_PROMPT_EXAMPLE = String.raw`if test -f .ready; then
+const PRECONDITION_PROMPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
   printf '1\n'
   cat >&3 <<'PROMPT'
 The readiness check passed. Include that context in this run.
@@ -96,7 +97,18 @@ fi`;
 export type SchedulePreconditionFormError =
   | 'source_required'
   | 'file_nul'
-  | 'file_tilde';
+  | 'file_tilde'
+  | 'file_absolute'
+  | 'file_root_unavailable'
+  | 'file_outside_trusted_root';
+
+type SchedulePreconditionTestResult = {
+  outcome: 'pass' | 'skip' | 'error';
+  additionalPrompt?: boolean;
+  durationMs?: number;
+  errorCode?: string;
+  error?: string;
+};
 
 export type SchedulePreconditionFormFields = {
   preconditionEnabled?: boolean;
@@ -155,12 +167,57 @@ export function schedulePreconditionEditorInitialState(input: {
   return { hasExisting: true, enabled, mode: 'keep', script: '', filePath: '' };
 }
 
-export function schedulePreconditionPathExample(
-  workingDir: string,
-  relativePath: string,
+export function isSchedulePreconditionAbsolutePath(value: string): boolean {
+  return value.trim().startsWith('/');
+}
+
+function normalizeSchedulePreconditionAbsolutePath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed.includes('\0')) return null;
+  const segments: string[] = [];
+  for (const segment of trimmed.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `/${segments.join('/')}`;
+}
+
+/** Browser-side lexical check for immediate form feedback. The daemon repeats
+ * the authoritative filesystem and symlink checks before saving or running. */
+export function isSchedulePreconditionPathWithinTrustedRoot(
+  value: string,
+  trustedRoot: string | null | undefined,
+): boolean {
+  const normalizedPath = normalizeSchedulePreconditionAbsolutePath(value);
+  const normalizedRoot = normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '');
+  if (!normalizedPath || !normalizedRoot || normalizedPath === normalizedRoot) return false;
+  return normalizedRoot === '/'
+    ? normalizedPath.startsWith('/')
+    : normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+export function schedulePreconditionFileExamplePath(
+  trustedRoot: string | null | undefined,
 ): string {
-  if (!workingDir) return relativePath;
-  return `${workingDir.endsWith('/') ? workingDir : `${workingDir}/`}${relativePath}`;
+  const normalizedRoot = normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '');
+  if (!normalizedRoot) return '';
+  return normalizedRoot === '/' ? '/check-ready.sh' : `${normalizedRoot}/check-ready.sh`;
+}
+
+function schedulePreconditionFileWriteError(
+  value: string,
+  trustedRoot: string | null | undefined,
+): SchedulePreconditionFormError | null {
+  if (!isSchedulePreconditionAbsolutePath(value)) return 'file_absolute';
+  if (!normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '')) return 'file_root_unavailable';
+  if (!isSchedulePreconditionPathWithinTrustedRoot(value, trustedRoot)) {
+    return 'file_outside_trusted_root';
+  }
+  return null;
 }
 
 function SchedulePreconditionProtocolHelp(props: {
@@ -191,23 +248,17 @@ function SchedulePreconditionProtocolHelp(props: {
         ) : null}
       </div>
       <pre aria-label={tr('schedules.form.preconditionPromptExampleTitle')}><code>{PRECONDITION_PROMPT_EXAMPLE}</code></pre>
-      <p><strong>{tr('schedules.form.preconditionPromptPrivacy')}</strong></p>
     </>
   );
 }
 
 function SchedulePreconditionSourceHelp(props: {
   source: PreconditionHelpSource;
-  workingDir: string;
+  trustedFileRoot: string;
   tr: ReturnType<typeof useT>;
 }) {
-  const { source, workingDir, tr } = props;
-  const relativeFileExample = workingDir
-    ? schedulePreconditionPathExample(workingDir, 'scripts/check-ready.sh')
-    : '';
-  const relativeScriptExample = workingDir
-    ? schedulePreconditionPathExample(workingDir, '.ready')
-    : '';
+  const { source, trustedFileRoot, tr } = props;
+  const fileExamplePath = schedulePreconditionFileExamplePath(trustedFileRoot);
 
   return (
     <section className="schedule-precondition-source-help" aria-labelledby="schedule-precondition-source-help-title">
@@ -216,50 +267,43 @@ function SchedulePreconditionSourceHelp(props: {
           ? tr('schedules.form.preconditionSourceInline')
           : tr('schedules.form.preconditionSourceFile')}
       </h3>
-      <p>{tr('schedules.form.preconditionEnableHelp')}</p>
       {source === 'inline' ? (
         <p>{tr('schedules.form.preconditionHelp')}</p>
       ) : (
         <>
           <p>{tr('schedules.form.preconditionFileHelp')}</p>
-          <dl className="schedule-precondition-path-context">
-            <div>
-              <dt>{tr('schedules.form.preconditionWorkingDir')}</dt>
-              <dd aria-live="polite">
-                {workingDir ? (
-                  <code>{workingDir}</code>
-                ) : (
-                  tr('schedules.form.preconditionWorkingDirUnavailable')
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt>{tr('schedules.form.preconditionRelativePath')}</dt>
-              <dd>
-                {workingDir ? (
-                  <><code>scripts/check-ready.sh</code> → <code>{relativeFileExample}</code></>
-                ) : (
-                  tr('schedules.form.preconditionRelativePathUnavailable')
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt>{tr('schedules.form.preconditionAbsolutePath')}</dt>
-              <dd><code>/opt/botmux/check-ready.sh</code> — {tr('schedules.form.preconditionAbsolutePathHelp')}</dd>
-            </div>
-            <div>
-              <dt>{tr('schedules.form.preconditionScriptWorkingDir')}</dt>
-              <dd>
-                {tr('schedules.form.preconditionScriptWorkingDirHelp')}
-                {relativeScriptExample ? (
-                  <> {tr('schedules.form.preconditionScriptWorkingDirExample')} <code>.ready</code> → <code>{relativeScriptExample}</code></>
-                ) : null}
-              </dd>
-            </div>
-          </dl>
-          <p>{tr('schedules.form.preconditionFileRequirements')}</p>
+          <ol className="schedule-precondition-file-steps">
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepPrepareTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepPrepare')}</p>
+              {trustedFileRoot ? (
+                <code className="schedule-precondition-path-code">{trustedFileRoot}</code>
+              ) : (
+                <span className="schedule-precondition-root-unavailable" role="status">
+                  {tr('schedules.form.preconditionFileRootUnavailable')}
+                </span>
+              )}
+            </li>
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepEnterTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepEnter')}</p>
+              {fileExamplePath ? (
+                <pre aria-label={tr('schedules.form.preconditionFileDemoTitle')}>
+                  <code>{fileExamplePath}</code>
+                </pre>
+              ) : null}
+            </li>
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepTestTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepTest')}</p>
+            </li>
+          </ol>
         </>
       )}
+      <div className="schedule-precondition-test-guide" role="note">
+        <strong>{tr('schedules.form.preconditionTestGuideTitle')}</strong>
+        <p>{tr('schedules.form.preconditionTestGuide')}</p>
+      </div>
     </section>
   );
 }
@@ -268,7 +312,7 @@ function SchedulePreconditionHelpDialog(props: {
   open: boolean;
   mode: PreconditionEditMode;
   source: PreconditionHelpSource;
-  workingDir: string;
+  trustedFileRoot: string;
   tr: ReturnType<typeof useT>;
   returnFocusRef: RefObject<HTMLButtonElement | null>;
   onClose(): void;
@@ -343,18 +387,9 @@ function SchedulePreconditionHelpDialog(props: {
           </button>
         </header>
         <div className="schedule-precondition-help-body">
-          {canApplyExample ? (
-            <p className="schedule-precondition-help-apply-note" role="note">
-              {tr('schedules.form.preconditionHelpApplyNote')}
-            </p>
-          ) : (
-            <p className="schedule-precondition-help-view-only" role="note">
-              {tr('schedules.form.preconditionHelpViewOnly')}
-            </p>
-          )}
           <SchedulePreconditionSourceHelp
             source={source}
-            workingDir={props.workingDir}
+            trustedFileRoot={props.trustedFileRoot}
             tr={tr}
           />
           <SchedulePreconditionProtocolHelp
@@ -383,6 +418,7 @@ export function buildSchedulePreconditionFormFields(input: {
   initialMode: PreconditionEditMode;
   initialScript: string;
   initialFilePath: string;
+  trustedFileRoot?: string | null;
   enabled: boolean;
   mode: PreconditionEditMode;
   script: string;
@@ -418,6 +454,11 @@ export function buildSchedulePreconditionFormFields(input: {
   const sourceChanged = !input.hasExisting
     || input.initialMode !== 'file'
     || path !== input.initialFilePath.trim();
+  const enablingExistingSource = input.hasExisting && !input.initialEnabled && input.enabled;
+  if (sourceChanged || enablingExistingSource) {
+    const error = schedulePreconditionFileWriteError(path, input.trustedFileRoot);
+    if (error) return { ok: false, error };
+  }
   if (sourceChanged) fields.preconditionFilePath = path;
   return { ok: true, fields };
 }
@@ -1646,6 +1687,10 @@ export function ScheduleFormModal(props: {
   const [preconditionScript, setPreconditionScript] = useState(initialPrecondition.script);
   const [preconditionFilePath, setPreconditionFilePath] = useState(initialPrecondition.filePath);
   const [preconditionError, setPreconditionError] = useState<SchedulePreconditionFormError | null>(null);
+  const [preconditionTestPending, setPreconditionTestPending] = useState(false);
+  const [preconditionTestResult, setPreconditionTestResult] = useState<SchedulePreconditionTestResult | null>(null);
+  const preconditionTestRunningRef = useRef(false);
+  const preconditionTestRevisionRef = useRef(0);
   const [silent, setSilent] = useState(editing?.silent === true);
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
     editing && scheduleExecutionPlacement(editing) === 'thread'
@@ -1816,13 +1861,123 @@ export function ScheduleFormModal(props: {
     && rawPreconditionWorkingDir.length > 0
     ? rawPreconditionWorkingDir
     : '';
-  const preconditionErrorText = preconditionError === 'source_required'
+  const preconditionTrustedFileRoot = typeof selectedBot?.schedulePreconditionFileRoot === 'string'
+    ? selectedBot.schedulePreconditionFileRoot.trim()
+    : '';
+  const preconditionFileExamplePath = schedulePreconditionFileExamplePath(preconditionTrustedFileRoot);
+  const trimmedPreconditionFilePath = preconditionFilePath.trim();
+  const preconditionFileSourceChanged = !hasExistingPrecondition
+    || initialPrecondition.mode !== 'file'
+    || trimmedPreconditionFilePath !== initialPrecondition.filePath.trim();
+  const preconditionFileWillBeEnabled = hasExistingPrecondition
+    && !initialPreconditionEnabled
+    && preconditionEnabled;
+  const preconditionFileIsTrusted = preconditionMode === 'file'
+    && isSchedulePreconditionPathWithinTrustedRoot(
+      trimmedPreconditionFilePath,
+      preconditionTrustedFileRoot,
+    );
+  const preconditionFileNeedsWriteValidation = preconditionMode === 'file'
+    && trimmedPreconditionFilePath.length > 0
+    && (preconditionFileSourceChanged || preconditionFileWillBeEnabled);
+  const livePreconditionFileError = preconditionMode === 'file'
+    && trimmedPreconditionFilePath.length > 0
+    && preconditionFileNeedsWriteValidation
+    ? schedulePreconditionFileWriteError(
+      trimmedPreconditionFilePath,
+      preconditionTrustedFileRoot,
+    )
+    : null;
+  const preconditionFileMigrationRequired = preconditionMode === 'file'
+    && hasExistingPrecondition
+    && initialPrecondition.mode === 'file'
+    && !preconditionFileSourceChanged
+    && trimmedPreconditionFilePath.length > 0
+    && !preconditionFileIsTrusted;
+  const displayedPreconditionError = preconditionError ?? livePreconditionFileError;
+  const preconditionErrorText = displayedPreconditionError === 'source_required'
     ? tr('schedules.form.preconditionErrSource')
-    : preconditionError === 'file_nul'
+    : displayedPreconditionError === 'file_nul'
       ? tr('schedules.form.preconditionErrFileNul')
-      : preconditionError === 'file_tilde'
+      : displayedPreconditionError === 'file_tilde'
         ? tr('schedules.form.preconditionErrFileTilde')
-        : null;
+        : displayedPreconditionError === 'file_absolute'
+          ? tr('schedules.form.preconditionErrFileAbsolute')
+          : displayedPreconditionError === 'file_root_unavailable'
+            ? tr('schedules.form.preconditionErrFileRootUnavailable')
+            : displayedPreconditionError === 'file_outside_trusted_root'
+              ? tr('schedules.form.preconditionErrFileOutsideTrustedRoot', {
+                root: preconditionTrustedFileRoot,
+              })
+              : null;
+  const preconditionTestSourceReady = preconditionMode === 'inline'
+    ? preconditionScript.trim().length > 0
+    : preconditionMode === 'file'
+      && trimmedPreconditionFilePath.length > 0
+      && !trimmedPreconditionFilePath.includes('\0')
+      && preconditionFileIsTrusted;
+  const canTestPrecondition = preconditionMode !== 'keep'
+    && preconditionTestSourceReady
+    && Boolean(larkAppId)
+    && Boolean(preconditionWorkingDir)
+    && !preconditionTestPending;
+
+  useEffect(() => {
+    preconditionTestRevisionRef.current += 1;
+    setPreconditionTestResult(null);
+  }, [
+    preconditionEnabled,
+    preconditionMode,
+    preconditionScript,
+    preconditionFilePath,
+    preconditionWorkingDir,
+    larkAppId,
+    open,
+  ]);
+
+  async function handleTestPrecondition(): Promise<void> {
+    if (!canTestPrecondition || preconditionTestRunningRef.current) return;
+    const requestRevision = preconditionTestRevisionRef.current;
+    preconditionTestRunningRef.current = true;
+    setPreconditionTestPending(true);
+    setPreconditionTestResult(null);
+    setPreconditionError(null);
+    try {
+      const source = preconditionMode === 'inline'
+        ? { kind: 'inline' as const, script: preconditionScript }
+        : { kind: 'file' as const, path: trimmedPreconditionFilePath };
+      const response = await fetch('/api/schedules/precondition/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ larkAppId, workingDir: preconditionWorkingDir, source }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (requestRevision !== preconditionTestRevisionRef.current) return;
+      if (!response.ok || body?.ok !== true || !['pass', 'skip'].includes(body?.result)) {
+        setPreconditionTestResult({
+          outcome: 'error',
+          errorCode: typeof body?.errorCode === 'string' ? body.errorCode : `HTTP ${response.status}`,
+          error: typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError'),
+          ...(Number.isFinite(body?.durationMs) ? { durationMs: body.durationMs } : {}),
+        });
+        return;
+      }
+      setPreconditionTestResult({
+        outcome: body.result,
+        additionalPrompt: body.additionalPrompt === true,
+        ...(Number.isFinite(body.durationMs) ? { durationMs: body.durationMs } : {}),
+      });
+    } catch (error) {
+      if (requestRevision !== preconditionTestRevisionRef.current) return;
+      setPreconditionTestResult({
+        outcome: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      preconditionTestRunningRef.current = false;
+      setPreconditionTestPending(false);
+    }
+  }
 
   function updateChatSelection(nextValues: readonly string[]): void {
     const nextChatIds = scheduleTargetChatIds({ chatIds: nextValues });
@@ -1875,6 +2030,7 @@ export function ScheduleFormModal(props: {
       initialMode: initialPrecondition.mode,
       initialScript: initialPrecondition.script,
       initialFilePath: initialPrecondition.filePath,
+      trustedFileRoot: preconditionTrustedFileRoot,
       enabled: preconditionEnabled,
       mode: preconditionMode,
       script: preconditionScript,
@@ -2143,13 +2299,91 @@ export function ScheduleFormModal(props: {
                     value={preconditionFilePath}
                     autoComplete="off"
                     spellCheck={false}
-                    aria-invalid={preconditionError?.startsWith('file_') || undefined}
-                    aria-describedby={preconditionError ? 'schedule-precondition-error' : undefined}
-                    placeholder={tr('schedules.form.preconditionFilePlaceholder')}
+                    aria-invalid={displayedPreconditionError?.startsWith('file_') || undefined}
+                    aria-describedby={[
+                      'schedule-precondition-file-help',
+                      preconditionFileMigrationRequired ? 'schedule-precondition-file-migration' : '',
+                      preconditionErrorText ? 'schedule-precondition-error' : '',
+                    ].filter(Boolean).join(' ')}
+                    placeholder={preconditionFileExamplePath
+                      || tr('schedules.form.preconditionFilePlaceholder')}
                     onChange={e => { setPreconditionFilePath(e.currentTarget.value); setPreconditionError(null); }}
                   />
+                  <small id="schedule-precondition-file-help" className="schedule-form-help">
+                    {preconditionTrustedFileRoot ? (
+                      <>
+                        {tr('schedules.form.preconditionFileVisibleHelp')}{' '}
+                        <code>{preconditionTrustedFileRoot}</code>
+                      </>
+                    ) : (
+                      <span role="status">{tr('schedules.form.preconditionFileRootUnavailable')}</span>
+                    )}
+                  </small>
+                  {preconditionFileMigrationRequired ? (
+                    <p
+                      id="schedule-precondition-file-migration"
+                      className="schedule-precondition-migration"
+                      role="note"
+                    >
+                      {preconditionTrustedFileRoot
+                        ? tr('schedules.form.preconditionFileMigration', {
+                          root: preconditionTrustedFileRoot,
+                        })
+                        : tr('schedules.form.preconditionFileMigrationRootUnavailable')}
+                    </p>
+                  ) : null}
                 </div>
               )}
+
+              {preconditionMode !== 'keep' ? (
+                <div className="schedule-precondition-test">
+                  <div className="schedule-precondition-test-controls">
+                    <button
+                      type="button"
+                      className={`schedule-precondition-test-button${preconditionTestPending ? ' is-loading' : ''}`}
+                      disabled={!canTestPrecondition}
+                      aria-busy={preconditionTestPending || undefined}
+                      aria-describedby="schedule-precondition-test-warning"
+                      onClick={() => void handleTestPrecondition()}
+                    >
+                      {preconditionTestPending
+                        ? tr('schedules.form.preconditionTesting')
+                        : tr('schedules.form.preconditionTest')}
+                    </button>
+                    <small id="schedule-precondition-test-warning" className="schedule-form-help">
+                      {tr('schedules.form.preconditionTestWarning')}
+                    </small>
+                  </div>
+                  <div
+                    className={`schedule-precondition-test-result${preconditionTestResult
+                      ? ` is-${preconditionTestResult.outcome}`
+                      : ''}`}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {preconditionTestResult ? (
+                      <>
+                        <span>
+                          {preconditionTestResult.outcome === 'pass'
+                            ? tr(preconditionTestResult.additionalPrompt
+                              ? 'schedules.form.preconditionTestPassedWithPrompt'
+                              : 'schedules.form.preconditionTestPassed')
+                            : preconditionTestResult.outcome === 'skip'
+                              ? tr('schedules.form.preconditionTestSkipped')
+                              : [preconditionTestResult.errorCode, preconditionTestResult.error]
+                                .filter(Boolean)
+                                .join(': ')}
+                        </span>
+                        {preconditionTestResult.durationMs !== undefined ? (
+                          <small>{tr('schedules.form.preconditionTestDuration', {
+                            duration: preconditionTestResult.durationMs,
+                          })}</small>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -2412,7 +2646,7 @@ export function ScheduleFormModal(props: {
       open={open && preconditionHelpSource !== null}
       mode={preconditionMode}
       source={preconditionHelpSource ?? 'inline'}
-      workingDir={preconditionWorkingDir}
+      trustedFileRoot={preconditionTrustedFileRoot}
       tr={tr}
       returnFocusRef={preconditionHelpReturnFocusRef}
       onClose={() => setPreconditionHelpSource(null)}

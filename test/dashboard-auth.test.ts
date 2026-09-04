@@ -1051,6 +1051,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
   it('tokenless schedule precondition writes stay management-only', () => {
     for (const [method, pathname] of [
       ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
       ['PATCH', '/api/schedules/sched-1'],
       ['DELETE', '/api/schedules/sched-1'],
     ] as const) {
@@ -1179,6 +1180,7 @@ describe('Workbench H5 capability boundary', () => {
       ['PUT', '/api/bots/app/env'],
       ['PUT', '/api/settings'],
       ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
       ['PATCH', '/api/schedules/sched-1'],
       ['DELETE', '/api/schedules/sched-1'],
       ['DELETE', '/api/skills/tool'],

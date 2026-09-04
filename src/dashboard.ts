@@ -5656,6 +5656,29 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Test the current unsaved Bash precondition draft on the selected bot's
+    // daemon. This remains a management-only mutation route and intentionally
+    // has no schedule id, so testing cannot alter any task or dispatch a model.
+    if (req.method === 'POST' && url.pathname === '/api/schedules/precondition/test') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+      }
+      const larkAppId = typeof (body as Record<string, unknown>).larkAppId === 'string'
+        ? (body as Record<string, unknown>).larkAppId as string
+        : '';
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, '/api/schedules/precondition/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Create a new scheduled task. Body must include `larkAppId` to select
     // which bot/daemon owns the task (multi-bot dashboards cannot guess).
     if (req.method === 'POST' && url.pathname === '/api/schedules') {

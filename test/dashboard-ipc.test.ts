@@ -15,11 +15,16 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import {
+  ensureSchedulePreconditionRoot,
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
+  schedulePreconditionTrustedFilesRoot,
 } from '../src/services/schedule-precondition-store.js';
-import { appendScheduleRunLog } from '../src/services/schedule-run-log-store.js';
+import {
+  appendScheduleRunLog,
+  scheduleRunLogDirectory,
+} from '../src/services/schedule-run-log-store.js';
 
 // Per-bot schedule stores: the daemon binds the store to its own bot before
 // serving IPC; the schedule endpoints under test assume that binding exists.
@@ -1669,14 +1674,16 @@ describe('POST /api/session-origin/attest', () => {
   }, 5_000);
 });
 
-describe('GET /api/bot-default-oncall — schedule working directory', () => {
-  it('reports the daemon process cwd without persisting it as bot config', async () => {
+describe('GET /api/bot-default-oncall — schedule host paths', () => {
+  it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-schedule-cwd-app';
     const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
     try {
       process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = join(dir, 'daemon-data');
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -1692,12 +1699,20 @@ describe('GET /api/bot-default-oncall — schedule working directory', () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
         scheduleWorkingDir: process.cwd(),
+        schedulePreconditionFileRoot: join(
+          config.session.dataDir,
+          'schedule-preconditions',
+          'trusted-files',
+        ),
         defaultWorkingDir: join(dir, 'session-default'),
       });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('scheduleWorkingDir');
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(persisted).not.toHaveProperty('scheduleWorkingDir');
+      expect(persisted).not.toHaveProperty('schedulePreconditionFileRoot');
     } finally {
       if (handle) await handle.close();
       handle = null;
+      config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
@@ -4612,6 +4627,109 @@ describe('GET /api/schedules/:id/logs', () => {
   });
 });
 
+describe('POST /api/schedules/precondition/test', () => {
+  it('is trusted-host only and tests an unsaved draft without touching schedules or logs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-precondition-test-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_precondition_draft_test';
+    const marker = join(dir, 'anonymous-must-not-run');
+    const filePath = join(dir, 'data', 'schedule-preconditions', 'trusted-files', 'guard.sh');
+    const routePath = '/api/schedules/precondition/test';
+    const runNowSpy = vi.spyOn(scheduler, 'runNow');
+    try {
+      config.session.dataDir = join(dir, 'data');
+      ensureSchedulePreconditionRoot(config.session.dataDir);
+      scheduleStore.setScheduleScope(appId);
+      setLarkAppId(appId);
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      writeFileSync(filePath, 'printf 0');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const anonymous = await fetch(`${base}${routePath}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          workingDir: dir,
+          source: { kind: 'inline', script: `touch ${JSON.stringify(marker)}; printf 1` },
+        }),
+      });
+      expect(anonymous.status).toBe(401);
+      expect(existsSync(marker)).toBe(false);
+
+      const requestDraft = async (source: unknown) => fetch(`${base}${routePath}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', routePath, handle!.port),
+        },
+        body: JSON.stringify({ larkAppId: appId, workingDir: dir, source }),
+      });
+
+      const passResponse = await requestDraft({
+        kind: 'inline',
+        script: "printf 1; printf 'draft prompt must stay private' >&3",
+      });
+      expect(passResponse.status).toBe(200);
+      const passText = await passResponse.text();
+      expect(passText).not.toContain('draft prompt must stay private');
+      expect(JSON.parse(passText)).toMatchObject({
+        ok: true,
+        result: 'pass',
+        additionalPrompt: true,
+      });
+      expect(JSON.parse(passText).durationMs).toBeGreaterThanOrEqual(0);
+
+      const skipResponse = await requestDraft({ kind: 'file', path: filePath });
+      expect(skipResponse.status).toBe(200);
+      expect(await skipResponse.json()).toMatchObject({
+        ok: true,
+        result: 'skip',
+        additionalPrompt: false,
+      });
+
+      const errorResponse = await requestDraft({ kind: 'inline', script: 'exit 37' });
+      expect(errorResponse.status).toBe(200);
+      expect(await errorResponse.json()).toMatchObject({
+        ok: false,
+        result: 'error',
+        errorCode: 'non_zero_exit',
+        error: 'Scheduled task precondition failed with exit code 37',
+        additionalPrompt: false,
+      });
+
+      const relativeResponse = await requestDraft({ kind: 'file', path: 'guard.sh' });
+      expect(relativeResponse.status).toBe(400);
+      expect(await relativeResponse.json()).toMatchObject({
+        ok: false,
+        result: 'error',
+        errorCode: 'invalid_path',
+        field: 'source',
+      });
+
+      expect(scheduleStore.listTasks(appId)).toEqual([]);
+      expect(existsSync(scheduleRunLogDirectory(appId))).toBe(false);
+      expect(runNowSpy).not.toHaveBeenCalled();
+    } finally {
+      runNowSpy.mockRestore();
+      if (handle) await handle.close();
+      handle = null;
+      setLarkAppId('');
+      setIpcAuthSecret(null);
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the central proxy management-only and routes by larkAppId without a task id', () => {
+    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+    expect(source).toContain("url.pathname === '/api/schedules/precondition/test'");
+    expect(source).toContain("proxyToDaemon(larkAppId, '/api/schedules/precondition/test'");
+    expect(source).toContain("if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });");
+  });
+});
+
 describe('schedule target cap', () => {
   const appId = 'cli_schedule_target_cap_test';
   const sixChats = ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'];
@@ -4852,6 +4970,9 @@ describe('POST /api/schedules execution position', () => {
         source: { kind: 'inline', script: 'printf 1' },
       });
 
+      const filePath = join(schedulePreconditionTrustedFilesRoot(config.session.dataDir), 'check-ready.sh');
+      const outsideFilePath = join(dir, 'scripts', 'check-ready.sh');
+
       const pausedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
@@ -4870,10 +4991,25 @@ describe('POST /api/schedules execution position', () => {
         source: { kind: 'inline', script: 'printf 1' },
       });
 
+      const sidecarPath = schedulePreconditionPath(appId, created.id, config.session.dataDir);
+      const sidecarBeforeRejectedReplace = readFileSync(sidecarPath, 'utf8');
+      const outsideReplacement = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: outsideFilePath }),
+      });
+      expect(outsideReplacement.status).toBe(400);
+      expect(await outsideReplacement.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+      expect(readFileSync(sidecarPath, 'utf8')).toBe(sidecarBeforeRejectedReplace);
+
       const replacedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ preconditionFilePath: 'scripts/check-ready.sh' }),
+        body: JSON.stringify({ preconditionFilePath: filePath }),
       });
       expect(replacedResponse.status).toBe(200);
       const replaced = (await replacedResponse.json()).task;
@@ -4882,7 +5018,7 @@ describe('POST /api/schedules execution position', () => {
         hasPrecondition: true,
         preconditionEnabled: false,
         preconditionSource: 'file',
-        preconditionFilePath: 'scripts/check-ready.sh',
+        preconditionFilePath: filePath,
       });
       expect(replaced).not.toHaveProperty('preconditionScript');
       expect(replaced).not.toHaveProperty('preconditionRef');
@@ -4892,12 +5028,12 @@ describe('POST /api/schedules execution position', () => {
       ).at(-1)?.body.patch).toMatchObject({
         preconditionSource: 'file',
         preconditionScript: null,
-        preconditionFilePath: 'scripts/check-ready.sh',
+        preconditionFilePath: filePath,
       });
       expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
         kind: 'configured',
         enabled: false,
-        source: { kind: 'file', path: 'scripts/check-ready.sh' },
+        source: { kind: 'file', path: filePath },
       });
 
       const listResponse = await fetch(`${base}/api/schedules`);
@@ -4906,7 +5042,7 @@ describe('POST /api/schedules execution position', () => {
         hasPrecondition: true,
         preconditionEnabled: false,
         preconditionSource: 'file',
-        preconditionFilePath: 'scripts/check-ready.sh',
+        preconditionFilePath: filePath,
       });
       expect(JSON.stringify(listed)).not.toContain('printf 1');
       expect(listed).not.toHaveProperty('preconditionRef');
@@ -4921,7 +5057,7 @@ describe('POST /api/schedules execution position', () => {
         hasPrecondition: true,
         preconditionEnabled: true,
         preconditionSource: 'file',
-        preconditionFilePath: 'scripts/check-ready.sh',
+        preconditionFilePath: filePath,
       });
 
       const mutuallyExclusive = await fetch(`${base}/api/schedules/${created.id}`, {
@@ -4929,11 +5065,23 @@ describe('POST /api/schedules execution position', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           preconditionScript: 'printf 1',
-          preconditionFilePath: 'scripts/check-ready.sh',
+          preconditionFilePath: filePath,
         }),
       });
       expect(mutuallyExclusive.status).toBe(400);
       expect(await mutuallyExclusive.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+
+      const relativePath = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: 'scripts/check-ready.sh' }),
+      });
+      expect(relativePath.status).toBe(400);
+      expect(await relativePath.json()).toMatchObject({
         ok: false,
         error: 'invalid_field',
         field: 'preconditionFilePath',
@@ -4949,6 +5097,33 @@ describe('POST /api/schedules execution position', () => {
         ok: false,
         error: 'invalid_field',
         field: 'preconditionFilePath',
+      });
+
+      const pausedLegacyResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: false }),
+      });
+      expect(pausedLegacyResponse.status).toBe(200);
+      const legacyRecord = JSON.parse(readFileSync(sidecarPath, 'utf8'));
+      legacyRecord.source = { kind: 'file', path: outsideFilePath };
+      writeFileSync(sidecarPath, JSON.stringify(legacyRecord));
+
+      const rejectedLegacyResume = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: true }),
+      });
+      expect(rejectedLegacyResume.status).toBe(400);
+      expect(await rejectedLegacyResume.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: false,
+        source: { kind: 'file', path: outsideFilePath },
       });
 
       const clearedResponse = await fetch(`${base}/api/schedules/${created.id}`, {

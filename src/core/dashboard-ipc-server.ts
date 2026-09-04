@@ -32,10 +32,20 @@ import * as scheduleStore from '../services/schedule-store.js';
 import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import {
   resolveSchedulePrecondition,
+  schedulePreconditionTrustedFilesRoot,
   validateSchedulePreconditionSource,
   type SchedulePreconditionDefinition,
   type SchedulePreconditionSource,
 } from '../services/schedule-precondition-store.js';
+import {
+  assertSchedulePreconditionFilePathTrusted,
+  readSchedulePreconditionFile,
+  SchedulePreconditionFileError,
+} from '../services/schedule-precondition-file.js';
+import {
+  runSchedulePrecondition,
+  SchedulePreconditionError,
+} from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
@@ -3158,6 +3168,8 @@ function parseSchedulePreconditionWrite(
         kind: 'file',
         path: body.preconditionFilePath,
       });
+      if (source.kind !== 'file') throw new TypeError('invalid_schedule_precondition_file_source');
+      assertSchedulePreconditionFilePathTrusted(source.path);
     } catch {
       return { ok: false, field: 'preconditionFilePath' };
     }
@@ -3376,6 +3388,101 @@ ipcRoute('GET', '/api/schedules/:id/logs', (req, res, p) => {
       `[schedule-run-log] query failed for task ${p.id}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return jsonRes(res, 500, { ok: false, error: 'schedule_run_logs_query_failed' });
+  }
+});
+
+// Execute the current unsaved Dashboard draft without creating/updating a
+// schedule. This route deliberately has no task id: it only reads the selected
+// file (if any) and invokes the existing bounded Bash runner. Consequently it
+// cannot dispatch a model, advance repeat/once accounting, or write task logs.
+ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_json',
+      error: 'Request body must be valid JSON',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_request',
+      error: 'Request body must be an object',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const draft = body as Record<string, unknown>;
+  if (typeof draft.workingDir !== 'string' || draft.workingDir.trim().length === 0) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: 'Scheduled task precondition requires a non-empty task working directory',
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const checkedWorkingDir = validateWorkingDir(draft.workingDir);
+  if (!checkedWorkingDir.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: checkedWorkingDir.error,
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  let source: SchedulePreconditionSource;
+  try {
+    source = validateSchedulePreconditionSource(draft.source);
+    if (source.kind === 'file') assertSchedulePreconditionFilePathTrusted(source.path);
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: error instanceof SchedulePreconditionFileError ? error.code : 'invalid_source',
+      error: error instanceof Error ? error.message : String(error),
+      field: 'source',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  const startedAt = Date.now();
+  try {
+    const script = source.kind === 'inline'
+      ? source.script
+      : readSchedulePreconditionFile(source.path, checkedWorkingDir.resolvedPath);
+    const result = await runSchedulePrecondition(script, checkedWorkingDir.resolvedPath);
+    return jsonRes(res, 200, {
+      ok: true,
+      result: result.decision,
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: result.decision === 'pass' && result.additionalPrompt !== undefined,
+    });
+  } catch (error) {
+    const expected = error instanceof SchedulePreconditionError
+      || error instanceof SchedulePreconditionFileError;
+    return jsonRes(res, expected ? 200 : 500, {
+      ok: false,
+      result: 'error',
+      errorCode: expected ? error.code : 'precondition_test_failed',
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: false,
+    });
   }
 });
 
@@ -3625,6 +3732,13 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
         ok: false,
         error: 'invalid_field',
         field: 'preconditionEnabled',
+      });
+    }
+    if (err instanceof SchedulePreconditionFileError) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
       });
     }
     logger.error(`[schedule-precondition] authenticated update failed for task ${p.id}`);
@@ -4676,9 +4790,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     // Dashboard-created schedules default to this daemon process directory.
-    // Expose it read-only so the file-precondition UI can resolve relative
-    // paths accurately without changing schedule creation or persistence.
+    // It remains the Bash execution cwd, not a file-path resolution base.
     scheduleWorkingDir: process.cwd(),
+    // Private Dashboard payload only. File-backed preconditions must live under
+    // this daemon-owned host directory; it is never derived from workingDir.
+    schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,

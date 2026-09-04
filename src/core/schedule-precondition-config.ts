@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import * as scheduler from './scheduler.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import { logger } from '../utils/logger.js';
+import { assertSchedulePreconditionFilePathTrusted } from '../services/schedule-precondition-file.js';
 import {
   abortSchedulePrecondition,
   activateSchedulePrecondition,
+  ensureSchedulePreconditionRoot,
   getSchedulePreconditionSummary,
   rebindSchedulePrecondition,
   removeSchedulePrecondition,
@@ -36,6 +38,17 @@ export type SchedulePreconditionUpdateInput =
   | SchedulePreconditionMutation
   | undefined;
 
+function assertWritableSchedulePreconditionSource(source: SchedulePreconditionSource): void {
+  if (source.kind === 'file') {
+    // Reject lexical escapes before creating anything. Then create/tighten the
+    // daemon-owned trusted root and inspect the completed layout once more so
+    // a symlinked root or existing ancestor can never be authorized.
+    assertSchedulePreconditionFilePathTrusted(source.path);
+    ensureSchedulePreconditionRoot();
+    assertSchedulePreconditionFilePathTrusted(source.path);
+  }
+}
+
 function allocateTaskId(appId: string): string {
   for (let attempt = 0; attempt < 32; attempt += 1) {
     const id = randomUUID().substring(0, 8);
@@ -65,6 +78,9 @@ export function createTaskWithOptionalPrecondition(
   const definition = typeof precondition === 'string'
     ? precondition
     : validateSchedulePreconditionDefinition(precondition);
+  if (typeof definition !== 'string') {
+    assertWritableSchedulePreconditionSource(definition.source);
+  }
 
   // A pending sidecar exists before the task row, so every observable partial
   // state fails closed. Fixed IDs let the sidecar and sandbox-writable row bind
@@ -157,6 +173,7 @@ function normalizeMutation(
       throw new TypeError('invalid_schedule_precondition_enabled');
     }
     if (!existing) throw new Error('schedule_precondition_not_configured');
+    if (input.enabled) assertWritableSchedulePreconditionSource(existing.source);
     return { action: 'set-enabled', enabled: input.enabled };
   }
   if (input.action === 'replace') {
@@ -169,11 +186,13 @@ function normalizeMutation(
     ) {
       throw new TypeError('invalid_schedule_precondition_replace');
     }
+    const source = validateSchedulePreconditionSource(input.source);
+    assertWritableSchedulePreconditionSource(source);
     return {
       action: 'replace',
       definition: {
         enabled: input.enabled ?? existing?.enabled ?? true,
-        source: validateSchedulePreconditionSource(input.source),
+        source,
       },
     };
   }
