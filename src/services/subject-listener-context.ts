@@ -110,9 +110,10 @@ export async function loadSubjectListenerContext(
   const cursorIndex = input.cursor
     ? scanned.findIndex(message => messageIdOf(message) === input.cursor?.messageId)
     : -1;
-  const continuity: SubjectListenerContinuity = input.cursor
-    ? cursorIndex >= 0 ? 'continuous' : 'cursor_lost'
-    : 'cold_start';
+  let continuity: SubjectListenerContinuity = 'cold_start';
+  if (input.cursor) {
+    continuity = cursorIndex >= 0 ? 'continuous' : 'cursor_lost';
+  }
   const afterCursor = continuity === 'continuous' ? scanned.slice(cursorIndex + 1) : scanned;
   const bounded = afterCursor.filter(message => isAtOrBeforeTrigger(message, input.trigger));
   const triggerId = input.trigger.messageId;

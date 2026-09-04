@@ -29,9 +29,11 @@ Subject 的事实上下文来自飞书，不依赖 CLI session 历史。系统�
 | --- | --- | --- |
 | 001 | Subject 运行时、飞书增量上下文、静默与游标提交 | [sprint-001](./sprint-001/) |
 | 002 | Dashboard/API 配置、兼容保存与可操作界面 | [sprint-002](./sprint-002/) |
+| Review | 合并前修复、架构讨论与最终验收 | [review-followups](./review-followups.md) |
 
 ## 当前状态
 
-- Sprint 001 已通过 evaluator 验收并完成提交。
-- Sprint 002 已通过 evaluator 验收：Subject 配置、Dashboard 交互、preview/run-preview 与向前兼容全部完成。
-- 总目标已实现，待建立 PR 并进入远程 CI/review。
+- Sprint 001、002 已完成，PR #1252 的构建与测试 CI 已通过。
+- Review 发现的 R-1、R-2、R-3 已确认是合并前必须修复项。
+- R-4 先讨论架构方案，不在未确认前改代码；R-5 放到最后补截图与 live 验收。
+- 本轮仅处理代码规范中的嵌套三元，不顺带修改其它 review 项。

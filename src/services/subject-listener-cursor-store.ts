@@ -40,7 +40,8 @@ export function compareSubjectListenerCreateTime(left: string, right: string): n
   if (normalizedLeft.length !== normalizedRight.length) {
     return normalizedLeft.length < normalizedRight.length ? -1 : 1;
   }
-  return normalizedLeft === normalizedRight ? 0 : normalizedLeft < normalizedRight ? -1 : 1;
+  if (normalizedLeft === normalizedRight) return 0;
+  return normalizedLeft < normalizedRight ? -1 : 1;
 }
 
 /** Corrupt, partially migrated, or absent state is deliberately fail-open. */
