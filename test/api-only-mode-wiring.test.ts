@@ -830,7 +830,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
-  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+  it('stamps proven sender type at IM entries and source testimony at dispatch launch', () => {
     // A bot's turn carries a perfectly valid union_id (its own), so a consumer
     // cannot tell "a person asked" from "a bot triggered itself" unless the host
     // says which it was. Both inbound paths must therefore pass it — a missed
@@ -843,8 +843,8 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    expect(trustedCallerArgs.length).toBe(2);
-    for (const args of trustedCallerArgs) {
+    expect(trustedCallerArgs.length).toBe(3);
+    for (const args of trustedCallerArgs.slice(0, 2)) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
@@ -855,6 +855,16 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       // which is the exact case a bare `sender_type` check already missed.
       expect(senderTypeArg).toContain('isForeignBot');
     }
+    // Dispatch launch is not an IM event on the target app: its same-host HMAC
+    // authenticated and policy-allowlisted source daemon attests the human
+    // caller union_id, while the immediate trigger is known to be that bot.
+    const dispatchArgs = trustedCallerArgs[2]!;
+    expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
+    expect(dispatchArgs[3]).toBe('true');
+    expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');
+    // The source testimony must never be reused as evaluateBotTalk's bot union.
+    expect(daemonSource).toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId)');
+    expect(daemonSource).not.toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId)');
   });
 
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
