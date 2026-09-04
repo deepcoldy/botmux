@@ -48,7 +48,9 @@ import {
   MAX_ROLE_BYTES,
   MESSAGE_LISTENER_WARN_BYTES,
   DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT,
+  DEFAULT_SUBJECT_FALLBACK_MESSAGES,
   MAX_MESSAGE_LISTENER_PREVIEW_LIMIT,
+  MAX_SUBJECT_FALLBACK_MESSAGES,
   roleKey,
   ROLE_WARN_BYTES,
   saveInjectMode,
@@ -118,6 +120,20 @@ const DEFAULT_LISTENER: MessageListenerData = {
   },
 };
 
+function listenerBehavior(listener: MessageListenerData): 'prompt' | 'subject' {
+  return listener.behavior === 'subject' ? 'subject' : 'prompt';
+}
+
+function subjectFallbackMessages(listener: MessageListenerData): number {
+  return listener.subjectPolicy?.context.fallbackMessages ?? DEFAULT_SUBJECT_FALLBACK_MESSAGES;
+}
+
+function isValidSubjectFallbackMessages(listener: MessageListenerData): boolean {
+  if (listenerBehavior(listener) !== 'subject') return true;
+  const value = subjectFallbackMessages(listener);
+  return Number.isInteger(value) && value > 0 && value <= MAX_SUBJECT_FALLBACK_MESSAGES;
+}
+
 function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
   // Mirror the backend storage default: persisted configs OMIT `mode` when it
   // equals 'all_except_excluded' (see message-listener-store sanitize +
@@ -129,10 +145,19 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
   const mode = listener?.senderPolicy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   return {
     enabled: listener?.enabled === true,
+    ...(listener?.behavior ? { behavior: listener.behavior } : {}),
     name: listener?.name ?? '',
     replyCardTitle: listener?.replyCardTitle ?? '',
     workingDir: listener?.workingDir ?? '',
     prompt: listener?.prompt ?? '',
+    ...(listener?.behavior === 'subject' ? {
+      subjectPolicy: {
+        context: {
+          source: 'lark',
+          fallbackMessages: listener.subjectPolicy?.context.fallbackMessages ?? DEFAULT_SUBJECT_FALLBACK_MESSAGES,
+        },
+      },
+    } : {}),
     senderPolicy: {
       mode,
       includeSenderOpenIds: [...(listener?.senderPolicy?.includeSenderOpenIds ?? [])],
@@ -161,7 +186,7 @@ function listenerHasConfig(listener: MessageListenerData | null): boolean {
   // backend persists such drafts (see messageListenerConfigFromUpdate); gating
   // on enabled here would reset the editor to blank on reload and make the saved
   // draft look lost. Runtime matching still requires enabled===true elsewhere.
-  return !!listener && listener.prompt.trim().length > 0;
+  return !!listener && (listener.behavior === 'subject' || listener.prompt.trim().length > 0);
 }
 
 function groupHasAnyRoleOrListener(group: GroupInfo): boolean {
@@ -720,12 +745,22 @@ function RolesPage(props: { tab: RolesTab }) {
         ...(raw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
       };
     })();
+    const behavior = listenerBehavior(editingListener);
     return {
       enabled: editingListener.enabled,
+      ...(editingListener.behavior ? { behavior: editingListener.behavior } : {}),
       ...(editingListener.name?.trim() ? { name: editingListener.name.trim() } : {}),
       ...(editingListener.replyCardTitle?.trim() ? { replyCardTitle: editingListener.replyCardTitle.trim() } : {}),
       ...(editingListener.workingDir?.trim() ? { workingDir: editingListener.workingDir.trim() } : {}),
       prompt: editingListener.prompt.trim(),
+      ...(behavior === 'subject' ? {
+        subjectPolicy: {
+          context: {
+            source: 'lark',
+            fallbackMessages: subjectFallbackMessages(editingListener),
+          },
+        },
+      } : {}),
       senderPolicy: {
         mode,
         // Persist ONLY the list relevant to the active mode so a later mode
@@ -745,8 +780,12 @@ function RolesPage(props: { tab: RolesTab }) {
   }
 
   function validateListenerForPreview(): MessageListenerData | null {
-    if (!editingListener.prompt.trim()) {
+    if (listenerBehavior(editingListener) === 'prompt' && !editingListener.prompt.trim()) {
       flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
+      return null;
+    }
+    if (!isValidSubjectFallbackMessages(editingListener)) {
+      flash(setListenerFlash, tr('roles.listenerSubjectFallbackInvalid', { max: MAX_SUBJECT_FALLBACK_MESSAGES }), true);
       return null;
     }
     if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
@@ -821,11 +860,12 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleSaveListener(): Promise<void> {
     if (!selectedGroupId || !selectedBotId) return;
-    // Disabled + blank prompt = clear the listener entirely (mirrors the backend
-    // messageListenerConfigFromUpdate: nothing worth persisting → delete). A
-    // disabled draft WITH a prompt falls through and is saved as-is (enabled:false),
-    // so turning the toggle off then Save no longer discards the typed content.
-    if (!editingListener.enabled && !editingListener.prompt.trim()) {
+    // Disabled + blank prompt clears only the legacy prompt listener. Subject's
+    // mode/policy are meaningful even with an empty optional focus, so its
+    // disabled draft must still persist and round-trip through the editor.
+    if (!editingListener.enabled
+      && listenerBehavior(editingListener) === 'prompt'
+      && !editingListener.prompt.trim()) {
       await handleDeleteListener(false);
       return;
     }
@@ -834,8 +874,12 @@ function RolesPage(props: { tab: RolesTab }) {
     // incomplete sender policy is fine to persist and re-editing later can
     // complete it before enabling.
     if (editingListener.enabled) {
-      if (!editingListener.prompt.trim()) {
+      if (listenerBehavior(editingListener) === 'prompt' && !editingListener.prompt.trim()) {
         flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
+        return;
+      }
+      if (!isValidSubjectFallbackMessages(editingListener)) {
+        flash(setListenerFlash, tr('roles.listenerSubjectFallbackInvalid', { max: MAX_SUBJECT_FALLBACK_MESSAGES }), true);
         return;
       }
       if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
@@ -1015,7 +1059,10 @@ function RolesPage(props: { tab: RolesTab }) {
   const listenerSaveDisabled = listenerSaving
     || listenerDeleting
     || listenerPromptByteLen > MAX_MESSAGE_LISTENER_PROMPT_BYTES
-    || (editingListener.enabled && editingListener.prompt.trim().length === 0);
+    || (editingListener.enabled
+      && listenerBehavior(editingListener) === 'prompt'
+      && editingListener.prompt.trim().length === 0)
+    || !isValidSubjectFallbackMessages(editingListener);
   const profileSaveDisabled = profileSaving || profileByteLen > MAX_ROLE_BYTES || profileEditingContent.trim().length === 0;
   const isProfiles = props.tab === 'profiles';
   const tabs = (
@@ -1555,6 +1602,7 @@ function MessageListenerEditor(props: {
   onPreviewLimitChange(limit: number): void;
 }) {
   const { listener, tr } = props;
+  const behavior = listenerBehavior(listener);
   const [targetTab, setTargetTab] = useState<ListenerTargetTab>('members');
   const [targetQuery, setTargetQuery] = useState('');
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => new Set());
@@ -1655,6 +1703,61 @@ function MessageListenerEditor(props: {
         <span className="filter-toggle-label">{tr('roles.listenerEnabled')}</span>
       </label>
       <p className="roles-listener-scope-help">{tr('roles.listenerScopeHelp')}</p>
+      <div className="roles-listener-grid">
+        <label className="roles-listener-field">
+          <span className="roles-field-label">{tr('roles.listenerBehavior')}</span>
+          <select
+            id="roles-listener-behavior"
+            value={behavior}
+            onChange={ev => {
+              const next = ev.currentTarget.value === 'subject' ? 'subject' : 'prompt';
+              props.onPatch(next === 'subject'
+                ? {
+                    behavior: 'subject',
+                    subjectPolicy: {
+                      context: {
+                        source: 'lark',
+                        fallbackMessages: subjectFallbackMessages(listener),
+                      },
+                    },
+                  }
+                : { behavior: 'prompt' });
+            }}
+          >
+            <option value="prompt">{tr('roles.listenerBehaviorPrompt')}</option>
+            <option value="subject">{tr('roles.listenerBehaviorSubject')}</option>
+          </select>
+          <small className="roles-listener-scope-help">
+            {behavior === 'subject'
+              ? tr('roles.listenerBehaviorSubjectHelp')
+              : tr('roles.listenerBehaviorPromptHelp')}
+          </small>
+        </label>
+        {behavior === 'subject' ? (
+          <label className="roles-listener-field">
+            <span className="roles-field-label">{tr('roles.listenerSubjectFallback')}</span>
+            <input
+              id="roles-listener-subject-fallback"
+              type="number"
+              min={1}
+              max={MAX_SUBJECT_FALLBACK_MESSAGES}
+              step={1}
+              value={Number.isFinite(subjectFallbackMessages(listener)) ? subjectFallbackMessages(listener) : ''}
+              onChange={ev => props.onPatch({
+                subjectPolicy: {
+                  context: {
+                    source: 'lark',
+                    fallbackMessages: ev.currentTarget.valueAsNumber,
+                  },
+                },
+              })}
+            />
+            <small className="roles-listener-scope-help">
+              {tr('roles.listenerSubjectFallbackHelp', { max: MAX_SUBJECT_FALLBACK_MESSAGES })}
+            </small>
+          </label>
+        ) : null}
+      </div>
       <div className="roles-listener-grid">
         <label className="roles-listener-field">
           <span className="roles-field-label">{tr('roles.listenerName')}</span>
@@ -1783,14 +1886,21 @@ function MessageListenerEditor(props: {
         <small className="roles-listener-scope-help">{tr('roles.listenerContentPolicyHelp')}</small>
       </div>
       <label className="roles-listener-field">
-        <span className="roles-field-label">{tr('roles.listenerPrompt')}</span>
+        <span className="roles-field-label">
+          {behavior === 'subject' ? tr('roles.listenerSubjectFocus') : tr('roles.listenerPrompt')}
+        </span>
         <textarea
           id="roles-listener-prompt"
-          placeholder={tr('roles.listenerPromptPlaceholder')}
+          placeholder={behavior === 'subject'
+            ? tr('roles.listenerSubjectFocusPlaceholder')
+            : tr('roles.listenerPromptPlaceholder')}
           rows={9}
           value={listener.prompt}
           onChange={ev => props.onPatch({ prompt: ev.currentTarget.value })}
         />
+        {behavior === 'subject'
+          ? <small className="roles-listener-scope-help">{tr('roles.listenerSubjectFocusHelp')}</small>
+          : null}
       </label>
       <div className="roles-editor-footer">
         <span id="roles-listener-bytecount" className={listenerByteCountClass(props.promptByteLen)}>

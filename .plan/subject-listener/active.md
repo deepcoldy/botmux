@@ -33,4 +33,5 @@ Subject 的事实上下文来自飞书，不依赖 CLI session 历史。系统�
 ## 当前状态
 
 - Sprint 001 已通过 evaluator 验收并完成提交。
-- Sprint 002 尚未开始。
+- Sprint 002 已通过 evaluator 验收：Subject 配置、Dashboard 交互、preview/run-preview 与向前兼容全部完成。
+- 总目标已实现，待建立 PR 并进入远程 CI/review。

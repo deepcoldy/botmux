@@ -27,6 +27,10 @@ import * as scheduler from '../src/core/scheduler.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
+import {
+  commitSubjectListenerCursor,
+  readSubjectListenerCursor,
+} from '../src/services/subject-listener-cursor-store.js';
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
@@ -2234,6 +2238,163 @@ describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence 
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].messageListeners).toBeUndefined();
       const get = await (await fetch(`${base}/api/message-listeners/${chatId}`)).json();
       expect(get.listener).toBeNull();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT/GET /api/message-listeners/:chatId — Subject', () => {
+  it('saves an empty-focus Subject and returns the same behavior and fallback after reload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-subject-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-listener-subject-app';
+    const chatId = 'oc_subject_chat';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const subject = {
+        enabled: true,
+        behavior: 'subject',
+        prompt: '',
+        subjectPolicy: {
+          context: { source: 'lark', fallbackMessages: 30 },
+        },
+      };
+
+      const put = await fetch(`${base}/api/message-listeners/${chatId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(subject),
+      });
+      expect(put.status).toBe(200);
+      expect(await put.json()).toMatchObject({ ok: true, listener: subject });
+
+      const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0].messageListeners[chatId];
+      expect(persisted).toMatchObject(subject);
+      const get = await fetch(`${base}/api/message-listeners/${chatId}`);
+      expect(get.status).toBe(200);
+      expect(await get.json()).toMatchObject({ listener: subject });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT/GET /api/message-listeners/:chatId — 旧监听', () => {
+  it('loads and saves a legacy listener without adding behavior or Subject policy', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-legacy-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-listener-legacy-app';
+    const chatId = 'oc_legacy_chat';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const legacy = {
+      enabled: true,
+      prompt: '继续使用旧提示词',
+      messagePolicy: { scope: 'top_level' },
+      replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    };
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        messageListeners: { [chatId]: legacy },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const firstLoad = await (await fetch(`${base}/api/message-listeners/${chatId}`)).json();
+      expect(firstLoad.listener).not.toHaveProperty('behavior');
+      expect(firstLoad.listener).not.toHaveProperty('subjectPolicy');
+
+      const put = await fetch(`${base}/api/message-listeners/${chatId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(firstLoad.listener),
+      });
+      expect(put.status).toBe(200);
+      const secondLoad = await (await fetch(`${base}/api/message-listeners/${chatId}`)).json();
+      expect(secondLoad.listener).not.toHaveProperty('behavior');
+      expect(secondLoad.listener).not.toHaveProperty('subjectPolicy');
+      expect(secondLoad.listener.prompt).toBe(legacy.prompt);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageListeners[chatId]).not.toHaveProperty('behavior');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/message-listeners/:chatId — 非法 Subject 配置', () => {
+  it.each([
+    ['unknown behavior', { behavior: 'ambient' }, 'unknown_behavior'],
+    ['non-Lark source', { behavior: 'subject', subjectPolicy: { context: { source: 'cli', fallbackMessages: 20 } } }, 'subject_source_must_be_lark'],
+    ['string fallbackMessages', { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: '20' } } }, 'invalid_fallback_messages'],
+    ['fractional fallbackMessages', { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: 1.5 } } }, 'invalid_fallback_messages'],
+    ['zero fallbackMessages', { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: 0 } } }, 'invalid_fallback_messages'],
+    ['fallbackMessages above max', { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: 201 } } }, 'invalid_fallback_messages'],
+  ])('returns 400 for %s and leaves bots.json byte-for-byte unchanged', async (_label, invalidPatch, expectedError) => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-invalid-subject-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-listener-invalid-subject-app';
+    const chatId = 'oc_invalid_subject_chat';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        messageListeners: {
+          [chatId]: {
+            enabled: true,
+            prompt: '原配置不能被非法请求覆盖',
+            messagePolicy: { scope: 'top_level' },
+            replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          },
+        },
+      }], null, 2));
+      const original = readFileSync(configPath, 'utf8');
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/message-listeners/${chatId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          enabled: true,
+          prompt: '',
+          ...invalidPatch,
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ ok: false, error: expectedError });
+      expect(readFileSync(configPath, 'utf8')).toBe(original);
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -6856,7 +7017,131 @@ describe('role profile IPC routes', () => {
     }
   });
 
-  it('runs message listener preview through the visible listener reply path', async () => {
+  it('previews and run-previews Subject with the real Lark renderer without advancing the durable cursor', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-subject-preview-'));
+    const prevDataDir = config.session.dataDir;
+    const appId = 'cli_subject_preview';
+    const chatId = 'oc_subject_preview';
+    const now = Date.now();
+    const previousCursor = { messageId: 'om_previous_cursor', createTime: String(now - 30_000) };
+    const history = [
+      {
+        message_id: previousCursor.messageId,
+        create_time: previousCursor.createTime,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '上次已处理' }) },
+        sender: { id: 'ou_previous', sender_type: 'user', sender_name: '上一位成员' },
+      },
+      {
+        message_id: 'om_lark_context',
+        create_time: String(now - 20_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '飞书里的增量上下文' }) },
+        sender: { id: 'ou_context', sender_type: 'user', sender_name: '协作者' },
+      },
+      {
+        message_id: 'om_subject_trigger',
+        create_time: String(now - 10_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '请看一下这个交付阻塞' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '发起人' },
+      },
+    ];
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    config.session.dataDir = dir;
+    commitSubjectListenerCursor(dir, appId, chatId, previousCursor);
+
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue(history);
+    const chatContextSpy = vi.spyOn(larkClient, 'getChatContext').mockResolvedValue({
+      chatId,
+      name: '发布协作群',
+      description: '这里讨论发布风险与阻塞',
+      mode: 'topic',
+      fetchStatus: 'available',
+    });
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue(chatId);
+    const activeSessions = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const listener = {
+      enabled: true,
+      behavior: 'subject',
+      prompt: '只关注交付阻塞',
+      subjectPolicy: {
+        context: { source: 'lark', fallbackMessages: 30 },
+      },
+      senderPolicy: {
+        mode: 'all_except_excluded',
+        includeSenderTypes: ['user'],
+      },
+      messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+    };
+
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const preview = await fetch(`${base}/api/message-listeners/${chatId}/preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ limit: 1, listener }),
+      });
+      expect(preview.status).toBe(200);
+      const previewBody = await preview.json();
+      expect(previewBody.matches).toHaveLength(1);
+      expect(previewBody.matches[0]).toMatchObject({
+        behavior: 'subject',
+        messageId: 'om_subject_trigger',
+        subjectPolicy: listener.subjectPolicy,
+      });
+      expect(previewBody.matches[0].renderedPrompt).toContain('# Botmux Subject protocol');
+      expect(previewBody.matches[0].renderedPrompt).toContain('发布协作群');
+      expect(previewBody.matches[0].renderedPrompt).toContain('这里讨论发布风险与阻塞');
+      expect(previewBody.matches[0].renderedPrompt).toContain('只关注交付阻塞');
+      expect(previewBody.matches[0].renderedPrompt).toContain('飞书里的增量上下文');
+      expect(readSubjectListenerCursor(dir, appId, chatId)).toEqual(previousCursor);
+
+      const run = await fetch(`${base}/api/message-listeners/${chatId}/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ limit: 1, listener }),
+      });
+      expect(run.status).toBe(200);
+      const runBody = await run.json();
+      expect(runBody.ok).toBe(true);
+      expect(runBody.matches[0].renderedPrompt).toBe(previewBody.matches[0].renderedPrompt);
+      expect(runBody.results[0]).toMatchObject({
+        messageId: 'om_subject_trigger',
+        ok: true,
+        action: 'queued',
+      });
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+      expect(chatContextSpy).toHaveBeenCalledWith(appId, chatId);
+      expect(historySpy).toHaveBeenCalledWith(appId, chatId, expect.any(Object));
+      expect(readSubjectListenerCursor(dir, appId, chatId)).toEqual(previousCursor);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      chatContextSpy.mockRestore();
+      historySpy.mockRestore();
+      config.session.dataDir = prevDataDir;
+      if (handle) await handle.close();
+      handle = null;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs 旧监听 message listener preview through the visible listener reply path', async () => {
     setLarkAppId('cli_listener_run');
     registerBot({
       larkAppId: 'cli_listener_run',

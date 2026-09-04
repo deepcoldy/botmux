@@ -1,0 +1,61 @@
+sprint: '002'
+goal: '补齐 Subject 监听的 Dashboard 与配置兼容入口'
+
+files_to_touch:
+  - src/services/message-listener-store.ts
+  - src/core/dashboard-ipc-server.ts
+  - src/dashboard/web/roles.ts
+  - src/dashboard/web/roles-page.tsx
+  - src/dashboard/web/i18n.ts
+  - test/message-listener-store.test.ts
+  - test/dashboard-ipc.test.ts
+  - test/dashboard-message-listener-subject.e2e.ts
+
+scenarios:
+  - id: S-1
+    name: '管理员保存 Subject 监听并在刷新后看到相同配置'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "Subject"'
+    points: 30
+  - id: S-2
+    name: '旧监听配置在升级后保持原来的提示词行为'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "旧监听"'
+    points: 25
+  - id: S-3
+    name: '管理员无法保存未知模式或非法兜底条数'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "非法 Subject 配置"'
+    points: 15
+
+exit_criteria:
+  - id: EC-1
+    description: '主流用户链路端到端走通：管理员在 Dashboard 选择 Subject、配置 N、保存并刷新后配置保持一致'
+    verification: 'bun x vitest run --project e2e test/dashboard-message-listener-subject.e2e.ts'
+  - id: EC-2
+    description: '所有 must_pass Scenario 通过'
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts'
+  - id: EC-3
+    description: '仓库构建通过'
+    verification: 'bun run build'
+
+rubrics:
+  - id: R-1
+    description: 'Subject 配置通过 API 与 bots.json 正确 round-trip'
+    points: 35
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts'
+  - id: R-2
+    description: 'Dashboard 用户可以选择模式并编辑兜底消息数，校验随模式切换'
+    points: 30
+    verification: 'bun x vitest run --project e2e test/dashboard-message-listener-subject.e2e.ts'
+  - id: R-3
+    description: '旧 listener 缺省行为、草稿和预览路径无回归'
+    points: 25
+    verification: 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts test/message-listener.test.ts'
+  - id: R-4
+    description: 'Dashboard bundle 与仓库构建通过'
+    points: 10
+    verification: 'bun run build'
+
+total_points: 100
+pass_threshold: 90

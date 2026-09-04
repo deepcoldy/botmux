@@ -1,0 +1,66 @@
+feedback_NO: '001'
+pass: true
+score: 100
+
+baseline: '662d5854327028dfa07570a9a4353212388eba91'
+
+bugs: []
+
+scenarios_result:
+  - id: S-1
+    name: '管理员保存 Subject 监听并在刷新后看到相同配置'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: Subject 定向用例 16 passed；空关注范围、fallbackMessages、preview/run-preview 与持久化 round-trip 正确。'
+  - id: S-2
+    name: '旧监听配置在升级后保持原来的提示词行为'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 旧监听定向用例 3 passed；缺省 behavior 未被改写，旧 prompt 路径保持不变。'
+  - id: S-3
+    name: '管理员无法保存未知模式或非法兜底条数'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 非法 Subject 配置定向用例 11 passed；未知模式、非 Lark source 与 N 的非法边界均返回 400 且配置文件字节不变。'
+
+exit_criteria_result:
+  - id: EC-1
+    pass: true
+    verification_output: 'PASS: Dashboard e2e 1 passed；选择 Subject、填写 N、保存并重新加载后配置一致。'
+  - id: EC-2
+    pass: true
+    verification_output: 'PASS: message-listener-store/dashboard-ipc/message-listener 共 249 tests。'
+  - id: EC-3
+    pass: true
+    verification_output: 'PASS: bun run build，Dashboard bundle 与 TypeScript 均通过。'
+
+rubrics_result:
+  - id: R-1
+    score: 35
+    max_score: 35
+    verification_output: 'PASS: Subject 配置通过 API 与 bots.json 完整 round-trip；非法写入不改变文件。'
+  - id: R-2
+    score: 30
+    max_score: 30
+    verification_output: 'PASS: Dashboard e2e 覆盖模式选择、fallbackMessages、可选关注范围和刷新回显。'
+  - id: R-3
+    score: 25
+    max_score: 25
+    verification_output: 'PASS: 249 个相关 unit 覆盖 legacy 配置、草稿、preview/run-preview 与原消息监听回归。'
+  - id: R-4
+    score: 10
+    max_score: 10
+    verification_output: 'PASS: bun run build；git diff --check。'
+
+anti_false_completion:
+  pass: true
+  detail: '真实 IPC server、临时 bots.json、持久 Subject cursor、飞书 API 替身和 Dashboard 交互均被覆盖，不是纯类型或源码存在性检查。'
+
+verification_commands:
+  - 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "Subject"'
+  - 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "旧监听"'
+  - 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts -t "非法 Subject 配置"'
+  - 'bun x vitest run --project unit test/message-listener-store.test.ts test/dashboard-ipc.test.ts test/message-listener.test.ts'
+  - 'bun x vitest run --project e2e test/dashboard-message-listener-subject.e2e.ts'
+  - 'bun run build'
+  - 'git diff --check'

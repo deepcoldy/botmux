@@ -1,4 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import {
+  DEFAULT_SUBJECT_FALLBACK_MESSAGES,
+  MAX_SUBJECT_FALLBACK_MESSAGES,
+} from '../src/bot-registry.js';
 import { messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, validateMessageListenerUpdate } from '../src/services/message-listener-store.js';
 
 describe('message listener store', () => {
@@ -81,5 +85,116 @@ describe('messageListenerConfigFromUpdate — disabled drafts persist', () => {
     const config = messageListenerConfigFromUpdate(update({ enabled: false }));
     expect(config?.messagePolicy?.scope).toBe('top_level');
     expect(config?.replyPolicy).toEqual({ mode: 'thread', sessionMode: 'per_message' });
+  });
+});
+
+describe('message listener store — Subject', () => {
+  it('round-trips an enabled Subject with empty optional focus and explicit fallbackMessages', () => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true,
+      behavior: 'subject',
+      prompt: '   ',
+      subjectPolicy: {
+        context: { source: 'lark', fallbackMessages: 30 },
+      },
+    });
+
+    expect(update).toEqual({
+      enabled: true,
+      behavior: 'subject',
+      prompt: '',
+      subjectPolicy: {
+        context: { source: 'lark', fallbackMessages: 30 },
+      },
+      messagePolicy: { scope: 'top_level' },
+    });
+    expect(validateMessageListenerUpdate(update)).toEqual({ ok: true });
+    expect(messageListenerConfigFromUpdate(update!)).toMatchObject({
+      enabled: true,
+      behavior: 'subject',
+      prompt: '',
+      subjectPolicy: {
+        context: { source: 'lark', fallbackMessages: 30 },
+      },
+      messagePolicy: { scope: 'top_level' },
+      replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    });
+  });
+
+  it('uses the documented Subject fallback default when policy is omitted', () => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: false,
+      behavior: 'subject',
+      prompt: '',
+    });
+
+    expect(validateMessageListenerUpdate(update)).toEqual({ ok: true });
+    expect(messageListenerConfigFromUpdate(update!)).toMatchObject({
+      enabled: false,
+      behavior: 'subject',
+      prompt: '',
+      subjectPolicy: {
+        context: {
+          source: 'lark',
+          fallbackMessages: DEFAULT_SUBJECT_FALLBACK_MESSAGES,
+        },
+      },
+    });
+  });
+});
+
+describe('message listener store — 旧监听', () => {
+  it('keeps a missing behavior as the legacy prompt listener shape', () => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '保持原来的提示词行为',
+    });
+
+    expect(update).not.toHaveProperty('behavior');
+    expect(validateMessageListenerUpdate(update)).toEqual({ ok: true });
+    const persisted = messageListenerConfigFromUpdate(update!);
+    expect(persisted).not.toHaveProperty('behavior');
+    expect(persisted).not.toHaveProperty('subjectPolicy');
+    expect(persisted).toMatchObject({
+      enabled: true,
+      prompt: '保持原来的提示词行为',
+    });
+  });
+});
+
+describe('message listener store — 非法 Subject 配置', () => {
+  it.each([
+    {
+      label: 'unknown behavior',
+      patch: { behavior: 'ambient' },
+      reason: 'unknown_behavior',
+    },
+    {
+      label: 'non-Lark source',
+      patch: { behavior: 'subject', subjectPolicy: { context: { source: 'cli', fallbackMessages: 20 } } },
+      reason: 'subject_source_must_be_lark',
+    },
+    {
+      label: 'non-integer fallbackMessages',
+      patch: { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: 1.5 } } },
+      reason: 'invalid_fallback_messages',
+    },
+    {
+      label: 'zero fallbackMessages',
+      patch: { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: 0 } } },
+      reason: 'invalid_fallback_messages',
+    },
+    {
+      label: 'fallbackMessages above the maximum',
+      patch: { behavior: 'subject', subjectPolicy: { context: { source: 'lark', fallbackMessages: MAX_SUBJECT_FALLBACK_MESSAGES + 1 } } },
+      reason: 'invalid_fallback_messages',
+    },
+  ])('rejects $label instead of coercing it', ({ patch, reason }) => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '',
+      ...patch,
+    });
+    expect(validateMessageListenerUpdate(update)).toEqual({ ok: false, reason });
   });
 });

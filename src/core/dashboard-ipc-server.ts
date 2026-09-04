@@ -103,7 +103,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatContext, getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 
@@ -158,8 +158,15 @@ import {
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
   renderMessageListenerInstruction,
+  renderMessageListenerPrompt,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
+import { loadSubjectListenerContext } from '../services/subject-listener-context.js';
+import {
+  compareSubjectListenerCreateTime,
+  readSubjectListenerCursor,
+  type SubjectListenerCursor,
+} from '../services/subject-listener-cursor-store.js';
 import {
   createMessageListenerRunPreview,
   createMessageListenerRunPreviewTurnId,
@@ -231,7 +238,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { DEFAULT_SUBJECT_FALLBACK_MESSAGES, getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -3789,7 +3796,18 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
     return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
   }
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
-  if (!result.ok) return jsonRes(res, ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500, { ok: false, error: result.reason });
+  if (!result.ok) {
+    const status = [
+      'invalid_listener',
+      'unknown_behavior',
+      'invalid_subject_policy',
+      'subject_source_must_be_lark',
+      'invalid_fallback_messages',
+      'prompt_required',
+      'sender_required',
+    ].includes(result.reason) ? 400 : 500;
+    return jsonRes(res, status, { ok: false, error: result.reason });
+  }
   jsonRes(res, 200, { ok: true, listener: result.listener });
 });
 
@@ -3836,21 +3854,29 @@ async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
 }
 
 
+type DashboardMessageListenerPreviewMatch = MessageListenerPreviewMatch & {
+  /** Exact Sprint 001 Subject renderer, generated from Lark-only context. */
+  renderedPrompt?: string;
+};
+
 async function collectMessageListenerPreviewMatches(
   larkAppId: string,
   chatId: string,
   listener: NonNullable<ReturnType<typeof sanitizeMessageListenerUpdate>>,
   limit: number,
-): Promise<MessageListenerPreviewMatch[]> {
+): Promise<DashboardMessageListenerPreviewMatch[]> {
   const bot = getBot(larkAppId);
   const previewListener: MessageListenerConfig = {
     enabled: true,
+    ...(listener.behavior ? { behavior: listener.behavior } : {}),
     ...(listener.name ? { name: listener.name } : {}),
     ...(listener.replyCardTitle ? { replyCardTitle: listener.replyCardTitle } : {}),
     ...(listener.workingDir ? { workingDir: listener.workingDir } : {}),
     prompt: listener.prompt,
+    ...(listener.subjectPolicy ? { subjectPolicy: listener.subjectPolicy } : {}),
     ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
     ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    ...(listener.contentPolicy ? { contentPolicy: listener.contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
   const previewBot = {
@@ -3900,11 +3926,55 @@ async function collectMessageListenerPreviewMatches(
     const merged = await resolveMergedCardContent(larkAppId, match.messageId).catch(() => null);
     if (merged?.text?.trim()) match.messageText = merged.text;
   }));
+
+  if (previewListener.behavior === 'subject') {
+    const rawMessageById = new Map(messages.map(message => [String(message?.message_id ?? ''), message]));
+    const chatContext = await getChatContext(larkAppId, chatId);
+    // Preview starts from the durable runtime cursor but advances only this
+    // local variable while rendering several chronological matches. No write
+    // API is called, so a test run can never move the live Subject position.
+    let previewCursor: SubjectListenerCursor | undefined = readSubjectListenerCursor(
+      config.session.dataDir,
+      larkAppId,
+      chatId,
+    );
+    for (const match of matches) {
+      const triggerMessage = rawMessageById.get(match.messageId);
+      const createTime = match.createTime;
+      if (!triggerMessage || !createTime || !/^\d+$/.test(createTime)) {
+        throw new Error(`Subject preview requires exact Lark trigger metadata for ${match.messageId}`);
+      }
+      const snapshot = await loadSubjectListenerContext({
+        larkAppId,
+        chatId,
+        cursor: previewCursor,
+        fallbackMessages: previewListener.subjectPolicy?.context.fallbackMessages
+          ?? DEFAULT_SUBJECT_FALLBACK_MESSAGES,
+        triggerMessage,
+        trigger: { messageId: match.messageId, createTime },
+      }, { listChatMessagesUntil });
+      (match as DashboardMessageListenerPreviewMatch).renderedPrompt = renderMessageListenerPrompt(match, {
+        chatId,
+        chatName: chatContext.name ?? undefined,
+        chatDescription: chatContext.description ?? undefined,
+        snapshot,
+      });
+      if (!previewCursor
+        || compareSubjectListenerCreateTime(snapshot.candidateCursor.createTime, previewCursor.createTime) > 0) {
+        previewCursor = snapshot.candidateCursor;
+      }
+    }
+  }
   return matches;
 }
 
-function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<string, unknown> {
+function publicMessageListenerMatch(
+  match: DashboardMessageListenerPreviewMatch,
+  options: { includeRenderedPrompt?: boolean } = {},
+): Record<string, unknown> {
   return {
+    behavior: match.behavior,
+    ...(match.subjectPolicy ? { subjectPolicy: match.subjectPolicy } : {}),
     messageId: match.messageId,
     createTime: match.createTime,
     messageText: match.messageText,
@@ -3913,6 +3983,7 @@ function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<
     senderOpenId: match.senderOpenId,
     senderName: match.senderName,
     senderType: match.senderType,
+    ...(options.includeRenderedPrompt && match.renderedPrompt ? { renderedPrompt: match.renderedPrompt } : {}),
   };
 }
 
@@ -3926,7 +3997,7 @@ ipcRoute('POST', '/api/message-listeners/:chatId/preview', async (req, res, p) =
     jsonRes(res, 200, {
       ok: true,
       requestedLimit: parsed.limit,
-      matches: matches.map(publicMessageListenerMatch),
+      matches: matches.map(match => publicMessageListenerMatch(match, { includeRenderedPrompt: true })),
     });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -3967,7 +4038,9 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
             payload: publicMessageListenerMatch(match),
             rawText: match.messageText,
           },
-          instruction: renderMessageListenerInstruction(match),
+          instruction: match.behavior === 'subject'
+            ? match.renderedPrompt
+            : renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
         }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
         const tracked = result.ok
@@ -4010,7 +4083,7 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
       ok: results.every(result => result.ok),
       runId: run.runId,
       requestedLimit: parsed.limit,
-      matches: matches.map(publicMessageListenerMatch),
+      matches: matches.map(match => publicMessageListenerMatch(match, { includeRenderedPrompt: true })),
       results,
     });
   } catch (err) {

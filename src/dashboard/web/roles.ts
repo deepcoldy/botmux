@@ -41,10 +41,18 @@ export interface RoleData {
 
 export interface MessageListenerData {
   enabled: boolean;
+  /** Omitted is the legacy prompt-listener behavior. */
+  behavior?: 'prompt' | 'subject';
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
   prompt: string;
+  subjectPolicy?: {
+    context: {
+      source: 'lark';
+      fallbackMessages: number;
+    };
+  };
   senderPolicy?: {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
@@ -72,6 +80,8 @@ export interface MessageListenerData {
 }
 
 export interface MessageListenerPreviewItem {
+  behavior?: 'prompt' | 'subject';
+  subjectPolicy?: MessageListenerData['subjectPolicy'];
   messageId: string;
   createTime?: string;
   messageText: string;
@@ -80,6 +90,8 @@ export interface MessageListenerPreviewItem {
   senderOpenId?: string;
   senderName?: string;
   senderType: 'user' | 'bot';
+  /** Present for Subject previews so the UI/API test path exposes the real renderer. */
+  renderedPrompt?: string;
 }
 
 export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
@@ -165,6 +177,8 @@ export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32768;
 export const MESSAGE_LISTENER_WARN_BYTES = Math.floor(MAX_MESSAGE_LISTENER_PROMPT_BYTES * 0.95);
 export const DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT = 5;
 export const MAX_MESSAGE_LISTENER_PREVIEW_LIMIT = 20;
+export const DEFAULT_SUBJECT_FALLBACK_MESSAGES = 20;
+export const MAX_SUBJECT_FALLBACK_MESSAGES = 200;
 
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
