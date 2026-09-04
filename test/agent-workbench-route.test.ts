@@ -80,6 +80,7 @@ describe('Agent Workbench route and surface integration', () => {
       activeToken: ACTIVE,
       roleHeader: 'owner',
       actorHeader: undefined,
+      scopesHeader: undefined,
       platformMachineId: 'machine-1',
       platformActorScope: machineId => `scope-${machineId}`,
       legacyAuthSessionId: token => `legacy-${token}`,

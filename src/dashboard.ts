@@ -479,6 +479,7 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
     activeToken: currentDashboardToken(),
     roleHeader: req.headers['x-botmux-role'],
     actorHeader: req.headers['x-botmux-actor'],
+    scopesHeader: req.headers['x-botmux-scopes'],
     platformMachineId: readPlatformBinding()?.machineId ?? null,
     platformActorScope: platformDashboardActorScope,
     legacyAuthSessionId: legacyDashboardAuthSessionId,
@@ -3610,7 +3611,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -3619,11 +3620,17 @@ const server = createServer(async (req, res) => {
       activeToken,
       publicReadOnly,
     });
-    // `authed` is deliberately the local management capability, not merely a
-    // valid Workbench/platform identity. Privileged mutations and management
-    // reads (settings, schedules, groups) therefore cannot be widened by H5
-    // authentication.
-    const authed = legacyAuthed;
+    // `authed` is the HOST MANAGEMENT capability: the local management cookie, or
+    // a platform co-manager the platform granted `dashboard:manage`. It is still
+    // NOT "any valid Workbench/platform identity" — H5 authentication cannot widen
+    // it, and neither can a co-manager without that scope.
+    //
+    // Deliberately NOT the same thing as `legacyAuthed` any more. The three
+    // capabilities that hand over the whole host — debug shell, write-link
+    // (a stable token) and spawn-command (credential-bearing) — keep querying
+    // `legacyAuthed` directly, so a co-manager can help maintain settings /
+    // schedules / groups without being able to run arbitrary commands.
+    const authed = canManageHost;
     // The session board is the one surface where `!authed` must NOT mean
     // "anonymous". `/api/sessions` and `/events` are exactly the two paths
     // workbenchH5Capability grants as `workbench.view`, and the same identity

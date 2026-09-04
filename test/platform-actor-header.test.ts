@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { resolveDashboardIdentity } from '../src/dashboard/request-identity.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+} from '../src/dashboard/request-identity.js';
 
 /**
  * 平台注入的 `X-Botmux-Actor`（操作者 union_id）。
@@ -19,6 +22,7 @@ describe('platform actor header', () => {
       activeToken: ACTIVE,
       roleHeader: role,
       actorHeader,
+      scopesHeader: undefined,
       platformMachineId: MACHINE,
       platformActorScope: machineId => `scope-${machineId}`,
       legacyAuthSessionId: token => `legacy-${token}`,
@@ -74,6 +78,7 @@ describe('platform actor header', () => {
       activeToken: ACTIVE,
       roleHeader: 'owner',
       actorHeader: 'ou_attacker',
+      scopesHeader: undefined,
       platformMachineId: null,
       platformActorScope: machineId => `scope-${machineId}`,
       legacyAuthSessionId: token => `legacy-${token}`,
@@ -90,6 +95,7 @@ describe('platform actor header', () => {
       activeToken: ACTIVE,
       roleHeader: 'owner',
       actorHeader: 'ou_attacker',
+      scopesHeader: undefined,
       platformMachineId: MACHINE,
       platformActorScope: machineId => `scope-${machineId}`,
       legacyAuthSessionId: token => `legacy-${token}`,
@@ -102,5 +108,140 @@ describe('platform actor header', () => {
     expect(resolve('ou_alice', 'owner')?.authSessionId).not.toBe(
       resolve('ou_alice', 'guest')?.authSessionId,
     );
+  });
+});
+
+/**
+ * 二期：平台授予 `dashboard:manage` 的协管者可以改本机配置，
+ * 但**绝不能**碰 debug shell / write-link / spawn-command。
+ */
+describe('platform dashboard:manage scope', () => {
+  const ACTIVE = 'active-management-token';
+  const MACHINE = 'machine-1';
+
+  const resolve = (scopesHeader: string | string[] | undefined, role = 'owner') =>
+    resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: role,
+      actorHeader: 'ou_alice',
+      scopesHeader,
+      platformMachineId: MACHINE,
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: null,
+    });
+
+  it('带 dashboard:manage 时拿到管理面能力', () => {
+    expect(resolve('machines:read,sessions:open,terminal:control,dashboard:manage')?.canManageHost).toBe(true);
+  });
+
+  it('默认档（无 dashboard:manage）拿不到管理面', () => {
+    expect(resolve('machines:read,sessions:open,terminal:control')?.canManageHost).toBe(false);
+    expect(resolve(undefined)?.canManageHost).toBe(false);
+    expect(resolve('')?.canManageHost).toBe(false);
+  });
+
+  it('guest 角色即使带 dashboard:manage 也不放行（fail-closed 的乘法）', () => {
+    // 平台侧一个组合失误不该把只读访客提成配置管理员。
+    expect(resolve('dashboard:manage', 'guest')?.canManageHost).toBe(false);
+  });
+
+  it('数组头视为缺失', () => {
+    expect(resolve(['dashboard:manage'])?.canManageHost).toBe(false);
+  });
+
+  it('容忍空格与多余分隔符', () => {
+    expect(resolve(' dashboard:manage , terminal:control ')?.canManageHost).toBe(true);
+  });
+
+  it('未知 scope 不影响判定，也不越权', () => {
+    expect(resolve('some:future-scope')?.canManageHost).toBe(false);
+    expect(resolve('some:future-scope,dashboard:manage')?.canManageHost).toBe(true);
+  });
+
+  it('本机管理 cookie 恒有管理面能力', () => {
+    const legacy = resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: undefined,
+      actorHeader: undefined,
+      scopesHeader: undefined,
+      platformMachineId: null,
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: null,
+    });
+    expect(legacy?.kind).toBe('legacy-dashboard');
+    expect(legacy?.canManageHost).toBe(true);
+  });
+});
+
+describe('gate: dashboard:manage 开管理面但不开整机', () => {
+  const ACTIVE = 'active-management-token';
+
+  const managingCoManager = resolveDashboardIdentity({
+    legacyCookie: ACTIVE,
+    activeToken: ACTIVE,
+    roleHeader: 'owner',
+    actorHeader: 'ou_alice',
+    scopesHeader: 'terminal:control,dashboard:manage',
+    platformMachineId: 'machine-1',
+    platformActorScope: machineId => `scope-${machineId}`,
+    legacyAuthSessionId: token => `legacy-${token}`,
+    h5: null,
+  });
+
+  const gateFor = (pathname: string, method = 'GET') =>
+    resolveDashboardRequestGate({
+      method,
+      pathname,
+      hasTokenParam: false,
+      identity: managingCoManager,
+      tokenFromRequest: undefined,
+      activeToken: ACTIVE,
+      publicReadOnly: false,
+    });
+
+  it('管理面路由放行（原本会被 workbench 窄门禁 401 挡死）', () => {
+    for (const p of ['/api/settings', '/api/schedules', '/api/groups']) {
+      const g = gateFor(p);
+      expect(g.canManageHost, p).toBe(true);
+      expect(g.decision.kind, p).toBe('allow');
+    }
+    expect(gateFor('/api/settings', 'PUT').decision.kind).toBe('allow');
+  });
+
+  it('但仍不是本机 owner —— 三个「拿到就等于拿到整机」的面照旧关着', () => {
+    const g = gateFor('/api/settings');
+    // dashboard.ts 里 debug-terminal / write-link / spawn-command 三处直接查
+    // legacyAuthed，不看 decision，所以这个 false 就是那三处的拒绝依据。
+    expect(g.legacyAuthed).toBe(false);
+  });
+
+  it('没有 dashboard:manage 的协管者仍走 workbench 窄门禁', () => {
+    const plain = resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: 'owner',
+      actorHeader: 'ou_bob',
+      scopesHeader: 'terminal:control',
+      platformMachineId: 'machine-1',
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: null,
+    });
+    const g = resolveDashboardRequestGate({
+      method: 'GET',
+      pathname: '/api/settings',
+      hasTokenParam: false,
+      identity: plain,
+      tokenFromRequest: undefined,
+      activeToken: ACTIVE,
+      publicReadOnly: false,
+    });
+    expect(g.canManageHost).toBe(false);
+    expect(g.workbenchOnlyIdentity).toBe(true);
+    expect(g.decision.kind).toBe('deny401');
   });
 });

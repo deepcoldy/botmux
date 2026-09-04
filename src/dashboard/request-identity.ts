@@ -28,6 +28,18 @@ import { decideDashboardAuth, decideWorkbenchH5Auth, type AuthDecision } from '.
 export interface DashboardRequestIdentity extends TerminalDashboardActor {
   kind: 'legacy-dashboard' | 'platform-dashboard' | DashboardAuthIdentity['kind'];
   previewCapability: 'operate' | 'readonly';
+  /**
+   * 本机管理能力（settings / schedules / groups 的读写与不脱敏）。
+   *
+   * 与 `legacy-dashboard` 身份的区别刻意保留：本机管理 cookie 之外，**平台授予
+   * `dashboard:manage` 的协管者**也拿到这一项，但**永远拿不到** debug shell /
+   * write-link / spawn-command —— 那三个仍只认 legacy 身份（见 dashboard.ts 里
+   * 直接引用 `legacyAuthed` 的三处）。
+   *
+   * 换句话说：这个布尔是「管理面能力」，`legacyAuthed` 是「本机 owner 身份」。
+   * 二者原本是同一个变量，机器协管者要求把它们分开。
+   */
+  canManageHost: boolean;
 }
 
 export interface DashboardIdentityInput {
@@ -53,6 +65,20 @@ export interface DashboardIdentityInput {
    * 由同一个反代注入、且平台在注入前会剥掉客户端伪造的同名头。
    */
   actorHeader: string | string[] | undefined;
+  /**
+   * 中心化平台注入的 `X-Botmux-Scopes`：这个访问者被授予的能力清单，逗号分隔。
+   *
+   * 为什么用独立的头、不新增角色值：角色（owner/guest）表达的是「能不能操作终端」，
+   * 而「能不能改本机配置」是另一个维度 —— 一个人可以能接管终端但不能改 settings。
+   * 塞进角色就得造 `manager` / `owner-no-config` 之类的组合值，数量随维度指数增长；
+   * 平台侧那张表（machines:read / sessions:open / terminal:control / dashboard:manage）
+   * 本来就是勾选式的，这里如实照搬即可。`teammate` 那档从未被平台发出、成了死代码，
+   * 正是「把能力硬编码进角色枚举」的前车之鉴。
+   *
+   * 缺失 = 没有任何额外能力（老平台、免登录只读）→ 与本改动前行为完全一致。
+   * 信任前提同 roleHeader / actorHeader：只有经平台反代的请求才作数。
+   */
+  scopesHeader: string | string[] | undefined;
   /** 已绑定平台的 machineId；未绑定为 null。 */
   platformMachineId: string | null;
   /** machineId → 平台 actor 作用域（HMAC，调用方与 liveness 检查共用同一实现）。 */
@@ -89,6 +115,15 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       // 避免异常值进入审计行与租约 key（它们会被写日志、做字符串比较）。
       const actorScope = actor && /^[A-Za-z0-9_-]{1,64}$/.test(actor) ? actor : undefined;
       const subject = actorScope ? `${machineScope}:${actorScope}` : machineScope;
+      // 平台授予的能力清单。只认 dashboard:manage 这一项（其余 scope 描述的是平台侧
+      // 能力，机器端无对应闸）。数组头视为缺失，与 role / actor 同一 fail-safe。
+      const rawScopes = input.scopesHeader;
+      const scopes = typeof rawScopes === 'string'
+        ? rawScopes.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+      // 只有能操作终端的身份才谈得上管理本机：guest 拿到 dashboard:manage 也不放行，
+      // 避免平台侧一个组合失误就把只读访客提成配置管理员（fail-closed 的乘法而非加法）。
+      const canManageHost = platformRole === 'owner' && scopes.includes('dashboard:manage');
       return {
         kind: 'platform-dashboard',
         // 带上人 → 同机多个协管者在审计里可区分、租约互斥不再误判为同一登录。
@@ -97,6 +132,7 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
         expiresAt: Number.MAX_SAFE_INTEGER,
         terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
+        canManageHost,
       };
     }
     return {
@@ -107,18 +143,30 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       expiresAt: Number.MAX_SAFE_INTEGER,
       terminalCapability: 'controlled',
       previewCapability: 'operate',
+      // 本机管理 cookie 恒有全部管理能力（它本身就是 owner 凭据）。
+      canManageHost: true,
     };
   }
   return input.h5 ? {
     ...input.h5,
     terminalCapability: 'controlled',
     previewCapability: 'operate',
+    // H5 会话是 workbench 身份，从不继承本机管理能力（P1-7 的既有口径）。
+    canManageHost: false,
   } : null;
 }
 
 export interface DashboardRequestGate {
-  /** 本机管理能力（settings / schedules / groups / debug shell 的唯一凭据）。 */
+  /** 本机 owner 身份（debug shell / write-link / spawn-command 的唯一凭据）。 */
   legacyAuthed: boolean;
+  /**
+   * 管理面能力（settings / schedules / groups 的读写与不脱敏）。
+   *
+   * = 本机 owner **或** 平台授予 `dashboard:manage` 的协管者。与 `legacyAuthed`
+   * 分开是机器协管者的核心诉求：协管者要能帮 owner 改配置，但**不能**拿到那三个
+   * 「拿到就等于拿到整台机器」的面。调用方按语义二选一，别再图省事共用一个布尔。
+   */
+  canManageHost: boolean;
   /** 只有工作台能力：H5 会话或平台角色，且本请求没有管理凭据。 */
   workbenchOnlyIdentity: boolean;
   /** 交给 `decideDashboardAuth` 的凭据；平台注入 cookie 场景恒为 undefined。 */
@@ -144,7 +192,13 @@ export function resolveDashboardRequestGate(input: {
   const presentedToken = platformIdentity ? undefined : input.tokenFromRequest;
   const managementCredential = !!presentedToken && !!input.activeToken
     && presentedToken === input.activeToken;
-  const workbenchOnlyIdentity = !legacyAuthed && !managementCredential
+  // 平台授予 dashboard:manage 的协管者：管理面路由不在 workbenchH5Capability 白名单里，
+  // 所以必须走宽门禁 decideDashboardAuth，否则 /api/settings 会被 401 挡死。
+  // 这样放宽是安全的 —— debug shell / write-link / spawn-command 三处**直接查
+  // legacyAuthed**（不经本函数的 decision），协管者仍拿不到，见 dashboard.ts 对应三处。
+  const platformManages = platformIdentity && input.identity?.canManageHost === true;
+  const canManageHost = legacyAuthed || managementCredential || platformManages;
+  const workbenchOnlyIdentity = !legacyAuthed && !managementCredential && !platformManages
     && (platformIdentity || input.identity?.kind === 'feishu-h5');
   const decision = workbenchOnlyIdentity
     ? decideWorkbenchH5Auth({ method: input.method, pathname: input.pathname })
@@ -152,11 +206,14 @@ export function resolveDashboardRequestGate(input: {
       method: input.method,
       pathname: input.pathname,
       hasTokenParam: input.hasTokenParam,
-      presentedToken,
+      // 平台协管者没有、也不该有本机 token；把活跃 token 同时作为「出示的凭据」
+      // 喂进去，等价于告诉门禁「这个请求持有管理凭据」——凭据的真正校验已经在
+      // 上面的平台反代信任前提里做完（活跃 cookie 证明请求经过平台）。
+      presentedToken: platformManages ? (input.activeToken ?? undefined) : presentedToken,
       activeToken: input.activeToken ?? '',
       publicReadOnly: input.publicReadOnly,
     });
-  return { legacyAuthed, workbenchOnlyIdentity, presentedToken, decision };
+  return { legacyAuthed, canManageHost, workbenchOnlyIdentity, presentedToken, decision };
 }
 
 /** 便于把 `IncomingMessage` 直接喂给上面的纯函数（测试与真实服务共用一条路径）。 */
