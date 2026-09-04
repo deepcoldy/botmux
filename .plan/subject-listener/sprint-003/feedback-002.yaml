@@ -1,0 +1,72 @@
+feedback_NO: '002'
+pass: true
+score: 100
+
+baseline: 'a67f2b0bce0432a5f65ce2c24ad7f3d22ec1bc3b'
+fixed_from:
+  - feedback-001.yaml
+
+bugs: []
+
+scenarios_result:
+  - id: S-1
+    name: '未被 @ 的群消息携带完整飞书现场进入现有 CLI'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 8 skipped；preparer 读取 Bot+群游标后的飞书历史，排除旧消息与 trigger 之后消息，以精确事件补尾并返回 trigger candidate cursor。'
+  - id: S-2
+    name: '内置 Subject Skill 与监听首轮使用同一份可信协议'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 32 skipped；内置 Skill 与首轮 prompt 均包含完整 BOTMUX_SUBJECT_PROTOCOL，群资料、发送者与历史仅位于 trusted=false 包络。'
+  - id: S-3
+    name: '无效的 Subject trigger 在创建会话前被拒绝'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 8 passed, 1 skipped；非群、非 Subject、入口/match/event message id 不一致、缺失或非法 createTime、event createTime 不一致均在任何依赖读取前拒绝。'
+
+exit_criteria_result:
+  - id: EC-1
+    pass: true
+    verification_output: 'PASS: e2e 1 passed；未 @ 消息经 prepareSubjectListenerTurn 获取飞书增量上下文，继续复用既有静默终态、持久游标提交与下一轮增量读取。'
+  - id: EC-2
+    pass: true
+    verification_output: 'PASS: 2 files, 42 tests；所有 must-pass Scenario 通过，plan 与 rubrics 的 S-1/S-2/S-3 id 保持 1:1。'
+  - id: EC-3
+    pass: true
+    verification_output: 'PASS: 3 files, 345 tests；Subject context/runtime/dispatcher 回归通过。'
+  - id: EC-4
+    pass: true
+    verification_output: 'PASS: bun run build；TypeScript、scripts typecheck、Dashboard bundle、dist/embed audit 均通过。'
+  - id: EC-5
+    pass: true
+    verification_output: 'PASS: 业务改动限于 R-4 指定 5 个文件；测试限于指定 3 个文件；未修改 dispatcher/worker/core/config/UI，Sprint 002 checkpoint 保持未跟踪且未改动。'
+
+rubrics_result:
+  - id: R-1
+    score: 15
+    max_score: 15
+    verification_output: 'PASS: 独立协议模块无 Skill catalog/daemon/Lark/worker 依赖；definitions 与 renderer 单向复用同一常量，协议测试通过。'
+  - id: R-2
+    score: 15
+    max_score: 15
+    verification_output: 'PASS: 精确 trigger、sender、chat、cursor、snapshot 与 prompt 均集中在最小依赖注入边界；返回明确 PreparedSubjectListenerTurn，且不执行 cursor/session/worker 写操作。'
+  - id: R-3
+    score: 10
+    max_score: 10
+    verification_output: 'PASS: daemon 仅检查 completion gate、调用 preparer 并接回结果；不再直接调用 context loader，未新增 runtime/session/framework；build 与 diff check 通过。'
+
+anti_false_completion:
+  pass: true
+  detail: '新增 unit 通过注入的 sender/chat/cursor/Lark scanner 验证真实数据流和前置拒绝；e2e 将 matcher、turn preparer、既有 worker 静默终态、持久化 cursor 与下一轮增量读取串联。'
+
+verification_commands:
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "完整飞书现场"'
+  - 'bun x vitest run --project unit test/message-listener.test.ts -t "同一份可信协议"'
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "无效的 Subject trigger"'
+  - 'bun x vitest run --project e2e test/subject-listener-runtime.e2e.ts'
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts test/message-listener.test.ts'
+  - 'bun x vitest run --project unit test/subject-listener-context.test.ts test/subject-listener-runtime.test.ts test/event-dispatcher.test.ts'
+  - 'bun run build'
+  - 'git diff --name-only HEAD -- src test .plan/subject-listener/sprint-003'
+  - 'git diff --check'

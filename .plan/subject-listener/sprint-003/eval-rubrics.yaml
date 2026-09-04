@@ -1,0 +1,65 @@
+sprint: '003'
+goal: '拆分 Subject 可信协议与 turn 准备边界'
+
+files_to_touch:
+  - src/services/subject-listener-protocol.ts
+  - src/services/subject-listener-turn.ts
+  - src/services/message-listener.ts
+  - src/skills/definitions.ts
+  - src/daemon.ts
+
+test_files:
+  - test/subject-listener-turn.test.ts
+  - test/message-listener.test.ts
+  - test/subject-listener-runtime.e2e.ts
+
+scenarios:
+  - id: S-1
+    name: '未被 @ 的群消息携带完整飞书现场进入现有 CLI'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "完整飞书现场"'
+    points: 25
+  - id: S-2
+    name: '内置 Subject Skill 与监听首轮使用同一份可信协议'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/message-listener.test.ts -t "同一份可信协议"'
+    points: 20
+  - id: S-3
+    name: '无效的 Subject trigger 在创建会话前被拒绝'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "无效的 Subject trigger"'
+    points: 15
+
+exit_criteria:
+  - id: EC-1
+    description: '主流链路端到端走通：未 @ 消息经新的 turn 准备边界获得飞书增量上下文，继续由现有 Subject runtime 静默或回复并按原语义处理游标'
+    verification: 'bun x vitest run --project e2e test/subject-listener-runtime.e2e.ts'
+  - id: EC-2
+    description: '所有 must_pass Scenario 通过，且 plan/yaml Scenario id 完全 1:1'
+    verification: 'bun x vitest run --project unit test/subject-listener-turn.test.ts test/message-listener.test.ts'
+  - id: EC-3
+    description: '现有 Subject context/runtime/dispatcher 回归通过，证明职责拆分未改变 FIFO、终态与普通监听行为'
+    verification: 'bun x vitest run --project unit test/subject-listener-context.test.ts test/subject-listener-runtime.test.ts test/event-dispatcher.test.ts'
+  - id: EC-4
+    description: '仓库 TypeScript、Dashboard bundle 与构建审计通过'
+    verification: 'bun run build'
+  - id: EC-5
+    description: '变更严格限于 R-4，未触碰公共配置、dispatcher/worker/core，也未夹带 R-1/R-2/R-3/R-5'
+    verification: 'git diff --name-only HEAD -- src test .plan/subject-listener/sprint-003'
+
+rubrics:
+  - id: R-1
+    description: '协议模块为无反向依赖的稳定叶子：Skill definitions 与消息渲染器单向复用同一常量，协议正文无语义漂移'
+    points: 15
+    verification: 'bun x vitest run --project unit test/message-listener.test.ts -t "同一份可信协议"'
+  - id: R-2
+    description: 'prepareSubjectListenerTurn 通过最小依赖注入集中 trigger、sender、chat、cursor、snapshot 与 prompt，并返回明确 PreparedSubjectListenerTurn'
+    points: 15
+    verification: 'bun x vitest run --project unit test/subject-listener-turn.test.ts'
+  - id: R-3
+    description: 'daemon 仅编排 turn 准备与既有 session/completion 注册，不再直接组装 Subject Lark context，且未新增第二 runtime/session/framework'
+    points: 10
+    verification: 'bun run build && git diff --check'
+
+total_points: 100
+pass_threshold: 90

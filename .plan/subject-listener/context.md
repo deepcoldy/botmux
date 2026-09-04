@@ -37,6 +37,17 @@
 7. 无需介入时不发消息、不发状态卡、不加处理 reaction；需要介入时允许 `botmux send`、handoff、workflow、schedule 等现有能力。
 8. Subject 的 CLI 执行可以是一次性 session；不得以 CLI transcript 补齐飞书上下文。
 
+## R-4 架构决策
+
+- Subject 继续是“主体层 Skill”：协议规定它先理解群、发送者和飞书历史，再决定静默、回复、执行或路由；现有 CLI 仍是思考与本地操作工具。
+- 新增稳定的 `src/services/subject-listener-protocol.ts`，只拥有可信 Subject 协议与必要的最小协议类型，不依赖 Skill catalog、daemon、Lark client 或 worker。
+- `src/skills/definitions.ts` 与 `src/services/message-listener.ts` 都单向依赖协议模块；service 不再反向导入整份 Skill definitions。
+- 新增 `src/services/subject-listener-turn.ts`，导出 `prepareSubjectListenerTurn(input, dependencies)` 与 `PreparedSubjectListenerTurn`。该边界集中校验精确群消息 trigger，解析发送者，读取群资料与持久化游标，加载截止 trigger 的飞书快照，并生成首轮 prompt。
+- 网络与持久化入口以最小依赖注入：发送者解析、群资料读取、游标读取与飞书消息扫描均由 daemon 传入现有实现；快照与 prompt 仍复用既有 Subject context/renderer。
+- `PreparedSubjectListenerTurn` 至少返回 `prompt`、`chatContext`、`resolvedSender` 与 `candidateCursor`，供 daemon 继续写入现有 `DaemonSession` 并注册现有 completion。
+- dispatcher 仍只负责匹配/FIFO/Subject 路由；daemon 仍负责 admission、工作目录与 session 创建、调用 turn 准备和注册 completion；worker-pool 仍负责回复/静默终态与游标提交。
+- 这是职责拆分，不引入第二套 runtime、session、framework 或公共配置，也不改变 @、legacy listener、Pty/Tmux、CLI/handoff/workflow/schedule 行为。
+
 ## 不做范围
 
 - 不改变普通 @、私聊、已有 topic 回复和 legacy prompt listener 的语义。
@@ -51,3 +62,5 @@
 | 2026-09-04 | 根据连续讨论固定 Subject、@、飞书上下文和游标契约 | 分为运行时与配置界面两个 sprint |
 | 2026-09-04 | Sprint 001 复评固定同 createTime 游标规则：无顺序证据时保留现有游标 | 只收紧游标单调性，不改变上下文或路由 scope |
 | 2026-09-04 | Sprint 002 验收确认 Subject/legacy 配置 round-trip、非法写入阻断与试运行只读游标 | 完成 Dashboard/API 入口，不改变 Sprint 001 运行时契约 |
+| 2026-09-04 | 用户确认 R-4：独立可信协议所有权并提取 Subject turn 准备边界 | 新增 Sprint 003，仅做职责拆分，不处理其它 review 项 |
+| 2026-09-04 | Sprint 003 验收通过：协议与现场准备职责完成拆分 | 保持现有 CLI/session/worker 执行链与公共配置不变 |

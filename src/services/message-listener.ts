@@ -7,7 +7,7 @@ import {
 } from '../bot-registry.js';
 import { extractCardContent, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
-import { BOTMUX_SUBJECT_PROTOCOL } from '../skills/definitions.js';
+import { BOTMUX_SUBJECT_PROTOCOL } from './subject-listener-protocol.js';
 import {
   renderSubjectListenerHistory,
   type SubjectListenerContextSnapshot,

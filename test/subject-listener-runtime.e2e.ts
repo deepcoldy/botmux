@@ -86,13 +86,12 @@ import type { DaemonSession, SubjectListenerTurnOutcome } from '../src/core/type
 import type { WorkerToDaemon } from '../src/types.js';
 import {
   evaluateMessageListener,
-  renderMessageListenerPrompt,
 } from '../src/services/message-listener.js';
 import {
-  loadSubjectListenerContext,
   type SubjectListenerMessageScanOptions,
 } from '../src/services/subject-listener-context.js';
 import { readSubjectListenerCursor } from '../src/services/subject-listener-cursor-store.js';
+import { prepareSubjectListenerTurn } from '../src/services/subject-listener-turn.js';
 
 function message(messageId: string, createTime: number, text: string) {
   return {
@@ -199,38 +198,49 @@ describe('Subject listener main path', () => {
     });
     expect(firstMatch?.behavior).toBe('subject');
 
-    const firstSnapshot = await loadSubjectListenerContext({
+    const firstPrepared = await prepareSubjectListenerTurn({
       larkAppId: 'app_subject',
       chatId: 'oc_subject',
-      fallbackMessages: firstMatch!.subjectPolicy!.context.fallbackMessages,
+      chatType: 'group',
+      messageId: 'om_first',
       triggerMessage: firstEvent,
-      trigger: {
-        messageId: firstMatch!.trigger.messageId,
-        createTime: firstMatch!.trigger.createTime!,
-      },
+      messageListener: firstMatch!,
+      senderOpenId: 'ou_alice',
+      senderType: 'user',
+      dataDir: TEST_DATA_DIR,
     }, {
+      resolveSender: async () => ({
+        openId: 'ou_alice', type: 'user', name: '值班成员',
+      }),
+      getChatContext: async () => ({
+        chatId: 'oc_subject',
+        name: '事故协作群',
+        description: '先了解上下文再决定是否介入',
+        mode: 'group',
+        fetchStatus: 'ok',
+      }),
+      readSubjectListenerCursor,
       listChatMessagesUntil: scan([
         message('om_late', 300, '触发后的消息不得读入'),
         message('om_first', 200, 'REST 副本'),
         message('om_seed', 100, '群里的前置事实'),
       ]),
     });
-    const firstPrompt = renderMessageListenerPrompt(firstMatch!, {
-      chatId: 'oc_subject',
-      chatName: '事故协作群',
-      chatDescription: '先了解上下文再决定是否介入',
-      snapshot: firstSnapshot,
-    });
+    const firstPrompt = firstPrepared.prompt;
     expect(firstPrompt).toContain('<subject_protocol trusted="true">');
     expect(firstPrompt).toContain('<subject_lark_context trusted="false">');
+    expect(firstPrompt).toContain('sender_name="值班成员"');
     expect(firstPrompt).toContain('群里的前置事实');
     expect(firstPrompt).not.toContain('触发后的消息不得读入');
+    expect(firstPrepared.candidateCursor).toEqual({
+      messageId: 'om_first', createTime: '200',
+    });
 
     const ds = makeDs();
     const outcomes: SubjectListenerTurnOutcome[] = [];
     registerSubjectListenerTurn(ds, 'om_first', {
       chatId: 'oc_subject',
-      candidateCursor: firstSnapshot.candidateCursor,
+      candidateCursor: firstPrepared.candidateCursor,
       completion: {
         claimed: false,
         settle: outcome => outcomes.push(outcome),
@@ -261,17 +271,28 @@ describe('Subject listener main path', () => {
       senderTypeRaw: 'user',
       explicitlyMentionedThisBot: false,
     });
-    const secondSnapshot = await loadSubjectListenerContext({
+    const secondPrepared = await prepareSubjectListenerTurn({
       larkAppId: 'app_subject',
       chatId: 'oc_subject',
-      cursor: committed,
-      fallbackMessages: 20,
+      chatType: 'group',
+      messageId: 'om_second',
       triggerMessage: secondEvent,
-      trigger: {
-        messageId: secondMatch!.trigger.messageId,
-        createTime: secondMatch!.trigger.createTime!,
-      },
+      messageListener: secondMatch!,
+      senderOpenId: 'ou_bob',
+      senderType: 'user',
+      dataDir: TEST_DATA_DIR,
     }, {
+      resolveSender: async () => ({
+        openId: 'ou_bob', type: 'user', name: '另一位成员',
+      }),
+      getChatContext: async () => ({
+        chatId: 'oc_subject',
+        name: '事故协作群',
+        description: '先了解上下文再决定是否介入',
+        mode: 'group',
+        fetchStatus: 'ok',
+      }),
+      readSubjectListenerCursor,
       listChatMessagesUntil: scan([
         message('om_second', 400, 'REST 副本'),
         message('om_between', 350, '游标后的新增事实'),
@@ -280,10 +301,11 @@ describe('Subject listener main path', () => {
       ]),
     });
 
-    expect(secondSnapshot.continuity).toBe('continuous');
-    expect(secondSnapshot.messages.map(item => item.message_id)).toEqual([
-      'om_between', 'om_second',
-    ]);
-    expect(secondSnapshot.messages.at(-1)).toBe(secondEvent);
+    expect(secondPrepared.prompt).toContain('continuity="continuous"');
+    expect(secondPrepared.prompt).toContain('游标后的新增事实');
+    expect(secondPrepared.prompt).not.toContain('已消费的旧事实');
+    expect(secondPrepared.candidateCursor).toEqual({
+      messageId: 'om_second', createTime: '400',
+    });
   });
 });

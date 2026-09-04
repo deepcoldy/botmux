@@ -81,7 +81,6 @@ import {
   type VcMeetingAgentConfig,
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
-  DEFAULT_SUBJECT_FALLBACK_MESSAGES,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
@@ -313,8 +312,8 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
-import { loadSubjectListenerContext } from './services/subject-listener-context.js';
 import { readSubjectListenerCursor } from './services/subject-listener-cursor-store.js';
+import { prepareSubjectListenerTurn } from './services/subject-listener-turn.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -17951,43 +17950,29 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
   let listenerPrompt: string | undefined;
   if (isSubjectListener) {
-    const trigger = messageListener.trigger;
-    if (chatType !== 'group'
-      || !ctx.subjectListenerCompletion
-      || trigger.messageId !== messageId
-      || !trigger.createTime
-      || !/^\d+$/.test(trigger.createTime)) {
-      throw new Error('Subject listener requires an exact numeric Lark trigger and completion gate');
+    if (!ctx.subjectListenerCompletion) {
+      throw new Error('Subject listener requires a completion gate');
     }
-    // The event is the authority for Bot/chat/sender/upper-bound. Conversational
-    // context comes only from Lark, never from this one-off CLI's transcript.
-    subjectResolvedSender = await resolveSender(
-      larkAppId,
-      senderOpenId,
-      parsed.senderType,
-      { messageId },
-    );
-    if (!messageListener.senderName && subjectResolvedSender?.name) {
-      messageListener.senderName = subjectResolvedSender.name;
-    }
-    subjectChatContext = await getChatContext(larkAppId, chatId);
-    const priorCursor = readSubjectListenerCursor(config.session.dataDir, larkAppId, chatId);
-    const snapshot = await loadSubjectListenerContext({
+    const prepared = await prepareSubjectListenerTurn({
       larkAppId,
       chatId,
-      cursor: priorCursor,
-      fallbackMessages: messageListener.subjectPolicy?.context.fallbackMessages
-        ?? DEFAULT_SUBJECT_FALLBACK_MESSAGES,
+      chatType,
+      messageId,
       triggerMessage: data.message,
-      trigger: { messageId: trigger.messageId, createTime: trigger.createTime },
-    }, { listChatMessagesUntil });
-    subjectCandidateCursor = snapshot.candidateCursor;
-    listenerPrompt = renderMessageListenerPrompt(messageListener, {
-      chatId,
-      chatName: subjectChatContext.name ?? undefined,
-      chatDescription: subjectChatContext.description ?? undefined,
-      snapshot,
+      messageListener,
+      senderOpenId,
+      senderType: parsed.senderType,
+      dataDir: config.session.dataDir,
+    }, {
+      resolveSender,
+      getChatContext,
+      readSubjectListenerCursor,
+      listChatMessagesUntil,
     });
+    subjectChatContext = prepared.chatContext;
+    subjectCandidateCursor = prepared.candidateCursor;
+    subjectResolvedSender = prepared.resolvedSender;
+    listenerPrompt = prepared.prompt;
   } else if (messageListener) {
     listenerPrompt = renderMessageListenerPrompt(messageListener);
   }

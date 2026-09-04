@@ -1,0 +1,77 @@
+feedback_NO: '001'
+pass: false
+score: 80
+
+baseline: 'a67f2b0bce0432a5f65ce2c24ad7f3d22ec1bc3b'
+
+bugs:
+  - id: 'S3-EXACT-EVENT-TRIGGER'
+    severity: 'must-pass'
+    file: 'src/services/subject-listener-turn.ts'
+    line: 66
+    description: 'prepareSubjectListenerTurn 未强制原始事件同时提供与 match 完全一致的 message_id 和 create_time。原始事件缺 message_id、缺 create_time、或 create_time 与 match 不一致时，函数仍读取 sender/chat/cursor/history 并返回 PreparedSubjectListenerTurn。'
+    expected: '在任何依赖读取前解析原始事件 message_id/create_time；两者都必须存在、create_time 必须是整数串，且分别与 input.messageId、messageListener.trigger 完全一致，否则抛出可诊断错误。'
+    evidence: 'S-3 定向测试 8 个无效变体中 3 个失败；失败用例均收到已解析的 prompt/chatContext/resolvedSender/candidateCursor，而不是 rejection。'
+
+scenarios_result:
+  - id: S-1
+    name: '未被 @ 的群消息携带完整飞书现场进入现有 CLI'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 8 skipped；preparer 读取 Bot+群游标后的飞书历史，排除旧消息与 trigger 之后消息，以精确事件补尾并返回 trigger candidate cursor。'
+  - id: S-2
+    name: '内置 Subject Skill 与监听首轮使用同一份可信协议'
+    must_pass: true
+    pass: true
+    verification_output: 'PASS: 1 passed, 32 skipped；内置 Skill 与首轮 prompt 均包含完整 BOTMUX_SUBJECT_PROTOCOL，群资料、发送者与历史仅位于 trusted=false 包络。'
+  - id: S-3
+    name: '无效的 Subject trigger 在创建会话前被拒绝'
+    must_pass: true
+    pass: false
+    verification_output: 'FAIL: 3 failed, 5 passed, 1 skipped；原始事件缺 message_id、缺 create_time、或 create_time 与 match 不一致时 promise resolved，且现场读取依赖已执行。'
+
+exit_criteria_result:
+  - id: EC-1
+    pass: true
+    verification_output: 'PASS: e2e 1 passed；未 @ 消息经 prepareSubjectListenerTurn 获取飞书增量上下文，继续复用既有静默终态、持久游标提交与下一轮增量读取。'
+  - id: EC-2
+    pass: false
+    verification_output: 'FAIL: 2 files 中 1 failed、1 passed；共 3 failed、39 passed。plan 与 rubrics 的 S-1/S-2/S-3 id 仍保持 1:1。'
+  - id: EC-3
+    pass: true
+    verification_output: 'PASS: 3 files, 345 tests；Subject context/runtime/dispatcher 回归通过。'
+  - id: EC-4
+    pass: true
+    verification_output: 'PASS: bun run build；TypeScript、scripts typecheck、Dashboard bundle、dist/embed audit 均通过。'
+  - id: EC-5
+    pass: true
+    verification_output: 'PASS: 业务改动限于 R-4 指定 5 个文件；测试限于指定 3 个文件；未修改 dispatcher/worker/core/config/UI，Sprint 002 checkpoint 保持未跟踪且未改动。'
+
+rubrics_result:
+  - id: R-1
+    score: 15
+    max_score: 15
+    verification_output: 'PASS: 独立协议模块无 Skill catalog/daemon/Lark/worker 依赖；definitions 与 renderer 单向复用同一常量，协议测试通过。'
+  - id: R-2
+    score: 10
+    max_score: 15
+    verification_output: 'PARTIAL: sender/chat/cursor/snapshot/prompt 与明确返回类型已集中，但精确事件 trigger 校验缺失 3 个边界，未满足完整的创建前拒绝契约。'
+  - id: R-3
+    score: 10
+    max_score: 10
+    verification_output: 'PASS: daemon 仅检查 completion gate、调用 preparer 并接回结果；不再直接调用 context loader，未新增 runtime/session/framework；build 与 diff check 通过。'
+
+anti_false_completion:
+  pass: true
+  detail: '新增 unit 通过注入的 sender/chat/cursor/Lark scanner 验证真实数据流和前置拒绝；e2e 将 matcher、turn preparer、既有 worker 静默终态、持久化 cursor 与下一轮增量读取串联。'
+
+verification_commands:
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "完整飞书现场"'
+  - 'bun x vitest run --project unit test/message-listener.test.ts -t "同一份可信协议"'
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts -t "无效的 Subject trigger"'
+  - 'bun x vitest run --project e2e test/subject-listener-runtime.e2e.ts'
+  - 'bun x vitest run --project unit test/subject-listener-turn.test.ts test/message-listener.test.ts'
+  - 'bun x vitest run --project unit test/subject-listener-context.test.ts test/subject-listener-runtime.test.ts test/event-dispatcher.test.ts'
+  - 'bun run build'
+  - 'git diff --name-only HEAD -- src test .plan/subject-listener/sprint-003'
+  - 'git diff --check'

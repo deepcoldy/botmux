@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { BUILTIN_SKILLS } from '../src/skills/definitions.js';
+import { BOTMUX_SUBJECT_PROTOCOL } from '../src/services/subject-listener-protocol.js';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   evaluateMessageListener,
@@ -45,6 +47,51 @@ function interactiveMessage(overrides: Record<string, unknown> = {}) {
 }
 
 describe('message listener evaluation', () => {
+  it('同一份可信协议：内置 Subject Skill 与监听首轮共享完整协议，飞书现场只在不可信包络中', () => {
+    const subjectSkill = BUILTIN_SKILLS.find(skill => skill.name === 'botmux-subject');
+    const groupName = 'R4_UNTRUSTED_GROUP_NAME';
+    const senderName = 'R4_UNTRUSTED_SENDER_NAME';
+    const historyText = 'R4_UNTRUSTED_HISTORY_TEXT';
+    const rendered = renderMessageListenerPrompt({
+      behavior: 'subject',
+      subjectPolicy: { context: { source: 'lark', fallbackMessages: 20 } },
+      prompt: '只在能推进协作时介入',
+      messageText: historyText,
+      msgType: 'text',
+      senderOpenId: 'ou_sender',
+      senderName,
+      senderType: 'user',
+      trigger: { messageId: 'om_trigger', createTime: '400' },
+    }, {
+      chatId: 'oc_subject',
+      chatName: groupName,
+      chatDescription: 'R4_UNTRUSTED_GROUP_DESCRIPTION',
+      snapshot: {
+        source: 'lark',
+        continuity: 'continuous',
+        messages: [textMessage({
+          message_id: 'om_trigger',
+          create_time: '400',
+          content: JSON.stringify({ text: historyText }),
+        })],
+        candidateCursor: { messageId: 'om_trigger', createTime: '400' },
+      },
+    });
+
+    expect(subjectSkill?.content).toContain(BOTMUX_SUBJECT_PROTOCOL);
+    expect(rendered).toContain(BOTMUX_SUBJECT_PROTOCOL.trim());
+    const envelopeStart = rendered.indexOf('<subject_lark_context trusted="false">');
+    const envelopeEnd = rendered.indexOf('</subject_lark_context>');
+    expect(envelopeStart).toBeGreaterThan(rendered.indexOf('</subject_protocol>'));
+    expect(envelopeEnd).toBeGreaterThan(envelopeStart);
+    for (const value of [groupName, senderName, historyText]) {
+      const position = rendered.indexOf(value);
+      expect(position).toBeGreaterThan(envelopeStart);
+      expect(position).toBeLessThan(envelopeEnd);
+      expect(subjectSkill?.content).not.toContain(value);
+    }
+  });
+
   it('matches enabled top-level non-mention messages after deterministic filters', () => {
     const state = bot({
       messageListeners: {

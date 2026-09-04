@@ -29,11 +29,12 @@ Subject 的事实上下文来自飞书，不依赖 CLI session 历史。系统�
 | --- | --- | --- |
 | 001 | Subject 运行时、飞书增量上下文、静默与游标提交 | [sprint-001](./sprint-001/) |
 | 002 | Dashboard/API 配置、兼容保存与可操作界面 | [sprint-002](./sprint-002/) |
+| 003 | 拆分 Subject 可信协议与 turn 准备边界，不改变现有执行链 | [sprint-003](./sprint-003/) |
 | Review | 合并前修复、架构讨论与最终验收 | [review-followups](./review-followups.md) |
 
 ## 当前状态
 
 - Sprint 001、002 已完成，PR #1252 的构建与测试 CI 已通过。
 - Review 发现的 R-1、R-2、R-3 已确认是合并前必须修复项。
-- R-4 先讨论架构方案，不在未确认前改代码；R-5 放到最后补截图与 live 验收。
-- 本轮仅处理代码规范中的嵌套三元，不顺带修改其它 review 项。
+- R-4 已由 Sprint 003 完成：可信协议与 turn 准备边界已拆分，未夹带 R-1、R-2、R-3 或 R-5。
+- R-5 放到最后补截图与 live 验收。
