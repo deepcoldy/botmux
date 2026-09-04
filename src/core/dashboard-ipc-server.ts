@@ -5261,6 +5261,8 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 标签是 owner 自己的收件箱侧边栏，这次授权只可能是他本人的。
+      cfg.ownerOpenId,
     );
     jsonRes(res, 200, { ok: true, authUrl });
   } catch (e: any) {
@@ -5275,7 +5277,7 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
-    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand), cfg.ownerOpenId);
     jsonRes(res, 200, {
       ok: true,
       ...status,

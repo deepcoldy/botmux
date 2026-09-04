@@ -2779,8 +2779,13 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
+        // 授权归属到「发起这条 /login 的人」。token 代表一个人而不是一个 bot：不带
+        // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
+        // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
+        const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
-          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
+          // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
+          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
@@ -2792,6 +2797,7 @@ export async function handleCommand(
             botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand),
             FEED_GROUP_OAUTH_SCOPES,
+            loginOpenId,
           );
           await sessionReply(rootId, [
             t('cmd.login.tags_title', undefined, loc),
@@ -2806,7 +2812,13 @@ export async function handleCommand(
           ].join('\n'));
           break;
         }
-        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
+        const { authUrl } = generateAuthUrl(
+          botCfg2.larkAppId,
+          botCfg2.larkAppSecret,
+          normalizeBrand(botCfg2.brand),
+          [],
+          loginOpenId,
+        );
         await sessionReply(rootId, [
           t('cmd.login.title', undefined, loc),
           '',
@@ -2858,7 +2870,15 @@ export async function handleCommand(
         // 旧流程：文档 scope 不污染通用 /login；缺少时由本命令发专用 OAuth 链接。
         const subCfg = getBot(larkAppId).config;
         const replyDocLogin = async () => {
-          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
+          const { authUrl } = generateAuthUrl(
+            subCfg.larkAppId,
+            subCfg.larkAppSecret,
+            normalizeBrand(subCfg.brand),
+            DOC_COMMENT_OAUTH_SCOPES,
+            // 归属到下这条 /subscribe-lark-doc 的人：订阅是他建立的，之后的评论
+            // 读写就按他的权限走。
+            message.senderId,
+          );
           await sessionReply(rootId, [
             t('cmd.subdoc.need_login', undefined, loc),
             '',
