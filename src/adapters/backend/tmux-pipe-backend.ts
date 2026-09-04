@@ -987,6 +987,11 @@ export class TmuxPipeBackend implements SessionBackend {
     this.fifoTornDown = true;
     if (this.readStream) {
       try { this.readStream.destroy(); } catch { /* already closed */ }
+      // After destroy the stream must not keep the event loop alive. Bun's test
+      // runner waits for open handles between cases; a destroyed-but-still-ref'd
+      // fifo reader is what wedged test/tmux-startup-storm-recovery.test.ts
+      // after its first case passed (CI FILE_WALL, 720s).
+      try { (this.readStream as { unref?: () => void }).unref?.(); } catch { /* not a handle anymore */ }
       this.readStream = null;
     }
     if (this.fifoWakeFd !== null) {

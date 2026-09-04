@@ -151,7 +151,18 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       // Live-pane plumbing works end to end after the recovery.
       expect(() => backend.sendText('storm-recovery-probe')).not.toThrow();
     } finally {
-      backend.kill();
+      // kill() only detaches the fifo observer; the pane's `sleep 60` would
+      // otherwise keep the private server busy. destroySession also drops the
+      // session. Under bun test a leftover fifo handle after the first case
+      // wedged the whole file until the 720s per-file wall.
+      try { backend.destroySession(); } catch { backend.kill(); }
+      try {
+        execFileSync(REAL_TMUX!, ['kill-session', '-t', SESSION_NAME], {
+          stdio: 'ignore',
+          env: realTmuxEnv(),
+          timeout: 5000,
+        });
+      } catch { /* already gone */ }
     }
   }, 25_000);
 
