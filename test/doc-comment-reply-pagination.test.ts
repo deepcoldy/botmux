@@ -283,3 +283,70 @@ describe('listDocComments: 轮询链路补全失败必须抛错', () => {
     expect(calls).toBeLessThan(200); // 有界，不是死循环
   });
 });
+
+/**
+ * 排序保险：`/replies` 的顺序是飞书**未承诺**的行为（文档既没声明排序也没给
+ * 排序参数）。事件链路的 priorReplies 直接吃这个顺序且不自己排，所以补全后
+ * 必须由我们自己排一次，不能只把「实测同序」写在注释里。
+ */
+describe('hydrate 后按 createdAt 升序排序（不信任 API 顺序）', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset();
+    mocks.resolveUserToken.mockReset().mockResolvedValue(null);
+    mocks.warn.mockReset();
+    mocks.info.mockReset();
+  });
+
+  function hydrateWith(items: unknown[]) {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments/batch_query')) return truncatedBatchQuery(first5);
+      if (opts.url.includes('/replies')) return { code: 0, data: { items, has_more: false } };
+      throw new Error(`unexpected ${opts.url}`);
+    });
+    return getDocComment('app-test', FILE, COMMENT_ID);
+  }
+
+  it('端点若返回降序，补全结果仍是升序', async () => {
+    const descending = [5, 4, 3, 2, 1].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    const comment = await hydrateWith(descending);
+    expect(comment!.replies.map(r => r.replyId)).toEqual(['reply-1', 'reply-2', 'reply-3', 'reply-4', 'reply-5']);
+  });
+
+  it('create_time 同秒并列时按 replyId 数值序（非字典序）稳定排', async () => {
+    // 同一秒内的三条回复，reply_id 长度不同 —— 字典序会把 '710' 排到 '99' 前面。
+    const sameSecond = [
+      { ...reply('7681633934731430857', 'c', 1788500001) },
+      { ...reply('999', 'a', 1788500001) },
+      { ...reply('7681622822946343898', 'b', 1788500001) },
+    ];
+    const comment = await hydrateWith(sameSecond);
+    expect(comment!.replies.map(r => r.replyId)).toEqual([
+      '999',
+      '7681622822946343898',
+      '7681633934731430857',
+    ]);
+  });
+
+  it('正常拉完最后一页不会被误判成分页死循环', async () => {
+    // 每页 1 条、共 3 页正常结束：不能因为翻了页就抛错。
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    let page = 0;
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments/batch_query')) return truncatedBatchQuery(first5);
+      page++;
+      const last = page >= 3;
+      return {
+        code: 0,
+        data: {
+          items: [reply(`reply-${page}`, `msg ${page}`, 1788500000 + page)],
+          has_more: !last,
+          page_token: last ? undefined : `cursor-${page}`,
+        },
+      };
+    });
+    const comment = await getDocComment('app-test', FILE, COMMENT_ID);
+    expect(comment!.replies).toHaveLength(3);
+    expect(comment!.hasMoreReplies).toBe(false);
+  });
+});

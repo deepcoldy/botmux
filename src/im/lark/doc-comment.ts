@@ -19,6 +19,7 @@ import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
+import { compareReplyIds } from '../../core/doc-comment-poller.js';
 
 /**
  * bot 回复的隐形哨兵：追加在 bot 发表的评论末尾（零宽字符，用户不可见）。
@@ -591,7 +592,8 @@ async function hydrateTruncatedReplies(
         : undefined;
       // 服务端若返回恒定 page_token 会把这里变成死循环，而且是嵌在
       // 「每条评论 × 每个订阅」的两层循环里，足以把整个 poller 卡死。
-      if (pages++ >= MAX_REPLY_PAGES) {
+      // ⚠️ 只在「确认还有下一页」时计数，否则正常拉完的第 51 页也会被判成异常。
+      if (pageToken && ++pages >= MAX_REPLY_PAGES) {
         throw new Error(`回复分页超过 ${MAX_REPLY_PAGES} 页上限（comment=${comment.commentId.slice(0, 12)}），疑似游标未推进`);
       }
     } while (pageToken);
@@ -601,6 +603,15 @@ async function hydrateTruncatedReplies(
       logger.warn(`[doc-comment] hydrate returned 0 replies for ${comment.commentId.slice(0, 12)} (截断结果有 ${comment.replies.length} 条)；保留截断结果`);
       return comment;
     }
+    // 按 createdAt 升序稳定排一次。实测 `/replies` 与 `reply_list.replies` 同序
+    // （均为 create_time 升序，跨页拼接后仍升序），但飞书**既没声明排序也没给
+    // 排序参数** —— 这是未承诺行为。上层 `priorReplies`
+    // （event-dispatcher 的 `replies.slice(0, triggerIndex)`）直接吃这个顺序且
+    // 不自己排，一旦飞书改成降序，症状是模型把「后面的回复」当历史上下文喂进去，
+    // 且没有任何日志会报。与其把这个假设只写在注释里，不如让代码自己守住。
+    // create_time 是秒级、同秒并列真实存在，故用 replyId 做次级比较（复用
+    // poller 的 compareReplyIds，别重写一套）。
+    replies.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || compareReplyIds(a.replyId, b.replyId));
     logger.info(`[doc-comment] hydrated truncated thread comment=${comment.commentId.slice(0, 12)} ${comment.replies.length} → ${replies.length} replies`);
     return { ...comment, replies, hasMoreReplies: false };
   } catch (err) {

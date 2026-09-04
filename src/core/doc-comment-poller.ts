@@ -15,7 +15,11 @@ export interface PolledDocReply extends DocCommentPollCursor {
   priorReplies: Array<{ authorOpenId?: string; text: string }>;
 }
 
-function compareReplyIds(a: string, b: string): number {
+/**
+ * reply_id 按数值比大小（飞书 id 是雪花数，字符串序会把长度不同的排错）。
+ * 非数字 id 退化成字典序。
+ */
+export function compareReplyIds(a: string, b: string): number {
   try {
     const aa = BigInt(a);
     const bb = BigInt(b);
