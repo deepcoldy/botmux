@@ -210,6 +210,34 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
   ].join('\n');
 }
 
+/**
+ * Create empty identity files so a sandboxed session can read them later.
+ *
+ * The file sandbox existence-filters its allow list: a path that does not exist
+ * at spawn is dropped, and a dropped path stays unreadable even once the daemon
+ * publishes to it — the session would then run without the sender's identity,
+ * silently. Creating the files up front keeps the grant intact.
+ *
+ * Empty is the right initial content. No identity exists until the first turn
+ * resolves one, and both the wrapper and a `.`-source treat an empty file the
+ * same as an absent one.
+ *
+ * Never truncates an existing file: a restart mid-session must not discard the
+ * identity already in force.
+ */
+export function ensureSessionIdentityPlaceholders(
+  sessionDataDir: string,
+  sessionId: string,
+  tools: readonly TriggerUserAuthTool[],
+): void {
+  mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+  for (const tool of tools) {
+    const path = sessionIdentityPath(sessionDataDir, sessionId, tool);
+    if (existsSync(path)) continue;
+    atomicWriteFileSync(path, '', { mode: 0o600 });
+  }
+}
+
 /** Whether the wrapper for `tool` is currently installed in `binDir`. */
 export function identityWrapperInstalled(binDir: string, tool: TriggerUserAuthTool): boolean {
   return existsSync(join(binDir, tool));

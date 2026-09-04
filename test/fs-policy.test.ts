@@ -1656,3 +1656,49 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(cold.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
   });
 });
+
+// Trigger-user CLI identity: the wrapper on PATH sources the per-session
+// identity file on every invocation, so a sandboxed session must be able to READ
+// exactly its own — and nothing else. The grant is per file, never the shared
+// `cli-identity/` parent, because that parent holds every concurrent session's
+// file and each one carries a live token belonging to a different person.
+describe('buildFsPolicy — trigger-user CLI identity', () => {
+  const dataDir = '/Users/u/.botmux/data';
+
+  it('grants this session\'s identity files read-only', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    for (const tool of ['lark-cli', 'bytedcli']) {
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.${tool}.env`).access)
+        .toBe('readOnly');
+    }
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('readOnly');
+  });
+
+  // The one that matters: session A must not be able to read session B's token.
+  it('leaves another session\'s identity denied', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.lark-cli.env`).access)
+      .not.toBe('readOnly');
+    // And the shared parent is never granted, so a future session's file cannot
+    // be reached either (the allow-list must not fail open for files created
+    // after spawn).
+    expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
+  });
+
+  // Writable would let an agent publish its own identity and act as anyone whose
+  // token it could name. The daemon writes; the CLI only reads.
+  it('never grants write access to an identity file', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+      .not.toBe('readWrite');
+  });
+
+  // A no-transport (core-only / apiOnly) turn has no Feishu credential surface at
+  // all; handing it a user token would re-open the very boundary that mode exists
+  // to close.
+  it('withholds the identity from a no-transport turn', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+      .not.toBe('readOnly');
+  });
+});

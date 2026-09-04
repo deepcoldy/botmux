@@ -17,7 +17,8 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary } from './core/cli-identity.js';
+import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders } from './core/cli-identity.js';
+import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -14305,6 +14306,22 @@ async function spawnCli(
   const triggerUserAuthPolicy = cfg.triggerUserAuth;
   if (triggerUserAuthPolicy?.enabled && process.env.SESSION_DATA_DIR) {
     const wrapperDir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    // Pre-create the identity files so they survive the sandbox's
+    // existence-filter (it drops allow paths that do not exist at spawn, and a
+    // dropped path would leave the wrapper unable to read what the daemon later
+    // publishes — the session would silently run without the sender's identity).
+    // Empty is the correct initial content: no identity is published until the
+    // first turn resolves one, and the wrapper treats an empty file as "no
+    // identity", the same as absent.
+    try {
+      ensureSessionIdentityPlaceholders(
+        process.env.SESSION_DATA_DIR,
+        cfg.sessionId,
+        triggerUserAuthPolicy.tools,
+      );
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
+    }
     let installedAny = false;
     for (const tool of triggerUserAuthPolicy.tools) {
       try {
@@ -14323,6 +14340,15 @@ async function spawnCli(
       }
     }
     if (installedAny) childEnv.PATH = prependBotmuxBin(wrapperDir, childEnv.PATH);
+    // Say plainly how protected the token store actually is. Without the file
+    // sandbox the agent runs as the same OS user as botmux and can read every
+    // person's token file directly; per-person storage fixes attribution and the
+    // overwrite bug, but only the sandbox makes the isolation OS-enforced.
+    // Logged rather than enforced: refusing to run would push operators away
+    // from a change that helps either way, and implying isolation we do not have
+    // would be worse than both.
+    const protection = tokenStoreProtection(sandboxRequested);
+    if (protection.advisory) log(`[trigger-user-auth] NOTE ${protection.advisory}`);
   }
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the

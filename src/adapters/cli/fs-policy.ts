@@ -803,6 +803,26 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
+  // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
+  // `cli-identity/<sessionId>.<tool>.env` on every invocation, so a sandboxed
+  // session needs to READ exactly those files plus the wrapper scripts.
+  //
+  // Granted per file/dir, never the `cli-identity/` parent: that directory holds
+  // every concurrent session's files, each with a live user token belonging to a
+  // different person. A parent grant would let one session read another's — the
+  // exact cross-person leak this feature exists to prevent — and it would fail
+  // OPEN for sessions created after spawn.
+  //
+  // Read-only by construction: the daemon writes these, the CLI must never be
+  // able to. Writable would let an agent publish its own identity and act as
+  // anyone whose token it could name.
+  if (ctx.sessionId && larkTransport) {
+    push([
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
+    ], 'readOnly', 'internal');
+  }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
   if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
