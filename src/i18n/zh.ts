@@ -1488,6 +1488,10 @@ export const messages: Record<string, string> = {
   'card.you': '你',
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
+  // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
+  'card.usage.ctx': 'ctx',
+  'card.usage.quota_5h': '5h',
+  'card.usage.quota_7d': '7d',
   'card.usage.tokens': 'Token',
   'card.usage.turn': '本轮',
   'card.usage.total': '累计',
@@ -1577,6 +1581,7 @@ export const messages: Record<string, string> = {
   'cmd.cot.status_on': '🧠 思考过程消息：开启中（总开关开 + 本群未关闭）。/cot off 可关闭本群。',
   'cmd.cot.status_chat_off': '🔕 思考过程消息：本群已关闭。/cot on 恢复。',
   'cmd.cot.status_master_off': '🔕 思考过程消息：bot 级总开关未开。/botconfig set thinkingCard on 开启（本群未单独关闭）。',
+  'cmd.cot.status_result_off': '📄 工具输出：已关闭（气泡只保留思考段落与工具节点标题）。/botconfig set thinkingCardToolResult on 恢复。',
   'cmd.cot.fail': '⚠️ 操作失败：{reason}',
   'cmd.cot.show_now': '🧠 已召唤本 turn 的思考气泡（含目前已累积的思考过程；本 turn 结束后自动恢复原设置）。',
   'cmd.cot.show_armed': '🧠 当前没有进行中的思考——下个 turn 将展示一次思考气泡，结束后自动恢复原设置。',

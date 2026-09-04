@@ -207,13 +207,19 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/keys AND --settings entirely when disableCliBypass is true', () => {
+  it('omits dangerous permission flags/keys when disableCliBypass is true (--settings stays for statusLine only)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--disallowed-tools');
     // SessionStart 就绪 hook 改走全局 settings.json（见 hookInstall.sessionStartCommand），
-    // 不再注入进程级 --settings；bypass 键也没有 → 没东西可传 → 干脆不带 --settings。
-    expect(args).not.toContain('--settings');
+    // 不再注入进程级 --settings；bypass 键也没有。claude-code 仍恒传 --settings，但只承载
+    // statusLine（→ `botmux statusline`，单值不能写全局），不含任何 bypass / hooks 键。
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(Object.keys(parsed)).toEqual(['statusLine']);
+    expect(parsed.statusLine.type).toBe('command');
+    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 

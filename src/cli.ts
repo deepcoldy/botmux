@@ -5611,50 +5611,6 @@ function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
   return listOnlineDaemons()[0] ?? null;
 }
 
-function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  const rawContext = raw.context;
-  const rawTokens = raw.tokens;
-
-  let context: CardUsageSnapshot['context'] = null;
-  if (rawContext && typeof rawContext === 'object' && !Array.isArray(rawContext)) {
-    const c = rawContext as Record<string, unknown>;
-    if (typeof c.usedTokens === 'number'
-      && Number.isFinite(c.usedTokens)
-      && c.usedTokens >= 0) {
-      context = {
-        usedTokens: c.usedTokens,
-        ...(typeof c.windowTokens === 'number'
-          && Number.isFinite(c.windowTokens)
-          && c.windowTokens > 0
-          ? { windowTokens: c.windowTokens }
-          : {}),
-        ...(typeof c.percentUsed === 'number'
-          && Number.isFinite(c.percentUsed)
-          && c.percentUsed >= 0
-          ? { percentUsed: c.percentUsed }
-          : {}),
-      };
-    }
-  }
-
-  let tokens: CardUsageSnapshot['tokens'] = null;
-  if (rawTokens && typeof rawTokens === 'object' && !Array.isArray(rawTokens)) {
-    const u = rawTokens as Record<string, unknown>;
-    if (typeof u.in === 'number'
-      && Number.isFinite(u.in)
-      && u.in >= 0
-      && typeof u.out === 'number'
-      && Number.isFinite(u.out)
-      && u.out >= 0) {
-      tokens = { in: u.in, out: u.out };
-    }
-  }
-
-  return { context, tokens };
-}
-
 /** Prefer the resident daemon's incremental transcript cache. Older/offline
  * daemons and isolated environments fall back to the local reader; either path
  * degrades to explicit unavailable facts without blocking the reply. */
@@ -5698,7 +5654,7 @@ async function readCardUsageSnapshotForSend(
   }
 
   try {
-    return getSessionUsageSnapshot({
+    const snapshot = getSessionUsageSnapshot({
       cliId: (session.cliId ?? session.adoptedFrom?.cliId ?? 'unknown') as CliId | 'unknown',
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
@@ -5710,6 +5666,14 @@ async function readCardUsageSnapshotForSend(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
+    // Claude statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
+    // 本地直接读 <DATA_DIR>/statusline/<sid>/latest.json；沙盒内该目录对本会话可读写。
+    // 非空才带 key；读取失败不影响 transcript 用量。
+    try {
+      const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
+      if (quota) return { ...snapshot, quota };
+    } catch { /* best-effort */ }
+    return snapshot;
   } catch {
     return { context: null, tokens: null };
   }
@@ -7606,6 +7570,8 @@ import { loadCompanionSecret } from './dashboard/companion-api.js';
 import { applyCompanionStartupOptions } from './cli/companion-startup-options.js';
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
+import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
+import { parseStatuslinePayload, readStatuslineSnapshot, toCardQuota, writeStatuslineSnapshot } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldDropAfterTheFactTopicQuote,
@@ -12735,22 +12701,30 @@ async function cmdSessionReady(): Promise<void> {
 // fail-open 铁律：任何失败（env 缺失 = 非 botmux 会话、daemon 不可达、未命中 =
 // 用户手输或 inline 模式、403/404）都空输出 + exit 0。绝不 exit 2（会阻塞该轮
 // prompt），绝不抛错（Claude 对 hook 失败的兜底是放弃注入，正合预期）。
-async function cmdUserPromptHook(): Promise<void> {
-  // 5s 自限时读 stdin：Claude 写完 payload 会关 stdin，正常情况下立即结束；
-  // 万一上游不关管道，也不能挂住 hook（settings.json 里的 10s timeout 是第二道）。
-  let payloadText = '';
+/**
+ * 自限时读完 stdin（原始字节）。Claude 写完 hook / statusline payload 会关 stdin，
+ * 正常情况下立即结束；万一上游不关管道，也不能挂住子进程（settings.json 里的 hook
+ * timeout 是第二道）。超时 / 读不到 ⇒ 返回已收到的部分（可能为空），从不抛错。
+ * user-prompt-hook 与 statusline 共用。
+ */
+async function readStdinWithTimeout(ms: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
   try {
-    const chunks: Buffer[] = [];
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; try { process.stdin.destroy(); } catch { /* */ } }, 5000);
+    const timer = setTimeout(() => { timedOut = true; try { process.stdin.destroy(); } catch { /* */ } }, ms);
     if (typeof timer.unref === 'function') timer.unref();
     for await (const chunk of process.stdin) {
       if (timedOut) break;
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     clearTimeout(timer);
-    payloadText = Buffer.concat(chunks).toString('utf-8');
-  } catch { /* stdin 读不到 → no-op */ }
+  } catch { /* stdin 读不到 → 返回已收到的部分 */ }
+  return Buffer.concat(chunks);
+}
+
+async function cmdUserPromptHook(): Promise<void> {
+  // 5s 自限时读 stdin（见 readStdinWithTimeout）。
+  const payloadText = (await readStdinWithTimeout(5000)).toString('utf-8');
 
   const sessionId = process.env.BOTMUX_SESSION_ID;
   // env 缺失 → adopt / 非 botmux 会话 / 用户手输，静默放行。
@@ -12826,6 +12800,92 @@ async function cmdUserPromptHook(): Promise<void> {
     }
   } catch { /* daemon 不可达 / claim 失败 → no-op */ }
   process.exit(0);
+}
+
+// ─── botmux statusline ───────────────────────────────────────────────────────
+//
+// Claude Code `statusLine.command` 客户端（由 claude-code.ts buildArgs 经进程级
+// --settings 注入）。Claude 在每条 assistant 消息后 / compact 后 / 到达 resets_at /
+// 每 refreshInterval 秒（300ms 防抖）把 JSON（context_window、rate_limits、model …）
+// 喂到 stdin。本命令做两件互不影响的事，各自 try/catch：
+//   1. 落盘：BOTMUX_SESSION_ID 非空且 payload 可解析 ⇒ 写
+//      `<DATA_DIR>/statusline/<sid>/latest.json`（daemon 合并进卡片用量段）。
+//   2. 转发：BOTMUX_STATUSLINE_CHAIN 非空（worker 找回的、被 --settings 遮蔽的用户
+//      statusLine 命令）⇒ `/bin/sh -c <chain>`，把**原始 stdin 字节**原样喂给它，
+//      stdout/stderr 直接继承（Claude 读的是本进程的 stdout），正常退出透传其退出码；
+//      10s 看门狗 SIGTERM → 1s 后 SIGKILL → exit 0；被信号杀 / spawn 失败 → exit 0。
+// 无 chain ⇒ stdout 空、exit 0（与用户没配 statusline 时一致：状态栏空）。
+// 诊断只走 stderr（stdout 是状态栏内容）；顶层兜底 exit 0——statusline 失败对 Claude
+// 只是「状态栏空」，绝不能让它挂住或刷错误。
+const STATUSLINE_STDIN_TIMEOUT_MS = 5000;
+const STATUSLINE_CHAIN_TIMEOUT_MS = 10_000;
+const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
+
+function statuslineDiagnostic(message: string): void {
+  try { process.stderr.write(`[botmux statusline] ${message}\n`); } catch { /* */ }
+}
+
+/** 把原始 payload 转发给用户自己的 statusline 命令；本函数负责最终 process.exit。 */
+function forwardStatuslineChain(chain: string, raw: Buffer): void {
+  let child: ReturnType<typeof spawn>;
+  try {
+    // detached：让 sh 及其子进程独占一个进程组，看门狗按组杀——用户脚本常是
+    // `bash ~/.claude/statusline.sh`（内部再 spawn jq / git），只杀 sh 会留下握着
+    // stdout 管道的孤儿，Claude 读不到 EOF 会一直等。
+    child = spawn('/bin/sh', ['-c', chain], { stdio: ['pipe', 'inherit', 'inherit'], detached: true });
+  } catch (error) {
+    statuslineDiagnostic(`chain spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(0);
+  }
+  const killGroup = (signal: NodeJS.Signals) => {
+    if (child.pid) {
+      try { process.kill(-child.pid, signal); return; } catch { /* 组已不在 → 退回单进程 */ }
+    }
+    try { child.kill(signal); } catch { /* */ }
+  };
+  let killTimer: NodeJS.Timeout | undefined;
+  const watchdog = setTimeout(() => {
+    killGroup('SIGTERM');
+    killTimer = setTimeout(() => {
+      killGroup('SIGKILL');
+      process.exit(0);
+    }, STATUSLINE_CHAIN_KILL_GRACE_MS);
+  }, STATUSLINE_CHAIN_TIMEOUT_MS);
+  const finish = (code: number) => {
+    clearTimeout(watchdog);
+    if (killTimer) clearTimeout(killTimer);
+    process.exit(code);
+  };
+  child.once('error', (error) => {
+    statuslineDiagnostic(`chain failed: ${error instanceof Error ? error.message : String(error)}`);
+    finish(0);
+  });
+  // 被信号杀（含看门狗）⇒ 0；正常退出透传退出码。
+  child.once('exit', (code, signal) => finish(signal ? 0 : (code ?? 0)));
+  // 用户命令可能不读 stdin 就退出 → EPIPE，吞掉即可。
+  child.stdin?.on('error', () => { /* */ });
+  child.stdin?.end(raw);
+}
+
+async function cmdStatusline(): Promise<void> {
+  try {
+    const raw = await readStdinWithTimeout(STATUSLINE_STDIN_TIMEOUT_MS);
+    const sessionId = process.env.BOTMUX_SESSION_ID;
+    // env 缺失 ⇒ 非 botmux 会话（用户手跑 / adopt），不落盘，只做转发。
+    if (sessionId) {
+      try {
+        const snap = parseStatuslinePayload(JSON.parse(raw.toString('utf-8')));
+        if (snap) writeStatuslineSnapshot(resolveDataDir(), sessionId, snap);
+      } catch (error) {
+        statuslineDiagnostic(`snapshot not written: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const chain = process.env.BOTMUX_STATUSLINE_CHAIN;
+    if (!chain) process.exit(0);
+    forwardStatuslineChain(chain, raw);
+  } catch {
+    process.exit(0);
+  }
 }
 
 // ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
@@ -13868,6 +13928,9 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // workflow, deployment, or external messaging effect.
     'preview',
     'session-ready',
+    // Claude statusLine.command 客户端：只写本会话的配额快照 + 转发用户 statusline，
+    // 无聊天 / workflow 副作用；workflow worker 里的 Claude 也会每分钟调它。
+    'statusline',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
     'schedule',
@@ -14938,6 +15001,12 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case 'statusline': {
+    // `botmux statusline` — Claude Code statusLine.command 客户端：落盘 ctx/5h/7d
+    // 配额快照，并把原始 payload 转发给被遮蔽的用户 statusline（BOTMUX_STATUSLINE_CHAIN）。
+    await cmdStatusline();
     break;
   }
   case 'native-subagent-runtime-hook': {

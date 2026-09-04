@@ -1492,6 +1492,10 @@ export const messages: Record<string, string> = {
   'card.you': 'You',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
+  // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
+  'card.usage.ctx': 'ctx',
+  'card.usage.quota_5h': '5h',
+  'card.usage.quota_7d': '7d',
   'card.usage.tokens': 'Tokens',
   'card.usage.turn': 'This turn',
   'card.usage.total': 'Total',
@@ -1577,6 +1581,7 @@ export const messages: Record<string, string> = {
   'cmd.cot.status_on': '🧠 Thinking-process messages: ON (master switch on + this chat not muted). /cot off to mute this chat.',
   'cmd.cot.status_chat_off': '🔕 Thinking-process messages: muted for this chat. /cot on to restore.',
   'cmd.cot.status_master_off': '🔕 Thinking-process messages: bot-level master switch is off. Enable via /botconfig set thinkingCard on (this chat is not individually muted).',
+  'cmd.cot.status_result_off': '📄 Tool output: off (the bubble keeps only thinking paragraphs and tool node titles). /botconfig set thinkingCardToolResult on to restore.',
   'cmd.cot.fail': '⚠️ Operation failed: {reason}',
   'cmd.cot.show_now': '🧠 Summoned this turn\'s thinking bubble (with everything accumulated so far; reverts when the turn ends).',
   'cmd.cot.show_armed': '🧠 No thinking in flight — the next turn will show the bubble once, then revert.',

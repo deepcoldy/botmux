@@ -316,6 +316,12 @@ describe('buildFsPolicy', () => {
     // another session's marker is NOT writable (can't corrupt its send-dedup).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/other.jsonl').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends').access).toBe('none');
+    // statusline: `botmux statusline` atomically writes latest.json (tmp+rename needs
+    // a writable parent) → the OWN session DIRECTORY is readWrite; siblings stay 'none'.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s/latest.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline').access).toBe('none');
     // own BOT_HOME rw + own attachments ro (allow-listed elsewhere)
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m/f.pdf').access).toBe('readWrite'); // botmux quoted downloads here
@@ -1140,6 +1146,15 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     authPaths: ['/Users/u/.codex'],               // REAL codex-app CLI login/state surface
     ...o,
   }));
+
+  it('grants the OWN statusline snapshot dir readWrite under no-transport too (siblings stay closed)', () => {
+    const p = noTransport({ workingDir: '/Users/u/proj' });
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s/latest.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).not.toBe('readWrite');
+    // parity with turn-sends: single own marker file still granted
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');
+  });
 
   it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {
     const p = noTransport();

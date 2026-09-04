@@ -3158,6 +3158,33 @@ describe('GET /api/sessions/:sessionId/usage', () => {
     }
   });
 
+  it('passes a statusline quota segment through untouched (claude-code ctx / 5h / 7d)', async () => {
+    const ds = { session: { sessionId: 's-usage-quota' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const usageSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345 },
+      tokens: { in: 67_890, out: 123 },
+      quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5 },
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-usage-quota/usage`);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: {
+          context: { usedTokens: 12_345 },
+          tokens: { in: 67_890, out: 123 },
+          quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5 },
+        },
+      });
+      expect(usageSpy).toHaveBeenCalledWith(ds);
+    } finally {
+      findSpy.mockRestore();
+      usageSpy.mockRestore();
+    }
+  });
+
   it('returns the card-specific empty snapshot when footer usage is disabled', async () => {
     const ds = { session: { sessionId: 's-usage-hidden' } } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
