@@ -34,6 +34,15 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (measured on Linux + tmux 3.3a: 12 KB ok, ceiling between 16256 and
+    // 16384 bytes). Gemini bakes the whole first round into `-i <content>`,
+    // and botmux's new-topic envelope alone is ~5.8 KB, so a pasted log or
+    // stack trace can cross the tmux limit before Gemini ever starts — the
+    // same failure #1250 hit on OpenCode. Same 8 KB budget as OpenCode
+    // (#1251): short messages keep the reliable argv cold-start path,
+    // over-limit ones defer to the post-start input queue.
+    maxInitialPromptArgBytes: 8192,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.sendText && pty.sendSpecialKeys) {

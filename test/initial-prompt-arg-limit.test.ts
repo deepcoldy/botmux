@@ -6,6 +6,8 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
@@ -406,5 +408,72 @@ describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)'
       passesInitialPromptViaArgs: true,
       deferInitialPrompt: defer,
     })).toBe(true);
+  });
+});
+
+// #1251 closed the OpenCode half of #1250, but gemini/mtr bake the first round
+// into argv the same way with no budget at all. These pin the fix AND the
+// deliberate exclusion of cursor, whose argv path is load-bearing (deferring
+// its opening turn can feed it into a still-active browser-login flow).
+describe('argv budget coverage for the remaining argv-baking adapters (#1264)', () => {
+  const cases = [
+    { id: 'gemini', adapter: createGeminiAdapter('/usr/bin/gemini'), flag: '-i' },
+    { id: 'mtr', adapter: createMtrAdapter('/usr/bin/mtr'), flag: '--prompt' },
+  ] as const;
+
+  it.each(cases.map(c => [c.id, c] as const))(
+    '%s declares a budget and keeps a short real envelope on argv',
+    (_id, c) => {
+      const budget = c.adapter.maxInitialPromptArgBytes;
+      expect(budget).toBe(8192);
+
+      const envelope = buildNewTopicPrompt('帮我看看这个 bug', 'sess-argv-short', _id);
+      // The envelope floor is ~5.8 KB; if a future change pushes it past the
+      // budget, short messages would silently stop using the argv cold-start
+      // path — this assertion is the tripwire for that.
+      expect(Buffer.byteLength(envelope, 'utf8')).toBeLessThan(budget!);
+      expect(shouldDeferInitialPromptForArgLimit({
+        passesInitialPromptViaArgs: true,
+        prompt: envelope,
+        maxInitialPromptArgBytes: budget,
+      })).toBe(false);
+    },
+  );
+
+  it.each(cases.map(c => [c.id, c] as const))(
+    '%s defers an oversized real envelope so it never reaches tmux argv',
+    (_id, c) => {
+      const budget = c.adapter.maxInitialPromptArgBytes!;
+      const envelope = buildNewTopicPrompt(
+        '请逐行审查以下代码并给出修改建议：\n'.repeat(400),
+        'sess-argv-long',
+        _id,
+      );
+      expect(Buffer.byteLength(envelope, 'utf8')).toBeGreaterThan(budget);
+
+      const defer = shouldDeferInitialPromptForArgLimit({
+        passesInitialPromptViaArgs: true,
+        prompt: envelope,
+        maxInitialPromptArgBytes: budget,
+      });
+      expect(defer).toBe(true);
+
+      const args = c.adapter.buildArgs({
+        sessionId: 'sess-argv-long',
+        resume: false,
+        initialPrompt: defer ? undefined : envelope,
+      });
+      expect(args).not.toContain(c.flag);
+      expect(args).not.toContain(envelope);
+    },
+  );
+
+  it('cursor is deliberately left without a budget (browser-login hazard)', () => {
+    // Not an oversight: cursor's positional prompt is only handed to the TUI
+    // after auth/startup settle. Deferring it to the post-start queue can write
+    // into a live browser-login flow — a worse failure than the tmux ceiling.
+    // Pinned so a future "complete the coverage" sweep has to read this first.
+    expect(createCursorAdapter('/usr/bin/cursor').maxInitialPromptArgBytes).toBeUndefined();
+    expect(createCursorAdapter('/usr/bin/cursor').passesInitialPromptViaArgs).toBe(true);
   });
 });
