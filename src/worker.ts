@@ -14800,6 +14800,20 @@ async function spawnCli(
         config.session.dataDir,
       ).map(canonical));
     }
+    // The sandboxed CLI reads its OWN session's skill manifest via
+    // `botmux skill show <name>` (manifest-store.ts writes it to
+    // `<config.session.dataDir>/skill-manifests/<sessionId>.json`). Without an
+    // explicit carve-out the file sandbox never exposes it, so the read EACCES's
+    // and `skill show` maps that to "manifest not found" — user-skill bodies are
+    // unreadable under sandbox=true + skillInjection=prompt. Expose ONLY this
+    // session's own manifest file, read-only, canonicalized so a symlinked HOME
+    // (`/home/u` → `/data00/home/u`) still matches. Scoping to the single
+    // `<sessionId>.json` (not the whole skill-manifests dir) keeps a task from
+    // reading other sessions' manifests. Built from config.session.dataDir — the
+    // exact path the store writes to, not the possibly-unset SESSION_DATA_DIR.
+    mandatoryReadOnlyPaths.push(
+      canonical(join(config.session.dataDir, 'skill-manifests', `${cfg.sessionId}.json`)),
+    );
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
         sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
