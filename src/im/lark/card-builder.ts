@@ -2848,7 +2848,7 @@ export function buildAdoptEntries(
       kind: 'live' as const,
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: project,
+      title: s.title || project,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
