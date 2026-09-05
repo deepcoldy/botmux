@@ -23,6 +23,8 @@ import {
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import {
+  isPlatformDashboardAuthSessionId,
+  platformAuthSessionsToRevoke,
   resolveDashboardIdentity,
   resolveDashboardRequestGate,
   type DashboardRequestIdentity,
@@ -457,10 +459,11 @@ function terminalAuthSessionLive(authSessionId: string): boolean {
   if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
   const binding = readPlatformBinding();
   if (binding) {
-    const scope = platformDashboardActorScope(binding.machineId);
-    if (authSessionId === `${scope}:owner`
-      || authSessionId === `${scope}:teammate`
-      || authSessionId === `${scope}:guest`) {
+    // ⚠️ 不要在这里硬枚举 `${scope}:owner|teammate|guest`：平台注入
+    // `X-Botmux-Actor` 后，协管者的 authSessionId 多出一段 actor
+    // （`<scope>:<actor>:<role>`），三个字面量会全部落空 → 协管者的终端只读链接
+    // 被判成「认证已结束」而 403。识别交给 request-identity 的同一份格式定义。
+    if (isPlatformDashboardAuthSessionId(authSessionId, platformDashboardActorScope(binding.machineId))) {
       return true;
     }
   }
@@ -481,6 +484,8 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
     // there is no module-level mirror to compare against any more.
     activeToken: currentDashboardToken(),
     roleHeader: req.headers['x-botmux-role'],
+    actorHeader: req.headers['x-botmux-actor'],
+    scopesHeader: req.headers['x-botmux-scopes'],
     platformMachineId: readPlatformBinding()?.machineId ?? null,
     platformActorScope: platformDashboardActorScope,
     legacyAuthSessionId: legacyDashboardAuthSessionId,
@@ -517,8 +522,22 @@ function syncPlatformBindingRevocation(): void {
   const current = readPlatformBinding()?.machineId ?? null;
   if (observedPlatformMachineId && observedPlatformMachineId !== current) {
     const scope = platformDashboardActorScope(observedPlatformMachineId);
-    for (const role of ['owner', 'teammate', 'guest'] as const) {
-      endDashboardAuthSession(`${scope}:${role}`);
+    // ⚠️ 不要硬枚举 `${scope}:owner|teammate|guest`：平台注入 `X-Botmux-Actor`
+    // 后协管者的 authSessionId 里含 union_id（`<scope>:<actor>:<role>`），而「有
+    // 哪些人」本进程不可能预先知道 —— 硬枚举扫不到他们，解绑后协管者**已建立的
+    // 写连接不会被断开**，正是本函数要堵的那扇后窗。
+    // 所以反过来做：把四个注册表里在册的认证会话取并集，按本机 scope 筛出平台
+    // 身份逐个吊销。取并集是因为一个会话可能只在其中一个表里有状态（例如只开了
+    // SSE、还没拿写租约）。
+    // 实现抽在 request-identity 的 platformAuthSessionsToRevoke（纯函数），
+    // 这样测试能直接调生产实现，而不是各自复刻一份「四表并集 + 筛选」。
+    for (const authSessionId of platformAuthSessionsToRevoke(scope, [
+      terminalControl,
+      previewInteraction,
+      authSessionConnections,
+      controlCsrfTokens,
+    ])) {
+      endDashboardAuthSession(authSessionId);
     }
   }
   observedPlatformMachineId = current;
@@ -3616,7 +3635,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -3625,11 +3644,17 @@ const server = createServer(async (req, res) => {
       activeToken,
       publicReadOnly,
     });
-    // `authed` is deliberately the local management capability, not merely a
-    // valid Workbench/platform identity. Privileged mutations and management
-    // reads (settings, schedules, groups) therefore cannot be widened by H5
-    // authentication.
-    const authed = legacyAuthed;
+    // `authed` is the HOST MANAGEMENT capability: the local management cookie, or
+    // a platform co-manager the platform granted `dashboard:manage`. It is still
+    // NOT "any valid Workbench/platform identity" — H5 authentication cannot widen
+    // it, and neither can a co-manager without that scope.
+    //
+    // Deliberately NOT the same thing as `legacyAuthed` any more. The three
+    // capabilities that hand over the whole host — debug shell, write-link
+    // (a stable token) and spawn-command (credential-bearing) — keep querying
+    // `legacyAuthed` directly, so a co-manager can help maintain settings /
+    // schedules / groups without being able to run arbitrary commands.
+    const authed = canManageHost;
     // The session board is the one surface where `!authed` must NOT mean
     // "anonymous". `/api/sessions` and `/events` are exactly the two paths
     // workbenchH5Capability grants as `workbench.view`, and the same identity
@@ -4170,6 +4195,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/autostart') {
+      // 开机自启是机器级**运营配置**，与 settings/schedules/groups 同档，
+      // 所以随 dashboard:manage 一起放开给协管者（刻意，不是漏改）。
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       res.setHeader('cache-control', 'no-store');
       return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
@@ -4308,7 +4335,10 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // owner-only：这条会 git pull + 重建，等于改机器上实际运行的代码。协管者的
+      // `dashboard:manage` 只覆盖「运营配置」（settings/schedules/groups/autostart），
+      // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
@@ -4471,7 +4501,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/rollback') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // owner-only，同 /api/update/run（回滚同样改运行中的代码）。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
 
       let targetVersion = '';
@@ -4650,7 +4681,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // owner-only：重启会打断 owner 正在跑的所有会话。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
       // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
