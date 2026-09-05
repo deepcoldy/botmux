@@ -182,6 +182,20 @@ interface DriveCallOpts {
   data?: unknown;
   /** true 时禁用 tenant 回退（评论事件订阅必须 user 身份才收得到推送时用）。 */
   userOnly?: boolean;
+  /**
+   * true 时**禁用 user 回退**：只用 tenant（应用身份）写，失败即失败。
+   *
+   * 与 `preferTenant` 的区别是「回退可不可接受」。`preferTenant` 用于**必须落地**
+   * 的写入（发评论），宁可显示成授权用户也要发出去。而有些写入是**持久且带主体
+   * 归属**的 —— 以错误的主体落地比不落地更糟，因为它会以用户自己的名义在文档里
+   * 留下不是用户做的动作。这类调用用 `tenantOnly`。
+   *
+   * 现用于「事件被丢弃」的 ❌ 标记（见 event-dispatcher.ts:markCommentEventDropped）：
+   * 它是**终态**标记、故意不清理，一旦回退 user 就等于在用户自己的评论上以用户
+   * 自己的名义永久挂一个叉。对比 Typing 指示器 —— 那个是成对的、几秒后必被
+   * removeCommentReaction 清掉，所以回退 user 只是短暂误导，可以接受。
+   */
+  tenantOnly?: boolean;
   /** true 时**优先 tenant（应用身份）**，失败再回退 user。用于发评论——这样 bot 的
    *  回复显示为机器人本身，而非授权用户。bot 对该文档无访问权时回退 user 身份保证落地。 */
   preferTenant?: boolean;
@@ -327,6 +341,18 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   };
 
   if (opts.userOnly) return callUser();
+
+  // 只用应用身份写，绝不回退 user —— 见 tenantOnly 的注释：这类写入是持久且带
+  // 主体归属的，以错误主体落地比不落地更糟。tenant 失败就让它失败，调用方决定
+  // 怎么降级（当前唯一调用方 markCommentEventDropped 是 best-effort 放弃 + 日志）。
+  if (opts.tenantOnly) {
+    await opts.beforeProviderEffect?.();
+    const res = await callTenant();
+    if (res?.code !== 0) {
+      throw new Error(`tenant-only drive call 失败 (${opts.path}): ${res?.msg ?? 'unknown'} (code: ${res?.code})`);
+    }
+    return res;
+  }
 
   // 发评论：优先应用身份（回复显示为 bot），bot 无访问权（抛错或 code!=0）时回退用户身份。
   if (opts.preferTenant) {
@@ -835,7 +861,9 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
  * 知道 bot 收到了、正在处理。bot 回复发出后再删掉。
  *
  * 端点：`POST drive/v2/files/{token}/comments/reaction`（v2，评论 reaction 专用）。
- * 优先应用身份（reaction 显示为 bot 加的）。
+ * 默认优先应用身份、失败回退 user（reaction 尽量显示为 bot 加的，但保证落地）。
+ * `options.tenantOnly` 关掉这个回退 —— 用于**不会被清理的终态标记**，那种场景下
+ * 以授权用户名义永久落一个 reaction 比不落更糟（见 DriveCallOpts.tenantOnly）。
  *
  * @returns 新创建的 reaction_id（删除时要用）；失败返回 undefined（不阻塞主流程）。
  */
@@ -845,7 +873,7 @@ export async function addCommentReaction(
   commentId: string,
   replyId: string,
   reactionType: string,
-  options: DocProviderEffectOptions = {},
+  options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
 ): Promise<string | undefined> {
   try {
     const res = await driveApiCall(larkAppId, {
@@ -853,7 +881,8 @@ export async function addCommentReaction(
       path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
       params: { file_type: file.fileType },
       data: { action: 'add', comment_id: commentId, reply_id: replyId, reaction_type: reactionType },
-      preferTenant: true,
+      // tenantOnly 与 preferTenant 互斥：前者禁用 user 回退，后者允许。
+      ...(options.tenantOnly ? { tenantOnly: true } : { preferTenant: true }),
       beforeProviderEffect: options.beforeProviderEffect,
     });
     const reactionId: string | undefined = res?.data?.reaction_id;

@@ -3082,7 +3082,13 @@ async function markCommentEventDropped(
   // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
   if (!replyId) return;
   try {
-    await addCommentReaction(larkAppId, file, commentId, replyId, DROPPED_REACTION_EMOJI_TYPE);
+    // ⚠️ tenantOnly：**绝不能**回退 user 身份。这个 ❌ 是终态标记、故意不清理，
+    // 一旦以授权用户身份落上去，就是在用户自己的评论上、以用户自己的名义、
+    // 永久挂一个叉 —— 用户会看到「我自己给自己打了个叉」。错误主体的持久写入
+    // 比没有标记更糟，所以 tenant 不行就放弃（下面 catch 里只记日志）。
+    // 对比同文件 Typing 指示器：那个成对、几秒后必被 removeCommentReaction 清掉，
+    // 回退 user 只是短暂误导，故仍用 preferTenant，本 PR 不动它。
+    await addCommentReaction(larkAppId, file, commentId, replyId, DROPPED_REACTION_EMOJI_TYPE, { tenantOnly: true });
   } catch (err) {
     logger.debug(`[doc-comment] failed to mark dropped event on reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
   }
@@ -3143,7 +3149,16 @@ async function processCommentEvent(
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
-    await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
+    // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
+    // 订阅下该文档的**所有**评论事件都会推给我们。拉不到正文时我们无从判断这条
+    // 评论是不是冲 bot 来的，无条件打标记会在**别人的评论上**留 ❌。
+    // 拿不到正文时能做到的最窄收窄：`is_mentioned` 为 false 说明评论里一个 @ 都
+    // 没有，肯定不是找 bot 的。注意这里是用它**收紧**，与代码里「不能用
+    // is_mentioned 放行」的警告不冲突 —— 那条警告说的是 true 不代表 @ 的是本 bot。
+    // 'all' 模式不收窄：那种模式不 @ 也该触发，拉不到就是真丢了。
+    if (sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned) {
+      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
+    }
     return;
   }
   const trigger = parsed.replyId
@@ -3177,7 +3192,23 @@ async function processCommentEvent(
   }
 
   const text = trigger.text.trim();
-  if (!text) return;
+  if (!text) {
+    // ⚠️ 空正文**不等于**用户没说话：`elementsToText` 只拼 text_run，把 person
+    // 元素整个丢掉（doc-comment.ts:elementsToText）。所以一条纯「@bot」、后面
+    // 一个字都没打的评论，走到这里 text 就是空串 —— 用户主观上明确 @ 了 bot，
+    // 客观上却零感知，正是 #1260 要治的症状。这里曾经是个裸 return，连日志都没有。
+    //
+    // 打不打标记按模式分：走到这一步已经过了上面的权威 mention gate，
+    // mention-only 说明**确认 @ 了本 bot**，噪音风险已排除，该打；
+    // 'all' 模式下没 @ 谁的空评论是真的「没说话」，只记日志不打，免得把文档里
+    // 所有无正文评论统一标成错误。
+    const mentionedSelf = sub.commentTriggerMode === 'mention-only';
+    logger.info(`[doc-comment] event dropped: 触发回复无文本正文 (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} marked=${mentionedSelf}) — 纯 @bot 无正文也会落到这里`);
+    if (mentionedSelf) {
+      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, trigger.replyId || parsed.replyId);
+    }
+    return;
+  }
 
   // 审计硬门：非 owner @bot 触发时，必须成功通知 owner 才允许回复。
   // 通知失败 = owner 无法感知 = 越权，直接拒绝响应并回滚 auto-sub。

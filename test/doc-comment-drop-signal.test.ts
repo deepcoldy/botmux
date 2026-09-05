@@ -60,6 +60,17 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     expect(emoji).toBe('ERROR');
   });
 
+  /**
+   * 这个 ❌ 是**终态**标记、故意不清理。若以授权用户身份落上去，就是在用户自己的
+   * 评论上、以用户自己的名义、永久挂一个叉 —— 错误主体的持久写入比没有标记更糟。
+   * 对比 Typing：成对、几秒后必被清掉，回退 user 只是短暂误导，故仍用 preferTenant。
+   */
+  it('必须 tenantOnly —— 绝不以授权用户身份留下永久标记', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID);
+    const opts = mocks.addCommentReaction.mock.calls[0][5];
+    expect(opts).toMatchObject({ tenantOnly: true });
+  });
+
   it('reply_id 缺失时不发请求（reaction 端点要求 comment_id + reply_id 齐全）', async () => {
     await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined);
     expect(mocks.addCommentReaction).not.toHaveBeenCalled();
@@ -79,28 +90,45 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
  */
 describe('processCommentEvent 的接线点（源码形状）', () => {
   const src = readFileSync(new URL('../src/im/lark/event-dispatcher.ts', import.meta.url), 'utf-8');
-  const region = (() => {
-    const start = src.indexOf('async function processCommentEvent');
-    expect(start).toBeGreaterThan(-1);
-    return src.slice(start, src.indexOf('const LARK_WS_PROXY_ENV_KEYS', start));
-  })();
 
-  it('「取不到评论内容」和「触发回复不在回复里」两处都打标记', () => {
-    expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(2);
+  /**
+   * 取源码区间。**每个锚点都必须先断言找得到** —— `indexOf` 找不到返回 -1，
+   * `slice(-1, n)` 会静默给出空串，下面的 `not.toContain` 就必然通过，测试变成
+   * 永远绿的空断言。而这几条负向断言的全部价值就是「防止后续有人把标记顺手扩大
+   * 到所有 return」，假绿等于没测。
+   */
+  function regionBetween(startAnchor: string, endAnchor: string, from = 0): string {
+    const start = src.indexOf(startAnchor, from);
+    expect(start, `锚点失效（源码已变动？）: ${startAnchor}`).toBeGreaterThan(-1);
+    const end = src.indexOf(endAnchor, start);
+    expect(end, `锚点失效（源码已变动？）: ${endAnchor}`).toBeGreaterThan(-1);
+    return src.slice(start, end);
+  }
+
+  const region = regionBetween('async function processCommentEvent', 'const LARK_WS_PROXY_ENV_KEYS');
+
+  it('三个该打的丢弃点都接上了：拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文', () => {
+    expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(3);
+  });
+
+  it('第一个打点（拉不到评论内容）必须收窄，不能在别人的评论上打标记', () => {
+    const firstDrop = regionBetween('取不到评论内容', 'const trigger = parsed.replyId');
+    // mention-only 下拉不到正文时无从判断是不是冲 bot 来的，只能靠 is_mentioned 收紧。
+    expect(firstDrop).toContain(`sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned`);
   });
 
   it('自触发过滤不打标记（那是 bot 自己的回复，打了是自己标自己）', () => {
-    const selfFilter = region.slice(
-      region.indexOf('const selfBotOpenId = getBot(larkAppId).botOpenId;'),
-      region.indexOf('// 4) 触发范围闸'),
+    const selfFilter = regionBetween(
+      'const selfBotOpenId = getBot(larkAppId).botOpenId;',
+      '// 4) 触发范围闸',
     );
     expect(selfFilter).not.toContain('markCommentEventDropped');
   });
 
   it('mention-only 未 @ 本 bot 不打标记（压根不该触发，打了是在别人评论上留噪音）', () => {
-    const gate = region.slice(
-      region.indexOf('if (!commentTriggerAllowed('),
-      region.indexOf('const text = trigger.text.trim();'),
+    const gate = regionBetween(
+      'if (!commentTriggerAllowed(',
+      'const text = trigger.text.trim();',
     );
     expect(gate).not.toContain('markCommentEventDropped');
   });
