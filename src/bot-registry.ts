@@ -3337,15 +3337,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       );
     }
 
-    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
-    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
-    // resolveAsrConfig 做，这里只挡明显垃圾。
+    // Preserve a structured per-bot voice override. Deep credential and ASR
+    // validation remains in the voice service; this parser only rejects an
+    // unknown engine and obviously malformed nested values.
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
       const eng = (rawVoice as any).engine;
-      if (eng === undefined || eng === 'sami' || eng === 'openai') {
+      if (eng === undefined || eng === 'sami' || eng === 'openai' || eng === 'minimax') {
         const v: VoiceConfig = {};
         if (eng) v.engine = eng;
         if (typeof (rawVoice as any).speaker === 'string') v.speaker = (rawVoice as any).speaker;
@@ -3354,6 +3353,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
+        const m = (rawVoice as any).minimax;
+        if (m && typeof m === 'object') v.minimax = {
+          apiKey: typeof m.apiKey === 'string' ? m.apiKey : undefined,
+          model: typeof m.model === 'string' ? m.model : undefined,
+          region: m.region === 'cn' ? 'cn' : m.region === 'global' ? 'global' : undefined,
+        };
         const a = (rawVoice as any).asr;
         if (a && typeof a === 'object') v.asr = {
           enabled: a.enabled === true,
@@ -3363,7 +3368,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
           ...(typeof a.language === 'string' ? { language: a.language } : {}),
         };
-        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
+        if (v.engine || v.sami || v.openai || v.minimax || v.speaker || v.asr) voice = v;
       }
     }
 

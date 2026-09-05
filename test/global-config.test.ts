@@ -68,6 +68,23 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads a MiniMax voice engine configuration', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: {
+        engine: 'minimax',
+        speaker: 'voice-id',
+        minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+
   it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: { noVisibleOutputHint: true },

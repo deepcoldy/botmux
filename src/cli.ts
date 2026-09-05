@@ -13512,7 +13512,12 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
 async function cmdVoiceSetup(args: string[]): Promise<void> {
   const sub = (args[0] ?? '').toLowerCase();
   const { readGlobalConfig, mergeGlobalConfig } = await import('./global-config.js');
-  const { DEFAULT_SAMI_SPEAKER, DEFAULT_OPENAI_SPEAKER } = await import('./services/voice/index.js');
+  const {
+    DEFAULT_SAMI_SPEAKER,
+    DEFAULT_OPENAI_SPEAKER,
+    DEFAULT_MINIMAX_SPEAKER,
+    DEFAULT_MINIMAX_TTS_MODEL,
+  } = await import('./services/voice/index.js');
   const mask = (s?: string) => (s ? `${s.slice(0, 4)}***` : '(未设)');
 
   if (sub === 'status') {
@@ -13524,6 +13529,7 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
     if (typeof v.rate === 'number') console.log(`  语速: ${v.rate}`);
     if (v.sami) console.log(`  SAMI: accessKey=${mask(v.sami.accessKey)} secretKey=${mask(v.sami.secretKey)} appkey=${v.sami.appkey ?? '(未设)'}${v.sami.tokenUrl ? ` tokenUrl=${v.sami.tokenUrl}` : ''}`);
     if (v.openai) console.log(`  OpenAI: baseUrl=${v.openai.baseUrl ?? '(未设)'} model=${v.openai.model ?? '(未设)'} apiKey=${mask(v.openai.apiKey)}`);
+    if (v.minimax) console.log(`  MiniMax: region=${v.minimax.region ?? 'global'} model=${v.minimax.model ?? DEFAULT_MINIMAX_TTS_MODEL} apiKey=${mask(v.minimax.apiKey)}`);
     return;
   }
   if (sub === 'disable' || sub === 'off') {
@@ -13588,9 +13594,20 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     console.log('🔊 配置语音总结（高级功能）。写入全局 ~/.botmux/config.json，重启后生效。\n');
+    console.log('Additional engine: [3] MiniMax');
     const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）: ')).trim();
     const voice: Record<string, any> = {};
-    if (eng === '2' || /openai/i.test(eng)) {
+    if (eng === '3' || /minimax/i.test(eng)) {
+      voice.engine = 'minimax';
+      const apiKey = (await ask(rl, 'MiniMax API key: ')).trim();
+      if (!apiKey) { console.error('MiniMax API key is required; no configuration was written.'); return; }
+      const regionAnswer = (await ask(rl, 'Region [1] Global [2] China (default 1): ')).trim();
+      const region = regionAnswer === '2' || /^(cn|china)$/i.test(regionAnswer) ? 'cn' : 'global';
+      const model = (await ask(rl, `Model (default ${DEFAULT_MINIMAX_TTS_MODEL}): `)).trim() || DEFAULT_MINIMAX_TTS_MODEL;
+      voice.minimax = { apiKey, region, model };
+      const sp = (await ask(rl, `Voice id (default ${DEFAULT_MINIMAX_SPEAKER}): `)).trim();
+      if (sp) voice.speaker = sp;
+    } else if (eng === '2' || /openai/i.test(eng)) {
       voice.engine = 'openai';
       const baseUrl = (await ask(rl, 'baseUrl（如 https://api.openai.com/v1，自托管如 http://127.0.0.1:8880/v1）: ')).trim();
       const apiKey = (await ask(rl, 'apiKey（无则留空）: ')).trim();
