@@ -563,6 +563,43 @@ process.exit(result.status ?? 1);
     expect(lstatSync(join(resumed.home, '.byte_cli', 'auth')).isSymbolicLink()).toBe(true);
   });
 
+  it('links the host bytedcli state directory into the isolated HOME', () => {
+    const { root, contract } = fixture();
+    const hostHome = join(root, 'host-home-bytedcli');
+    const hostStore = join(hostHome, '.local', 'share', 'bytedcli');
+    mkdirSync(join(hostStore, 'data', 'bytecloud-auth'), { recursive: true });
+    writeFileSync(join(hostStore, 'data', 'sso_session.json'), '{"site":"cn"}\n');
+
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-bytedcli-seed',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    const link = join(runtime.home, '.local', 'share', 'bytedcli');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(realpathSync(link)).toBe(realpathSync(hostStore));
+    expect(readFileSync(join(link, 'data', 'sso_session.json'), 'utf8')).toContain('"site":"cn"');
+    // No byte-cli store on this host: nothing is fabricated for it.
+    expect(existsSync(join(runtime.home, '.byte_cli'))).toBe(false);
+
+    // A stale empty bytedcli directory left by an executor run before seeding is replaced.
+    const legacyHome = join(root, 'candidate-runtime', 'session-bytedcli-legacy', 'home');
+    mkdirSync(join(legacyHome, '.local', 'share', 'bytedcli'), { recursive: true });
+    const legacy = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-bytedcli-legacy',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      credentialHome: hostHome,
+    }, botmuxIdentity(contract));
+    expect(legacy.home).toBe(legacyHome);
+    expect(lstatSync(join(legacy.home, '.local', 'share', 'bytedcli')).isSymbolicLink()).toBe(true);
+  });
+
   it('skips credential seeding when the host store is absent and never destroys live state', () => {
     const { root, contract } = fixture();
     const runtime = prepareCandidateCocoHome({

@@ -793,19 +793,16 @@ export function prepareCandidateCocoHome(input: {
   };
 }
 
-// Employee evidence skills (argos-log / tce-query) authenticate through
-// byte-cli, which resolves its credential store as $HOME/.byte_cli/auth. The
-// host store is maintained by the credential vault and rotates hourly, so the
-// isolated HOME gets a symlink to the host auth directory — rotation
-// propagates without re-seeding, and executor log writes stay local. A
-// pre-existing real auth directory (legacy session homes created before
-// seeding existed) is replaced only when empty; a non-empty one is left
-// untouched so live session state is never destroyed mid-flight.
-function linkEmployeeCredentialAuth(home: string, hostHome: string = homedir()): void {
-  const hostAuth = join(hostHome, '.byte_cli', 'auth');
-  if (!existsSync(hostAuth) || !lstatSync(hostAuth).isDirectory()) return;
-  const target = join(home, '.byte_cli');
-  const link = join(target, 'auth');
+// Employee evidence skills authenticate through CLIs that resolve their
+// credential store under $HOME. The host stores are maintained on the daemon
+// host (bytedcli refreshes its own bytecloud session; the byte-cli store is
+// rotated by the credential vault), so the isolated HOME gets a symlink to
+// each host directory — rotation propagates without re-seeding, and executor
+// log writes stay local. A pre-existing real directory (legacy session homes
+// created before seeding existed) is replaced only when empty; a non-empty
+// one is left untouched so live session state is never destroyed mid-flight.
+function linkHostCredentialDirectory(hostDir: string, link: string): void {
+  if (!existsSync(hostDir) || !lstatSync(hostDir).isDirectory()) return;
   let existing: ReturnType<typeof lstatSync> | null = null;
   try {
     existing = lstatSync(link);
@@ -814,7 +811,7 @@ function linkEmployeeCredentialAuth(home: string, hostHome: string = homedir()):
   }
   if (existing) {
     if (existing.isSymbolicLink()) {
-      if (realpathSync(link) !== realpathSync(hostAuth)) {
+      if (realpathSync(link) !== realpathSync(hostDir)) {
         throw new Error(`Candidate credential binding conflicts at ${link}`);
       }
       return;
@@ -825,8 +822,25 @@ function linkEmployeeCredentialAuth(home: string, hostHome: string = homedir()):
       return;
     }
   }
-  mkdirSync(target, { recursive: true, mode: 0o700 });
-  symlinkSync(hostAuth, link, 'dir');
+  mkdirSync(dirname(link), { recursive: true, mode: 0o700 });
+  symlinkSync(hostDir, link, 'dir');
+}
+
+// Every evidence skill the Search RCA release ships is bytedcli-backed
+// (bytedance-apm / -log / -tce / ..., search-platform), and bytedcli keeps its
+// whole state — the bytecloud-auth session, JWT cache, plugin lock — under
+// $HOME/.local/share/bytedcli. The byte-cli store ($HOME/.byte_cli/auth) is
+// still linked for one release so sessions started on the previous skill set
+// keep their credential.
+function linkEmployeeCredentialAuth(home: string, hostHome: string = homedir()): void {
+  linkHostCredentialDirectory(
+    join(hostHome, '.local', 'share', 'bytedcli'),
+    join(home, '.local', 'share', 'bytedcli'),
+  );
+  linkHostCredentialDirectory(
+    join(hostHome, '.byte_cli', 'auth'),
+    join(home, '.byte_cli', 'auth'),
+  );
 }
 
 export function prepareCandidateRuntimeHome(input: {
