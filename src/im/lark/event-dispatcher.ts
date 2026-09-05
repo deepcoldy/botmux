@@ -3078,9 +3078,40 @@ async function markCommentEventDropped(
   file: { fileToken: string; fileType: string },
   commentId: string,
   replyId: string | undefined,
+  requesterOpenId: string | undefined,
 ): Promise<void> {
   // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
   if (!replyId) return;
+
+  // ⚠️ 审计硬门：打标记是 **provider-visible 的持久外部写入**，不是内部日志，
+  // 必须受和「回复」同一套审计约束 —— 现有不变量是「非 owner 触发时，owner
+  // 无法感知 = 越权」。但这些丢弃点全都在下面那道审计门**之前**，而且前两处
+  // 连评论正文都没读到，构造不出审计门要发的通知（通知正文含 text 摘要）。
+  // 所以这里取**保守侧**：只有 owner 本人触发才打标记，非 owner 一律只记日志。
+  //
+  // 代价是非 owner 触发时用户仍然零感知 —— 但那是 #1260 的既有症状，
+  // 而越权留下一个绕过审计的永久外部写入是**新引入**的问题，孰轻孰重很清楚。
+  // 对比 Typing：它在 handleDocComment 入场后才加，而入场发生在审计门之后，
+  // 所以它本来就不存在这个绕过，不需要跟着改。
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (!ownerOpenId || !requesterOpenId || requesterOpenId !== ownerOpenId) {
+    logger.info(`[doc-comment] dropped-signal skipped (audit gate): 非 owner 触发不打标记 comment=${commentId.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+    return;
+  }
+
+  // ⚠️ 自触发过滤：正常那道（`trigger.userId === selfBotOpenId` 等三重保险）在
+  // 下面，前两个丢弃点**跑在它之前**，所以必须在这里自己挡一次，否则 bot 会给
+  // 自己的回复打 ❌。缺正文时可用的两个信号：
+  //   ① 事件操作者就是本 bot（应用身份发的评论）
+  //   ② reply_id 在本进程「bot 创建过」的集合里（用户身份发的评论，作者分不出）
+  // 信号 ② 尤其关键：bot 回退 user 身份发评论时作者 = 授权用户 = owner，
+  // 恰好**穿过上面那道 owner 审计门** —— 只靠审计门挡不住这种自标。
+  const selfBotOpenId = getBot(larkAppId).botOpenId;
+  if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
+    logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
+    return;
+  }
+
   try {
     // ⚠️ tenantOnly：**绝不能**回退 user 身份。这个 ❌ 是终态标记、故意不清理，
     // 一旦以授权用户身份落上去，就是在用户自己的评论上、以用户自己的名义、
@@ -3157,7 +3188,7 @@ async function processCommentEvent(
     // is_mentioned 放行」的警告不冲突 —— 那条警告说的是 true 不代表 @ 的是本 bot。
     // 'all' 模式不收窄：那种模式不 @ 也该触发，拉不到就是真丢了。
     if (sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned) {
-      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
+      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId, parsed.operatorOpenId);
     }
     return;
   }
@@ -3171,7 +3202,7 @@ async function processCommentEvent(
   // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
   if (!trigger) {
     logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
-    await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
+    await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId, parsed.operatorOpenId);
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
@@ -3205,7 +3236,7 @@ async function processCommentEvent(
     const mentionedSelf = sub.commentTriggerMode === 'mention-only';
     logger.info(`[doc-comment] event dropped: 触发回复无文本正文 (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} marked=${mentionedSelf}) — 纯 @bot 无正文也会落到这里`);
     if (mentionedSelf) {
-      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, trigger.replyId || parsed.replyId);
+      await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, trigger.replyId || parsed.replyId, parsed.operatorOpenId);
     }
     return;
   }

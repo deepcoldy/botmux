@@ -12,25 +12,36 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   addCommentReaction: vi.fn(),
+  isBotAuthoredReply: vi.fn(() => false),
+  getOwnerOpenId: vi.fn(() => 'ou_owner'),
+  getBot: vi.fn(() => ({ botOpenId: 'ou_selfbot', config: {} })),
   debug: vi.fn(),
+  info: vi.fn(),
 }));
 
 vi.mock('../src/im/lark/doc-comment.js', () => ({
   addCommentReaction: mocks.addCommentReaction,
   getDocComment: vi.fn(),
-  isBotAuthoredReply: vi.fn(() => false),
+  isBotAuthoredReply: mocks.isBotAuthoredReply,
   hasBotSentinel: vi.fn(() => false),
   commentTriggerAllowed: vi.fn(() => true),
   BOT_REPLY_SENTINEL: '​',
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { debug: mocks.debug, error: vi.fn(), info: vi.fn(), warn: vi.fn() },
+  logger: { debug: mocks.debug, error: vi.fn(), info: mocks.info, warn: vi.fn() },
+}));
+
+vi.mock('../src/bot-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getOwnerOpenId: mocks.getOwnerOpenId,
+  getBot: mocks.getBot,
 }));
 
 const FILE = { fileToken: 'DocToken1234567890123456', fileType: 'docx' };
 const COMMENT_ID = '7681622822925421500';
 const REPLY_ID = '7681633934731430857';
+const OWNER = 'ou_owner';
 
 describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', () => {
   let markCommentEventDropped: (
@@ -38,17 +49,22 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     file: { fileToken: string; fileType: string },
     commentId: string,
     replyId: string | undefined,
+    requesterOpenId: string | undefined,
   ) => Promise<void>;
 
   beforeEach(async () => {
     mocks.addCommentReaction.mockReset().mockResolvedValue('reaction-1');
+    mocks.isBotAuthoredReply.mockReset().mockReturnValue(false);
+    mocks.getOwnerOpenId.mockReset().mockReturnValue(OWNER);
+    mocks.getBot.mockReset().mockReturnValue({ botOpenId: 'ou_selfbot', config: {} });
     mocks.debug.mockReset();
+    mocks.info.mockReset();
     ({ __testOnly_markCommentEventDropped: markCommentEventDropped } =
       await import('../src/im/lark/event-dispatcher.js'));
   });
 
   it('给触发回复打 ERROR reaction（用飞书文档里确实存在的 emoji_type）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
 
     expect(mocks.addCommentReaction).toHaveBeenCalledTimes(1);
     const [appId, file, commentId, replyId, emoji] = mocks.addCommentReaction.mock.calls[0];
@@ -66,20 +82,59 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
    * 对比 Typing：成对、几秒后必被清掉，回退 user 只是短暂误导，故仍用 preferTenant。
    */
   it('必须 tenantOnly —— 绝不以授权用户身份留下永久标记', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
     const opts = mocks.addCommentReaction.mock.calls[0][5];
     expect(opts).toMatchObject({ tenantOnly: true });
   });
 
   it('reply_id 缺失时不发请求（reaction 端点要求 comment_id + reply_id 齐全）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined, OWNER);
     expect(mocks.addCommentReaction).not.toHaveBeenCalled();
   });
 
   it('打标记失败不外抛 —— 丢弃路径本身已经是失败路径，不能再被它拖垮', async () => {
     mocks.addCommentReaction.mockRejectedValue(new Error('reaction endpoint down'));
-    await expect(markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID)).resolves.toBeUndefined();
+    await expect(markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER)).resolves.toBeUndefined();
     expect(mocks.debug).toHaveBeenCalled();
+  });
+
+  /**
+   * 审计硬门：打标记是 provider-visible 的持久外部写入，不是内部日志。既有不变量
+   * 是「非 owner 触发时 owner 无法感知 = 越权」。这些丢弃点全在那道门之前，且前两处
+   * 读不到正文、构造不出门要发的通知，所以取保守侧：只有 owner 本人触发才打。
+   */
+  it('非 owner 触发不打标记（不能绕过审计硬门做外部写入）', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else');
+    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+  });
+
+  it('owner 未配置时不打标记（无从判定越权，保守拒绝）', async () => {
+    mocks.getOwnerOpenId.mockReturnValue(undefined);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
+    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+  });
+
+  it('operator 缺失时不打标记（判不出是谁触发的）', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, undefined);
+    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 自触发：正常那道 self-filter 在下面，前两个丢弃点跑在它之前，必须自己挡一次。
+   */
+  it('触发者是 bot 自己（应用身份）不打标记 —— 否则给自己打 ❌', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_selfbot');
+    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 最刁钻的一条：bot 回退 user 身份发评论时作者 = 授权用户 = owner，
+   * **恰好穿过上面那道 owner 审计门**。只有 isBotAuthoredReply 挡得住。
+   */
+  it('bot 以 user 身份发的回复（作者=owner）也不打标记 —— 审计门挡不住这种自标', async () => {
+    mocks.isBotAuthoredReply.mockReturnValue(true);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
+    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
   });
 });
 
@@ -118,11 +173,13 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
   });
 
   it('自触发过滤不打标记（那是 bot 自己的回复，打了是自己标自己）', () => {
+    // 锚在 processCommentEvent 里的那段注释上 —— helper 内部也有个 selfBotOpenId
+    // 声明（它自己挡了一次自触发），直接锚变量名会命中 helper、把区间撑到整个文件。
     const selfFilter = regionBetween(
-      'const selfBotOpenId = getBot(larkAppId).botOpenId;',
+      '// 3) 自触发过滤（防死循环）',
       '// 4) 触发范围闸',
     );
-    expect(selfFilter).not.toContain('markCommentEventDropped');
+    expect(selfFilter).not.toMatch(/markCommentEventDropped\(/);
   });
 
   it('mention-only 未 @ 本 bot 不打标记（压根不该触发，打了是在别人评论上留噪音）', () => {
@@ -130,6 +187,6 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
       'if (!commentTriggerAllowed(',
       'const text = trigger.text.trim();',
     );
-    expect(gate).not.toContain('markCommentEventDropped');
+    expect(gate).not.toMatch(/markCommentEventDropped\(/);
   });
 });
