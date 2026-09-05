@@ -77,7 +77,6 @@ function readIsolationEnforceable(larkAppId: string): boolean {
 }
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
-import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
 import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
@@ -3595,49 +3594,6 @@ ipcRoute('POST', '/api/groups/:chatId/leave', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const r = await groupsStore.leaveChat(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, r);
-});
-
-// 平台团队大厅打卡：dashboard 在 team-sync 后编排本机 bot 往大厅（bot-only 群）
-// 发登记消息。实测大厅只有「直接点名 @」会投递（普通消息/自 @/@all 全部静默），
-// 所以打卡消息点名 @ 本机其他未入册 bot（mentionNames，open_id 由本 app 的
-// cross-ref 解析——open_id 是 per-app 的，只有发送方自己能解析），被点到的 bot
-// 从 mentions 学到自己的 union_id。回声路径保留（有 receive-all scope 的应用仍可
-// 从自家消息学）。已入册且无人可教时幂等跳过。
-ipcRoute('POST', '/api/platform/hall-announce', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
-  let body: { chatId?: unknown; mentionNames?: unknown };
-  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
-  if (!/^oc_[0-9a-f]+$/i.test(chatId)) return jsonRes(res, 400, { ok: false, error: 'bad_chat_id' });
-  const mentionNames = Array.isArray(body.mentionNames)
-    ? body.mentionNames.filter((x): x is string => typeof x === 'string' && !!x.trim())
-    : [];
-  // 解析点名目标：name → 本 app 视角的 open_id（cross-ref，来自历史 @ 事件）。解析不到的跳过。
-  const resolved: Array<{ name: string; openId: string }> = [];
-  if (mentionNames.length) {
-    try {
-      const map: Record<string, string> = JSON.parse(
-        readFileSync(join(config.session.dataDir, `bot-openids-${cachedLarkAppId}.json`), 'utf-8'),
-      );
-      for (const name of mentionNames) {
-        const openId = map[name];
-        if (typeof openId === 'string' && openId.startsWith('ou_')) resolved.push({ name, openId });
-      }
-    } catch { /* 无 cross-ref → 全部解析失败，退化为普通打卡 */ }
-  }
-  if (getBotUnionId(config.session.dataDir, cachedLarkAppId) && resolved.length === 0) {
-    return jsonRes(res, 200, { ok: true, skipped: 'already_learned' });
-  }
-  try {
-    const atPrefix = resolved.map((r) => `<at user_id="${r.openId}">${r.name}</at> `).join('');
-    // 自己还没入册 → 带 #hall-echo 请求回执：被点到的 bot 会 @ 回我们一次，
-    // 我们从回执的 mentions[] 学到自己的 union_id（见 event-dispatcher hall 分支）。
-    const echoTag = getBotUnionId(config.session.dataDir, cachedLarkAppId) ? '' : ' #hall-echo';
-    await sendMessage(cachedLarkAppId, chatId, atPrefix + t('platform.hall_announce', undefined, localeForBot(cachedLarkAppId)) + echoTag, 'text');
-    jsonRes(res, 200, { ok: true, mentioned: resolved.map((r) => r.name), unresolved: mentionNames.filter((n) => !resolved.some((r) => r.name === n)) });
-  } catch (e) {
-    jsonRes(res, 502, { ok: false, error: `send_failed: ${(e as Error).message}` });
-  }
 });
 
 // ─── Oncall bindings (dashboard) ───────────────────────────────────────────
