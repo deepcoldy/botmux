@@ -4146,7 +4146,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork <task>` hosts it in a new sibling topic of the same chat;
+        // both topic groups and native topics inside regular groups are valid.
         // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
@@ -4210,17 +4211,6 @@ export async function handleCommand(
             break;
           }
           if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-            break;
-          }
-          let chatMode: string | undefined;
-          try {
-            chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-          } catch {
-            // Treat an unknown mode as unsupported: sending a top-level message
-            // to a regular group would not create the isolated topic we promise.
-          }
-          if (chatMode !== 'topic') {
             await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
             break;
           }
@@ -5126,7 +5116,8 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current session into a new sub-topic of the same topic group.
+/** Fork the current thread-scoped session into a new sibling topic of the same
+ *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
  *  and records display-only lineage for the parent panel. */

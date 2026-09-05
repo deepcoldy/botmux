@@ -1658,7 +1658,8 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
-    it('creates a child topic and forwards the multiline task as the first fork turn', async () => {
+    it('creates a child topic in a regular group and forwards the multiline task as the first fork turn', async () => {
+      vi.mocked(getChatModeStrict).mockResolvedValue('group');
       const ds = makeDaemonSession({
         scope: 'thread',
         lastScreenStatus: 'idle',
@@ -1679,7 +1680,9 @@ describe('handleCommand', () => {
         LARK_APP_ID,
       );
 
-      expect(getChatModeStrict).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+      // A thread-scoped source is sufficient. The containing chat does not
+      // need to be a topic group; regular groups can host native topics too.
+      expect(getChatModeStrict).not.toHaveBeenCalled();
       expect(sendMessage).toHaveBeenCalledWith(
         LARK_APP_ID,
         CHAT_ID,
@@ -1716,6 +1719,33 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('omt_child'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('keeps a regular-group top-level chat session out of the topic fork path', async () => {
+      vi.mocked(getChatModeStrict).mockResolvedValue('group');
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+          scope: 'chat',
+          rootMessageId: CHAT_ID,
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 继续排查'), deps, LARK_APP_ID);
+
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已有独立会话的话题'),
         undefined,
         LARK_APP_ID,
         'msg_001',
