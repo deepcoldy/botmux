@@ -57,6 +57,11 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // See the Gemini adapter for the measured tmux ceiling. MTR bakes the
+    // first round into `--prompt <content>` and declares no budget, so the
+    // same `command too long` launch failure applies. 8 KB matches OpenCode
+    // (#1251); over-limit prompts defer to the post-start input queue.
+    maxInitialPromptArgBytes: 8192,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.sendText && pty.sendSpecialKeys) {
