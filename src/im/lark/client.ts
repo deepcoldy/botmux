@@ -5,7 +5,7 @@ import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
+import { emitHookEvent, evaluatePromptGate, hasSyncGateHooks, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
@@ -280,6 +280,69 @@ async function emitOutboundHookIfAllowed(
   }
 }
 
+/**
+ * Is an `outbound.pre_send` gate configured right now? Synchronous on purpose.
+ *
+ * Callers branch on this BEFORE awaiting anything: an `await` placed ahead of
+ * the Lark API call defers that call by a microtask, and fire-and-forget
+ * callers (`void sendUserMessage(...)` in notifyVcMeetingInviteFailure) plus
+ * anything asserting straight after them can observe the difference. With no
+ * gate configured this feature must be invisible — call ordering included, not
+ * just behaviour.
+ */
+function outboundGateArmed(): boolean {
+  return hasSyncGateHooks('outbound.pre_send');
+}
+
+/**
+ * Thrown when an `outbound.pre_send` sync gate hook rejected a message BEFORE
+ * it reached Lark. Distinct from a transport failure: nothing was sent, there
+ * is no messageId, and retrying verbatim will be rejected again.
+ */
+export class OutboundBlockedError extends Error {
+  readonly blockedReason?: string;
+  constructor(surface: string, reason?: string) {
+    super(`outbound.pre_send hook blocked ${surface}${reason ? `: ${reason}` : ''}`);
+    this.name = 'OutboundBlockedError';
+    this.blockedReason = reason;
+  }
+}
+
+/**
+ * Ask the `outbound.pre_send` sync gate before handing anything to Lark.
+ *
+ * Unlike `outbound.send`/`outbound.reply` — which fire only after the API call
+ * succeeded and therefore cannot intercept anything — this runs BEFORE the
+ * call, so a `deny` means the message never reaches the chat.
+ *
+ * Throws `OutboundBlockedError` on deny so a caller cannot mistake a blocked
+ * send for a successful one (each of these functions is typed to return a
+ * messageId; inventing a fake one would be worse). With no sync hook configured
+ * `evaluatePromptGate` returns allow without spawning anything.
+ */
+async function assertOutboundAllowed(
+  surface: 'sendMessage' | 'replyMessage' | 'sendUserMessage' | 'sendEphemeralCard',
+  larkAppId: string,
+  payload: Record<string, unknown>,
+  options?: OutboundMessageOptions,
+): Promise<void> {
+  // `suppressHook` already means "this delivery is not a hook-visible event"
+  // (internal re-renders and the like); honour it here too so the two hook
+  // families stay consistent about what counts as an outbound message.
+  if (options?.suppressHook) return;
+  const decision = await evaluatePromptGate('outbound.pre_send', {
+    ...payload,
+    surface,
+    larkAppId,
+  });
+  if (decision.allowed) return;
+  logger.info(
+    `[hooks:${larkAppId}] outbound.pre_send blocked ${surface}`
+    + `${decision.reason ? `: ${decision.reason}` : ''}`,
+  );
+  throw new OutboundBlockedError(surface, decision.reason);
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -290,6 +353,7 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  if (outboundGateArmed()) await assertOutboundAllowed('sendMessage', larkAppId, { chatId, msgType, uuid, content, ...hookContext }, options);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
@@ -353,6 +417,7 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  if (outboundGateArmed()) await assertOutboundAllowed('replyMessage', larkAppId, { replyToMessageId: messageId, msgType, replyInThread, uuid, content, ...hookContext }, options);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
@@ -590,6 +655,7 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  if (outboundGateArmed()) await assertOutboundAllowed('sendUserMessage', larkAppId, { toOpenId: openId, msgType, uuid, content });
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
@@ -1075,6 +1141,7 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
+  if (outboundGateArmed()) await assertOutboundAllowed('sendEphemeralCard', larkAppId, { chatId, toOpenId: openId, msgType: 'interactive', content: cardJson });
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;

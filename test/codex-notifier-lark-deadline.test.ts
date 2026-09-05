@@ -18,6 +18,10 @@ vi.mock('../src/bot-registry.js', () => ({
 
 vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: vi.fn(),
+  // sendUserMessage now asks the outbound.pre_send gate before hitting Lark;
+  // with no sync hook configured the real one allows without spawning.
+  evaluatePromptGate: vi.fn(async () => ({ allowed: true })),
+  hasSyncGateHooks: vi.fn(() => false),
 }));
 
 import { getMessageChatId, sendUserMessage } from '../src/im/lark/client.js';

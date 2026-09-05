@@ -1,6 +1,8 @@
 # Lifecycle Hooks
 
-botmux can **asynchronously invoke external commands** when key lifecycle events occur. If a command fails, times out, or doesn't exist, it only writes to the log and never blocks botmux's main flow.
+botmux can invoke external commands when key lifecycle events occur. By default they are **asynchronous**: if a command fails, times out, or doesn't exist, it only writes to the log and never blocks botmux's main flow.
+
+There is also a **synchronous pre-submit gate** (`mode: "sync"`, supported only on the `prompt.submit` event): the daemon waits for it and uses its verdict to decide whether the message reaches the CLI. See [Synchronous pre-submit gate](#synchronous-pre-submit-gate-promptsubmit).
 
 ## Configuration Location
 
@@ -52,9 +54,13 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `event` | string | Required. The event name to subscribe to (see table below) |
 | `command` | string | Required. The external executable command; supports arguments, but is not run through a shell |
 | `timeoutMs` | number | Optional. Defaults to 5000; on timeout, sends `SIGTERM` first, then falls back to `SIGKILL` |
+| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async`. `sync` is supported **only** on `prompt.submit`; declaring it on any other event degrades to `async` with a warning in the log |
+| `onError` | `"allow"`｜`"deny"` | Optional, meaningful only with `mode:"sync"`. Fallback direction when the hook itself fails (timeout / missing command / crash). Defaults to `allow` (fail-open) |
 | `filter.chatId` | string｜string[] | Optional. Only match the chat of the specified Lark group / topic |
 | `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
 | `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
+
+> **To block an outgoing message use `outbound.pre_send`** (fires before the API call and can actually stop it). `outbound.send` / `outbound.reply` are **post-send notifications**: they fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat. Declaring `sync` on them degrades to async with a warning.
 
 ## Supported Events
 
@@ -62,6 +68,8 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 |------|----------|
 | `topic.new` | A new topic / @mention is received |
 | `thread.reply` | A reply to an existing topic is received |
+| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Supports `mode:"sync"` blocking |
+| `outbound.pre_send` | botmux is **about to send a message to Lark** (before the API call). Supports `mode:"sync"` blocking |
 | `outbound.send` | botmux successfully sends a regular message |
 | `outbound.reply` | botmux successfully replies to a topic message |
 | `schedule.fired` | A scheduled task finishes running |
@@ -79,6 +87,8 @@ Different events carry extra fields:
 | Event | Extra fields |
 |------|----------|
 | `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
+| `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` (`[{type,name}]`, metadata only) |
+| `outbound.pre_send` | `surface` (`sendMessage`｜`replyMessage`｜`sendUserMessage`｜`sendEphemeralCard`), `larkAppId`, `content`, `msgType`, `chatId`/`toOpenId`/`replyToMessageId` (depends on surface), `uuid` |
 | `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
 | `outbound.send` | `messageId`, `msgType`, `uuid`, `content` |
 | `outbound.reply` | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
@@ -89,6 +99,111 @@ Different events carry extra fields:
 | `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
 
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
+
+## Synchronous pre-submit gate (prompt.submit)
+
+A regular hook is a *notification* — nothing reads its result. `prompt.submit` with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the message accordingly. Use it to add a custom authorization layer before a message reaches the CLI (an internal permission service, working-hours limits, dangerous-command interception, …).
+
+```json
+[
+  {
+    "event": "prompt.submit",
+    "mode": "sync",
+    "command": "/root/bin/prompt-gate.sh",
+    "timeoutMs": 3000,
+    "onError": "allow"
+  }
+]
+```
+
+A ready-to-adapt example ships in the repo: `examples/hooks/prompt-gate.sh`.
+
+### When it fires
+
+**The gate runs *before* the prompt is handed to the CLI — not "typed into the box, before Enter".**
+
+That second moment does not exist in botmux: writing the text and pressing Enter are a single atomic adapter call (`writeInput` types line by line and the trailing Enter *is* the submit), with no insertion point between them.
+
+```
+Lark message → built-in permission checks → 🚦 prompt.submit gate → charge quota
+   → download attachments → createSession/forkWorker → IPC to worker
+   → writeInput (type + Enter, atomic) → CLI
+```
+
+The gate runs in the **daemon** process, before the CLI subprocess has this turn's input at all (for a new topic the CLI has not even been forked). A denied message never existed as far as the CLI is concerned.
+
+### Expressing a verdict
+
+Two ways; **JSON on stdout takes precedence over the exit code**:
+
+| Method | How | Notes |
+|------|------|------|
+| JSON (recommended) | print `{"decision":"deny","reason":"..."}` on stdout | `reason` is shown to the user; `decision` is `allow`｜`deny` |
+| Exit code | print no JSON, `exit 0` / non-zero | 0 allows, non-zero denies; stderr is used as the reason |
+
+Stdout must be a **whole JSON object** to count as a verdict. Printing an ordinary log line will not be mistaken for one — that case falls back to the exit code.
+
+### Boundaries and guarantees
+
+- **It can only tighten, never loosen.** The built-in permission model (`allowedUsers` / `grant` / oncall / quota) runs first; the hook is asked only after all of it passes. A hook returning `allow` cannot let in someone the built-in gate rejected.
+- **A rejection costs no quota.** The gate sits before the charge, so a denied message does not consume the user's message quota.
+- **A rejection tells the user** (with `reason`) instead of dropping silently — an authorized user whose messages vanish is the hardest failure to diagnose.
+- **Multiple sync hooks are ANDed.** Any `deny` rejects; hooks after the first `deny` do not run.
+- **A broken hook is not a rejection.** Timeout, missing command, and crashes all follow `onError`, which defaults to `allow` — a broken checker should not brick the whole bot. Set `onError: "deny"` explicitly for the opposite.
+- **The latency lands directly on the inbound path.** Keep `timeoutMs` small (1–3s). Bot-level admission is concurrent so a slow gate will not stall the whole daemon, but replies **within one topic** hold an ordering lock — a slow gate makes later messages in that topic queue up. Do not lean on a large timeout to paper over a slow service. With no sync hook configured there is zero overhead — no spawn is added per message.
+- **Message-listener traffic is adjudicated too.** That content comes from third parties (alert bots and the like) and still reaches a CLI, so it is exactly what a gate should inspect. That path never charges quota; a denial is logged only, with no reply (there is no human sender to answer).
+- **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
+  ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
+- **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
+- **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks and workflow-generated prompts do not** — those are automation the operator pre-authorized, not external input. Do not read the gate as "everything reaching the CLI was checked".
+- A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
+
+## Pre-send gate (outbound.pre_send)
+
+The mirror image of `prompt.submit`: that one gates messages coming **in**, this one gates messages botmux is about to send **out**. Use it to keep secrets, internal details, or out-of-policy content from reaching a Lark chat.
+
+```json
+[
+  {
+    "event": "outbound.pre_send",
+    "mode": "sync",
+    "command": "/root/bin/outbound-gate.sh",
+    "timeoutMs": 2000,
+    "onError": "allow"
+  }
+]
+```
+
+Verdicts work exactly as for `prompt.submit` (stdout JSON takes precedence over the exit code).
+
+### Which send paths are covered
+
+| Function | Used for | Gated |
+|---|---|---|
+| `sendMessage` | chat messages (including `botmux send`) | ✅ |
+| `replyMessage` | replies inside a topic | ✅ |
+| `sendUserMessage` | direct messages | ✅ |
+| `sendEphemeralCard` | ephemeral, single-viewer cards | ✅ |
+| `updateMessage` | **editing an existing card** | ❌ not gated (not a new send) |
+
+The `surface` field in the payload tells you which one, so a hook can apply different rules per path.
+
+### How it differs from `outbound.send`
+
+| | `outbound.pre_send` | `outbound.send` / `outbound.reply` |
+|---|---|---|
+| Timing | **before** the Lark API call | **after** the call succeeds |
+| Can block | ✅ the message never reaches the chat | ❌ already delivered |
+| Has `messageId` | no (nothing sent yet) | yes |
+| Supports `sync` | ✅ | ❌ (degrades to async with a warning) |
+
+### What a block does
+
+> ⚠️ A blocked send **throws `OutboundBlockedError`** rather than quietly returning a fake messageId — these functions are typed to return a message id, and inventing one would make callers believe the send succeeded.
+>
+> Existing error handling absorbs it (the inbound paths have a catch-all, and the failure notice itself is wrapped in try/catch so a blocked notice cannot loop). But this **is** a behaviour change: with a gate configured and actually denying, those code paths take their error branch. Roll it out with `onError: "allow"` and an observe-only script first, confirm what it would have blocked, then switch to real denials.
+
+With no `outbound.pre_send` gate configured, the check is a synchronous no-op — it adds no process spawn and no extra microtask before the API call, so call ordering is byte-for-byte what it was before the feature existed.
 
 ## Practical: Auto-Update Skills with session.start
 
