@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import type { LinuxPm2GodProcess } from '../core/pm2-lifecycle-owner.js';
+import { buildPm2HelperSpawn, PM2_EXISTING_CLIENT_SUBCOMMAND } from './pm2-helper-spawn.js';
 
 const ABSENT_EXIT_CODE = 4;
 
@@ -44,16 +43,19 @@ function mutationFromArgs(args: string[]): ExistingPm2Mutation {
   };
 }
 
-function helperArgs(pkgRoot: string, request: ExistingPm2Request): string[] {
-  const built = join(pkgRoot, 'dist', 'cli', 'pm2-existing-client.js');
+function helperSpawn(pkgRoot: string, request: ExistingPm2Request, nodePath?: string) {
   const payload = JSON.stringify(request);
-  // Source/test execution must not silently select a stale dist helper with an
-  // older request contract. Installed production code runs from dist and uses
-  // the sibling built helper.
-  if (import.meta.url.includes('/dist/cli/pm2-existing.js') && existsSync(built)) {
-    return [built, payload];
-  }
-  return ['--import', 'tsx', join(pkgRoot, 'src', 'cli', 'pm2-existing-client.ts'), payload];
+  return buildPm2HelperSpawn({
+    pkgRoot,
+    nodePath,
+    clientName: 'pm2-existing-client',
+    clientSubcommand: PM2_EXISTING_CLIENT_SUBCOMMAND,
+    clientArgs: [payload],
+    // Source/test execution must not silently select a stale dist helper with an
+    // older request contract. Installed production code runs from dist and uses
+    // the sibling built helper.
+    runningFromDist: import.meta.url.includes('/dist/cli/pm2-existing.js'),
+  });
 }
 
 /** Mutate an attested existing God without PM2's public connect/daemonize path. */
@@ -71,9 +73,10 @@ export function runExistingPm2Command(input: {
     throw new Error(`PM2 God pid ${input.expectedGod.pid} has no process-birth identity`);
   }
   const request = { ...mutationFromArgs(input.args), expectedGod: input.expectedGod };
+  const helper = helperSpawn(input.pkgRoot, request, input.nodePath);
   const result = spawnSync(
-    input.nodePath ?? process.execPath,
-    helperArgs(input.pkgRoot, request),
+    helper.command,
+    helper.args,
     {
       stdio: input.inherit === false ? 'pipe' : 'inherit',
       env: {

@@ -40,6 +40,7 @@ import {
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
+import { PM2_EXISTING_CLIENT_SUBCOMMAND, PM2_READONLY_CLIENT_SUBCOMMAND } from './cli/pm2-helper-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -13303,6 +13304,18 @@ if (__entrySubcommand) {
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
+  await new Promise<never>(() => {});
+}
+
+if (command === PM2_READONLY_CLIENT_SUBCOMMAND) {
+  process.argv.splice(2, 1);
+  await import('./cli/pm2-readonly-client.js');
+  await new Promise<never>(() => {});
+}
+
+if (command === PM2_EXISTING_CLIENT_SUBCOMMAND) {
+  process.argv.splice(2, 1);
+  await import('./cli/pm2-existing-client.js');
   await new Promise<never>(() => {});
 }
 
