@@ -298,7 +298,46 @@ export function installIdentityWrapper(
  * disk, never placed in a URL, and never logged. A JWT embedded in a remote URL
  * would persist in `.git/config` and in any error message git prints.
  */
-export function renderGitAskpassScript(bytedcliPath: string): string {
+/**
+ * Git credential helper, so a push is attributed to the person who asked for it.
+ *
+ * `git` over HTTPS to a Codebase host authenticates with a Codebase JWT, which
+ * is derived from the acting ByteCloud identity. It does not read any of the env
+ * vars above, so without this a commit pushed on someone's behalf would carry
+ * the machine's identity — and "who opened this MR" is exactly the attribution
+ * this feature exists to fix.
+ *
+ * The script asks the WRAPPED `bytedcli` for the token, which means it inherits
+ * the per-turn identity for free: no second credential path to keep in sync, and
+ * nothing here needs to know whose turn it is.
+ *
+ * `GIT_ASKPASS` is called once for the username and once for the password, with
+ * the prompt text as $1 — matching on "Username" is git's own contract.
+ *
+ * `exchangeUrl` is an optional second source for the token, used only when
+ * bytedcli cannot produce one (not installed, broken, mid-upgrade). It is passed
+ * in rather than hardcoded: the endpoint is deployment-specific, and this
+ * repository deliberately keeps private hostnames out of source.
+ *
+ * Deliberately: the JWT is fetched fresh per invocation and never written to
+ * disk, never placed in a URL, and never logged. A JWT embedded in a remote URL
+ * would persist in `.git/config` and in any error message git prints.
+ */
+export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: string): string {
+  const fallback = exchangeUrl
+    ? [
+        // Second source: exchange the ByteCloud JWT the wrapper already exported
+        // for a Codebase JWT over HTTP. Without it a bytedcli that is missing or
+        // mid-upgrade turns every push into an unexplained auth failure.
+        '  if [ -z "$__botmux_token" ] && [ -n "$BYTEDCLI_USER_CLOUD_JWT" ]; then',
+        `    __botmux_token="$(curl -fsS --max-time 10 -X POST ${shellSingleQuote(exchangeUrl)} \\`,
+        '      -H "Content-Type: application/json" -H "domain: tenant;v1" \\',
+        '      -H "x-jwt-token: $BYTEDCLI_USER_CLOUD_JWT" \\',
+        '      --data-binary "$(printf \'{"jwt_token":"%s"}\' "$BYTEDCLI_USER_CLOUD_JWT")" 2>/dev/null \\',
+        '      | sed -n \'s/.*"code_base_token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\')"',
+        '  fi',
+      ]
+    : [];
   return [
     '#!/bin/sh',
     '# botmux trigger-user git credential helper — generated, do not edit.',
@@ -306,11 +345,24 @@ export function renderGitAskpassScript(bytedcliPath: string): string {
     '# CURRENT acting identity, so a push is attributed to the person who asked.',
     'case "$1" in',
     '  *Username*) printf %s x-access-token ;;',
+    '  *)',
+    // GIT_CONFIG_COUNT=0 / GIT_SSH_COMMAND=false while calling bytedcli: this
+    // helper is itself reached FROM git, and bytedcli shells out to git for repo
+    // context. Without the reset that inner git re-reads the very credential
+    // config that invoked us and can recurse, or quietly take an SSH path that
+    // authenticates as the machine instead of the person.
+    //
     // -j keeps the output machine-readable. The response shape is
     // `{"status":…,"data":{"jwt":"…"}}` (verified against bytedcli 0.x), and the
     // token goes straight to git on stdout without touching disk.
-    `  *) ${shellSingleQuote(bytedcliPath)} -j auth get-codebase-jwt-token 2>/dev/null \\`,
-    '       | sed -n \'s/.*"jwt"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' ;;',
+    `  __botmux_token="$(GIT_CONFIG_COUNT=0 GIT_SSH_COMMAND=false ${shellSingleQuote(bytedcliPath)} \\`,
+    '    -j auth get-codebase-jwt-token 2>/dev/null \\',
+    '    | sed -n \'s/.*"jwt"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\')"',
+    ...fallback,
+    // Empty output makes git report an auth failure, which is the honest
+    // outcome; a shell error here would look like a botmux bug instead.
+    '  printf %s "$__botmux_token"',
+    '  ;;',
     'esac',
     '',
   ].join('\n');
@@ -330,12 +382,52 @@ export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
  * — without it there is no way to mint a JWT, and a helper that always failed
  * would turn "no credentials" into an opaque git error.
  */
-export function installGitAskpass(binDir: string, wrappedBytedcliInstalled: boolean): string | null {
+export function installGitAskpass(
+  binDir: string,
+  wrappedBytedcliInstalled: boolean,
+  exchangeUrl?: string,
+): string | null {
   if (!wrappedBytedcliInstalled) return null;
   mkdirSync(binDir, { recursive: true });
   const path = join(binDir, GIT_ASKPASS_BASENAME);
-  atomicWriteFileSync(path, renderGitAskpassScript(join(binDir, 'bytedcli')), { mode: 0o755 });
+  atomicWriteFileSync(
+    path,
+    renderGitAskpassScript(join(binDir, 'bytedcli'), exchangeUrl),
+    { mode: 0o755 },
+  );
   return path;
+}
+
+/**
+ * Git config that forces an identity-bearing HTTPS path for `host`.
+ *
+ * Returned as `GIT_CONFIG_*` env entries rather than written to a config file:
+ * they apply to this session's git only, leave the user's own `~/.gitconfig`
+ * untouched, and vanish with the process.
+ *
+ * Two settings, for two different escapes:
+ *  - `credential.https://<host>.helper` binds the helper to that host alone, so
+ *    it never answers prompts for unrelated remotes.
+ *  - `url.https://<host>/.insteadOf ssh://git@<host>/` rewrites SSH remotes to
+ *    HTTPS. Without it a repo cloned over SSH keeps authenticating with the
+ *    machine's key — the push lands under the host's identity and the whole
+ *    attribution chain silently breaks.
+ */
+export function gitIdentityConfigEnv(
+  askpassPath: string,
+  host: string,
+): Record<string, string> {
+  const entries: Array<[string, string]> = [
+    [`credential.https://${host}.helper`, `!f() { "${askpassPath}" "$@"; }; f`],
+    [`url.https://${host}/.insteadOf`, `ssh://git@${host}/`],
+    [`url.https://${host}/.insteadOf`, `git@${host}:`],
+  ];
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
+  entries.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value;
+  });
+  return env;
 }
 
 /**
