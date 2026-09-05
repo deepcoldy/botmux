@@ -142,6 +142,32 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * Shell heredoc operators remain copyable, and bot fields are still rendered
  * from trusted bot config without changing their historical handling.
  */
+/**
+ * The credential-boundary block for a trigger-user-auth session.
+ *
+ * ONE definition for both prompt paths — claude-family adapters
+ * (`buildBotmuxSystemPromptText`) and the inline-prompt CLIs that go through
+ * session-manager. A second copy would drift, and the copy that drifted would
+ * be the one nobody notices is missing.
+ *
+ * This is a behavioral rule, not a security control: nothing in the OS stops a
+ * curious agent from reading another person's token file today. It exists
+ * because the likeliest path to that happening is an agent grepping the data
+ * directory to debug an auth failure — which a clear instruction does prevent —
+ * and it does NOT survive a determined user or a prompt injection.
+ */
+export function buildCredentialBoundaryBlock(locale?: Locale): string {
+  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+  return [
+    '<botmux_credentials>',
+    line('ai.credentials.acting_identity'),
+    line('ai.credentials.never_read_others'),
+    line('ai.credentials.never_forward'),
+    line('ai.credentials.on_auth_failure'),
+    '</botmux_credentials>',
+  ].join('\n');
+}
+
 export function buildBotmuxSystemPromptText(opts: {
   locale?: Locale;
   botName?: string;
@@ -164,8 +190,14 @@ export function buildBotmuxSystemPromptText(opts: {
    *  reintroduce a sentinel line here. Computed daemon-side as
    *  `!larkTransportEnabled({chatId, apiOnly})` and threaded through buildArgs. */
   noTransport?: boolean;
+  /**
+   * Trigger-user CLI auth is on for this session: add the credential boundary
+   * block. Off → nothing is emitted, so a bot that never enabled the feature
+   * gets no extra prompt text.
+   */
+  triggerUserAuth?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
@@ -239,11 +271,23 @@ export function buildBotmuxSystemPromptText(opts: {
       hiddenContextDefense(locale),
       ...whiteboardRouting,
     ];
+  // Trigger-user auth: this session acts with ONE person's credentials, and the
+  // token store on disk holds everyone else's. Nothing in the OS stops a curious
+  // agent from reading those files today, so the boundary is stated here.
+  //
+  // This is a behavioral rule, not a security control — it does not survive a
+  // determined user or a prompt injection. It exists because the likeliest way
+  // these files get read is an agent troubleshooting an auth failure and
+  // grepping the data directory, which a clear instruction does prevent.
+  const credentialBoundaryBlock = triggerUserAuth
+    ? ['', buildCredentialBoundaryBlock(locale)]
+    : [];
   return [
     '<botmux_routing>',
     ...routingInner,
     '</botmux_routing>',
     ...identityBlock,
+    ...credentialBoundaryBlock,
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

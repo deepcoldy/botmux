@@ -157,6 +157,12 @@ export interface CliAdapter {
      *  session-manager's buildBotmuxShellHints. Adapters without a routing block
      *  ignore it. */
     noTransport?: boolean;
+    /** Trigger-user CLI auth is enabled for this bot. injectsSessionContext
+     *  adapters forward it so the credential-boundary block is added to the
+     *  system prompt: the session acts with ONE person's credentials while the
+     *  on-disk store holds everyone else's, and nothing in the OS currently
+     *  stops an agent from reading those files. Off → no extra prompt text. */
+    triggerUserAuth?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

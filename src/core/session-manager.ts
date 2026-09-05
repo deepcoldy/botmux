@@ -16,7 +16,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -1095,6 +1095,15 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
+/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
+ *  Absent bot / unreadable config → false: an uncertain answer must not add a
+ *  block claiming a boundary that is not configured. */
+function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
  *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
@@ -1109,7 +1118,7 @@ type NewTopicOpts = {
   sessionBackendType?: BackendType;
 };
 
-type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'sessionId' | 'role'
+type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
@@ -1230,6 +1239,18 @@ function buildNewTopicBlocks(
     if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
     if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+    // Trigger-user auth: the same credential boundary the claude-family adapters
+    // get via --append-system-prompt. Without it the inline-prompt CLIs
+    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // this release's only protection, a missing block there is a silent hole.
+    //
+    // Deliberately NOT in ENVELOPE_KEYS: the block must reach the agent in BOTH
+    // inline and hook mode, so it stays in the PTY text either way. Putting it in
+    // the envelope would drop it for any CLI whose hook path is unavailable —
+    // silently, since nothing errors when a constraint is merely absent.
+    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
+      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
+    }
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
