@@ -17,7 +17,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled } from './core/cli-identity.js';
+import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv } from './core/cli-identity.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -14350,10 +14350,24 @@ async function spawnCli(
     if (triggerUserAuthPolicy.tools.includes('bytedcli')
         && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
       try {
-        const askpass = installGitAskpass(wrapperDir, true);
+        const askpass = installGitAskpass(
+          wrapperDir,
+          true,
+          triggerUserAuthPolicy.gitTokenExchangeUrl,
+        );
         if (askpass) {
           childEnv.GIT_ASKPASS = askpass;
-          log(`[trigger-user-auth] git pushes will authenticate as the acting user`);
+          // Bind the helper to the configured code host and rewrite SSH remotes
+          // to HTTPS for it. Without the rewrite, a repo cloned over SSH keeps
+          // authenticating with the machine's key and the attribution chain
+          // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
+          // ~/.gitconfig is never touched.
+          if (triggerUserAuthPolicy.gitHost) {
+            Object.assign(childEnv, gitIdentityConfigEnv(askpass, triggerUserAuthPolicy.gitHost));
+            log(`[trigger-user-auth] git pushes to ${triggerUserAuthPolicy.gitHost} authenticate as the acting user`);
+          } else {
+            log('[trigger-user-auth] git askpass installed; set triggerUserAuth.gitHost to also force HTTPS for a code host');
+          }
         }
       } catch (e) {
         log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);

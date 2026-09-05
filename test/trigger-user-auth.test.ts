@@ -158,3 +158,44 @@ describe('tokenStoreProtection', () => {
     expect(report.advisory).toContain('同一个系统用户');
   });
 });
+
+// gitHost / gitTokenExchangeUrl are deployment-specific, so they are configured
+// rather than compiled in — which means the parser is the only thing standing
+// between a typo and a broken (or unsafe) git setup.
+describe('git attribution settings', () => {
+  it('accepts a bare hostname and an https endpoint', () => {
+    const c = parseTriggerUserAuthConfig({
+      enabled: true,
+      gitHost: 'code.example.com',
+      gitTokenExchangeUrl: 'https://gw.example.com/jwt_to_code_base',
+    });
+    expect(c?.gitHost).toBe('code.example.com');
+    expect(c?.gitTokenExchangeUrl).toBe('https://gw.example.com/jwt_to_code_base');
+  });
+
+  it('leaves git alone when unset', () => {
+    const c = parseTriggerUserAuthConfig({ enabled: true });
+    expect(c?.gitHost).toBeUndefined();
+    expect(c?.gitTokenExchangeUrl).toBeUndefined();
+  });
+
+  // The host is interpolated into git config keys AND into a shell script, so a
+  // value carrying a scheme, path or metacharacter would corrupt both.
+  it('rejects a host that is not a bare hostname', () => {
+    for (const bad of ['https://code.example.com', 'code.example.com/path', 'a b', 'x;rm -rf /']) {
+      expect(() => parseTriggerUserAuthConfig({ enabled: true, gitHost: bad }))
+        .toThrow(/gitHost/);
+    }
+  });
+
+  // This endpoint receives a live ByteCloud JWT; plaintext http would put a
+  // credential on the wire.
+  it('refuses a non-https exchange endpoint', () => {
+    expect(() => parseTriggerUserAuthConfig({
+      enabled: true, gitTokenExchangeUrl: 'http://gw.example.com/x',
+    })).toThrow(/https/);
+    expect(() => parseTriggerUserAuthConfig({
+      enabled: true, gitTokenExchangeUrl: 'not-a-url',
+    })).toThrow(/absolute URL/);
+  });
+});

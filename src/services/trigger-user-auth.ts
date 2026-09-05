@@ -53,6 +53,21 @@ export interface TriggerUserAuthConfig {
   /** Tools this applies to. Empty means the policy is inert. */
   tools: TriggerUserAuthTool[];
   fallback: TriggerUserAuthFallback;
+  /**
+   * Code host whose git pushes should carry the acting identity, e.g.
+   * `code.example.com`. Absent → git is left alone.
+   *
+   * Deployment-specific, so it is configured rather than compiled in: the host
+   * differs per organization, and this repository keeps private hostnames out
+   * of source.
+   */
+  gitHost?: string;
+  /**
+   * Optional second source for a Codebase JWT, used only when `bytedcli` cannot
+   * produce one (missing, broken, mid-upgrade). Same reason as `gitHost` for
+   * being configuration: the endpoint is deployment-specific.
+   */
+  gitTokenExchangeUrl?: string;
 }
 
 /** Per-tool facts that decide what "unauthorized" can degrade to. */
@@ -165,7 +180,50 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     fallback = rec.fallback as TriggerUserAuthFallback;
   }
 
-  return { enabled, tools, fallback };
+  const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
+  const gitTokenExchangeUrl = optionalHttpsUrl(
+    rec.gitTokenExchangeUrl,
+    'triggerUserAuth.gitTokenExchangeUrl',
+  );
+
+  return {
+    enabled,
+    tools,
+    fallback,
+    ...(gitHost ? { gitHost } : {}),
+    ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
+  };
+}
+
+/** A bare hostname. Rejects anything carrying a scheme, path, or shell-hostile
+ *  character — the value is interpolated into git config keys and a shell
+ *  script, so a loose value would corrupt both. */
+function optionalHost(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string' || !/^[A-Za-z0-9.-]{1,253}$/.test(value)) {
+    throw new TriggerUserAuthConfigError(
+      `${field} must be a bare hostname such as code.example.com`,
+    );
+  }
+  return value;
+}
+
+/** HTTPS only: this endpoint receives a live ByteCloud JWT, so plaintext http
+ *  would put a credential on the wire. */
+function optionalHttpsUrl(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') {
+    throw new TriggerUserAuthConfigError(`${field} must be a string`);
+  }
+  let parsed: URL;
+  try { parsed = new URL(value); }
+  catch { throw new TriggerUserAuthConfigError(`${field} must be an absolute URL`); }
+  if (parsed.protocol !== 'https:') {
+    throw new TriggerUserAuthConfigError(
+      `${field} must use https (it carries a live credential)`,
+    );
+  }
+  return value;
 }
 
 /** Whether this policy governs `tool` right now. */

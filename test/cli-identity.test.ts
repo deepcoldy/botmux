@@ -15,7 +15,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, statSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -29,6 +29,7 @@ import {
   identityWrapperInstalled,
   renderGitAskpassScript,
   installGitAskpass,
+  gitIdentityConfigEnv,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -307,11 +308,82 @@ describe('renderGitAskpassScript / installGitAskpass', () => {
     expect(installGitAskpass(join(dir, 'bin'), false)).toBeNull();
   });
 
+  // The helper is reached FROM git, and bytedcli shells out to git for repo
+  // context. Without resetting the config that inner git re-reads the very
+  // credential helper that invoked us — recursing, or silently taking an SSH
+  // path that authenticates as the machine instead of the person.
+  it('neutralizes git config and SSH before calling bytedcli', () => {
+    const script = renderGitAskpassScript('/usr/local/bin/bytedcli');
+    expect(script).toContain('GIT_CONFIG_COUNT=0');
+    expect(script).toContain('GIT_SSH_COMMAND=false');
+  });
+
+  it('falls back to the exchange endpoint when bytedcli yields nothing', () => {
+    const failing = join(dir, 'no-token.sh');
+    writeFileSync(failing, '#!/bin/sh\nexit 1\n');
+    chmodSync(failing, 0o755);
+    // Stub `curl` on PATH so the fallback is exercised without a network call.
+    const stubBin = join(dir, 'stub-bin');
+    mkdirSync(stubBin, { recursive: true });
+    writeFileSync(join(stubBin, 'curl'),
+      '#!/bin/sh\nprintf \'%s\' \'{"code":0,"data":{"code_base_token":"from-exchange"}}\'\n');
+    chmodSync(join(stubBin, 'curl'), 0o755);
+
+    const p = join(dir, 'askpass');
+    writeFileSync(p, renderGitAskpassScript(failing, 'https://exchange.example.com/token'));
+    const out = execFileSync('/bin/sh', [p, 'Password: '], {
+      encoding: 'utf8',
+      env: { PATH: `${stubBin}:/usr/bin:/bin`, BYTEDCLI_USER_CLOUD_JWT: 'a.b.c' },
+    });
+    expect(out).toBe('from-exchange');
+  });
+
+  // No cloud JWT means there is nothing to exchange — it must not call out with
+  // an empty credential and must still answer empty rather than erroring.
+  it('skips the fallback when there is no cloud JWT to exchange', () => {
+    const failing = join(dir, 'no-token2.sh');
+    writeFileSync(failing, '#!/bin/sh\nexit 1\n');
+    chmodSync(failing, 0o755);
+    const p = join(dir, 'askpass2');
+    writeFileSync(p, renderGitAskpassScript(failing, 'https://exchange.example.com/token'));
+    const out = execFileSync('/bin/sh', [p, 'Password: '], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin' },
+    });
+    expect(out).toBe('');
+  });
+
   // A JWT in a remote URL would persist in .git/config and leak into any error
   // message git prints.
   it('never embeds the token in a URL or writes it to disk', () => {
     const script = renderGitAskpassScript('/usr/local/bin/bytedcli');
     expect(script).not.toMatch(/https:\/\/\S*\$/);
     expect(script).not.toMatch(/>\s*\/tmp|>\s*\$TMPDIR|tee /);
+  });
+});
+
+// SSH remotes are the quiet escape hatch: a repo cloned over SSH keeps using the
+// machine's key, the push lands under the host's identity, and nothing reports a
+// problem. Rewriting to HTTPS for the configured host closes that path.
+describe('gitIdentityConfigEnv', () => {
+  it('binds the helper to one host and rewrites its SSH remotes', () => {
+    const env = gitIdentityConfigEnv('/tmp/askpass', 'code.example.com');
+    const pairs: Record<string, string> = {};
+    for (let i = 0; i < Number(env.GIT_CONFIG_COUNT); i++) {
+      pairs[env[`GIT_CONFIG_KEY_${i}`]] = env[`GIT_CONFIG_VALUE_${i}`];
+    }
+    expect(pairs['credential.https://code.example.com.helper']).toContain('/tmp/askpass');
+    expect(pairs['url.https://code.example.com/.insteadOf']).toBeDefined();
+  });
+
+  it('declares a count matching the entries, so git reads them all', () => {
+    const env = gitIdentityConfigEnv('/tmp/askpass', 'code.example.com');
+    const count = Number(env.GIT_CONFIG_COUNT);
+    expect(count).toBeGreaterThan(0);
+    for (let i = 0; i < count; i++) {
+      expect(env[`GIT_CONFIG_KEY_${i}`]).toBeTruthy();
+      expect(env[`GIT_CONFIG_VALUE_${i}`]).toBeTruthy();
+    }
+    expect(env[`GIT_CONFIG_KEY_${count}`]).toBeUndefined();
   });
 });
