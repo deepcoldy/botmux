@@ -248,4 +248,19 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     );
     expect(gate).not.toMatch(/markCommentEventDropped\(/);
   });
+
+  /**
+   * ⚠️ 五处回滚全都经由同一个闭包，而**唯一**阻止它删掉「用户此前用
+   * /watch-comment 建的既有订阅」的，就是那句 `if (autoCreatedSub)`。
+   * 本 PR 把 rollback 的调用点从 2 处扩到 11 处，这个守卫一旦丢失，
+   * 任何一条陌生人的无关评论都会静默退订用户真正想要的订阅 —— 破坏性远大于
+   * 本 PR 要修的问题。这里把它钉死。
+   */
+  it('rollback 闭包必须由 autoCreatedSub 守卫 —— 绝不能删掉既有订阅', () => {
+    expect(region).toContain('const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(');
+  });
+
+  it('removeDocSubscription 只在那一个闭包里被调用，没有旁路', () => {
+    expect(region.match(/removeDocSubscription\(/g) ?? []).toHaveLength(1);
+  });
 });
