@@ -512,17 +512,21 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       ev('TOOL_CALL_END', { toolCallId: entry.id }),
     ];
   }
-  // 工具输出关闭：不发 TOOL_CALL_RESULT，气泡只剩思考段落与工具节点标题
-  // （与 Claude Code 自身界面一致）。START/ARGS/END 照发，节点仍在时间线上。
-  if (!cotToolResultEnabled(ds)) return [];
-  if (entry.result.length === 0) return [];
-  const language = state.resultLanguages?.get(entry.id);
+  // 工具节点在 TOOL_CALL_END 之后处于「执行中」状态（官方 COT 事件文档对 22 的定义），
+  // 只有 TOOL_CALL_RESULT 才让它落定。所以「关掉工具输出」不能简单地不发 RESULT——
+  // 那会让每个工具节点永远转圈；结果串本身为空时同理。两种情况都改发一条极简 text
+  // 结果收尾：气泡里只留「工具名 · 命令/路径」加一个完成标记，与 Claude Code 自身
+  // 界面一致，又不会留下未落定的节点。
+  const omitResult = !cotToolResultEnabled(ds) || entry.result.length === 0;
+  const language = omitResult ? undefined : state.resultLanguages?.get(entry.id);
   return [
     ev('TOOL_CALL_RESULT', {
       messageId: `tr-${entry.id}`,
       toolCallId: entry.id,
       role: 'tool',
-      content: JSON.stringify({ type: 'code', ...(language ? { language } : {}), code: entry.result }),
+      content: JSON.stringify(omitResult
+        ? { type: 'text', text: t('cot.tool.result_done', undefined, localeForBot(ds.larkAppId)) }
+        : { type: 'code', ...(language ? { language } : {}), code: entry.result }),
     }),
   ];
 }

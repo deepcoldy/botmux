@@ -463,7 +463,7 @@ describe('handleCotThinkingUpdate', () => {
     expect(body.language).toBe('typescript');
   });
 
-  it('thinkingCardToolResult=false drops TOOL_CALL_RESULT but keeps START/ARGS/END', async () => {
+  it('thinkingCardToolResult=false swaps the result body for a minimal marker (never drops it)', async () => {
     const ds = makeDs();
     vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, thinkingCardToolResult: false } } as any);
     handleCotThinkingUpdate(ds, upd([
@@ -476,7 +476,24 @@ describe('handleCotThinkingUpdate', () => {
     expect(types).toContain('TOOL_CALL_START');
     expect(types).toContain('TOOL_CALL_ARGS');
     expect(types).toContain('TOOL_CALL_END');
-    expect(types).not.toContain('TOOL_CALL_RESULT');
+    // RESULT 必须仍在：TOOL_CALL_END 之后节点处于「执行中」，只有 RESULT 让它落定。
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('R1');
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+    // 但真实输出不再出现在气泡里。
+    expect(JSON.stringify(pushedEvents())).not.toContain('file-a');
+  });
+
+  it('an empty tool result is also closed with the marker rather than left pending', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'E1', name: 'Bash', args: '{"command":"true"}' },
+      { kind: 'tool_result', id: 'E1', result: '' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('E1');
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
   });
 
   it('absent thinkingCardToolResult means ON; turning it off mid-turn affects the next batch', async () => {
@@ -488,9 +505,11 @@ describe('handleCotThinkingUpdate', () => {
     ];
     handleCotThinkingUpdate(ds, upd(first));
     await flush();
-    const resultIds = () => pushedEvents().filter(e => e.type === 'TOOL_CALL_RESULT').map(e => e.content.toolCallId);
-    expect(resultIds()).toEqual(['R1']);
-    // 配置改为关闭：累积列表追加的第二批不再带 RESULT，START 照发。
+    const results = () => pushedEvents().filter(e => e.type === 'TOOL_CALL_RESULT')
+      .map(e => [e.content.toolCallId, JSON.parse(e.content.content).type]);
+    expect(results()).toEqual([['R1', 'code']]);
+    // 配置改为关闭：累积列表追加的第二批仍带 RESULT（否则节点停在「执行中」），
+    // 但内容退化成完成标记而不是输出代码块。
     vi.mocked(getBot).mockReturnValue({ config: { thinkingCardToolResult: false } } as any);
     handleCotThinkingUpdate(ds, upd([
       ...first,
@@ -498,7 +517,8 @@ describe('handleCotThinkingUpdate', () => {
       { kind: 'tool_result', id: 'R2', result: '/root' },
     ]));
     await flush();
-    expect(resultIds()).toEqual(['R1']);
+    expect(results()).toEqual([['R1', 'code'], ['R2', 'text']]);
+    expect(JSON.stringify(pushedEvents())).not.toContain('/root');
     expect(pushedEvents().filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.toolCallId)).toEqual(['R1', 'R2']);
   });
 
