@@ -3097,6 +3097,7 @@ async function passesDocCommentAuditGate(
   requesterOpenId: string | undefined,
   textSummary: string,
   rollbackAutoSub: () => void,
+  kind: 'reply' | 'dropped-signal' = 'reply',
 ): Promise<boolean> {
   const ownerOpenId = getOwnerOpenId(larkAppId);
   if (ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId) return true;
@@ -3110,9 +3111,9 @@ async function passesDocCommentAuditGate(
     const loc = localeForBot(larkAppId);
     const requesterName = requesterOpenId?.slice(0, 12) || '?';
     const notifyText = [
-      t('daemon.doc_mention_notify_title', undefined, loc),
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_title' : 'daemon.doc_dropped_notify_title', undefined, loc),
       '',
-      t('daemon.doc_mention_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_body' : 'daemon.doc_dropped_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
       '',
       `📄 \`${fileToken}\``,
       `💬 ${textSummary.slice(0, 200)}${textSummary.length > 200 ? '…' : ''}`,
@@ -3150,7 +3151,12 @@ async function markCommentEventDropped(
   rollbackAutoSub: () => void,
 ): Promise<DroppedSignalOutcome> {
   // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
-  if (!replyId) return 'no-reply-id';
+  // 这条事件到此为止且从未过审计，auto-sub 占位必须回滚 —— 否则 malformed /
+  // 缺字段的事件也能留下一条 owner 不知情的订阅。下面 self-triggered 同理。
+  if (!replyId) {
+    rollbackAutoSub();
+    return 'no-reply-id';
+  }
 
   // ⚠️ 自触发拦截要放在审计门**之前**：给自己打标记本来就不该发生，没必要为它
   // 去打扰 owner。正常那道 self-filter（trigger.userId 等三重保险）在下游，
@@ -3164,6 +3170,7 @@ async function markCommentEventDropped(
   const selfBotOpenId = getBot(larkAppId).botOpenId;
   if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
     logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
+    rollbackAutoSub();
     return 'self-triggered';
   }
 
@@ -3175,7 +3182,7 @@ async function markCommentEventDropped(
   // 正文，失败路径传一句说明即可（见调用方传的 auditSummary）。也不能拿
   // 「本次是否新建了 auto-sub」当授权判据 —— 历史脏状态和并发窗口都会让
   // 未审计的订阅看起来像既有授权。
-  if (!await passesDocCommentAuditGate(larkAppId, file.fileToken, requesterOpenId, auditSummary, rollbackAutoSub)) {
+  if (!await passesDocCommentAuditGate(larkAppId, file.fileToken, requesterOpenId, auditSummary, rollbackAutoSub, 'dropped-signal')) {
     logger.info(`[doc-comment] dropped-signal skipped (audit gate): comment=${commentId.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
     return 'audit-rejected';
   }
@@ -3250,6 +3257,13 @@ async function processCommentEvent(
   // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
   const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
 
+  // 「这条事件**可能**与本 bot 有关」—— 在读不到评论正文时唯一能用的收窄。
+  // mention-only 订阅下该文档的**所有**评论事件都会推给我们，`is_mentioned`
+  // 为 false 说明这条评论里一个 @ 都没有，肯定不是找 bot 的。注意这是用它
+  // **收紧**，与「不能用 is_mentioned 放行」的既有警告不冲突 —— 那条警告说的是
+  // true 不代表 @ 的是本 bot。'all' 模式不收窄：不 @ 也该触发。
+  const mayConcernThisBot = sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned === true;
+
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
   // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId
   // → 合法的 @bot 评论被误丢（事件已被 ACK，飞书不会重投，@ 永久丢失）。await
@@ -3268,7 +3282,7 @@ async function processCommentEvent(
     // 没有，肯定不是找 bot 的。注意这里是用它**收紧**，与代码里「不能用
     // is_mentioned 放行」的警告不冲突 —— 那条警告说的是 true 不代表 @ 的是本 bot。
     // 'all' 模式不收窄：那种模式不 @ 也该触发，拉不到就是真丢了。
-    if (sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned) {
+    if (mayConcernThisBot) {
       const outcome = await markCommentEventDropped(
         larkAppId, { fileToken, fileType: sub.fileType }, commentId,
         parsed.replyId, parsed.operatorOpenId,
@@ -3276,6 +3290,9 @@ async function processCommentEvent(
         rollbackAutoSub,
       );
       logger.info(`[doc-comment] dropped-signal outcome=${outcome} (取不到评论内容) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
+      rollbackAutoSub();
     }
     return;
   }
@@ -3289,13 +3306,22 @@ async function processCommentEvent(
   // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
   if (!trigger) {
     logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
-    const outcome = await markCommentEventDropped(
-      larkAppId, { fileToken, fileType: sub.fileType }, commentId,
-      parsed.replyId, parsed.operatorOpenId,
-      '评论回复串未能补全，bot 读不到这条 @ 的正文，准备留下失败标记',
-      rollbackAutoSub,
-    );
-    logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
+    // ⚠️ 和第一个打点同样要收窄。`trigger` 缺失只证明**回复数据不完整**，
+    // 不证明这条回复是冲 bot 来的 —— 已订阅文档下别人的普通回复同样会推事件，
+    // 只要那条 reply 恰好没被拉到就会走到这里。不收窄就会在别人的评论上留 ❌。
+    if (mayConcernThisBot) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        parsed.replyId, parsed.operatorOpenId,
+        '评论回复串未能补全，bot 读不到这条评论的正文，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 这条事件从未过审计。auto-sub 是这次事件建的占位，必须回滚，
+      // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
+      rollbackAutoSub();
+    }
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
@@ -3304,7 +3330,11 @@ async function processCommentEvent(
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
   //    ②reply_id 在 bot 创建集合 ③文本含隐形哨兵。任一命中即跳过。
   const selfBotOpenId = getBot(larkAppId).botOpenId;
-  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) {
+    // 这条事件不会走到审计门，本次 auto-sub 占位必须回滚（同下面 mention gate）。
+    rollbackAutoSub();
+    return;
+  }
 
   // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
   //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
@@ -3312,6 +3342,7 @@ async function processCommentEvent(
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
   if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    rollbackAutoSub();
     return;
   }
 
@@ -3340,6 +3371,8 @@ async function processCommentEvent(
         rollbackAutoSub,
       );
       logger.info(`[doc-comment] dropped-signal outcome=${outcome} (纯 @bot 无正文) comment=${commentId.slice(0, 12)}`);
+    } else {
+      rollbackAutoSub();
     }
     return;
   }

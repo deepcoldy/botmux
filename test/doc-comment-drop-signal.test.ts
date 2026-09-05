@@ -92,9 +92,11 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     expect(opts).toMatchObject({ tenantOnly: true });
   });
 
-  it('reply_id 缺失时不发请求（reaction 端点要求 comment_id + reply_id 齐全）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined, OWNER, 'summary', mocks.rollback);
+  it('reply_id 缺失时不发请求，且回滚 auto-sub（malformed 事件不能留下订阅）', async () => {
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined, OWNER, 'summary', mocks.rollback);
+    expect(outcome).toBe('no-reply-id');
     expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+    expect(mocks.rollback).toHaveBeenCalledTimes(1);
   });
 
   it('打标记失败不外抛 —— 丢弃路径本身已经是失败路径，不能再被它拖垮', async () => {
@@ -152,10 +154,11 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     expect(mocks.rollback).toHaveBeenCalledTimes(1);
   });
 
-  it('自触发拦截在审计门之前 —— 不为 bot 自己的事件打扰 owner，也不回滚', async () => {
+  it('自触发拦截在审计门之前 —— 不为 bot 自己的事件打扰 owner，但仍回滚 auto-sub', async () => {
     const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_selfbot', 'summary', mocks.rollback);
     expect(outcome).toBe('self-triggered');
-    expect(mocks.rollback).not.toHaveBeenCalled();
+    // 没过审计 ⇒ 占位订阅不能留下。但也不该为自己的事件去打扰 owner。
+    expect(mocks.rollback).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -210,10 +213,22 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(3);
   });
 
-  it('第一个打点（拉不到评论内容）必须收窄，不能在别人的评论上打标记', () => {
+  it('前两个打点都必须收窄，不能在别人的评论上打标记', () => {
+    // trigger 缺失只证明回复数据不完整，不证明这条回复冲 bot 来的 —— 已订阅文档下
+    // 别人的普通回复同样推事件，那条 reply 没被拉到就会走到第二个打点。
     const firstDrop = regionBetween('取不到评论内容', 'const trigger = parsed.replyId');
-    // mention-only 下拉不到正文时无从判断是不是冲 bot 来的，只能靠 is_mentioned 收紧。
-    expect(firstDrop).toContain(`sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned`);
+    const secondDrop = regionBetween('不在拉到的', 'const triggerIndex');
+    expect(firstDrop).toContain('mayConcernThisBot');
+    expect(secondDrop).toContain('mayConcernThisBot');
+  });
+
+  it('收窄谓词本身用 is_mentioned 收紧，且只作用于 mention-only', () => {
+    expect(region).toContain(`sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned === true`);
+  });
+
+  it('每个未打标记的早退都回滚 auto-sub（不留 owner 不知情的订阅）', () => {
+    // 三个 dropped 打点的 else 分支 + self-filter + mention gate。
+    expect((region.match(/rollbackAutoSub\(\);/g) ?? []).length).toBeGreaterThanOrEqual(5);
   });
 
   it('自触发过滤不打标记（那是 bot 自己的回复，打了是自己标自己）', () => {

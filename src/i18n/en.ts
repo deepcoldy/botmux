@@ -460,6 +460,8 @@ export const messages: Record<string, string> = {
   'cmd.vc.replaced': 'Note: this group was also bound to meeting `{meetingNo}`. The old record remains; remove it with `/vc off {meetingNo}` if needed.',
   'daemon.doc_mention_notify_title': '📄 Doc @bot trigger notification',
   'daemon.doc_mention_notify_body': 'User {requester} mentioned the bot in doc {token} and triggered a reply.',
+  'daemon.doc_dropped_notify_title': '⚠️ Doc comment event not handled',
+  'daemon.doc_dropped_notify_body': "Bot could not read or handle {requester}'s comment event in doc {token}; no reply was produced. If the audit passes, a failure marker will be attempted on that reply.",
   'daemon.doc_comment_reply_prefix': '↪ Reply to {author}: ',
   'cmd.adopt.already_adopted': 'This topic is already adopting {label} ({pane}).\nClick "Disconnect" on the card first, then run /adopt again (the original CLI is untouched).',
   'cmd.adopt.no_sessions': 'No adoptable CLI session found.',

@@ -43,6 +43,7 @@ describe('passesDocCommentAuditGate', () => {
     requesterOpenId: string | undefined,
     textSummary: string,
     rollbackAutoSub: () => void,
+    kind?: 'reply' | 'dropped-signal',
   ) => Promise<boolean>;
 
   beforeEach(async () => {
@@ -101,5 +102,25 @@ describe('passesDocCommentAuditGate', () => {
     const [, , notifyText] = mocks.sendUserMessage.mock.calls[0];
     expect(notifyText).toContain('x'.repeat(200) + '…');
     expect(notifyText).not.toContain('x'.repeat(201));
+  });
+
+  /**
+   * 失败路径**不能**复用成功文案。`doc_mention_notify_body` 说的是「@了机器人，
+   * 已触发回复」—— 但前两个丢弃点拿不到 trigger，无法确认 @ 的是不是本 bot；
+   * 三个丢弃点也都没有产生任何回复。照搬会让 owner 收到与实际情况矛盾的通知，
+   * 而这正是本 PR 反复在治的「日志/通知谎报事实」。
+   */
+  it('dropped-signal 用独立文案，不谎称「已 @机器人、已触发回复」', async () => {
+    await gate('app-test', FILE_TOKEN, 'ou_stranger', '评论正文读取失败', mocks.rollback, 'dropped-signal');
+    const [, , notifyText] = mocks.sendUserMessage.mock.calls[0];
+    expect(notifyText).not.toContain('已触发回复');
+    expect(notifyText).not.toContain('@了机器人');
+    expect(notifyText).toContain('未能读取或处理');
+  });
+
+  it('正常回复路径仍用原成功文案（抽取不改既有行为）', async () => {
+    await gate('app-test', FILE_TOKEN, 'ou_stranger', '正文', mocks.rollback, 'reply');
+    const [, , notifyText] = mocks.sendUserMessage.mock.calls[0];
+    expect(notifyText).toContain('已触发回复');
   });
 });
