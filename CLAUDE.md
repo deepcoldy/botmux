@@ -59,6 +59,32 @@ worktree 的 `node_modules` **形态不统一**，是逐个手工决定的，不
 
 所以：**依赖需求与 canonical 完全一致**时才用 symlink（省 750M）；一旦分支动了 `package.json` / lockfile，就该独立 install，并且**在 worktree 之外**做（比如把改动推上去让 CI 装，或在 canonical 上装完再 symlink）。
 
+### worktree 的分支名：别用通用临时名（改前必读）
+
+本仓 ~40 个 worktree 共享同一个 `.git/refs`——**分支名是全局的**：你在任何一个 worktree 里 `git checkout -B <name>` 都会挪动**所有** checkout 了该分支的 worktree 的 HEAD 指针。`verify-master` / `verify-merged` 这类通用临时名已被多个会话反复 reset（reflog 里一串 `Reset to origin/master`），是 fleet 级现状，不是个例。
+
+**铁律：临时验证一律用 detached HEAD（`git checkout --detach <sha>`）或带 PR 号后缀的分支名（`verify-1198`），绝不用通用名。** 建之前先 `git worktree list | grep <name>` 查一眼有没有人在用。
+
+为什么 `-B` 危险：`git checkout <name>` 在分支已被别的 worktree checkout 时会报 `fatal: ... already checked out` 拒绝；但 `git checkout -B <name>` **绕过这道保护**强制挪指针。被挪的 worktree 文件和 index 一个字没动，但 `git status` 会显示 HEAD 与 index 之间的**假 diff**（实测一次事故制造了 251 条假 staged），受害者可能据此做出破坏性的「修复」。
+
+**怀疑自己的 worktree 被挪了指针，怎么验、怎么还原**：
+
+1. `git reflog show <branch>` 找旧 SHA（看 `Reset to` 记录）。reflog 默认 90 天、可能被 `gc` / `reflog expire` 清掉——过期了走第 3 步的兜底；
+2. `git -C <worktree> write-tree` 取 index 的 tree hash，与 `git rev-parse <旧SHA>^{tree}` 对比——**精确相等**就是指针被挪的指纹（index 是旧树、HEAD 是新树）。注意同样的症状（几百条 staged）也可能是真工作，必须逐个验、不能看数字下结论。`write-tree` 只往对象库写一个 tree 对象（append-only），**不改 index 与工作区**，在别人的 worktree 上跑也安全；
+3. **reflog 过期的兜底**：不依赖 reflog，直接用 index tree 反查 commit——
+
+   ```bash
+   t=$(git -C <worktree> write-tree)
+   git log --all --format='%H %s' | while read sha subj; do
+     [ "$(git rev-parse "$sha^{tree}" 2>/dev/null)" = "$t" ] && echo "命中: ${sha:0:9} $subj"
+   done
+   ```
+
+   实测直接命中 `b4bba94dd feat(card): …(#1067)`——无需 reflog 就定位到指针原位，还顺带读出「这是哪个 PR 的树」，比纯 SHA 更好判断是谁的树被挪了；
+4. 还原：`git update-ref refs/heads/<branch> <旧SHA> <新SHA>`（**带 old-value 做 CAS**，避免并发下再踩）。
+
+**未经确认不动别人的 worktree**——哪怕你「看出」它是假树，清理由该会话自己或维护者决定。
+
 ### 编译态（单文件二进制）注意
 
 编译版里没有 `dist/` 落在磁盘上——模块图在虚拟只读的 `/$bunfs/` 下，`__dirname` 是 `/$bunfs/root`。所以**任何把 `__dirname` 拼出的路径写到磁盘、或交给别的进程用的代码，在编译态都是坏的**（那个路径进程外不存在，且 sh 里未转义的 `$bunfs` 还会被展开成空串）。曾因此把 install.sh 装在 `~/.botmux/bin/botmux` 的二进制**覆盖成 47 字节的壳**。判断运行形态用 `isStandaloneBinary()`（`src/core/self-spawn.ts`），子进程一律走 `resolveEntrySpawn` / `spawnWorker` re-exec `process.execPath`，不要拼 `dist/*.js` 路径。
