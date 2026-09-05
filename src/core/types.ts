@@ -8,6 +8,7 @@ import type {
   DaemonToWorker,
   LarkAttachment,
   LarkMention,
+  ModelFallbackState,
   DisplayMode,
   StreamStatus,
   VcMeetingImTurnOrigin,
@@ -389,6 +390,14 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Claude model fallback still in effect, reported by the worker from the
+   *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
+   *  without a live worker keeps the notice. Unlike the other runtime facts it
+   *  is NOT owned by a worker generation and survives every respawn: it is
+   *  bound to a Claude session id instead, and only positive evidence moves it
+   *  — a reply served by a different model, a newer switch record, a message
+   *  from another Claude session, or a role switch away from claude-code. */
+  modelFallback?: ModelFallbackState;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
   /** Queued suspend: the request arrived while the session was producing

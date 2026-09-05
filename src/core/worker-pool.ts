@@ -32,6 +32,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnRe
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -339,6 +340,10 @@ export function getDaemonStreamingCardUsageSnapshot(
   const reasoningEffort = ds.activeReasoningEffort?.trim()
     || ds.session.reasoningEffort?.trim();
   const modelBackendVariant = ds.session.modelBackendVariant;
+  // The fallback notice is a warning about which model is answering, not a
+  // usage metric — it rides the snapshot (every buildStreamingCard call site
+  // already forwards one) but must survive the 'off'/'footer' early return.
+  const modelFallback = ds.modelFallback;
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
@@ -347,6 +352,7 @@ export function getDaemonStreamingCardUsageSnapshot(
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(modelBackendVariant ? { modelBackendVariant } : {}),
+        ...(modelFallback ? { modelFallback } : {}),
       };
     }
   } catch {
@@ -369,6 +375,87 @@ export function getDaemonStreamingCardUsageSnapshot(
     ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
     ...(modelBackendVariant ? { modelBackendVariant } : {}),
+    ...(modelFallback ? { modelFallback } : {}),
+  };
+}
+
+/**
+ * Merge one worker `model_fallback` observation into the fallback the daemon
+ * holds. The daemon is the authority here, not the worker: the persisted state
+ * outlives every worker generation, while a worker only ever sees a bounded
+ * tail of the transcript.
+ *
+ * The rules, in order:
+ *   a) a message from a DIFFERENT Claude session drops what we held first. The
+ *      notice belongs to one Claude conversation; `/repo`, `/adopt` and a
+ *      resume onto another native session all replace it, and carrying the old
+ *      record across shows a warning about a conversation the user has left —
+ *      or, when the new session's real model happens to equal the old
+ *      `fallbackModel`, a warning nothing can ever clear. State persisted
+ *      before the binding existed carries no session id and is likewise
+ *      dropped: it cannot be shown to belong here, and the same message's seed
+ *      re-establishes it when it does.
+ *   b) a switch record with a NEW uuid replaces whatever we held (and is
+ *      stamped with the message's Claude session); `fallback: null` — the
+ *      newest session-scoped record is NOT a live Fable fallback — clears.
+ *   c) a serving model that is a FABLE model clears it — the notice is "this
+ *      session fell OFF Fable", and the only evidence it is over is Claude
+ *      being observed back on a Fable model. A drift onto a THIRD non-Fable
+ *      model (opus-5 → opus-4-8 across a resume, with no new switch record) is
+ *      still "not on Fable": clearing there would hide the very condition the
+ *      notice exists for. Ordering matters: a `servingModel` arriving in the
+ *      same message as a `fallback` was observed AFTER it, so (c) runs after
+ *      (b).
+ *   d) `changed` compares the resulting STATE with the one we came in with, so
+ *      a message that runs both rules and lands back where it started costs no
+ *      write and no card patch.
+ *
+ * Everything else — a missing record, a restarted worker on the SAME Claude
+ * session, a transcript window too short to reach the switch — leaves the state
+ * exactly as it was. Absence of evidence is never evidence of a switch back.
+ */
+export function mergeModelFallbackObservation(
+  current: ModelFallbackState | undefined,
+  msg: { claudeSessionId?: string; fallback?: ModelFallbackState | null; servingModel?: string },
+): { next: ModelFallbackState | undefined; changed: boolean } {
+  let next = current;
+  if (next && msg.claudeSessionId && next.claudeSessionId !== msg.claudeSessionId) {
+    next = undefined;
+  }
+  if (msg.fallback === null) {
+    next = undefined;
+  } else if (msg.fallback) {
+    const incoming = msg.claudeSessionId
+      ? { ...msg.fallback, claudeSessionId: msg.claudeSessionId }
+      : msg.fallback;
+    if (next?.uuid !== incoming.uuid || next?.claudeSessionId !== incoming.claudeSessionId) {
+      next = incoming;
+    }
+  }
+  if (msg.servingModel && next) {
+    const serving = normalizeClaudeModelId(msg.servingModel);
+    // Back ON a Fable model is the only switch-back evidence. Answering on a
+    // model that merely differs from the fallback one is not: a silent drift
+    // onto a third non-Fable model (observed in a real transcript — opus-5 →
+    // opus-4-8 across a resume, no new switch record) also "differs", and
+    // clearing on it retires the notice while the session is still off Fable.
+    // Same Fable predicate the parse layer uses to scope the notice.
+    if (serving && isFableModelId(serving)) {
+      next = undefined;
+    }
+  }
+  // `changed` is about the STATE, not about which rules fired. A cold-start
+  // message carrying a record together with a serving model that already
+  // disagrees with it runs both rules and lands back on "no notice" — where we
+  // started — so persisting and patching the card for it would be a wasted
+  // Feishu edit on every worker start of an already-switched-back session.
+  // Same identity the persist dirty-check uses: uuid AND Claude session, so an
+  // upgrade that only stamps the session id onto pre-existing state still
+  // persists it once.
+  return {
+    next,
+    changed: current?.uuid !== next?.uuid
+      || current?.claudeSessionId !== next?.claudeSessionId,
   };
 }
 
@@ -407,6 +494,7 @@ import type {
   CodexAppTurnInput,
   FrozenSessionReplyTarget,
   DaemonToWorker,
+  ModelFallbackState,
   TrustedCaller,
   WorkerToDaemon,
   Session,
@@ -11160,6 +11248,20 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  // The model-fallback notice is the ONE runtime fact a worker generation does
+  // NOT own: it must survive every respawn and stay visible each round until
+  // Claude is observed answering on a different model. Clearing it here and
+  // waiting for the new worker to re-seed loses it whenever the switch record
+  // has scrolled out of the bounded tail scan (a long session), and nothing
+  // ever brings it back. So only a role switch AWAY from claude-code clears it
+  // — that worker would never send a correcting observation of its own. And it
+  // must be cleared on DISK as well: leaving the mirror on Session.modelFallback
+  // means a daemon restart (or any card rebuilt without a live worker) revives
+  // the notice on a session that is no longer running Claude at all.
+  if (sessionCliId(ds, getBot(ds.larkAppId).config) !== 'claude-code') {
+    ds.modelFallback = undefined;
+    persistStreamCardState(ds);
+  }
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
@@ -12092,6 +12194,41 @@ function setupWorkerHandlers(
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
         scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
+      case 'model_fallback': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored model_fallback from stale worker generation`);
+          break;
+        }
+        // Claude-Code-only affordance (product decision). A worker for any
+        // other CLI has no business moving this state.
+        if (effectiveCliId !== 'claude-code') break;
+        const merged = mergeModelFallbackObservation(ds.modelFallback, msg);
+        if (merged.changed) {
+          ds.modelFallback = merged.next;
+          persistStreamCardState(ds);
+        }
+        // The card's usage line shows ds.activeModel, and Claude Code never
+        // emits `active_runtime` — so without this the line renders the LAUNCH
+        // model (ds.session.model) forever, even while an automatic fallback
+        // has the session answering on something else. The serving model is a
+        // per-reply observation of the real thing, so it is the runtime model:
+        // same "only write when it changed, then patch" semantics as the
+        // active_runtime handler. Effort is untouched — Claude reports none,
+        // and a blank one would erase what another channel wrote.
+        let runtimeChanged = false;
+        const servingModel = normalizeClaudeModelId(msg.servingModel);
+        if (servingModel && ds.activeModel !== servingModel) {
+          ds.activeModel = servingModel;
+          runtimeChanged = true;
+        }
+        if (merged.changed || runtimeChanged) scheduleActiveRuntimePatch(ds);
         break;
       }
 
