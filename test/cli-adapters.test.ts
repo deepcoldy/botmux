@@ -410,6 +410,28 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--codex-bin');
   });
 
+  it('canonicalizes a symlinked app-bundled Codex before spawning it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-direct-symlink-'));
+    try {
+      const resourcesDir = join(root, 'ChatGPT.app', 'Contents', 'Resources');
+      mkdirSync(resourcesDir, { recursive: true });
+      const realBin = join(resourcesDir, 'codex');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      writeFileSync(join(resourcesDir, 'codex-code-mode-host'), '#!/bin/sh\n', { mode: 0o755 });
+
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'codex');
+      symlinkSync(realBin, linkBin);
+
+      const symlinkAdapter = createCodexAdapter(linkBin);
+      expect(linkBin).not.toBe(realpathSync(realBin));
+      expect(symlinkAdapter.resolvedBin).toBe(realpathSync(realBin));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('bypasses the interactive hook-trust gate right after the approval/sandbox bypass when the toggle is on', () => {
     // codex 0.14x adds a "Press t to trust" gate for the botmux-installed
     // ~/.codex/hooks.json hooks; a headless pane can never press `t`, so without

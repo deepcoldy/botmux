@@ -184,12 +184,12 @@ export function resolveCommand(cmd: string): string {
  * sandbox and the second-stage process crash-loops. Canonicalizing here makes the
  * spawned path identical to the one the sandbox authorized.
  *
- * NOT needed for `resolvedBin` alone: the worker canonicalizes that itself on both
- * the authorization side and the spawn side. The bug only appears where an adapter
- * passes a path THROUGH to something else that execs it — which is why this is a
- * shared helper rather than folded into `resolveCommand` (that would also rewrite
- * the many display/probe call sites, where the user-facing PATH entry is the more
- * useful string).
+ * Also use it for `resolvedBin` when the launched executable discovers sibling
+ * resources from its own path. Codex does this for `codex-code-mode-host`, so
+ * launching an app-bundled Codex through a PATH symlink makes it search beside the
+ * symlink unless the adapter canonicalizes first. Keep this helper separate from
+ * `resolveCommand` so display/probe call sites can still report the user-facing PATH
+ * entry when they do not have an execution-path requirement.
  *
  * Falls back to the non-canonical path when realpath fails (binary genuinely
  * absent) so the failure surfaces as the same unmasked ENOENT as before.
