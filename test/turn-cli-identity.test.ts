@@ -126,6 +126,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
     const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
     const outcomes = await publish(config, BOB);
+    expect(readFileSync(larkPath(), 'utf8')).toContain('飞书');
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     // A refusal is published, not an empty file: it carries the text the person
     // whose command just failed reads, including how to authorize.
@@ -151,9 +152,25 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
     expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
-    // And it names the ByteCloud command — plain `/login` would send them to
-    // authorize Feishu again and hit the same refusal.
+    // And it names ByteCloud, not Feishu — both in the provider it asks them to
+    // authorize with and in the command. Getting either wrong sends them off to
+    // authorize the other provider and hit this same refusal again.
+    expect(body).toContain('ByteCloud');
+    expect(body).not.toContain('飞书');
     expect(body).toContain('/login bytedcli');
+    // Someone refused for lack of authorization usually has no stored name, so
+    // the nameless path is the common one — it must read as a sentence, not
+    // print a raw open_id back at the person.
+    expect(body).not.toContain(ALICE);
+    expect(body).toContain('你自己');
+  });
+
+  it('uses the stored name when we actually know it', async () => {
+    const { lookupAuthorizedUserName } = await import('../src/utils/user-token.js');
+    vi.mocked(lookupAuthorizedUserName).mockReturnValueOnce('孙晓雪');
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+    await publish(config, ALICE);
+    expect(readFileSync(larkPath(), 'utf8')).toContain('孙晓雪');
   });
 
   it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
