@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import {
   renderIdentityEnv,
   renderIdentityWrapper,
+  IDENTITY_DENIED_EXIT_CODE,
   writeSessionIdentity,
   clearSessionIdentity,
   clearAllSessionIdentities,
@@ -161,6 +162,24 @@ describe('renderIdentityWrapper', () => {
     });
   }
 
+  /** Run a wrapper expected to refuse; returns its exit code and stderr. */
+  function runDenied(
+    wrapperPath: string,
+    env: Record<string, string>,
+  ): { status: number; stderr: string } {
+    try {
+      const out = execFileSync('/bin/sh', [wrapperPath], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin', ...env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      throw new Error(`expected the wrapper to refuse, but the tool ran: ${out}`);
+    } catch (e: any) {
+      if (typeof e.status !== 'number') throw e;
+      return { status: e.status, stderr: String(e.stderr ?? '') };
+    }
+  }
+
   it('exports the published identity to the real tool', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
@@ -170,19 +189,75 @@ describe('renderIdentityWrapper', () => {
     expect(out).toBe('cli_app|u-tok|im +send');
   });
 
-  // Missing file is the bot-identity fallback path, not an error: lark-cli runs
-  // as the bot with no env at all. Failing closed is the daemon's call.
-  it('runs the tool with no identity when the file is absent', () => {
+  // The regression this whole wrapper exists to prevent. Running the tool with
+  // no identity env does NOT make it act as the bot: lark-cli then resolves the
+  // operator's on-disk login and acts as *that person* — the machine account.
+  // So a missing file refuses, and the refusal says how to fix it, or the person
+  // whose command failed just retries it forever.
+  it('refuses instead of running when the identity file is absent', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
-    const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
-    expect(out).toBe('||');
+    const { status, stderr } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(stderr).toContain('/login');
   });
 
-  it('runs the tool plainly outside a botmux session', () => {
+  it('refuses outside a botmux session, where no identity can be published', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
-    expect(runWrapper(wrapperPath, {})).toBe('||');
+    expect(runDenied(wrapperPath, {}).status).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
+  // A half-written or truncated file must not read as permission. The mode
+  // marker is what authorizes the exec, so credentials without it are refused.
+  it('refuses a file that carries credentials but no mode marker', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    mkdirSync(join(dir, 'cli-identity'), { recursive: true });
+    writeFileSync(join(dir, 'cli-identity', `${SESSION}.lark-cli.env`), "LARKSUITE_CLI_APP_ID='cli_app'\n");
+    const { status } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
+  // The caller cannot talk its way past the check either: the wrapper resets the
+  // marker before sourcing, so an inherited value is ignored.
+  it('ignores a mode marker injected through the environment', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    const { status } = runDenied(wrapperPath, {
+      SESSION_DATA_DIR: dir,
+      BOTMUX_SESSION_ID: SESSION,
+      BOTMUX_IDENTITY_MODE: 'user',
+    });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
+  it('prints the published refusal verbatim, naming who must authorize', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli',
+      mode: 'denied',
+      message: 'botmux: 需要「张三」本人的授权。\nbotmux: 请 ta 发 /login。',
+    });
+    const { status, stderr } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(stderr).toContain('张三');
+    expect(stderr).toContain('/login');
+  });
+
+  // Bot mode carries the app secret: that pair is what actually makes lark-cli
+  // resolve `identity: bot` while an on-disk user login exists.
+  it('runs as the bot when bot mode is published', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    const real = join(dir, 'bot-tool.sh');
+    writeFileSync(real, '#!/bin/sh\nprintf "%s|%s|%s" "$LARKSUITE_CLI_APP_ID" "$LARKSUITE_CLI_APP_SECRET" "$LARKSUITE_CLI_USER_ACCESS_TOKEN"\n');
+    chmodSync(real, 0o755);
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', real));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', mode: 'bot', appId: 'cli_app', appSecret: 'sec' });
+
+    const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(out).toBe('cli_app|sec|');
   });
 
   // A cleared identity must actually stop being used — this is the same
@@ -196,7 +271,7 @@ describe('renderIdentityWrapper', () => {
     expect(runWrapper(wrapperPath, env)).toBe('cli_app|u-tok|');
 
     clearSessionIdentity(dir, SESSION, 'lark-cli');
-    expect(runWrapper(wrapperPath, env)).toBe('||');
+    expect(runDenied(wrapperPath, env).status).toBe(IDENTITY_DENIED_EXIT_CODE);
   });
 
   // Re-reading per invocation is the whole reason this is a file. Same process

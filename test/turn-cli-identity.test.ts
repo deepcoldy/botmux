@@ -2,10 +2,15 @@
  * Per-turn identity publication — the decision layer.
  *
  * The property that matters most is negative: **no turn ever runs with the
- * previous sender's credentials still on disk.** So the tests below are mostly
+ * previous sender's credentials still in force.** So the tests below are mostly
  * about what happens when a token is *not* available — a new sender who has not
  * authorized, a turn with no human sender at all, a bot whose policy is off.
- * Every one of those must end with the file gone, not merely un-refreshed.
+ *
+ * Note "not in force" is not the same as "file deleted". The wrapper refuses to
+ * run when the file is missing, so the bot identity has to be written out
+ * explicitly (lark-cli handed no env picks up the operator's on-disk login, not
+ * the bot's). What every case below asserts is therefore the *content*: the
+ * previous person's token must be gone from it.
  *
  * Run:  npx vitest run --project unit test/turn-cli-identity.test.ts
  */
@@ -18,6 +23,7 @@ const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
     tokens.get(`${appId}|${openId ?? ''}`) ?? null),
+  lookupAuthorizedUserName: vi.fn(() => undefined),
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
@@ -86,10 +92,16 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     await publish(botConfig(), ALICE);
     expect(existsSync(larkPath())).toBe(true);
 
-    // Bob has no token: the file must GO, not keep Alice's.
+    // Bob has no token: Alice's must be gone. Under the default fallback the
+    // file is rewritten to the bot identity rather than deleted — deleting it
+    // would make the wrapper refuse, and leaving it would run Bob's command as
+    // Alice.
     const outcomes = await publish(botConfig(), BOB);
-    expect(existsSync(larkPath())).toBe(false);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).not.toContain('tok-alice');
+    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'bot\'');
+    expect(body).toContain('LARKSUITE_CLI_APP_SECRET');
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
@@ -99,15 +111,20 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     await publish(botConfig(), ALICE);
     const outcomes = await publish(botConfig(), undefined);
-    expect(existsSync(larkPath())).toBe(false);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
     const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
     const outcomes = await publish(config, BOB);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    expect(existsSync(larkPath())).toBe(false);
+    // A refusal is published, not an empty file: it carries the text the person
+    // whose command just failed reads, including how to authorize.
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
+    expect(body).toContain('/login');
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
   });
 
   // bytedcli authenticates against ByteCloud SSO, a different provider from Lark
@@ -119,7 +136,11 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(config, ALICE);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
-    expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
+    // bytedcli has no bot identity to fall back to, so it is refused outright
+    // even though the same turn's lark-cli runs as Alice.
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
+    expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
   });
 });
 
@@ -154,18 +175,23 @@ describe('publishTurnCliIdentity — failures fail closed', () => {
 
     vi.mocked(resolveUserToken).mockRejectedValueOnce(new Error('keychain unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
-    // The turn survives, and the stale identity is gone.
-    expect(existsSync(larkPath())).toBe(false);
+    // The turn survives, and the stale identity is gone. A store outage lands on
+    // the same policy as "never authorized" — otherwise a transient failure
+    // would quietly grant a different identity than a missing token does.
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
   });
 
-  it('withholds when the bot has no app credentials to pair with the token', async () => {
+  // Without app credentials there is no bot identity to fall back to either —
+  // running as the bot needs the very app id and secret that are missing. So
+  // this degrades to a refusal, not to "run it and see".
+  it('refuses when the bot has no app credentials to pair with the token', async () => {
     tokens.set(`|${ALICE}`, 'tok');
     const outcomes = await publish(
       { larkAppId: '', larkAppSecret: '', brand: 'feishu', triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) } as any,
       ALICE,
     );
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
-    expect(existsSync(larkPath())).toBe(false);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    expect(readFileSync(larkPath(), 'utf8')).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
   });
 });

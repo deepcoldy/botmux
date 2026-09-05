@@ -13,7 +13,9 @@
  * previous person, which is the exact failure the feature exists to remove.
  */
 import { logger } from '../utils/logger.js';
-import { resolveUserToken } from '../utils/user-token.js';
+import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.js';
+import { t } from '../i18n/index.js';
+import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
@@ -47,6 +49,8 @@ export interface PublishTurnIdentityArgs {
   sessionId: string;
   /** The person who sent THIS turn. Absent for turns with no human sender. */
   senderOpenId: string | undefined;
+  /** For the stderr text the wrapper prints when a command is refused. */
+  locale?: Locale;
 }
 
 /**
@@ -59,7 +63,7 @@ export interface PublishTurnIdentityArgs {
 export async function publishTurnCliIdentity(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
-  const { botConfig, sessionDataDir, sessionId, senderOpenId } = args;
+  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
 
@@ -69,17 +73,18 @@ export async function publishTurnCliIdentity(
       continue;
     }
     try {
-      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId));
+      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale));
     } catch (e) {
-      // Fail closed: withhold rather than risk leaving a previous identity in
-      // place. Withholding degrades to the bot identity (or a clear auth error);
-      // a stale file would run as the wrong person with no signal at all.
-      clearSessionIdentity(sessionDataDir, sessionId, tool);
+      // Fail closed through the SAME policy as an ordinary missing token, so a
+      // credential-store outage and "this person never authorized" cannot end
+      // up with different identities in force. Overwriting matters as much as
+      // the policy: leaving the previous person's file would keep running as
+      // them with no signal at all.
       logger.warn(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push({ tool, state: unauthorizedOutcomeFor(policy, tool) === 'fail' ? 'needs-authorization' : 'bot-identity' });
+      outcomes.push(withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale));
     }
   }
   return outcomes;
@@ -91,16 +96,10 @@ async function publishOne(
   sessionDataDir: string,
   sessionId: string,
   senderOpenId: string | undefined,
+  locale: Locale | undefined,
 ): Promise<ToolIdentityOutcome> {
-  const withheld = (): ToolIdentityOutcome => {
-    clearSessionIdentity(sessionDataDir, sessionId, tool);
-    return {
-      tool,
-      state: unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) === 'fail'
-        ? 'needs-authorization'
-        : 'bot-identity',
-    };
-  };
+  const withheld = () =>
+    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale);
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
@@ -112,6 +111,94 @@ async function publishOne(
 
   writeSessionIdentity(sessionDataDir, sessionId, identity);
   return { tool, state: 'user' };
+}
+
+/**
+ * What "no usable credentials for this turn's sender" resolves to.
+ *
+ * The one place that decision is made, so every route into it — no sender, no
+ * token, a store outage — lands on the same identity.
+ *
+ * Neither outcome can be expressed by deleting the file. The wrapper reads an
+ * absent file as a refusal, so running as the bot has to be published
+ * explicitly (with app id + secret; lark-cli given nothing picks up the
+ * operator's on-disk login instead). And a refusal is published too, because it
+ * carries the text the refused person reads.
+ */
+function withholdIdentity(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  sessionDataDir: string,
+  sessionId: string,
+  senderOpenId: string | undefined,
+  locale: Locale | undefined,
+): ToolIdentityOutcome {
+  if (
+    unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) !== 'fail'
+    && tool === 'lark-cli'
+    && botConfig.larkAppId
+    && botConfig.larkAppSecret
+  ) {
+    try {
+      writeSessionIdentity(sessionDataDir, sessionId, {
+        tool: 'lark-cli',
+        mode: 'bot',
+        appId: botConfig.larkAppId,
+        appSecret: botConfig.larkAppSecret,
+      });
+      return { tool, state: 'bot-identity' };
+    } catch {
+      // Fall through to the refusal: no file at all is refused by the wrapper,
+      // which is the safe end of this failure.
+    }
+  }
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale);
+  return { tool, state: 'needs-authorization' };
+}
+
+/**
+ * Publish a refusal the wrapper prints verbatim on stderr.
+ *
+ * Names the person whose authorization is missing when we know it, and always
+ * says how to supply it. Without the "how", someone whose command just failed
+ * has no way to discover that /login is the answer — they retry, fail again,
+ * and conclude the bot is broken.
+ *
+ * Best-effort by construction: if this write fails the file stays absent, which
+ * the wrapper also reads as a denial. Safety does not depend on it landing —
+ * only the quality of the message does.
+ */
+function writeDenial(
+  sessionDataDir: string,
+  sessionId: string,
+  tool: TriggerUserAuthTool,
+  senderOpenId: string | undefined,
+  botConfig: BotConfig,
+  locale: Locale | undefined,
+): void {
+  try {
+    const name = senderOpenId && botConfig.larkAppId
+      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId)
+      : undefined;
+    const head = senderOpenId
+      ? t('trigger_user_auth.denied_known_user', { name: name ?? senderOpenId, tool }, locale)
+      : t('trigger_user_auth.denied_anonymous', { tool }, locale);
+    writeSessionIdentity(sessionDataDir, sessionId, {
+      tool,
+      mode: 'denied',
+      message: [
+        head,
+        t('trigger_user_auth.denied_howto', undefined, locale),
+        t('trigger_user_auth.denied_howto_status', undefined, locale),
+      ].join('\n'),
+    });
+  } catch (e) {
+    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    logger.debug(
+      `[trigger-user-auth] could not publish the ${tool} denial (absent file denies too): `
+      + `${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
 }
 
 async function resolveIdentityFor(
