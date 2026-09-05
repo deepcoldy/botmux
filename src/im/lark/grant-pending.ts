@@ -173,5 +173,36 @@ export function throttleReason(
   return null;
 }
 
-export function _resetForTest(): void { table.clear(); lastPrunedAt = 0; }
+// ─── 通用提示节流（无权限提示 / owner DM 等轻量通知）─────────────────────
+// 与上面的授权卡节流互相独立：授权卡状态要挂 nonce/quota/messageData，这里只记
+// 「上次放行时间戳」。用于 B-1 修复后给被挡发送者/owner 的可观测性提示，避免
+// 同一发送者反复触发时刷屏。纯内存，daemon 重启清空。
+type NoticeEntry = { ts: number; windowMs: number };
+const noticeTable = new Map<string, NoticeEntry>();
+let lastNoticePrunedAt = 0;
+
+/** 轻量通知节流：同一 key 在 windowMs 内只放行一次。
+ *  返回 true 表示「仍在窗口内，应抑制」；返回 false 表示「可以发」，并记录本次时间戳。
+ *  过期条目在下次全表 prune（最多每 PRUNE_INTERVAL_MS 一次）时回收，表不会无限增长。 */
+export function shouldThrottleNotice(key: string, windowMs: number): boolean {
+  const now = Date.now();
+  const e = noticeTable.get(key);
+  if (e && now - e.ts < e.windowMs) return true;
+  noticeTable.set(key, { ts: now, windowMs });
+  if (now - lastNoticePrunedAt >= PRUNE_INTERVAL_MS) {
+    lastNoticePrunedAt = now;
+    for (const [k, ent] of noticeTable) {
+      if (now - ent.ts >= ent.windowMs) noticeTable.delete(k);
+    }
+  }
+  return false;
+}
+
+export function _resetForTest(): void {
+  table.clear();
+  noticeTable.clear();
+  lastPrunedAt = 0;
+  lastNoticePrunedAt = 0;
+}
 export function _tableSizeForTest(): number { return table.size; }
+export function _noticeTableSizeForTest(): number { return noticeTable.size; }

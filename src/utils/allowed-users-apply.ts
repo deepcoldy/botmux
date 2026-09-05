@@ -31,6 +31,14 @@ export interface AllowedUsersResolveResultLike {
    * `definitive` (safest: never revived from cache).
    */
   entryStatus?: Map<string, EntryResolveStatus>;
+  /**
+   * Raw entries this pass definitively could not resolve. Unused by the pure
+   * merge (definitive drops are simply not revived — see `entryStatus`); present
+   * so callers can pass the resolver result through unchanged and surface the
+   * misses as warnings / notices. Optional: older callers and partial mocks may
+   * omit it without affecting the merge.
+   */
+  definitiveMisses?: string[];
 }
 
 export interface ApplyAllowedUsersResolveInput {

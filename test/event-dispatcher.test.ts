@@ -73,6 +73,7 @@ const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockSendUserMessage = vi.fn(async () => 'dm-msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
 const mockListChatMessages = vi.fn(async () => [] as any[]);
 const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
@@ -90,6 +91,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  sendUserMessage: (...args: any[]) => mockSendUserMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
@@ -2381,7 +2383,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
-  it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
+  it('falls back to a generic no-permission notice (no card, no owner DM) when auto grant cards are disabled', async () => {
+    // B-1：autoGrantRequestCards=false 时不再静默——给发送者一条通用无权限提示，
+    // 但不发授权卡、不发 owner DM。
     setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
     mockGetOwnerOpenId.mockReturnValue('ou_owner');
     mockGetChatMode.mockResolvedValueOnce('group');
@@ -2402,10 +2406,18 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(mockReplyMessage).not.toHaveBeenCalled();
+    // 通用无权限提示（文本），不发授权卡
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining('你没有权限使用此 Bot'),
+      'text',
+    );
+    expect(mockReplyMessage.mock.calls.filter(c => c[3] === 'interactive')).toHaveLength(0);
   });
 
-  it('throttles repeat @blocked mentions from the same bot+chat to a single grant card', async () => {
+  it('throttles repeat @blocked mentions from the same bot+chat to a single grant card (+ one pending notice)', async () => {
     setupBotState({ allowedUsers: ['ou_owner'] });
     mockGetOwnerOpenId.mockReturnValue('ou_owner');
     mockGetChatMode.mockResolvedValue('group');
@@ -2434,12 +2446,19 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
     await flushEventWork();
 
-    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    // 授权卡只发一次（第一次）；第二次被节流抑制 → 补发一条「已提交/冷却中」文本提示（B-1）
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
     expect(mockReplyMessage).toHaveBeenCalledWith(
       MY_APP_ID,
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
+    );
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-002',
+      expect.stringContaining('授权申请已提交'),
+      'text',
     );
   });
 
@@ -5183,6 +5202,222 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   });
 });
 
+describe('im.message.receive_v1 — 无权限消息可观测性 (B-1: 不再静默丢弃)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const STRANGER = 'ou_stranger_p2p';
+  const OWNER = 'ou_owner';
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockReset().mockResolvedValue('msg-id');
+    mockSendUserMessage.mockReset().mockResolvedValue('dm-msg-id');
+    mockGetOwnerOpenId.mockReset().mockReturnValue(OWNER);
+    mockGetUserProfile.mockReset().mockResolvedValue(null);
+    mockGetChatMode.mockReset().mockResolvedValue('group');
+    mockFindOncallChat.mockReset().mockReturnValue(undefined);
+    setupBotState({ allowedUsers: [OWNER] });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  /** 统计 replyMessage 调用里 msgType 为 text 且内容包含 needle 的次数。 */
+  function textNoticeCalls(needle: string): any[][] {
+    return mockReplyMessage.mock.calls.filter(
+      c => c[3] === 'text' && String(c[2]).includes(needle),
+    );
+  }
+
+  it('p2p 被挡：发送者收到通用无权限提示，owner 收到 DM，提示不含 owner 身份', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '你好，我想用这个 Bot' }),
+      messageId: 'msg-p2p-denied-1',
+      chatId: 'oc_p2p_stranger',
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // 发送者收到通用提示（reply 到原消息）
+    const notices = textNoticeCalls('你没有权限使用此 Bot');
+    expect(notices).toHaveLength(1);
+    expect(notices[0][0]).toBe(MY_APP_ID);
+    expect(notices[0][1]).toBe('msg-p2p-denied-1');
+    // 安全红线：给陌生人的提示绝不能携带 owner 的 open_id/姓名
+    expect(notices[0][2]).not.toContain(OWNER);
+    // owner 收到 DM（含请求者身份，与授权卡同口径的缩略 open_id）
+    expect(mockSendUserMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      OWNER,
+      expect.stringContaining('私聊'),
+      'text',
+    );
+    const dmContent = mockSendUserMessage.mock.calls[0][2] as string;
+    expect(dmContent).toContain('ou_strange');
+    // 未建会话
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('p2p 被挡：节流窗口内第二次不重复发提示、不重复 DM', async () => {
+    for (const mid of ['msg-p2p-throttle-1', 'msg-p2p-throttle-2']) {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: STRANGER,
+        content: JSON.stringify({ text: '在吗' }),
+        messageId: mid,
+        chatId: 'oc_p2p_stranger',
+        chatType: 'p2p',
+      }));
+      await flushEventWork();
+    }
+
+    expect(textNoticeCalls('你没有权限使用此 Bot')).toHaveLength(1);
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('p2p 被挡且无 owner：发送者仍收到提示，但不发 DM', async () => {
+    mockGetOwnerOpenId.mockReturnValue(undefined);
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '你好' }),
+      messageId: 'msg-p2p-no-owner-1',
+      chatId: 'oc_p2p_stranger',
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(textNoticeCalls('你没有权限使用此 Bot')).toHaveLength(1);
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('p2p 被挡：owner DM 含请求者名字（profile 可取时）', async () => {
+    mockGetUserProfile.mockResolvedValue({ name: '张三' });
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '你好' }),
+      messageId: 'msg-p2p-named-1',
+      chatId: 'oc_p2p_stranger',
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockSendUserMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      OWNER,
+      expect.stringContaining('张三'),
+      'text',
+    );
+  });
+
+  it('群聊被挡：授权卡正常发送（sent），不补发文本提示', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '@_bot_a 帮我看看这个报错' }),
+      messageId: 'msg-group-card-1',
+      chatId: 'chat-group-denied',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // 授权卡（interactive）正常发出
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-group-card-1',
+      expect.stringContaining(STRANGER),
+      'interactive',
+    );
+    // 卡本身就是反馈 → 不补发任何文本提示
+    expect(textNoticeCalls('你没有权限')).toHaveLength(0);
+    expect(textNoticeCalls('授权申请已提交')).toHaveLength(0);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('群聊被挡：节流窗口内第二次 @ → 发「已提交/冷却中」提示，不重复发卡', async () => {
+    for (const mid of ['msg-group-throttle-1', 'msg-group-throttle-2']) {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: STRANGER,
+        content: JSON.stringify({ text: '@_bot_a 再问一次' }),
+        messageId: mid,
+        chatId: 'chat-group-denied',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }));
+      await flushEventWork();
+    }
+
+    // 只发了一次卡（第一次），第二次被节流抑制
+    const cardCalls = mockReplyMessage.mock.calls.filter(c => c[3] === 'interactive');
+    expect(cardCalls).toHaveLength(1);
+    // 第二次补发「已提交/冷却中」文本提示
+    expect(textNoticeCalls('授权申请已提交')).toHaveLength(1);
+  });
+
+  it('群聊被挡且 autoGrantRequestCards=false：发通用提示，不发卡、不 DM owner', async () => {
+    setupBotState({ allowedUsers: [OWNER], autoGrantRequestCards: false });
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '@_bot_a 帮我看看' }),
+      messageId: 'msg-group-disabled-1',
+      chatId: 'chat-group-denied',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(textNoticeCalls('你没有权限使用此 Bot')).toHaveLength(1);
+    expect(mockReplyMessage.mock.calls.filter(c => c[3] === 'interactive')).toHaveLength(0);
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('群聊被挡且无 owner：发通用提示，不发卡', async () => {
+    mockGetOwnerOpenId.mockReturnValue(undefined);
+    const event = makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '@_bot_a 帮我看看' }),
+      messageId: 'msg-group-no-owner-1',
+      chatId: 'chat-group-denied',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(textNoticeCalls('你没有权限使用此 Bot')).toHaveLength(1);
+    expect(mockReplyMessage.mock.calls.filter(c => c[3] === 'interactive')).toHaveLength(0);
+  });
+
+  it('群聊提示节流：窗口内多次被抑制只发一次提示', async () => {
+    // 第一次：发卡（sent，无提示）。后两次：均被节流 → 只补发一次提示。
+    for (const mid of ['msg-group-nt-1', 'msg-group-nt-2', 'msg-group-nt-3']) {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: STRANGER,
+        content: JSON.stringify({ text: '@_bot_a 继续追问' }),
+        messageId: mid,
+        chatId: 'chat-group-denied',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }));
+      await flushEventWork();
+    }
+
+    expect(textNoticeCalls('授权申请已提交')).toHaveLength(1);
+  });
+});
+
 describe('im.message.receive_v1 — regular group thread replies preference', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
@@ -6414,7 +6649,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
   });
 
-  it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次', async () => {
+  it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次卡 + 一条冷却提示', async () => {
     setupAutoTopicBotSender(true, false);
     const e1 = makeBotTopicSeed('msg-bot-dup-1', 'chat-bot-dup');
     const e2 = makeBotTopicSeed('msg-bot-dup-2', 'chat-bot-dup');
@@ -6425,8 +6660,16 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     await flushEventWork();
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）
-    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）；
+    // 第二条被节流抑制 → 补发一条「已提交/冷却中」文本提示（B-1）。
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-dup-1', expect.any(String), 'interactive');
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-bot-dup-2',
+      expect.stringContaining('授权申请已提交'),
+      'text',
+    );
   });
 
   it('open 模式（空 allowlist，默认态）陌生 bot 开新话题（未 @）→ 自动开工（open 腿放行，无需授权卡）', async () => {

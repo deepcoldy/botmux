@@ -20,7 +20,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // Stub the Lark client so setBotAllowedUsers resolves emails/on_ → fake open_ids
 // without any network. Mirrors resolveAllowedUsersWithMap's contract: pass ou_
-// through, on_xxx → ou_xxx, email → ou_<localpart>, anything else is dropped.
+// through, on_xxx → ou_xxx, email → ou_<localpart> (except ghost@* which models
+// a definitive miss), anything else is dropped.
 vi.mock('../src/im/lark/client.js', () => ({
   resolveAllowedUsersWithMap: async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
@@ -30,12 +31,22 @@ vi.mock('../src/im/lark/client.js', () => ({
       let id: string | undefined;
       if (v.startsWith('ou_')) id = v;
       else if (v.startsWith('on_')) id = 'ou_' + v.slice(3);
-      else if (v.includes('@')) id = 'ou_' + v.split('@')[0];
+      else if (v.includes('@') && !v.startsWith('ghost@')) id = 'ou_' + v.split('@')[0];
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = [...entryStatus.entries()]
+      .filter(([, s]) => s === 'definitive').map(([e]) => e);
+    return { resolved, map, entryStatus, definitiveMisses };
   },
+}));
+
+// B-3: setBotAllowedUsers probes ou_/on_ entries through detectUnusableOwnerEntries
+// before writing. Default = inconclusive ([]) so existing tests exercise the
+// normal write path; individual tests override the verdict.
+const { detectUnusableMock } = vi.hoisted(() => ({ detectUnusableMock: vi.fn() }));
+vi.mock('../src/setup/owner-identity.js', () => ({
+  detectUnusableOwnerEntries: detectUnusableMock,
 }));
 
 async function freshModules() {
@@ -56,6 +67,10 @@ describe('bot-config store', () => {
     // Isolate the allowedUsers sidecar (setBotAllowedUsers writes it) into the
     // same tmp dir so tests don't pollute the real ~/.botmux/data.
     process.env.SESSION_DATA_DIR = dir;
+    // Inconclusive by default: the cross-app probe must never block a write
+    // unless a test explicitly programs a definitive verdict.
+    detectUnusableMock.mockReset();
+    detectUnusableMock.mockResolvedValue([]);
   });
   afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
 
@@ -869,6 +884,81 @@ describe('bot-config store', () => {
     const r = await store.setBotAllowedUsers('app_default', ['garbage'], 'ou_owner');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('empty_resolved');
+  });
+
+  // B-2: a definitive miss (email不存在/不可见) must not fail the write (the
+  // entry may be temporarily invisible), but the result must carry a warning
+  // naming the dropped entry instead of it vanishing silently.
+  it('setBotAllowedUsers keeps writing but warns when an entry definitively misses (B-2)', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', 'ghost@corp.com'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.resolved).toEqual(['ou_alice']);
+    expect(r.warnings).toBeDefined();
+    expect(r.warnings!.join(' ')).toContain('ghost@corp.com');
+    expect(r.warnings!.join(' ')).toContain('未生效');
+    // Write still happened — raw entries persist so a later resolve can recover.
+    expect(readConfig().allowedUsers).toEqual(['alice@corp.com', 'ghost@corp.com']);
+  });
+
+  it('setBotAllowedUsers returns no warnings when every entry resolves', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['alice@corp.com', 'ou_owner'], 'ou_alice');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.warnings).toBeUndefined();
+  });
+
+  // B-3: a runtime write must reject ou_/on_ entries the target app proves
+  // unusable (cross-app open_id etc.) BEFORE writing — the resolver keeps literal
+  // ou_ as-is, so without this guard the entry would silently match nobody.
+  it('setBotAllowedUsers rejects definitively-unusable ou_/on_ entries before writing (B-3)', async () => {
+    detectUnusableMock.mockResolvedValue(['ou_foreign']);
+    const { store } = await loaded();
+    const before = readConfig().allowedUsers;
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['ou_foreign', 'alice@corp.com'], 'ou_alice',
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'unusable_owner_entries', entries: ['ou_foreign'] });
+    // Nothing written — disk keeps the previous allowlist.
+    expect(readConfig().allowedUsers).toEqual(before);
+    // Probe ran with THIS bot's credentials + brand, and only on ou_/on_ entries
+    // (before the resolve, so the error is explicit).
+    expect(detectUnusableMock).toHaveBeenCalledWith('app_default', 'secret', 'feishu', ['ou_foreign']);
+  });
+
+  it('setBotAllowedUsers rejects a definitively-unusable on_ entry with the entries list (B-3)', async () => {
+    detectUnusableMock.mockResolvedValue(['on_other_tenant']);
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['on_other_tenant'], 'ou_owner');
+    expect(r).toMatchObject({ ok: false, reason: 'unusable_owner_entries', entries: ['on_other_tenant'] });
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);
+  });
+
+  it('setBotAllowedUsers proceeds when the cross-app probe is inconclusive (B-3 fail-closed kept)', async () => {
+    // [] = network error / scope missing / no secret → do NOT reject; the
+    // resolver's transient path (cache fallback + retry) stays the safety net.
+    detectUnusableMock.mockResolvedValue([]);
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['ou_owner', 'alice@corp.com'], 'ou_owner');
+    expect(r).toMatchObject({ ok: true });
+    expect(readConfig().allowedUsers).toEqual(['ou_owner', 'alice@corp.com']);
+  });
+
+  it('setBotAllowedUsers does not probe email/mobile entries for cross-app identity (B-3)', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['alice@corp.com'], 'ou_alice');
+    expect(r).toMatchObject({ ok: true });
+    expect(detectUnusableMock).not.toHaveBeenCalled();
+  });
+
+  it('setBotAllowedUsers passes the configured brand into the cross-app probe (B-3)', async () => {
+    const { store } = await loaded({ brand: 'lark' });
+    detectUnusableMock.mockResolvedValue([]);
+    await store.setBotAllowedUsers('app_default', ['ou_owner'], 'ou_owner');
+    expect(detectUnusableMock).toHaveBeenCalledWith('app_default', 'secret', 'lark', ['ou_owner']);
   });
 
   it('coerceConfigValue parses per kind (bool/enum/cli) and rejects junk', async () => {

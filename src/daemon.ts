@@ -128,6 +128,7 @@ import type { CliTurnPayload, Session, TrustedCaller, VcMeetingImTurnOrigin, Tur
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
+import { detectUnusableOwnerEntries } from './setup/owner-identity.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
@@ -22509,6 +22510,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
             scheduleAllowedUsersResolveRetry(cfg.larkAppId);
           }
+          // B-2: 确定性解析失败（邮箱不存在/不可见/手机号无效）与瞬态故障不同——
+          // 重试无意义，也不会走缓存兜底。此前这类条目被静默丢弃，owner 完全无感知。
+          // 现在 DM owner 列出无法解析的条目（不拒绝启动：可能是临时不可见，且
+          // self-lockout 防护已保证 owner 自身仍在名单内）。
+          if (resolveResult.definitiveMisses.length > 0) {
+            logger.warn(`[${cfg.larkAppId}] allowedUsers 中 ${resolveResult.definitiveMisses.length} 个条目确定性解析失败（未生效，非瞬态不重试）：${resolveResult.definitiveMisses.join(', ')}`);
+            notifyAllowedUsersResolveFailure(
+              cfg.larkAppId,
+              `以下 allowedUsers 条目确定性解析失败，未生效（非瞬态故障，不会自动重试；如确认条目有效，请检查其在本企业/本应用下的可见性）：${resolveResult.definitiveMisses.join(', ')}`,
+              bot.resolvedAllowedUsers,
+            );
+          }
         } catch (err: any) {
           // A full throw is a transient outage: mark every contact-resolvable
           // entry transient so the pure fn can recover each from cache.
@@ -22542,6 +22555,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // will eventually catch up too.
       desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+
+      // B-3: 启动期跨 app ou_ 巡检（不拒绝启动）。ou_ 是 app-scoped——从别的 Bot
+      // 复制来的 open_id 在本应用下永远无法匹配发送者，会静默锁死所有人。用本 bot
+      // 凭证探测 ou_/on_ 条目，确定性不可用（99992361 / 41012 / 40001 / code-0 无
+      // user）→ DM owner 警告；网络/scope 错误保持 inconclusive（返回 []），不告警。
+      // 纯 ou_ 名单不走上面的 resolve 块（needsResolve=false），所以巡检放在块外。
+      // fire-and-forget：巡检是建议性警告，不阻塞 daemon 启动。
+      const idEntries = configured.filter(e => e.startsWith('ou_') || e.startsWith('on_'));
+      if (idEntries.length > 0) {
+        void detectUnusableOwnerEntries(cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), idEntries)
+          .then((unusable) => {
+            if (unusable.length === 0) return;
+            logger.warn(`[${cfg.larkAppId}] allowedUsers 中 ${unusable.length} 个 ou_/on_ 条目在本应用下不可用（可能是其他应用的 open_id）：${unusable.join(', ')}`);
+            notifyAllowedUsersResolveFailure(
+              cfg.larkAppId,
+              `以下 allowedUsers 身份条目在本应用下无法解析（可能是其他应用的 open_id，请改用邮箱/手机号/union_id(on_)）：${unusable.join(', ')}`,
+              bot.resolvedAllowedUsers,
+            );
+          })
+          .catch(() => { /* inconclusive：网络/scope 错误，不告警 */ });
+      }
     }
 
     checkAllowedChatGroupsConfig(bot);

@@ -46,7 +46,7 @@ import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, shouldThrottleNotice } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
   chatQuotaKey,
@@ -2144,17 +2144,32 @@ export function canRunDaemonCommand(
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
 }
 
+/** 授权申请卡的处置结果，供调用方决定是否给发送者补发文本提示（卡本身就是反馈时不补）。 */
+export type GrantCardResult = 'sent' | 'throttled' | 'disabled' | 'no_owner' | 'no_requester';
+
+/** 无权限通用提示（p2p / 群聊 disabled / 无 owner 同口径）。文案中性，绝不携带 owner 身份信息。 */
+const NO_PERMISSION_NOTICE_TEXT = '你没有权限使用此 Bot。如需访问权限，请联系管理员。';
+/** 授权卡已在 pending / denied 冷却中被抑制时的提示。 */
+const GRANT_PENDING_NOTICE_TEXT = '授权申请已提交，正在等待管理员处理（或冷却中），请稍后再试。';
+/** 发送者侧提示节流窗口（per-(bot,chat,sender) / per-(bot,sender)）。 */
+const NOTICE_THROTTLE_MS = 10 * 60 * 1000;
+/** owner DM 节流窗口（per-(bot,owner)：不管多少陌生人来问，一天只 DM 一次）。 */
+const OWNER_DM_THROTTLE_MS = 24 * 60 * 60 * 1000;
+
 /**
  * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
+ * 返回处置结果：'sent'（卡已发，卡本身即反馈）/ 'throttled'（被节流抑制）/
+ * 'disabled'（autoGrantRequestCards=false）/ 'no_owner' / 'no_requester'。
  */
 async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
-): Promise<void> {
-  if (getBot(larkAppId).config.autoGrantRequestCards === false) return;
+): Promise<GrantCardResult> {
+  if (getBot(larkAppId).config.autoGrantRequestCards === false) return 'disabled';
   const owner = getOwnerOpenId(larkAppId);
-  if (!owner || !requesterOpenId) return;
-  if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  if (!owner) return 'no_owner';
+  if (!requesterOpenId) return 'no_requester';
+  if (isThrottled(larkAppId, chatId, requesterOpenId)) return 'throttled';
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
@@ -2198,6 +2213,64 @@ async function maybeSendGrantRequestCard(
       clearPending(larkAppId, chatId, requesterOpenId);
       logger.debug(`grant request card send failed: ${err}`);
     });
+  return 'sent';
+}
+
+/** 群聊授权卡未发出时，给发送者补发一条文本反馈（per-(bot,chat,sender) 10 分钟节流，
+ *  fire-and-forget，失败只 debug 日志，绝不影响消息主流程）：
+ *  - 'throttled'         → 「已提交/冷却中」提示；
+ *  - 'disabled'/'no_owner' → 通用无权限提示；
+ *  - 'sent'（卡本身就是反馈）/ 'no_requester' → 不发。 */
+function sendGroupGrantNotice(
+  larkAppId: string,
+  message: any,
+  chatId: string,
+  senderOpenId: string | undefined,
+  result: GrantCardResult | undefined,
+): void {
+  if (!senderOpenId) return;
+  if (result !== 'throttled' && result !== 'disabled' && result !== 'no_owner') return;
+  const text = result === 'throttled' ? GRANT_PENDING_NOTICE_TEXT : NO_PERMISSION_NOTICE_TEXT;
+  if (shouldThrottleNotice(`group-notice:${larkAppId}:${chatId}:${senderOpenId}`, NOTICE_THROTTLE_MS)) return;
+  replyMessage(larkAppId, message.message_id, text, 'text')
+    .catch(err => logger.debug(`group grant notice send failed: ${err}`));
+}
+
+/** p2p 私聊被挡（B-1）：不再静默丢弃。
+ *  1) 给发送者一条通用无权限提示（per-(bot,sender) 10 分钟节流）——文案中性，
+ *     绝不泄露 owner 的 open_id/姓名/任何身份信息；
+ *  2) 把授权申请 best-effort 转发到 owner DM（per-(bot,owner) 24 小时节流，
+ *     无 owner 则跳过），DM 内容可含请求者身份（与授权卡同口径取名）。
+ *  全部 fire-and-forget：提示/DM 失败只记 debug 日志，不影响消息主流程。 */
+async function notifyP2pAccessDenied(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+): Promise<void> {
+  if (!senderOpenId) return;
+  if (!shouldThrottleNotice(`p2p-notice:${larkAppId}:${senderOpenId}`, NOTICE_THROTTLE_MS)) {
+    replyMessage(larkAppId, message.message_id, NO_PERMISSION_NOTICE_TEXT, 'text')
+      .catch(err => logger.debug(`p2p no-permission notice send failed: ${err}`));
+  }
+  const owner = getOwnerOpenId(larkAppId);
+  if (!owner) return;
+  if (shouldThrottleNotice(`owner-dm:${larkAppId}:${owner}`, OWNER_DM_THROTTLE_MS)) return;
+  // 与授权卡同口径：mentions/observed 花名册在 p2p 场景不可用，直接 best-effort
+  // getUserProfile 取名，失败回落缩略 open_id（ou_xxx…xxxx）。contact API 挂起
+  // 时不得阻塞消息分发关键路径——5s 超时后按无名处理（与 daemon.ts 的
+  // notifyAllowedUsersResolveFailure 同一纪律：untimed SDK 路径不 await）。
+  const profileName = await Promise.race([
+    getUserProfile(larkAppId, senderOpenId).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+  ]).then((p) => p?.name);
+  const shortRequester = `${senderOpenId.slice(0, 10)}…${senderOpenId.slice(-4)}`;
+  const who = profileName ? `${profileName}（${shortRequester}）` : shortRequester;
+  void dmAdmin(
+    larkAppId,
+    owner,
+    `有用户在私聊中请求访问权限。\n请求者：${who}`,
+    'p2p access request',
+  );
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -3534,8 +3607,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                   `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
                 );
-                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
-                  .catch(err => logger.error(`Error sending grant card for foreign-bot new topic: ${err}`));
+                const grantResult = await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
+                  .catch((err): undefined => {
+                    logger.error(`Error sending grant card for foreign-bot new topic: ${err}`);
+                    return undefined;
+                  });
+                // 卡被抑制（节流/禁用/无 owner）时给触发 bot 补发文本反馈，保持「发卡后 return」语义不变。
+                sendGroupGrantNotice(larkAppId, message, chatId, senderOpenId, grantResult);
                 return;
               }
               logger.info(
@@ -3620,7 +3698,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
           } else {
             logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            const grantResult = await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            // 卡被抑制（节流/禁用/无 owner）时给发送者补发文本反馈。
+            sendGroupGrantNotice(larkAppId, message, chatId, senderOpenId, grantResult);
             return;
           }
         }
@@ -4133,7 +4213,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           if (access === 'not_allowed') {
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            const grantResult = await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            // 卡被抑制（节流/禁用/无 owner）时给发送者补发文本反馈，不再静默丢弃。
+            sendGroupGrantNotice(larkAppId, message, chatId, senderOpenId, grantResult);
             logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
             return;
           }
@@ -4158,10 +4240,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         }
       } else if (!isAllowed) {
-        // 私聊被挡目前是静默丢弃：owner 不在这个 p2p 会话里，把授权申请卡 reply 回来只会
-        // 发给陌生人自己（卡上的按钮又是 owner 专属），既不可用又泄露 owner —— 所以不发。
-        // 真正的修法是把申请发到 owner 自己的 DM 并加 owner 维度节流，单独一个 PR 做。
+        // 私聊被挡不再静默丢弃（B-1）：给发送者一条通用无权限提示（不泄露 owner 身份），
+        // 并把授权申请 best-effort 转发到 owner DM（owner 维度 24h 节流，无 owner 则跳过）。
+        // 授权申请卡不能 reply 回 p2p——owner 不在这个会话里，卡上的按钮又是 owner 专属，
+        // 既不可用又会把 owner 身份暴露给陌生人，所以申请只走 owner DM 这条暗路。
         logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
+        await notifyP2pAccessDenied(larkAppId, message, senderOpenId);
         return;
       }
 

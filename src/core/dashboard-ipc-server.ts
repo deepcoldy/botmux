@@ -1985,6 +1985,39 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
 const chatRenameSerialQueue = new ChatRenameSerialQueue();
 
+/**
+ * `user_explicit` 改名豁免防抖的凭证核验：请求必须携带与 `ds.managedTurnOrigin`
+ * 匹配的当前 turn origin 凭证（read-isolated CLI 的 capability 回退路径），
+ * 证明改名绑定在一个真实的用户 turn 上。与 `sessionCliIpcAuth` 的区别：
+ * 后者 `trustedHost` 短路放行本机 HMAC 签名请求（不绑定任何 turn），这里
+ * 固定 `trustedHost: false`——本机进程身份不足以证明「用户这一轮要求改名」。
+ * 无凭证 / 凭证过期或不匹配 / 会话无活跃 turn → 一律不放行（调用方据此
+ * 强制走防抖）。
+ */
+function proveCurrentTurnOrigin(
+  ds: DaemonSession | undefined,
+  sessionId: string,
+  body: Record<string, unknown> | undefined,
+): { ok: true } | { ok: false; error: string } {
+  const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
+  const decision = authorizeSessionScopedIpc({
+    trustedHost: false,
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: true,
+    sessionId,
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
+    claimedTurnId: typeof body?.originTurnId === 'string' ? body.originTurnId : undefined,
+    claimedDispatchAttempt: claimedAttempt,
+  });
+  return decision.ok ? { ok: true } : { ok: false, error: decision.error };
+}
+
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
   const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
@@ -1998,12 +2031,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 
-  const proactive = body.proactive === true;
-  const trigger = proactive ? 'ai_proactive' : 'user_explicit';
+  // 信任模型翻转：`user_explicit`（豁免 10 分钟防抖）不再由 CLI 自报——agent
+  // 漏传 `--proactive` 时服务端原先无核验，防抖被完全绕过。现在只有携带与
+  // `ds.managedTurnOrigin` 匹配的**当前 turn origin 凭证**（read-isolated CLI
+  // 的 capability 回退路径）才豁免防抖；trusted-host（HMAC 签名的本机请求）
+  // 只证明「本机进程」、不绑定具体用户 turn，不算数。无凭证/凭证过期或不匹配
+  // → 强制按 `ai_proactive` 走防抖（fail-closed：宁防抖勿绕过）。显式
+  // `--proactive` 本来就走防抖，行为不变。
+  let effectiveProactive = body.proactive === true;
+  let trigger = effectiveProactive ? 'ai_proactive' : 'user_explicit';
+  if (!effectiveProactive) {
+    const originDecision = proveCurrentTurnOrigin(ds, params.sessionId, body);
+    if (!originDecision.ok) {
+      effectiveProactive = true;
+      trigger = 'ai_proactive';
+    }
+  }
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
   await chatRenameSerialQueue.run(cooldownKey, async () => {
     const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
-      beforeUpdate: proactive
+      beforeUpdate: effectiveProactive
         ? () => {
             const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
             return cooldown.ok
@@ -2027,7 +2074,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
       return jsonRes(res, status, result);
     }
     if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
+      if (effectiveProactive) proactiveChatRenameCooldown.record(cooldownKey);
       // FR-7: the Lark write already succeeded, so a local cache-refresh
       // failure (ENOSPC/EACCES on the session store) must NOT reverse the
       // outcome into an HTTP 500 — best-effort per session, warn and keep the

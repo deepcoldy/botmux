@@ -11,8 +11,10 @@ import {
   markDenied,
   isThrottled,
   updatePendingGrantLimits,
+  shouldThrottleNotice,
   _resetForTest,
   _tableSizeForTest,
+  _noticeTableSizeForTest,
 } from '../src/im/lark/grant-pending.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
@@ -117,6 +119,49 @@ describe('grant-pending', () => {
       openPending('a1', 'oc_2', 'ou_h');     // triggers a sweep
       expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(true); // still throttled
       expect(checkNonce('a1', 'oc_1', 'ou_g', n)).toBe(true); // nonce still valid
+    });
+  });
+
+  // ─── shouldThrottleNotice：通用提示节流（B-1 无权限提示/DM）──────────────
+  describe('shouldThrottleNotice (generic notice throttle)', () => {
+    it('first call passes, repeats within the window are suppressed, after the window passes again', () => {
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 10 * 60 * 1000)).toBe(false);
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 10 * 60 * 1000)).toBe(true);
+      vi.advanceTimersByTime(10 * 60 * 1000 + 1);
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 10 * 60 * 1000)).toBe(false);
+    });
+
+    it('keys are isolated (per bot/sender/chat/owner)', () => {
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 1000)).toBe(false);
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_y', 1000)).toBe(false); // different sender
+      expect(shouldThrottleNotice('p2p-notice:a2:ou_x', 1000)).toBe(false); // different bot
+      expect(shouldThrottleNotice('group-notice:a1:oc_1:ou_x', 1000)).toBe(false); // different surface
+      expect(shouldThrottleNotice('owner-dm:a1:ou_owner', 1000)).toBe(false); // owner-dim key
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 1000)).toBe(true); // same key still throttled
+    });
+
+    it('owner-dm window (24h) is independent of the 10-min notice window', () => {
+      expect(shouldThrottleNotice('owner-dm:a1:ou_owner', 24 * 60 * 60 * 1000)).toBe(false);
+      vi.advanceTimersByTime(10 * 60 * 1000 + 1); // past the 10-min notice window…
+      expect(shouldThrottleNotice('owner-dm:a1:ou_owner', 24 * 60 * 60 * 1000)).toBe(true); // …but still within 24h
+      vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+      expect(shouldThrottleNotice('owner-dm:a1:ou_owner', 24 * 60 * 60 * 1000)).toBe(false);
+    });
+
+    it('eviction: a flood of distinct notice keys does not grow the table without bound', () => {
+      for (let i = 0; i < 1000; i++) shouldThrottleNotice(`p2p-notice:a1:ou_${i}`, 1000);
+      expect(_noticeTableSizeForTest()).toBe(1000);
+      vi.advanceTimersByTime(11 * 60 * 1000); // past every window + the prune interval
+      shouldThrottleNotice('p2p-notice:a1:ou_fresh', 1000); // triggers the periodic sweep
+      expect(_noticeTableSizeForTest()).toBe(1); // only the fresh key remains
+    });
+
+    it('reset clears the notice table too', () => {
+      shouldThrottleNotice('p2p-notice:a1:ou_x', 1000);
+      expect(_noticeTableSizeForTest()).toBe(1);
+      _resetForTest();
+      expect(_noticeTableSizeForTest()).toBe(0);
+      expect(shouldThrottleNotice('p2p-notice:a1:ou_x', 1000)).toBe(false);
     });
   });
 });

@@ -16,6 +16,8 @@ import { config } from '../config.js';
 import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
+import type { Brand } from '../im/lark/lark-hosts.js';
+import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
@@ -407,16 +409,22 @@ export async function setChatFeedbackPolicy(larkAppId: string, chatId: string, p
 }
 
 export type SetAllowedUsersResult =
-  | { ok: true; raw: string[]; resolved: string[] }
+  | { ok: true; raw: string[]; resolved: string[]; warnings?: string[] }
+  | { ok: false; reason: 'unusable_owner_entries'; entries: string[] }
   | { ok: false; reason: 'bot_not_registered' | 'bot_not_in_config' | 'self_lockout' | 'empty_resolved' | string };
 
 /**
  * 改 allowedUsers（管理员名单）。这是动信任根的敏感操作，与普通字段分开：
+ *   0. **跨 app 身份校验**：ou_/on_ 条目先用本 bot 凭证过 detectUnusableOwnerEntries——
+ *      确定性不可用（跨 app ou_ 99992361 / 41012 / 40001 / code-0 无 user）直接拒绝写入；
+ *      网络/scope 错误保持 inconclusive（不拒绝，走下面的正常流程，瞬态路径兜底）。
  *   1. 用 bot 凭证把邮箱/on_ 解析成 open_id（与启动期同一路径）。
  *   2. **防自锁**：解析后名单必须仍含发起人的 open_id，否则拒绝——避免把自己踢出管理员。
  *   3. 解析后非空才写。
  *   4. 落盘原始条目（邮箱/on_/ou_，与 setup 一致），并同步内存 resolvedAllowedUsers /
  *      rawAllowedUserResolution（与 daemon 启动期赋值同口径），无需重启。
+ *   5. 确定性解析失败（邮箱不存在/不可见等）不拒绝写入（可能临时不可见），但以
+ *      `warnings` 带回，由调用方提示；瞬态失败仍走缓存兜底 + 后台重试。
  *
  * confirm 二次确认由调用方（command-handler）处理，本函数只做校验 + 落盘。
  */
@@ -428,7 +436,26 @@ export async function setBotAllowedUsers(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+  // B-3: runtime writes used to accept another app's ou_ verbatim — the literal
+  // passthrough below keeps it in the runtime allowlist but it can never match a
+  // sender, silently locking everyone out. Probe ou_/on_ entries with THIS bot's
+  // credentials BEFORE the resolve so the error is explicit. Only a definitive
+  // verdict rejects; inconclusive (network / scope / no secret → []) proceeds —
+  // fail-closed stays in the resolver's transient path (cache fallback + retry).
+  // Emails/mobiles are not probed here: their definitive misses are warnings
+  // (step 5), not identity rejections.
+  const brand: Brand = bot.config.brand ?? 'feishu';
+  const idEntries = rawEntries.filter(e => e.startsWith('ou_') || e.startsWith('on_'));
+  if (idEntries.length > 0) {
+    const unusable = await detectUnusableOwnerEntries(
+      larkAppId, bot.config.larkAppSecret, brand, idEntries,
+    );
+    if (unusable.length > 0) {
+      return { ok: false, reason: 'unusable_owner_entries', entries: unusable };
+    }
+  }
+
+  const { resolved, map, entryStatus, definitiveMisses } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
   if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
   if (senderOpenId && !resolved.includes(senderOpenId)) return { ok: false, reason: 'self_lockout' };
 
@@ -455,6 +482,19 @@ export async function setBotAllowedUsers(
     if (status === 'definitive') definitiveEntries.push(entry);
     else if (status === 'transient') anyTransient = true;
   }
+  // B-2: definitive misses (no such user / not visible) are NOT transient — the
+  // write still succeeds (the entry may be temporarily invisible, and the
+  // self-lockout guard above proved the sender still resolves), but the caller
+  // must surface which entries never took effect instead of them vanishing
+  // silently. Prefer the resolver's raw-order list; fall back to the
+  // entryStatus-derived one for partial mocks / older callers.
+  const misses = definitiveMisses ?? definitiveEntries;
+  const warnings: string[] = [];
+  if (misses.length > 0) {
+    warnings.push(`以下条目无法解析，未生效：${misses.join(', ')}`);
+    logger.warn(`[config:${larkAppId}] allowedUsers set: ${misses.length} entr${misses.length === 1 ? 'y' : 'ies'} ` +
+      `definitively unresolved (not transient, no retry scheduled): ${misses.join(', ')}`);
+  }
   writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
     map,
     retainKeys: rawEntries,
@@ -467,7 +507,9 @@ export async function setBotAllowedUsers(
   // contact API does, instead of silently staying dropped until the next restart.
   if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
-  return { ok: true, raw: rawEntries, resolved };
+  return warnings.length > 0
+    ? { ok: true, raw: rawEntries, resolved, warnings }
+    : { ok: true, raw: rawEntries, resolved };
 }
 
 export type CoerceResult =
