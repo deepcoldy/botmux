@@ -251,11 +251,18 @@ export function resolveDashboardRequestGate(input: {
     : decideDashboardAuth({
       method: input.method,
       pathname: input.pathname,
-      hasTokenParam: input.hasTokenParam,
       // 平台协管者没有、也不该有本机 token；把活跃 token 同时作为「出示的凭据」
       // 喂进去，等价于告诉门禁「这个请求持有管理凭据」——凭据的真正校验已经在
       // 上面的平台反代信任前提里做完（活跃 cookie 证明请求经过平台）。
       presentedToken: platformManages ? (input.activeToken ?? undefined) : presentedToken,
+      // ⚠️ 但必须同时压掉 `hasTokenParam`：`decideDashboardAuth` 有一条
+      // 「首次带正确 ?t= → allow+set-cookie，把 token 回写给浏览器」的分支
+      // （见 auth.ts 的 `hasTokenParam && authed && presentedToken`）。协管者的
+      // presentedToken 是我们**代填**的活跃 token、不是他自己出示的，若还让
+      // hasTokenParam 为真，他只要在 URL 上随便带个 `?t=x` 就会被回吐**本机真实
+      // 管理 token** —— 那是长期落盘凭证，撤销协管授权也不会失效，等于永久后门。
+      // 协管者本就不需要这条 cookie 引导：他的身份来自平台反代注入的 cookie。
+      hasTokenParam: platformManages ? false : input.hasTokenParam,
       activeToken: input.activeToken ?? '',
       publicReadOnly: input.publicReadOnly,
     });

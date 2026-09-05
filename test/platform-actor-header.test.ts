@@ -301,3 +301,86 @@ describe('gate: dashboard:manage 开管理面但不开整机', () => {
     expect(g.decision.kind).toBe('deny401');
   });
 });
+
+/**
+ * F1（外仓复审 · 严重）：带 `dashboard:manage` 的协管者若在 URL 上随便带一个 `?t=`，
+ * 会被回吐**本机真实管理 token**。
+ *
+ * 成因是 `1b47dd5` 为了让管理面路由走宽门禁，把活跃 token 代填进 `presentedToken`，
+ * 却没同时压掉 `hasTokenParam`。`decideDashboardAuth` 有一条「首次带正确 ?t= →
+ * allow+set-cookie，把 token 回写浏览器」的分支（auth.ts 的
+ * `hasTokenParam && authed && presentedToken`），于是 `?t=任意值` 就能命中。
+ *
+ * 危害不是「多一次越权读」：泄漏的是**长期落盘凭证**，撤销协管授权也不失效，
+ * 而 `config.dashboard.host` 默认 `0.0.0.0`（不是 loopback-only），拿到 token
+ * 的人网络够得着 dashboard 端口就能直连本机、绕开平台的一切判权。
+ */
+describe('F1: 协管者不得拿到本机管理 token', () => {
+  const ACTIVE = 'REAL-ACTIVE-TOKEN';
+
+  const managing = () => resolveDashboardIdentity({
+    legacyCookie: ACTIVE,
+    activeToken: ACTIVE,
+    roleHeader: 'owner',
+    actorHeader: 'ou_comanager',
+    scopesHeader: 'terminal:control,dashboard:manage',
+    platformMachineId: 'm1',
+    platformActorScope: m => `scope-${m}`,
+    legacyAuthSessionId: t => `legacy-${t}`,
+    h5: null,
+  });
+
+  const gate = (identity: ReturnType<typeof managing>, hasTokenParam: boolean, tokenFromRequest?: string) =>
+    resolveDashboardRequestGate({
+      method: 'GET',
+      pathname: '/api/settings',
+      hasTokenParam,
+      identity,
+      tokenFromRequest,
+      activeToken: ACTIVE,
+      publicReadOnly: false,
+    });
+
+  it('带任意 ?t= 也绝不回吐 token（allow 但不 set-cookie）', () => {
+    const d = gate(managing(), true, 'whatever-garbage').decision;
+    expect(d.kind).toBe('allow');
+    expect((d as { token?: string }).token).toBeUndefined();
+  });
+
+  it('即便 ?t= 恰好是正确的活跃 token 也不下发 cookie', () => {
+    // 协管者不该持有这个值；万一从别处得知，也不能借这条路把它固化成本机 cookie。
+    const d = gate(managing(), true, ACTIVE).decision;
+    expect((d as { token?: string }).token).toBeUndefined();
+  });
+
+  it('管理面可达性不受影响（修复没有把功能一起关掉）', () => {
+    const g = gate(managing(), false, undefined);
+    expect(g.canManageHost).toBe(true);
+    expect(g.decision.kind).toBe('allow');
+  });
+
+  it('legacy owner 带正确 ?t= 仍然 allow+set-cookie —— 不能连坐', () => {
+    const legacy = resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: undefined,
+      actorHeader: undefined,
+      scopesHeader: undefined,
+      platformMachineId: null,
+      platformActorScope: m => `scope-${m}`,
+      legacyAuthSessionId: t => `legacy-${t}`,
+      h5: null,
+    });
+    const d = resolveDashboardRequestGate({
+      method: 'GET',
+      pathname: '/api/settings',
+      hasTokenParam: true,
+      identity: legacy,
+      tokenFromRequest: ACTIVE,
+      activeToken: ACTIVE,
+      publicReadOnly: false,
+    }).decision;
+    expect(d.kind).toBe('allow+set-cookie');
+    expect((d as { token?: string }).token).toBe(ACTIVE);
+  });
+});
