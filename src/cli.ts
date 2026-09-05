@@ -9169,8 +9169,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Freeze email reviewers into this bot's app-scoped open_id NOW, with
   // the bot's own credentials, so the card callback can match network-free
   // against the delivery snapshot. Pure ou_/on_ lists (and requester/everyone)
-  // skip the lookup. If resolution empties a reviewers list, fail closed (no
-  // feedback control) rather than ship a card nobody can click.
+  // skip the lookup. An empty materialized list still renders the control; the
+  // callback then rejects every operator without widening access.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'reviewers') {
     try {
       const { materializeFeedbackReviewers } = await import('./services/feedback-policy.js');
@@ -9187,7 +9187,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     } catch {
       feedbackPolicy = undefined;
     }
-    if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
   // `reviewers`/`everyone` audiences gate clicks without a human requester —
