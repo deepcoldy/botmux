@@ -139,6 +139,26 @@ export function isPlatformDashboardAuthSessionId(authSessionId: string, machineS
 }
 
 /**
+ * 解绑吊销要吊销的平台会话集合：四个注册表在册会话的并集，按本机 scope 筛出平台身份。
+ *
+ * 抽成纯函数是为了让**测试能调到生产实现本身**。此前测试自己复刻了一份「四表并集 +
+ * 筛选」，于是把生产代码改回硬枚举时 5 个用例仍然全绿 —— 锁的是复刻品、不是生产逻辑
+ *（复审实测证伪了我原先「改回硬枚举 → 5 个全红」的说法）。
+ *
+ * ⚠️ 取并集而非只看写租约：一个会话可能只在其中一个表里有状态（例如只开了 SSE、
+ * 还没拿写租约），只看租约会漏。**新增任何持有 authSessionId 状态的注册表，
+ * 必须把它的 `authSessionIds()` 也传进这里。**
+ */
+export function platformAuthSessionsToRevoke(
+  machineScope: string,
+  registries: ReadonlyArray<{ authSessionIds(): Iterable<string> }>,
+): string[] {
+  const observed = new Set<string>();
+  for (const r of registries) for (const id of r.authSessionIds()) observed.add(id);
+  return [...observed].filter(id => isPlatformDashboardAuthSessionId(id, machineScope));
+}
+
+/**
  * 身份优先级：legacy 管理 cookie > 平台注入角色 > H5 会话。
  *
  * 中心化平台通过「剥掉浏览器 Cookie 头、注入本机活跃 cookie」证明自己的边界，

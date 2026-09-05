@@ -24,6 +24,7 @@ import {
 } from './dashboard/auth.js';
 import {
   isPlatformDashboardAuthSessionId,
+  platformAuthSessionsToRevoke,
   resolveDashboardIdentity,
   resolveDashboardRequestGate,
   type DashboardRequestIdentity,
@@ -525,14 +526,15 @@ function syncPlatformBindingRevocation(): void {
     // 所以反过来做：把四个注册表里在册的认证会话取并集，按本机 scope 筛出平台
     // 身份逐个吊销。取并集是因为一个会话可能只在其中一个表里有状态（例如只开了
     // SSE、还没拿写租约）。
-    const observed = new Set<string>([
-      ...terminalControl.authSessionIds(),
-      ...previewInteraction.authSessionIds(),
-      ...authSessionConnections.authSessionIds(),
-      ...controlCsrfTokens.authSessionIds(),
-    ]);
-    for (const authSessionId of observed) {
-      if (isPlatformDashboardAuthSessionId(authSessionId, scope)) endDashboardAuthSession(authSessionId);
+    // 实现抽在 request-identity 的 platformAuthSessionsToRevoke（纯函数），
+    // 这样测试能直接调生产实现，而不是各自复刻一份「四表并集 + 筛选」。
+    for (const authSessionId of platformAuthSessionsToRevoke(scope, [
+      terminalControl,
+      previewInteraction,
+      authSessionConnections,
+      controlCsrfTokens,
+    ])) {
+      endDashboardAuthSession(authSessionId);
     }
   }
   observedPlatformMachineId = current;

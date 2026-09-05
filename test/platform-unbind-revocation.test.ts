@@ -5,6 +5,7 @@ import { PreviewInteractionManager } from '../src/dashboard/preview-interaction.
 import { TerminalControlManager } from '../src/dashboard/terminal-control.js';
 import {
   isPlatformDashboardAuthSessionId,
+  platformAuthSessionsToRevoke,
   resolveDashboardIdentity,
 } from '../src/dashboard/request-identity.js';
 
@@ -42,7 +43,15 @@ describe('平台解绑时的协管者会话吊销', () => {
     return id;
   }
 
-  /** dashboard.ts 的四表并集 + 按 scope 筛，与 syncPlatformBindingRevocation 同构。 */
+  /**
+   * 「该吊销哪些会话」直调**生产实现** `platformAuthSessionsToRevoke`
+   *（在 request-identity），吊销动作本身照 dashboard.ts 的写法逐个调
+   * `endDashboardAuthSession` 的等价物（这里就是四个注册表的 end/清理）。
+   *
+   * 刻意不复刻「四表并集 + 筛选」那段算法：此前测试自己抄了一份，于是把生产代码
+   * 改回硬枚举时 5 个用例仍全绿 —— 锁的是复刻品不是生产逻辑（复审实测证伪了我
+   * 原先「改回硬枚举 → 5 个全红」的说法）。现在改回硬枚举会真的红。
+   */
   function revokeOnUnbind(
     scope: string,
     registries: {
@@ -52,22 +61,20 @@ describe('平台解绑时的协管者会话吊销', () => {
       csrf: ControlCsrfTokens;
     },
   ): string[] {
-    const observed = new Set<string>([
-      ...registries.terminalControl.authSessionIds(),
-      ...registries.previewInteraction.authSessionIds(),
-      ...registries.connections.authSessionIds(),
-      ...registries.csrf.authSessionIds(),
+    const toRevoke = platformAuthSessionsToRevoke(scope, [
+      registries.terminalControl,
+      registries.previewInteraction,
+      registries.connections,
+      registries.csrf,
     ]);
-    const revoked: string[] = [];
-    for (const authSessionId of observed) {
-      if (!isPlatformDashboardAuthSessionId(authSessionId, scope)) continue;
-      registries.terminalControl.releaseByAuthSession(authSessionId);
-      registries.previewInteraction.relockAuthSession(authSessionId);
-      registries.connections.closeAuthSession(authSessionId);
-      registries.csrf.revokeAuthSession(authSessionId);
-      revoked.push(authSessionId);
+    // 与 dashboard.ts 的 endDashboardAuthSession 逐字对应的同一组副作用。
+    for (const id of toRevoke) {
+      registries.terminalControl.releaseByAuthSession(id);
+      registries.previewInteraction.relockAuthSession(id);
+      registries.connections.closeAuthSession(id);
+      registries.csrf.revokeAuthSession(id);
     }
-    return revoked;
+    return toRevoke;
   }
 
   function freshRegistries() {
