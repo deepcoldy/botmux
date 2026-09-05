@@ -1,9 +1,21 @@
 /**
  * User Access Token — self-contained OAuth token management for botmux.
  *
- * Token storage:
- *   1. FEISHU_USER_ACCESS_TOKEN env var
- *   2. ~/.botmux/data/user-token.json
+ * Token storage is keyed by (app, authorizing user):
+ *   - `~/.botmux/data/user-token-<appId>-<openId>.json` — one file per person
+ *   - `~/.botmux/data/user-token-<appId>.json` — LEGACY, pre-openId
+ *   - `~/.botmux/data/user-token.json` — LEGACY, pre-multi-bot
+ *
+ * The openId dimension exists because a token identifies a PERSON, not a bot:
+ * without it a second `/login` in the same bot silently overwrites the first,
+ * and every later call runs as whoever authorized last (no error, wrong name in
+ * the audit trail). Callers that must act as a specific human pass `openId` and
+ * get that person's token or nothing — a legacy unstamped file is NEVER accepted
+ * for a named person, because we cannot prove whose it is.
+ *
+ * There is deliberately NO env-var override: a global
+ * `FEISHU_USER_ACCESS_TOKEN` would be an invisible bypass around the whole
+ * per-user boundary.
  *
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
@@ -25,12 +37,26 @@ const PENDING_DIR = join(TOKEN_DIR, 'oauth-pending');
 const LEGACY_TOKEN_PATH = join(TOKEN_DIR, 'user-token.json');
 const BUFFER_MS = 60_000; // 60s safety margin before expiry
 
+/** open_id 形状校验。用于文件名拼接，必须先过滤掉路径分隔符等字符 —— 一个
+ *  `../` 的 openId 会让 token 写到 TOKEN_DIR 之外。 */
+const OPEN_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+
+export function isUsableOpenId(openId: string | undefined): openId is string {
+  return typeof openId === 'string' && OPEN_ID_RE.test(openId);
+}
+
 /**
- * Per-app token 文件：`~/.botmux/data/user-token-<appId>.json`。
+ * Token 文件路径。
+ *
+ * - 传 `openId` → `user-token-<appId>-<openId>.json`，每个授权人各存一份。
+ * - 不传 → `user-token-<appId>.json`，升级前的 per-app 文件；只读不写。
+ *
  * 一台机器混挂 Feishu + Lark 多 bot 时，各自的 User Token 互不覆盖、互不串用。
  */
-function tokenPathForApp(appId: string): string {
-  return join(TOKEN_DIR, `user-token-${appId}.json`);
+function tokenPathForApp(appId: string, openId?: string): string {
+  return isUsableOpenId(openId)
+    ? join(TOKEN_DIR, `user-token-${appId}-${openId}.json`)
+    : join(TOKEN_DIR, `user-token-${appId}.json`);
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -48,6 +74,13 @@ export interface TokenStore {
    */
   appId?: string;
   brand?: Brand;
+  /**
+   * 完成这次授权的人的 open_id（app-scoped）。旧文件没有这个字段，因此**无法证明
+   * 属于谁** —— 按人取 token 时一律不认领这类文件（见 {@link loadTokenForApp}）。
+   */
+  openId?: string;
+  /** 授权人姓名，仅用于 /status、/login status 等展示，非身份依据。 */
+  userName?: string;
 }
 
 interface TokenResponse {
@@ -70,6 +103,11 @@ interface PendingLogin {
   appSecret: string;
   /** 租户品牌——决定回调换 token 时打哪个域名。缺省 feishu。 */
   brand: Brand;
+  /**
+   * 发起这次 /login 的人的 open_id。回调落盘时用它决定文件名，使 token 归属到
+   * 具体的人而不是整个 bot。缺省（旧链路 / 无 sender 的入口）→ 写 per-app 文件。
+   */
+  openId?: string;
   createdAt: number;
 }
 
@@ -127,8 +165,8 @@ function loadTokenFromPath(path: string): TokenStore | null {
   }
 }
 
-function saveTokenForApp(token: TokenStore, appId: string): void {
-  const path = tokenPathForApp(appId);
+function saveTokenForApp(token: TokenStore, appId: string, openId?: string): void {
+  const path = tokenPathForApp(appId, openId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
@@ -156,10 +194,32 @@ function tokenMatches(t: TokenStore, appId: string, brand: Brand): boolean {
 }
 
 /**
- * 取指定 app 的 token。优先 per-app 文件，其次回退旧的单文件；两者都过
- * {@link tokenMatches} 校验（文件名 + 内容双重把关），不匹配一律视为无 token。
+ * 取指定 app 的 token。
+ *
+ * 传 `openId`（按人取，trigger-user 鉴权的主路径）：**只认属于那个人的文件**。
+ * per-person 文件的内容 `openId` 也要复核；per-app / 单文件这类未标注归属的旧
+ * 文件一律不认领 —— 无法证明它属于谁，拿来当某人的凭证就是静默的身份错配。
+ *
+ * 不传 `openId`（bot 级取，旧行为）：per-app 文件 → 旧单文件，都过
+ * {@link tokenMatches} 校验（文件名 + 内容双重把关）。
+ *
+ * `allowUnattributed` 是给「owner 个人功能」开的一道窄口子（见
+ * {@link resolveOwnerUserToken}），普通按人取绝不能打开。
  */
-function loadTokenForApp(appId: string, brand: Brand): { token: TokenStore; source: string } | null {
+function loadTokenForApp(
+  appId: string,
+  brand: Brand,
+  openId?: string,
+  allowUnattributed = false,
+): { token: TokenStore; source: string } | null {
+  if (isUsableOpenId(openId)) {
+    const perPerson = loadTokenFromPath(tokenPathForApp(appId, openId));
+    if (perPerson && tokenMatches(perPerson, appId, brand) && perPerson.openId === openId) {
+      return { token: perPerson, source: 'botmux' };
+    }
+    if (!allowUnattributed) return null;
+    // 落到下面的 per-app / legacy 查找。
+  }
   const perApp = loadTokenFromPath(tokenPathForApp(appId));
   if (perApp && tokenMatches(perApp, appId, brand)) return { token: perApp, source: 'botmux' };
   const legacy = loadTokenFromPath(LEGACY_TOKEN_PATH);
@@ -167,9 +227,57 @@ function loadTokenForApp(appId: string, brand: Brand): { token: TokenStore; sour
   return null;
 }
 
+/**
+ * 这个 app 下所有已授权的人。用于 Dashboard 的「已授权 N 人」与 /login status。
+ * 只读文件名与内容里的归属字段，**不返回任何 token 内容**。
+ */
+export function listAuthorizedUsers(
+  appId: string,
+  brand: Brand = 'feishu',
+): Array<{ openId: string; userName?: string; expiresAt: string; refreshExpiresAt: string }> {
+  const out: Array<{ openId: string; userName?: string; expiresAt: string; refreshExpiresAt: string }> = [];
+  let names: string[];
+  try { names = readdirSync(TOKEN_DIR); } catch { return out; }
+  const prefix = `user-token-${appId}-`;
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue;
+    const token = loadTokenFromPath(join(TOKEN_DIR, name));
+    if (!token || !isUsableOpenId(token.openId) || !tokenMatches(token, appId, brand)) continue;
+    out.push({
+      openId: token.openId,
+      ...(token.userName ? { userName: token.userName } : {}),
+      expiresAt: token.expires_at ?? '',
+      refreshExpiresAt: token.refresh_expires_at ?? '',
+    });
+  }
+  return out;
+}
+
+/**
+ * 这个人授权时留下的显示名，没有就返回 undefined。
+ *
+ * 只读归属字段，不碰 token 内容，也不触发刷新——调用点是「命令被拒」的错误文案，
+ * 那里只需要一个能让人对上号的名字，拿不到就退回 open_id。
+ */
+export function lookupAuthorizedUserName(
+  appId: string,
+  openId: string,
+  brand: Brand = 'feishu',
+): string | undefined {
+  if (!isUsableOpenId(openId)) return undefined;
+  const token = loadTokenFromPath(tokenPathForApp(appId, openId));
+  if (!token || !tokenMatches(token, appId, brand)) return undefined;
+  return token.userName;
+}
+
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
-async function refreshToken(token: TokenStore, appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<TokenStore | null> {
+async function refreshToken(
+  token: TokenStore,
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+): Promise<TokenStore | null> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
@@ -197,10 +305,15 @@ async function refreshToken(token: TokenStore, appId: string, appSecret: string,
       scope: data.scope || token.scope,
       appId,
       brand,
+      // 归属不因刷新而改变——刷新的是同一个人的 token。旧文件没有 openId 时保持
+      // 没有，绝不在这里凭空归属给某个人。
+      ...(token.openId ? { openId: token.openId } : {}),
+      ...(token.userName ? { userName: token.userName } : {}),
     };
 
-    // Write to this app's own token file (per-app, brand-stamped)
-    try { saveTokenForApp(updated, appId); } catch { /* best-effort */ }
+    // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
+    // per-app 路径去覆盖别的东西。
+    try { saveTokenForApp(updated, appId, token.openId); } catch { /* best-effort */ }
     logger.info('[user-token] Refreshed User Access Token');
     return updated;
   } catch (err: any) {
@@ -212,23 +325,37 @@ async function refreshToken(token: TokenStore, appId: string, appSecret: string,
 // ─── Public API: resolve token ────────────────────────────────────────────────
 
 /**
- * Resolve a valid User Access Token.
- * Returns access_token string, or null if unavailable.
+ * Owner 个人功能专用的 token 解析（目前只有飞书「消息分组」标签）。
+ *
+ * 这类功能操作的是 owner 自己的收件箱侧边栏，bot 没有收件箱，所以它天然只能用
+ * owner 本人的 token。与 {@link resolveUserToken} 的严格按人取相比，这里额外接受
+ * **未标注归属的旧 per-app 文件**：升级前这些文件事实上就是 owner 自己 /login 写
+ * 的，拒绝它们会让存量安装的标签功能在升级后静默失效。
+ *
+ * 这道口子只对 owner 开：ownerOpenId 由 bot 配置决定，不来自消息，所以不存在
+ * 「借用别人凭证」的路径。任何按消息发送者取凭证的地方都必须用
+ * {@link resolveUserToken}。
  */
-export async function resolveUserToken(appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<string | null> {
-  // 1. Environment variable (explicit global override)
-  const envToken = process.env.FEISHU_USER_ACCESS_TOKEN;
-  if (envToken) return envToken;
+export async function resolveOwnerUserToken(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  ownerOpenId?: string,
+): Promise<string | null> {
+  return resolveTokenFrom(loadTokenForApp(appId, brand, ownerOpenId, true), appId, appSecret, brand);
+}
 
-  // 2. Per-app token file (mismatched / 别的 bot 的 token → null，调用方提示 /login)
-  const loaded = loadTokenForApp(appId, brand);
+/** {@link resolveUserToken} / {@link resolveOwnerUserToken} 共用的过期与刷新处理。 */
+async function resolveTokenFrom(
+  loaded: { token: TokenStore; source: string } | null,
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+): Promise<string | null> {
   if (!loaded) return null;
-
   const { token } = loaded;
 
-  if (isValid(token.expires_at)) {
-    return token.access_token;
-  }
+  if (isValid(token.expires_at)) return token.access_token;
 
   // access_token expired — try refresh
   if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
@@ -238,6 +365,27 @@ export async function resolveUserToken(appId: string, appSecret: string, brand: 
 
   logger.debug('[user-token] Token expired and refresh_token also expired');
   return null;
+}
+
+/**
+ * Resolve a valid User Access Token.
+ *
+ * `openId` 给定时按人取：只接受属于那个人的 token，取不到就返回 null（调用方负责
+ * 降级到 bot 身份或提示 /login）。不给时按 bot 取（旧行为），拿这个 app 下任何
+ * 已授权的 per-app / 旧单文件 token。
+ *
+ * Returns access_token string, or null if unavailable.
+ */
+export async function resolveUserToken(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+): Promise<string | null> {
+  // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
+  // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
+  // 边界，而且绕过时没有任何痕迹。
+  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand);
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
@@ -295,8 +443,17 @@ export function resolveOAuthRedirectUri(): string {
 /**
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
+ *
+ * `openId` 是发起这次授权的人。传了它，回调拿到的 token 就归属到那个人名下
+ * （`user-token-<appId>-<openId>.json`），第二个人 /login 不会覆盖第一个人。
  */
-export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = []): { authUrl: string; state: string } {
+export function generateAuthUrl(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  extraScopes: string[] = [],
+  openId?: string,
+): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
   const redirectUri = resolveOAuthRedirectUri();
 
@@ -320,6 +477,7 @@ export function generateAuthUrl(appId: string, appSecret: string, brand: Brand =
     appId,
     appSecret,
     brand,
+    ...(isUsableOpenId(openId) ? { openId } : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -369,10 +527,19 @@ export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleR
  * Feed-group authorization status for the dashboard's session-group tag UI:
  * authorized = a stored token for this app carries the feed-group write scope
  * and is still usable (valid or refreshable).
+ *
+ * 飞书「消息分组」是某个人的收件箱侧边栏，bot 没有收件箱 —— 所以这里问的始终是
+ * 「某个具体的人授权了没」。`openId` 给定时按人查，不给时沿用旧的 per-app 行为。
  */
-export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu'): { authorized: boolean; expiresAt?: string } {
+export function getFeedGroupAuthStatus(
+  appId: string,
+  brand: Brand = 'feishu',
+  ownerOpenId?: string,
+): { authorized: boolean; expiresAt?: string } {
   try {
-    const loaded = loadTokenForApp(appId, brand);
+    // 与 resolveOwnerUserToken 同一条口径：优先 owner 自己的文件，回落到未标注归属
+    // 的旧 per-app 文件，否则存量安装升级后徽标会莫名变成「未授权」。
+    const loaded = loadTokenForApp(appId, brand, ownerOpenId, true);
     if (!loaded) return { authorized: false };
     const token = loaded.token;
     const scopes = (token.scope ?? '').split(/\s+/);
@@ -383,6 +550,45 @@ export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu'): 
     return { authorized: true, expiresAt: token.refresh_expires_at || token.expires_at };
   } catch {
     return { authorized: false };
+  }
+}
+
+/**
+ * 用刚拿到的 access_token 回读授权人是谁。
+ *
+ * OAuth token 响应本身不带 open_id，所以归属只能靠这一步确认。它同时是一道防线：
+ * /login 链接可能被转给别人点，如果不核对，B 点了 A 的链接就会把 B 的 token 存到
+ * A 名下 —— 之后 A 的每次操作都在用 B 的权限，且无声无息。
+ */
+type AuthorizedUser =
+  | { ok: true; openId: string; userName?: string }
+  /** Could not establish who authorized. `reason` is shown to the user, so it
+   *  must say what failed rather than just "failed". */
+  | { ok: false; reason: string };
+
+async function fetchAuthorizedUser(
+  accessToken: string,
+  brand: Brand,
+): Promise<AuthorizedUser> {
+  try {
+    const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v1/user_info`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return { ok: false, reason: `user_info HTTP ${res.status}` };
+    const body = await res.json() as { code?: number; msg?: string; data?: { open_id?: string; name?: string } };
+    if (body.code !== 0 || !body.data) {
+      return { ok: false, reason: `user_info code ${body.code ?? 'unknown'}${body.msg ? `: ${body.msg}` : ''}` };
+    }
+    if (!isUsableOpenId(body.data.open_id)) {
+      return { ok: false, reason: 'user_info 未返回可用的 open_id' };
+    }
+    return {
+      ok: true,
+      openId: body.data.open_id,
+      ...(body.data.name ? { userName: body.data.name } : {}),
+    };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -431,6 +637,24 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     }
 
     const now = new Date();
+    // 归属以「实际完成授权的那个人」为准，回读 user_info 得到。发起人 open_id 只作
+    // 校验对照：不一致说明链接被转给了别人点，此时按真实授权人落盘并明确告知，绝不
+    // 把 B 的凭证存到 A 名下。
+    const authorized = await fetchAuthorizedUser(data.access_token, pending.brand);
+
+    // 回读失败就不落盘。退回 pending.openId 是「猜」：一条 /login 链接完全可能被
+    // 转给别人点，此时猜出来的归属正好把 B 的凭证记在 A 名下 —— 而这条链路存在的
+    // 唯一理由就是防止这件事。宁可让人重来一次，也不能存一个可能张冠李戴的 token：
+    // 存错了没有任何报错，只是之后 A 的每次操作都在用 B 的权限。
+    if (!authorized.ok) {
+      logger.warn(`[user-token] 放弃保存：无法确认授权人（${authorized.reason}）`);
+      return `❌ 授权未完成：拿到了 token，但无法确认是谁完成的授权（${authorized.reason}），`
+        + `为避免记到错误的人名下，本次没有保存。请重新 /login。`;
+    }
+
+    const ownerOpenId = authorized.openId;
+    const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
+
     const token: TokenStore = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -442,13 +666,20 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       scope: data.scope,
       appId: pending.appId,
       brand: pending.brand,
+      openId: ownerOpenId,
+      ...(authorized.userName ? { userName: authorized.userName } : {}),
     };
 
-    saveTokenForApp(token, pending.appId);
-    logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId}`);
+    saveTokenForApp(token, pending.appId, ownerOpenId);
+    logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId} (per-user)`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    return `✅ 授权成功！Token 已保存。\n有效期至 ${expiresAt}，过期后自动刷新。`;
+    const who = authorized.userName ? `${authorized.userName} ` : '';
+    return mismatched
+      ? `✅ 授权成功，Token 已保存给实际完成授权的账号${who ? `（${authorized.userName}）` : ''}。\n`
+        + `注意：这与发起 /login 的账号不是同一个人 —— 如果不是你本人操作，请让本人重新 /login。\n`
+        + `有效期至 ${expiresAt}，过期后自动刷新。`
+      : `✅ ${who}授权成功！Token 已保存。\n有效期至 ${expiresAt}，过期后自动刷新。`;
   } catch (err: any) {
     return `❌ 授权失败：${err.message}`;
   }
@@ -462,23 +693,26 @@ export function isCallbackUrl(text: string): boolean {
 }
 
 /**
- * Get current token status for /login status display. Per-app: reports the
- * token belonging to this bot (appId/brand), not whatever was last written.
+ * Get current token status for /login status display.
+ *
+ * 传 `openId` → 报「你自己」授权了没（trigger-user 场景，别人的状态与你无关）。
+ * 不传 → 报这个 bot 有没有任何可用的 per-app / 旧单文件 token（旧行为）。
  */
-export function getTokenStatus(appId: string, brand: Brand = 'feishu'): string {
-  const loaded = loadTokenForApp(appId, brand);
+export function getTokenStatus(appId: string, brand: Brand = 'feishu', openId?: string): string {
+  const loaded = loadTokenForApp(appId, brand, openId);
   if (!loaded) return '未登录（无 User Token）';
 
   const { token, source } = loaded;
   const accessValid = isValid(token.expires_at);
   const refreshValid = isValid(token.refresh_expires_at) || (!token.refresh_expires_at && !!token.refresh_token);
+  const who = token.userName ? `${token.userName}，` : '';
 
   if (accessValid) {
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    return `已登录（来源: ${source}）\nToken 有效至 ${expiresAt}`;
+    return `已登录（${who}来源: ${source}）\nToken 有效至 ${expiresAt}`;
   }
   if (refreshValid) {
-    return `已登录但 Token 已过期，将在下次使用时自动刷新（来源: ${source}）`;
+    return `已登录但 Token 已过期，将在下次使用时自动刷新（${who}来源: ${source}）`;
   }
-  return `Token 已过期且无法刷新，请重新 /login（来源: ${source}）`;
+  return `Token 已过期且无法刷新，请重新 /login（${who}来源: ${source}）`;
 }

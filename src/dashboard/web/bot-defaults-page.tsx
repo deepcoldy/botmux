@@ -1085,6 +1085,7 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -3270,6 +3271,154 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
         <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
       </div>
     </div>
+  );
+}
+
+/**
+ * Trigger-user CLI auth.
+ *
+ * Sits in the security tab beside sandbox / Codex credentials / grants — this is
+ * the same class of setting: who a session acts as.
+ *
+ * The shape mirrors SandboxSection: a main toggle, with the detail controls
+ * appearing only once it is on. Tools are checkboxes rather than separate toggles
+ * because they are one feature's scope, not two independent capabilities.
+ *
+ * The two advisories are shown, not hidden. Without the file sandbox the agent
+ * can read other people's token files directly, and a self-credentialed MCP
+ * server bypasses the wrapper entirely — an operator who is not told either of
+ * those would believe the boundary is complete.
+ */
+function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const policy = bot.triggerUserAuth ?? null;
+  const enabled = policy?.enabled === true;
+  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
+  const fallback = policy?.fallback ?? 'bot-identity';
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [info, setInfo] = useState<{
+    authorizedCount?: number;
+    tokenStoreAdvisory?: string;
+    mcpAdvisory?: string;
+  } | null>(null);
+
+  // Only fetch the advisories when the feature is on: they describe THIS
+  // policy's limits, and showing them for a bot that never enabled it would be
+  // noise about a boundary nobody asked for.
+  useEffect(() => {
+    if (!enabled) { setInfo(null); return; }
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth-status`, undefined);
+        if (alive && res.ok && res.body.ok) setInfo(res.body as any);
+      } catch { /* advisory only — never block the panel on it */ }
+    })();
+    return () => { alive = false; };
+  }, [bot.larkAppId, enabled]);
+
+  async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
+    const previous = policy;
+    setStatus(null);
+    setBusy(true);
+    patchBot(bot.larkAppId, { triggerUserAuth: next });
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+        triggerUserAuth: next,
+      });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.triggerUserAuthSaved')}`, ok: true });
+      } else {
+        patchBot(bot.larkAppId, { triggerUserAuth: previous });
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      patchBot(bot.larkAppId, { triggerUserAuth: previous });
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
+    void save({ enabled: true, tools: next, fallback });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-trigger-user-auth"
+        title={tr('botDefaults.triggerUserAuthToggle')}
+        help={tr('botDefaults.triggerUserAuthHelp')}
+        onChange={checked => void save(
+          checked ? { enabled: true, tools, fallback } : null,
+        )}
+      />
+      {enabled ? (
+        <>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthTools')}</span>
+            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+              <label key={tool} className="bd-inline-check">
+                <input
+                  type="checkbox"
+                  data-action={`trigger-user-auth-tool-${tool}`}
+                  checked={tools.includes(tool)}
+                  disabled={busy}
+                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                />
+                <span>{tool}</span>
+              </label>
+            ))}
+          </div>
+          <div className="bd-row">
+            <label>
+              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
+              <select
+                data-input="triggerUserAuthFallback"
+                value={fallback}
+                disabled={busy}
+                onChange={event => void save({
+                  enabled: true,
+                  tools,
+                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
+                })}
+              >
+                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
+                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
+              </select>
+            </label>
+          </div>
+          {tools.includes('bytedcli') ? (
+            <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
+          ) : null}
+          {typeof info?.authorizedCount === 'number' ? (
+            <p className="bd-section-note" data-trigger-user-auth-authorized="">
+              {tr('botDefaults.triggerUserAuthAuthorized', { count: String(info.authorizedCount) })}
+            </p>
+          ) : null}
+          {info?.tokenStoreAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-token-advisory="">
+              ⚠️ {info.tokenStoreAdvisory}
+            </p>
+          ) : null}
+          {info?.mcpAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-mcp-advisory="">
+              ⚠️ {info.mcpAdvisory}
+            </p>
+          ) : null}
+        </>
+      ) : null}
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-trigger-user-auth-status': '' }} />
+      </div>
+    </section>
   );
 }
 

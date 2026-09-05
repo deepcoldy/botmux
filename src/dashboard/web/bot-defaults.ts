@@ -89,6 +89,13 @@ export type BotDefaultsRow = {
   replyStyle?: ReplyStyleConfig | null;
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
+   *  CLI calls use whatever identity is logged in on the machine). */
+  triggerUserAuth?: {
+    enabled: boolean;
+    tools: Array<'lark-cli' | 'bytedcli'>;
+    fallback: 'bot-identity' | 'none';
+  } | null;
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;

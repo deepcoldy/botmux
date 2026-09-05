@@ -6,7 +6,9 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -46,7 +48,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -1068,6 +1070,97 @@ async function applyAllowedUsersSet(
  * `/botconfig` —— owner/allowedUsers 远程改本 bot 运营字段。sessionless：只认 larkAppId，
  * 不需活跃会话。严格 admin 闸（拒绝开放模式 bot），写盘 + 内存热更新，无需重启。
  */
+/**
+ * `/status` lines describing whose credentials the CLI is acting with.
+ *
+ * Answers the question a shared bot actually raises: "is it using MY permissions
+ * right now?" Reports only about the ASKING person — the roster of who else
+ * authorized is not something a group member should learn from /status, and
+ * `/login status` already covers "did I authorize".
+ *
+ * Empty when the policy is off: the answer would then be "the machine's login",
+ * which is the historical behavior and not something /status has ever claimed.
+ */
+/**
+ * The body of a `/login` prompt, matching the callback mode actually in effect.
+ *
+ * `oauthRedirectBase` decides whether the browser can complete the exchange on
+ * its own. Without branching on it, one of the two audiences always gets wrong
+ * instructions — and the wrong-but-scary version ("the page will fail to load,
+ * that's normal, now copy the address bar, and if you can't see it open
+ * DevTools") is what stops a colleague from ever finishing authorization.
+ *
+ * The auto path still mentions the paste fallback in one line: the redirect can
+ * be momentarily unreachable, and a user staring at an error page with no
+ * recourse is exactly the dead end this exists to remove.
+ */
+function loginPromptLines(
+  authUrl: string,
+  loc: Locale | undefined,
+  titleKey = 'cmd.login.title',
+): string[] {
+  const autoCallback = !resolveOAuthRedirectUri().startsWith('http://127.0.0.1:');
+  return [
+    t(titleKey, undefined, loc),
+    '',
+    t('cmd.login.step1', undefined, loc),
+    authUrl,
+    '',
+    ...(autoCallback
+      ? [
+        t('cmd.login.step2_auto', undefined, loc),
+        t('cmd.login.step2_auto_fallback', undefined, loc),
+      ]
+      : [
+        t('cmd.login.step2', undefined, loc),
+        t('cmd.login.step3', undefined, loc),
+      ]),
+  ];
+}
+
+/**
+ * Whose credentials this session's CLI calls use right now — per tool.
+ *
+ * Per tool because the answer genuinely differs between them. `/login` grants
+ * Lark only; bytedcli authenticates against ByteCloud SSO, so the same person
+ * can be authorized for one and refused by the other. Printing the tools on one
+ * line above a single verdict said "you are authorized" about a tool the token
+ * has no bearing on — the reader then discovers otherwise only when a command
+ * fails.
+ */
+function triggerUserAuthStatusLines(
+  botCfg: BotConfig,
+  senderOpenId: string | undefined,
+): string[] {
+  const policy = botCfg.triggerUserAuth;
+  if (!policy?.enabled || !policy.tools.length) return [];
+  const brand = normalizeBrand(botCfg.brand);
+  const larkAuthorized = senderOpenId
+    ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
+    : undefined;
+  const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
+
+  const lines = ['Trigger-user auth: 已开启'];
+  for (const tool of policy.tools) {
+    lines.push(`  ${tool}: ${
+      tool === 'lark-cli'
+        ? larkAuthorized
+          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
+          : botFallback
+            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
+            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+        // ByteCloud is a separate identity provider, so this is a genuinely
+        // different verdict from the Lark line above — the same person can be
+        // authorized for one and not the other. There is no bot identity to
+        // degrade to here, so unauthorized always means the command is refused.
+        : hasBytedcliHome(senderOpenId ?? '')
+          ? '以你自己的身份调用'
+          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
+    }`);
+  }
+  return lines;
+}
+
 async function handleConfigCommand(
   message: LarkMessage,
   rootId: string,
@@ -2627,6 +2720,11 @@ export async function handleCommand(
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
+            // Trigger-user auth: whose credentials this session's CLI calls are
+            // using RIGHT NOW. Shown only when the policy is on — otherwise the
+            // answer is "the machine's", which is the historical behavior and
+            // not something /status has ever claimed to report.
+            ...triggerUserAuthStatusLines(botCfg, message.senderId),
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
@@ -2779,8 +2877,65 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
+        // 授权归属到「发起这条 /login 的人」。token 代表一个人而不是一个 bot：不带
+        // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
+        // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
+        const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
-          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
+          // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
+          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
+          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
+          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+            lines.push(t(
+              hasBytedcliHome(loginOpenId)
+                ? 'cmd.login.bytedcli_status_yes'
+                : 'cmd.login.bytedcli_status_no',
+              undefined,
+              loc,
+            ));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login bytedcli` —— ByteCloud SSO 授权。跟飞书 OAuth 是两个身份提供方，
+        // 换不过来，所以必须各授权一次；这条命令只管 ByteCloud 那一半。
+        //
+        // 分两步而不是一步等：设备码流程要人去点链接，阻塞等待会把会话卡住，所以
+        // `--begin` 拿链接先回，人点完再发 `done` 收尾。
+        if (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ')) {
+          if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
+          const done = subCmd.slice('bytedcli'.length).trim();
+          if (done === 'done' || done === '完成') {
+            const challenge = pendingBytedcliChallenge(loginOpenId);
+            if (!challenge) {
+              await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
+              break;
+            }
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
+            await sessionReply(rootId, state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          const started = await beginBytedcliLogin(loginOpenId);
+          if (!started) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+            break;
+          }
+          await sessionReply(rootId, [
+            t('cmd.login.bytedcli_title', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_step1', undefined, loc),
+            started.authUrl,
+            '',
+            t('cmd.login.bytedcli_step2', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_note', undefined, loc),
+          ].join('\n'));
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
@@ -2792,29 +2947,24 @@ export async function handleCommand(
             botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand),
             FEED_GROUP_OAUTH_SCOPES,
+            loginOpenId,
           );
           await sessionReply(rootId, [
-            t('cmd.login.tags_title', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            tagAuthUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
+            ...loginPromptLines(tagAuthUrl, loc, 'cmd.login.tags_title'),
             '',
             t('cmd.login.tags_footer', undefined, loc),
           ].join('\n'));
           break;
         }
-        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
+        const { authUrl } = generateAuthUrl(
+          botCfg2.larkAppId,
+          botCfg2.larkAppSecret,
+          normalizeBrand(botCfg2.brand),
+          [],
+          loginOpenId,
+        );
         await sessionReply(rootId, [
-          t('cmd.login.title', undefined, loc),
-          '',
-          t('cmd.login.step1', undefined, loc),
-          authUrl,
-          '',
-          t('cmd.login.step2', undefined, loc),
-          t('cmd.login.step3', undefined, loc),
+          ...loginPromptLines(authUrl, loc),
           '',
           t('cmd.login.footer', undefined, loc),
           t('cmd.login.status_hint', undefined, loc),
@@ -2858,16 +3008,19 @@ export async function handleCommand(
         // 旧流程：文档 scope 不污染通用 /login；缺少时由本命令发专用 OAuth 链接。
         const subCfg = getBot(larkAppId).config;
         const replyDocLogin = async () => {
-          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
-          await sessionReply(rootId, [
-            t('cmd.subdoc.need_login', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            authUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
-          ].join('\n'));
+          const { authUrl } = generateAuthUrl(
+            subCfg.larkAppId,
+            subCfg.larkAppSecret,
+            normalizeBrand(subCfg.brand),
+            DOC_COMMENT_OAUTH_SCOPES,
+            // 归属到下这条 /subscribe-lark-doc 的人：订阅是他建立的，之后的评论
+            // 读写就按他的权限走。
+            message.senderId,
+          );
+          await sessionReply(
+            rootId,
+            loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
+          );
         };
         const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
         if (!userTok) { await replyDocLogin(); break; }

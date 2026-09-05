@@ -350,6 +350,12 @@ export interface DaemonSession {
    *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
    *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
   pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
+  /** Tools this session has already asked the current people to authorize
+   *  (trigger-user CLI auth). Repeating the notice every turn would be noise —
+   *  the sender already has the link. In-memory only: a daemon restart at worst
+   *  re-sends one notice, which is strictly better than suppressing it forever
+   *  off stale persisted state. */
+  triggerUserAuthNotified?: Set<string>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */

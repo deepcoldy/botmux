@@ -408,8 +408,32 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': 'idle',
   'cmd.status.fallback_no_session': 'No active session in this topic.\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
+  // Printed on stderr to whoever's command did not run: name whose
+  // authorization is missing and how to supply it, or they just retry.
+  // bytedcli uses ByteCloud SSO, a different identity provider from Feishu, so
+  // both need authorizing separately.
+  'cmd.login.bytedcli_title': '🔐 ByteCloud (bytedcli) authorization',
+  'cmd.login.bytedcli_step1': '1. Open this link to authorize:',
+  'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
+  'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
+  'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli and git actions you trigger here now run as you.',
+  'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
+  'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
+  'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
+  'cmd.login.bytedcli_status_yes': 'ByteCloud (bytedcli): authorized',
+  'cmd.login.bytedcli_status_no': 'ByteCloud (bytedcli): not authorized — send /login bytedcli',
+  'trigger_user_auth.provider_lark': 'Feishu',
+  'trigger_user_auth.denied_you': 'botmux: this step runs as you and needs your own {provider} authorization, but you have not authorized {tool}. Command not run.',
+  'trigger_user_auth.denied_known_user': 'botmux: this step needs {name}\'s own {provider} authorization, but they have not authorized {tool}. Command not run.',
+  'trigger_user_auth.denied_anonymous': 'botmux: this step needs the sender\'s own {provider} authorization, but this turn has no identifiable sender. {tool} command not run.',
+  'trigger_user_auth.denied_howto': 'botmux: to authorize — send {command} in this chat, open the link it returns, then retry.',
+  'trigger_user_auth.denied_howto_status': 'botmux: to check whether you are already authorized, send /login status.',
+  'trigger_user_auth.needs_login': '🔐 This step runs as you, but you have not authorized {tools} yet. Send /login to authorize, then retry. This notice appears once per session.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',
+  'cmd.login.step2_auto': '2. When authorization finishes the browser shows "✅ Authorized" — that is the end of it. Nothing to copy; just come back here and retry.',
+  'cmd.login.step2_auto_fallback': '   If the browser stops on an error page (callback temporarily unreachable), sending the full address-bar URL back to this topic also completes it.',
   'cmd.login.step2': '2. After authorizing, the browser redirects to a page that fails to load ("This site can\'t be reached / ERR_CONNECTION_REFUSED") — this is expected (the callback points at 127.0.0.1, but the daemon runs remotely).',
   'cmd.login.step3': '3. Copy the full http://127.0.0.1:9768/callback?code=... URL from the address bar and send it back to this topic.\n   ⚠️ If the address bar doesn\'t show it (intercepted / no redirect): press F12 → Network tab → enable All → click Authorize → find the request to 127.0.0.1:9768 → right-click → Copy → Copy URL → send it here.',
   'cmd.login.footer': 'With auth you can download images and resources from third-party cards.',
@@ -782,6 +806,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
+  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
+  'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
+  'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
+  'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',

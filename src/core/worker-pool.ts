@@ -563,6 +563,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { clearAllSessionIdentities } from './cli-identity.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   MAX_STARTUP_AUTO_RETRIES,
@@ -6841,6 +6842,13 @@ export async function closeSession(
   // All authoritative map/status/store/event state above transitions
   // synchronously, before the first await. Lark reaction/unsubscribe cleanup is
   // best-effort and can be slow; it must not leave a resurrection window.
+
+  // Trigger-user credentials die with the session. These files hold a live user
+  // token, so a closed session must not leave one on disk for a future session
+  // (or an operator inspecting the data dir) to pick up.
+  try { clearAllSessionIdentities(config.session.dataDir, sessionId); }
+  catch { /* best-effort; absence is the desired state */ }
+
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
   if (cleanupAppId) {
     for (const target of docReactionTargets) {
@@ -10808,6 +10816,9 @@ export function forkWorker(
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     codexAuthSync: botCfg.codexAuthSync ?? 'shared',
+    // Trigger-user CLI auth: the worker needs the policy to know which tools to
+    // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
+    ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
