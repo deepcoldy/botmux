@@ -3167,7 +3167,14 @@ async function markCommentEventDropped(
   // 恰好**穿过**下面那道 owner 审计门 —— 只靠审计门挡不住这种自标。
   // 注意这只是 best-effort：authored set 是进程内内存，重启即失效；
   // hasBotSentinel 那道要正文，这里没有。不宣称密封。
-  const selfBotOpenId = getBot(larkAppId).botOpenId;
+  // getBot 抛错时不能让 rollback 被跳过（占位订阅会残留），故取值也包进容错：
+  // 拿不到 open_id 就退化成只靠 isBotAuthoredReply 这一路信号。
+  let selfBotOpenId: string | undefined;
+  try {
+    selfBotOpenId = getBot(larkAppId).botOpenId;
+  } catch {
+    selfBotOpenId = undefined;
+  }
   if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
     logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
     rollbackAutoSub();
@@ -3257,12 +3264,22 @@ async function processCommentEvent(
   // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
   const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
 
-  // 「这条事件**可能**与本 bot 有关」—— 在读不到评论正文时唯一能用的收窄。
-  // mention-only 订阅下该文档的**所有**评论事件都会推给我们，`is_mentioned`
-  // 为 false 说明这条评论里一个 @ 都没有，肯定不是找 bot 的。注意这是用它
-  // **收紧**，与「不能用 is_mentioned 放行」的既有警告不冲突 —— 那条警告说的是
-  // true 不代表 @ 的是本 bot。'all' 模式不收窄：不 @ 也该触发。
-  const mayConcernThisBot = sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned === true;
+  // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
+  // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
+  //
+  //  ① 只在 mention-only 下打。这是唯一没有兜底的模式：poller
+  //     （daemon.ts:pollWatchedDocComments）只轮 `commentTriggerMode === 'all'`，
+  //     且直接调 handleDocComment、不经过本函数。所以 'all' 恰恰**有**轮询兜底
+  //     —— push 链路这次拉取失败的评论，下一轮 poll 很可能被正常处理，而 ❌ 是
+  //     终态、不会被摘掉，结果就是永久挂在一条根本没丢的评论上。
+  //     （早先注释写的「'all' 拉不到就是真丢了」是反的，PR 描述里「不进轮询 ⇒
+  //     没兜底 ⇒ 终点」那条论证**只对 mention-only 成立**。）
+  //  ② `is_mentioned` 为 false 说明这条评论里一个 @ 都没有，肯定不是找 bot 的。
+  //     注意这是用它**收紧**，与「不能用 is_mentioned 放行」的既有警告不冲突
+  //     —— 那条警告说的是 true 不代表 @ 的是本 bot。
+  //
+  // 这样三个打点的闸口就一致了（第三个打点用的 markEligible 同样只认 mention-only）。
+  const mayConcernThisBot = sub.commentTriggerMode === 'mention-only' && parsed.isMentioned === true;
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
   // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId

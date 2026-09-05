@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   isBotAuthoredReply: vi.fn(() => false),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
   getBot: vi.fn(() => ({ botOpenId: 'ou_selfbot', config: {} })),
+  sendUserMessage: vi.fn(),
   debug: vi.fn(),
   info: vi.fn(),
   rollback: vi.fn(),
@@ -28,6 +29,11 @@ vi.mock('../src/im/lark/doc-comment.js', () => ({
   hasBotSentinel: vi.fn(() => false),
   commentTriggerAllowed: vi.fn(() => true),
   BOT_REPLY_SENTINEL: '​',
+}));
+
+vi.mock('../src/im/lark/client.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  sendUserMessage: mocks.sendUserMessage,
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -64,6 +70,7 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     mocks.debug.mockReset();
     mocks.info.mockReset();
     mocks.rollback.mockReset();
+    mocks.sendUserMessage.mockReset().mockResolvedValue(undefined);
     ({ __testOnly_markCommentEventDropped: markCommentEventDropped } =
       await import('../src/im/lark/event-dispatcher.js'));
   });
@@ -106,13 +113,25 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
   });
 
   /**
-   * 审计硬门：打标记是 provider-visible 的持久外部写入，不是内部日志。既有不变量
-   * 是「非 owner 触发时 owner 无法感知 = 越权」。这些丢弃点全在那道门之前，且前两处
-   * 读不到正文、构造不出门要发的通知，所以取保守侧：只有 owner 本人触发才打。
+   * 审计硬门：打标记是 provider-visible 的持久外部写入，不是内部日志。不变量是
+   * 「非 owner 触发时 owner 必须先感知」—— **不是**「非 owner 一律不打」。
+   * 通知发出去了 owner 就已感知，此时照打（这正是 9436bb9 撤回 owner-only 降级
+   * 的用意：owner-only 等于放弃 #1260 的非 owner 核心场景）。
    */
-  it('非 owner 触发不打标记（不能绕过审计硬门做外部写入）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
+  it('非 owner + owner 通知成功：照打（owner 已感知，不算越权）', async () => {
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
+    expect(outcome).toBe('marked');
+    expect(mocks.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.addCommentReactionChecked).toHaveBeenCalledTimes(1);
+    expect(mocks.rollback).not.toHaveBeenCalled();
+  });
+
+  it('非 owner + owner 通知失败：拒绝、不打、回滚（owner 无法感知 = 越权）', async () => {
+    mocks.sendUserMessage.mockRejectedValue(new Error('DM 发不出去'));
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
+    expect(outcome).toBe('audit-rejected');
     expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+    expect(mocks.rollback).toHaveBeenCalledTimes(1);
   });
 
   it('owner 未配置时不打标记（无从判定越权，保守拒绝）', async () => {
@@ -121,9 +140,10 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
-  it('operator 缺失时不打标记（判不出是谁触发的）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, undefined, 'summary', mocks.rollback);
-    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+  it('operator 缺失：按非 owner 处理 —— 通知成功后照打', async () => {
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, undefined, 'summary', mocks.rollback);
+    expect(outcome).toBe('marked');
+    expect(mocks.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -149,6 +169,7 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
    * 完全不知情的订阅记录，且没有任何人会清掉它。
    */
   it('审计拒绝时回滚 auto-sub，不留下 owner 不知情的订阅', async () => {
+    mocks.sendUserMessage.mockRejectedValue(new Error('DM 发不出去'));
     const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_stranger', 'summary', mocks.rollback);
     expect(outcome).toBe('audit-rejected');
     expect(mocks.rollback).toHaveBeenCalledTimes(1);
@@ -222,8 +243,30 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     expect(secondDrop).toContain('mayConcernThisBot');
   });
 
-  it('收窄谓词本身用 is_mentioned 收紧，且只作用于 mention-only', () => {
-    expect(region).toContain(`sub.commentTriggerMode !== 'mention-only' || parsed.isMentioned === true`);
+  /**
+   * 三个打点的闸口必须一致，且**只在 mention-only 下打**。
+   * 'all' 有 poller 兜底（pollWatchedDocComments 只轮 'all'，且不经过
+   * processCommentEvent），push 这次没读到的评论下轮 poll 很可能被正常处理；
+   * 而 ❌ 是终态不清理，在 'all' 下打就会永久挂在一条根本没丢的评论上。
+   */
+  it("收窄谓词只认 mention-only + is_mentioned（'all' 有轮询兜底，不该打)", () => {
+    expect(region).toContain(`sub.commentTriggerMode === 'mention-only' && parsed.isMentioned === true`);
+  });
+
+  it('第三个打点的闸口与前两个一致（都只认 mention-only）', () => {
+    expect(region).toContain(`const markEligible = sub.commentTriggerMode === 'mention-only'`);
+  });
+
+  /**
+   * ⚠️ 生产调用点必须传 'dropped-signal'。audit-gate 那组测试**证明不了**这一点 ——
+   * 它直调 helper 并手动传 kind，所以把这里的 'dropped-signal' 悄悄改回默认
+   * 'reply'（即 180f2b4 修掉的「失败通知谎称已触发回复」），两组共 31 个用例
+   * 一条都不会红。这条断言就是补那个缺口。
+   */
+  it("dropped-signal 打点必须传 kind，不能退回成功文案", () => {
+    // 这个调用在 markCommentEventDropped 里，位于 processCommentEvent **之前**，
+    // 不在 region 切片内 —— 用整份源码断言，别锚错范围（锚错就又是一条假绿）。
+    expect(src).toContain("rollbackAutoSub, 'dropped-signal')");
   });
 
   it('每个未打标记的早退都回滚 auto-sub（不留 owner 不知情的订阅）', () => {

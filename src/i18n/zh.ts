@@ -460,7 +460,7 @@ export const messages: Record<string, string> = {
   'daemon.doc_mention_notify_title': '📄 文档 @bot 触发通知',
   'daemon.doc_mention_notify_body': '用户 {requester} 在文档 {token} 中 @了机器人，已触发回复。',
   'daemon.doc_dropped_notify_title': '⚠️ 文档评论事件未处理',
-  'daemon.doc_dropped_notify_body': '用户 {requester} 在文档 {token} 中的评论事件，bot 未能读取或处理；未产生回复。审计通过后会尝试在该回复上留下失败标记。',
+  'daemon.doc_dropped_notify_body': '用户 {requester} 在文档 {token} 中的评论事件，bot 未能读取或处理；未产生回复。将在该评论上留下失败标记，提示对方重发。',
   'daemon.doc_comment_reply_prefix': '↪ 回复 {author}：',
   'cmd.adopt.already_adopted': '本话题已接入 {label} ({pane})。\n请先点击卡片上的「断开」按钮，再 /adopt 切换 CLI 会话（原 CLI 不受影响）。',
   'cmd.adopt.no_sessions': '未发现可接入的 CLI 会话',
