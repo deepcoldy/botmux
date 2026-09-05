@@ -9,6 +9,9 @@
  */
 
 import { ASK_HUMAN_ERROR_CODE, GOAL_ASK_FILE, GOAL_ENV } from '../workflows/v3/contract.js';
+import { BOTMUX_SUBJECT_PROTOCOL } from '../services/subject-listener-protocol.js';
+
+export { BOTMUX_SUBJECT_PROTOCOL } from '../services/subject-listener-protocol.js';
 
 export interface SkillDef {
   /** Filesystem-safe name — becomes the directory name under {skillsDir}/ */
@@ -16,6 +19,13 @@ export interface SkillDef {
   /** Markdown content including YAML frontmatter */
   content: string;
 }
+
+const SUBJECT_SKILL = `---
+name: botmux-subject
+description: Botmux 未被明确 @ 的群 Subject 监听协议；先读群、发送者与飞书增量历史，再决定静默、回复、执行或路由。
+---
+
+${BOTMUX_SUBJECT_PROTOCOL}`;
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
@@ -1650,6 +1660,7 @@ export const ASK_SKILL_NAME = 'botmux-ask';
 export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
+  { name: 'botmux-subject', content: SUBJECT_SKILL },
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },

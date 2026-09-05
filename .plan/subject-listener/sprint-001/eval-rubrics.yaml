@@ -1,0 +1,75 @@
+sprint: '001'
+goal: '实现基于飞书增量上下文的 Subject 监听运行时'
+
+files_to_touch:
+  - src/bot-registry.ts
+  - src/services/message-listener.ts
+  - src/services/subject-listener-context.ts
+  - src/services/subject-listener-cursor-store.ts
+  - src/im/lark/event-dispatcher.ts
+  - src/daemon.ts
+  - src/core/types.ts
+  - src/core/worker-pool.ts
+  - src/skills/definitions.ts
+  - test/subject-listener-context.test.ts
+  - test/subject-listener-runtime.test.ts
+  - test/subject-listener-runtime.e2e.ts
+
+scenarios:
+  - id: S-1
+    name: '未被 @ 的消息按已提交游标获得连续飞书上下文'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-context.test.ts -t "连续飞书上下文"'
+    points: 20
+  - id: S-2
+    name: '冷启动或游标丢失时使用最近 N 条消息兜底'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-context.test.ts -t "消息兜底"'
+    points: 15
+  - id: S-3
+    name: 'Subject 静默成功时不留下任何群内辅助痕迹'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "静默成功"'
+    points: 20
+  - id: S-4
+    name: '明确 @ 当前 Bot 时绕过 Subject 并保证可见反馈'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "明确 @"'
+    points: 15
+  - id: S-5
+    name: 'Subject 执行失败时不越过未成功处理的消息'
+    must_pass: true
+    verification: 'bun x vitest run --project unit test/subject-listener-runtime.test.ts -t "执行失败"'
+    points: 10
+
+exit_criteria:
+  - id: EC-1
+    description: '主流链路端到端走通：未 @ 消息从飞书增量读取进入 Subject，静默不产生 UI，下一条消息从已提交游标继续'
+    verification: 'bun x vitest run --project e2e test/subject-listener-runtime.e2e.ts'
+  - id: EC-2
+    description: '所有 must_pass Scenario 通过'
+    verification: 'bun x vitest run --project unit test/subject-listener-context.test.ts test/subject-listener-runtime.test.ts'
+  - id: EC-3
+    description: '仓库构建通过'
+    verification: 'bun run build'
+
+rubrics:
+  - id: R-1
+    description: '飞书游标增量、触发上界、事件补尾和 N 条兜底行为正确'
+    points: 35
+    verification: 'bun x vitest run --project unit test/subject-listener-context.test.ts'
+  - id: R-2
+    description: 'Subject 静默、回复、失败提交与明确 @ 隔离行为正确'
+    points: 35
+    verification: 'bun x vitest run --project unit test/subject-listener-runtime.test.ts'
+  - id: R-3
+    description: 'legacy listener、其它 CLI/后端共用路径无回归'
+    points: 20
+    verification: 'bun x vitest run --project unit test/message-listener.test.ts test/event-dispatcher.test.ts test/bridge-final-output-retry.test.ts'
+  - id: R-4
+    description: 'TypeScript 与构建产物通过'
+    points: 10
+    verification: 'bun run build'
+
+total_points: 100
+pass_threshold: 90

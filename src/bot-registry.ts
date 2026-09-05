@@ -192,13 +192,27 @@ export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
 export type MessageListenerSenderType = 'user' | 'bot';
+export type MessageListenerBehavior = 'prompt' | 'subject';
+export const DEFAULT_SUBJECT_FALLBACK_MESSAGES = 20;
+export const MAX_SUBJECT_FALLBACK_MESSAGES = 200;
+
+export interface MessageListenerSubjectPolicy {
+  context: {
+    source: 'lark';
+    fallbackMessages: number;
+  };
+}
 
 export interface MessageListenerConfig {
   enabled: boolean;
+  /** Omitted is the byte-compatible legacy prompt listener. */
+  behavior?: MessageListenerBehavior;
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
+  /** Required for enabled prompt listeners; optional for Subject listeners. */
   prompt: string;
+  subjectPolicy?: MessageListenerSubjectPolicy;
   senderPolicy?: {
     /**
      * all_except_excluded: listen to all matching sender types except excluded ids.
@@ -1092,9 +1106,41 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const entry = raw as Record<string, unknown>;
   const prompt = normalizeNonEmptyString(entry.prompt);
   const enabled = entry.enabled === true;
-  if (enabled && !prompt) {
+  if (entry.behavior !== undefined && entry.behavior !== 'prompt' && entry.behavior !== 'subject') {
+    logger.warn(`Bot config [${botIndex}] messageListeners[${chatId}] ignored: unknown behavior`);
+    return undefined;
+  }
+  const behavior: MessageListenerBehavior = entry.behavior === 'subject' ? 'subject' : 'prompt';
+  if (enabled && behavior === 'prompt' && !prompt) {
     logger.warn(`Bot config [${botIndex}] messageListeners[${chatId}] ignored: enabled listener requires prompt`);
     return undefined;
+  }
+
+  let subjectPolicy: MessageListenerSubjectPolicy | undefined;
+  if (behavior === 'subject') {
+    const subjectRaw = entry.subjectPolicy && typeof entry.subjectPolicy === 'object' && !Array.isArray(entry.subjectPolicy)
+      ? entry.subjectPolicy as Record<string, unknown>
+      : {};
+    const contextRaw = subjectRaw.context && typeof subjectRaw.context === 'object' && !Array.isArray(subjectRaw.context)
+      ? subjectRaw.context as Record<string, unknown>
+      : {};
+    if (contextRaw.source !== undefined && contextRaw.source !== 'lark') {
+      logger.warn(`Bot config [${botIndex}] messageListeners[${chatId}] ignored: subject context source must be lark`);
+      return undefined;
+    }
+    const rawFallback = contextRaw.fallbackMessages;
+    const fallbackMessages = typeof rawFallback === 'number'
+      && Number.isInteger(rawFallback)
+      && rawFallback > 0
+      && rawFallback <= MAX_SUBJECT_FALLBACK_MESSAGES
+      ? rawFallback
+      : DEFAULT_SUBJECT_FALLBACK_MESSAGES;
+    subjectPolicy = {
+      context: {
+        source: 'lark',
+        fallbackMessages,
+      },
+    };
   }
 
   const senderRaw = entry.senderPolicy && typeof entry.senderPolicy === 'object' && !Array.isArray(entry.senderPolicy)
@@ -1143,10 +1189,12 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
 
   return {
     enabled,
+    ...(entry.behavior !== undefined ? { behavior } : {}),
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
     ...(normalizeNonEmptyString(entry.replyCardTitle) ? { replyCardTitle: normalizeNonEmptyString(entry.replyCardTitle) } : {}),
     ...(normalizeNonEmptyString(entry.workingDir) ? { workingDir: normalizeNonEmptyString(entry.workingDir) } : {}),
     prompt: prompt ?? '',
+    ...(subjectPolicy ? { subjectPolicy } : {}),
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),

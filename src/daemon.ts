@@ -56,7 +56,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, listChatMessagesUntil, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -226,6 +226,9 @@ import {
   silentIdleCardFlag,
   dshRuntimeForSession,
   recordTurnExplicitMention,
+  registerSubjectListenerTurn,
+  isSubjectListenerTurn,
+  failSubjectListenerTurn,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -309,6 +312,8 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import { readSubjectListenerCursor } from './services/subject-listener-cursor-store.js';
+import { prepareSubjectListenerTurn } from './services/subject-listener-turn.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -3437,6 +3442,7 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * address spaces never collide; the lookup just tries both.
  */
 function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
+  if (isSubjectListenerTurn(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -3491,6 +3497,7 @@ export async function noteTurnReceived(
   // reaction-free (it is meeting-driven and routes through the audited listener
   // action, not the ordinary progress-reaction channel). Transcript deliveries
   // never reach this inbound-message acceptance point at all.
+  if (isSubjectListenerTurn(ds, _turnId ?? triggerMessageId)) return;
   if (ds.session.vcMeetingReceiver
     && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
@@ -17645,10 +17652,30 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   ctx.ingressAdmission ??= { admitted: false };
-  return withBotTurnAdmission(
-    ctx.larkAppId,
-    () => handleNewTopicAdmitted(data, ctx),
-  ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
+  try {
+    await withBotTurnAdmission(
+      ctx.larkAppId,
+      () => handleNewTopicAdmitted(data, ctx),
+    );
+  } catch (err) {
+    if (ctx.messageListener?.behavior === 'subject') {
+      logger.error(
+        `[subject:${ctx.larkAppId}] failed before terminal evidence `
+        + `chat=${ctx.chatId.substring(0, 12)} msg=${ctx.messageId.substring(0, 12)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } else {
+      await notifyOrdinaryIngressFailure(ctx, err);
+    }
+  } finally {
+    // Once claimed, the exact worker turn owns settlement. Every earlier
+    // return/error is a silent fail-closed Subject outcome and must release the
+    // dispatcher lane without advancing its cursor.
+    if (ctx.messageListener?.behavior === 'subject'
+      && ctx.subjectListenerCompletion?.claimed !== true) {
+      ctx.subjectListenerCompletion?.settle('failed');
+    }
+  }
 }
 
 /**
@@ -17692,6 +17719,7 @@ function computeCodexAppSteerable(facts: {
 
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
+  const isSubjectListener = messageListener?.behavior === 'subject';
   // Session-group birth re-homes the turn into the new group: replies/quotes
   // anchor on the in-group intro message, while `messageId` (the ORIGINAL
   // inbound message) keeps serving resource downloads / merge-forward
@@ -17824,7 +17852,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       parsed.msgType,
       data.message?.content ?? '',
       parsed.content,
-      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      (text) => isSubjectListener
+        ? Promise.resolve('')
+        : replyMessage(larkAppId, replyAnchorId, text, 'text'),
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -17919,10 +17949,40 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
   const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
   const botCfg = getBot(larkAppId).config;
+  let subjectChatContext: Awaited<ReturnType<typeof getChatContext>> | undefined;
+  let subjectCandidateCursor: { messageId: string; createTime: string } | undefined;
+  let subjectResolvedSender: ResolvedSender | undefined;
   // Upgrade a card match's text/title from the resolved message (button URLs the
   // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
   if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
-  const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
+  let listenerPrompt: string | undefined;
+  if (isSubjectListener) {
+    if (!ctx.subjectListenerCompletion) {
+      throw new Error('Subject listener requires a completion gate');
+    }
+    const prepared = await prepareSubjectListenerTurn({
+      larkAppId,
+      chatId,
+      chatType,
+      messageId,
+      triggerMessage: data.message,
+      messageListener,
+      senderOpenId,
+      senderType: parsed.senderType,
+      dataDir: config.session.dataDir,
+    }, {
+      resolveSender,
+      getChatContext,
+      readSubjectListenerCursor,
+      listChatMessagesUntil,
+    });
+    subjectChatContext = prepared.chatContext;
+    subjectCandidateCursor = prepared.candidateCursor;
+    subjectResolvedSender = prepared.resolvedSender;
+    listenerPrompt = prepared.prompt;
+  } else if (messageListener) {
+    listenerPrompt = renderMessageListenerPrompt(messageListener);
+  }
   if (listenerPrompt) {
     content = listenerPrompt;
     parsed.content = listenerPrompt;
@@ -18238,7 +18298,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     parsed.attachments = attachments;
   }
   if (needLogin) {
-    sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    if (isSubjectListener) {
+      logger.warn(`[subject:${larkAppId}] attachment download needs login; keeping turn silent`);
+    } else {
+      sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    }
   }
 
   // First-turn quote-reply: when the user @s the bot via Lark's "quote" UI as
@@ -18279,14 +18343,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     parsed.content,
     parsed.mentions,
   );
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
+  const newTopicSender = subjectResolvedSender
+    ?? await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
 
   refreshCliVersion(botCfg);
 
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+  const resolvedPinnedWorkingDir = await resolvePinnedWorkingDir({
     scope,
     anchor,
     chatId,
@@ -18294,6 +18359,20 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
   });
+  let { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = resolvedPinnedWorkingDir;
+  if (isSubjectListener && !pinnedWorkingDir) {
+    // Ambient turns must never expose the interactive repo picker. Run in the
+    // bot/global base working directory when no listener/oncall/default/peer
+    // pin exists; invalid local state fails closed through the Subject lane.
+    const ambientWorkingDir = expandHome(botCfg.workingDir ?? config.daemon.workingDir);
+    if (!statSync(ambientWorkingDir).isDirectory()) {
+      throw new Error(`Subject listener working directory is unavailable: ${ambientWorkingDir}`);
+    }
+    pinnedWorkingDir = ambientWorkingDir;
+    oncallEntry = undefined;
+    inheritedFrom = null;
+    pinnedFromBotDefault = false;
+  }
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -18343,7 +18422,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+  const autoWt = isSubjectListener
+    ? false
+    : willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
 
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
@@ -18429,6 +18510,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
+    pendingChatContext: subjectChatContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     pendingSubstituteTrigger: substituteTrigger,
@@ -18545,10 +18627,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
+    if (isSubjectListener) {
+      if (!subjectCandidateCursor || !ctx.subjectListenerCompletion) {
+        throw new Error('Subject listener runtime metadata was lost before worker dispatch');
+      }
+      registerSubjectListenerTurn(ds, replyAnchorId, {
+        chatId,
+        candidateCursor: subjectCandidateCursor,
+        completion: ctx.subjectListenerCompletion,
+      });
+    }
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
-    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots, trustedCaller);
+    try {
+      await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      forkReservedInitialSession(ds, availableBots, trustedCaller);
+    } catch (err) {
+      if (isSubjectListener) failSubjectListenerTurn(ds, replyAnchorId);
+      throw err;
+    }
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
