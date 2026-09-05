@@ -27,6 +27,9 @@ export interface OnlineDaemonInfo {
   cliId?: string;
   pid?: number;
   lastHeartbeat?: number;
+  /** botmux version of the process serving this daemon (from package.json).
+   * Absent for daemons started by older builds. */
+  version?: string;
 }
 
 /** `dataDir` lets a caller that already resolved a data dir keep the daemon
@@ -88,6 +91,7 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
         pid: d.pid,
         lastHeartbeat: d.lastHeartbeat,
+        ...(typeof d.version === 'string' && d.version.trim() ? { version: d.version.trim() } : {}),
       });
     } catch { /* malformed — skip */ }
   }
@@ -97,4 +101,30 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
 /** Find a specific online daemon by larkAppId. Returns null if offline / not found. */
 export function findOnlineDaemon(larkAppId: string, dataDir?: string): OnlineDaemonInfo | null {
   return listOnlineDaemons(dataDir).find(d => d.larkAppId === larkAppId) ?? null;
+}
+
+/**
+ * Compare the running CLI's version against the versions advertised by online
+ * daemons. Returns the first mismatching daemon version, or null when every
+ * daemon matches or no meaningful comparison is possible.
+ *
+ * - Daemons started by older builds don't publish a version field — skipped
+ *   (backward compat), never treated as a mismatch.
+ * - A source checkout reports '0.0.0' (the real version is injected only at
+ *   publish time). When the CLI itself runs from a checkout there is nothing
+ *   sensible to compare, so the check is skipped entirely rather than emitting
+ *   noise against daemons that may also be 0.0.0.
+ */
+export function detectDaemonVersionMismatch(
+  cliVersion: string,
+  daemons: OnlineDaemonInfo[],
+): string | null {
+  const cli = cliVersion.trim();
+  if (!cli || cli === '0.0.0') return null;
+  for (const d of daemons) {
+    const daemonVersion = (d.version ?? '').trim();
+    if (!daemonVersion) continue;
+    if (daemonVersion !== cli) return daemonVersion;
+  }
+  return null;
 }

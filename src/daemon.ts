@@ -301,6 +301,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
+import { botmuxVersion } from './utils/install-info.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
@@ -4044,6 +4045,10 @@ interface DaemonDescriptor {
    * never sees them; empty if the bot has no allowlist configured.
    */
   resolvedAllowedUsers: string[];
+  /** botmux version of this daemon process (from package.json). Absent for
+   * daemons started by older builds; lets `botmux status` detect a CLI↔daemon
+   * version mismatch after an npm upgrade. */
+  version?: string;
 }
 
 function writeDaemonDescriptor(d: DaemonDescriptor): void {
@@ -20645,6 +20650,16 @@ async function handleThreadReplyAdmitted(
               : {}),
           },
         );
+        // A user-triggered refork ends the post-restart recovery silence. This
+        // queued path returns without rememberLastCliInput (the ordinary place
+        // that clears suppressRecoveryCard), so without this line the flag
+        // survives forever: a later async worker death is muted by
+        // notifyStartupFailure and the user gets zero feedback, message after
+        // message. Clear ONLY the recovery flag — no rememberLastCliInput here
+        // (it must not run when the fork throws, see the main refork path).
+        // Timing mirrors the main path: after forkWorker returned, so a sync
+        // throw keeps the flag and falls through to the ingress notice.
+        ds.suppressRecoveryCard = undefined;
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         ds.initialStartPending = false;
@@ -20669,6 +20684,11 @@ async function handleThreadReplyAdmitted(
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           ...(retainedQueuedActivation.trustedCaller ? { trustedCaller: retainedQueuedActivation.trustedCaller } : {}),
         });
+        // Same recovery-silence contract as the queuedActivationPending branch
+        // above: fork accepted → user has intervened → clear
+        // suppressRecoveryCard (this path also skips rememberLastCliInput), so
+        // a later async worker failure still notifies instead of being muted.
+        ds.suppressRecoveryCard = undefined;
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         // Keep the staged tail for a later activation attempt, but release the
@@ -21895,6 +21915,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // email/on_ forms; emitting only ou_ avoids a startup race where the dashboard
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
+    version: botmuxVersion(),
   };
   // Expose the live descriptor module-level so the deferred allowedUsers resolve
   // retry can republish healed open_ids coherently (see republishResolvedAllowedUsers).

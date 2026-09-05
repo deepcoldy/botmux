@@ -440,4 +440,62 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(repliedText()).toContain(resendNotice());
     expect(repliedText()).not.toContain(admittedNotice());
   });
+
+  it('queued-activation-pending refork clears suppressRecoveryCard (user inbound ends restart silence)', async () => {
+    const anchor = 'om_thread_queued_pending';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    // Restart restore: recovery silence set, a queued activation still pending
+    // from before the daemon died.
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-pending-1';
+
+    await handleThreadReply(
+      makeEventData('om_msg_qp', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qp'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // This branch returns without rememberLastCliInput, so it must clear the
+    // recovery flag itself — otherwise every later async worker death stays
+    // muted and the session is permanently silent.
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('retained-queued-activation refork clears suppressRecoveryCard too', async () => {
+    const anchor = 'om_thread_queued_retained';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queued = true;
+    ds.session.queuedActivationInput = { content: 'retained opening task' };
+    ds.session.queuedActivationTurnId = 'turn-queued-retained-1';
+
+    await handleThreadReply(
+      makeEventData('om_msg_qr', '继续任务', anchor),
+      makeCtx(anchor, 'om_msg_qr'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker throws synchronously (clear happens only after acceptance)', async () => {
+    const anchor = 'om_thread_queued_throw';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    mocks.forkWorker.mockImplementationOnce(() => {
+      throw new Error('fork threw: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_qt', '继续', anchor), makeCtx(anchor, 'om_msg_qt')),
+    ).rejects.toThrow('fork threw: EAGAIN');
+
+    // Timing contract: the flag is cleared only AFTER forkWorker returns. A
+    // sync throw keeps the silence and routes to the ingress-notice catch.
+    expect(ds.suppressRecoveryCard).toBe(true);
+  });
 });

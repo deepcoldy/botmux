@@ -198,7 +198,7 @@ export async function restartBrowser(
     appPathFor?: (bundleId: string) => Promise<string>;
   } = {},
 ): Promise<RestartResult> {
-  const run = opts.run ?? (async (file, args) => pExecFile(file, args, { timeout: 15_000 }));
+  const run = opts.run ?? (async (file, args) => pExecFile(file, args, { timeout: 15_000, maxBuffer: 32 * 1024 * 1024 }));
   const sleep = opts.sleep ?? ((ms) => new Promise<void>(r => setTimeout(r, ms)));
   const now = opts.now ?? (() => Date.now());
   const quitTimeoutMs = opts.quitTimeoutMs ?? 12_000;

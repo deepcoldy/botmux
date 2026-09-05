@@ -190,7 +190,7 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
-import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot, botmuxVersion } from './utils/install-info.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -309,6 +309,7 @@ import {
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
 import {
+  detectDaemonVersionMismatch,
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
   resolveDaemonIpcPort,
@@ -3126,6 +3127,19 @@ async function cmdStatus(): Promise<void> {
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+  warnIfDaemonVersionMismatch();
+}
+
+/** CLI↔daemon 版本错配感知：npm 升级后 daemon 若仍跑旧代码，新功能会静默
+ * 失效。daemon 描述符的 version 字段由新版 daemon 发布；旧 daemon 无此字段
+ * （detectDaemonVersionMismatch 跳过），源码 checkout（0.0.0）也跳过。 */
+function warnIfDaemonVersionMismatch(): void {
+  const cliVersion = botmuxVersion();
+  const daemonVersion = detectDaemonVersionMismatch(cliVersion, listOnlineDaemons());
+  if (daemonVersion) {
+    console.log('');
+    console.log(`⚠️  版本不一致：daemon 运行 v${daemonVersion}，CLI 为 v${cliVersion}，新功能可能不生效，请执行 botmux restart`);
+  }
 }
 
 async function cmdUpgrade(): Promise<void> {

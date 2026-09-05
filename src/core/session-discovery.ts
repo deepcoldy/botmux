@@ -257,7 +257,11 @@ export function readCmdline(pid: number): string[] {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
     try {
-      const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+        // 与其它 ps 进程表扫描保持一致：显式 maxBuffer，防 ENOBUFS。
+        maxBuffer: 32 * 1024 * 1024,
+      });
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
@@ -428,6 +432,8 @@ export function readProcessStartTime(pid: number): number | undefined {
   try {
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+      // 与其它 ps 进程表扫描保持一致：显式 maxBuffer，防 ENOBUFS。
+      maxBuffer: 32 * 1024 * 1024,
     }).trim();
     if (out) {
       const ms = Date.parse(out);

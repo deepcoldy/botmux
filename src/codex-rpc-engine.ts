@@ -564,7 +564,7 @@ export class CodexRpcEngine {
     let argv = '';
     try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 32 * 1024 * 1024 }); }
       catch { return false; }
     }
     if (!/\bapp-server\b/.test(argv)) return false;
