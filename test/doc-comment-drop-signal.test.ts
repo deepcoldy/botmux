@@ -11,16 +11,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const mocks = vi.hoisted(() => ({
-  addCommentReaction: vi.fn(),
+  addCommentReactionChecked: vi.fn(),
   isBotAuthoredReply: vi.fn(() => false),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
   getBot: vi.fn(() => ({ botOpenId: 'ou_selfbot', config: {} })),
   debug: vi.fn(),
   info: vi.fn(),
+  rollback: vi.fn(),
 }));
 
 vi.mock('../src/im/lark/doc-comment.js', () => ({
-  addCommentReaction: mocks.addCommentReaction,
+  addCommentReactionChecked: mocks.addCommentReactionChecked,
+  addCommentReaction: vi.fn(),
   getDocComment: vi.fn(),
   isBotAuthoredReply: mocks.isBotAuthoredReply,
   hasBotSentinel: vi.fn(() => false),
@@ -50,24 +52,27 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     commentId: string,
     replyId: string | undefined,
     requesterOpenId: string | undefined,
-  ) => Promise<void>;
+    auditSummary: string,
+    rollbackAutoSub: () => void,
+  ) => Promise<string>;
 
   beforeEach(async () => {
-    mocks.addCommentReaction.mockReset().mockResolvedValue('reaction-1');
+    mocks.addCommentReactionChecked.mockReset().mockResolvedValue({ ok: true, reactionId: 'reaction-1' });
     mocks.isBotAuthoredReply.mockReset().mockReturnValue(false);
     mocks.getOwnerOpenId.mockReset().mockReturnValue(OWNER);
     mocks.getBot.mockReset().mockReturnValue({ botOpenId: 'ou_selfbot', config: {} });
     mocks.debug.mockReset();
     mocks.info.mockReset();
+    mocks.rollback.mockReset();
     ({ __testOnly_markCommentEventDropped: markCommentEventDropped } =
       await import('../src/im/lark/event-dispatcher.js'));
   });
 
   it('给触发回复打 ERROR reaction（用飞书文档里确实存在的 emoji_type）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
 
-    expect(mocks.addCommentReaction).toHaveBeenCalledTimes(1);
-    const [appId, file, commentId, replyId, emoji] = mocks.addCommentReaction.mock.calls[0];
+    expect(mocks.addCommentReactionChecked).toHaveBeenCalledTimes(1);
+    const [appId, file, commentId, replyId, emoji] = mocks.addCommentReactionChecked.mock.calls[0];
     expect(appId).toBe('app-test');
     expect(file).toEqual(FILE);
     expect(commentId).toBe(COMMENT_ID);
@@ -82,19 +87,19 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
    * 对比 Typing：成对、几秒后必被清掉，回退 user 只是短暂误导，故仍用 preferTenant。
    */
   it('必须 tenantOnly —— 绝不以授权用户身份留下永久标记', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
-    const opts = mocks.addCommentReaction.mock.calls[0][5];
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
+    const opts = mocks.addCommentReactionChecked.mock.calls[0][5];
     expect(opts).toMatchObject({ tenantOnly: true });
   });
 
   it('reply_id 缺失时不发请求（reaction 端点要求 comment_id + reply_id 齐全）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined, OWNER);
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, undefined, OWNER, 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
   it('打标记失败不外抛 —— 丢弃路径本身已经是失败路径，不能再被它拖垮', async () => {
-    mocks.addCommentReaction.mockRejectedValue(new Error('reaction endpoint down'));
-    await expect(markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER)).resolves.toBeUndefined();
+    mocks.addCommentReactionChecked.mockRejectedValue(new Error('reaction endpoint down'));
+    await expect(markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback)).resolves.toBe('reaction-failed');
     expect(mocks.debug).toHaveBeenCalled();
   });
 
@@ -104,27 +109,27 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
    * 读不到正文、构造不出门要发的通知，所以取保守侧：只有 owner 本人触发才打。
    */
   it('非 owner 触发不打标记（不能绕过审计硬门做外部写入）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else');
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
   it('owner 未配置时不打标记（无从判定越权，保守拒绝）', async () => {
     mocks.getOwnerOpenId.mockReturnValue(undefined);
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
   it('operator 缺失时不打标记（判不出是谁触发的）', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, undefined);
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, undefined, 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
   /**
    * 自触发：正常那道 self-filter 在下面，前两个丢弃点跑在它之前，必须自己挡一次。
    */
   it('触发者是 bot 自己（应用身份）不打标记 —— 否则给自己打 ❌', async () => {
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_selfbot');
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_selfbot', 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
   });
 
   /**
@@ -133,8 +138,47 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
    */
   it('bot 以 user 身份发的回复（作者=owner）也不打标记 —— 审计门挡不住这种自标', async () => {
     mocks.isBotAuthoredReply.mockReturnValue(true);
-    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER);
-    expect(mocks.addCommentReaction).not.toHaveBeenCalled();
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 审计拒绝时必须回滚本次 auto-sub —— 否则陌生人一次触发就留下一条 owner
+   * 完全不知情的订阅记录，且没有任何人会清掉它。
+   */
+  it('审计拒绝时回滚 auto-sub，不留下 owner 不知情的订阅', async () => {
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_stranger', 'summary', mocks.rollback);
+    expect(outcome).toBe('audit-rejected');
+    expect(mocks.rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it('自触发拦截在审计门之前 —— 不为 bot 自己的事件打扰 owner，也不回滚', async () => {
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_selfbot', 'summary', mocks.rollback);
+    expect(outcome).toBe('self-triggered');
+    expect(mocks.rollback).not.toHaveBeenCalled();
+  });
+
+  /**
+   * outcome 必须反映**服务端真实结果**。飞书 update_reaction 的响应体是空对象、
+   * 不承诺 reaction_id，所以不能用 `reactionId ? 成功 : 失败` —— 那会把 code=0
+   * 但没带 id 的成功记成失败，排障的人反而被误导。只信 ok。
+   */
+  it('code=0 但响应不带 reaction_id 时仍算 marked（官方 schema 不承诺 id）', async () => {
+    mocks.addCommentReactionChecked.mockResolvedValue({ ok: true });
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
+    expect(outcome).toBe('marked');
+  });
+
+  it('ok=false 时如实记成 reaction-failed，不谎报 marked', async () => {
+    mocks.addCommentReactionChecked.mockResolvedValue({ ok: false });
+    const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, 'summary', mocks.rollback);
+    expect(outcome).toBe('reaction-failed');
+  });
+
+  it('审计通过时把调用方给的摘要透传给审计门（失败路径也必须有摘要，不能跳过审计）', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, OWNER, '评论正文读取失败', mocks.rollback);
+    // owner 本人触发无需通知，但摘要参数必须存在于签名里、由调用方传真实说明。
+    expect(mocks.addCommentReactionChecked).toHaveBeenCalledTimes(1);
   });
 });
 

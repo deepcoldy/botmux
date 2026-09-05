@@ -35,7 +35,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
 }));
 
-import { addCommentReaction } from '../src/im/lark/doc-comment.js';
+import { addCommentReaction, addCommentReactionChecked } from '../src/im/lark/doc-comment.js';
 
 const FILE = { fileToken: 'DocToken1234567890123456', fileType: 'docx' };
 const COMMENT_ID = '7681622822925421500';
@@ -133,5 +133,43 @@ describe('driveApiCall: userOnly 与 tenantOnly 互斥', () => {
     // 关键：一次 provider 请求都不能发出去。
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(mocks.tenantRequest).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `addCommentReactionChecked` 的 `ok` 必须反映**服务端真实结果**，不能用
+ * `reactionId` 是否存在来推断 —— 飞书官方 `update_reaction` 的响应体是空对象、
+ * **不承诺**带 `reaction_id`。用 id 判成败会把 code=0 的成功记成失败，让排障的人
+ * 以为「飞书拒绝了」，正好和引入 outcome 字段的目的相反。
+ */
+describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset();
+    mocks.resolveUserToken.mockReset().mockResolvedValue(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('code=0 但响应体不带 reaction_id ⇒ ok=true（官方 schema 就是空对象）', async () => {
+    mocks.tenantRequest.mockResolvedValue({ code: 0, data: {} });
+    const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
+    expect(res.ok).toBe(true);
+    expect(res.reactionId).toBeUndefined();
+  });
+
+  it('code=0 且带 reaction_id ⇒ ok=true 并透出 id', async () => {
+    mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-9' } });
+    const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
+    expect(res).toEqual({ ok: true, reactionId: 'r-9' });
+  });
+
+  it('请求抛错 ⇒ ok=false（tenantOnly 下 code!=0 也会抛）', async () => {
+    mocks.tenantRequest.mockRejectedValue(new Error('boom'));
+    const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
+    expect(res.ok).toBe(false);
+  });
+
+  it('旧签名 addCommentReaction 行为不变（仍返回 reactionId | undefined）', async () => {
+    mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-legacy' } });
+    await expect(addCommentReaction('app-test', FILE, COMMENT_ID, REPLY_ID, 'Typing')).resolves.toBe('r-legacy');
   });
 });

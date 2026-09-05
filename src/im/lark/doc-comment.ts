@@ -885,6 +885,28 @@ export async function addCommentReaction(
   reactionType: string,
   options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
 ): Promise<string | undefined> {
+  return (await addCommentReactionChecked(larkAppId, file, commentId, replyId, reactionType, options)).reactionId;
+}
+
+/**
+ * 同 {@link addCommentReaction}，但**如实回报服务端结果**。
+ *
+ * 为什么需要：上面那个签名把失败投影成 `undefined`，而飞书官方
+ * `update_reaction` 的响应体是**空对象、不承诺 `reaction_id`** —— 所以
+ * `reactionId ? 成功 : 失败` 会把「code=0 但没带 id」误记成失败。要在日志里
+ * 写真实 outcome，必须在投影掉之前把 `res.code === 0` 留住。
+ *
+ * `ok` 只表示**这次请求本身**成功（HTTP 通了且 code=0），不代表 reaction 一定
+ * 在 UI 上可见（重复 add 的服务端语义未实测）。
+ */
+export async function addCommentReactionChecked(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionType: string,
+  options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
+): Promise<{ ok: boolean; reactionId?: string }> {
   try {
     const res = await driveApiCall(larkAppId, {
       method: 'POST',
@@ -899,10 +921,12 @@ export async function addCommentReaction(
     if (reactionId) {
       logger.info(`[doc-comment] added reaction=${reactionId} type=${reactionType} on reply=${replyId.slice(0, 12)}`);
     }
-    return reactionId;
+    // 走到这里说明 driveApiCall 没抛（tenantOnly 路径 code!=0 会抛；其余路径
+    // 返回体自带 code）。id 可能为空 —— 官方 schema 不承诺，不能据此判失败。
+    return { ok: res?.code === undefined || res.code === 0, reactionId };
   } catch (err) {
     logger.warn(`[doc-comment] addCommentReaction failed for reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
-    return undefined;
+    return { ok: false };
   }
 }
 
