@@ -105,3 +105,33 @@ describe('addCommentReaction 的身份选择', () => {
     expect(id).toBe('r-user');
   });
 });
+
+/**
+ * userOnly + tenantOnly 同时传是调用方的逻辑错误。必须炸，不能静默走 userOnly ——
+ * tenantOnly 的全部意义就是禁止 user 身份写入，静默降级成 user-only 恰好是它要防
+ * 的那件事。当前没有调用方这么传，这是给未来的护栏。
+ */
+describe('driveApiCall: userOnly 与 tenantOnly 互斥', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset();
+    mocks.resolveUserToken.mockReset().mockResolvedValue('u-token-live');
+    vi.unstubAllGlobals();
+  });
+
+  it('同时指定时抛错，绝不静默降级成 user-only', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/whatever',
+      userOnly: true,
+      tenantOnly: true,
+    })).rejects.toThrow(/互斥/);
+
+    // 关键：一次 provider 请求都不能发出去。
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(mocks.tenantRequest).not.toHaveBeenCalled();
+  });
+});

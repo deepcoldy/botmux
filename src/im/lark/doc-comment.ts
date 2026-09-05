@@ -340,6 +340,13 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     return fetchWithUserToken(brand, userToken, opts);
   };
 
+  // ⚠️ userOnly 与 tenantOnly 是互斥的硬约束，同时传是调用方的逻辑错误。
+  // 不能让它静默走 userOnly —— tenantOnly 的**全部意义**就是禁止 user 身份写入，
+  // 静默降级成 user-only 恰好是它要防的那件事（错误主体的持久写入）。宁可炸。
+  if (opts.userOnly && opts.tenantOnly) {
+    throw new Error(`driveApiCall: userOnly 与 tenantOnly 互斥，不能同时指定 (${opts.path})`);
+  }
+
   if (opts.userOnly) return callUser();
 
   // 只用应用身份写，绝不回退 user —— 见 tenantOnly 的注释：这类写入是持久且带
@@ -433,6 +440,9 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   }
   return tenantResult;
 }
+
+/** 仅供测试：直接驱动身份选择逻辑，验证互斥约束等不经由具体端点的行为。 */
+export const __testOnly_driveApiCall = driveApiCall;
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
   const url = `${larkHosts(brand).openApi}${opts.path}${buildQuery(opts.params)}`;
