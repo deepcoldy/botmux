@@ -227,7 +227,9 @@ describe('手机 Web 终端输入栏', () => {
     const connected = bootMobileInput({ wsHasWrite: true });
     connected.textarea.value = 'ship it';
     connected.bar.dispatch('submit');
-    expect(connected.sentInputs()).toEqual(['ship it\n']);
+    // 上屏 types the text into the CLI's input box and stops — no trailing
+    // newline, which would land there as a literal blank line.
+    expect(connected.sentInputs()).toEqual(['ship it']);
     expect(connected.textarea.value).toBe('');
   });
 
@@ -357,6 +359,47 @@ describe('手机 Web 终端输入栏', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('「上屏」只把正文送上终端，不追加换行——追加的换行会在 CLI 输入框里留下一个空行', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = '继续';
+    page.bar.dispatch('submit');
+
+    const sent = page.sentInputs();
+    expect(sent).toEqual(['继续']);
+    // The regression this pins: a trailing \n is NOT a submit in a TUI, it is an
+    // inserted line break, so the text showed up with a stray empty line after it.
+    expect(sent.some(sequence => sequence.endsWith('\n'))).toBe(false);
+    // …and it must not silently become a real submit either — that would throw
+    // away the deliberate two-step 上屏 → 检查 → Enter semantics.
+    expect(sent.some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // The Enter key is what actually runs it, and it still does.
+    page.shortcut('enter')?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['继续', '\r']);
+  });
+
+  it('实时模式的「发送」仍然真提交，两步语义只属于缓冲模式', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    page.textarea.value = 'ls';
+    page.bar.dispatch('submit');
+    // live mode diffs the mirror and appends a carriage return: a real submit.
+    expect(page.sentInputs().join('').endsWith('\r')).toBe(true);
+  });
+
+  it('输入框字号不低于 16px，否则 iOS 聚焦时会自动放大页面且不再缩回', () => {
+    const source = workerSource();
+    const start = source.indexOf('#mobile-input{');
+    expect(start, '#mobile-input 规则缺失').toBeGreaterThan(-1);
+    const rule = source.slice(start, source.indexOf('}', start));
+    const fontSize = rule.match(/font:\s*(\d+(?:\.\d+)?)px/);
+    expect(fontSize, '#mobile-input 未声明 px 字号').not.toBeNull();
+    // Hard floor, not a taste call: below 16px, iOS Safari / WKWebView zooms the
+    // page on focus and never zooms back, pushing the terminal's right-hand
+    // columns off screen. -webkit-text-size-adjust does not prevent this.
+    expect(Number.parseFloat(fontSize![1])).toBeGreaterThanOrEqual(16);
   });
 
   it('底栏按钮抑制 iOS 长按选中与 callout，避免长按删除时弹出选择气泡', () => {

@@ -17317,10 +17317,15 @@ body.touch.has-token #terminal .xterm{
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+/* 16px is a hard floor, not a taste call: iOS Safari / WKWebView auto-zooms the
+   page whenever a focused form control renders below 16px, and it never zooms
+   back out — the terminal is left scaled up with its right-hand columns off
+   screen. -webkit-text-size-adjust does NOT prevent that (it only stops the
+   text-inflation algorithm), so the size itself has to be 16px. */
 #mobile-input{
   flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
   padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
-  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
@@ -18416,17 +18421,21 @@ if(isTouch&&hasToken){(function(){
     measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
-  function sendBuffered(appendEnter){
+  // 上屏 puts the text into the CLI's own input box and stops there — the user
+  // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
+  // lands inside that box as a literal line break (a TUI reads it as "insert"),
+  // so the text showed up with a stray empty line after it. Only the Enter key
+  // (or live mode's own commit) sends the \\r that actually runs the command.
+  function sendBuffered(){
     var text=ta.value;
-    var payload=appendEnter?text+'\\n':text;
-    if(!payload)return;
-    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
+    if(!text)return;
+    if(!sendInput(text.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
     if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
-  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered();}
 
   // shortcut keys row
   var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
