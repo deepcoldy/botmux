@@ -404,9 +404,22 @@ export const messages: Record<string, string> = {
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
   // Printed on stderr to whoever's command did not run: name whose
   // authorization is missing and how to supply it, or they just retry.
+  // bytedcli uses ByteCloud SSO, a different identity provider from Feishu, so
+  // both need authorizing separately.
+  'cmd.login.bytedcli_title': '🔐 ByteCloud (bytedcli) authorization',
+  'cmd.login.bytedcli_step1': '1. Open this link to authorize:',
+  'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
+  'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
+  'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli and git actions you trigger here now run as you.',
+  'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
+  'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
+  'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
+  'cmd.login.bytedcli_status_yes': 'ByteCloud (bytedcli): authorized',
+  'cmd.login.bytedcli_status_no': 'ByteCloud (bytedcli): not authorized — send /login bytedcli',
   'trigger_user_auth.denied_known_user': 'botmux: this step needs {name}\'s own Feishu authorization, but they have not authorized {tool}. Command not run.',
   'trigger_user_auth.denied_anonymous': 'botmux: this step needs the sender\'s own Feishu authorization, but this turn has no identifiable sender. {tool} command not run.',
-  'trigger_user_auth.denied_howto': 'botmux: to authorize — send /login in this chat, open the link it returns, then retry.',
+  'trigger_user_auth.denied_howto': 'botmux: to authorize — send {command} in this chat, open the link it returns, then retry.',
   'trigger_user_auth.denied_howto_status': 'botmux: to check whether you are already authorized, send /login status.',
   'trigger_user_auth.needs_login': '🔐 This step runs as you, but you have not authorized {tools} yet. Send /login to authorize, then retry. This notice appears once per session.',
   'cmd.login.title': '🔐 Lark User OAuth',
@@ -784,9 +797,9 @@ export const messages: Record<string, string> = {
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
   'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
-  'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/ belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
+  'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
-  'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to run /login. Do not go looking for, assemble, or reuse other credentials to work around it.',
+  'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',

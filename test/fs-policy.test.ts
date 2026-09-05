@@ -1685,6 +1685,11 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
       .not.toBe('readOnly');
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.turn`).access)
       .not.toBe('readOnly');
+    // Same for bytedcli: each person's login state lives in a private HOME, and
+    // the daemon (not the sandboxed CLI) mints their JWTs, so the agent has no
+    // business reading these — its own included.
+    expect(accessForPath(p.rules, `${dataDir}/bytedcli-home/ou_alice/.local/share/bytedcli/data/bytecloud_session.json`).access)
+      .not.toBe('readOnly');
     // And the shared parent is never granted, so a future session's file cannot
     // be reached either (the allow-list must not fail open for files created
     // after spawn).

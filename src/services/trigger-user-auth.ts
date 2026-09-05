@@ -20,11 +20,16 @@
  *
  * ## Why the two tools cannot share one rule
  *
- * `lark-cli` has a real non-human identity (`--as bot`, usable with zero
- * login), so most calls can degrade safely. `bytedcli` has only SSO personal
- * login — no service account, no AK/SK — so for it "unauthorized" genuinely
- * means "this command cannot run". `supportsBotIdentity` records that
+ * `lark-cli` has a real non-human identity (app id + secret resolve
+ * `identity: bot`), so most calls can degrade safely. `bytedcli` has only SSO
+ * personal login — no service account, no AK/SK — so for it "unauthorized"
+ * genuinely means "this command cannot run". `supportsBotIdentity` records that
  * asymmetry rather than pretending both tools behave alike.
+ *
+ * Both tools DO support per-person credentials, by different mechanisms: Lark
+ * through an OAuth user token injected as env, ByteCloud through that person's
+ * own `bytedcli` login kept in a private HOME (see services/bytedcli-auth.ts).
+ * What differs is only the fallback when someone has not authorized.
  *
  * Whether a *particular* lark-cli command accepts `--as bot` is not decided
  * here: the CLI itself declares it (an unsupported one answers `--as bot is
@@ -77,7 +82,9 @@ export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
 > = {
   // `lark-cli --as bot` works with app credentials alone.
   'lark-cli': { supportsBotIdentity: true },
-  // `bytedcli auth` offers only SSO personal login.
+  // `bytedcli auth` offers only SSO personal login — no bot/tenant identity to
+  // degrade to. (Per-person authorization itself IS supported; see
+  // services/bytedcli-auth.ts.)
   bytedcli: { supportsBotIdentity: false },
 };
 

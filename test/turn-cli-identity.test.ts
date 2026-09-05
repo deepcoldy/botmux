@@ -26,6 +26,12 @@ vi.mock('../src/utils/user-token.js', () => ({
   lookupAuthorizedUserName: vi.fn(() => undefined),
 }));
 
+// bytedcli shells out to the real CLI; here we control who is authorized.
+const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
+vi.mock('../src/services/bytedcli-auth.js', () => ({
+  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+}));
+
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
@@ -39,6 +45,7 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
   tokens.clear();
+  bytedcliJwts.clear();
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -132,6 +139,8 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   // OAuth — a Lark token cannot become a ByteCloud JWT. It must report "not
   // authorized" rather than quietly using the machine's own SSO session.
   it('never fabricates a bytedcli identity from a Lark token', async () => {
+    // Authorized for Feishu, NOT for ByteCloud — a real and common state, since
+    // they are different identity providers with no conversion between them.
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     const config = botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
     const outcomes = await publish(config, ALICE);
@@ -142,6 +151,33 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
     expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
+    // And it names the ByteCloud command — plain `/login` would send them to
+    // authorize Feishu again and hit the same refusal.
+    expect(body).toContain('/login bytedcli');
+  });
+
+  it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice', codeJwt: 'code-alice' });
+    const config = botConfig({ enabled: true, tools: ['bytedcli'] });
+    const outcomes = await publish(config, ALICE);
+
+    expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('user');
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-alice'");
+    // git attribution rides this one.
+    expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-alice'");
+  });
+
+  // Alice authorized, Bob did not. Bob's turn must not inherit her JWT.
+  it('never hands one person\'s ByteCloud JWT to another', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });
+    const config = botConfig({ enabled: true, tools: ['bytedcli'] });
+    await publish(config, ALICE);
+    const outcomes = await publish(config, BOB);
+
+    expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8'))
+      .not.toContain('cloud-alice');
   });
 });
 

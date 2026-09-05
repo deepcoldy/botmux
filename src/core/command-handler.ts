@@ -7,7 +7,8 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
-import { unauthorizedOutcomeFor } from '../services/trigger-user-auth.js';
+import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -1148,10 +1149,13 @@ function triggerUserAuthStatusLines(
           : botFallback
             ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
             : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
-        // Not a per-person state: no botmux path can mint a ByteCloud JWT yet,
-        // so saying "you are not authorized" would suggest a /login that does
-        // not exist. Say what is actually true.
-        : '本期尚不支持按人鉴权，命令会被拒绝'
+        // ByteCloud is a separate identity provider, so this is a genuinely
+        // different verdict from the Lark line above — the same person can be
+        // authorized for one and not the other. There is no bot identity to
+        // degrade to here, so unauthorized always means the command is refused.
+        : hasBytedcliHome(senderOpenId ?? '')
+          ? '以你自己的身份调用'
+          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
     }`);
   }
   return lines;
@@ -2879,7 +2883,59 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
           // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
-          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
+          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
+          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+            lines.push(t(
+              hasBytedcliHome(loginOpenId)
+                ? 'cmd.login.bytedcli_status_yes'
+                : 'cmd.login.bytedcli_status_no',
+              undefined,
+              loc,
+            ));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login bytedcli` —— ByteCloud SSO 授权。跟飞书 OAuth 是两个身份提供方，
+        // 换不过来，所以必须各授权一次；这条命令只管 ByteCloud 那一半。
+        //
+        // 分两步而不是一步等：设备码流程要人去点链接，阻塞等待会把会话卡住，所以
+        // `--begin` 拿链接先回，人点完再发 `done` 收尾。
+        if (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ')) {
+          if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
+          const done = subCmd.slice('bytedcli'.length).trim();
+          if (done === 'done' || done === '完成') {
+            const challenge = pendingBytedcliChallenge(loginOpenId);
+            if (!challenge) {
+              await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
+              break;
+            }
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
+            await sessionReply(rootId, state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          const started = await beginBytedcliLogin(loginOpenId);
+          if (!started) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+            break;
+          }
+          await sessionReply(rootId, [
+            t('cmd.login.bytedcli_title', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_step1', undefined, loc),
+            started.authUrl,
+            '',
+            t('cmd.login.bytedcli_step2', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_note', undefined, loc),
+          ].join('\n'));
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
