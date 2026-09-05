@@ -15,7 +15,7 @@
  * step always works against the latest on-disk snapshot.
  */
 import { readFileSync, statSync } from 'node:fs';
-import { getBot, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
+import { findOncallChat, getBot, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { logger } from '../utils/logger.js';
 import { expandHomePath } from '../utils/working-dir.js';
@@ -117,9 +117,8 @@ export function getOncallStatus(larkAppId: string, chatId: string): OncallChat |
   // registered yet (boot races, or tests exercising the IPC layer without
   // a full registry). Treat "no such bot" as "no oncall binding" — this
   // is best-effort enrichment, not a critical path.
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return undefined; }
-  return bot.config.oncallChats?.find(c => c.chatId === chatId);
+  try { getBot(larkAppId); } catch { return undefined; }
+  return findOncallChat(larkAppId, chatId);
 }
 
 // ─── Per-bot defaultOncall ───────────────────────────────────────────────

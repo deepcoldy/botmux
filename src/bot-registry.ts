@@ -2142,6 +2142,7 @@ export function __testOnly_resetBotRegistry(): void {
   parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
   loadedConfigProvenance = undefined;
+  registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
@@ -2499,8 +2500,57 @@ export function effectiveBotDisplayName(state: BotState): string {
   return state.config.displayName || state.botName || state.config.larkAppId;
 }
 
+// Exact-bot oncall bindings can be written by another process. The main case is
+// `botmux create-group --working-dir`: the one-shot creator process persists a
+// binding for every invited bot, then immediately sends the kickoff message.
+// Each target bot daemon must observe that write before it resolves the new
+// session's working directory. Keep the registered configs fresh with one
+// stat() per lookup and only re-read bots.json when its mtime changes.
+let registeredOncallConfigMtimeMs: number | null = null;
+let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
+
+function refreshRegisteredOncallChatsFromDisk(): void {
+  if (underReadIsolation()) return;
+  const path = loadedConfigProvenance === 'loaded' ? loadedConfigPath : undefined;
+  if (!path) return;
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (registeredOncallConfigMtimeMs === mtimeMs) return;
+
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!Array.isArray(raw)) return;
+
+    const byAppId = new Map<string, OncallChat[]>();
+    const chats = new Map<string, OncallChat>();
+    for (const entry of raw) {
+      if (!entry || typeof entry.larkAppId !== 'string') continue;
+      const botChats: OncallChat[] = [];
+      if (Array.isArray(entry.oncallChats)) {
+        for (const chat of entry.oncallChats) {
+          if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
+            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            botChats.push(normalized);
+            chats.set(normalized.chatId, normalized);
+          }
+        }
+      }
+      byAppId.set(entry.larkAppId, botChats);
+    }
+
+    for (const [larkAppId, bot] of bots) {
+      const chats = byAppId.get(larkAppId);
+      if (chats) bot.config.oncallChats = chats;
+    }
+    oncallChatCache = { mtimeMs, chats };
+    registeredOncallConfigMtimeMs = mtimeMs;
+  } catch {
+    // Keep the last known-good in-memory snapshot during transient read errors.
+  }
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
@@ -2541,39 +2591,15 @@ export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
 // map only sees this daemon's own bot — sibling bots' bindings live only on
 // disk in the shared bots.json. Re-read that file lazily, keyed by mtime,
 // so the hot path is a single stat() once the cache is warm.
-let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
-
 export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   // Fast path: this daemon's own bot(s). Covers single-daemon setups and any
   // case where the receiving bot itself is bound.
   for (const bot of bots.values()) {
     const entry = bot.config.oncallChats?.find(c => c.chatId === chatId);
     if (entry) return entry;
   }
-  // Slow path: scan the shared bots.json for sibling bots' bindings.
-  const path = loadedConfigPath;
-  if (!path) return undefined;
-  try {
-    const stat = statSync(path);
-    if (!oncallChatCache || oncallChatCache.mtimeMs !== stat.mtimeMs) {
-      const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      const chats = new Map<string, OncallChat>();
-      if (Array.isArray(raw)) {
-        for (const entry of raw) {
-          if (!Array.isArray(entry?.oncallChats)) continue;
-          for (const c of entry.oncallChats) {
-            if (c && typeof c.chatId === 'string' && typeof c.workingDir === 'string') {
-              chats.set(c.chatId, { chatId: c.chatId, workingDir: c.workingDir });
-            }
-          }
-        }
-      }
-      oncallChatCache = { mtimeMs: stat.mtimeMs, chats };
-    }
-    return oncallChatCache.chats.get(chatId);
-  } catch {
-    return undefined;
-  }
+  return oncallChatCache?.chats.get(chatId);
 }
 
 export function isChatOncallBoundForAnyBot(chatId: string): boolean {

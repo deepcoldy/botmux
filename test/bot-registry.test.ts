@@ -1844,6 +1844,85 @@ describe('isChatOncallBoundForAnyBot', () => {
   });
 });
 
+// ─── findOncallChat cross-process refresh ─────────────────────────────────
+
+describe('findOncallChat cross-process refresh', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    mod = await freshImport();
+    const fs = await import('node:fs');
+    fsMock = {
+      existsSync: fs.existsSync as unknown as ReturnType<typeof vi.fn>,
+      readFileSync: fs.readFileSync as unknown as ReturnType<typeof vi.fn>,
+      statSync: fs.statSync as unknown as ReturnType<typeof vi.fn>,
+    };
+    fsMock.existsSync.mockReset();
+    fsMock.readFileSync.mockReset();
+    fsMock.statSync.mockReset();
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    delete process.env.BOTS_CONFIG;
+  });
+
+  it('observes externally added, updated, and removed bindings for the registered bot', () => {
+    const initial = JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa' },
+    ]);
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    const configs = mod.loadBotConfigs();
+    mod.registerBot(configs[0]);
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 1 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_new')).toBeUndefined();
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo/a' }] },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_new')).toEqual({ chatId: 'oc_new', workingDir: '/repo/a' });
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 3 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo/b' }] },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_new')).toEqual({ chatId: 'oc_new', workingDir: '/repo/b' });
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 4 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_new')).toBeUndefined();
+  });
+
+  it('keeps the last known-good binding when an external rewrite is temporarily unreadable', () => {
+    const initial = JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa', oncallChats: [{ chatId: 'oc_live', workingDir: '/repo' }] },
+    ]);
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    const configs = mod.loadBotConfigs();
+    mod.registerBot(configs[0]);
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 1 });
+    fsMock.readFileSync.mockReturnValueOnce(initial);
+    expect(mod.findOncallChat('app_a', 'oc_live')?.workingDir).toBe('/repo');
+
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockImplementationOnce(() => { throw new Error('transient read failure'); });
+    expect(mod.findOncallChat('app_a', 'oc_live')?.workingDir).toBe('/repo');
+
+    // The failed mtime was not cached, so the next lookup retries the read.
+    fsMock.statSync.mockReturnValueOnce({ mtimeMs: 2 });
+    fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
+      { larkAppId: 'app_a', larkAppSecret: 'sa' },
+    ]));
+    expect(mod.findOncallChat('app_a', 'oc_live')).toBeUndefined();
+  });
+});
+
 // ─── loadBotConfigs ───────────────────────────────────────────────────────
 
 describe('loadBotConfigs', () => {
