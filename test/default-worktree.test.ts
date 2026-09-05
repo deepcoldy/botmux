@@ -134,6 +134,27 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices).toHaveLength(1);    // ONLY the fallback — no misleading "creating…" first
   });
 
+  it('an explicit force request creates and then reuses the deterministic topic worktree when the toggle is off', async () => {
+    const repo = makeRepo('forced-topic');
+    const { mod } = await loadWithBot(repo, false);
+    const target = join(tempRoot, 'forced-topic-shared');
+    const ctx = {
+      isBotDefaultDir: true,
+      locale: 'zh' as const,
+      force: true,
+      worktreePath: target,
+      branch: 'wt/botmux-topic',
+      reuseExisting: true,
+    };
+
+    const first = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+    const second = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+
+    expect(first.dir).toBe(target);
+    expect(second.dir).toBe(target);
+    expect(git(target, 'branch', '--show-current')).toBe('wt/botmux-topic');
+  });
+
   it('no-ops (no notice, dir unchanged) when the dir did not come from the bot default', async () => {
     const repo = makeRepo('proj');
     const { mod } = await loadWithBot(repo, true);

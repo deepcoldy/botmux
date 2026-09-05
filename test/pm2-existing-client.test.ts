@@ -51,6 +51,43 @@ describe.runIf(process.platform === 'linux')('existing PM2 RPC mutation boundary
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
+  it('flushes a large read-only jlist projection before exiting', () => {
+    const largeAppName = 'botmux-readonly-large-fixture';
+    const largeConfig = join(root, 'ecosystem-large.config.cjs');
+    const largeEnv = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [
+      `BOTMUX_PM2_READONLY_LARGE_${index}`,
+      'x'.repeat(32 * 1024),
+    ]));
+    writeFileSync(largeConfig, `module.exports = ${JSON.stringify({
+      apps: [{ name: largeAppName, script: join(root, 'fixture.cjs'), env: largeEnv }],
+    })};\n`);
+    const ownership = inspectLinuxPm2GodOwnership(pm2Home);
+    expect(ownership.kind).not.toBe('absent');
+    const god = ownership.kind === 'absent' ? undefined : ownership.processes[0];
+
+    runExistingPm2Command({
+      pkgRoot: PKG_ROOT,
+      home: pm2Home,
+      args: ['start', largeConfig],
+      inherit: false,
+      expectedGod: god!,
+    });
+    try {
+      const output = captureReadonlyPm2Jlist({ pkgRoot: PKG_ROOT, home: pm2Home });
+      expect(output.at(-1)).toBe(']');
+      const apps = JSON.parse(output) as Array<{ name?: string }>;
+      expect(apps.some(app => app.name === largeAppName)).toBe(true);
+    } finally {
+      runExistingPm2Command({
+        pkgRoot: PKG_ROOT,
+        home: pm2Home,
+        args: ['delete', largeAppName],
+        inherit: false,
+        expectedGod: god!,
+      });
+    }
+  });
+
   it('mutates an existing God without rotation, then fails absent without replacement', () => {
     const pidFile = join(pm2Home, 'pm2.pid');
     const originalPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);

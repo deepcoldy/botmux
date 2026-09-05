@@ -81,8 +81,9 @@ pm2.Client.pingDaemon((alive: boolean) => {
     if (mode === 'jlist') {
       pm2.list((error: Error | null | undefined, list: unknown[]) => {
         if (error) fail(`PM2 read-only jlist failed: ${error.message}`);
-        process.stdout.write(JSON.stringify(Array.isArray(list) ? list : []));
-        pm2.disconnect(() => process.exit(0));
+        process.stdout.write(JSON.stringify(Array.isArray(list) ? list : []), () => {
+          pm2.disconnect(() => process.exit(0));
+        });
       });
       return;
     }

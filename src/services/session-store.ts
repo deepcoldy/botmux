@@ -2329,6 +2329,10 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
   );
 }
 
+export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
+  return findActiveSessionsMatching(s => s.workingDir === workingDir);
+}
+
 /**
  * Cross-store lookup: every active thread-scope session in `chatId`, across
  * all bots. Backs `schedule add --follow-active`: at fire time the scheduler

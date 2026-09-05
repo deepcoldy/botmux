@@ -44,6 +44,15 @@ export interface MaybeCreateWorktreeCtx {
   locale: Locale;
   /** Best-effort chat notice sink. Omit for silent (e.g. HTTP-virtual sessions). */
   notify?: (message: string) => Promise<unknown> | void;
+  /** Explicit user command (for example `/tw`) requested a worktree even when
+   *  the bot's default auto-worktree toggle is off. */
+  force?: boolean;
+  /** Deterministic worktree target for sharing one /tw topic across multiple bots. */
+  worktreePath?: string;
+  /** Deterministic branch for `worktreePath`. */
+  branch?: string;
+  /** Reuse an existing linked worktree at `worktreePath`. */
+  reuseExisting?: boolean;
 }
 
 /**
@@ -71,7 +80,7 @@ export async function maybeCreateDefaultWorktree(
   baseDir: string,
   ctx: MaybeCreateWorktreeCtx,
 ): Promise<AutoWorktreeResult> {
-  if (!ctx.isBotDefaultDir || !botAutoWorktreeEnabled(larkAppId)) {
+  if (!ctx.force && (!ctx.isBotDefaultDir || !botAutoWorktreeEnabled(larkAppId))) {
     return { dir: baseDir };
   }
   const notify = async (msg: string) => {
@@ -90,8 +99,13 @@ export async function maybeCreateDefaultWorktree(
 
   await notify(t('worktree.auto_creating', undefined, ctx.locale));
   try {
-    const slug = await worktreeSlugFromContextAI(ctx.title, ctx.prompt);
-    const creation = await createRepoWorktree(baseDir, { slug });
+    const slug = ctx.branch ? undefined : await worktreeSlugFromContextAI(ctx.title, ctx.prompt);
+    const creation = await createRepoWorktree(baseDir, {
+      slug,
+      branch: ctx.branch,
+      worktreePath: ctx.worktreePath,
+      reuseExisting: ctx.reuseExisting,
+    });
     logger.info(`[auto-worktree:${larkAppId}] ${baseDir} → ${creation.path} (branch ${creation.branch} from ${creation.baseRef})`);
     // riff：远程沙箱从 origin 克隆，本地新分支必须先推送才能被任务钉住。
     // 推送失败不阻塞（会话仍可用，riff 侧回退默认分支并在卡片注入告警）。

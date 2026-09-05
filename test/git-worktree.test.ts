@@ -154,6 +154,36 @@ describe('createRepoWorktree', () => {
     expect(git(target, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/group');
   });
 
+  it('reuses an existing explicit worktree only when its repo and branch match', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'shared-topic', 'proj');
+    const first = await createRepoWorktree(repo, { branch: 'feat/shared', worktreePath: target });
+
+    const reused = await createRepoWorktree(repo, {
+      branch: 'feat/shared',
+      worktreePath: target,
+      reuseExisting: true,
+    });
+
+    expect(reused).toEqual({ path: target, branch: 'feat/shared', baseRef: 'feat/shared' });
+    expect(git(repo, 'worktree', 'list').split('\n').filter(line => line.includes(target))).toHaveLength(1);
+    expect(first.path).toBe(reused.path);
+  });
+
+  it('refuses to reuse an explicit path checked out on a different branch', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'shared-topic', 'proj');
+    await createRepoWorktree(repo, { branch: 'feat/other', worktreePath: target });
+
+    await expect(createRepoWorktree(repo, {
+      branch: 'feat/shared',
+      worktreePath: target,
+      reuseExisting: true,
+    })).rejects.toThrow('not feat/shared in the expected repository');
+  });
+
   it('removeRepoWorktree detaches the worktree dir so the slot is reusable (rollback)', async () => {
     const upstream = makeUpstream('upstream');
     const repo = makeClone(upstream, 'proj');
