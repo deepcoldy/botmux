@@ -2,10 +2,12 @@
  * Single source of truth for which CliIds use the structured transcript
  * bridge (CodexBridgeQueue path in the worker).
  *
- * Split intentionally:
- *   - ALWAYS: harvested whenever the CLI is botmux-spawned (or adopted)
- *   - CURSOR: adopt-only — botmux-spawned cursor replies via `botmux send`,
- *     so the transcript bridge stays off outside adopt mode
+ * ALWAYS = harvested whenever the CLI is botmux-spawned (or adopted).
+ * Cursor was historically adopt-only (spawned cursor replied via `botmux
+ * send` with no fallback, so a send-less turn ghosted the thread); it now
+ * rides the same always-on fallback as codex — the send-marker gate in
+ * bridge-fallback-gate.ts suppresses the transcript emit when the model
+ * did send, exactly like the other structured CLIs.
  *
  * File-path resolution for JSONL-style bridges lives in
  * `resolveFileBridgePath` (same module family, worker-facing). Hermes/MTR
@@ -26,6 +28,7 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   'oh-my-pi',
   'ebsd',
   'grok',
+  'cursor',
 ] as const satisfies readonly CliId[];
 
 /** Adopt must forward pid/cwd/cliSessionId for these (CLIs whose worker
@@ -87,15 +90,9 @@ export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined
   return !!cliId && LIFECYCLE_BLOCKING_SET.has(cliId);
 }
 
-/** Worker `codexBridgeFallbackActive` — cursor only when adoptMode. */
-export function isStructuredBridgeFallbackActive(
-  cliId: string | undefined,
-  adoptMode?: boolean,
-): boolean {
-  if (!cliId) return false;
-  if (ALWAYS_SET.has(cliId)) return true;
-  if (cliId === 'cursor') return adoptMode === true;
-  return false;
+/** Worker `codexBridgeFallbackActive`. */
+export function isStructuredBridgeFallbackActive(cliId: string | undefined): boolean {
+  return !!cliId && ALWAYS_SET.has(cliId);
 }
 
 /** Daemon adopt path — forward transcript bind fields. */

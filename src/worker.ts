@@ -225,7 +225,7 @@ import {
   isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
-import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid, classifyCursorPendingTail, isCursorFallbackDisabled, type CursorTailClass } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -4378,6 +4378,19 @@ let codexBridgeRolloutPath: string | undefined;
 let codexBridgeOffset = 0;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+/** True while a cursor attach is deferred: the from-0 drain found a partial
+ *  tail too short to classify (message vs footer). The poller re-runs
+ *  cursorBridgeAttach each tick until the line grows enough to commit a
+ *  baseline. During defer, codexBridgeRolloutPath is set but
+ *  codexBridgeBaselineDone is false, so codexBridgeIngest is a no-op. */
+let cursorBaselineDeferred = false;
+/** When the defer started (for the bounded fail-safe). */
+let cursorDeferStartedAtMs: number | undefined;
+/** Set by the 30s fail-safe: the cursor transcript fallback is disabled for
+ *  this session. The CLI keeps working (input is released) but no transcript
+ *  baseline is ever committed. */
+let cursorBridgeDisabled = false;
+const CURSOR_DEFER_FAILSAFE_MS = 30_000;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
@@ -6054,10 +6067,15 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
+  // The 30s fail-safe disables the cursor transcript fallback for this
+  // session: not just polling, but also mark attribution — otherwise
+  // flushPending would keep piling 20s attribution heads that never get a
+  // transcript start. Other CLIs are unaffected.
+  if (isCursorFallbackDisabled(lastInitConfig?.cliId, cursorBridgeDisabled)) return false;
   // Transcript-backed CLIs whose final output can be harvested when the
-  // model forgets to call `botmux send`. Cursor is adopt-only — see
+  // model forgets to call `botmux send` — see
   // services/structured-bridge-clis.ts (single source of the allowlist).
-  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
+  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId);
 }
 
 /** A Codex App shared-adopt starts a SECOND official `codex --remote` client
@@ -6210,6 +6228,20 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (codexBridgeIsCursor()) {
+        // Fail-safe: if the baseline defer has lasted too long, disable this
+        // session's transcript fallback and release held input. The CLI keeps
+        // working (no transcript attribution) rather than wedging forever.
+        if (cursorBaselineDeferred && cursorDeferStartedAtMs !== undefined
+          && Date.now() - cursorDeferStartedAtMs > CURSOR_DEFER_FAILSAFE_MS) {
+          cursorBridgeDisabled = true;
+          cursorBaselineDeferred = false;
+          cursorDeferStartedAtMs = undefined;
+          codexBridgeDetachFile();
+          log('Cursor bridge fallback disabled (defer timeout); releasing held input');
+          void flushPending();
+          return;
+        }
+        if (cursorBridgeDisabled) return;
         // Late-attach: the transcript usually exists at adopt time (the
         // session is already running), so cursorBridgeAttach in setup wins.
         // This covers the rare race where pid→chatId resolved but the JSONL
@@ -6223,12 +6255,36 @@ function codexBridgeStartTimer(): void {
             path = findCursorTranscriptByPid(codexAdoptPendingPid)?.path;
           }
           if (path) {
+            // Only clear the pending identity once the baseline is actually
+            // committed. A deferred attach (partial tail too short to
+            // classify) keeps the sid/pid so the poller can retry below.
+            if (cursorBridgeAttach(path, cursorLateAttachMode(path)) === 'attached') {
+              codexBridgePendingSessionId = undefined;
+              codexAdoptPendingPid = undefined;
+            }
+          }
+        } else if (cursorBaselineDeferred) {
+          // Retry a deferred baseline: the from-0 drain's partial tail was
+          // too short to classify last tick. Re-drain and commit once the
+          // line grows enough. Clear the pending identity only on success.
+          if (cursorBridgeAttach(codexBridgeRolloutPath, 'baseline-existing') === 'attached') {
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
-            cursorBridgeAttach(path, cursorLateAttachMode(path));
           }
         }
         codexBridgeIngest();
+        // Cursor's mirror can flush THIS turn's user line as late as the end
+        // of the first assistant step (a tool-less reply flushes the whole
+        // turn at once, at the end). While the CLI is visibly busy the head's
+        // bounded attribution lease must not lapse waiting for that flush —
+        // refresh it each tick; the 20s countdown then effectively starts
+        // when the CLI goes idle, preserving the wedge protection for a
+        // swallowed Enter. Non-adopt only: adopt keeps its historical timing
+        // (an expired adopt mark degrades to local-turn synthesis, still
+        // visible in Lark).
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease();
+        }
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -6511,6 +6567,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
 }
 
 type CursorAttachMode = 'baseline-existing' | 'fresh-empty';
+type CursorAttachResult = 'attached' | 'deferred';
 
 function cursorLateAttachMode(path: string): CursorAttachMode {
   const start = codexAdoptStartMs;
@@ -6522,26 +6579,108 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
       // be ingested from byte 0 rather than swallowed as history.
       if (Number.isFinite(birthtimeMs) && birthtimeMs >= start - 5_000) return 'fresh-empty';
     } catch { /* fall back to history-safe baseline */ }
+    return 'baseline-existing';
   }
-  return 'baseline-existing';
+  // Non-adopt (botmux-spawned): a FRESH spawn's chatId is a brand-new UUID,
+  // so its JSONL can only contain THIS session's lines — always ingest from
+  // byte 0, even when the file appears (with the first turn already inside)
+  // before the poller attaches. A RESUME spawn's JSONL carries the prior
+  // run's history and must be baselined behind the tail.
+  return lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty';
 }
 
 /** Attach the Cursor adopt bridge. Cursor's JSONL has no per-event
- *  timestamp, so existing transcripts are baselined by byte offset. Cursor
- *  restore intentionally skips any partial tail present at attach time: it is
- *  old in-flight output and must not be attributed to the next Lark turn. If
- *  the transcript is created after /adopt, attach fresh so the first
- *  post-adopt Lark/user turn can still be attributed. */
-function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
-  if (mode === 'baseline-existing' && existsSync(path)) {
-    try {
-      const full = drainCursorTranscript(path, 0);
-      maybeEmitCodexAdoptPreamble(full.events);
-    } catch (err: any) {
-      log(`Cursor bridge preamble drain failed: ${err.message}`);
+ *  timestamp, so existing transcripts are baselined by byte offset. The
+ *  from-0 drain's frontier is footer-aware (never advances past a trailing
+ *  turn_ended footer), but a snapshot can also end mid in-flight line:
+ *
+ *  - partial MESSAGE line → old in-flight output; baseline at the snapshot
+ *    EOF (readEndOffset) to skip it, restoring the old `size` baseline.
+ *  - partial FOOTER line → hold at the footer's line start (newOffset) so
+ *    the completed footer is recognized and the next turn's rewrite is not
+ *    ghosted.
+ *  - tail too short to classify → DEFER: arm the poller but commit no
+ *    baseline; the poller re-drains each tick until the line grows enough
+ *    to classify. Guessing would reopen the stale-replay / ghost hole.
+ *
+ *  Returns 'attached' (baseline committed) or 'deferred' (caller must keep
+ *  its own sid/pid and let the poller retry). If the transcript is created
+ *  after /adopt, attach fresh so the first post-adopt Lark/user turn can
+ *  still be attributed. */
+function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): CursorAttachResult {
+  // The fail-safe disabled this session's fallback — don't retry.
+  if (cursorBridgeDisabled) return 'deferred';
+  let drainFrontier: number | undefined;
+  let tailClass: CursorTailClass | 'none' = 'none';
+  let snapshotOk = true;
+  if (mode === 'baseline-existing') {
+    if (!existsSync(path)) {
+      // File missing: can't establish a baseline. Defer — do NOT enter the
+      // generic missing→fresh branch (that would read old history as live
+      // when the mirror reappears, causing stale misattribution).
+      snapshotOk = false;
+    } else {
+      try {
+        const full = drainCursorTranscript(path, 0);
+        if (!full.snapshotComplete) {
+          // Short read / I/O failure: partial snapshot. The events may be
+          // valid but the frontier is unreliable — defer, don't feed
+          // preamble or commit a baseline.
+          snapshotOk = false;
+        } else {
+          maybeEmitCodexAdoptPreamble(full.events);
+          if (full.pendingTail.length > 0) {
+            tailClass = classifyCursorPendingTail(full.pendingTail);
+            if (tailClass === 'message') {
+              // Old in-flight message line: skip it (baseline at snapshot EOF).
+              drainFrontier = full.readEndOffset;
+            } else {
+              // 'footer': hold at the footer's line start so the completed
+              // footer is recognized and held. 'defer' is handled below.
+              drainFrontier = full.newOffset;
+            }
+          } else {
+            // No partial tail: footer-aware frontier (≤ size in every state).
+            drainFrontier = full.newOffset;
+          }
+        }
+      } catch (err: any) {
+        log(`Cursor bridge preamble drain failed: ${err.message}`);
+        snapshotOk = false;
+      }
     }
   }
+  if (!snapshotOk || tailClass === 'defer') {
+    // The snapshot is unusable (missing / short read / I/O failure) or the
+    // partial tail is too short to classify. Arm the poller but commit no
+    // baseline; the poller re-runs this attach each tick until a complete
+    // snapshot classifies. The caller keeps its own sid/pid (it only clears
+    // them on 'attached'), so a path re-resolution stays possible.
+    cursorBaselineDeferred = true;
+    cursorDeferStartedAtMs ??= Date.now();
+    codexBridgeRolloutPath = path;
+    codexBridgeStartTimer();
+    log(`Cursor bridge baseline deferred: ${path} (snapshotOk=${snapshotOk}, tail=${tailClass})`);
+    return 'deferred';
+  }
+  // Successfully attached: clear defer state and re-kick held input (same
+  // live backend — safe to write now that the baseline is committed).
+  const wasDeferred = cursorBaselineDeferred;
+  cursorBaselineDeferred = false;
+  cursorDeferStartedAtMs = undefined;
   codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
+  if (mode === 'baseline-existing' && drainFrontier !== undefined) {
+    // Commit the drain's frontier unconditionally: it is the safe frontier
+    // (≤ the skip-tail size in every reachable state), so this is a no-op
+    // when there is no trailing footer / partial line and a rewind otherwise.
+    if (drainFrontier < codexBridgeOffset) {
+      log(`Cursor bridge baseline rewound before trailing status footer: ${codexBridgeOffset} → ${drainFrontier}`);
+    }
+    codexBridgeOffset = drainFrontier;
+    codexBridgePendingTail = '';
+  }
+  if (wasDeferred) void flushPending();
+  return 'attached';
 }
 
 /** Drop the current file-backed bridge attachment (watcher + path cursor).
@@ -6560,6 +6699,11 @@ function codexBridgeDetachFile(): void {
   ebsdBridgeState = {};
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
+  // Clear cursor defer state. Do NOT re-kick flushPending here: a rotation
+  // detach's held input is released by the NEXT attach's success re-kick,
+  // not during the gap (writing mid-rotation could land in the wrong file).
+  cursorBaselineDeferred = false;
+  cursorDeferStartedAtMs = undefined;
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -6792,8 +6936,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // agent-transcript JSONL, so it resolves the path directly.
     const cursorPath = resolveFileBridgePath('cursor', { sessionId: cliSessionId });
     if (cursorPath) {
-      codexBridgePendingSessionId = undefined;
-      cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
+      // Clear the pending sid only once the baseline is committed; a deferred
+      // attach keeps it so the poller can retry.
+      if (cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath)) === 'attached') {
+        codexBridgePendingSessionId = undefined;
+      }
     } else {
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
@@ -7648,6 +7795,12 @@ function stopCodexBridge(): void {
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
+  // Clear cursor defer state. Do NOT re-kick flushPending: teardown means
+  // the old backend is exiting; held input is taken over by the new
+  // generation's ready/init lifecycle, not written to the dying CLI.
+  cursorBaselineDeferred = false;
+  cursorDeferStartedAtMs = undefined;
+  cursorBridgeDisabled = false;
   grokBridgePidProbeLastMs = 0;
 }
 
@@ -10733,6 +10886,11 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      // The chatId also names the agent-transcript JSONL — hand it to the
+      // structured bridge so a `botmux send`-less turn can be harvested.
+      // Safe when already attached (first-attach-wins) and when the JSONL
+      // doesn't exist yet (arms the 1s late-attach poller).
+      codexBridgeNotifyCliSessionId(chatId);
       return;
     }
     attempts++;
@@ -11099,6 +11257,13 @@ async function flushPending(): Promise<void> {
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
   if (cliRestartInProgress) return;
+  // During a cursor baseline defer, hold ALL botmux-controlled PTY input:
+  // the transcript baseline isn't committed yet, so sending input now could
+  // be ghosted (the live turn's events would be swallowed by the baseline
+  // when it commits). The gate is cursor-only — non-cursor CLIs and cursor's
+  // normal attached rounds flush as usual. Released by cursorBridgeAttach
+  // (success) or the 30s fail-safe.
+  if (codexBridgeIsCursor() && cursorBaselineDeferred) return;
   if (initialInputOwnershipPending) return;
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
@@ -12326,7 +12491,12 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       if (probed) path = probed.path;
     }
     if (path) {
-      cursorBridgeAttach(path);
+      // On defer, stash the adopt identity so the poller can re-resolve /
+      // retry; cursorBridgeAttach already armed the timer.
+      if (cursorBridgeAttach(path) === 'deferred') {
+        if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+        codexAdoptPendingPid = cfg.adoptCliPid;
+      }
     } else {
       if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
       codexAdoptPendingPid = cfg.adoptCliPid;
@@ -15923,6 +16093,28 @@ async function spawnCli(
       codexBridgePendingSessionId = sid;
       codexBridgeStartTimer();
     } else {
+      codexBridgeStartTimer();
+    }
+  } else if (cfg.cliId === 'cursor') {
+    // Cursor's chatId (= cliSessionId) is only discoverable from the CLI's
+    // open store.db fd, so a FRESH spawn has no id yet at this point —
+    // observeCursorCliSessionId's pid poll surfaces it and
+    // codexBridgeNotifyCliSessionId completes the attach. A RESUME spawn
+    // knows the chatId up front and can resolve the JSONL immediately (it
+    // persists from the prior run). Attach modes: resume → baseline behind
+    // the existing tail (history must not replay); fresh → ingest from byte
+    // 0 (the JSONL is chatId-scoped, so it can only hold this session).
+    const path = effectiveCliSessionId
+      ? resolveFileBridgePath('cursor', { sessionId: effectiveCliSessionId })
+      : undefined;
+    if (path) {
+      // On defer (resume only — fresh-empty has no from-0 drain), stash the
+      // chatId so the poller can re-resolve / retry.
+      if (cursorBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty') === 'deferred') {
+        if (effectiveCliSessionId) codexBridgePendingSessionId = effectiveCliSessionId;
+      }
+    } else {
+      if (effectiveCliSessionId) codexBridgePendingSessionId = effectiveCliSessionId;
       codexBridgeStartTimer();
     }
   }

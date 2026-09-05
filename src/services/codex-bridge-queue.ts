@@ -308,6 +308,21 @@ export class CodexBridgeQueue {
     return true;
   }
 
+  /** Refresh the head's bounded attribution-only lease while the CLI is
+   *  visibly busy. Cursor's transcript mirror may not flush the current
+   *  turn's user line until the first assistant step (or the whole turn)
+   *  completes, which can exceed the 20s lease measured from write time; the
+   *  caller ticks this while the CLI is working so the countdown effectively
+   *  starts at idle. Confirmed and rpc-active turns keep their own leases. */
+  refreshUnstartedHeadAttributionLease(nowMs: number = this.now()): boolean {
+    const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+    if (!head || head.rpcActive) return false;
+    if (head.submitConfirmedAtMs !== undefined) return false;
+    if (head.unconfirmedAttributionStartedAtMs === undefined) return false;
+    head.unconfirmedAttributionStartedAtMs = nowMs;
+    return true;
+  }
+
   /** Finish verification without positive submit evidence. A bare mark remains
    *  available for transcript attribution but no longer gates screen-ready. */
   finishSubmitVerification(
