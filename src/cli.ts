@@ -13290,6 +13290,14 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  else if (__entrySubcommand === 'pm2-readonly-client') {
+    // The disk-backed Node helper sees `<node> <script> <mode> ...`, whereas the
+    // standalone form arrives as `<binary> __pm2-readonly-client <mode> ...`.
+    // Remove only the private entry token so the helper keeps one argv contract.
+    // The literal import is required: Bun cannot embed a computed import target.
+    process.argv.splice(2, 1);
+    await import('./cli/pm2-readonly-client.js');
+  }
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that

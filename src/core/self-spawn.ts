@@ -3,17 +3,17 @@ import { join, dirname } from 'node:path';
 
 /**
  * Spawn one of botmux's own entry modules (daemon / core-only / worker /
- * supervisor / dashboard) as a child process, transparently across two runtime
- * shapes:
+ * supervisor / dashboard / utility helpers) as a child process, transparently
+ * across two runtime shapes:
  *
  *   • Node (npm install, dev): the entry is a real file on disk under dist/, so
  *     we spawn `node dist/<entry>.js` exactly as before — ZERO behavior change.
  *   • Bun single-file executable (`bun build --compile`): there is no dist/ on
  *     disk (everything is bundled inside /$bunfs/), so `node dist/<entry>.js`
  *     cannot work. Instead we re-exec THIS binary (`process.execPath`) with a
- *     hidden subcommand (`__core-only` / `__daemon` / `__worker` / `__supervisor`
- *     / `__dashboard`) that the CLI dispatcher routes to the same entry module,
- *     imported inline.
+ *     hidden subcommand (`__core-only` / `__worker` /
+ *     `__pm2-readonly-client` / …) that the CLI dispatcher routes to the same
+ *     entry module, imported inline.
  *
  * `Bun.isStandaloneExecutable` is the authoritative "am I a compiled binary"
  * check (true only inside `bun build --compile` output; false under `bun run`
@@ -29,6 +29,9 @@ import { join, dirname } from 'node:path';
 
 export type BotmuxEntry =
   | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
+  // Short-lived utility process. It must stay out-of-process because importing
+  // PM2's client into the caller would share mutable singleton state with it.
+  | 'pm2-readonly-client'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
@@ -42,6 +45,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'worker': '__worker',
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
+  'pm2-readonly-client': '__pm2-readonly-client',
   'codex-app-runner': '__codex-app-runner',
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
@@ -55,6 +59,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'worker': 'worker.js',
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
+  'pm2-readonly-client': 'cli/pm2-readonly-client.js',
   'codex-app-runner': 'codex-app-runner.js',
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',
