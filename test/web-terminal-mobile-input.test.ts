@@ -431,6 +431,59 @@ describe('手机 Web 终端输入栏', () => {
     expect(Number.parseFloat(fontSize![1])).toBeGreaterThanOrEqual(16);
   });
 
+  it('实时模式下输入框已空时，系统键盘的删除键仍然删得掉终端里的字符', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+
+    // The regression this pins: live mode only ever sends what the textarea's
+    // `input` event diffs, and deleting from an EMPTY box changes nothing — so a
+    // real browser fires beforeinput but NO input event at all (verified with
+    // Playwright + a real worker). Every Backspace was silently dropped, which
+    // is exactly what "上屏 的字用系统键盘删不掉" looks like: the text is on the
+    // terminal, the box is empty, and the key does nothing.
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+
+    // A pending IME draft must still edit locally instead of eating terminal
+    // characters, so a non-empty box is left to the diff path (which the browser
+    // does drive with a real input event).
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+  });
+
+  it('缓冲模式下删除键不被接管，仍然只编辑输入框', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    // Buffer mode's box is a staging area — an empty-box Backspace there means
+    // "nothing to delete", not "delete a terminal character".
+    expect(page.sentInputs()).toEqual([]);
+  });
+
+  it('切进实时模式时，输入框里没上屏的文字要送上终端而不是隐形留着', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = 'hello';
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+
+    // Live mode renders the textarea transparent, so leftover text is invisible
+    // to the user while still being the mirror's baseline mismatch: the next
+    // keystroke diffed '' → 'hell' and INSERTED the stale text into the terminal
+    // instead of deleting anything. Flush it the way 上屏 does.
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // …and it must stay an insert, not a submit — the two-step semantics hold.
+    expect(page.sentInputs().some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // With the box actually empty, the very next Backspace reaches the terminal.
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
+  });
+
   it('底栏按钮抑制 iOS 长按选中与 callout，避免长按删除时弹出选择气泡', () => {
     const source = workerSource();
     // `user-select` alone leaves the WKWebView selection handles / callout menu

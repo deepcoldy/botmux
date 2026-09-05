@@ -18498,6 +18498,16 @@ if(isTouch&&hasToken){(function(){
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
     if(mode===LIVE&&!sendLiveKey(''))return;
+    // Entering live must flush the staged buffer text too, for the same reason:
+    // live means "what the box holds is already in the terminal", and the mirror
+    // is reset to empty just below. Leaving text in the textarea breaks that
+    // invariant AND is invisible (live renders the textarea transparent), so the
+    // next keystroke would diff '' → 'hello…' and INSERT the stale text into the
+    // terminal instead of editing it. Flush it the way 上屏 does — insert without
+    // submitting — rather than silently discarding what the user typed.
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();}
     setMode(mode===LIVE?BUFFER:LIVE);
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
@@ -18515,6 +18525,17 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
       sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    // Backspace on an EMPTY textarea has to be forwarded by hand. Live mode
+    // otherwise only ever sends what the 'input' listener diffs — and deleting
+    // from an empty box changes nothing, so the browser fires beforeinput but
+    // NO input event at all (verified in a real browser). The result was that
+    // text already on the terminal — typed in buffer mode and 上屏'd, or typed
+    // live and mirrored away — could not be erased with the system keyboard:
+    // every Backspace was silently dropped. Non-empty is left to the diff so a
+    // pending IME draft still edits locally instead of eating terminal chars.
+    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+      e.preventDefault();
+      sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
   setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
