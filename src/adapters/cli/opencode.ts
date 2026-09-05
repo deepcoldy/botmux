@@ -355,10 +355,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
     // bakes the full first-round prompt into `--prompt <content>`, so a long
     // routing/role/user prompt blows the tmux limit before OpenCode starts.
-    // Set a conservative 4 KB budget: short prompts keep the reliable
-    // `--prompt` cold-start path; over-limit prompts defer to the normal
-    // post-start input queue (same mechanism Pi/Grok use).
-    maxInitialPromptArgBytes: 4096,
+    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
+    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
+    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
+    // below the measured tmux ceiling.  Over-limit prompts defer to the
+    // normal post-start input queue.
+    maxInitialPromptArgBytes: 8192,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,

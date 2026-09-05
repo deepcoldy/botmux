@@ -1491,7 +1491,7 @@ describe('opencode buildArgs', () => {
     // tmux new-session rejects long command strings well below OS ARG_MAX,
     // so the adapter must declare a byte budget: short prompts keep --prompt,
     // over-limit prompts defer to the post-start input queue.
-    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('exposes paste-line raw command delivery capability', () => {
