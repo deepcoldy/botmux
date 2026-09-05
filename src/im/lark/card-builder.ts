@@ -9,7 +9,7 @@ import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
+import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -873,6 +873,10 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
 
 /** Push the shared "output body" elements (usage-limit notice + screenshot) used
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+/** Smallest built-in Feishu card font (10px): the fallback notice is a
+ *  footnote, one step below the 12px usage line. */
+const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
+
 function pushStreamBody(
   elements: any[],
   opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
@@ -1161,6 +1165,18 @@ export function buildStreamingCard(
         mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
         mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
       ],
+    });
+  }
+
+  // Model auto-fallback notice — pinned as small yellow text at the very bottom of
+  // the session card (never a separate message) for as long as the session
+  // keeps running on the fallback model.
+  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
+  if (modelFallbackNotice) {
+    elements.push({
+      tag: 'markdown',
+      text_size: MODEL_FALLBACK_NOTICE_TEXT_SIZE,
+      content: `<font color='yellow'>${modelFallbackNotice}</font>`,
     });
   }
 

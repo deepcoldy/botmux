@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -19,6 +19,7 @@ type Listener = (event: Record<string, unknown>) => void;
 
 class FakeElement {
   value = '';
+  textContent = '';
   disabled = false;
   scrollHeight = 38;
   offsetHeight = 91;
@@ -268,5 +269,107 @@ describe('手机 Web 终端输入栏', () => {
     backspace?.dispatch('click');
     down?.dispatch('click');
     expect(page.sentInputs()).toEqual(['\x1b[A', '\x7f', '\x1b[B']);
+  });
+
+  it('缓冲模式的按钮叫「上屏」并说明还要按 Enter，实时模式才叫「发送」', () => {
+    const source = workerSource();
+    // The static markup must already say 上屏 so there is no flash of the wrong
+    // word before setMode() runs on boot.
+    expect(source).toMatch(/<button id="mobile-send" type="submit">上屏<\/button>/);
+
+    const page = bootMobileInput({ wsHasWrite: true });
+    const send = page.controls.find(control => control.id === 'mobile-send');
+    expect(send?.textContent).toBe('上屏');
+    expect(send?.getAttribute('aria-label')).toContain('Enter');
+    const mode = page.controls.find(control => control.id === 'mobile-mode');
+    expect(mode?.getAttribute('aria-label')).toContain('Enter');
+
+    // Switching to live mode makes the button a real submit again.
+    mode?.dispatch('click');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    mode?.dispatch('click');
+    expect(send?.textContent).toBe('上屏');
+  });
+
+  it('长按 ⌫ 连续删除，松手即停，且 Enter/Ctrl+C 这类一次性键从不重复', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true });
+      const backspace = page.shortcut('bs');
+      expect(backspace).toBeDefined();
+
+      // A press shorter than the repeat delay must not add any repeat tick.
+      backspace?.dispatch('pointerdown');
+      vi.advanceTimersByTime(200);
+      backspace?.dispatch('pointerup');
+      vi.advanceTimersByTime(600);
+      expect(page.sentInputs()).toEqual([]);
+
+      // Holding past the delay repeats at a steady cadence…
+      backspace?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 5);
+      const whileHeld = page.sentInputs().length;
+      expect(whileHeld).toBe(5);
+      expect(page.sentInputs().every(sequence => sequence === '\x7f')).toBe(true);
+
+      // …and releasing stops it immediately (no ticks after pointerup).
+      backspace?.dispatch('pointerup');
+      vi.advanceTimersByTime(600);
+      expect(page.sentInputs().length).toBe(whileHeld);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('一次性键长按不重复，手指移开或断线都会停下重复', () => {
+    vi.useFakeTimers();
+    try {
+      // Repeating Enter would run the command several times; Ctrl+C would spray
+      // interrupts. Neither may gain a repeat handler.
+      const oneShot = bootMobileInput({ wsHasWrite: true });
+      for (const action of ['enter', 'ctrlc', 'esc', 'tab', 'stab', 'paste']) {
+        oneShot.shortcut(action)?.dispatch('pointerdown');
+        vi.advanceTimersByTime(450 + 60 * 10);
+        oneShot.shortcut(action)?.dispatch('pointerup');
+      }
+      expect(oneShot.sentInputs()).toEqual([]);
+
+      // Sliding the finger off the key stops the repeat too.
+      const slide = bootMobileInput({ wsHasWrite: true });
+      slide.shortcut('left')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 3);
+      const beforeLeave = slide.sentInputs().length;
+      expect(beforeLeave).toBe(3);
+      slide.shortcut('left')?.dispatch('pointerleave');
+      vi.advanceTimersByTime(600);
+      expect(slide.sentInputs().length).toBe(beforeLeave);
+
+      // A socket that stops accepting input mid-hold must not spin forever.
+      const dropped = bootMobileInput({ wsHasWrite: true });
+      dropped.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 2);
+      const beforeDrop = dropped.sentInputs().length;
+      expect(beforeDrop).toBe(2);
+      dropped.setWriteState?.(null);
+      vi.advanceTimersByTime(600);
+      expect(dropped.sentInputs().length).toBe(beforeDrop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('底栏按钮抑制 iOS 长按选中与 callout，避免长按删除时弹出选择气泡', () => {
+    const source = workerSource();
+    // `user-select` alone leaves the WKWebView selection handles / callout menu
+    // on a long press — the `-webkit-` pair is what suppresses both.
+    for (const selector of ['#mobile-bar-keys button', '#mobile-bar-row button']) {
+      const start = source.indexOf(`${selector}{`);
+      expect(start, `${selector} 规则缺失`).toBeGreaterThan(-1);
+      const rule = source.slice(start, source.indexOf('}', start));
+      expect(rule, selector).toContain('-webkit-user-select:none');
+      expect(rule, selector).toContain('user-select:none');
+      expect(rule, selector).toContain('-webkit-touch-callout:none');
+    }
   });
 });

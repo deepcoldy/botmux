@@ -19,6 +19,7 @@ import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
+import { compareReplyIds } from '../../core/doc-comment-poller.js';
 
 /**
  * bot 回复的隐形哨兵：追加在 bot 发表的评论末尾（零宽字符，用户不可见）。
@@ -91,6 +92,11 @@ export interface DocComment {
   quote?: string;
   /** 是否为整篇文档的全文评论。 */
   isWhole?: boolean;
+  /**
+   * `replies` 是否被飞书分页截断（评论对象顶层 `has_more`）。
+   * true 表示这里拿到的只是**前几条**回复，不能当作完整 thread 用。
+   */
+  hasMoreReplies?: boolean;
   /** 该评论 thread 下所有回复（飞书把评论建模成 reply_list）。 */
   replies: Array<{
     replyId: string;
@@ -176,6 +182,20 @@ interface DriveCallOpts {
   data?: unknown;
   /** true 时禁用 tenant 回退（评论事件订阅必须 user 身份才收得到推送时用）。 */
   userOnly?: boolean;
+  /**
+   * true 时**禁用 user 回退**：只用 tenant（应用身份）写，失败即失败。
+   *
+   * 与 `preferTenant` 的区别是「回退可不可接受」。`preferTenant` 用于**必须落地**
+   * 的写入（发评论），宁可显示成授权用户也要发出去。而有些写入是**持久且带主体
+   * 归属**的 —— 以错误的主体落地比不落地更糟，因为它会以用户自己的名义在文档里
+   * 留下不是用户做的动作。这类调用用 `tenantOnly`。
+   *
+   * 现用于「事件被丢弃」的 ❌ 标记（见 event-dispatcher.ts:markCommentEventDropped）：
+   * 它是**终态**标记、故意不清理，一旦回退 user 就等于在用户自己的评论上以用户
+   * 自己的名义永久挂一个叉。对比 Typing 指示器 —— 那个是成对的、几秒后必被
+   * removeCommentReaction 清掉，所以回退 user 只是短暂误导，可以接受。
+   */
+  tenantOnly?: boolean;
   /** true 时**优先 tenant（应用身份）**，失败再回退 user。用于发评论——这样 bot 的
    *  回复显示为机器人本身，而非授权用户。bot 对该文档无访问权时回退 user 身份保证落地。 */
   preferTenant?: boolean;
@@ -320,7 +340,26 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     return fetchWithUserToken(brand, userToken, opts);
   };
 
+  // ⚠️ userOnly 与 tenantOnly 是互斥的硬约束，同时传是调用方的逻辑错误。
+  // 不能让它静默走 userOnly —— tenantOnly 的**全部意义**就是禁止 user 身份写入，
+  // 静默降级成 user-only 恰好是它要防的那件事（错误主体的持久写入）。宁可炸。
+  if (opts.userOnly && opts.tenantOnly) {
+    throw new Error(`driveApiCall: userOnly 与 tenantOnly 互斥，不能同时指定 (${opts.path})`);
+  }
+
   if (opts.userOnly) return callUser();
+
+  // 只用应用身份写，绝不回退 user —— 见 tenantOnly 的注释：这类写入是持久且带
+  // 主体归属的，以错误主体落地比不落地更糟。tenant 失败就让它失败，调用方决定
+  // 怎么降级（当前唯一调用方 markCommentEventDropped 是 best-effort 放弃 + 日志）。
+  if (opts.tenantOnly) {
+    await opts.beforeProviderEffect?.();
+    const res = await callTenant();
+    if (res?.code !== 0) {
+      throw new Error(`tenant-only drive call 失败 (${opts.path}): ${res?.msg ?? 'unknown'} (code: ${res?.code})`);
+    }
+    return res;
+  }
 
   // 发评论：优先应用身份（回复显示为 bot），bot 无访问权（抛错或 code!=0）时回退用户身份。
   if (opts.preferTenant) {
@@ -401,6 +440,9 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   }
   return tenantResult;
 }
+
+/** 仅供测试：直接驱动身份选择逻辑，验证互斥约束等不经由具体端点的行为。 */
+export const __testOnly_driveApiCall = driveApiCall;
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
   const url = `${larkHosts(brand).openApi}${opts.path}${buildQuery(opts.params)}`;
@@ -508,11 +550,130 @@ export async function getDocComment(
     const data = ensureOk(res, '获取评论');
     const raw = Array.isArray(data?.items) ? data.items[0] : undefined;
     if (!raw) return null;
-    return normalizeComment(raw);
+    // 事件链路：与本函数的 batch_query 主请求保持同一身份优先级（user-first），
+    // 不要一半 user-first 一半 tenant-first。补全失败降级，下游有 `!trigger` 兜底。
+    return await hydrateTruncatedReplies(larkAppId, file, normalizeComment(raw), {
+      onTruncated: 'degrade',
+      preferTenant: false,
+    });
   } catch (err) {
     logger.warn(`[doc-comment] getDocComment ${commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+}
+
+/**
+ * 补全被截断的回复串。
+ *
+ * ⚠️ 飞书**对每条评论的 `reply_list.replies` 分页**，`has_more` 挂在评论对象
+ * 顶层（不是 reply_list 里），没有参数可以调大，也不能靠 page_size 绕过。
+ *
+ * 实测（33 条评论、单串最长 11 条回复的真实文档）两个端点表现**并不一样**：
+ *   • `POST .../comments/batch_query` —— 截断，一页只给 5 条并置 has_more=true
+ *   • `GET  .../comments`            —— 未见截断，11 条的串也完整返回
+ * 事件链路走 batch_query，所以是它踩了这个坑。`listDocComments` 走 GET，目前
+ * 观察不到截断，但 `has_more` 是文档化字段、飞书随时可能对它也生效，故两条
+ * 链路都接上补全（GET 那条实际是防御性的，正常不会真的发请求）。
+ *
+ * 吃下这个截断的后果是**长评论串会永久静默失联**：事件带着第 6 条以后的
+ * reply_id 打进来，在只有 5 条的 replies 里 find 不到，触发回复解析出错的那条
+ * → @ 判定、自触发过滤、turnId 去重全部基于错误的回复，最终每一条新评论都被
+ * 当成重复回合丢弃。
+ *
+ * 因此 `has_more` 为真时改用专用端点 `GET /comments/{id}/replies` 翻全量。
+ * 实测确认该端点与 `reply_list.replies` **同序（create_time 升序）**、跨页拼接
+ * 后仍升序、前 N 条与截断结果逐字节一致 —— 上层 priorReplies / trigger 依赖
+ * 这个顺序，换端点不能破坏它。
+ *
+ * `onTruncated` 决定**补全没能拿到完整回复串**时的行为（包括请求失败、分页
+ * 超上限，以及 `/replies` 返回空数组这种「合法但用不了」的应答 —— 三者对调用
+ * 方是同一件事：手上仍是截断结果）。**两条链路语义不同，必须由调用方选**：
+ * - 事件链路（getDocComment）传 'degrade'：退回截断结果。下游 `!trigger` 有
+ *   兜底告警，且事件链路本来就没有游标可污染。
+ * - 轮询链路（listDocComments）传 'throw'：**绝不能**降级。游标是按拿到的
+ *   回复算的，降级会让 `latestDocCommentPollCursor` 用截断的 5 条推游标；一旦
+ *   某轮补全成功把游标推到第 11 条、下一轮补全失败只看到 5 条，
+ *   `docCommentRepliesAfterCursor` 返回空，这轮新来的第 12 条就永久不投了
+ *   （游标已在 11，而截断响应里永远看不到 12）。抛错让 daemon 的 per-sub
+ *   try/catch 跳过这一轮、游标不动、下轮重试，才是正确语义。
+ */
+/** 单条评论回复串的翻页上限。纯粹是死循环保险，正常 thread 远够用。 */
+const MAX_REPLY_PAGES = 50;
+
+async function hydrateTruncatedReplies(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  comment: DocComment,
+  opts: { onTruncated: 'degrade' | 'throw'; preferTenant: boolean },
+): Promise<DocComment> {
+  if (!comment.hasMoreReplies || !comment.commentId) return comment;
+  try {
+    const replies: DocComment['replies'] = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    do {
+      const res = await driveApiCall(larkAppId, {
+        method: 'GET',
+        path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(comment.commentId)}/replies`,
+        params: {
+          file_type: file.fileType,
+          user_id_type: 'open_id',
+          page_size: 50,
+          page_token: pageToken,
+        },
+        preferTenant: opts.preferTenant,
+      });
+      const data = ensureOk(res, '拉取评论回复');
+      if (Array.isArray(data?.items)) replies.push(...data.items.map(normalizeReply));
+      pageToken = data?.has_more === true && typeof data?.page_token === 'string' && data.page_token
+        ? data.page_token
+        : undefined;
+      // 服务端若返回恒定 page_token 会把这里变成死循环，而且是嵌在
+      // 「每条评论 × 每个订阅」的两层循环里，足以把整个 poller 卡死。
+      // ⚠️ 只在「确认还有下一页」时计数，否则正常拉完的第 51 页也会被判成异常。
+      if (pageToken && ++pages >= MAX_REPLY_PAGES) {
+        throw new Error(`回复分页超过 ${MAX_REPLY_PAGES} 页上限（comment=${comment.commentId.slice(0, 12)}），疑似游标未推进`);
+      }
+    } while (pageToken);
+    // 空数组是**合法应答**（整串回复都被删了），不能和「没拉到」混为一谈；
+    // 但也不敢直接拿它覆盖已有的 N 条，只能保留截断结果。
+    //
+    // ⚠️ 保留截断结果 == 补全没成功，所以**必须和补全失败走同一条路**。这里曾经
+    // 无条件 `return comment`，绕过了下面的 catch，等于给 'throw' 契约开了条边路：
+    // 轮询链路拿到截断的回复 + hasMoreReplies:true，游标照样按截断的条数推进，
+    // 正是 onTruncated:'throw' 要堵的永久漏投。
+    // 故这里只管抛，由 catch 里那**唯一一处** onTruncated 分派决定抛还是降级 ——
+    // 别在这儿再判一次 opts.onTruncated，两处分派迟早会走岔。
+    if (replies.length === 0) {
+      throw new Error(`hydrate returned 0 replies for ${comment.commentId.slice(0, 12)}（截断结果有 ${comment.replies.length} 条）`);
+    }
+    // 按 createdAt 升序稳定排一次。实测 `/replies` 与 `reply_list.replies` 同序
+    // （均为 create_time 升序，跨页拼接后仍升序），但飞书**既没声明排序也没给
+    // 排序参数** —— 这是未承诺行为。上层 `priorReplies`
+    // （event-dispatcher 的 `replies.slice(0, triggerIndex)`）直接吃这个顺序且
+    // 不自己排，一旦飞书改成降序，症状是模型把「后面的回复」当历史上下文喂进去，
+    // 且没有任何日志会报。与其把这个假设只写在注释里，不如让代码自己守住。
+    // create_time 是秒级、同秒并列真实存在，故用 replyId 做次级比较（复用
+    // poller 的 compareReplyIds，别重写一套）。
+    replies.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || compareReplyIds(a.replyId, b.replyId));
+    logger.info(`[doc-comment] hydrated truncated thread comment=${comment.commentId.slice(0, 12)} ${comment.replies.length} → ${replies.length} replies`);
+    return { ...comment, replies, hasMoreReplies: false };
+  } catch (err) {
+    if (opts.onTruncated === 'throw') throw err;
+    // 事件链路降级：返回截断结果，下游 `!trigger` 的告警会暴露问题。
+    logger.warn(`[doc-comment] hydrate replies for ${comment.commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
+    return comment;
+  }
+}
+
+function normalizeReply(r: any): DocComment['replies'][number] {
+  return {
+    replyId: r?.reply_id ?? '',
+    userId: r?.user_id,
+    text: elementsToText(r?.content?.elements),
+    mentions: elementsMentions(r?.content?.elements),
+    createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
+  };
 }
 
 function normalizeComment(raw: any): DocComment {
@@ -525,13 +686,9 @@ function normalizeComment(raw: any): DocComment {
     isSolved: raw?.is_solved === true,
     quote: quote || undefined,
     isWhole: raw?.is_whole === true,
-    replies: replies.map((r: any) => ({
-      replyId: r?.reply_id ?? '',
-      userId: r?.user_id,
-      text: elementsToText(r?.content?.elements),
-      mentions: elementsMentions(r?.content?.elements),
-      createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
-    })),
+    // 顶层 has_more 表示**回复串**还有下一页（不是评论列表还有下一页）。
+    hasMoreReplies: raw?.has_more === true,
+    replies: replies.map(normalizeReply),
   };
 }
 
@@ -539,6 +696,10 @@ function normalizeComment(raw: any): DocComment {
  * 列出文档当前可见的全部评论。`/watch-comment --all` 用它做增量轮询：
  * 评论读取优先应用身份，因此不需要 User Token；只有应用身份无权访问文档时才
  * 回退已有的用户授权。
+ *
+ * ⚠️ 两层分页别混淆：外层 `data.has_more` 是**评论列表**还有下一页，每个 item
+ * 自己的 `has_more` 是**该评论的回复串**被截断（见 hydrateTruncatedReplies）。
+ * 只翻外层会让轮询永远看不到长 thread 第 6 条以后的回复。
  */
 export async function listDocComments(
   larkAppId: string,
@@ -564,7 +725,23 @@ export async function listDocComments(
       ? data.page_token
       : undefined;
   } while (pageToken);
-  return comments;
+  // 串行补全，且只在 has_more 的评论上真正发请求。GET /comments 实测不截断，
+  // 所以这里通常一个补全请求都不会发；Promise.all 只会在真出现批量截断时把
+  // 补全请求一次性打出去撞飞书限流（具体额度未核实，别在别处引用一个拍脑袋的
+  // 数字当依据），得不偿失。
+  // 注：真出现「一篇文档几十条串都被截断」时，本轮 poll 会明显变慢（有
+  // docCommentPollRunning 互斥，不会重入，但会拖慢游标推进）。届时应改成只补全
+  // 游标之后可能有新回复的评论 —— 留待后续 PR。
+  const hydrated: DocComment[] = [];
+  for (const comment of comments) {
+    // 轮询链路：与本函数的列表主请求同为 tenant-first；补全失败必须抛错，
+    // 降级会让游标按截断的回复数推进并永久漏投后续回复（见 hydrateTruncatedReplies）。
+    hydrated.push(await hydrateTruncatedReplies(larkAppId, file, comment, {
+      onTruncated: 'throw',
+      preferTenant: true,
+    }));
+  }
+  return hydrated;
 }
 
 // ─── 回评论 ─────────────────────────────────────────────────────────────────────
@@ -694,7 +871,9 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
  * 知道 bot 收到了、正在处理。bot 回复发出后再删掉。
  *
  * 端点：`POST drive/v2/files/{token}/comments/reaction`（v2，评论 reaction 专用）。
- * 优先应用身份（reaction 显示为 bot 加的）。
+ * 默认优先应用身份、失败回退 user（reaction 尽量显示为 bot 加的，但保证落地）。
+ * `options.tenantOnly` 关掉这个回退 —— 用于**不会被清理的终态标记**，那种场景下
+ * 以授权用户名义永久落一个 reaction 比不落更糟（见 DriveCallOpts.tenantOnly）。
  *
  * @returns 新创建的 reaction_id（删除时要用）；失败返回 undefined（不阻塞主流程）。
  */
@@ -704,25 +883,50 @@ export async function addCommentReaction(
   commentId: string,
   replyId: string,
   reactionType: string,
-  options: DocProviderEffectOptions = {},
+  options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
 ): Promise<string | undefined> {
+  return (await addCommentReactionChecked(larkAppId, file, commentId, replyId, reactionType, options)).reactionId;
+}
+
+/**
+ * 同 {@link addCommentReaction}，但**如实回报服务端结果**。
+ *
+ * 为什么需要：上面那个签名把失败投影成 `undefined`，而飞书官方
+ * `update_reaction` 的响应体是**空对象、不承诺 `reaction_id`** —— 所以
+ * `reactionId ? 成功 : 失败` 会把「code=0 但没带 id」误记成失败。要在日志里
+ * 写真实 outcome，必须在投影掉之前把 `res.code === 0` 留住。
+ *
+ * `ok` 只表示**这次请求本身**成功（HTTP 通了且 code=0），不代表 reaction 一定
+ * 在 UI 上可见（重复 add 的服务端语义未实测）。
+ */
+export async function addCommentReactionChecked(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionType: string,
+  options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
+): Promise<{ ok: boolean; reactionId?: string }> {
   try {
     const res = await driveApiCall(larkAppId, {
       method: 'POST',
       path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
       params: { file_type: file.fileType },
       data: { action: 'add', comment_id: commentId, reply_id: replyId, reaction_type: reactionType },
-      preferTenant: true,
+      // tenantOnly 与 preferTenant 互斥：前者禁用 user 回退，后者允许。
+      ...(options.tenantOnly ? { tenantOnly: true } : { preferTenant: true }),
       beforeProviderEffect: options.beforeProviderEffect,
     });
     const reactionId: string | undefined = res?.data?.reaction_id;
     if (reactionId) {
       logger.info(`[doc-comment] added reaction=${reactionId} type=${reactionType} on reply=${replyId.slice(0, 12)}`);
     }
-    return reactionId;
+    // 走到这里说明 driveApiCall 没抛（tenantOnly 路径 code!=0 会抛；其余路径
+    // 返回体自带 code）。id 可能为空 —— 官方 schema 不承诺，不能据此判失败。
+    return { ok: res?.code === undefined || res.code === 0, reactionId };
   } catch (err) {
     logger.warn(`[doc-comment] addCommentReaction failed for reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
-    return undefined;
+    return { ok: false };
   }
 }
 

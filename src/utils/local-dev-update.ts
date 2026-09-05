@@ -183,9 +183,10 @@ export function gitHeadSha(dir: string): string {
  *   2. bun run build       (dist/ is gitignored: a pull alone leaves stale code)
  *
  * MUST stay `bun run build`, and MUST NOT go back to pnpm. Since the repo
- * declares `packageManager: bun@1.4.0`, a corepack-shimmed `pnpm` REFUSES to run
- * here at all — even `pnpm --version` exits 1 with `Unsupported package manager
- * specification (bun@1.4.0)`, so the whole update aborted before building.
+ * declares `packageManager: bun@<pinned>` (1.4.1 at the time of writing; the
+ * pin lives in package.json), a corepack-shimmed `pnpm` REFUSES to run here at
+ * all — even `pnpm --version` exits 1 with `Unsupported package manager
+ * specification (bun@<pinned>)`, so the whole update aborted before building.
  *
  * `run` is not optional either: bare `bun build` is Bun's BUNDLER subcommand,
  * which exits 1 with "Missing entrypoints" instead of running the `build`

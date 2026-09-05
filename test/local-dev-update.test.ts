@@ -111,7 +111,7 @@ describe('localDevUpdateSteps', () => {
   });
 
   // Regression guard for the real breakage: the repo declares
-  // `packageManager: bun@1.4.0`, so a corepack-shimmed `pnpm` refuses to run in
+  // `packageManager: bun@<pinned>` (see package.json), so a corepack-shimmed `pnpm` refuses to run in
   // this repo AT ALL (`pnpm --version` itself exits 1 with "Unsupported package
   // manager specification"). `botmux upgrade` therefore died right after
   // `git pull` with `pnpm build 退出码 1`. A per-token check rather than only the

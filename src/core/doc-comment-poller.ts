@@ -1,3 +1,6 @@
+// ⚠️ 必须保持 **type-only**：doc-comment.ts 反过来从本模块值导入
+// `compareReplyIds`（补全后自排序要用）。type-only import 编译后被擦除，所以
+// 现在不构成运行时循环；一旦这行改成值导入，两个模块就成真循环了。
 import type { DocComment } from '../im/lark/doc-comment.js';
 
 export interface DocCommentPollCursor {
@@ -15,7 +18,13 @@ export interface PolledDocReply extends DocCommentPollCursor {
   priorReplies: Array<{ authorOpenId?: string; text: string }>;
 }
 
-function compareReplyIds(a: string, b: string): number {
+/**
+ * reply_id 按数值比大小（飞书 id 是雪花数，字符串序会把长度不同的排错）。
+ * 无法解析成数字的 id 退化成字典序 —— 但注意空串不走这条路：`BigInt('')` 返回
+ * `0n` 而不抛，所以空 id 会当 0 参与比较。实际无影响（空 id 的回复在
+ * `flattenDocCommentReplies` 里已被过滤，事件链路也匹配不上）。
+ */
+export function compareReplyIds(a: string, b: string): number {
   try {
     const aa = BigInt(a);
     const bb = BigInt(b);
