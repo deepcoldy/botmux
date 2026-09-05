@@ -25,7 +25,7 @@ import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReaction } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
@@ -77,6 +77,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
+import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -3056,6 +3057,39 @@ function handleVcMeetingPushEventAckSafe(
   }, `vc-meeting ${kind} event`);
 }
 
+/**
+ * 在被丢弃的触发回复上打一个 ❌，让「这条 @ 我没能处理」在文档里**看得见**。
+ *
+ * 为什么需要：文档评论事件被丢弃后，飞书不会重投（事件已 ACK），而 mention-only
+ * 订阅**不进轮询**（poller 只收 commentTriggerMode==='all'），所以事件链路失败
+ * 就是终点。用户侧原本只能看到「bot 不理我」，与「bot 正在忙」无法区分——doc
+ * 发起的会话在飞书上整个不可见，只能去 dashboard 翻 terminal 才知道发生了什么。
+ *
+ * 只在**明确知道该怪谁**、且非预期的丢弃点上打：
+ *   • 拉不到评论内容 / 触发回复不在拉到的回复里 —— 都是我们这边没读到用户说了啥
+ * **不打**的场景：自触发过滤（那是 bot 自己的回复）、mention-only 未 @ 本 bot
+ * （压根不该触发，打了反而在别人的评论上留噪音）、空正文（用户确实没说话）。
+ *
+ * best-effort：`addCommentReaction` 自己吞异常返回 undefined，这里再兜一层，
+ * 绝不让「打标记失败」影响丢弃路径本身（那已经是失败路径了）。
+ */
+async function markCommentEventDropped(
+  larkAppId: string,
+  file: { fileToken: string; fileType: string },
+  commentId: string,
+  replyId: string | undefined,
+): Promise<void> {
+  // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
+  if (!replyId) return;
+  try {
+    await addCommentReaction(larkAppId, file, commentId, replyId, DROPPED_REACTION_EMOJI_TYPE);
+  } catch (err) {
+    logger.debug(`[doc-comment] failed to mark dropped event on reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+export const __testOnly_markCommentEventDropped = markCommentEventDropped;
+
 async function processCommentEvent(
   parsed: ReturnType<typeof parseCommentEvent>,
   larkAppId: string,
@@ -3109,6 +3143,7 @@ async function processCommentEvent(
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
+    await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
     return;
   }
   const trigger = parsed.replyId
@@ -3121,6 +3156,7 @@ async function processCommentEvent(
   // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
   if (!trigger) {
     logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
+    await markCommentEventDropped(larkAppId, { fileToken, fileType: sub.fileType }, commentId, parsed.replyId);
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
