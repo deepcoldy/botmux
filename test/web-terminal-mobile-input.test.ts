@@ -227,7 +227,9 @@ describe('手机 Web 终端输入栏', () => {
     const connected = bootMobileInput({ wsHasWrite: true });
     connected.textarea.value = 'ship it';
     connected.bar.dispatch('submit');
-    expect(connected.sentInputs()).toEqual(['ship it\n']);
+    // 上屏 types the text into the CLI's input box and stops — no trailing
+    // newline, which would land there as a literal blank line.
+    expect(connected.sentInputs()).toEqual(['ship it']);
     expect(connected.textarea.value).toBe('');
   });
 
@@ -315,6 +317,10 @@ describe('手机 Web 终端输入栏', () => {
 
       // …and releasing stops it immediately (no ticks after pointerup).
       backspace?.dispatch('pointerup');
+      // The browser always sends a click when the finger lifts — it arrives
+      // AFTER the repeat ticks, so it must be swallowed rather than delete one
+      // more character than the user watched tick by.
+      backspace?.dispatch('click');
       vi.advanceTimersByTime(600);
       expect(page.sentInputs().length).toBe(whileHeld);
     } finally {
@@ -357,6 +363,143 @@ describe('手机 Web 终端输入栏', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('长按后手指滑开(无 click)，下一次单击仍然生效——吞掉尾随 click 的标志必须每次按下重置', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true });
+
+      // Slide off after the repeat has started: pointerleave stops the ticks and
+      // the browser sends NO click, so the swallow flag is left armed.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 3);
+      page.shortcut('bs')?.dispatch('pointerleave');
+      const afterSlide = page.sentInputs().length;
+      expect(afterSlide).toBe(3);
+
+      // The next plain tap must still delete one character. Without the reset on
+      // pointerdown the stale flag eats it and the key silently does nothing.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(100);
+      page.shortcut('bs')?.dispatch('pointerup');
+      page.shortcut('bs')?.dispatch('click');
+      expect(page.sentInputs().length).toBe(afterSlide + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('「上屏」只把正文送上终端，不追加换行——追加的换行会在 CLI 输入框里留下一个空行', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = '继续';
+    page.bar.dispatch('submit');
+
+    const sent = page.sentInputs();
+    expect(sent).toEqual(['继续']);
+    // The regression this pins: a trailing \n is NOT a submit in a TUI, it is an
+    // inserted line break, so the text showed up with a stray empty line after it.
+    expect(sent.some(sequence => sequence.endsWith('\n'))).toBe(false);
+    // …and it must not silently become a real submit either — that would throw
+    // away the deliberate two-step 上屏 → 检查 → Enter semantics.
+    expect(sent.some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // The Enter key is what actually runs it, and it still does.
+    page.shortcut('enter')?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['继续', '\r']);
+  });
+
+  it('实时模式的「发送」仍然真提交，两步语义只属于缓冲模式', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    page.textarea.value = 'ls';
+    page.bar.dispatch('submit');
+    // live mode diffs the mirror and appends a carriage return: a real submit.
+    expect(page.sentInputs().join('').endsWith('\r')).toBe(true);
+  });
+
+  it('输入框字号不低于 16px，否则 iOS 聚焦时会自动放大页面且不再缩回', () => {
+    const source = workerSource();
+    const start = source.indexOf('#mobile-input{');
+    expect(start, '#mobile-input 规则缺失').toBeGreaterThan(-1);
+    const rule = source.slice(start, source.indexOf('}', start));
+    const fontSize = rule.match(/font:\s*(\d+(?:\.\d+)?)px/);
+    expect(fontSize, '#mobile-input 未声明 px 字号').not.toBeNull();
+    // Hard floor, not a taste call: below 16px, iOS Safari / WKWebView zooms the
+    // page on focus and never zooms back, pushing the terminal's right-hand
+    // columns off screen. -webkit-text-size-adjust does not prevent this.
+    expect(Number.parseFloat(fontSize![1])).toBeGreaterThanOrEqual(16);
+  });
+
+  it('实时模式下输入框已空时，系统键盘的删除键仍然删得掉终端里的字符', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+
+    // The regression this pins: live mode only ever sends what the textarea's
+    // `input` event diffs, and deleting from an EMPTY box changes nothing — so a
+    // real browser fires beforeinput but NO input event at all (verified with
+    // Playwright + a real worker). Every Backspace was silently dropped, which
+    // is exactly what "上屏 的字用系统键盘删不掉" looks like: the text is on the
+    // terminal, the box is empty, and the key does nothing.
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+
+    // A pending IME draft must still edit locally instead of eating terminal
+    // characters, so a non-empty box is left to the diff path (which the browser
+    // does drive with a real input event).
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+  });
+
+  it('缓冲模式下「上屏」后输入框已空，系统键盘的删除键同样删得掉终端里的字符', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+
+    // 上屏 puts the text on the terminal and empties the box.
+    page.textarea.value = 'hello';
+    page.bar.dispatch('submit');
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // An empty box has no draft to edit, so Backspace can only sensibly mean
+    // "delete on the terminal" — the same thing the bottom bar's ⌫ (aria-label
+    // 删除终端字符) already does in this exact state. Gating the forwarding on
+    // live mode made the two disagree while looking identical to the user: the
+    // text sits on the terminal, the box is empty, ⌫ erases it and the system
+    // keyboard's delete key does nothing.
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
+  });
+
+  it('缓冲模式下输入框非空时，删除键仍然只编辑草稿，不碰终端', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual([]);
+  });
+
+  it('切进实时模式时，输入框里没上屏的文字要送上终端而不是隐形留着', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = 'hello';
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+
+    // Live mode renders the textarea transparent, so leftover text is invisible
+    // to the user while still being the mirror's baseline mismatch: the next
+    // keystroke diffed '' → 'hell' and INSERTED the stale text into the terminal
+    // instead of deleting anything. Flush it the way 上屏 does.
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // …and it must stay an insert, not a submit — the two-step semantics hold.
+    expect(page.sentInputs().some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // With the box actually empty, the very next Backspace reaches the terminal.
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
   });
 
   it('底栏按钮抑制 iOS 长按选中与 callout，避免长按删除时弹出选择气泡', () => {

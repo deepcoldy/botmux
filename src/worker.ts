@@ -17431,10 +17431,15 @@ body.touch.has-token #terminal .xterm{
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+/* 16px is a hard floor, not a taste call: iOS Safari / WKWebView auto-zooms the
+   page whenever a focused form control renders below 16px, and it never zooms
+   back out — the terminal is left scaled up with its right-hand columns off
+   screen. -webkit-text-size-adjust does NOT prevent that (it only stops the
+   text-inflation algorithm), so the size itself has to be 16px. */
 #mobile-input{
   flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
   padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
-  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
@@ -18530,17 +18535,21 @@ if(isTouch&&hasToken){(function(){
     measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
-  function sendBuffered(appendEnter){
+  // 上屏 puts the text into the CLI's own input box and stops there — the user
+  // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
+  // lands inside that box as a literal line break (a TUI reads it as "insert"),
+  // so the text showed up with a stray empty line after it. Only the Enter key
+  // (or live mode's own commit) sends the \\r that actually runs the command.
+  function sendBuffered(){
     var text=ta.value;
-    var payload=appendEnter?text+'\\n':text;
-    if(!payload)return;
-    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
+    if(!text)return;
+    if(!sendInput(text.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
     if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
-  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered();}
 
   // shortcut keys row
   var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
@@ -18549,7 +18558,11 @@ if(isTouch&&hasToken){(function(){
   var REPEAT_DELAY=450,REPEAT_EVERY=60;
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
+    // Set once a repeat tick has actually fired, so the click the browser sends
+    // when the finger lifts can be swallowed instead of adding one more hit.
+    var suppressTrailingClick=false;
     btn.addEventListener('click',function(){btn.blur();
+      if(suppressTrailingClick){suppressTrailingClick=false;return;}
       var act=btn.getAttribute('data-sk');
       if(act==='paste'){
         // Commit pending live text before the async clipboard result lands.
@@ -18564,13 +18577,16 @@ if(isTouch&&hasToken){(function(){
     // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
     // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
     // repeating Enter would fire the command several times, repeating Ctrl-C
-    // would spray interrupts. The first hit still comes from the click handler
-    // above (so a plain tap keeps working, mouse included); this only adds the
-    // follow-up ticks after the finger has stayed down past REPEAT_DELAY.
+    // would spray interrupts. A plain tap is still served by the click handler
+    // above (mouse included); this adds the follow-up ticks once the finger has
+    // stayed down past REPEAT_DELAY. Note a click event fires when the finger
+    // LIFTS, so on a long press it lands AFTER the ticks — it is swallowed above
+    // so a 1.2s hold deletes exactly as many characters as it showed ticks.
     if(REPEATABLE[btn.getAttribute('data-sk')]){
       var holdT=null,holdIv=null;
       var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
       btn.addEventListener('pointerdown',function(){
+        suppressTrailingClick=false;
         stopHold();
         holdT=setTimeout(function(){
           holdIv=setInterval(function(){
@@ -18580,7 +18596,8 @@ if(isTouch&&hasToken){(function(){
             if(btn.disabled){stopHold();return;}
             var seq=sk[btn.getAttribute('data-sk')];
             var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
-            if(!ok)stopHold();
+            if(!ok){stopHold();return;}
+            suppressTrailingClick=true;
           },REPEAT_EVERY);
         },REPEAT_DELAY);
       });
@@ -18595,6 +18612,16 @@ if(isTouch&&hasToken){(function(){
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
     if(mode===LIVE&&!sendLiveKey(''))return;
+    // Entering live must flush the staged buffer text too, for the same reason:
+    // live means "what the box holds is already in the terminal", and the mirror
+    // is reset to empty just below. Leaving text in the textarea breaks that
+    // invariant AND is invisible (live renders the textarea transparent), so the
+    // next keystroke would diff '' → 'hello…' and INSERT the stale text into the
+    // terminal instead of editing it. Flush it the way 上屏 does — insert without
+    // submitting — rather than silently discarding what the user typed.
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();}
     setMode(mode===LIVE?BUFFER:LIVE);
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
@@ -18612,6 +18639,22 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
       sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    // Backspace on an EMPTY textarea has to be forwarded by hand, in BOTH modes.
+    // Live mode otherwise only ever sends what the 'input' listener diffs, and
+    // buffer mode does not send keystrokes at all — but deleting from an empty
+    // box changes nothing, so the browser fires beforeinput and NO input event
+    // (verified in a real browser). Either way the keystroke evaporates.
+    // An empty box has no draft to edit, so the only thing Backspace can
+    // sensibly mean there is "delete on the terminal" — which is exactly what
+    // the bottom bar's ⌫ (aria-label 删除终端字符) already does in both modes.
+    // Leaving it mode-gated made the two disagree in the same visible state:
+    // after 上屏 the box is empty and the text is on the terminal, yet the
+    // system keyboard could not erase it while ⌫ could.
+    // Non-empty is still left alone so a pending IME draft edits locally
+    // instead of eating terminal characters.
+    if(!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+      e.preventDefault();
+      sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
   setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
