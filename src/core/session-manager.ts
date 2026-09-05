@@ -16,7 +16,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -1095,6 +1095,15 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
+/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
+ *  Absent bot / unreadable config → false: an uncertain answer must not add a
+ *  block claiming a boundary that is not configured. */
+function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -1201,6 +1210,13 @@ export function buildNewTopicPrompt(
     if (routingBlock) parts.push(routingBlock);
     if (skillBlock) parts.push(skillBlock);
     if (identityBlock) parts.push(identityBlock);
+    // Trigger-user auth: the same credential boundary the claude-family adapters
+    // get via --append-system-prompt. Without it the inline-prompt CLIs
+    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // this release's only protection, a missing block there is a silent hole.
+    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
+      parts.push(buildCredentialBoundaryBlock(locale));
+    }
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
   if (roleBlock) parts.push(roleBlock);

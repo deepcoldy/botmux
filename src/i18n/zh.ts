@@ -774,6 +774,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
+  'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
+  'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
+  'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
+  'ai.credentials.on_auth_failure': '遇到鉴权失败：直接把失败原样告诉用户，并提示他发 /login 授权；不要试图翻找、拼凑或复用其他凭证来绕过。',
   'ai.identity.routing_intro': '群里可能有多个 bot，按 @名字 和 open_id 区分归属：',
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',

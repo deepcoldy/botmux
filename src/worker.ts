@@ -14165,6 +14165,11 @@ async function spawnCli(
     // adapters (claude-code/genius/grok build it via buildBotmuxSystemPromptText).
     // Reuses the same predicate computed above for the persistent-pane guard.
     noTransport: noTransportSession,
+    // Trigger-user auth on → the system prompt gains the credential-boundary
+    // block. It is a behavioral rule, not a control: nothing in the OS stops the
+    // agent from reading another person's token file today, and the likeliest
+    // way that happens is an agent grepping the data dir to debug an auth error.
+    triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,

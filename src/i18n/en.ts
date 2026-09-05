@@ -775,6 +775,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
+  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
+  'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/ belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
+  'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
+  'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to run /login. Do not go looking for, assemble, or reuse other credentials to work around it.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',
