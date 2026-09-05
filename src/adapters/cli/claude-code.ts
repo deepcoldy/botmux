@@ -23,6 +23,7 @@ import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -361,6 +362,12 @@ export function syncClaudeResumeTargetToCwd(
  *  them. Single source of truth for both the adapter's `pluginDir` field and
  *  the spawn-time flag. */
 const CLAUDE_PLUGIN_DIR = join(homedir(), '.botmux', 'claude-plugin');
+
+/** Effort levels Claude Code's `--effort` flag accepts (claude 2.1.259), taken
+ *  from the same catalog the config gate and the dashboard selector read, so the
+ *  accepted set cannot drift between them. The shared `reasoningEffort` type is a
+ *  superset — `ultra` is a codex/traex level Claude rejects. */
+const CLAUDE_EFFORT_LEVELS = new Set<string>(CLAUDE_REASONING_EFFORTS);
 
 /** Substrings that indicate Claude Code received our submit. We accept either:
  *  - `"role":"user","content":"` — direct submission while idle (the canonical
@@ -730,6 +737,11 @@ export interface ClaudeFamilyVariant {
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
   readonly reliableTurnTerminal?: boolean;
+  /** True when this variant's CLI accepts `--effort <level>` (Claude Code
+   *  2.1.x). Forks and gateway variants whose flag surface is not Claude's
+   *  own leave it undefined, so `reasoningEffort` is silently ignored for
+   *  them rather than producing an unknown-flag launch. */
+  readonly supportsEffortFlag?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
@@ -740,6 +752,8 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // refuses durable submits unless it has first installed an attributable
     // bridge mark, and failure/exit paths share the same terminal deduper.
     reliableTurnTerminal: true,
+    // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
+    supportsEffortFlag: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -830,7 +844,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, noTransport }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -852,6 +866,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
       if (model && model.trim()) {
         args.push('--model', model.trim());
+      }
+      // Per-bot reasoning effort. Claude's flag is `--effort` (not grok's
+      // `--reasoning-effort`), and its accepted set is low|medium|high|xhigh|max
+      // — `ultra` is NOT one of them: claude 2.1.259 answers an unknown value
+      // with `Warning: Unknown --effort value '<v>' — ignoring it and using the
+      // default effort.` and runs on regardless, so passing the shared type's
+      // `ultra` through would be a silent no-op plus a warning on every spawn.
+      // (Claude's own `ultracode` level is deliberately not mapped here: it is
+      // session-scoped — `/effort ultracode` inside the TUI — and additionally
+      // gated, so a declarative config value would silently resolve to `high`.)
+      if (variant.supportsEffortFlag && reasoningEffort && CLAUDE_EFFORT_LEVELS.has(reasoningEffort)) {
+        args.push('--effort', reasoningEffort);
       }
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');

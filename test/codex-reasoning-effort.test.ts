@@ -30,7 +30,8 @@ describe('Grok model-aware reasoning efforts', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
     expect(isConfigurableReasoningCliId('codex')).toBe(true);
     expect(isConfigurableReasoningCliId('traex')).toBe(true);
-    expect(isConfigurableReasoningCliId('claude-code')).toBe(false);
+    expect(isConfigurableReasoningCliId('claude-code')).toBe(true);
+    expect(isConfigurableReasoningCliId('gemini')).toBe(false);
   });
 
   it('exposes xhigh only for grok-4.6', () => {
@@ -65,5 +66,39 @@ describe('TraeX model-aware reasoning efforts', () => {
     expect(reasoningEffortsForCliModel('traex', 'custom-model')).toEqual(['low', 'medium', 'high']);
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(true);
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'xhigh')).toBe(false);
+  });
+});
+
+describe('Claude model-aware reasoning efforts', () => {
+  it('offers all five levels on every non-haiku model', () => {
+    // Mirrors claude-code.ts modelChoices (aliases + pinned 5-series ids).
+    for (const m of ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'opus', 'sonnet', 'fable']) {
+      expect(reasoningEffortsForCliModel('claude-code', m)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  it('offers nothing for haiku, which takes no effort parameter but IS selectable', () => {
+    // Both spellings appear in modelChoices, so this pair is reachable from setup
+    // and the dashboard; without the guard it would be accepted and never honoured.
+    for (const m of ['claude-haiku-4-5-20251001', 'claude-haiku-4-5', 'haiku']) {
+      expect(reasoningEffortsForCliModel('claude-code', m)).toEqual([]);
+      expect(cliModelSupportsReasoningEffort('claude-code', m, 'max')).toBe(false);
+      expect(cliModelSupportsReasoningEffort('claude-code', m, 'low')).toBe(false);
+    }
+  });
+
+  it('offers the full set for gateway aliases and unrecognised names', () => {
+    // A relay/model_hub alias cannot be matched to a capability row. Capping it
+    // would silently deny max to every gateway user; an unsupported level only
+    // costs a CLI warning, a missing one is unrecoverable from config.
+    for (const m of ['model_hub/es1_orange_o50[1m]', 'some-future-claude', undefined]) {
+      expect(reasoningEffortsForCliModel('claude-code', m)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  it('never offers ultra, which claude rejects outright', () => {
+    for (const m of [undefined, 'claude-opus-5', 'claude-opus-4-6']) {
+      expect(reasoningEffortsForCliModel('claude-code', m)).not.toContain('ultra');
+    }
   });
 });

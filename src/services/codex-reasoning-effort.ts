@@ -3,6 +3,33 @@ export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
 export const TRAEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 3);
+/** Claude Code's `--effort` flag parses exactly low|medium|high|xhigh|max —
+ *  `ultra` is codex/traex-only and Claude answers it with an unknown-value
+ *  warning. Spelled out rather than sliced off CODEX_REASONING_EFFORTS: the two
+ *  lists agree today by coincidence, and a level inserted mid-list upstream
+ *  would silently drop `max` here and admit a level Claude rejects.
+ *
+ *  Flag parsing is model-independent (opus-5 / sonnet-5 / haiku-4.5 all print
+ *  the same `Valid values:`), but *honouring* a level is not — the Claude docs'
+ *  effort page lists no Haiku model at all. See claudeReasoningEffortsForModel. */
+const CLAUDE_ALL_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** Exported for the adapter's arg filter: the widest set any Claude model takes. */
+export const CLAUDE_REASONING_EFFORTS = CLAUDE_ALL_REASONING_EFFORTS;
+
+/** Only Haiku is withheld: it takes no effort parameter at all, yet the adapter
+ *  lists it in `modelChoices` (both `haiku` and the pinned `claude-haiku-4-5-…`),
+ *  so it is the one selectable pairing that would be accepted and never honoured.
+ *
+ *  Everything else — including gateway-mapped names such as `model_hub/…` that
+ *  cannot be matched to a row, and models released after this table — gets the
+ *  full set. Withholding levels from an unrecognised name would silently cap
+ *  relay users at `high` on a model that may well honour `max`, and an
+ *  unsupported level costs only a warning on the CLI, while a missing one is
+ *  unrecoverable from config. */
+export function claudeReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
+  if (model?.trim().toLowerCase().includes('haiku')) return [];
+  return CLAUDE_ALL_REASONING_EFFORTS;
+}
 
 export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
 
@@ -39,7 +66,8 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
 }
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
-  return isCodexReasoningCliId(cliId) || cliId === 'grok' || cliId === 'traex';
+  return isCodexReasoningCliId(cliId) || cliId === 'grok' || cliId === 'traex'
+    || cliId === 'claude-code';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -79,6 +107,7 @@ export function reasoningEffortsForCliModel(
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
+  if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
   return [];
 }
 
