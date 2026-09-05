@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -1784,6 +1784,60 @@ describe('handleCommand', () => {
 
       expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
       expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+    });
+  });
+
+  // 会话发起人闸放宽：bot 管理员（canOperate）能 fork 本 bot 的任意会话。
+  // 理由是权限单调性——管理员本来就能 /close /restart 掉这个会话，"能销毁却不能
+  // 拷贝一份"没有安全意义；fork 又是非破坏性的（源会话不动）。非管理员不受影响。
+  describe('/fork 发起人闸 — 管理员例外', () => {
+    afterEach(() => { vi.mocked(canOperate).mockReturnValue(true); });
+
+    it('非发起人且非管理员（canOperate=false）→ 拒，不建话题', async () => {
+      vi.mocked(canOperate).mockReturnValue(false);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+    });
+
+    it('非发起人但是管理员（canOperate=true）→ 放行，子会话归 fork 发起的管理员', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      // 关键：子会话 owner 改记成 ou_sender（发 fork 的管理员），不继承 ou_other_user。
+      // 否则 --create 建的新群里只有管理员自己，owner-only 回复会指向一个不在群里的人。
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
+    });
+
+    it('发起人自己 fork → childOwnerOpenId 不下发（继承源 owner，保持现状）', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
     });
   });
 
