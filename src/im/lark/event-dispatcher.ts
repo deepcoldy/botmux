@@ -3112,8 +3112,17 @@ async function processCommentEvent(
     return;
   }
   const trigger = parsed.replyId
-    ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
+    ? comment.replies.find(r => r.replyId === parsed.replyId)
     : comment.replies[comment.replies.length - 1];
+  // ⚠️ 事件给了 reply_id 却在 thread 里找不到 → 只能是**我们拿到的 replies 不完整**
+  // （飞书对回复串分页，见 doc-comment.ts:hydrateTruncatedReplies）。这里曾经
+  // `?? replies[last]` 静默回退到最后一条已知回复，后果是长 thread 从第 6 条起
+  // 永久失联：turnId 恒等于那条老回复 → 每条新评论都被 dedup 当成重复回合丢掉，
+  // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
+  if (!trigger) {
+    logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
+    return;
+  }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
