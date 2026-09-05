@@ -51,9 +51,10 @@ function botConfig(triggerUserAuth: unknown = { enabled: true, tools: ['lark-cli
   } as any;
 }
 
-function publish(config: any, senderOpenId: string | undefined) {
+function publish(config: any, senderOpenId: string | undefined, turnId?: string) {
   return publishTurnCliIdentity({
     botConfig: config,
+    ...(turnId ? { turnId } : {}),
     sessionDataDir: dir,
     sessionId: SESSION,
     senderOpenId,
@@ -141,6 +142,25 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
     expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
+  });
+});
+
+// The identity has to say which turn it is for, or the wrapper cannot tell a
+// stale one from the current one — see the turn-binding tests in
+// cli-identity.test.ts for what it does with this.
+describe('publishTurnCliIdentity — turn stamping', () => {
+  it('stamps the turn on published credentials', async () => {
+    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    await publish(botConfig(), ALICE, 'turn-A');
+    expect(readFileSync(larkPath(), 'utf8')).toContain("BOTMUX_IDENTITY_TURN='turn-A'");
+  });
+
+  it('stamps the turn on a refusal too', async () => {
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+    await publish(config, BOB, 'turn-B');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).toContain("BOTMUX_IDENTITY_TURN='turn-B'");
   });
 });
 

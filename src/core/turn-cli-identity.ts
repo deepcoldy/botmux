@@ -51,6 +51,12 @@ export interface PublishTurnIdentityArgs {
   senderOpenId: string | undefined;
   /** For the stderr text the wrapper prints when a command is refused. */
   locale?: Locale;
+  /**
+   * The turn these credentials are for. Stamped into the file so the wrapper can
+   * refuse to use them during a different turn — the CLI runs its own queue, so
+   * a newer message's credentials can land while an older turn is still going.
+   */
+  turnId?: string;
 }
 
 /**
@@ -63,7 +69,7 @@ export interface PublishTurnIdentityArgs {
 export async function publishTurnCliIdentity(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
-  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale } = args;
+  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
 
@@ -73,7 +79,7 @@ export async function publishTurnCliIdentity(
       continue;
     }
     try {
-      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale));
+      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -84,7 +90,7 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push(withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale));
+      outcomes.push(withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     }
   }
   return outcomes;
@@ -97,9 +103,10 @@ async function publishOne(
   sessionId: string,
   senderOpenId: string | undefined,
   locale: Locale | undefined,
+  turnId: string | undefined,
 ): Promise<ToolIdentityOutcome> {
   const withheld = () =>
-    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale);
+    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId);
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
@@ -109,7 +116,7 @@ async function publishOne(
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return withheld();
 
-  writeSessionIdentity(sessionDataDir, sessionId, identity);
+  writeSessionIdentity(sessionDataDir, sessionId, { ...identity, ...(turnId ? { turnId } : {}) });
   return { tool, state: 'user' };
 }
 
@@ -132,6 +139,7 @@ function withholdIdentity(
   sessionId: string,
   senderOpenId: string | undefined,
   locale: Locale | undefined,
+  turnId: string | undefined,
 ): ToolIdentityOutcome {
   if (
     unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) !== 'fail'
@@ -145,6 +153,7 @@ function withholdIdentity(
         mode: 'bot',
         appId: botConfig.larkAppId,
         appSecret: botConfig.larkAppSecret,
+        ...(turnId ? { turnId } : {}),
       });
       return { tool, state: 'bot-identity' };
     } catch {
@@ -152,7 +161,7 @@ function withholdIdentity(
       // which is the safe end of this failure.
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId);
   return { tool, state: 'needs-authorization' };
 }
 
@@ -175,6 +184,7 @@ function writeDenial(
   senderOpenId: string | undefined,
   botConfig: BotConfig,
   locale: Locale | undefined,
+  turnId: string | undefined,
 ): void {
   try {
     const name = senderOpenId && botConfig.larkAppId
@@ -186,6 +196,7 @@ function writeDenial(
     writeSessionIdentity(sessionDataDir, sessionId, {
       tool,
       mode: 'denied',
+      ...(turnId ? { turnId } : {}),
       message: [
         head,
         t('trigger_user_auth.denied_howto', undefined, locale),
