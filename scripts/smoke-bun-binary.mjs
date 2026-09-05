@@ -71,8 +71,18 @@ mkdirSync(join(home, '.botmux'), { recursive: true });
 // dashboard to add their first bot" state — and it needs no credentials.
 writeFileSync(join(home, '.botmux', 'bots.json'), '[]');
 
+// Drop every inherited BOTMUX_* variable before layering the scratch config on
+// top. When this script runs INSIDE a botmux-managed CLI session (a bot doing a
+// local repro), the shell carries the live fleet's BOTMUX_DAEMON_IPC_PORT,
+// BOTMUX_LARK_APP_ID, BOTMUX_SESSION_ID, … — and the smoke supervisor inherits
+// them, so a scratch-HOME test fleet can end up addressing the REAL daemon's IPC
+// port. Measured: a leftover smoke supervisor carried BOTMUX_DAEMON_IPC_PORT=7950
+// (the live daemon) while its own base port had been set to 19950.
+const inheritedEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([k]) => !k.startsWith('BOTMUX_') && k !== 'BOTMUX' && k !== 'BOTS_CONFIG' && k !== 'SESSION_DATA_DIR'),
+);
 const childEnv = {
-  ...process.env,
+  ...inheritedEnv,
   HOME: home,
   BOTMUX_DAEMON_IPC_BASE_PORT: String(PORTS.ipc),
   BOTMUX_WEB_PROXY_BASE_PORT: String(PORTS.proxy),
@@ -149,6 +159,32 @@ const fail = (step, detail) => {
   process.exit(1);
 };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── 0. darwin: the Mach-O ad-hoc signature is valid ──────────────────────────
+// `bun build --compile` writes an ad-hoc code signature into every darwin
+// binary. Bun 1.4.0 wrote an INVALID one (last page hashed zero-padded, stale
+// signature bytes left past the new one — oven-sh/bun#39764, fixed in #39837 /
+// 1.4.1). Older macOS tolerated it, so the binary still ran here on the
+// macos-14 runner and every check below passed, while macOS 27 SIGKILLs the
+// process before main() — `botmux upgrade` to 3.18.14 died with `exit SIGKILL`
+// and nothing else. Verify the signature explicitly so a release gate never
+// again depends on the runner's macOS being lenient. `--strict` is what Apple's
+// newer loaders effectively enforce.
+if (process.platform === 'darwin') {
+  try {
+    // codesign reports on stderr even on success; a zero exit is the verdict.
+    execFileSync('codesign', ['--verify', '--strict', '--verbose=2', binary], {
+      encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    console.log('smoke: ✅ codesign — ad-hoc Mach-O signature valid (--strict)');
+  } catch (err) {
+    const detail = err && typeof err === 'object' && 'stderr' in err && err.stderr
+      ? String(err.stderr).trim()
+      : (err instanceof Error ? err.message : String(err));
+    fail('codesign', `invalid Mach-O signature — newer macOS will SIGKILL this binary before it runs. ` +
+      `Check the Bun that compiled it (1.4.0 is known-bad, need >= 1.4.1). codesign said: ${detail}`);
+  }
+}
 
 // ── 1. capabilities: the CLI graph loads ─────────────────────────────────────
 // Run from a scratch cwd with NO node_modules so a missing native/embedded

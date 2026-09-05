@@ -62,7 +62,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.1
       - run: bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
@@ -314,7 +314,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.1
       - run: bun install --frozen-lockfile
 
       - name: Upgrade npm for Trusted Publishing
@@ -707,7 +707,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: matrix.glibc_baseline == ''
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.1
       # --frozen-lockfile + the platform's own install compiles node-pty's
       # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
       - if: matrix.glibc_baseline == ''
@@ -738,6 +738,27 @@ jobs:
           for t in ${{ matrix.targets }}; do
             bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
           done
+
+      - name: Verify Mach-O signatures on every darwin binary
+        if: matrix.glibc_baseline == '' && runner.os == 'macOS'
+        # `bun build --compile` ad-hoc-signs darwin binaries, and Bun 1.4.0 wrote
+        # an INVALID signature (oven-sh/bun#39764, fixed in #39837 → 1.4.1). The
+        # macos-14 runner tolerated it, so 3.18.14 built, smoke-passed and shipped
+        # — and macOS 27 SIGKILLed it before main(), which is all `botmux upgrade`
+        # saw. The smoke step below only runs the HOST arch; this verifies BOTH
+        # darwin outputs (the cross-built one included) with the same strictness
+        # newer macOS applies, so a bad signature fails the release here instead
+        # of on a user machine.
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            echo "codesign --verify --strict $f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
 
       - name: Smoke-test the host-arch binary
         if: matrix.glibc_baseline == ''
@@ -866,7 +887,7 @@ jobs:
 
               # setup-bun does not support musl, and npm ships musl builds of bun
               # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
-              npm i -g bun@1.4.0 --loglevel=error
+              npm i -g bun@1.4.1 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the whole point of this job.
