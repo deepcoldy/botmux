@@ -81,7 +81,7 @@ docker run --rm \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
     export PATH="/opt/node/bin:$PATH"
     node --version
-    npm install -g bun@1.4.0 --loglevel=error
+    npm install -g bun@1.4.1 --loglevel=error
     bun --version
 
     # Compiles node-pty on glibc 2.28; trustedDependencies makes this lifecycle

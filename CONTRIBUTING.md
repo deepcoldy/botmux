@@ -18,7 +18,7 @@ bun run daemon:logs
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.0`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.1`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without

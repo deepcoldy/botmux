@@ -41,13 +41,13 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      # Bun is the package manager (packageManager: bun@1.4.0). node-pty's native
+      # Bun is the package manager (packageManager: bun@1.4.1). node-pty's native
       # build runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
       # need a real build/Release/pty.node.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.1
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run test
@@ -89,7 +89,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.1
       - run: bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
@@ -183,7 +183,7 @@ jobs:
               # prebuild and must compile here. binutils supplies readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.0 --loglevel=error
+              npm i -g bun@1.4.1 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
