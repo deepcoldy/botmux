@@ -3569,6 +3569,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     sessionId: ds.session.sessionId,
     senderOpenId,
     locale: localeForBot(ds.larkAppId),
+    // Stamped so the wrapper can tell these credentials apart from a later
+    // message's: acceptance here is not the same instant as the CLI starting
+    // this turn, and B's message can be accepted while A's turn still runs.
+    turnId,
   });
 
   const needsAuth = outcomes.filter(o => o.state === 'needs-authorization');

@@ -56,6 +56,41 @@ export function sessionIdentityPath(
   return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`);
 }
 
+/**
+ * The turn the CLI is executing RIGHT NOW, as published by the worker.
+ *
+ * Separate from the identity file because the two have different writers and
+ * different lifetimes: the daemon writes the identity when a message is
+ * *accepted*, the worker writes this when a turn actually *starts*. The gap
+ * between those is the whole problem — see {@link renderIdentityWrapper}.
+ *
+ * Plain text, one line, no JSON: the wrapper reads it in `/bin/sh` on every
+ * invocation, and parsing JSON there would mean spawning `jq`.
+ */
+export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`);
+}
+
+/**
+ * Publish the turn now executing. Called by the worker at the point it hands a
+ * queued input to the CLI, which is later than the daemon's acceptance of that
+ * message and possibly much later.
+ *
+ * Best-effort: a failure here can only cost a refused command, never a wrong
+ * identity, because the wrapper treats an unreadable turn file as a mismatch.
+ */
+export function publishActiveTurn(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string | undefined,
+): void {
+  const path = sessionActiveTurnPath(sessionDataDir, sessionId);
+  try {
+    mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+    atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
+  } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
+}
+
 /** Session ids reach here from IPC; they are concatenated into a path, so a
  *  `../` shaped id must not be able to redirect a credential write. */
 function assertSafeSegment(value: string): string {
@@ -87,13 +122,20 @@ export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> =
   bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
 };
 
-export interface LarkCliIdentity {
+/** Common to every variant: the turn these credentials were published FOR.
+ *  The wrapper refuses to use them during any other turn. Absent ⇒ no binding
+ *  (the pre-turn-binding paths, and tests that do not exercise it). */
+interface TurnBound {
+  turnId?: string;
+}
+
+export interface LarkCliIdentity extends TurnBound {
   tool: 'lark-cli';
   appId: string;
   userAccessToken: string;
 }
 
-export interface BytedCliIdentity {
+export interface BytedCliIdentity extends TurnBound {
   tool: 'bytedcli';
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
@@ -112,7 +154,7 @@ export interface BytedCliIdentity {
  * than reaching back to the disk credentials — so the bot identity is a real
  * floor, not a default the agent can step out of.
  */
-export interface BotIdentity {
+export interface BotIdentity extends TurnBound {
   tool: 'lark-cli';
   mode: 'bot';
   appId: string;
@@ -126,7 +168,7 @@ export interface BotIdentity {
  * learns whose authorization is missing and how to supply it. Composed in TS
  * because that is where the locale lives.
  */
-export interface DeniedIdentity {
+export interface DeniedIdentity extends TurnBound {
   tool: TriggerUserAuthTool;
   mode: 'denied';
   message: string;
@@ -143,6 +185,9 @@ export const IDENTITY_DENIED_EXIT_CODE = 77;
  *  truncated, empty, or never-written file can never mean "run unrestricted". */
 const MODE_VAR = 'BOTMUX_IDENTITY_MODE';
 const DENY_MSG_VAR = 'BOTMUX_IDENTITY_DENY_MSG';
+/** The turn these credentials belong to; compared against the worker's live
+ *  turn file before they may be used. */
+const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
 
 /**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
@@ -181,6 +226,7 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
   }
+  if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
   return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
 }
@@ -260,6 +306,18 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *    Failing this way is safe to default to: the only thing an unwritten file
  *    can mean is that the daemon has not yet decided, and borrowing a stranger's
  *    credentials while it decides is worse than not running.
+ *
+ *  - **The identity must belong to the turn now running.** The daemon publishes
+ *    when a message is ACCEPTED; the CLI runs turns from its own queue, so
+ *    while A's turn is still executing, B's message can arrive and overwrite the
+ *    file — and A's remaining tool calls would then run with B's permissions.
+ *    The daemon cannot close that gap alone (the worker does not wait for it),
+ *    so each identity carries the turn it was published for, the worker
+ *    publishes the turn it is actually executing, and a mismatch refuses.
+ *
+ *    The cost is real and deliberate: tool calls in the tail of A's turn fail
+ *    once B has spoken. That is the trade this feature is for — a failed command
+ *    is recoverable, a command that silently ran as the wrong person is not.
  */
 export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
@@ -282,9 +340,35 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '  unset __botmux_cred',
     'fi',
     '',
+    // Turn binding. `__botmux_live` is the turn the CLI is executing now; the
+    // identity names the turn it was published for. Unequal ⇒ the file has been
+    // replaced by a newer message's credentials while this turn is still
+    // running, so these are somebody else's.
+    '__botmux_live=',
+    'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
+    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.turn"',
+    '  if [ -f "$__botmux_turnf" ]; then',
+    '    read -r __botmux_live < "$__botmux_turnf" || __botmux_live=',
+    '  fi',
+    '  unset __botmux_turnf',
+    'fi',
+    // Only enforced when both sides state a turn. An identity published without
+    // one predates turn binding; a session with no live turn file has nothing to
+    // contradict. Neither is evidence of a mismatch, so neither refuses here.
+    `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
+    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    `  ${MODE_VAR}=turn-mismatch`,
+    'fi',
+    'unset __botmux_live',
+    '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
     `    export ${exportKeys}`,
+    '    ;;',
+    '  turn-mismatch)',
+    `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,
+    `    printf '%s\\n' 'botmux: 请等当前这轮结束后重试，或由本轮发起人重新发起该操作。' >&2`,
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     '  *)',
     // Guidance, not just refusal: whoever reads this needs to know it was a
@@ -297,7 +381,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR}`,
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');
@@ -324,8 +408,13 @@ export function ensureSessionIdentityPlaceholders(
   tools: readonly TriggerUserAuthTool[],
 ): void {
   mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
-  for (const tool of tools) {
-    const path = sessionIdentityPath(sessionDataDir, sessionId, tool);
+  const paths = [
+    ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
+    // Same existence-filter reason: the wrapper reads the active turn on every
+    // invocation, and a path missing at spawn stays unreadable afterwards.
+    sessionActiveTurnPath(sessionDataDir, sessionId),
+  ];
+  for (const path of paths) {
     if (existsSync(path)) continue;
     atomicWriteFileSync(path, '', { mode: 0o600 });
   }

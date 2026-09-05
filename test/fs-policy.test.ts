@@ -1672,12 +1672,18 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
         .toBe('readOnly');
     }
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('readOnly');
+    // The wrapper also reads the turn the CLI is currently executing, to refuse
+    // credentials that belong to a different turn. Without this grant a
+    // sandboxed session reads nothing and every governed command is refused.
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.turn`).access).toBe('readOnly');
   });
 
   // The one that matters: session A must not be able to read session B's token.
   it('leaves another session\'s identity denied', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.lark-cli.env`).access)
+      .not.toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.turn`).access)
       .not.toBe('readOnly');
     // And the shared parent is never granted, so a future session's file cannot
     // be reached either (the allow-list must not fail open for files created

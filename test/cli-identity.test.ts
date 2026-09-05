@@ -22,6 +22,7 @@ import {
   renderIdentityEnv,
   renderIdentityWrapper,
   IDENTITY_DENIED_EXIT_CODE,
+  publishActiveTurn,
   writeSessionIdentity,
   clearSessionIdentity,
   clearAllSessionIdentities,
@@ -248,6 +249,69 @@ describe('renderIdentityWrapper', () => {
 
   // Bot mode carries the app secret: that pair is what actually makes lark-cli
   // resolve `identity: bot` while an on-disk user login exists.
+  // ── Turn binding ────────────────────────────────────────────────────────
+  //
+  // The daemon publishes credentials when a message is ACCEPTED, but the CLI
+  // runs turns off its own queue. So while A's turn is still executing, B's
+  // message can overwrite the file, and A's remaining tool calls would run with
+  // B's permissions. Each identity therefore names its turn, the worker
+  // publishes the turn actually running, and a mismatch refuses.
+
+  it('runs when the identity belongs to the turn now executing', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A' });
+    publishActiveTurn(dir, SESSION, 'turn-A');
+
+    expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
+  });
+
+  // The regression itself: Alice's turn is mid-flight when Bob's message lands.
+  it('refuses the older turn once a newer sender has overwritten the identity', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    publishActiveTurn(dir, SESSION, 'turn-A');
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-bob', turnId: 'turn-B' });
+
+    const { status, stderr } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(stderr).toContain('上一轮');
+    // And Bob's turn works the moment the CLI actually reaches it.
+    publishActiveTurn(dir, SESSION, 'turn-B');
+    expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-bob|');
+  });
+
+  // Only a real disagreement refuses. An identity with no turn predates the
+  // binding, and a session with no live turn file states nothing to contradict;
+  // treating either as a mismatch would refuse every command in those paths.
+  it.each([
+    ['the identity carries no turn', undefined, 'turn-A'],
+    ['no live turn has been published', 'turn-A', undefined],
+  ])('still runs when %s', (_label, identityTurn, liveTurn) => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok', ...(identityTurn ? { turnId: identityTurn } : {}),
+    });
+    if (liveTurn) publishActiveTurn(dir, SESSION, liveTurn);
+
+    expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok|');
+  });
+
+  // The turn marker is bookkeeping between daemon and wrapper; leaking it into
+  // the tool's environment would make it look like a real lark-cli setting.
+  it('does not leak the turn marker into the tool environment', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    const real = join(dir, 'echo-turn.sh');
+    writeFileSync(real, '#!/bin/sh\nprintf "[%s][%s]" "$BOTMUX_IDENTITY_TURN" "$BOTMUX_IDENTITY_MODE"\n');
+    chmodSync(real, 0o755);
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', real));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok', turnId: 'turn-A' });
+    publishActiveTurn(dir, SESSION, 'turn-A');
+
+    expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('[][]');
+  });
+
   it('runs as the bot when bot mode is published', () => {
     const wrapperPath = join(dir, 'lark-cli');
     const real = join(dir, 'bot-tool.sh');

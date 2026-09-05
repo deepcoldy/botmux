@@ -821,6 +821,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
+      // The turn the CLI is currently executing. The wrapper compares it against
+      // the turn stamped on the identity and refuses on a mismatch, so without
+      // this grant a sandboxed session reads nothing and every governed command
+      // fails — the deny is safe, but it is not the behavior we want.
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.turn`,
     ], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
