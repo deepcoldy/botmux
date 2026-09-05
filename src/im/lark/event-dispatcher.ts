@@ -25,7 +25,7 @@ import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
@@ -77,6 +77,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
+import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -3056,6 +3057,162 @@ function handleVcMeetingPushEventAckSafe(
   }, `vc-meeting ${kind} event`);
 }
 
+/**
+ * 在被丢弃的触发回复上打一个 ❌，让「这条 @ 我没能处理」在文档里**看得见**。
+ *
+ * 为什么需要：文档评论事件被丢弃后，飞书不会重投（事件已 ACK），而 mention-only
+ * 订阅**不进轮询**（poller 只收 commentTriggerMode==='all'），所以事件链路失败
+ * 就是终点。用户侧原本只能看到「bot 不理我」，与「bot 正在忙」无法区分——doc
+ * 发起的会话在飞书上整个不可见，只能去 dashboard 翻 terminal 才知道发生了什么。
+ *
+ * 只在**明确知道该怪谁**、且非预期的丢弃点上打：
+ *   • 拉不到评论内容 / 触发回复不在拉到的回复里 —— 都是我们这边没读到用户说了啥
+ *   • 纯 @bot 无文本正文（elementsToText 只拼 text_run，丢掉 person）
+ * **不打**的场景：自触发（bot 自己的回复）、mention-only 未 @ 本 bot（压根不该
+ * 触发，打了反而在别人的评论上留噪音）、'all' 模式下真正没 @ 谁的空评论。
+ *
+ * 顺序是**自触发拦截 → 审计门 → tenant-only 写入**：先挡掉自己的事件，免得为它
+ * 去打扰 owner；审计通过后才允许产生 provider-visible 效果。
+ *
+ * best-effort：内部再兜一层 try/catch，绝不让「打标记失败」影响丢弃路径本身
+ * （那已经是失败路径了）。返回值如实回报结果，调用方据此记日志。
+ */
+/**
+ * 审计硬门：非 owner 触发时，必须**成功通知 owner** 才允许对外产生可见效果。
+ * owner 无法感知 = 越权，一律拒绝并回滚本次 auto-sub。owner 本人触发直接放行。
+ *
+ * 抽成 helper 是为了让「回复」和「失败标记」共用同一套规则 —— 两者都是
+ * provider-visible 的外部写入，规则分叉迟早会让其中一条悄悄绕过审计。
+ *
+ * `textSummary` 是通知正文里给 owner 看的摘要。**它可以不是评论正文**：失败
+ * 路径根本读不到正文，此时传一句说明（「评论正文读取失败…」）即可，不能因为
+ * 「构造不出摘要」就跳过审计。
+ *
+ * @returns true = 已授权（owner 本人，或通知成功）；false = 拒绝，调用方必须
+ *          立刻 return，且 auto-sub 已在这里回滚。
+ */
+async function passesDocCommentAuditGate(
+  larkAppId: string,
+  fileToken: string,
+  requesterOpenId: string | undefined,
+  textSummary: string,
+  rollbackAutoSub: () => void,
+  kind: 'reply' | 'dropped-signal' = 'reply',
+): Promise<boolean> {
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId) return true;
+
+  if (!ownerOpenId) {
+    logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+    rollbackAutoSub();
+    return false;
+  }
+  try {
+    const loc = localeForBot(larkAppId);
+    const requesterName = requesterOpenId?.slice(0, 12) || '?';
+    const notifyText = [
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_title' : 'daemon.doc_dropped_notify_title', undefined, loc),
+      '',
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_body' : 'daemon.doc_dropped_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
+      '',
+      `📄 \`${fileToken}\``,
+      `💬 ${textSummary.slice(0, 200)}${textSummary.length > 200 ? '…' : ''}`,
+    ].join('\n');
+    await sendUserMessage(larkAppId, ownerOpenId, notifyText);
+    return true;
+  } catch (e) {
+    logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
+    rollbackAutoSub();
+    return false;
+  }
+}
+
+export const __testOnly_passesDocCommentAuditGate = passesDocCommentAuditGate;
+
+/**
+ * 打失败标记的真实结果。**日志必须记这个，不能在调用前自己猜** —— 「模式命中」
+ * 只说明有资格尝试，离真的打上还隔着审计门、自触发拦截和 tenant 请求本身。
+ * 记错了会让排障的人以为「打了但飞书没渲染」，正好和加这个字段的目的相反。
+ */
+type DroppedSignalOutcome =
+  | 'marked'           // 真的打上了
+  | 'no-reply-id'      // 事件没带 reply_id，无处可打
+  | 'self-triggered'   // 触发者是 bot 自己（best-effort 识别）
+  | 'audit-rejected'   // 未过审计硬门（非 owner 且通知 owner 失败 / owner 未配置）
+  | 'reaction-failed'; // 审计通过了，但 tenant 请求失败
+
+async function markCommentEventDropped(
+  larkAppId: string,
+  file: { fileToken: string; fileType: string },
+  commentId: string,
+  replyId: string | undefined,
+  requesterOpenId: string | undefined,
+  auditSummary: string,
+  rollbackAutoSub: () => void,
+): Promise<DroppedSignalOutcome> {
+  // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
+  // 这条事件到此为止且从未过审计，auto-sub 占位必须回滚 —— 否则 malformed /
+  // 缺字段的事件也能留下一条 owner 不知情的订阅。下面 self-triggered 同理。
+  if (!replyId) {
+    rollbackAutoSub();
+    return 'no-reply-id';
+  }
+
+  // ⚠️ 自触发拦截要放在审计门**之前**：给自己打标记本来就不该发生，没必要为它
+  // 去打扰 owner。正常那道 self-filter（trigger.userId 等三重保险）在下游，
+  // 前两个丢弃点跑在它之前，所以这里得自己挡一次。缺正文时可用的两个信号：
+  //   ① 事件操作者就是本 bot（应用身份发的评论）
+  //   ② reply_id 在本进程「bot 创建过」的集合里（用户身份发的评论，作者分不出）
+  // 信号 ② 不可省：bot 回退 user 身份发评论时作者 = 授权用户 = owner，
+  // 恰好**穿过**下面那道 owner 审计门 —— 只靠审计门挡不住这种自标。
+  // 注意这只是 best-effort：authored set 是进程内内存，重启即失效；
+  // hasBotSentinel 那道要正文，这里没有。不宣称密封。
+  // getBot 抛错时不能让 rollback 被跳过（占位订阅会残留），故取值也包进容错：
+  // 拿不到 open_id 就退化成只靠 isBotAuthoredReply 这一路信号。
+  let selfBotOpenId: string | undefined;
+  try {
+    selfBotOpenId = getBot(larkAppId).botOpenId;
+  } catch {
+    selfBotOpenId = undefined;
+  }
+  if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
+    logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
+    rollbackAutoSub();
+    return 'self-triggered';
+  }
+
+  // ⚠️ 审计硬门：打标记是 **provider-visible 的持久外部写入**，不是内部日志，
+  // 必须和「回复」受同一套约束 —— 非 owner 触发时 owner 无法感知 = 越权。
+  // 这些丢弃点全在下游那道门之前，所以在这里显式过一次同一个 helper。
+  //
+  // 关键：**不能因为「读不到正文、构造不出摘要」就跳过审计**。摘要不必是评论
+  // 正文，失败路径传一句说明即可（见调用方传的 auditSummary）。也不能拿
+  // 「本次是否新建了 auto-sub」当授权判据 —— 历史脏状态和并发窗口都会让
+  // 未审计的订阅看起来像既有授权。
+  if (!await passesDocCommentAuditGate(larkAppId, file.fileToken, requesterOpenId, auditSummary, rollbackAutoSub, 'dropped-signal')) {
+    logger.info(`[doc-comment] dropped-signal skipped (audit gate): comment=${commentId.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+    return 'audit-rejected';
+  }
+
+  try {
+    // ⚠️ tenantOnly：**绝不能**回退 user 身份。这个 ❌ 是终态标记、故意不清理，
+    // 一旦以授权用户身份落上去，就是在用户自己的评论上、以用户自己的名义、
+    // 永久挂一个叉 —— 用户会看到「我自己给自己打了个叉」。错误主体的持久写入
+    // 比没有标记更糟，所以 tenant 不行就放弃（下面 catch 里只记日志）。
+    // 对比同文件 Typing 指示器：那个成对、几秒后必被 removeCommentReaction 清掉，
+    // 回退 user 只是短暂误导，故仍用 preferTenant，本 PR 不动它。
+    const { ok } = await addCommentReactionChecked(larkAppId, file, commentId, replyId, DROPPED_REACTION_EMOJI_TYPE, { tenantOnly: true });
+    // ⚠️ 不能用 reactionId 是否存在判成败：官方 schema 的响应体是空对象、
+    // 不承诺带 id，那样会把 code=0 的成功记成失败。只信 ok。
+    return ok ? 'marked' : 'reaction-failed';
+  } catch (err) {
+    logger.debug(`[doc-comment] failed to mark dropped event on reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return 'reaction-failed';
+  }
+}
+
+export const __testOnly_markCommentEventDropped = markCommentEventDropped;
+
 async function processCommentEvent(
   parsed: ReturnType<typeof parseCommentEvent>,
   larkAppId: string,
@@ -3098,6 +3255,32 @@ async function processCommentEvent(
     logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by @mention (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)}, requester=${operatorOpenId?.slice(0, 12) || '?'})`);
   }
 
+  // ⚠️ 回滚能力必须在**所有**早退路径之前就绪。auto-sub 是先建占位、后由审计门
+  // 决定去留的；下面几个丢弃点（拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文）
+  // 都在原审计门之前 return，若不在这里备好回滚，陌生人一次触发就会留下一条
+  // **owner 完全不知情**的订阅记录，且不会被任何人清掉。
+  // 注意反过来也不成立：不能拿「本次没新建 auto-sub」当「owner 曾授权」的证据 ——
+  // 历史脏记录（旧版本留下的未审计订阅）和并发窗口（事件 A 刚 put、事件 B 就读到）
+  // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
+  const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+
+  // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
+  // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
+  //
+  //  ① 只在 mention-only 下打。这是唯一没有兜底的模式：poller
+  //     （daemon.ts:pollWatchedDocComments）只轮 `commentTriggerMode === 'all'`，
+  //     且直接调 handleDocComment、不经过本函数。所以 'all' 恰恰**有**轮询兜底
+  //     —— push 链路这次拉取失败的评论，下一轮 poll 很可能被正常处理，而 ❌ 是
+  //     终态、不会被摘掉，结果就是永久挂在一条根本没丢的评论上。
+  //     （早先注释写的「'all' 拉不到就是真丢了」是反的，PR 描述里「不进轮询 ⇒
+  //     没兜底 ⇒ 终点」那条论证**只对 mention-only 成立**。）
+  //  ② `is_mentioned` 为 false 说明这条评论里一个 @ 都没有，肯定不是找 bot 的。
+  //     注意这是用它**收紧**，与「不能用 is_mentioned 放行」的既有警告不冲突
+  //     —— 那条警告说的是 true 不代表 @ 的是本 bot。
+  //
+  // 这样三个打点的闸口就一致了（第三个打点用的 markEligible 同样只认 mention-only）。
+  const mayConcernThisBot = sub.commentTriggerMode === 'mention-only' && parsed.isMentioned === true;
+
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
   // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId
   // → 合法的 @bot 评论被误丢（事件已被 ACK，飞书不会重投，@ 永久丢失）。await
@@ -3109,6 +3292,25 @@ async function processCommentEvent(
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
+    // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
+    // 订阅下该文档的**所有**评论事件都会推给我们。拉不到正文时我们无从判断这条
+    // 评论是不是冲 bot 来的，无条件打标记会在**别人的评论上**留 ❌。
+    // 拿不到正文时能做到的最窄收窄：`is_mentioned` 为 false 说明评论里一个 @ 都
+    // 没有，肯定不是找 bot 的。注意这里是用它**收紧**，与代码里「不能用
+    // is_mentioned 放行」的警告不冲突 —— 那条警告说的是 true 不代表 @ 的是本 bot。
+    // 'all' 模式不收窄：那种模式不 @ 也该触发，拉不到就是真丢了。
+    if (mayConcernThisBot) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        parsed.replyId, parsed.operatorOpenId,
+        '评论正文读取失败，bot 未处理该条 @，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (取不到评论内容) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
+      rollbackAutoSub();
+    }
     return;
   }
   const trigger = parsed.replyId
@@ -3121,6 +3323,22 @@ async function processCommentEvent(
   // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
   if (!trigger) {
     logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
+    // ⚠️ 和第一个打点同样要收窄。`trigger` 缺失只证明**回复数据不完整**，
+    // 不证明这条回复是冲 bot 来的 —— 已订阅文档下别人的普通回复同样会推事件，
+    // 只要那条 reply 恰好没被拉到就会走到这里。不收窄就会在别人的评论上留 ❌。
+    if (mayConcernThisBot) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        parsed.replyId, parsed.operatorOpenId,
+        '评论回复串未能补全，bot 读不到这条评论的正文，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 这条事件从未过审计。auto-sub 是这次事件建的占位，必须回滚，
+      // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
+      rollbackAutoSub();
+    }
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
@@ -3129,7 +3347,11 @@ async function processCommentEvent(
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
   //    ②reply_id 在 bot 创建集合 ③文本含隐形哨兵。任一命中即跳过。
   const selfBotOpenId = getBot(larkAppId).botOpenId;
-  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) {
+    // 这条事件不会走到审计门，本次 auto-sub 占位必须回滚（同下面 mention gate）。
+    rollbackAutoSub();
+    return;
+  }
 
   // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
   //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
@@ -3137,43 +3359,47 @@ async function processCommentEvent(
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
   if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    rollbackAutoSub();
     return;
   }
 
   const text = trigger.text.trim();
-  if (!text) return;
+  if (!text) {
+    // ⚠️ 空正文**不等于**用户没说话：`elementsToText` 只拼 text_run，把 person
+    // 元素整个丢掉（doc-comment.ts:elementsToText）。所以一条纯「@bot」、后面
+    // 一个字都没打的评论，走到这里 text 就是空串 —— 用户主观上明确 @ 了 bot，
+    // 客观上却零感知，正是 #1260 要治的症状。这里曾经是个裸 return，连日志都没有。
+    //
+    // 打不打标记按模式分：走到这一步已经过了上面的权威 mention gate，
+    // mention-only 说明**确认 @ 了本 bot**，噪音风险已排除，该打；
+    // 'all' 模式下没 @ 谁的空评论是真的「没说话」，只记日志不打，免得把文档里
+    // 所有无正文评论统一标成错误。
+    //
+    // ⚠️ 这里只能判「有没有资格尝试」（markEligible），**不能**写成 marked ——
+    // 离真的打上还隔着审计门、自触发拦截和 tenant 请求，任一不过都不会打。
+    // 真实结果由 helper 返回后单独记，否则排障的人会以为「打了但飞书没渲染」。
+    const markEligible = sub.commentTriggerMode === 'mention-only';
+    logger.info(`[doc-comment] event dropped: 触发回复无文本正文 (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} markEligible=${markEligible}) — 纯 @bot 无正文也会落到这里`);
+    if (markEligible) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        trigger.replyId || parsed.replyId, parsed.operatorOpenId,
+        '纯 @bot，无文本正文，bot 未处理，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (纯 @bot 无正文) comment=${commentId.slice(0, 12)}`);
+    } else {
+      rollbackAutoSub();
+    }
+    return;
+  }
 
   // 审计硬门：非 owner @bot 触发时，必须成功通知 owner 才允许回复。
   // 通知失败 = owner 无法感知 = 越权，直接拒绝响应并回滚 auto-sub。
   // （owner 自己触发的不通知，直接放行。）
-  const ownerOpenId = getOwnerOpenId(larkAppId);
-  const requesterOpenId = parsed.operatorOpenId;
-  const isOwnerTrigger = ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId;
-  if (!isOwnerTrigger) {
-    const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
-    if (!ownerOpenId) {
-      logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
-      rollbackAutoSub();
-      return;
-    }
-    try {
-      const loc = localeForBot(larkAppId);
-      const requesterName = requesterOpenId?.slice(0, 12) || '?';
-      const notifyText = [
-        t('daemon.doc_mention_notify_title', undefined, loc),
-        '',
-        t('daemon.doc_mention_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
-        '',
-        `📄 \`${fileToken}\``,
-        `💬 ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`,
-      ].join('\n');
-      await sendUserMessage(larkAppId, ownerOpenId, notifyText);
-    } catch (e) {
-      logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
-      rollbackAutoSub();
-      return;
-    }
-  }
+  // 走同一个 helper —— 「回复」和「失败标记」共用一套规则，规则分叉迟早会让
+  // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
+  if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) return;
 
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
   await handlers.handleDocComment({
