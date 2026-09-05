@@ -549,7 +549,9 @@ export async function getDocComment(
  * 后仍升序、前 N 条与截断结果逐字节一致 —— 上层 priorReplies / trigger 依赖
  * 这个顺序，换端点不能破坏它。
  *
- * `onTruncated` 决定补全失败时的行为，**两条链路语义不同，必须由调用方选**：
+ * `onTruncated` 决定**补全没能拿到完整回复串**时的行为（包括请求失败、分页
+ * 超上限，以及 `/replies` 返回空数组这种「合法但用不了」的应答 —— 三者对调用
+ * 方是同一件事：手上仍是截断结果）。**两条链路语义不同，必须由调用方选**：
  * - 事件链路（getDocComment）传 'degrade'：退回截断结果。下游 `!trigger` 有
  *   兜底告警，且事件链路本来就没有游标可污染。
  * - 轮询链路（listDocComments）传 'throw'：**绝不能**降级。游标是按拿到的
@@ -597,11 +599,17 @@ async function hydrateTruncatedReplies(
         throw new Error(`回复分页超过 ${MAX_REPLY_PAGES} 页上限（comment=${comment.commentId.slice(0, 12)}），疑似游标未推进`);
       }
     } while (pageToken);
-    // 空数组是**合法应答**（整串回复都被删了），不能和「没拉到」混为一谈。
-    // 但也不敢直接拿它覆盖已有的 5 条，故保留旧值并留痕，让线上能分辨。
+    // 空数组是**合法应答**（整串回复都被删了），不能和「没拉到」混为一谈；
+    // 但也不敢直接拿它覆盖已有的 N 条，只能保留截断结果。
+    //
+    // ⚠️ 保留截断结果 == 补全没成功，所以**必须和补全失败走同一条路**。这里曾经
+    // 无条件 `return comment`，绕过了下面的 catch，等于给 'throw' 契约开了条边路：
+    // 轮询链路拿到截断的回复 + hasMoreReplies:true，游标照样按截断的条数推进，
+    // 正是 onTruncated:'throw' 要堵的永久漏投。
+    // 故这里只管抛，由 catch 里那**唯一一处** onTruncated 分派决定抛还是降级 ——
+    // 别在这儿再判一次 opts.onTruncated，两处分派迟早会走岔。
     if (replies.length === 0) {
-      logger.warn(`[doc-comment] hydrate returned 0 replies for ${comment.commentId.slice(0, 12)} (截断结果有 ${comment.replies.length} 条)；保留截断结果`);
-      return comment;
+      throw new Error(`hydrate returned 0 replies for ${comment.commentId.slice(0, 12)}（截断结果有 ${comment.replies.length} 条）`);
     }
     // 按 createdAt 升序稳定排一次。实测 `/replies` 与 `reply_list.replies` 同序
     // （均为 create_time 升序，跨页拼接后仍升序），但飞书**既没声明排序也没给
@@ -683,7 +691,8 @@ export async function listDocComments(
   } while (pageToken);
   // 串行补全，且只在 has_more 的评论上真正发请求。GET /comments 实测不截断，
   // 所以这里通常一个补全请求都不会发；Promise.all 只会在真出现批量截断时把
-  // 请求一次性打出去撞限流（/replies 限 100 次/分，poll 每 5s 一轮），得不偿失。
+  // 补全请求一次性打出去撞飞书限流（具体额度未核实，别在别处引用一个拍脑袋的
+  // 数字当依据），得不偿失。
   // 注：真出现「一篇文档几十条串都被截断」时，本轮 poll 会明显变慢（有
   // docCommentPollRunning 互斥，不会重入，但会拖慢游标推进）。届时应改成只补全
   // 游标之后可能有新回复的评论 —— 留待后续 PR。

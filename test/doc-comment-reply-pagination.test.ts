@@ -282,6 +282,38 @@ describe('listDocComments: 轮询链路补全失败必须抛错', () => {
     await expect(listDocComments('app-test', FILE)).rejects.toThrow(/页上限|游标未推进/);
     expect(calls).toBeLessThan(200); // 有界，不是死循环
   });
+
+  /**
+   * 回归：`/replies` 返回**空数组**是合法应答（整串回复被删），但对调用方而言
+   * 和补全失败是同一件事 —— 手上仍是截断结果。这里曾经无条件 `return comment`，
+   * 绕过了 onTruncated:'throw'，等于给上面那条游标漏投的契约开了条边路。
+   */
+  it('回归：/replies 返回空数组时轮询链路同样抛错，不走边路降级', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments')) {
+        return listResponse([{ comment_id: COMMENT_ID, has_more: true, reply_list: { replies: first5 } }]);
+      }
+      if (opts.url.includes('/replies')) return { code: 0, data: { items: [], has_more: false } };
+      throw new Error(`unexpected ${opts.url}`);
+    });
+
+    await expect(listDocComments('app-test', FILE)).rejects.toThrow(/0 replies/);
+  });
+
+  it('事件链路对同样的空数组仍降级（两条链路语义不同，别一起改）', async () => {
+    const first5 = [1, 2, 3, 4, 5].map(i => reply(`reply-${i}`, `msg ${i}`, 1788500000 + i));
+    mocks.tenantRequest.mockImplementation(async (opts: any) => {
+      if (opts.url.endsWith('/comments/batch_query')) return truncatedBatchQuery(first5);
+      if (opts.url.includes('/replies')) return { code: 0, data: { items: [], has_more: false } };
+      throw new Error(`unexpected ${opts.url}`);
+    });
+
+    const comment = await getDocComment('app-test', FILE, COMMENT_ID);
+    expect(comment!.replies).toHaveLength(5);
+    // 截断标记必须留着 —— 下游 `!trigger` 的告警靠它区分「分页没补全」和别的原因。
+    expect(comment!.hasMoreReplies).toBe(true);
+  });
 });
 
 /**
