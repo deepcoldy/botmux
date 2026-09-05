@@ -454,13 +454,31 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.sentInputs()).toEqual(['\x7f']);
   });
 
-  it('缓冲模式下删除键不被接管，仍然只编辑输入框', () => {
+  it('缓冲模式下「上屏」后输入框已空，系统键盘的删除键同样删得掉终端里的字符', () => {
     const page = bootMobileInput({ wsHasWrite: true });
     expect(page.bar.getAttribute('data-mode')).toBe('buffer');
-    page.textarea.value = '';
+
+    // 上屏 puts the text on the terminal and empties the box.
+    page.textarea.value = 'hello';
+    page.bar.dispatch('submit');
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // An empty box has no draft to edit, so Backspace can only sensibly mean
+    // "delete on the terminal" — the same thing the bottom bar's ⌫ (aria-label
+    // 删除终端字符) already does in this exact state. Gating the forwarding on
+    // live mode made the two disagree while looking identical to the user: the
+    // text sits on the terminal, the box is empty, ⌫ erases it and the system
+    // keyboard's delete key does nothing.
     page.textarea.dispatch('keydown', { key: 'Backspace' });
-    // Buffer mode's box is a staging area — an empty-box Backspace there means
-    // "nothing to delete", not "delete a terminal character".
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
+  });
+
+  it('缓冲模式下输入框非空时，删除键仍然只编辑草稿，不碰终端', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
     expect(page.sentInputs()).toEqual([]);
   });
 

@@ -18525,15 +18525,20 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
       sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
-    // Backspace on an EMPTY textarea has to be forwarded by hand. Live mode
-    // otherwise only ever sends what the 'input' listener diffs — and deleting
-    // from an empty box changes nothing, so the browser fires beforeinput but
-    // NO input event at all (verified in a real browser). The result was that
-    // text already on the terminal — typed in buffer mode and 上屏'd, or typed
-    // live and mirrored away — could not be erased with the system keyboard:
-    // every Backspace was silently dropped. Non-empty is left to the diff so a
-    // pending IME draft still edits locally instead of eating terminal chars.
-    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+    // Backspace on an EMPTY textarea has to be forwarded by hand, in BOTH modes.
+    // Live mode otherwise only ever sends what the 'input' listener diffs, and
+    // buffer mode does not send keystrokes at all — but deleting from an empty
+    // box changes nothing, so the browser fires beforeinput and NO input event
+    // (verified in a real browser). Either way the keystroke evaporates.
+    // An empty box has no draft to edit, so the only thing Backspace can
+    // sensibly mean there is "delete on the terminal" — which is exactly what
+    // the bottom bar's ⌫ (aria-label 删除终端字符) already does in both modes.
+    // Leaving it mode-gated made the two disagree in the same visible state:
+    // after 上屏 the box is empty and the text is on the terminal, yet the
+    // system keyboard could not erase it while ⌫ could.
+    // Non-empty is still left alone so a pending IME draft edits locally
+    // instead of eating terminal characters.
+    if(!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
       e.preventDefault();
       sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
