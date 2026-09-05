@@ -317,6 +317,10 @@ describe('手机 Web 终端输入栏', () => {
 
       // …and releasing stops it immediately (no ticks after pointerup).
       backspace?.dispatch('pointerup');
+      // The browser always sends a click when the finger lifts — it arrives
+      // AFTER the repeat ticks, so it must be swallowed rather than delete one
+      // more character than the user watched tick by.
+      backspace?.dispatch('click');
       vi.advanceTimersByTime(600);
       expect(page.sentInputs().length).toBe(whileHeld);
     } finally {
@@ -356,6 +360,31 @@ describe('手机 Web 终端输入栏', () => {
       dropped.setWriteState?.(null);
       vi.advanceTimersByTime(600);
       expect(dropped.sentInputs().length).toBe(beforeDrop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('长按后手指滑开(无 click)，下一次单击仍然生效——吞掉尾随 click 的标志必须每次按下重置', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true });
+
+      // Slide off after the repeat has started: pointerleave stops the ticks and
+      // the browser sends NO click, so the swallow flag is left armed.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 3);
+      page.shortcut('bs')?.dispatch('pointerleave');
+      const afterSlide = page.sentInputs().length;
+      expect(afterSlide).toBe(3);
+
+      // The next plain tap must still delete one character. Without the reset on
+      // pointerdown the stale flag eats it and the key silently does nothing.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(100);
+      page.shortcut('bs')?.dispatch('pointerup');
+      page.shortcut('bs')?.dispatch('click');
+      expect(page.sentInputs().length).toBe(afterSlide + 1);
     } finally {
       vi.useRealTimers();
     }

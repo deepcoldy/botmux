@@ -18444,7 +18444,11 @@ if(isTouch&&hasToken){(function(){
   var REPEAT_DELAY=450,REPEAT_EVERY=60;
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
+    // Set once a repeat tick has actually fired, so the click the browser sends
+    // when the finger lifts can be swallowed instead of adding one more hit.
+    var suppressTrailingClick=false;
     btn.addEventListener('click',function(){btn.blur();
+      if(suppressTrailingClick){suppressTrailingClick=false;return;}
       var act=btn.getAttribute('data-sk');
       if(act==='paste'){
         // Commit pending live text before the async clipboard result lands.
@@ -18459,13 +18463,16 @@ if(isTouch&&hasToken){(function(){
     // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
     // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
     // repeating Enter would fire the command several times, repeating Ctrl-C
-    // would spray interrupts. The first hit still comes from the click handler
-    // above (so a plain tap keeps working, mouse included); this only adds the
-    // follow-up ticks after the finger has stayed down past REPEAT_DELAY.
+    // would spray interrupts. A plain tap is still served by the click handler
+    // above (mouse included); this adds the follow-up ticks once the finger has
+    // stayed down past REPEAT_DELAY. Note a click event fires when the finger
+    // LIFTS, so on a long press it lands AFTER the ticks — it is swallowed above
+    // so a 1.2s hold deletes exactly as many characters as it showed ticks.
     if(REPEATABLE[btn.getAttribute('data-sk')]){
       var holdT=null,holdIv=null;
       var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
       btn.addEventListener('pointerdown',function(){
+        suppressTrailingClick=false;
         stopHold();
         holdT=setTimeout(function(){
           holdIv=setInterval(function(){
@@ -18475,7 +18482,8 @@ if(isTouch&&hasToken){(function(){
             if(btn.disabled){stopHold();return;}
             var seq=sk[btn.getAttribute('data-sk')];
             var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
-            if(!ok)stopHold();
+            if(!ok){stopHold();return;}
+            suppressTrailingClick=true;
           },REPEAT_EVERY);
         },REPEAT_DELAY);
       });
