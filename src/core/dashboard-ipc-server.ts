@@ -146,7 +146,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -3843,16 +3843,19 @@ async function collectMessageListenerPreviewMatches(
   limit: number,
 ): Promise<MessageListenerPreviewMatch[]> {
   const bot = getBot(larkAppId);
-  const previewListener: MessageListenerConfig = {
-    enabled: true,
-    ...(listener.name ? { name: listener.name } : {}),
-    ...(listener.replyCardTitle ? { replyCardTitle: listener.replyCardTitle } : {}),
-    ...(listener.workingDir ? { workingDir: listener.workingDir } : {}),
-    prompt: listener.prompt,
-    ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
-    ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
-  };
+  // Build the preview listener with the SAME builder the save path uses, so
+  // preview can never drift from what the saved listener actually does. This
+  // used to be a hand-copied object literal that silently omitted
+  // contentPolicy: preview then ran with "no content filter" and reported
+  // every message as a match (and run-preview forked real sessions for
+  // messages the live listener would never wake on). Reusing the builder makes
+  // the preview leg structurally immune to the next field added to the config.
+  // Only `enabled` is overridden: an off draft is still previewable.
+  const configured = messageListenerConfigFromUpdate(listener);
+  // Blank prompt => nothing worth previewing (findMessageListenerForChat would
+  // reject it anyway); mirrors the save path treating it as a clear.
+  if (!configured) return [];
+  const previewListener: MessageListenerConfig = { ...configured, enabled: true };
   const previewBot = {
     ...bot,
     config: {
