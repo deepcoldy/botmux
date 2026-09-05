@@ -862,7 +862,16 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
   const wrapped = asRecord(root.data);
   const data = Object.keys(wrapped).length > 0 ? wrapped : root;
   const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
-  if (!Array.isArray(raw)) return null;
+  if (!Array.isArray(raw)) {
+    // 新建应用在白名单为空时会直接省略 redirectURL，而不是返回 []。
+    // 只在其它三个 safe_setting 标志字段都符合真实响应形状时才当空集；
+    // 普通 `{code:0,data:{}}` 仍是不可识别，继续零写入保护用户配置。
+    const omittedEmptyList = raw === undefined
+      && typeof data.allowRefreshToken === 'boolean'
+      && Array.isArray(data.ipWhiteList)
+      && Array.isArray(data.safeServerDomain);
+    return omittedEmptyList ? [] : null;
+  }
   return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
 }
 
@@ -959,6 +968,10 @@ export async function writeRedirectWhitelist(
     existing = extractOpenPlatformRedirectUrls(payload);
     if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
   } catch (err: any) {
+    // 开放平台首页仍可能返回 csrf，但具体 console 接口才报
+    // Code=4101 / "please log in again"。这不是「白名单读不出」，而是
+    // 「需要重新扫码」；保留结构化错误给调用方分流，不要压成 warning。
+    if (openPlatformWebSessionExpired(err)) throw err;
     // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
     existing = null;
     readError = safeErrorMessage(err);
@@ -2937,6 +2950,36 @@ export class OpenPlatformApiError extends Error {
   constructor(message: string, readonly payload: unknown, readonly status: number) {
     super(message);
   }
+}
+
+/**
+ * 开放平台 Web session 已被服务端注销。
+ *
+ * console 会出现「`/app` 首页还有 csrf，具体管理接口才报退出」的
+ * 半失效状态。实测返回为 HTTP 400 + 顶层 code=99991641，强信号在
+ * `error.Code=4101` / `error.LogoutReason=40` / "please log in again"。顶层
+ * 99991641 是通用错误，不单独当登录失效，避免一般 console 故障也误弹扫码。
+ */
+export function openPlatformWebSessionExpired(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof OpenPlatformApiError) {
+      if (current.status === 401) return true;
+      const payload = asRecord(current.payload);
+      const detail = asRecord(payload.error);
+      const codes = [payload.code, detail.Code, detail.code];
+      if (codes.some(code => Number(code) === 4101)) return true;
+      if (Number(payload.code) === 99991641 && Number(detail.LogoutReason ?? detail.logoutReason) === 40) {
+        return true;
+      }
+      const messages = [current.message, payload.msg, payload.message, detail.msg, detail.message]
+        .filter((value): value is string => typeof value === 'string')
+        .join(' ');
+      if (/please\s+log\s+in\s+again|请重新登录/i.test(messages)) return true;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
 }
 
 function openPlatformOwnerAccessDenied(error: unknown): boolean {
