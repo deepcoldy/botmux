@@ -46,7 +46,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -1079,6 +1079,43 @@ async function applyAllowedUsersSet(
  * Empty when the policy is off: the answer would then be "the machine's login",
  * which is the historical behavior and not something /status has ever claimed.
  */
+/**
+ * The body of a `/login` prompt, matching the callback mode actually in effect.
+ *
+ * `oauthRedirectBase` decides whether the browser can complete the exchange on
+ * its own. Without branching on it, one of the two audiences always gets wrong
+ * instructions — and the wrong-but-scary version ("the page will fail to load,
+ * that's normal, now copy the address bar, and if you can't see it open
+ * DevTools") is what stops a colleague from ever finishing authorization.
+ *
+ * The auto path still mentions the paste fallback in one line: the redirect can
+ * be momentarily unreachable, and a user staring at an error page with no
+ * recourse is exactly the dead end this exists to remove.
+ */
+function loginPromptLines(
+  authUrl: string,
+  loc: Locale | undefined,
+  titleKey = 'cmd.login.title',
+): string[] {
+  const autoCallback = !resolveOAuthRedirectUri().startsWith('http://127.0.0.1:');
+  return [
+    t(titleKey, undefined, loc),
+    '',
+    t('cmd.login.step1', undefined, loc),
+    authUrl,
+    '',
+    ...(autoCallback
+      ? [
+        t('cmd.login.step2_auto', undefined, loc),
+        t('cmd.login.step2_auto_fallback', undefined, loc),
+      ]
+      : [
+        t('cmd.login.step2', undefined, loc),
+        t('cmd.login.step3', undefined, loc),
+      ]),
+  ];
+}
+
 function triggerUserAuthStatusLines(
   botCfg: BotConfig,
   senderOpenId: string | undefined,
@@ -2835,13 +2872,7 @@ export async function handleCommand(
             loginOpenId,
           );
           await sessionReply(rootId, [
-            t('cmd.login.tags_title', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            tagAuthUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
+            ...loginPromptLines(tagAuthUrl, loc, 'cmd.login.tags_title'),
             '',
             t('cmd.login.tags_footer', undefined, loc),
           ].join('\n'));
@@ -2855,13 +2886,7 @@ export async function handleCommand(
           loginOpenId,
         );
         await sessionReply(rootId, [
-          t('cmd.login.title', undefined, loc),
-          '',
-          t('cmd.login.step1', undefined, loc),
-          authUrl,
-          '',
-          t('cmd.login.step2', undefined, loc),
-          t('cmd.login.step3', undefined, loc),
+          ...loginPromptLines(authUrl, loc),
           '',
           t('cmd.login.footer', undefined, loc),
           t('cmd.login.status_hint', undefined, loc),
@@ -2914,15 +2939,10 @@ export async function handleCommand(
             // 读写就按他的权限走。
             message.senderId,
           );
-          await sessionReply(rootId, [
-            t('cmd.subdoc.need_login', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            authUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
-          ].join('\n'));
+          await sessionReply(
+            rootId,
+            loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
+          );
         };
         const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
         if (!userTok) { await replyDocLogin(); break; }

@@ -398,7 +398,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
   resolveUserToken: vi.fn(async () => null),
+  listAuthorizedUsers: vi.fn(() => []),
+  resolveOAuthRedirectUri: vi.fn(() => 'http://127.0.0.1:9768/callback'),
   DOC_COMMENT_OAUTH_SCOPES: ['docs:document.comment:read'],
+  FEED_GROUP_OAUTH_SCOPES: ['im:feed_group'],
 }));
 
 vi.mock('../src/im/lark/doc-comment.js', () => {
@@ -537,7 +540,8 @@ import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, getChatMo
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
+import { t } from '../src/i18n/index.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
@@ -4614,6 +4618,37 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('飞书用户授权');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
+    });
+
+    // 授权提示必须跟真实回调方式一致。没配 oauthRedirectBase 时浏览器会停在
+    // ERR_CONNECTION_REFUSED，用户必须自己粘回地址栏；配了之后 Dashboard 会自动
+    // 完成兑换，这时候还教人「复制地址栏、看 F12」只会把人劝退——而被劝退的人
+    // 恰恰是点了授权链接、却不知道下一步该干什么的那批人。
+    it('tells the manual paste steps when no oauthRedirectBase is configured', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(resolveOAuthRedirectUri).mockReturnValue('http://127.0.0.1:9768/callback');
+
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.login.step2', undefined, 'zh'));
+      expect(replyContent).toContain(t('cmd.login.step3', undefined, 'zh'));
+      expect(replyContent).not.toContain(t('cmd.login.step2_auto', undefined, 'zh'));
+    });
+
+    it('tells the auto-callback steps when oauthRedirectBase is configured', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(resolveOAuthRedirectUri).mockReturnValue('https://botmux.example.com/oauth/callback');
+
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.login.step2_auto', undefined, 'zh'));
+      // 自动回调也留一句「万一没跳转就粘地址栏」的兜底，别让人卡在报错页上。
+      expect(replyContent).toContain(t('cmd.login.step2_auto_fallback', undefined, 'zh'));
+      expect(replyContent).not.toContain(t('cmd.login.step3', undefined, 'zh'));
     });
 
     it('should show token status with "status" subcommand', async () => {

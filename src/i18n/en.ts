@@ -405,6 +405,8 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.needs_login': '🔐 This step runs as you, but you have not authorized {tools} yet. Send /login to authorize, then retry. This notice appears once per session.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',
+  'cmd.login.step2_auto': '2. When authorization finishes the browser shows "✅ Authorized" — that is the end of it. Nothing to copy; just come back here and retry.',
+  'cmd.login.step2_auto_fallback': '   If the browser stops on an error page (callback temporarily unreachable), sending the full address-bar URL back to this topic also completes it.',
   'cmd.login.step2': '2. After authorizing, the browser redirects to a page that fails to load ("This site can\'t be reached / ERR_CONNECTION_REFUSED") — this is expected (the callback points at 127.0.0.1, but the daemon runs remotely).',
   'cmd.login.step3': '3. Copy the full http://127.0.0.1:9768/callback?code=... URL from the address bar and send it back to this topic.\n   ⚠️ If the address bar doesn\'t show it (intercepted / no redirect): press F12 → Network tab → enable All → click Authorize → find the request to 127.0.0.1:9768 → right-click → Copy → Copy URL → send it here.',
   'cmd.login.footer': 'With auth you can download images and resources from third-party cards.',
