@@ -210,3 +210,69 @@ describe('resolveOwnerUserToken — the one narrow fallback', () => {
     expect(await resolveOwnerUserToken(APP, 'sec', 'feishu', ALICE)).toBeNull();
   });
 });
+
+/**
+ * Attribution at the moment of authorization.
+ *
+ * The OAuth token response carries no open_id, so who authorized is known only
+ * by reading `user_info` back with the fresh token. That read-back is not a
+ * formality: a /login link can be forwarded, so the person who clicked is not
+ * reliably the person who asked. If it fails, guessing "probably the requester"
+ * is exactly how B's credentials end up filed under A — after which every one
+ * of A's commands runs with B's permissions, with nothing to show for it.
+ */
+describe('handleCallbackUrl — attribution must be proven, never assumed', () => {
+  beforeEach(() => { files.clear(); vi.unstubAllGlobals(); });
+
+  /** @param userInfo how the user_info read-back behaves. */
+  async function runCallback(userInfo: { status?: number; body?: unknown; throws?: boolean }) {
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    const state = new URL(authUrl).searchParams.get('state')!;
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).includes('/oauth/token')) {
+        return {
+          ok: true,
+          json: async () => ({
+            access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer',
+            expires_in: 7200, refresh_token_expires_in: 604800, scope: 's',
+          }),
+        };
+      }
+      if (userInfo.throws) throw new Error('network down');
+      return { ok: userInfo.status === undefined, status: userInfo.status ?? 200, json: async () => userInfo.body };
+    }));
+
+    const msg = await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`);
+    return { msg, mod };
+  }
+
+  it('files the token under the person who actually authorized', async () => {
+    const { msg } = await runCallback({ body: { code: 0, data: { open_id: ALICE, name: '爱丽丝' } } });
+    expect(msg).toContain('✅');
+    expect(files.has(perUserPath(APP, ALICE))).toBe(true);
+  });
+
+  // The forwarded-link case: Bob clicked Alice's link. Bob's token is Bob's.
+  it('files under the clicker, not the requester, and says so', async () => {
+    const { msg } = await runCallback({ body: { code: 0, data: { open_id: BOB, name: '鲍勃' } } });
+    expect(files.has(perUserPath(APP, BOB))).toBe(true);
+    expect(files.has(perUserPath(APP, ALICE))).toBe(false);
+    expect(msg).toContain('不是同一个人');
+  });
+
+  it.each([
+    ['a non-2xx response', { status: 500, body: {} }],
+    ['a Lark error code', { body: { code: 99991663, msg: 'invalid token' } }],
+    ['a response with no usable open_id', { body: { code: 0, data: { name: 'nobody' } } }],
+    ['a network failure', { throws: true }],
+  ])('saves nothing when the read-back gives %s', async (_label, userInfo) => {
+    const { msg } = await runCallback(userInfo as any);
+    // Nothing written anywhere — not under the requester, not per-app.
+    expect([...files.keys()].filter(p => p.includes('user-token'))).toEqual([]);
+    // And the person is told to retry rather than left believing they are done.
+    expect(msg).toContain('无法确认');
+    expect(msg).toContain('/login');
+  });
+});

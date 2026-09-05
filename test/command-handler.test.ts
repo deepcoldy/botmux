@@ -541,7 +541,8 @@ import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
+import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
@@ -2684,6 +2685,66 @@ describe('handleCommand', () => {
       // than its executable basename.
       expect(legacyReply).toContain('codex:');
       expect(legacyReply).not.toContain('vendor-codex:');
+    });
+
+    // Per tool, because the answer really does differ between them: /login
+    // grants Lark only, while bytedcli authenticates against ByteCloud SSO. One
+    // combined verdict claimed "you are authorized" for a tool the token has no
+    // bearing on, and the reader found out only when a command failed.
+    describe('trigger-user auth lines', () => {
+      function statusWith(triggerUserAuth: unknown, authorized: boolean) {
+        vi.mocked(listAuthorizedUsers).mockReturnValue(
+          authorized ? [{ openId: 'ou_sender', userName: '孙晓雪', expiresAt: '', refreshExpiresAt: '' }] : [],
+        );
+        vi.mocked(getBot).mockImplementation((() => ({
+          botName: 'Claude',
+          config: {
+            larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+            workingDir: '~/projects', workingDirs: ['~/projects'],
+            triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined,
+          },
+        })) as any);
+        return makeDeps(makeDaemonSession({ worker: { killed: false } as any, workerPort: 8080 }));
+      }
+
+      async function statusText(deps: any) {
+        await handleCommand('/status', ROOT_ID, makeLarkMessage('/status'), deps, LARK_APP_ID);
+        return (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      }
+
+      it('says nothing at all when the policy is off', async () => {
+        const text = await statusText(statusWith({ enabled: false }, true));
+        expect(text).not.toContain('Trigger-user auth');
+      });
+
+      it('names the authorized person for lark-cli', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
+        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+      });
+
+      it('tells an unauthorized sender what the fallback is and how to change it', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
+        expect(text).toContain('lark-cli: 你未授权');
+        expect(text).toContain('bot 身份');
+        expect(text).toContain('/login');
+      });
+
+      it('warns that the command will be refused under fallback: none', async () => {
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['lark-cli'], fallback: 'none' }, false),
+        );
+        expect(text).toContain('命令会被拒绝');
+      });
+
+      // The bug this split fixes: an authorized Lark token must not make the
+      // line for bytedcli read as authorized — nothing can mint a ByteCloud JWT.
+      it('reports bytedcli separately even when Lark is authorized', async () => {
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
+        );
+        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+        expect(text).toContain('bytedcli: 本期尚不支持按人鉴权');
+      });
     });
   });
 

@@ -7,6 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { unauthorizedOutcomeFor } from '../services/trigger-user-auth.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -1116,6 +1117,16 @@ function loginPromptLines(
   ];
 }
 
+/**
+ * Whose credentials this session's CLI calls use right now — per tool.
+ *
+ * Per tool because the answer genuinely differs between them. `/login` grants
+ * Lark only; bytedcli authenticates against ByteCloud SSO, so the same person
+ * can be authorized for one and refused by the other. Printing the tools on one
+ * line above a single verdict said "you are authorized" about a tool the token
+ * has no bearing on — the reader then discovers otherwise only when a command
+ * fails.
+ */
 function triggerUserAuthStatusLines(
   botCfg: BotConfig,
   senderOpenId: string | undefined,
@@ -1123,16 +1134,27 @@ function triggerUserAuthStatusLines(
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
   const brand = normalizeBrand(botCfg.brand);
-  const authorized = senderOpenId
+  const larkAuthorized = senderOpenId
     ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
     : undefined;
-  const who = authorized
-    ? `${authorized.userName ?? '你'}（已授权）`
-    : '未授权 —— 发 /login 授权后本 bot 才会以你的身份调用';
-  return [
-    `Trigger-user auth: ${policy.tools.join(' / ')}`,
-    `  你的身份: ${who}`,
-  ];
+  const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
+
+  const lines = ['Trigger-user auth: 已开启'];
+  for (const tool of policy.tools) {
+    lines.push(`  ${tool}: ${
+      tool === 'lark-cli'
+        ? larkAuthorized
+          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
+          : botFallback
+            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
+            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+        // Not a per-person state: no botmux path can mint a ByteCloud JWT yet,
+        // so saying "you are not authorized" would suggest a /login that does
+        // not exist. Say what is actually true.
+        : '本期尚不支持按人鉴权，命令会被拒绝'
+    }`);
+  }
+  return lines;
 }
 
 async function handleConfigCommand(

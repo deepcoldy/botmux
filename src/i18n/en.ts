@@ -402,6 +402,12 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': 'idle',
   'cmd.status.fallback_no_session': 'No active session in this topic.\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
+  // Printed on stderr to whoever's command did not run: name whose
+  // authorization is missing and how to supply it, or they just retry.
+  'trigger_user_auth.denied_known_user': 'botmux: this step needs {name}\'s own Feishu authorization, but they have not authorized {tool}. Command not run.',
+  'trigger_user_auth.denied_anonymous': 'botmux: this step needs the sender\'s own Feishu authorization, but this turn has no identifiable sender. {tool} command not run.',
+  'trigger_user_auth.denied_howto': 'botmux: to authorize — send /login in this chat, open the link it returns, then retry.',
+  'trigger_user_auth.denied_howto_status': 'botmux: to check whether you are already authorized, send /login status.',
   'trigger_user_auth.needs_login': '🔐 This step runs as you, but you have not authorized {tools} yet. Send /login to authorize, then retry. This notice appears once per session.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',

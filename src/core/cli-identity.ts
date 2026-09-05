@@ -79,7 +79,9 @@ function assertSafeSegment(value: string): string {
  * (whose master key a sandboxed process cannot read).
  */
 export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> = {
-  'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
+  // APP_SECRET appears only in bot mode; in user mode it is absent from the
+  // file, and `export` on an unset name puts nothing in the child's env.
+  'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
   // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
   // pushes authenticate with, so attribution of a commit follows from it.
   bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
@@ -98,7 +100,49 @@ export interface BytedCliIdentity {
   codeJwt?: string;
 }
 
-export type CliIdentity = LarkCliIdentity | BytedCliIdentity;
+/**
+ * Run as the bot, explicitly.
+ *
+ * Publishing *nothing* does not achieve this. Measured on lark-cli 2026-09:
+ * with no identity env at all it resolves `identity: user` from the operator's
+ * on-disk login (`~/Library/Application Support/lark-cli/<appId>_<openId>.enc`)
+ * and acts as that person. Supplying `LARKSUITE_CLI_APP_ID` +
+ * `LARKSUITE_CLI_APP_SECRET` instead resolves `identity: bot` even while that
+ * login exists, and `--as user` on top of it then fails `token_missing` rather
+ * than reaching back to the disk credentials — so the bot identity is a real
+ * floor, not a default the agent can step out of.
+ */
+export interface BotIdentity {
+  tool: 'lark-cli';
+  mode: 'bot';
+  appId: string;
+  appSecret: string;
+}
+
+/**
+ * No identity, and the command must not run.
+ *
+ * Carries the text the wrapper prints, so the person reading a failed command
+ * learns whose authorization is missing and how to supply it. Composed in TS
+ * because that is where the locale lives.
+ */
+export interface DeniedIdentity {
+  tool: TriggerUserAuthTool;
+  mode: 'denied';
+  message: string;
+}
+
+export type CliIdentity = LarkCliIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+
+/** Exit code for a command refused for want of authorization. Distinct from the
+ *  tool's own failures so callers can tell "not allowed" from "did not work".
+ *  77 is the conventional EX_NOPERM. */
+export const IDENTITY_DENIED_EXIT_CODE = 77;
+
+/** Marker the wrapper dispatches on. Absent or unrecognized ⇒ denied, so a
+ *  truncated, empty, or never-written file can never mean "run unrestricted". */
+const MODE_VAR = 'BOTMUX_IDENTITY_MODE';
+const DENY_MSG_VAR = 'BOTMUX_IDENTITY_DENY_MSG';
 
 /**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
@@ -118,17 +162,38 @@ function shellSingleQuote(value: string): string {
 
 /** Render the `.env` body a wrapper will source. */
 export function renderIdentityEnv(identity: CliIdentity): string {
-  const pairs: Array<[string, string]> = identity.tool === 'lark-cli'
-    ? [
-        ['LARKSUITE_CLI_APP_ID', identity.appId],
-        ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
-      ]
-    : [
-        ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt],
-        ...(identity.codeJwt ? [['BYTEDCLI_USER_CODE_JWT', identity.codeJwt] as [string, string]] : []),
-      ];
+  const pairs: Array<[string, string]> = [];
+  if ('mode' in identity && identity.mode === 'denied') {
+    pairs.push([MODE_VAR, 'denied'], [DENY_MSG_VAR, identity.message]);
+  } else if ('mode' in identity && identity.mode === 'bot') {
+    pairs.push(
+      [MODE_VAR, 'bot'],
+      ['LARKSUITE_CLI_APP_ID', identity.appId],
+      ['LARKSUITE_CLI_APP_SECRET', identity.appSecret],
+    );
+  } else if (identity.tool === 'lark-cli') {
+    pairs.push(
+      [MODE_VAR, 'user'],
+      ['LARKSUITE_CLI_APP_ID', identity.appId],
+      ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
+    );
+  } else {
+    pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+  }
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
-  return header + pairs.map(([k, v]) => `${k}=${shellSingleQuote(v)}`).join('\n') + '\n';
+  return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
+}
+
+/** The deny message is prose and legitimately spans lines; a credential never
+ *  does, and one containing a newline means something upstream is wrong. */
+function quoteFor(key: string, value: string): string {
+  return key === DENY_MSG_VAR ? shellSingleQuoteMultiline(value) : shellSingleQuote(value);
+}
+
+function shellSingleQuoteMultiline(value: string): string {
+  if (value.includes('\0')) throw new Error('[cli-identity] message contains NUL');
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 /**
@@ -185,26 +250,54 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *  - `BOTMUX_SESSION_ID` / `SESSION_DATA_DIR` come from the session env the
  *    worker already injects; the wrapper is identical for every session, so
  *    nothing needs rewriting when sessions come and go.
- *  - Missing identity file is NOT an error here. Under `fallback: bot-identity`
- *    the tool is meant to run as the bot, and lark-cli does that with no env at
- *    all. Failing closed is the daemon's decision (it withholds the file and
- *    tells the sender to authorize), not the wrapper's.
+ *  - **A missing or unrecognized identity file denies the command.** The
+ *    earlier version exec'd the tool anyway, on the belief that no env means
+ *    "run as the bot". It does not: lark-cli then resolves the operator's
+ *    on-disk login and acts as *that person* — the machine account this whole
+ *    feature exists to stop. So absence is refusal, and running as the bot is
+ *    something the daemon must ask for explicitly (`mode=bot`).
+ *
+ *    Failing this way is safe to default to: the only thing an unwritten file
+ *    can mean is that the daemon has not yet decided, and borrowing a stranger's
+ *    credentials while it decides is worse than not running.
  */
 export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
+  const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   return [
     '#!/bin/sh',
     '# botmux trigger-user identity wrapper — generated, do not edit.',
     '# Sources the identity the daemon published for the CURRENT turn, then execs',
     '# the real tool. Re-read on every invocation, which is what lets the acting',
     '# identity change without restarting the session.',
+    '#',
+    '# No usable identity => the command does not run. Exec\'ing the tool bare',
+    '# would hand it the machine account\'s login, not the bot\'s.',
+    `${MODE_VAR}=`,
+    `${DENY_MSG_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
     '    . "$__botmux_cred"',
-    `    export ${IDENTITY_ENV_KEYS[tool].join(' ')}`,
     '  fi',
     '  unset __botmux_cred',
     'fi',
+    '',
+    `case "$${MODE_VAR}" in`,
+    '  user|bot)',
+    `    export ${exportKeys}`,
+    '    ;;',
+    '  *)',
+    // Guidance, not just refusal: whoever reads this needs to know it was a
+    // permission decision and what to do next, or they retry the same command.
+    `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
+    `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
+    '    else',
+    `      printf '%s\\n' 'botmux: ${tool} 需要发起人本人的授权，当前会话没有可用凭证，命令未执行。请发送 /login 完成授权后重试。' >&2`,
+    '    fi',
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    ;;',
+    'esac',
+    `unset ${MODE_VAR} ${DENY_MSG_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');

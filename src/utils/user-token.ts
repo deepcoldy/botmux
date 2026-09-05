@@ -253,6 +253,23 @@ export function listAuthorizedUsers(
   return out;
 }
 
+/**
+ * 这个人授权时留下的显示名，没有就返回 undefined。
+ *
+ * 只读归属字段，不碰 token 内容，也不触发刷新——调用点是「命令被拒」的错误文案，
+ * 那里只需要一个能让人对上号的名字，拿不到就退回 open_id。
+ */
+export function lookupAuthorizedUserName(
+  appId: string,
+  openId: string,
+  brand: Brand = 'feishu',
+): string | undefined {
+  if (!isUsableOpenId(openId)) return undefined;
+  const token = loadTokenFromPath(tokenPathForApp(appId, openId));
+  if (!token || !tokenMatches(token, appId, brand)) return undefined;
+  return token.userName;
+}
+
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
 async function refreshToken(
@@ -543,23 +560,35 @@ export function getFeedGroupAuthStatus(
  * /login 链接可能被转给别人点，如果不核对，B 点了 A 的链接就会把 B 的 token 存到
  * A 名下 —— 之后 A 的每次操作都在用 B 的权限，且无声无息。
  */
+type AuthorizedUser =
+  | { ok: true; openId: string; userName?: string }
+  /** Could not establish who authorized. `reason` is shown to the user, so it
+   *  must say what failed rather than just "failed". */
+  | { ok: false; reason: string };
+
 async function fetchAuthorizedUser(
   accessToken: string,
   brand: Brand,
-): Promise<{ openId?: string; userName?: string }> {
+): Promise<AuthorizedUser> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v1/user_info`, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) return {};
-    const body = await res.json() as { code?: number; data?: { open_id?: string; name?: string } };
-    if (body.code !== 0 || !body.data) return {};
+    if (!res.ok) return { ok: false, reason: `user_info HTTP ${res.status}` };
+    const body = await res.json() as { code?: number; msg?: string; data?: { open_id?: string; name?: string } };
+    if (body.code !== 0 || !body.data) {
+      return { ok: false, reason: `user_info code ${body.code ?? 'unknown'}${body.msg ? `: ${body.msg}` : ''}` };
+    }
+    if (!isUsableOpenId(body.data.open_id)) {
+      return { ok: false, reason: 'user_info 未返回可用的 open_id' };
+    }
     return {
-      ...(isUsableOpenId(body.data.open_id) ? { openId: body.data.open_id } : {}),
+      ok: true,
+      openId: body.data.open_id,
       ...(body.data.name ? { userName: body.data.name } : {}),
     };
-  } catch {
-    return {};
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -612,10 +641,19 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // 校验对照：不一致说明链接被转给了别人点，此时按真实授权人落盘并明确告知，绝不
     // 把 B 的凭证存到 A 名下。
     const authorized = await fetchAuthorizedUser(data.access_token, pending.brand);
-    const ownerOpenId = authorized.openId ?? pending.openId;
-    const mismatched = isUsableOpenId(pending.openId)
-      && isUsableOpenId(authorized.openId)
-      && pending.openId !== authorized.openId;
+
+    // 回读失败就不落盘。退回 pending.openId 是「猜」：一条 /login 链接完全可能被
+    // 转给别人点，此时猜出来的归属正好把 B 的凭证记在 A 名下 —— 而这条链路存在的
+    // 唯一理由就是防止这件事。宁可让人重来一次，也不能存一个可能张冠李戴的 token：
+    // 存错了没有任何报错，只是之后 A 的每次操作都在用 B 的权限。
+    if (!authorized.ok) {
+      logger.warn(`[user-token] 放弃保存：无法确认授权人（${authorized.reason}）`);
+      return `❌ 授权未完成：拿到了 token，但无法确认是谁完成的授权（${authorized.reason}），`
+        + `为避免记到错误的人名下，本次没有保存。请重新 /login。`;
+    }
+
+    const ownerOpenId = authorized.openId;
+    const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
 
     const token: TokenStore = {
       access_token: data.access_token,
@@ -628,15 +666,12 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       scope: data.scope,
       appId: pending.appId,
       brand: pending.brand,
-      ...(isUsableOpenId(ownerOpenId) ? { openId: ownerOpenId } : {}),
+      openId: ownerOpenId,
       ...(authorized.userName ? { userName: authorized.userName } : {}),
     };
 
     saveTokenForApp(token, pending.appId, ownerOpenId);
-    logger.info(
-      `[user-token] OAuth login successful, token saved for ${pending.appId}`
-      + (isUsableOpenId(ownerOpenId) ? ` (per-user)` : ` (per-app, no owner resolved)`),
-    );
+    logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId} (per-user)`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
     const who = authorized.userName ? `${authorized.userName} ` : '';

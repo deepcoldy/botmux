@@ -401,6 +401,12 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': '等待中',
   'cmd.status.fallback_no_session': '当前话题没有活跃的会话。\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ 无法获取应用凭证',
+  // 这几条走 stderr 给「命令没跑起来」的那个人看：必须说清是谁的授权缺了、
+  // 以及怎么补。只说「拒绝」会让人反复重试同一条命令。
+  'trigger_user_auth.denied_known_user': 'botmux: 这一步需要「{name}」本人的飞书授权，但 ta 还没授权过 {tool}，命令未执行。',
+  'trigger_user_auth.denied_anonymous': 'botmux: 这一步需要发起人本人的飞书授权，但本轮没有可识别的发起人，{tool} 命令未执行。',
+  'trigger_user_auth.denied_howto': 'botmux: 怎么授权 —— 在本会话发一条 /login，点返回的链接完成授权，然后重试。',
+  'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
   'trigger_user_auth.needs_login': '🔐 这一步要用你自己的权限，但你还没授权过 {tools}。发一条 /login 完成授权后重试；本次会话里这条提示只出现一次。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',

@@ -3556,14 +3556,19 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
   if (!botConfig.triggerUserAuth?.enabled) return;
 
-  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId
-    ?? ds.session.lastCallerOpenId;
+  // Strictly this turn's sender. NOT `lastCallerOpenId`: that is the last human
+  // who happened to talk to the session, and a turn with no sender of its own
+  // (scheduled run, hook, meeting event, bot-to-bot handoff) is exactly the case
+  // where borrowing them would run someone else's automation under their name,
+  // silently and with their permissions.
+  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
 
   const outcomes = await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId,
+    locale: localeForBot(ds.larkAppId),
   });
 
   const needsAuth = outcomes.filter(o => o.state === 'needs-authorization');
