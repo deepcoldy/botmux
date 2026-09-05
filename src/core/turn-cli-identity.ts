@@ -191,9 +191,22 @@ function writeDenial(
     const name = senderOpenId && botConfig.larkAppId
       ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId)
       : undefined;
-    const head = senderOpenId
-      ? t('trigger_user_auth.denied_known_user', { name: name ?? senderOpenId, tool }, locale)
-      : t('trigger_user_auth.denied_anonymous', { tool }, locale);
+    // Name the right provider. bytedcli authenticates against ByteCloud, so
+    // saying "Feishu authorization" would send the reader to authorize the
+    // wrong thing — the same mistake as naming the wrong /login command.
+    const provider = tool === 'bytedcli'
+      ? 'ByteCloud'
+      : t('trigger_user_auth.provider_lark', undefined, locale);
+    // With no name, address the reader directly rather than printing a raw
+    // open_id at them. The name comes from a stored Lark token, which someone
+    // being refused for lack of authorization usually does not have — so the
+    // nameless case is the COMMON one here, not an edge case, and `「ou_5f3a…」
+    // 本人` reads as a machine talking to itself.
+    const head = !senderOpenId
+      ? t('trigger_user_auth.denied_anonymous', { tool, provider }, locale)
+      : name
+        ? t('trigger_user_auth.denied_known_user', { name, tool, provider }, locale)
+        : t('trigger_user_auth.denied_you', { tool, provider }, locale);
     writeSessionIdentity(sessionDataDir, sessionId, {
       tool,
       mode: 'denied',
