@@ -17,6 +17,7 @@ import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -199,7 +200,14 @@ function writeDenial(
       ...(turnId ? { turnId } : {}),
       message: [
         head,
-        t('trigger_user_auth.denied_howto', undefined, locale),
+        // Name the right command: ByteCloud and Feishu are separate providers,
+        // so telling a refused bytedcli user to send `/login` would send them
+        // to authorize the wrong thing and fail again.
+        t(
+          'trigger_user_auth.denied_howto',
+          { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+          locale,
+        ),
         t('trigger_user_auth.denied_howto_status', undefined, locale),
       ].join('\n'),
     });
@@ -232,10 +240,16 @@ async function resolveIdentityFor(
   }
 
   // bytedcli authenticates against ByteCloud SSO, a different provider from
-  // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT, so
-  // there is nothing to derive here. Per-person bytedcli credentials arrive
-  // through its own device flow (`auth login --begin` / `--complete`), which is
-  // a separate slice; until that lands this correctly reports "not authorized"
-  // instead of quietly falling back to the machine's own SSO session.
-  return null;
+  // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT. So
+  // this person's credentials come from their own bytedcli login, minted fresh
+  // per turn: the ByteCloud JWT lives ~2 hours while the login behind it lives
+  // ~3 weeks, and bytedcli refreshes it internally, so asking each time is what
+  // keeps people from being sent back to a QR code every couple of hours.
+  //
+  // Null when they have not authorized (or their login has ended), which the
+  // caller turns into the ordinary "authorize, then retry" refusal rather than
+  // falling back to the machine's own SSO session.
+  const jwts = await mintBytedcliJwts(senderOpenId);
+  if (!jwts) return null;
+  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
 }
