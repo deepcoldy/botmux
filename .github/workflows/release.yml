@@ -755,7 +755,7 @@ jobs:
           for f in dist-bin/botmux-darwin-*; do
             case "$f" in *.map|*.sha256) continue;; esac
             found=1
-            echo "codesign --verify --strict $f"
+            echo "verifying signature: $f"
             codesign --verify --strict --verbose=2 "$f"
           done
           if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi

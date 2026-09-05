@@ -70,7 +70,12 @@ describe('release.yml — every darwin binary is codesign-verified before it shi
   });
 
   it('runs codesign --verify --strict (strict is what newer macOS enforces)', () => {
-    expect(verify).toMatch(/codesign --verify --strict/);
+    // Anchored to the start of a line so the EXECUTED command must carry --strict.
+    // An `echo "codesign --verify --strict $f"` progress line is not a comment and
+    // survives stripHashComments; without the anchor it satisfied this assertion
+    // while the real invocation had dropped --strict — the exact parameter that
+    // separates "rejects 3.18.14's bad signature" from "lets it through".
+    expect(verify).toMatch(/^\s*codesign --verify --strict/m);
   });
 
   it('iterates ALL darwin outputs, not just the host arch the smoke step runs', () => {
