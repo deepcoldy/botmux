@@ -1,14 +1,54 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { store } from '../src/dashboard/web/store.js';
 import {
+  buildSchedulePreconditionFormFields,
   canSubmitSchedule,
   checkSchedule,
+  countScheduleRunHistory,
   filterSchedules,
+  formatScheduleRepeat,
+  formatScheduleRunDuration,
   fmtScheduleDate,
+  isSchedulePreconditionAbsolutePath,
+  isSchedulePreconditionPathWithinTrustedRoot,
+  schedulePreconditionFileExamplePath,
+  scheduleRunTargetResults,
+  scheduleRunHistoryForBackdrop,
+  schedulePreconditionEditorInitialState,
   scheduleExecutionPlacement,
+  scheduleTargetChatIds,
 } from '../src/dashboard/web/schedules-page.js';
 
+const TRUSTED_FILE_ROOT = '/srv/botmux-data/schedule-preconditions/trusted-files';
+const TRUSTED_FILE_PATH = `${TRUSTED_FILE_ROOT}/check-ready.sh`;
+
 describe('dashboard schedules React page helpers', () => {
+  it('clears the previous Bash source from the browser cache on a live replacement', () => {
+    store.replaceSnapshot([], [{
+      id: 'schedule-precondition-live',
+      hasPrecondition: true,
+      preconditionSource: 'inline',
+      preconditionScript: 'printf 1',
+    }]);
+
+    store.applySse('schedule.updated', {
+      id: 'schedule-precondition-live',
+      patch: {
+        preconditionSource: 'file',
+        preconditionScript: null,
+        preconditionFilePath: TRUSTED_FILE_PATH,
+      },
+    });
+
+    expect(store.schedules.get('schedule-precondition-live')).toMatchObject({
+      preconditionSource: 'file',
+      preconditionScript: null,
+      preconditionFilePath: TRUSTED_FILE_PATH,
+    });
+  });
+
   const tr = ((key: string) => key) as Parameters<typeof checkSchedule>[1];
 
   it('reads enabled filter checkbox state before entering React state updaters', () => {
@@ -80,16 +120,607 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).not.toContain('setDeliver(');
   });
 
-  it('shows the target chat in both the schedule row and edit dialog', () => {
+  it('shows run counts only for schedules that configure repeat limits', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain("import { chatDisplayTitle, loadNameMaps } from './ui.js';");
-    // Row chip: dedicated class so a long (Chinese) chat name can be width-capped
-    // + ellipsised instead of overrunning into the action buttons.
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(formatScheduleRepeat()).toBeNull();
+    expect(formatScheduleRepeat({ times: null, completed: 5 })).toBe('5/∞');
+    expect(formatScheduleRepeat({ times: 10, completed: 3 })).toBe('3/10');
+    expect(page).toContain('const repeat = formatScheduleRepeat(s.repeat);');
+    expect(page).toContain(
+      "{repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}",
+    );
+    expect(zh('schedules.repeat')).toBe('执行次数');
+    expect(en('schedules.repeat')).toBe('Run count');
+  });
+
+  it('fills task backgrounds with the latest run outcomes from older to newer', () => {
+    const newestFirst = [
+      { id: 'newest', outcome: 'error' as const },
+      { id: 'middle', outcome: 'precondition_skipped' as const },
+      { id: 'oldest', outcome: 'model_dispatched' as const },
+    ];
+    const original = [...newestFirst];
+
+    expect(scheduleRunHistoryForBackdrop(newestFirst).map(entry => entry.id))
+      .toEqual(['oldest', 'middle', 'newest']);
+    expect(newestFirst).toEqual(original);
+    expect(countScheduleRunHistory(newestFirst)).toEqual({
+      model_dispatched: 1,
+      precondition_skipped: 1,
+      error: 1,
+    });
+
+    const moreThanOnePage = Array.from({ length: 51 }, (_, index) => ({
+      id: `run-${index}`,
+      outcome: 'model_dispatched' as const,
+    }));
+    const capped = scheduleRunHistoryForBackdrop(moreThanOnePage);
+    expect(capped).toHaveLength(50);
+    expect(capped[0]?.id).toBe('run-49');
+    expect(capped.at(-1)?.id).toBe('run-0');
+  });
+
+  it('renders the run history as a non-interactive semantic-color backdrop', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+
+    expect(page).toContain('if (!ui.authed)');
+    expect(page).toContain('store.onScheduleRunLogsChanged');
+    expect(page).toContain('className="schedule-run-log-fill" aria-hidden="true"');
+    expect(page).toContain('className={`outcome-${entry.outcome}`}');
+    expect(page).toContain('aria-label={openLogsLabel}');
+    expect(zh('schedules.logs.backgroundSummary', {
+      shown: 3,
+      total: 8,
+      dispatched: 1,
+      skipped: 1,
+      failed: 1,
+    })).toContain('最近 3/8 次执行');
+
+    expect(css).toMatch(/\.schedule-run-log-fill \{[\s\S]*?pointer-events:\s*none/);
+    expect(css).toMatch(/\.schedule-run-log-fill > i \{[\s\S]*?flex:\s*1 1 0/);
+    expect(css).toMatch(/\.outcome-model_dispatched \{[\s\S]*?var\(--accent\)/);
+    expect(css).toMatch(/\.outcome-precondition_skipped \{[\s\S]*?var\(--warning\)/);
+    expect(css).toMatch(/\.outcome-error \{[\s\S]*?var\(--danger\)/);
+    expect(css).toMatch(/\.schedule-list-row > \.overview-list-main,[\s\S]*?z-index:\s*1/);
+  });
+
+  it('invalidates only the fired task history and all histories after a snapshot refresh', () => {
+    const invalidated: Array<string | undefined> = [];
+    const unsubscribe = store.onScheduleRunLogsChanged(taskId => invalidated.push(taskId));
+
+    store.applySse('schedule.fired', { id: 'task-fired', status: 'ok' });
+    store.replaceSnapshot([], [{ id: 'task-snapshot' }]);
+    unsubscribe();
+
+    expect(invalidated).toEqual(['task-fired', undefined]);
+  });
+
+  it('prefills revealed preconditions and keeps a fail-safe for incomplete legacy projections', () => {
+    expect(schedulePreconditionEditorInitialState({
+      hasPrecondition: true,
+      preconditionEnabled: true,
+      preconditionSource: 'inline',
+      preconditionScript: 'printf 1',
+    })).toEqual({
+      hasExisting: true,
+      enabled: true,
+      mode: 'inline',
+      script: 'printf 1',
+      filePath: '',
+    });
+    expect(schedulePreconditionEditorInitialState({
+      hasPrecondition: true,
+      preconditionEnabled: false,
+      preconditionSource: 'file',
+      preconditionFilePath: TRUSTED_FILE_PATH,
+    })).toEqual({
+      hasExisting: true,
+      enabled: false,
+      mode: 'file',
+      script: '',
+      filePath: TRUSTED_FILE_PATH,
+    });
+    expect(schedulePreconditionEditorInitialState({ hasPrecondition: true })).toEqual({
+      hasExisting: true,
+      enabled: true,
+      mode: 'keep',
+      script: '',
+      filePath: '',
+    });
+  });
+
+  it('omits precondition fields when create is off or a revealed source is unchanged', () => {
+    expect(buildSchedulePreconditionFormFields({
+      hasExisting: false,
+      initialEnabled: false,
+      initialMode: 'inline',
+      initialScript: '',
+      initialFilePath: '',
+      enabled: false,
+      mode: 'inline',
+      script: '',
+      filePath: '',
+    })).toEqual({ ok: true, fields: {} });
+
+    expect(buildSchedulePreconditionFormFields({
+      hasExisting: true,
+      initialEnabled: true,
+      initialMode: 'inline',
+      initialScript: 'printf 1',
+      initialFilePath: '',
+      enabled: true,
+      mode: 'inline',
+      script: 'printf 1',
+      filePath: '',
+    })).toEqual({ ok: true, fields: {} });
+
+    expect(buildSchedulePreconditionFormFields({
+      hasExisting: true,
+      initialEnabled: false,
+      initialMode: 'file',
+      initialScript: '',
+      initialFilePath: TRUSTED_FILE_PATH,
+      trustedFileRoot: TRUSTED_FILE_ROOT,
+      enabled: false,
+      mode: 'file',
+      script: '',
+      filePath: TRUSTED_FILE_PATH,
+    })).toEqual({ ok: true, fields: {} });
+  });
+
+  it('sends only an actual toggle, source replacement, or removal by clearing the current source', () => {
+    const base = {
+      hasExisting: true,
+      initialEnabled: true,
+      initialMode: 'inline',
+      initialScript: 'printf 1',
+      initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
+      script: 'printf 1',
+      filePath: '',
+    } as const;
+
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      enabled: false,
+      mode: 'inline',
+    })).toEqual({ ok: true, fields: { preconditionEnabled: false } });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      initialEnabled: false,
+      enabled: true,
+      mode: 'inline',
+    })).toEqual({ ok: true, fields: { preconditionEnabled: true } });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      enabled: true,
+      mode: 'inline',
+      script: 'printf 2',
+    })).toEqual({
+      ok: true,
+      fields: { preconditionScript: 'printf 2' },
+    });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      enabled: true,
+      mode: 'file',
+      filePath: ` ${TRUSTED_FILE_PATH} `,
+    })).toEqual({
+      ok: true,
+      fields: { preconditionFilePath: TRUSTED_FILE_PATH },
+    });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      initialEnabled: false,
+      initialMode: 'file',
+      initialScript: '',
+      initialFilePath: TRUSTED_FILE_PATH,
+      enabled: false,
+      mode: 'file',
+      filePath: `${TRUSTED_FILE_ROOT}/check-next.sh`,
+    })).toEqual({
+      ok: true,
+      fields: { preconditionFilePath: `${TRUSTED_FILE_ROOT}/check-next.sh` },
+    });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      enabled: true,
+      mode: 'inline',
+      script: '',
+    })).toEqual({ ok: true, fields: { preconditionScript: null } });
+
+    expect(buildSchedulePreconditionFormFields({
+      hasExisting: false,
+      initialEnabled: false,
+      initialMode: 'inline',
+      initialScript: '',
+      initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
+      enabled: true,
+      mode: 'inline',
+      script: 'printf 1',
+      filePath: '',
+    })).toEqual({
+      ok: true,
+      fields: { preconditionEnabled: true, preconditionScript: 'printf 1' },
+    });
+  });
+
+  it.each(['inline', 'file'] as const)('clears an existing %s source when its visible value is blank, even while paused', mode => {
+    for (const enabled of [true, false]) {
+      for (const value of ['', ' \n\t ']) {
+        expect(buildSchedulePreconditionFormFields({
+          hasExisting: true,
+          initialEnabled: true,
+          initialMode: mode,
+          initialScript: mode === 'inline' ? 'printf 1' : '',
+          initialFilePath: mode === 'file' ? TRUSTED_FILE_PATH : '',
+          trustedFileRoot: TRUSTED_FILE_ROOT,
+          enabled,
+          mode,
+          script: value,
+          filePath: value,
+        })).toEqual({ ok: true, fields: { preconditionScript: null } });
+      }
+    }
+  });
+
+  it('preserves the unreadable legacy keep source instead of treating it as an empty editor', () => {
+    const base = {
+      hasExisting: true,
+      initialEnabled: true,
+      initialMode: 'keep',
+      mode: 'keep',
+      initialScript: '',
+      initialFilePath: '',
+      script: '',
+      filePath: '',
+    } as const;
+    expect(buildSchedulePreconditionFormFields({ ...base, enabled: true }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, enabled: false }))
+      .toEqual({ ok: true, fields: { preconditionEnabled: false } });
+  });
+
+  it('omits blank new sources and still validates nonempty live-file paths before submit', () => {
+    const base = {
+      hasExisting: false,
+      initialEnabled: false,
+      initialMode: 'inline',
+      initialScript: '',
+      initialFilePath: '',
+      trustedFileRoot: TRUSTED_FILE_ROOT,
+      enabled: true,
+      script: '',
+      filePath: '',
+    } as const;
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'inline' }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'inline', script: ' \n\t ' }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file' }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: ' \n\t ' }))
+      .toEqual({ ok: true, fields: {} });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: '~/.ready' }))
+      .toEqual({ ok: false, error: 'file_tilde' });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: 'bad\0path' }))
+      .toEqual({ ok: false, error: 'file_nul' });
+    expect(buildSchedulePreconditionFormFields({ ...base, mode: 'file', filePath: 'scripts/check-ready.sh' }))
+      .toEqual({ ok: false, error: 'file_absolute' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      mode: 'file',
+      filePath: '/srv/botmux/scripts/check-ready.sh',
+    })).toEqual({ ok: false, error: 'file_outside_trusted_root' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      trustedFileRoot: null,
+      mode: 'file',
+      filePath: TRUSTED_FILE_PATH,
+    })).toEqual({ ok: false, error: 'file_root_unavailable' });
+    expect(buildSchedulePreconditionFormFields({
+      ...base,
+      mode: 'file',
+      filePath: TRUSTED_FILE_PATH,
+    })).toEqual({
+      ok: true,
+      fields: { preconditionEnabled: true, preconditionFilePath: TRUSTED_FILE_PATH },
+    });
+    expect(isSchedulePreconditionAbsolutePath('/srv/botmux/check-ready.sh')).toBe(true);
+    expect(isSchedulePreconditionAbsolutePath('scripts/check-ready.sh')).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(TRUSTED_FILE_PATH, TRUSTED_FILE_ROOT)).toBe(true);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(TRUSTED_FILE_ROOT, TRUSTED_FILE_ROOT)).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(
+      `${TRUSTED_FILE_ROOT}-other/check-ready.sh`,
+      TRUSTED_FILE_ROOT,
+    )).toBe(false);
+    expect(isSchedulePreconditionPathWithinTrustedRoot(
+      `${TRUSTED_FILE_ROOT}/../outside/check-ready.sh`,
+      TRUSTED_FILE_ROOT,
+    )).toBe(false);
+    expect(schedulePreconditionFileExamplePath(TRUSTED_FILE_ROOT)).toBe(TRUSTED_FILE_PATH);
+    expect(schedulePreconditionFileExamplePath(null)).toBe('');
+  });
+
+  it('reveals saved Bash sources in an accessible editor without forcing a rewrite', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(page).toContain('hasPrecondition?: boolean');
+    expect(page).toContain('preconditionEnabled?: boolean');
+    expect(page).toContain("preconditionSource?: 'inline' | 'file';");
+    expect(page).toContain('preconditionScript?: string;');
+    expect(page).toContain('preconditionFilePath?: string;');
+    expect(page).toContain('schedulePreconditionEditorInitialState(editing)');
+    expect(page).toContain('useState(initialPrecondition.script)');
+    expect(page).toContain('useState(initialPrecondition.filePath)');
+    expect(page).toContain("initialPrecondition.mode === 'keep'");
+    expect(page).toContain('preconditionEnabled || hasExistingPrecondition');
+    expect(page).not.toContain('removePrecondition');
+    expect(page).toContain('...(data.preconditionScript !== undefined');
+    expect(page).toContain('...(data.preconditionFilePath !== undefined');
+    expect(page).not.toContain('className="schedule-precondition-remove"');
+    expect(page).toContain('role="switch"');
+    expect(page).toContain('<fieldset className="schedule-precondition-source">');
+    expect(page).toContain('type="radio"');
+    expect(page).toContain('htmlFor="schedule-precondition-script"');
+    expect(page).toContain('htmlFor="schedule-precondition-file-path"');
+    expect(page).not.toContain('type="file"');
+    expect(page).toContain('PRECONDITION_SCRIPT_EXAMPLE');
+    expect(page).toContain('PRECONDITION_PROMPT_EXAMPLE');
+    expect(page).toContain("tr('schedules.form.preconditionRule')");
+    expect(page).toContain("tr('schedules.form.preconditionUseExample')");
+    expect(page).toContain("tr('schedules.form.preconditionFileHelp')");
+    expect(zh('schedules.form.preconditionSourceKeep')).toContain('暂不可读');
+    expect(en('schedules.form.preconditionSourceKeep')).toContain('unavailable');
+  });
+
+  it('moves the Bash gate and FD 3 examples into an accessible help dialog', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(page).toContain("printf '1\\n'");
+    expect(page).toContain("cat >&3 <<'PROMPT'");
+    expect(page.match(/<SchedulePreconditionProtocolHelp/g)).toHaveLength(1);
+    expect(page.match(/className="schedule-precondition-source-option"/g)).toHaveLength(2);
+    expect(page.match(/className="schedule-precondition-help-trigger"/g)).toHaveLength(2);
+    expect(page).toContain("aria-label={tr('schedules.form.preconditionInlineHelpOpen')}");
+    expect(page).toContain("title={tr('schedules.form.preconditionInlineHelpOpen')}");
+    expect(page).toContain("aria-label={tr('schedules.form.preconditionFileHelpOpen')}");
+    expect(page).toContain("title={tr('schedules.form.preconditionFileHelpOpen')}");
+    expect(page).toContain('aria-haspopup="dialog"');
+    expect(page).toContain('aria-controls="schedule-precondition-help-dialog"');
+    expect(page).toContain("aria-expanded={preconditionHelpSource === 'inline'}");
+    expect(page).toContain("aria-expanded={preconditionHelpSource === 'file'}");
+    expect(page).toContain("setPreconditionHelpSource('inline')");
+    expect(page).toContain("setPreconditionHelpSource('file')");
+    expect(page).toContain('id="schedule-precondition-help-dialog"');
+    expect(page).toContain('aria-labelledby="schedule-precondition-help-title"');
+    expect(page).toContain('aria-describedby="schedule-precondition-help-intro"');
+    expect(page).toContain("aria-label={tr('schedules.form.preconditionHelpClose')}");
+    expect(page).toContain("title={tr('schedules.form.preconditionHelpClose')}");
+    expect(page).toContain('dialog.showModal()');
+    expect(page).toContain('closeButtonRef.current?.focus()');
+    expect(page).toContain('onCancel={e => {');
+    expect(page).toContain('if (e.target === dialogRef.current) closeDialog()');
+    expect(page).toContain('props.returnFocusRef.current?.focus()');
+    expect(page).toContain("const canApplyExample = mode === 'inline' && source === 'inline';");
+    expect(page).toContain('onUseSimple={canApplyExample ? () => {');
+    expect(page).toContain('onUsePrompt={canApplyExample ? () => {');
+    expect(page).toContain('open={open && preconditionHelpSource !== null}');
+    expect(page.match(/<SchedulePreconditionSourceHelp/g)).toHaveLength(1);
+    expect(page).toMatch(
+      /<SchedulePreconditionSourceHelp[\s\S]*?<SchedulePreconditionProtocolHelp/,
+    );
+    expect(page).not.toContain('workingDir={preconditionWorkingDir}');
+    expect(page).not.toContain('workingDir={props.workingDir}');
+    expect(page).toContain("tr('schedules.form.preconditionTestGuideTitle')");
+    expect(page).toContain("tr('schedules.form.preconditionTestGuide')");
+    expect(page).not.toContain("tr('schedules.form.preconditionTestGuideBoundary')");
+    expect(page).not.toContain('id="schedule-precondition-inline-help"');
+    expect(page.match(/id="schedule-precondition-file-help"/g)).toHaveLength(1);
+    expect(page).not.toContain('className="schedule-precondition-guide"');
+    // Only file paths retain validation errors; empty inline scripts remove the gate.
+    expect(page).toContain("preconditionFileMigrationRequired ? 'schedule-precondition-file-migration' : ''");
+    expect(page).toContain("preconditionErrorText ? 'schedule-precondition-error' : ''");
+
+    expect(zh('schedules.form.preconditionRule')).toContain('stdout 去除首尾空白后严格等于 1');
+    expect(zh('schedules.form.preconditionPromptHelp')).toContain('只对本次执行生效');
+    expect(zh('schedules.form.preconditionPromptHelp')).toContain('请勿包含密钥');
+    expect(zh('schedules.form.preconditionEnableHelp')).toContain('关闭或未配置时不执行前置脚本');
+    expect(zh('schedules.form.preconditionInlineHelpOpen')).toContain('直接填写 Bash');
+    expect(zh('schedules.form.preconditionFileHelpOpen')).toContain('Bash 文件路径');
+    expect(zh('schedules.form.preconditionUseExample')).toContain('填入');
+    expect(zh('schedules.form.preconditionHelp')).toContain('任务执行目录');
+    expect(zh('schedules.form.preconditionHelp')).not.toContain('点击');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('当前未保存的配置');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('完整错误与退出码');
+    expect(zh('schedules.form.preconditionTestGuide')).toContain('不保存任务、不调用模型');
+
+    expect(en('schedules.form.preconditionRule')).toContain('trimmed stdout is strictly 1');
+    expect(en('schedules.form.preconditionPromptHelp')).toContain('for this run');
+    expect(en('schedules.form.preconditionPromptHelp')).toContain('do not include secrets');
+    expect(en('schedules.form.preconditionInlineHelpOpen')).toContain('entering Bash directly');
+    expect(en('schedules.form.preconditionFileHelpOpen')).toContain('Bash file paths');
+    expect(en('schedules.form.preconditionHelp')).toContain('execution directory');
+    expect(en('schedules.form.preconditionTestGuide')).toContain('current unsaved configuration');
+    expect(en('schedules.form.preconditionTestGuide')).toContain('does not save');
+  });
+
+  it('uses the daemon trusted root for a complete three-step file configuration demo', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(page).toContain('scheduleWorkingDir?: string | null');
+    expect(page).toContain('schedulePreconditionFileRoot?: string | null');
+    expect(page).toContain('editing\n    ? editing.workingDir\n    : selectedBot?.scheduleWorkingDir');
+    expect(page).toContain('selectedBot?.schedulePreconditionFileRoot');
+    expect(page).toContain('function SchedulePreconditionSourceHelp');
+    expect(page).toContain("source === 'inline'");
+    expect(page).not.toContain('schedule-precondition-path-context');
+    expect(page).not.toContain('/opt/botmux/check-ready.sh');
+    expect(page).not.toContain('/path/to/');
+    expect(page).toContain('test -f /srv/my-service/ready.flag');
+    expect(page).not.toContain('<code>{workingDir}</code>');
+    expect(page).not.toContain('relativeFileExample');
+    expect(page).not.toContain('relativeScriptExample');
+    expect(page).toContain("tr('schedules.form.preconditionFileDemoTitle')");
+    expect(page).toContain('<code>{fileExamplePath}</code>');
+    expect(page).toContain('className="schedule-precondition-file-steps"');
+    expect(page).toContain('<code className="schedule-precondition-path-code">{trustedFileRoot}</code>');
+
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('受保护目录内的完整绝对路径');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('不支持相对路径');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('模型不可写');
+    expect(zh('schedules.form.preconditionFileHelp')).toContain('每次测试和执行时重新读取');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Botmux 已创建');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('daemon 主机');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('普通 UTF-8 Bash 文件');
+    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Dashboard 不会上传文件');
+    expect(zh('schedules.form.preconditionFileStepEnter')).toContain('完整绝对路径');
+    expect(zh('schedules.form.preconditionFileStepTest')).toContain('测试前置条件');
+    expect(zh('schedules.form.preconditionFileMigration')).toContain('保存其它字段不会改动');
+    expect(zh('schedules.form.preconditionFileMigration')).toContain('测试、重新启用或替换前');
+    expect(zh('schedules.form.preconditionErrFileOutsideTrustedRoot')).toContain('{root}');
+
+    expect(en('schedules.form.preconditionFileHelp')).toContain('protected directory');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('Relative paths');
+    expect(en('schedules.form.preconditionFileHelp')).toContain('cannot be written by the model');
+    expect(en('schedules.form.preconditionFileStepPrepare')).toContain('normal UTF-8 Bash file');
+    expect(en('schedules.form.preconditionFileStepEnter')).toContain('complete absolute path');
+    expect(en('schedules.form.preconditionFileStepTest')).toContain('Test precondition');
+  });
+
+  it('renders the precondition editor as code with a visible keyboard focus', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    expect(css).toMatch(
+      /textarea\.schedule-precondition-editor \{[\s\S]*?font-family:\s*var\(--mono/,
+    );
+    expect(css).toMatch(
+      /\.schedule-precondition-toggle input:focus-visible \+ \.switch \{[\s\S]*?outline:/,
+    );
+    expect(css).not.toContain('.schedule-precondition-path-context');
+    expect(css).toMatch(
+      /\.schedule-precondition-help-body \{[\s\S]*?grid-auto-rows:\s*max-content;[\s\S]*?overflow-y:\s*auto/,
+    );
+    expect(css).toMatch(
+      /\.schedule-precondition-help-body pre code \{[\s\S]*?display:\s*block;[\s\S]*?white-space:\s*inherit/,
+    );
+    expect(css).toMatch(
+      /\.schedule-precondition-help-trigger:focus-visible \{[\s\S]*?outline:/,
+    );
+    expect(css).toMatch(
+      /\.schedule-precondition-help-close:focus-visible \{[\s\S]*?outline:/,
+    );
+    expect(css).toMatch(
+      /\.schedule-precondition-help-dialog > article \{[\s\S]*?grid-template-rows:/,
+    );
+  });
+
+  it('keeps Bash options and help compact on desktop while preserving touch targets', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    expect(css).toMatch(/\.schedule-precondition-field \{[^}]*gap:\s*4px/);
+    expect(css).toMatch(/\.schedule-precondition-header \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-toggle \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-source label \{[^}]*min-height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*24px;[^}]*height:\s*24px/);
+    expect(css).toMatch(/\.schedule-precondition-help-trigger > span \{[^}]*width:\s*14px;[^}]*height:\s*14px;[^}]*font-size:\s*10px/);
+    const touchRules = css.match(/@media \(pointer: coarse\) \{([\s\S]*?)\n\}/)?.[1];
+    expect(touchRules).toMatch(/\.schedule-precondition-toggle,[\s\S]*?\.schedule-precondition-source label \{[^}]*min-height:\s*44px/);
+    expect(touchRules).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*44px;[^}]*height:\s*44px/);
+  });
+
+  it('shows a multi-chat summary in the row and an editable Bot-scoped selector', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain("import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';");
     expect(page).toContain('className="schedule-chat-chip"');
-    expect(page).toContain("{tr('schedules.form.chat')}: {chatTitle ?? s.chatId}");
-    // Tooltip keeps the full name AND the raw chatId so truncation loses nothing.
-    expect(page).toContain('title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}');
-    expect(page).toContain("<code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>");
+    expect(page).toContain("{tr('schedules.form.chat')}: {chatPresentation.summary}");
+    expect(page).toContain('title={chatPresentation.title}');
+    expect(page).toContain('className="schedule-chat-selector"');
+    expect(page).toContain('checked={chatIds.includes(group.chatId)}');
+    expect(page).toContain('onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}');
+    expect(page).toContain('className="schedule-chat-search"');
+    expect(page).toContain('group.chatId.toLocaleLowerCase().includes(normalizedChatQuery)');
+    expect(page).toContain('groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))');
+    expect(page).toContain('if (editing || !larkAppId || !groupsHaveMembership');
+    expect(page).toContain('...selectedUnknownChatIds.map');
+    expect(page).toContain("tr('schedules.form.chatRetained')");
+    expect(page).toContain('chatIds: data.chatIds');
+    expect(page).not.toContain('chatManual');
+    expect(page).not.toContain('schedule-chat-manual-input');
+    expect(page).not.toContain('When editing, chatId/larkAppId are immutable');
+  });
+
+  it('prefers normalized chatIds and falls back to legacy chatId', () => {
+    expect(scheduleTargetChatIds({ chatId: ' oc_legacy ' })).toEqual(['oc_legacy']);
+    expect(scheduleTargetChatIds({ chatIds: [' oc_a ', 'oc_b', 'oc_a', '', 7] })).toEqual([
+      'oc_a',
+      'oc_b',
+    ]);
+    expect(scheduleTargetChatIds({ chatIds: [], chatId: 'oc_ignored' })).toEqual([]);
+  });
+
+  it('puts an accessible multi-chat execution explanation immediately after 绑定群聊', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(page).toMatch(
+      /<FieldTitle\s+help=\{tr\('schedules\.form\.chatBindingHelp'\)\}[\s\S]*?>\s*\{tr\('schedules\.form\.chatBinding'\)\}/,
+    );
+    expect(zh('schedules.form.chatBinding')).toBe('绑定群聊');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('每个群会独立调用模型');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('Bash 前置条件每次调度只执行一次');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('单个群执行失败不影响其他群');
+    expect(zh('schedules.form.chatBindingHelp')).toContain('模型调用量会随绑定群数增加');
+    expect(en('schedules.form.chatBindingHelp')).toContain('Each group invokes the model independently');
+  });
+
+  it('keeps the Bot read-only while allowing target groups to change during edit', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="schedule-form-readonly"');
+    expect(page).toContain("tr('schedules.form.botImmutableHelp')");
+    expect(page).toContain('if (!open || localDelivery) return;');
+    expect(page).toContain('chatIds: data.chatIds');
+    expect(page).not.toContain('if (!open || editing) return;');
+  });
+
+  it('renders compatible per-group results without rejecting legacy or malformed logs', () => {
+    expect(scheduleRunTargetResults({})).toEqual([]);
+    expect(scheduleRunTargetResults({ targetResults: 'legacy' })).toEqual([]);
+    expect(scheduleRunTargetResults({
+      targetResults: [
+        { chatId: ' oc_ok ', outcome: 'model_dispatched' },
+        { chatId: 'oc_failed', outcome: 'error', error: 'dispatch failed' },
+        { chatId: '', outcome: 'error' },
+        { chatId: 'oc_unknown', outcome: 'skipped' },
+        null,
+      ],
+    })).toEqual([
+      { chatId: 'oc_ok', outcome: 'model_dispatched' },
+      { chatId: 'oc_failed', outcome: 'error', error: 'dispatch failed' },
+    ]);
+
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain('className="schedule-run-log-targets"');
+    expect(page).toContain("tr('schedules.logs.targetResults')");
+    expect(page).toContain("tr('schedules.logs.targetDispatched')");
+    expect(page).toContain("tr('schedules.logs.targetError')");
+    expect(page).toContain("tr('schedules.logs.modelInvocationTargets'");
+    expect(createDashboardTranslator('zh')('schedules.logs.modelInvocationTargets', {
+      submitted: 1,
+      total: 2,
+    })).toBe('1/2 个群');
   });
 
   it('caps the target-chat chip width so a long name cannot overrun the row', () => {
@@ -106,6 +737,38 @@ describe('dashboard schedules React page helpers', () => {
     );
   });
 
+  it('keeps the multi-chat selector compact, keyboard-visible, and scrollable', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(
+      /\.schedule-chat-picker-trigger \{[\s\S]*?min-height:\s*44px/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-picker-trigger:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-picker-summary \{[\s\S]*?min-width:\s*0[\s\S]*?text-overflow:\s*ellipsis/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-selector \{[\s\S]*?max-height:\s*220px[\s\S]*?overflow-y:\s*auto/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-search:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option \{[\s\S]*?min-height:\s*44px/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option input:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-chat-option\.is-retained \{[\s\S]*?var\(--warning\)/,
+    );
+    expect(css).toMatch(
+      /\.schedule-run-log-targets li\.outcome-error \{[\s\S]*?var\(--danger\)/,
+    );
+  });
+
   it('offers three execution positions and allows lazy silent fresh topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
@@ -113,13 +776,15 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain("value=\"top-level\"");
     expect(page).toContain("value=\"topic\"");
     expect(page).toContain("value=\"new-topic\"");
-    expect(page).toContain("setExecutionPosition('new-topic')");
+    expect(page).toContain("updateExecutionPosition('new-topic')");
     expect(page).toContain("tr('schedules.form.topicTitle')");
     expect(page).toContain('maxLength={200}');
     expect(page).not.toContain("disabled={executionPosition === 'new-topic'}");
     expect(page).toContain("executionPosition === 'new-topic' && silent");
     expect(page).toContain("tr('schedules.form.topicRoot')");
-    expect(page).toContain("executionPosition === 'topic' && !rootMessageId.trim()");
+    expect(page).toContain("executionPosition === 'topic' && chatIds.length !== 1");
+    expect(page).toContain("nextChatIds[0] !== initialTopicChatId");
+    expect(page).toContain("setRootMessageId('')");
     expect(page).toContain("const localDelivery = editing?.deliver === 'local';");
     expect(page).toContain('updateExecutionPosition: !localDelivery');
     expect(page).toContain('...(data.updateExecutionPosition ? {');
@@ -146,21 +811,74 @@ describe('dashboard schedules React page helpers', () => {
     expect(out).toMatch(/GMT|UTC|[A-Z]{2,5}/);
   });
 
-  it('keeps schedule-state CSS rule intact and left-aligns the error chip', () => {
+  it('formats scheduler dispatch duration without implying model runtime', () => {
+    expect(formatScheduleRunDuration(-1)).toBe('—');
+    expect(formatScheduleRunDuration(248)).toBe('248 ms');
+    expect(formatScheduleRunDuration(1_250)).toBe('1.3 s');
+    expect(formatScheduleRunDuration(12_400)).toBe('12 s');
+    expect(formatScheduleRunDuration(61_000)).toBe('1 min 1 s');
+  });
+
+  it('opens a read-only task-scoped run-log dialog with paging and focus return', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="schedule-action-button schedule-log-button"');
+    expect(page).toContain('aria-haspopup="dialog"');
+    expect(page).toContain('aria-controls="schedule-run-log-dialog"');
+    expect(page).toContain('id="schedule-run-log-dialog"');
+    expect(page).toContain('dialog.showModal()');
+    expect(page).toContain('closeButtonRef.current?.focus()');
+    expect(page).toContain('props.returnFocusRef.current?.focus()');
+    expect(page).toContain('onCancel={event => {');
+    expect(page).toContain('if (event.target === dialogRef.current) closeDialog()');
+    expect(page).toContain('SCHEDULE_RUN_LOG_PAGE_SIZE = 50');
+    expect(page).toContain('/logs?limit=${SCHEDULE_RUN_LOG_PAGE_SIZE}&offset=${offset}');
+    expect(page).toContain("loadLogs('more')");
+    expect(page).toContain('<LoadingState compact');
+    expect(page).toContain('className="schedule-run-log-alert" role="alert"');
+    expect(page).toContain('className="schedule-run-log-empty"');
+    expect(page).not.toContain('setInterval(');
+  });
+
+  it('moves the scheduler-log boundary behind an accessible model-submission tooltip', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    // Regression: inserting the error-chip rule must not clobber the
-    // `.schedule-row-head .schedule-state {` selector (previously its body
-    // became orphaned declarations, dropping enabled styling + min-width).
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+
+    expect(zh('schedules.logs.outcomeDispatched')).toBe('已提交模型');
+    expect(zh('schedules.logs.outcomeSkipped')).toBe('前置条件未通过');
+    expect(zh('schedules.logs.outcomeError')).toBe('调度失败');
+    expect(zh('schedules.logs.intro')).toContain('不包含模型生成');
+    expect(zh('schedules.logs.boundary')).toContain('不代表模型已完成');
+    expect(zh('schedules.logs.emptyHint')).toContain('仅展示升级后产生的记录');
+    expect(en('schedules.logs.boundary')).toContain('does not mean the model finished');
+    expect(page).toMatch(
+      /<dt>\s*<FieldTitle\s+help=\{tr\('schedules\.logs\.boundary'\)\}\s+helpLabel=\{tr\('schedules\.logs\.boundary'\)\}\s*>\s*\{tr\('schedules\.logs\.modelInvocation'\)\}\s*<\/FieldTitle>\s*<\/dt>/,
+    );
+    expect(page).not.toContain('className="schedule-run-log-boundary"');
+    expect(css).not.toContain('.schedule-run-log-boundary');
+  });
+
+  it('keeps the run-log dialog usable on small screens', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(/\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:/);
+    expect(css).toMatch(/@media \(max-width: 720px\) \{[\s\S]*?\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:\s*1fr/);
+    expect(css).toMatch(/\.schedule-run-log-list-panel \{[\s\S]*?min-height:\s*0/);
+    expect(css).toMatch(/button\.schedule-run-log-row:focus-visible \{[\s\S]*?outline:/);
+  });
+
+  it('keeps run errors in the log dialog instead of the task panel', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).not.toContain('className="schedule-error-chip"');
+    expect(page).not.toContain("s.lastStatus === 'error'");
+    expect(page).toContain('<code>{selected.errorCode}</code>');
+    expect(page).toContain('<strong>{selected.error}</strong>');
+    expect(css).not.toContain('.schedule-error-chip');
     expect(css).toContain('.schedule-row-head .schedule-state {');
-    // The error chip must left-align so long errors keep the "⚠ Error" prefix
-    // instead of being center-clipped.
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-error-chip \{[\s\S]*?justify-content:\s*flex-start/,
-    );
-    // No orphaned declarations between the error-chip rule and the next rule.
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-error-chip \{[\s\S]*?\}\s*\.schedule-row-head \.schedule-state \{/,
-    );
     expect(css).toMatch(/\.schedules-list \{[\s\S]*?grid-auto-rows:\s*max-content/);
     expect(css).toMatch(/\.schedule-list-row \.schedule-actions \{[\s\S]*?flex-wrap:\s*nowrap/);
   });

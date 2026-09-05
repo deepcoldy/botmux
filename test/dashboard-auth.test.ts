@@ -874,6 +874,17 @@ describe('decideDashboardAuth — protected surface', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('GET /api/schedules/:id/logs without token → deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/api/schedules/sched-1/logs',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
   it('GET /api/v3 run list/detail without token → deny401', () => {
     for (const pathname of ['/api/v3/runs', '/api/v3/runs/project-review-1']) {
       const d = decideDashboardAuth({
@@ -1037,6 +1048,25 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('tokenless schedule precondition writes stay management-only', () => {
+    for (const [method, pathname] of [
+      ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
+      ['PATCH', '/api/schedules/sched-1'],
+      ['DELETE', '/api/schedules/sched-1'],
+    ] as const) {
+      const d = decideDashboardAuth({
+        method,
+        pathname,
+        hasTokenParam: false,
+        presentedToken: undefined,
+        activeToken: TOK,
+        publicReadOnly: true,
+      });
+      expect(d.kind, `${method} ${pathname}`).toBe('deny401');
+    }
+  });
+
   it('tokenless GET raw PTY log → still deny401 (sensitive carve-out)', () => {
     const d = decideDashboardAuth({
       method: 'GET', pathname: '/api/workflows/run-1/nodes/n1/terminal-log/raw', hasTokenParam: false,
@@ -1088,6 +1118,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/bots',
       '/api/skills',
       '/api/cli-options',
+      '/api/schedules/sched-1/logs',
       // Workflow projections contain user-authored goals and identifiers.
       '/api/v3/runs',
       '/api/v3/runs/project-review-1',
@@ -1149,6 +1180,9 @@ describe('Workbench H5 capability boundary', () => {
       ['PUT', '/api/bots/app/env'],
       ['PUT', '/api/settings'],
       ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
+      ['PATCH', '/api/schedules/sched-1'],
+      ['DELETE', '/api/schedules/sched-1'],
       ['DELETE', '/api/skills/tool'],
       ['POST', '/api/sessions/s1/close'],
       ['GET', '/api/sessions/s1/write-link'],

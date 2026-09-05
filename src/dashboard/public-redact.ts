@@ -10,6 +10,7 @@
 // must not see, so each sensitive payload gets a redactor here:
 //   - /api/groups   → memberBots[].oncallChat = { chatId, workingDir }
 //   - /api/schedules → row carries `prompt` (business instructions) + `workingDir`
+//     and authenticated-only precondition source values
 //   - /api/settings → notifier carries recipient / delivery diagnostics
 //   - /api/sessions + /events → session rows/patches may carry `gitBranch`
 //     and private message preview fields
@@ -62,15 +63,97 @@ export function redactGroupsForPublic(chats: unknown[]): unknown[] {
   });
 }
 
-/** Drop `prompt` (business instructions) and `workingDir` (repo/customer path)
- *  from `/api/schedules` rows for anonymous visitors. Returns a new array; never
- *  mutates the input. Name / timing / status fields are preserved so the
- *  read-only schedules view still renders. */
+/** Project one schedule row or event patch for an authenticated management
+ *  browser. Only the explicit flat edit fields are returned; daemon-side
+ *  references, hashes, nested definitions, and legacy aliases are always
+ *  stripped. `preserveClearMarkers` is for merge-based live-event patches:
+ *  JSON nulls clear a previous inline/file value after a source change. */
+export function stripSchedulePreconditionMaterial(
+  schedule: unknown,
+  options: { preserveClearMarkers?: boolean } = {},
+): unknown {
+  if (!schedule || typeof schedule !== 'object') return schedule;
+  const {
+    preconditionScript,
+    preconditionFile: _preconditionFile,
+    preconditionFilePath,
+    preconditionPath: _preconditionPath,
+    preconditionSource,
+    preconditionDefinition: _preconditionDefinition,
+    preconditionRef: _preconditionRef,
+    preconditionHash: _preconditionHash,
+    precondition: _precondition,
+    ...rest
+  } = schedule as Record<string, unknown>;
+  if (preconditionSource === 'inline' && typeof preconditionScript === 'string') {
+    return {
+      ...rest,
+      preconditionSource,
+      preconditionScript,
+      ...(options.preserveClearMarkers && preconditionFilePath === null
+        ? { preconditionFilePath: null }
+        : {}),
+    };
+  }
+  if (preconditionSource === 'file' && typeof preconditionFilePath === 'string') {
+    return {
+      ...rest,
+      preconditionSource,
+      preconditionFilePath,
+      ...(options.preserveClearMarkers && preconditionScript === null
+        ? { preconditionScript: null }
+        : {}),
+    };
+  }
+  if (
+    options.preserveClearMarkers
+    && rest.hasPrecondition === false
+    && preconditionSource === null
+    && preconditionScript === null
+    && preconditionFilePath === null
+  ) {
+    return {
+      ...rest,
+      preconditionSource: null,
+      preconditionScript: null,
+      preconditionFilePath: null,
+    };
+  }
+  return rest;
+}
+
+/** Strip every precondition source representation while preserving unrelated
+ * schedule fields. Use this for audiences that may see schedule metadata but
+ * must not receive executable text, host paths, or protected-store internals. */
+export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown {
+  const projected = stripSchedulePreconditionMaterial(schedule);
+  if (!projected || typeof projected !== 'object') return projected;
+  const {
+    preconditionSource: _preconditionSource,
+    preconditionScript: _preconditionScript,
+    preconditionFilePath: _preconditionFilePath,
+    ...rest
+  } = projected as Record<string, unknown>;
+  return rest;
+}
+
+/** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
+ *  and every executable/authority-bearing precondition field from
+ *  `/api/schedules` rows for anonymous visitors. The supported list projection
+ *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
+ *  ref/hash are stripped defensively even though authenticated management rows
+ *  expose the validated flat edit fields. Returns a new array; never mutates the
+ *  input. Name / timing / status fields remain available to the public board. */
 export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
   if (!Array.isArray(schedules)) return schedules;
   return schedules.map((s) => {
-    if (!s || typeof s !== 'object') return s;
-    const { prompt: _prompt, workingDir: _workingDir, ...rest } = s as Record<string, unknown>;
+    const projected = stripAllSchedulePreconditionMaterial(s);
+    if (!projected || typeof projected !== 'object') return projected;
+    const {
+      prompt: _prompt,
+      workingDir: _workingDir,
+      ...rest
+    } = projected as Record<string, unknown>;
     return rest;
   });
 }

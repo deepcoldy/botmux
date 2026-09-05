@@ -938,6 +938,10 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
+   *  never stored in this sandbox-writable task row. Absence does not prove
+   *  that no condition exists: runtime always checks the sidecar by task id. */
+  preconditionRef?: string;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;
@@ -945,7 +949,12 @@ export interface ScheduledTask {
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
+  /** Primary execution chat retained for backward compatibility. For a
+   *  multi-chat task this is always the first entry of `chatIds`. */
   chatId: string;
+  /** All execution chats in deterministic dispatch order. Persisted only
+   *  when more than one chat is configured; absent means `[chatId]`. */
+  chatIds?: string[];
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
@@ -994,7 +1003,7 @@ export interface ScheduledTask {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */

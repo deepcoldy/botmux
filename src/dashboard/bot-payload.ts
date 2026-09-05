@@ -89,6 +89,13 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     displayName: typeof j?.displayName === 'string' ? j.displayName : null,
     larkBotName: typeof j?.larkBotName === 'string' ? j.larkBotName : null,
     defaultOncall: j?.defaultOncall,
+    scheduleWorkingDir: typeof j?.scheduleWorkingDir === 'string' && j.scheduleWorkingDir.trim()
+      ? j.scheduleWorkingDir
+      : null,
+    schedulePreconditionFileRoot: typeof j?.schedulePreconditionFileRoot === 'string'
+      && j.schedulePreconditionFileRoot.trim()
+      ? j.schedulePreconditionFileRoot
+      : null,
     defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     // 「仓库选择卡片」形态的工作目录。与 defaultWorkingDir 互斥（见 BotConfig）。
     // 克隆弹窗要用它判断源 Bot 是哪种目录形态，才能预填出与克隆结果一致的表单。

@@ -1,24 +1,467 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react';
 import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
   CreateActionButton,
   DropdownMenu,
+  FieldTitle,
+  LoadingState,
   OverviewList,
   OverviewListItem,
   OverviewListMain,
   OverviewListTail,
+  RefreshIconButton,
 } from './dashboard-components.js';
-import { chatDisplayTitle, loadNameMaps } from './ui.js';
+import { store } from './store.js';
+import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 
-type ScheduleRow = Record<string, any> & { id: string };
+type ScheduleRow = Record<string, any> & {
+  id: string;
+  chatId?: string;
+  chatIds?: string[];
+  hasPrecondition?: boolean;
+  preconditionEnabled?: boolean;
+  preconditionSource?: 'inline' | 'file';
+  preconditionScript?: string;
+  preconditionFilePath?: string;
+};
+type ScheduleBotOption = {
+  larkAppId: string;
+  botName?: string;
+  scheduleWorkingDir?: string | null;
+  schedulePreconditionFileRoot?: string | null;
+};
 type ScheduleAction = 'run' | 'pause' | 'resume';
 type ActionFeedback = 'success' | 'error';
+type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
+type ScheduleTargetRunResult = {
+  chatId: string;
+  outcome: 'model_dispatched' | 'error';
+  error?: string;
+};
+type ScheduleRunLogEntry = {
+  id: string;
+  taskId: string;
+  trigger: 'scheduler' | 'dashboard';
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  outcome: ScheduleRunOutcome;
+  precondition: 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
+  additionalPrompt: boolean;
+  errorCode?: string;
+  error?: string;
+  targetResults?: ScheduleTargetRunResult[];
+};
+type ScheduleRunHistoryPreview = {
+  logs: ScheduleRunLogEntry[];
+  total: number;
+};
+type ScheduleRunLogPage = {
+  logs: ScheduleRunLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
+export type PreconditionEditMode = 'keep' | 'inline' | 'file';
+type PreconditionHelpSource = 'inline' | 'file';
 const RUN_ACTION_MIN_PENDING_MS = 1000;
+const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
+const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
+const MAX_SCHEDULE_TARGET_CHATS = 5;
+const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
+  printf '1\n'
+else
+  printf '0\n'
+fi`;
+const PRECONDITION_PROMPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
+  printf '1\n'
+  cat >&3 <<'PROMPT'
+The readiness check passed. Include that context in this run.
+PROMPT
+else
+  printf '0\n'
+fi`;
+
+export type SchedulePreconditionFormError =
+  | 'source_required'
+  | 'file_nul'
+  | 'file_tilde'
+  | 'file_absolute'
+  | 'file_root_unavailable'
+  | 'file_outside_trusted_root';
+
+type SchedulePreconditionTestResult = {
+  outcome: 'pass' | 'skip' | 'error';
+  additionalPrompt?: boolean;
+  durationMs?: number;
+  errorCode?: string;
+  error?: string;
+};
+
+export type SchedulePreconditionFormFields = {
+  preconditionEnabled?: boolean;
+  preconditionScript?: string | null;
+  preconditionFilePath?: string;
+};
+
+export type SchedulePreconditionEditorInitialState = {
+  hasExisting: boolean;
+  enabled: boolean;
+  mode: PreconditionEditMode;
+  script: string;
+  filePath: string;
+};
+
+/** Prefer the authenticated source projection when it is complete. `keep` is
+ *  retained only as a fail-safe for an older service or a damaged projection. */
+export function schedulePreconditionEditorInitialState(input: {
+  hasPrecondition?: boolean;
+  preconditionEnabled?: boolean;
+  preconditionSource?: 'inline' | 'file';
+  preconditionScript?: string;
+  preconditionFilePath?: string;
+} | null): SchedulePreconditionEditorInitialState {
+  const hasExisting = input?.hasPrecondition === true;
+  const enabled = hasExisting && input?.preconditionEnabled !== false;
+  if (!hasExisting) {
+    return { hasExisting: false, enabled: false, mode: 'inline', script: '', filePath: '' };
+  }
+  if (
+    input.preconditionSource === 'inline'
+    && typeof input.preconditionScript === 'string'
+    && input.preconditionScript.trim().length > 0
+  ) {
+    return {
+      hasExisting: true,
+      enabled,
+      mode: 'inline',
+      script: input.preconditionScript,
+      filePath: '',
+    };
+  }
+  if (
+    input.preconditionSource === 'file'
+    && typeof input.preconditionFilePath === 'string'
+    && input.preconditionFilePath.trim().length > 0
+  ) {
+    return {
+      hasExisting: true,
+      enabled,
+      mode: 'file',
+      script: '',
+      filePath: input.preconditionFilePath,
+    };
+  }
+  return { hasExisting: true, enabled, mode: 'keep', script: '', filePath: '' };
+}
+
+export function isSchedulePreconditionAbsolutePath(value: string): boolean {
+  return value.trim().startsWith('/');
+}
+
+function normalizeSchedulePreconditionAbsolutePath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed.includes('\0')) return null;
+  const segments: string[] = [];
+  for (const segment of trimmed.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `/${segments.join('/')}`;
+}
+
+/** Browser-side lexical check for immediate form feedback. The daemon repeats
+ * the authoritative filesystem and symlink checks before saving or running. */
+export function isSchedulePreconditionPathWithinTrustedRoot(
+  value: string,
+  trustedRoot: string | null | undefined,
+): boolean {
+  const normalizedPath = normalizeSchedulePreconditionAbsolutePath(value);
+  const normalizedRoot = normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '');
+  if (!normalizedPath || !normalizedRoot || normalizedPath === normalizedRoot) return false;
+  return normalizedRoot === '/'
+    ? normalizedPath.startsWith('/')
+    : normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+export function schedulePreconditionFileExamplePath(
+  trustedRoot: string | null | undefined,
+): string {
+  const normalizedRoot = normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '');
+  if (!normalizedRoot) return '';
+  return normalizedRoot === '/' ? '/check-ready.sh' : `${normalizedRoot}/check-ready.sh`;
+}
+
+function schedulePreconditionFileWriteError(
+  value: string,
+  trustedRoot: string | null | undefined,
+): SchedulePreconditionFormError | null {
+  if (!isSchedulePreconditionAbsolutePath(value)) return 'file_absolute';
+  if (!normalizeSchedulePreconditionAbsolutePath(trustedRoot ?? '')) return 'file_root_unavailable';
+  if (!isSchedulePreconditionPathWithinTrustedRoot(value, trustedRoot)) {
+    return 'file_outside_trusted_root';
+  }
+  return null;
+}
+
+function SchedulePreconditionProtocolHelp(props: {
+  tr: ReturnType<typeof useT>;
+  onUseSimple?: () => void;
+  onUsePrompt?: () => void;
+}) {
+  const { tr, onUseSimple, onUsePrompt } = props;
+  return (
+    <>
+      <p><strong>{tr('schedules.form.preconditionRule')}</strong></p>
+      <div className="schedule-precondition-example-header">
+        <span>{tr('schedules.form.preconditionExampleTitle')}</span>
+        {onUseSimple ? (
+          <button type="button" onClick={onUseSimple}>
+            {tr('schedules.form.preconditionUseExample')}
+          </button>
+        ) : null}
+      </div>
+      <pre aria-label={tr('schedules.form.preconditionExampleTitle')}><code>{PRECONDITION_SCRIPT_EXAMPLE}</code></pre>
+      <p>{tr('schedules.form.preconditionPromptHelp')}</p>
+      <div className="schedule-precondition-example-header">
+        <span>{tr('schedules.form.preconditionPromptExampleTitle')}</span>
+        {onUsePrompt ? (
+          <button type="button" onClick={onUsePrompt}>
+            {tr('schedules.form.preconditionUsePromptExample')}
+          </button>
+        ) : null}
+      </div>
+      <pre aria-label={tr('schedules.form.preconditionPromptExampleTitle')}><code>{PRECONDITION_PROMPT_EXAMPLE}</code></pre>
+    </>
+  );
+}
+
+function SchedulePreconditionSourceHelp(props: {
+  source: PreconditionHelpSource;
+  trustedFileRoot: string;
+  tr: ReturnType<typeof useT>;
+}) {
+  const { source, trustedFileRoot, tr } = props;
+  const fileExamplePath = schedulePreconditionFileExamplePath(trustedFileRoot);
+
+  return (
+    <section className="schedule-precondition-source-help" aria-labelledby="schedule-precondition-source-help-title">
+      <h3 id="schedule-precondition-source-help-title">
+        {source === 'inline'
+          ? tr('schedules.form.preconditionSourceInline')
+          : tr('schedules.form.preconditionSourceFile')}
+      </h3>
+      {source === 'inline' ? (
+        <p>{tr('schedules.form.preconditionHelp')}</p>
+      ) : (
+        <>
+          <p>{tr('schedules.form.preconditionFileHelp')}</p>
+          <ol className="schedule-precondition-file-steps">
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepPrepareTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepPrepare')}</p>
+              {trustedFileRoot ? (
+                <code className="schedule-precondition-path-code">{trustedFileRoot}</code>
+              ) : (
+                <span className="schedule-precondition-root-unavailable" role="status">
+                  {tr('schedules.form.preconditionFileRootUnavailable')}
+                </span>
+              )}
+            </li>
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepEnterTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepEnter')}</p>
+              {fileExamplePath ? (
+                <pre aria-label={tr('schedules.form.preconditionFileDemoTitle')}>
+                  <code>{fileExamplePath}</code>
+                </pre>
+              ) : null}
+            </li>
+            <li>
+              <strong>{tr('schedules.form.preconditionFileStepTestTitle')}</strong>
+              <p>{tr('schedules.form.preconditionFileStepTest')}</p>
+            </li>
+          </ol>
+        </>
+      )}
+      <div className="schedule-precondition-test-guide" role="note">
+        <strong>{tr('schedules.form.preconditionTestGuideTitle')}</strong>
+        <p>{tr('schedules.form.preconditionTestGuide')}</p>
+      </div>
+    </section>
+  );
+}
+
+function SchedulePreconditionHelpDialog(props: {
+  open: boolean;
+  mode: PreconditionEditMode;
+  source: PreconditionHelpSource;
+  trustedFileRoot: string;
+  tr: ReturnType<typeof useT>;
+  returnFocusRef: RefObject<HTMLButtonElement | null>;
+  onClose(): void;
+  onUseSimple(): void;
+  onUsePrompt(): void;
+}) {
+  const { open, mode, source, tr } = props;
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const canApplyExample = mode === 'inline' && source === 'inline';
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      try {
+        dialog.showModal();
+        closeButtonRef.current?.focus();
+      } catch (error) {
+        console.error('Failed to open Bash precondition help dialog', error);
+        props.onClose();
+      }
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
+  }, [open]);
+
+  function closeDialog(): void {
+    const dialog = dialogRef.current;
+    if (dialog?.open) dialog.close();
+    else props.onClose();
+  }
+
+  function finishClose(): void {
+    props.onClose();
+    props.returnFocusRef.current?.focus();
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      id="schedule-precondition-help-dialog"
+      className="schedule-precondition-help-dialog"
+      aria-labelledby="schedule-precondition-help-title"
+      aria-describedby="schedule-precondition-help-intro"
+      onClose={finishClose}
+      onCancel={e => {
+        e.preventDefault();
+        closeDialog();
+      }}
+      onClick={e => { if (e.target === dialogRef.current) closeDialog(); }}
+    >
+      <article>
+        <header>
+          <div>
+            <h2 id="schedule-precondition-help-title">
+              {tr('schedules.form.preconditionHelpTitle')}
+            </h2>
+            <p id="schedule-precondition-help-intro">
+              {tr('schedules.form.preconditionHelpIntro')}
+            </p>
+          </div>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="schedule-precondition-help-close"
+            aria-label={tr('schedules.form.preconditionHelpClose')}
+            title={tr('schedules.form.preconditionHelpClose')}
+            onClick={closeDialog}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        <div className="schedule-precondition-help-body">
+          <SchedulePreconditionSourceHelp
+            source={source}
+            trustedFileRoot={props.trustedFileRoot}
+            tr={tr}
+          />
+          <SchedulePreconditionProtocolHelp
+            tr={tr}
+            onUseSimple={canApplyExample ? () => {
+              props.onUseSimple();
+              closeDialog();
+            } : undefined}
+            onUsePrompt={canApplyExample ? () => {
+              props.onUsePrompt();
+              closeDialog();
+            } : undefined}
+          />
+        </div>
+      </article>
+    </dialog>
+  );
+}
+
+/** Convert the visible precondition editor state into the minimal API DTO.
+ *  An unchanged revealed definition is intentionally omitted so ordinary task
+ *  edits do not rewrite its protected sidecar record. */
+export function buildSchedulePreconditionFormFields(input: {
+  hasExisting: boolean;
+  initialEnabled: boolean;
+  initialMode: PreconditionEditMode;
+  initialScript: string;
+  initialFilePath: string;
+  trustedFileRoot?: string | null;
+  enabled: boolean;
+  mode: PreconditionEditMode;
+  script: string;
+  filePath: string;
+}): { ok: true; fields: SchedulePreconditionFormFields } | { ok: false; error: SchedulePreconditionFormError } {
+  if (!input.hasExisting && !input.enabled) return { ok: true, fields: {} };
+  const currentSourceEmpty = input.mode === 'inline'
+    ? !input.script.trim()
+    : input.mode === 'file' && !input.filePath.trim();
+  if (currentSourceEmpty) {
+    return { ok: true, fields: input.hasExisting ? { preconditionScript: null } : {} };
+  }
+
+  const fields: SchedulePreconditionFormFields = {};
+  if (!input.hasExisting || input.enabled !== input.initialEnabled) {
+    fields.preconditionEnabled = input.enabled;
+  }
+  if (input.mode === 'keep') {
+    return input.hasExisting
+      ? { ok: true, fields }
+      : { ok: false, error: 'source_required' };
+  }
+  if (input.mode === 'inline') {
+    const sourceChanged = !input.hasExisting
+      || input.initialMode !== 'inline'
+      || input.script !== input.initialScript;
+    if (sourceChanged) fields.preconditionScript = input.script;
+    return { ok: true, fields };
+  }
+  const path = input.filePath.trim();
+  if (path.includes('\0')) return { ok: false, error: 'file_nul' };
+  if (path.startsWith('~')) return { ok: false, error: 'file_tilde' };
+  const sourceChanged = !input.hasExisting
+    || input.initialMode !== 'file'
+    || path !== input.initialFilePath.trim();
+  const enablingExistingSource = input.hasExisting && !input.initialEnabled && input.enabled;
+  if (sourceChanged || enablingExistingSource) {
+    const error = schedulePreconditionFileWriteError(path, input.trustedFileRoot);
+    if (error) return { ok: false, error };
+  }
+  if (sourceChanged) fields.preconditionFilePath = path;
+  return { ok: true, fields };
+}
 
 export interface ScheduleFilters {
   q: string;
@@ -69,13 +512,476 @@ function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
     : tr('schedules.deliveryTopLevel');
 }
 
-function repeatLabel(s: ScheduleRow): string {
-  if (!s.repeat) return '—';
-  return `${s.repeat.completed}/${s.repeat.times ?? '∞'}`;
+export function formatScheduleRepeat(
+  repeat?: { times: number | null; completed: number },
+): string | null {
+  if (!repeat) return null;
+  return `${repeat.completed}/${repeat.times ?? '∞'}`;
+}
+
+export function scheduleRunHistoryForBackdrop<T extends { outcome: ScheduleRunOutcome }>(
+  newestFirst: readonly T[],
+): T[] {
+  return newestFirst.slice(0, SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT).reverse();
+}
+
+export function countScheduleRunHistory(
+  logs: readonly { outcome: ScheduleRunOutcome }[],
+): Record<ScheduleRunOutcome, number> {
+  const counts: Record<ScheduleRunOutcome, number> = {
+    model_dispatched: 0,
+    precondition_skipped: 0,
+    error: 0,
+  };
+  for (const log of logs) counts[log.outcome] += 1;
+  return counts;
+}
+
+export function scheduleTargetChatIds(
+  schedule: { chatIds?: unknown; chatId?: unknown } | null | undefined,
+): string[] {
+  const source = Array.isArray(schedule?.chatIds)
+    ? schedule.chatIds
+    : [schedule?.chatId];
+  const seen = new Set<string>();
+  const chatIds: string[] = [];
+  for (const value of source) {
+    if (typeof value !== 'string') continue;
+    const chatId = value.trim();
+    if (!chatId || seen.has(chatId)) continue;
+    seen.add(chatId);
+    chatIds.push(chatId);
+  }
+  return chatIds;
+}
+
+export function scheduleRunTargetResults(value: unknown): ScheduleTargetRunResult[] {
+  if (!value || typeof value !== 'object') return [];
+  const targetResults = (value as { targetResults?: unknown }).targetResults;
+  if (!Array.isArray(targetResults)) return [];
+  const parsed: ScheduleTargetRunResult[] = [];
+  for (const result of targetResults) {
+    if (!result || typeof result !== 'object') continue;
+    const chatId = typeof (result as { chatId?: unknown }).chatId === 'string'
+      ? (result as { chatId: string }).chatId.trim()
+      : '';
+    const outcome = (result as { outcome?: unknown }).outcome;
+    if (!chatId || (outcome !== 'model_dispatched' && outcome !== 'error')) continue;
+    const error = typeof (result as { error?: unknown }).error === 'string'
+      ? (result as { error: string }).error
+      : undefined;
+    parsed.push({ chatId, outcome, ...(error ? { error } : {}) });
+  }
+  return parsed;
+}
+
+function isScheduleRunOutcome(value: unknown): value is ScheduleRunOutcome {
+  return value === 'model_dispatched' || value === 'precondition_skipped' || value === 'error';
+}
+
+async function fetchScheduleRunHistoryPreview(
+  taskId: string,
+  signal: AbortSignal,
+): Promise<ScheduleRunHistoryPreview> {
+  const response = await fetch(
+    `/api/schedules/${encodeURIComponent(taskId)}/logs?limit=${SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT}&offset=0`,
+    { signal },
+  );
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`invalid_response: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!response.ok) {
+    const error = body && typeof body === 'object' && 'error' in body
+      ? String((body as { error?: unknown }).error ?? response.status)
+      : String(response.status);
+    throw new Error(error);
+  }
+  if (
+    !body
+    || typeof body !== 'object'
+    || !Array.isArray((body as { logs?: unknown }).logs)
+    || typeof (body as { total?: unknown }).total !== 'number'
+  ) {
+    throw new Error('invalid_response');
+  }
+  const rawLogs = (body as { logs: unknown[] }).logs;
+  if (rawLogs.some(log => (
+    !log
+    || typeof log !== 'object'
+    || typeof (log as { id?: unknown }).id !== 'string'
+    || !isScheduleRunOutcome((log as { outcome?: unknown }).outcome)
+  ))) {
+    throw new Error('invalid_response');
+  }
+  return {
+    logs: rawLogs as ScheduleRunLogEntry[],
+    total: Math.max(0, Math.floor((body as { total: number }).total)),
+  };
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+export function formatScheduleRunDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return '—';
+  if (durationMs < 1_000) return `${Math.round(durationMs)} ms`;
+  if (durationMs < 60_000) {
+    const seconds = durationMs / 1_000;
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} s`;
+  }
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1_000);
+  return seconds > 0 ? `${minutes} min ${seconds} s` : `${minutes} min`;
+}
+
+function ScheduleRunLogDialog(props: {
+  open: boolean;
+  schedule: ScheduleRow | null;
+  scheduleTimeZone?: string;
+  tr: ReturnType<typeof useT>;
+  returnFocusRef: RefObject<HTMLButtonElement | null>;
+  onClose(): void;
+}) {
+  const { open, schedule, scheduleTimeZone, tr } = props;
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const activeRequestRef = useRef<AbortController | null>(null);
+  const [logs, setLogs] = useState<ScheduleRunLogEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && schedule && !dialog.open) {
+      try {
+        dialog.showModal();
+        closeButtonRef.current?.focus();
+        setLogs([]);
+        setTotal(0);
+        setHasMore(false);
+        setSelectedId(null);
+        setError(null);
+        void loadLogs('initial');
+      } catch (openError) {
+        console.error('Failed to open schedule run log dialog', openError);
+        props.onClose();
+      }
+    } else if ((!open || !schedule) && dialog.open) {
+      activeRequestRef.current?.abort();
+      dialog.close();
+    }
+    return () => {
+      if (!open) activeRequestRef.current?.abort();
+    };
+  }, [open, schedule?.id]);
+
+  async function loadLogs(mode: 'initial' | 'refresh' | 'more'): Promise<void> {
+    if (!schedule) return;
+    const offset = mode === 'more' ? logs.length : 0;
+    const controller = new AbortController();
+    activeRequestRef.current?.abort();
+    activeRequestRef.current = controller;
+    setError(null);
+    if (mode === 'initial') setLoading(true);
+    if (mode === 'refresh') setRefreshing(true);
+    if (mode === 'more') setLoadingMore(true);
+
+    try {
+      const response = await fetch(
+        `/api/schedules/${encodeURIComponent(schedule.id)}/logs?limit=${SCHEDULE_RUN_LOG_PAGE_SIZE}&offset=${offset}`,
+        { signal: controller.signal },
+      );
+      const body = await response.json().catch(() => null) as (ScheduleRunLogPage & { error?: string }) | null;
+      if (!response.ok) {
+        throw new Error(body?.error || `HTTP ${response.status}`);
+      }
+      if (!body || !Array.isArray(body.logs)) {
+        throw new Error(tr('schedules.logs.invalidResponse'));
+      }
+      if (activeRequestRef.current !== controller) return;
+
+      const nextLogs = body.logs;
+      const nextTotal = Number.isFinite(body.total) ? body.total : offset + nextLogs.length;
+      const nextHasMore = typeof body.hasMore === 'boolean'
+        ? body.hasMore
+        : offset + nextLogs.length < nextTotal;
+      if (mode === 'more') {
+        setLogs(current => {
+          const existing = new Set(current.map(entry => entry.id));
+          return [...current, ...nextLogs.filter(entry => !existing.has(entry.id))];
+        });
+      } else {
+        setLogs(nextLogs);
+        setSelectedId(nextLogs[0]?.id ?? null);
+      }
+      setTotal(nextTotal);
+      setHasMore(nextHasMore);
+    } catch (loadError) {
+      if (loadError instanceof DOMException && loadError.name === 'AbortError') return;
+      if (activeRequestRef.current !== controller) return;
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      if (activeRequestRef.current === controller) {
+        setLoading(false);
+        setRefreshing(false);
+        setLoadingMore(false);
+      }
+    }
+  }
+
+  function closeDialog(): void {
+    activeRequestRef.current?.abort();
+    const dialog = dialogRef.current;
+    if (dialog?.open) dialog.close();
+    else props.onClose();
+  }
+
+  function finishClose(): void {
+    activeRequestRef.current?.abort();
+    props.onClose();
+    props.returnFocusRef.current?.focus();
+  }
+
+  const selected = logs.find(entry => entry.id === selectedId) ?? logs[0] ?? null;
+  const selectedTargetResults = scheduleRunTargetResults(selected);
+  const dispatchedTargetCount = selectedTargetResults.filter(
+    result => result.outcome === 'model_dispatched',
+  ).length;
+
+  function outcomeLabel(outcome: ScheduleRunLogEntry['outcome']): string {
+    if (outcome === 'model_dispatched') return tr('schedules.logs.outcomeDispatched');
+    if (outcome === 'precondition_skipped') return tr('schedules.logs.outcomeSkipped');
+    return tr('schedules.logs.outcomeError');
+  }
+
+  function preconditionLabel(precondition: ScheduleRunLogEntry['precondition']): string {
+    if (precondition === 'none') return tr('schedules.logs.preconditionNone');
+    if (precondition === 'disabled') return tr('schedules.logs.preconditionDisabled');
+    if (precondition === 'passed') return tr('schedules.logs.preconditionPassed');
+    if (precondition === 'skipped') return tr('schedules.logs.preconditionSkipped');
+    return tr('schedules.logs.preconditionError');
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      id="schedule-run-log-dialog"
+      className="schedule-run-log-dialog"
+      aria-labelledby="schedule-run-log-title"
+      aria-describedby="schedule-run-log-intro"
+      onClose={finishClose}
+      onCancel={event => {
+        event.preventDefault();
+        closeDialog();
+      }}
+      onClick={event => { if (event.target === dialogRef.current) closeDialog(); }}
+    >
+      <article>
+        <header className="schedule-run-log-header">
+          <div>
+            <p className="eyebrow">{tr('schedules.logs.eyebrow')}</p>
+            <h2 id="schedule-run-log-title">
+              {tr('schedules.logs.title')} · <span>{schedule?.name ?? schedule?.id ?? '—'}</span>
+            </h2>
+            <p id="schedule-run-log-intro">{tr('schedules.logs.intro')}</p>
+          </div>
+          <div className="schedule-run-log-header-actions">
+            <RefreshIconButton
+              className="schedule-run-log-refresh"
+              label={tr('schedules.logs.refresh')}
+              busy={refreshing}
+              disabled={loading || refreshing || loadingMore}
+              onClick={() => void loadLogs('refresh')}
+            />
+            <button
+              ref={closeButtonRef}
+              type="button"
+              className="schedule-run-log-close"
+              aria-label={tr('schedules.logs.close')}
+              title={tr('schedules.logs.close')}
+              onClick={closeDialog}
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          </div>
+        </header>
+
+        <div className="schedule-run-log-body">
+          {error ? (
+            <div className="schedule-run-log-alert" role="alert">
+              <div>
+                <strong>{tr('schedules.logs.loadFailed')}</strong>
+                <span>{error}</span>
+              </div>
+              <button type="button" onClick={() => void loadLogs(logs.length ? 'refresh' : 'initial')}>
+                {tr('schedules.logs.retry')}
+              </button>
+            </div>
+          ) : null}
+
+          {loading ? (
+            <LoadingState compact label={tr('schedules.logs.loading')} />
+          ) : logs.length === 0 ? (
+            error ? null : (
+              <div className="schedule-run-log-empty">
+                <span aria-hidden="true">◎</span>
+                <strong>{tr('schedules.logs.emptyTitle')}</strong>
+                <p>{tr('schedules.logs.emptyHint')}</p>
+              </div>
+            )
+          ) : (
+            <div className="schedule-run-log-workspace">
+              <section className="schedule-run-log-list-panel" aria-labelledby="schedule-run-log-history-title">
+                <header>
+                  <h3 id="schedule-run-log-history-title">{tr('schedules.logs.history')}</h3>
+                  <span>{total}</span>
+                </header>
+                <ol className="schedule-run-log-list">
+                  {logs.map(entry => {
+                    const active = selected?.id === entry.id;
+                    return (
+                      <li key={entry.id}>
+                        <button
+                          type="button"
+                          className={`schedule-run-log-row outcome-${entry.outcome}${active ? ' is-active' : ''}`}
+                          aria-current={active ? 'true' : undefined}
+                          onClick={() => setSelectedId(entry.id)}
+                        >
+                          <span className="schedule-run-log-row-main">
+                            <strong>{outcomeLabel(entry.outcome)}</strong>
+                            <time dateTime={entry.startedAt}>{fmtScheduleDate(entry.startedAt, scheduleTimeZone)}</time>
+                          </span>
+                          <span className="schedule-run-log-row-duration">
+                            {formatScheduleRunDuration(entry.durationMs)}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+                {hasMore ? (
+                  <button
+                    type="button"
+                    className="schedule-run-log-more"
+                    disabled={loadingMore}
+                    onClick={() => void loadLogs('more')}
+                  >
+                    {loadingMore ? tr('schedules.logs.loadingMore') : tr('schedules.logs.loadMore')}
+                  </button>
+                ) : null}
+              </section>
+
+              <section className="schedule-run-log-detail-panel" aria-labelledby="schedule-run-log-detail-title">
+                {selected ? (
+                  <>
+                    <header>
+                      <div>
+                        <p id="schedule-run-log-detail-title">{tr('schedules.logs.details')}</p>
+                        <time dateTime={selected.startedAt}>{fmtScheduleDate(selected.startedAt, scheduleTimeZone)}</time>
+                      </div>
+                      <strong className={`schedule-run-log-outcome outcome-${selected.outcome}`}>
+                        {outcomeLabel(selected.outcome)}
+                      </strong>
+                    </header>
+                    <dl className="schedule-run-log-facts">
+                      <div>
+                        <dt>{tr('schedules.logs.trigger')}</dt>
+                        <dd>{selected.trigger === 'dashboard'
+                          ? tr('schedules.logs.triggerDashboard')
+                          : tr('schedules.logs.triggerScheduler')}</dd>
+                      </div>
+                      <div>
+                        <dt>{tr('schedules.logs.duration')}</dt>
+                        <dd>{formatScheduleRunDuration(selected.durationMs)}</dd>
+                      </div>
+                      <div>
+                        <dt>{tr('schedules.logs.startedAt')}</dt>
+                        <dd><time dateTime={selected.startedAt}>{fmtScheduleDate(selected.startedAt, scheduleTimeZone)}</time></dd>
+                      </div>
+                      <div>
+                        <dt>{tr('schedules.logs.finishedAt')}</dt>
+                        <dd><time dateTime={selected.finishedAt}>{fmtScheduleDate(selected.finishedAt, scheduleTimeZone)}</time></dd>
+                      </div>
+                      <div>
+                        <dt>{tr('schedules.logs.precondition')}</dt>
+                        <dd>{preconditionLabel(selected.precondition)}</dd>
+                      </div>
+                      <div>
+                        <dt>
+                          <FieldTitle
+                            help={tr('schedules.logs.boundary')}
+                            helpLabel={tr('schedules.logs.boundary')}
+                          >
+                            {tr('schedules.logs.modelInvocation')}
+                          </FieldTitle>
+                        </dt>
+                        <dd>{selectedTargetResults.length > 0
+                          ? tr('schedules.logs.modelInvocationTargets', {
+                              submitted: dispatchedTargetCount,
+                              total: selectedTargetResults.length,
+                            })
+                          : selected.outcome === 'model_dispatched'
+                            ? tr('schedules.logs.yes')
+                            : tr('schedules.logs.no')}</dd>
+                      </div>
+                      <div>
+                        <dt>{tr('schedules.logs.additionalPrompt')}</dt>
+                        <dd>{selected.additionalPrompt
+                          ? tr('schedules.logs.yes')
+                          : tr('schedules.logs.no')}</dd>
+                      </div>
+                    </dl>
+                    {selectedTargetResults.length > 0 ? (
+                      <section className="schedule-run-log-targets" aria-labelledby="schedule-run-log-targets-title">
+                        <h3 id="schedule-run-log-targets-title">{tr('schedules.logs.targetResults')}</h3>
+                        <ul>
+                          {selectedTargetResults.map((result, index) => {
+                            const targetTitle = chatDisplayTitle({ chatId: result.chatId });
+                            return (
+                              <li key={`${result.chatId}:${index}`} className={`outcome-${result.outcome}`}>
+                                <div>
+                                  <strong>{targetTitle ?? result.chatId}</strong>
+                                  {targetTitle ? <code>{result.chatId}</code> : null}
+                                </div>
+                                <span>{result.outcome === 'model_dispatched'
+                                  ? tr('schedules.logs.targetDispatched')
+                                  : tr('schedules.logs.targetError')}</span>
+                                {result.error ? <p>{result.error}</p> : null}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </section>
+                    ) : null}
+                    {selected.errorCode || selected.error ? (
+                      <div className="schedule-run-log-error-detail">
+                        {selected.errorCode ? (
+                          <p><span>{tr('schedules.logs.errorCode')}</span><code>{selected.errorCode}</code></p>
+                        ) : null}
+                        {selected.error ? (
+                          <p><span>{tr('schedules.logs.errorMessage')}</span><strong>{selected.error}</strong></p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+              </section>
+            </div>
+          )}
+        </div>
+      </article>
+    </dialog>
+  );
 }
 
 // ── 调度规则内联校验 ─────────────────────────────────────────────────────────
@@ -163,6 +1069,49 @@ export function canSubmitSchedule(
   return checkSchedule(normalized, tr, timeZone).ok;
 }
 
+function scheduleRunHistoryLabel(
+  preview: ScheduleRunHistoryPreview | null,
+  tr: ReturnType<typeof useT>,
+): string | undefined {
+  if (!preview) return undefined;
+  const displayed = scheduleRunHistoryForBackdrop(preview.logs);
+  if (displayed.length === 0) return tr('schedules.logs.emptyTitle');
+  const counts = countScheduleRunHistory(displayed);
+  return tr('schedules.logs.backgroundSummary', {
+    shown: displayed.length,
+    total: preview.total,
+    dispatched: counts.model_dispatched,
+    skipped: counts.precondition_skipped,
+    failed: counts.error,
+  });
+}
+
+function scheduleChatPresentation(
+  schedule: ScheduleRow,
+  tr: ReturnType<typeof useT>,
+): { summary: string; title: string } | null {
+  const chatIds = scheduleTargetChatIds(schedule);
+  if (chatIds.length === 0) return null;
+  const labels = chatIds.map(chatId => chatDisplayTitle({
+    chatId,
+    chatDisplayName: schedule.chatId === chatId ? schedule.chatDisplayName : undefined,
+  }) ?? chatId);
+  const summary = labels.length === 1
+    ? labels[0]!
+    : labels.length === 2
+      ? tr('schedules.chatSummaryTwo', { first: labels[0]!, second: labels[1]! })
+      : tr('schedules.chatSummaryMany', {
+          first: labels[0]!,
+          second: labels[1]!,
+          count: labels.length,
+          remaining: labels.length - 2,
+        });
+  const title = chatIds.map((chatId, index) => (
+    labels[index] === chatId ? chatId : `${labels[index]} · ${chatId}`
+  )).join('\n');
+  return { summary, title };
+}
+
 function ScheduleRowCard(props: {
   schedule: ScheduleRow;
   scheduleTimeZone?: string;
@@ -170,17 +1119,72 @@ function ScheduleRowCard(props: {
   feedback: Record<string, ActionFeedback>;
   tr: ReturnType<typeof useT>;
   onAction(id: string, op: ScheduleAction): void;
+  onOpenLogs(schedule: ScheduleRow, trigger: HTMLButtonElement): void;
   onEdit(schedule: ScheduleRow): void;
   onDelete(schedule: ScheduleRow): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
-  const chatTitle = chatDisplayTitle(s);
+  const chatPresentation = scheduleChatPresentation(s, tr);
   const kind = String(s.parsed?.kind ?? 'unknown');
   const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
   const toggleKey = `${s.id}:${toggleOp}`;
   const runKey = `${s.id}:run`;
+  const repeat = formatScheduleRepeat(s.repeat);
+  const [runHistory, setRunHistory] = useState<ScheduleRunHistoryPreview | null>(null);
+  const displayedRunHistory = runHistory
+    ? scheduleRunHistoryForBackdrop(runHistory.logs)
+    : [];
+  const runHistoryLabel = scheduleRunHistoryLabel(runHistory, tr);
+  const openLogsLabel = runHistoryLabel
+    ? `${tr('schedules.logs.open')} · ${runHistoryLabel}`
+    : tr('schedules.logs.open');
+
+  useEffect(() => {
+    if (!ui.authed) {
+      setRunHistory(null);
+      return;
+    }
+    let activeController: AbortController | null = null;
+    let disposed = false;
+    const loadHistory = async (): Promise<void> => {
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+      try {
+        const preview = await fetchScheduleRunHistoryPreview(s.id, controller.signal);
+        if (!disposed && !controller.signal.aborted) setRunHistory(preview);
+      } catch (error) {
+        if (disposed || controller.signal.aborted) return;
+        console.warn(
+          `[schedule-run-history] Failed to load task ${s.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    void loadHistory();
+    const unsubscribe = store.onScheduleRunLogsChanged(taskId => {
+      if (taskId === undefined || taskId === s.id) void loadHistory();
+    });
+    return () => {
+      disposed = true;
+      activeController?.abort();
+      unsubscribe();
+    };
+  }, [s.id]);
+
   return (
-    <OverviewListItem kind="schedule" className="schedule-list-row" data-id={s.id}>
+    <OverviewListItem
+      kind="schedule"
+      className="schedule-list-row"
+      data-id={s.id}
+      title={runHistoryLabel}
+    >
+      {displayedRunHistory.length > 0 ? (
+        <span className="schedule-run-log-fill" aria-hidden="true">
+          {displayedRunHistory.map(entry => (
+            <i key={entry.id} className={`outcome-${entry.outcome}`} />
+          ))}
+        </span>
+      ) : null}
       <OverviewListMain>
         <div className="schedule-row-head">
           <b>{s.name ?? s.id}</b>
@@ -195,27 +1199,27 @@ function ScheduleRowCard(props: {
         </div>
         <div className="schedule-chip-strip">
           <span>{kind}</span>
-          {s.chatId ? (
+          {chatPresentation ? (
             <span
               className="schedule-chat-chip"
-              title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}
+              title={chatPresentation.title}
             >
-              {tr('schedules.form.chat')}: {chatTitle ?? s.chatId}
+              {tr('schedules.form.chat')}: {chatPresentation.summary}
             </span>
           ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
-          <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
-          <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
-          {s.lastStatus === 'error' ? (
-            <span
-              className="schedule-error-chip"
-              title={typeof s.lastError === 'string' ? s.lastError : undefined}
-            >
-              ⚠ {tr('schedules.error')}: {typeof s.lastError === 'string' && s.lastError.length > 60 ? s.lastError.slice(0, 60) + '…' : (s.lastError ?? tr('schedules.errorUnknown'))}
+          {s.hasPrecondition ? (
+            <span className={`schedule-precondition-chip${s.preconditionEnabled === false ? ' is-paused' : ''}`}>
+              <i className="schedule-precondition-chip-icon" aria-hidden="true">⌘</i>
+              {s.preconditionEnabled === false
+                ? tr('schedules.preconditionPaused')
+                : tr('schedules.precondition')}
             </span>
           ) : null}
-          <span>{tr('schedules.repeat')}: {repeatLabel(s)}</span>
+          <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
+          <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
+          {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
         </div>
       </OverviewListMain>
       <OverviewListTail>
@@ -227,6 +1231,17 @@ function ScheduleRowCard(props: {
             feedback={props.feedback[runKey] ?? null}
             onClick={() => props.onAction(s.id, 'run')}
           />
+          <button
+            type="button"
+            className="schedule-action-button schedule-log-button"
+            aria-haspopup="dialog"
+            aria-controls="schedule-run-log-dialog"
+            onClick={event => props.onOpenLogs(s, event.currentTarget)}
+            aria-label={openLogsLabel}
+            title={openLogsLabel}
+          >
+            <span className="schedule-action-label">{tr('schedules.logs.open')}</span>
+          </button>
           <ScheduleEnabledSwitch
             checked={Boolean(s.enabled)}
             pending={props.pending === toggleKey}
@@ -271,8 +1286,10 @@ function SchedulesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   // 每次打开表单时递增，强制 ScheduleFormModal 重挂载以重置全部表单状态
   const [formNonce, setFormNonce] = useState(0);
-  const [bots, setBots] = useState<Array<{ larkAppId: string; botName?: string }>>([]);
+  const [bots, setBots] = useState<ScheduleBotOption[]>([]);
   const [, setNameMapsVersion] = useState(0);
+  const [logSchedule, setLogSchedule] = useState<ScheduleRow | null>(null);
+  const logTriggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     fetch('/api/bots')
@@ -349,6 +1366,11 @@ function SchedulesPage() {
     setFormOpen(true);
   }
 
+  function openLogs(s: ScheduleRow, trigger: HTMLButtonElement): void {
+    logTriggerRef.current = trigger;
+    setLogSchedule(s);
+  }
+
   async function handleDelete(s: ScheduleRow): Promise<void> {
     const ok = await confirm({
       title: tr('schedules.delete'),
@@ -373,29 +1395,43 @@ function SchedulesPage() {
 
   async function handleSubmit(data: {
     name: string; schedule: string; prompt: string;
+    preconditionEnabled?: boolean;
+    preconditionScript?: string | null;
+    preconditionFilePath?: string;
     silent: boolean;
     executionPosition: 'top-level' | 'topic' | 'new-topic';
     rootMessageId: string;
     topicTitle: string;
     updateExecutionPosition: boolean;
-    chatId: string; larkAppId: string;
+    chatIds: string[]; larkAppId: string;
   }): Promise<void> {
     setFormError(null);
     try {
       const url = editing ? `/api/schedules/${encodeURIComponent(editing.id)}` : '/api/schedules';
       const method = editing ? 'PATCH' : 'POST';
-      // When editing, chatId/larkAppId are immutable (PATCH ignores them);
-      // when creating, larkAppId selects the owning bot/daemon.
+      // The owning bot remains immutable after creation. Target groups are
+      // editable and are always submitted as an array, including single-group
+      // tasks, so the server can preserve one consistent update path.
       const payload = editing
         ? {
             name: data.name,
             schedule: data.schedule,
             prompt: data.prompt,
             silent: data.silent,
+            ...(data.preconditionEnabled !== undefined
+              ? { preconditionEnabled: data.preconditionEnabled }
+              : {}),
+            ...(data.preconditionScript !== undefined
+              ? { preconditionScript: data.preconditionScript }
+              : {}),
+            ...(data.preconditionFilePath !== undefined
+              ? { preconditionFilePath: data.preconditionFilePath }
+              : {}),
             ...(data.updateExecutionPosition ? {
               executionPosition: data.executionPosition,
               rootMessageId: data.rootMessageId,
               topicTitle: data.topicTitle,
+              chatIds: data.chatIds,
             } : {}),
           }
         : {
@@ -403,10 +1439,19 @@ function SchedulesPage() {
             schedule: data.schedule,
             prompt: data.prompt,
             silent: data.silent,
+            ...(data.preconditionEnabled !== undefined
+              ? { preconditionEnabled: data.preconditionEnabled }
+              : {}),
+            ...(data.preconditionScript !== undefined
+              ? { preconditionScript: data.preconditionScript }
+              : {}),
+            ...(data.preconditionFilePath !== undefined
+              ? { preconditionFilePath: data.preconditionFilePath }
+              : {}),
             executionPosition: data.executionPosition,
             rootMessageId: data.rootMessageId,
             topicTitle: data.topicTitle,
-            chatId: data.chatId,
+            chatIds: data.chatIds,
             larkAppId: data.larkAppId,
           };
       const r = await fetch(url, {
@@ -416,7 +1461,9 @@ function SchedulesPage() {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        throw new Error(body?.error ?? `HTTP ${r.status}`);
+        throw new Error(body?.error === 'too_many_target_chats'
+          ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
+          : body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -492,6 +1539,7 @@ function SchedulesPage() {
                   feedback={feedback}
                   tr={tr}
                   onAction={(id, op) => void runAction(id, op)}
+                  onOpenLogs={openLogs}
                   onEdit={openEdit}
                   onDelete={s => void handleDelete(s)}
                 />
@@ -500,6 +1548,14 @@ function SchedulesPage() {
           )}
         </div>
       </section>
+      <ScheduleRunLogDialog
+        open={logSchedule !== null}
+        schedule={logSchedule}
+        scheduleTimeZone={scheduleTimeZone}
+        tr={tr}
+        returnFocusRef={logTriggerRef}
+        onClose={() => setLogSchedule(null)}
+      />
       <ScheduleFormModal
         key={`${editing?.id ?? 'new'}-${formNonce}`}
         open={formOpen}
@@ -586,20 +1642,24 @@ interface ScheduleFormData {
   name: string;
   schedule: string;
   prompt: string;
+  /** Changed definition controls only. Script null explicitly removes it. */
+  preconditionEnabled?: boolean;
+  preconditionScript?: string | null;
+  preconditionFilePath?: string;
   silent: boolean;
   executionPosition: 'top-level' | 'topic' | 'new-topic';
   rootMessageId: string;
   topicTitle: string;
   updateExecutionPosition: boolean;
-  chatId: string;
+  chatIds: string[];
   larkAppId: string;
 }
 
-function ScheduleFormModal(props: {
+export function ScheduleFormModal(props: {
   open: boolean;
   editing: ScheduleRow | null;
   error: string | null;
-  bots: Array<{ larkAppId: string; botName?: string }>;
+  bots: ScheduleBotOption[];
   scheduleTimeZone?: string;
   tr: ReturnType<typeof useT>;
   onClose(): void;
@@ -607,21 +1667,50 @@ function ScheduleFormModal(props: {
 }) {
   const { editing, tr, bots, open, scheduleTimeZone } = props;
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const chatPickerRef = useRef<HTMLDivElement | null>(null);
+  const chatPickerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const chatSearchRef = useRef<HTMLInputElement | null>(null);
+  const preconditionHelpReturnFocusRef = useRef<HTMLButtonElement | null>(null);
+  const [preconditionHelpSource, setPreconditionHelpSource] = useState<PreconditionHelpSource | null>(null);
   const [name, setName] = useState(editing?.name ?? '');
   const [schedule, setSchedule] = useState(editing?.schedule ?? '');
   const [prompt, setPrompt] = useState(editing?.prompt ?? '');
+  const initialPrecondition = schedulePreconditionEditorInitialState(editing);
+  const hasExistingPrecondition = initialPrecondition.hasExisting;
+  const initialPreconditionEnabled = initialPrecondition.enabled;
+  const [preconditionEnabled, setPreconditionEnabled] = useState(
+    initialPreconditionEnabled,
+  );
+  const [preconditionMode, setPreconditionMode] = useState<PreconditionEditMode>(
+    initialPrecondition.mode,
+  );
+  const [preconditionScript, setPreconditionScript] = useState(initialPrecondition.script);
+  const [preconditionFilePath, setPreconditionFilePath] = useState(initialPrecondition.filePath);
+  const [preconditionError, setPreconditionError] = useState<SchedulePreconditionFormError | null>(null);
+  const [preconditionTestPending, setPreconditionTestPending] = useState(false);
+  const [preconditionTestResult, setPreconditionTestResult] = useState<SchedulePreconditionTestResult | null>(null);
+  const preconditionTestRunningRef = useRef(false);
+  const preconditionTestRevisionRef = useRef(0);
   const [silent, setSilent] = useState(editing?.silent === true);
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
     editing && scheduleExecutionPlacement(editing) === 'thread'
       ? 'topic'
       : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
   );
+  const initialChatIds = scheduleTargetChatIds(editing);
+  const initialTopicChatId = editing && scheduleExecutionPlacement(editing) === 'thread'
+    ? initialChatIds[0] ?? ''
+    : '';
   const [rootMessageId, setRootMessageId] = useState(editing?.rootMessageId ?? '');
   const [topicTitle, setTopicTitle] = useState(editing?.topicTitle ?? '');
-  const [chatId, setChatId] = useState(editing?.chatId ?? '');
+  const [chatIds, setChatIds] = useState(initialChatIds);
   const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
   const [groups, setGroups] = useState<GroupChat[]>([]);
-  const [chatManual, setChatManual] = useState(false);
+  const [groupsLoading, setGroupsLoading] = useState(true);
+  const [groupsLoadError, setGroupsLoadError] = useState(false);
+  const [groupsReloadNonce, setGroupsReloadNonce] = useState(0);
+  const [chatQuery, setChatQuery] = useState('');
+  const [chatPickerOpen, setChatPickerOpen] = useState(false);
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
@@ -638,15 +1727,45 @@ function ScheduleFormModal(props: {
     }
   }, [open]);
 
-  // 创建模式下拉取群列表（30s 缓存，与 Groups 等入口共享）
   useEffect(() => {
-    if (!open || editing) return;
+    if (!open || !chatPickerOpen) return;
+    chatSearchRef.current?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (chatPickerRef.current?.contains(event.target as Node)) return;
+      setChatPickerOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      // Close this picker first, without dismissing the parent edit dialog.
+      event.preventDefault();
+      event.stopPropagation();
+      setChatPickerOpen(false);
+      chatPickerTriggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [open, chatPickerOpen]);
+
+  // 创建和编辑都拉取群列表（30s 缓存，与 Groups 等入口共享），这样编辑时
+  // 可以改选同一 Bot 已加入的其它群；Bot 本身仍保持不可变。
+  useEffect(() => {
+    if (!open || localDelivery) return;
     let cancelled = false;
-    fetchGroupsSnapshot({ cacheMs: 30_000 })
-      .then(snap => { if (!cancelled) setGroups(snap.chats); })
-      .catch(() => undefined);
+    setGroupsLoading(true);
+    fetchGroupsSnapshot({ cacheMs: 30_000, ...(groupsReloadNonce > 0 ? { force: true } : {}) })
+      .then(snap => {
+        if (cancelled) return;
+        setGroups(snap.chats);
+        setGroupsLoadError(false);
+      })
+      .catch(() => { if (!cancelled) setGroupsLoadError(true); })
+      .finally(() => { if (!cancelled) setGroupsLoading(false); });
     return () => { cancelled = true; };
-  }, [open, editing]);
+  }, [open, localDelivery, groupsReloadNonce]);
 
   // If the modal opened before /api/bots resolved, default to the first bot
   // once it arrives so the submit button doesn't stay permanently disabled.
@@ -661,13 +1780,12 @@ function ScheduleFormModal(props: {
     [schedule, tr, scheduleTimeZone],
   );
 
-  // 只列出选中 bot 已在群的群（memberBots 有 inChat 记录时才过滤；
-  // 成员信息缺失时 fail-open 显示全部，避免阻塞创建）
+  // 只列出选中 Bot 已加入的群；编辑任务里不在当前 roster 的既有目标会在
+  // selectorOptions 中单独补回，而不会把其它未加入的群误当作可选项。
   const groupOptions = useMemo(() => {
-    const hasMembership = groups.some(g => g.memberBots?.length > 0);
-    const filtered = hasMembership && larkAppId
+    const filtered = larkAppId
       ? groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))
-      : groups;
+      : [];
     // 有名群按名称排序，无名群（仅 oc_ ID）排最后
     return [...filtered].sort((a, b) => {
       const an = a.name ?? '';
@@ -679,19 +1797,220 @@ function ScheduleFormModal(props: {
     });
   }, [groups, larkAppId]);
 
-  // bot 变更时，若当前 chatId 不在新 bot 的群列表中则清除，避免给不在群的 bot 投递
-  useEffect(() => {
-    if (!chatId || !larkAppId || groupOptions.length === 0) return;
-    if (!groupOptions.some(g => g.chatId === chatId)) setChatId('');
-  }, [larkAppId, groupOptions, chatId]);
+  const groupsHaveMembership = groups.some(g => g.memberBots?.length > 0);
 
-  const showGroupSelect = !editing && !localDelivery && !chatManual && groupOptions.length > 0;
+  // 创建时切换 Bot 后只保留新 Bot 已加入的群。编辑时 Bot 不可变，并且任务
+  // 的既有未知目标必须保留，避免 roster 暂时缺失导致一次普通保存意外删群。
+  useEffect(() => {
+    if (editing || !larkAppId || !groupsHaveMembership || chatIds.length === 0) return;
+    const allowed = new Set(groupOptions.map(group => group.chatId));
+    const nextChatIds = chatIds.filter(chatId => allowed.has(chatId));
+    if (nextChatIds.length !== chatIds.length) updateChatSelection(nextChatIds);
+  }, [editing, larkAppId, groupsHaveMembership, groupOptions, chatIds]);
+
+  const selectedUnknownChatIds = chatIds.filter(
+    chatId => !groupOptions.some(group => group.chatId === chatId),
+  );
+  const selectorOptions: Array<GroupChat & { retained?: boolean }> = [
+    ...groupOptions,
+    ...selectedUnknownChatIds.map(chatId => ({ chatId, memberBots: [], retained: true })),
+  ];
+  const normalizedChatQuery = chatQuery.trim().toLocaleLowerCase();
+  const visibleSelectorOptions = normalizedChatQuery
+    ? selectorOptions.filter(group => (
+        group.chatId.toLocaleLowerCase().includes(normalizedChatQuery)
+        || (group.name ?? chatDisplayTitle({
+          chatId: group.chatId,
+          chatDisplayName: editing?.chatId === group.chatId ? editing.chatDisplayName : undefined,
+        }) ?? '')
+          .toLocaleLowerCase()
+          .includes(normalizedChatQuery)
+      ))
+    : selectorOptions;
+
+  const selectedChatLabels = chatIds.map(chatId => (
+    selectorOptions.find(group => group.chatId === chatId)?.name
+    ?? chatDisplayTitle({
+      chatId,
+      chatDisplayName: editing?.chatId === chatId ? editing.chatDisplayName : undefined,
+    })
+    ?? chatId
+  ));
   const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
   const schedulePreview = check?.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
-  const chatMissing = touched && !editing && !localDelivery && !chatId.trim();
-  const rootMissing = touched && !localDelivery && executionPosition === 'topic' && !rootMessageId.trim();
+  const chatMissing = touched && !localDelivery && chatIds.length === 0;
+  const chatBindingChanged = chatIds.length !== initialChatIds.length
+    || chatIds.some((chatId, index) => chatId !== initialChatIds[index]);
+  const chatCountInvalid = !localDelivery && chatIds.length > MAX_SCHEDULE_TARGET_CHATS
+    && (!editing || chatBindingChanged);
+  const topicChatCountInvalid = !localDelivery
+    && executionPosition === 'topic'
+    && chatIds.length > 1;
+  const rootMissing = touched
+    && !localDelivery
+    && executionPosition === 'topic'
+    && chatIds.length === 1
+    && !rootMessageId.trim();
+  const selectedBot = bots.find(bot => bot.larkAppId === larkAppId);
+  const rawPreconditionWorkingDir = editing
+    ? editing.workingDir
+    : selectedBot?.scheduleWorkingDir;
+  const preconditionWorkingDir = typeof rawPreconditionWorkingDir === 'string'
+    && rawPreconditionWorkingDir.length > 0
+    ? rawPreconditionWorkingDir
+    : '';
+  const preconditionTrustedFileRoot = typeof selectedBot?.schedulePreconditionFileRoot === 'string'
+    ? selectedBot.schedulePreconditionFileRoot.trim()
+    : '';
+  const preconditionFileExamplePath = schedulePreconditionFileExamplePath(preconditionTrustedFileRoot);
+  const trimmedPreconditionFilePath = preconditionFilePath.trim();
+  const preconditionFileSourceChanged = !hasExistingPrecondition
+    || initialPrecondition.mode !== 'file'
+    || trimmedPreconditionFilePath !== initialPrecondition.filePath.trim();
+  const preconditionFileWillBeEnabled = hasExistingPrecondition
+    && !initialPreconditionEnabled
+    && preconditionEnabled;
+  const preconditionFileIsTrusted = preconditionMode === 'file'
+    && isSchedulePreconditionPathWithinTrustedRoot(
+      trimmedPreconditionFilePath,
+      preconditionTrustedFileRoot,
+    );
+  const preconditionFileNeedsWriteValidation = preconditionMode === 'file'
+    && trimmedPreconditionFilePath.length > 0
+    && (preconditionFileSourceChanged || preconditionFileWillBeEnabled);
+  const livePreconditionFileError = preconditionMode === 'file'
+    && trimmedPreconditionFilePath.length > 0
+    && preconditionFileNeedsWriteValidation
+    ? schedulePreconditionFileWriteError(
+      trimmedPreconditionFilePath,
+      preconditionTrustedFileRoot,
+    )
+    : null;
+  const preconditionFileMigrationRequired = preconditionMode === 'file'
+    && hasExistingPrecondition
+    && initialPrecondition.mode === 'file'
+    && !preconditionFileSourceChanged
+    && trimmedPreconditionFilePath.length > 0
+    && !preconditionFileIsTrusted;
+  const displayedPreconditionError = preconditionError ?? livePreconditionFileError;
+  const preconditionErrorText = displayedPreconditionError === 'source_required'
+    ? tr('schedules.form.preconditionErrSource')
+    : displayedPreconditionError === 'file_nul'
+      ? tr('schedules.form.preconditionErrFileNul')
+      : displayedPreconditionError === 'file_tilde'
+        ? tr('schedules.form.preconditionErrFileTilde')
+        : displayedPreconditionError === 'file_absolute'
+          ? tr('schedules.form.preconditionErrFileAbsolute')
+          : displayedPreconditionError === 'file_root_unavailable'
+            ? tr('schedules.form.preconditionErrFileRootUnavailable')
+            : displayedPreconditionError === 'file_outside_trusted_root'
+              ? tr('schedules.form.preconditionErrFileOutsideTrustedRoot', {
+                root: preconditionTrustedFileRoot,
+              })
+              : null;
+  const preconditionTestSourceReady = preconditionMode === 'inline'
+    ? preconditionScript.trim().length > 0
+    : preconditionMode === 'file'
+      && trimmedPreconditionFilePath.length > 0
+      && !trimmedPreconditionFilePath.includes('\0')
+      && preconditionFileIsTrusted;
+  const canTestPrecondition = preconditionMode !== 'keep'
+    && preconditionTestSourceReady
+    && Boolean(larkAppId)
+    && Boolean(preconditionWorkingDir)
+    && !preconditionTestPending;
+
+  useEffect(() => {
+    preconditionTestRevisionRef.current += 1;
+    setPreconditionTestResult(null);
+  }, [
+    preconditionEnabled,
+    preconditionMode,
+    preconditionScript,
+    preconditionFilePath,
+    preconditionWorkingDir,
+    larkAppId,
+    open,
+  ]);
+
+  async function handleTestPrecondition(): Promise<void> {
+    if (!canTestPrecondition || preconditionTestRunningRef.current) return;
+    const requestRevision = preconditionTestRevisionRef.current;
+    preconditionTestRunningRef.current = true;
+    setPreconditionTestPending(true);
+    setPreconditionTestResult(null);
+    setPreconditionError(null);
+    try {
+      const source = preconditionMode === 'inline'
+        ? { kind: 'inline' as const, script: preconditionScript }
+        : { kind: 'file' as const, path: trimmedPreconditionFilePath };
+      const response = await fetch('/api/schedules/precondition/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ larkAppId, workingDir: preconditionWorkingDir, source }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (requestRevision !== preconditionTestRevisionRef.current) return;
+      if (!response.ok || body?.ok !== true || !['pass', 'skip'].includes(body?.result)) {
+        setPreconditionTestResult({
+          outcome: 'error',
+          errorCode: typeof body?.errorCode === 'string' ? body.errorCode : `HTTP ${response.status}`,
+          error: typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError'),
+          ...(Number.isFinite(body?.durationMs) ? { durationMs: body.durationMs } : {}),
+        });
+        return;
+      }
+      setPreconditionTestResult({
+        outcome: body.result,
+        additionalPrompt: body.additionalPrompt === true,
+        ...(Number.isFinite(body.durationMs) ? { durationMs: body.durationMs } : {}),
+      });
+    } catch (error) {
+      if (requestRevision !== preconditionTestRevisionRef.current) return;
+      setPreconditionTestResult({
+        outcome: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      preconditionTestRunningRef.current = false;
+      setPreconditionTestPending(false);
+    }
+  }
+
+  function updateChatSelection(nextValues: readonly string[]): void {
+    const nextChatIds = scheduleTargetChatIds({ chatIds: nextValues });
+    if (
+      initialTopicChatId
+      && (nextChatIds.length !== 1 || nextChatIds[0] !== initialTopicChatId)
+    ) {
+      setRootMessageId('');
+    }
+    setChatIds(nextChatIds);
+  }
+
+  function toggleChat(chatId: string, checked: boolean): void {
+    if (checked && executionPosition === 'topic') {
+      updateChatSelection([chatId]);
+      return;
+    }
+    updateChatSelection(checked
+      ? [...chatIds, chatId]
+      : chatIds.filter(value => value !== chatId));
+  }
+
+  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic'): void {
+    setExecutionPosition(next);
+    if (
+      next === 'topic'
+      && rootMessageId
+      && (chatIds.length !== 1 || chatIds[0] !== initialTopicChatId)
+    ) {
+      setRootMessageId('');
+    }
+    if (next === 'new-topic') setSilent(false);
+  }
 
   function handleSubmit(e: React.FormEvent): void {
     e.preventDefault();
@@ -700,24 +2019,45 @@ function ScheduleFormModal(props: {
     // 必填内联校验：不静默 return，每个缺字段都有可见红提示
     if (!editing && !larkAppId) return;
     if (!name.trim() || !prompt.trim()) return;
-    if (!localDelivery && !chatId.trim()) return;
+    if (!localDelivery && chatIds.length === 0) return;
+    if (chatCountInvalid) return;
+    if (!localDelivery && executionPosition === 'topic' && chatIds.length !== 1) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
     if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
+    const precondition = buildSchedulePreconditionFormFields({
+      hasExisting: hasExistingPrecondition,
+      initialEnabled: initialPreconditionEnabled,
+      initialMode: initialPrecondition.mode,
+      initialScript: initialPrecondition.script,
+      initialFilePath: initialPrecondition.filePath,
+      trustedFileRoot: preconditionTrustedFileRoot,
+      enabled: preconditionEnabled,
+      mode: preconditionMode,
+      script: preconditionScript,
+      filePath: preconditionFilePath,
+    });
+    if (!precondition.ok) {
+      setPreconditionError(precondition.error);
+      return;
+    }
+    setPreconditionError(null);
     props.onSubmit({
       name: name.trim(),
       schedule: schedule.trim(),
       prompt,
+      ...precondition.fields,
       silent,
       executionPosition,
       rootMessageId: rootMessageId.trim(),
       topicTitle: topicTitle.trim(),
       updateExecutionPosition: !localDelivery,
-      chatId: chatId.trim(),
+      chatIds,
       larkAppId,
     });
   }
 
   return (
+    <>
     <dialog
       ref={dialogRef}
       className="schedule-form-dialog"
@@ -741,7 +2081,18 @@ function ScheduleFormModal(props: {
               ))}
             </select>
           </label>
-        ) : null}
+        ) : (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
+            <div className="schedule-form-readonly">
+              <strong>{bots.find(bot => bot.larkAppId === larkAppId)?.botName
+                ?? editing.botName
+                ?? larkAppId}</strong>
+              <code>{larkAppId}</code>
+            </div>
+            <small className="schedule-form-help">{tr('schedules.form.botImmutableHelp')}</small>
+          </div>
+        )}
         <label className="schedule-form-field">
           <span className="schedule-form-label">{tr('schedules.form.name')}</span>
           <input
@@ -802,63 +2153,376 @@ function ScheduleFormModal(props: {
             <small className="schedule-form-help">{tr('schedules.form.promptHelp')}</small>
           )}
         </label>
-        {editing ? (
-          <div className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
-            <code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>
+        <div className="schedule-form-field schedule-precondition-field">
+          <div className="schedule-precondition-header">
+            <span className="schedule-form-label">
+              <FieldTitle
+                help={tr('schedules.form.preconditionEnableHelp')}
+                helpLabel={tr('schedules.form.preconditionEnable')}
+              >
+                <span id="schedule-precondition-label">{tr('schedules.form.precondition')}</span>
+              </FieldTitle>
+            </span>
+            <label className="toggle-row schedule-precondition-toggle">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={preconditionEnabled}
+                aria-labelledby="schedule-precondition-label"
+                aria-describedby="schedule-precondition-toggle-help"
+                aria-controls="schedule-precondition-panel"
+                onChange={e => {
+                  setPreconditionEnabled(e.currentTarget.checked);
+                  setPreconditionError(null);
+                }}
+              />
+              <span className="switch" aria-hidden="true" />
+              <span aria-hidden="true">{tr(preconditionEnabled ? 'schedules.enabled' : 'schedules.paused')}</span>
+            </label>
           </div>
-        ) : !localDelivery ? (
-          <div className="schedule-form-field">
-            <span className="schedule-form-label">{tr('schedules.form.chat')} <i className="req" aria-hidden="true">*</i></span>
-            {showGroupSelect ? (
-              <>
-                <select
-                  value={chatId}
-                  onChange={e => setChatId(e.target.value)}
-                  required
-                  aria-invalid={chatMissing || undefined}
-                >
-                  <option value="" disabled>{tr('schedules.form.chatPlaceholder')}</option>
-                  {groupOptions.map(g => {
-                    const inChat = g.memberBots?.filter(b => b.inChat).length ?? 0;
-                    return (
-                      <option key={g.chatId} value={g.chatId}>
-                        {g.name ?? g.chatId}{inChat > 0 ? ` · ${inChat} bots` : ''}
-                      </option>
-                    );
-                  })}
-                </select>
-                <button
-                  type="button"
-                  className="schedule-form-link"
-                  onClick={() => setChatManual(true)}
-                >
-                  {tr('schedules.form.chatManual')}
-                </button>
-              </>
-            ) : (
-              <>
-                <input
-                  type="text"
-                  value={chatId}
-                  onChange={e => setChatId(e.target.value)}
-                  placeholder="oc_..."
-                  required
-                  aria-invalid={chatMissing || undefined}
-                />
-                {groupOptions.length > 0 ? (
-                  <button
-                    type="button"
-                    className="schedule-form-link"
-                    onClick={() => { setChatManual(false); setChatId(''); }}
+          <span id="schedule-precondition-toggle-help" className="schedule-precondition-sr-only">
+            {tr('schedules.form.preconditionEnableHelp')}
+          </span>
+
+          {hasExistingPrecondition && initialPrecondition.mode === 'keep' ? (
+            <p className="schedule-precondition-status" role="status">
+              {tr('schedules.form.preconditionUnavailableHelp')}
+            </p>
+          ) : null}
+
+          {preconditionEnabled || hasExistingPrecondition ? (
+            <div className="schedule-precondition-toolbar">
+              <fieldset className="schedule-precondition-source">
+                <legend className="schedule-precondition-sr-only">{tr('schedules.form.preconditionSource')}</legend>
+                <div className="schedule-form-radio-group">
+                  {initialPrecondition.mode === 'keep' ? (
+                    <label>
+                      <input
+                        type="radio"
+                        name="preconditionSource"
+                        value="keep"
+                        checked={preconditionMode === 'keep'}
+                        onChange={() => { setPreconditionMode('keep'); setPreconditionError(null); }}
+                      />
+                      {tr('schedules.form.preconditionSourceKeep')}
+                    </label>
+                  ) : null}
+                  <span className="schedule-precondition-source-option">
+                    <label>
+                      <input
+                        type="radio"
+                        name="preconditionSource"
+                        value="inline"
+                        checked={preconditionMode === 'inline'}
+                        onChange={() => { setPreconditionMode('inline'); setPreconditionError(null); }}
+                      />
+                      {tr('schedules.form.preconditionSourceInline')}
+                    </label>
+                    <button
+                      type="button"
+                      className="schedule-precondition-help-trigger"
+                      aria-label={tr('schedules.form.preconditionInlineHelpOpen')}
+                      title={tr('schedules.form.preconditionInlineHelpOpen')}
+                      aria-haspopup="dialog"
+                      aria-controls="schedule-precondition-help-dialog"
+                      aria-expanded={preconditionHelpSource === 'inline'}
+                      onClick={e => {
+                        preconditionHelpReturnFocusRef.current = e.currentTarget;
+                        setPreconditionHelpSource('inline');
+                      }}
+                    >
+                      <span aria-hidden="true">?</span>
+                    </button>
+                  </span>
+                  <span className="schedule-precondition-source-option">
+                    <label>
+                      <input
+                        type="radio"
+                        name="preconditionSource"
+                        value="file"
+                        checked={preconditionMode === 'file'}
+                        onChange={() => { setPreconditionMode('file'); setPreconditionError(null); }}
+                      />
+                      {tr('schedules.form.preconditionSourceFile')}
+                    </label>
+                    <button
+                      type="button"
+                      className="schedule-precondition-help-trigger"
+                      aria-label={tr('schedules.form.preconditionFileHelpOpen')}
+                      title={tr('schedules.form.preconditionFileHelpOpen')}
+                      aria-haspopup="dialog"
+                      aria-controls="schedule-precondition-help-dialog"
+                      aria-expanded={preconditionHelpSource === 'file'}
+                      onClick={e => {
+                        preconditionHelpReturnFocusRef.current = e.currentTarget;
+                        setPreconditionHelpSource('file');
+                      }}
+                    >
+                      <span aria-hidden="true">?</span>
+                    </button>
+                  </span>
+                </div>
+              </fieldset>
+            </div>
+          ) : null}
+
+          {preconditionEnabled || hasExistingPrecondition ? (
+            <div id="schedule-precondition-panel" className="schedule-precondition-panel">
+              {preconditionMode === 'keep' ? (
+                <p className="schedule-form-help" role="note">
+                  {tr('schedules.form.preconditionKeepHelp')}
+                </p>
+              ) : preconditionMode === 'inline' ? (
+                <div className="schedule-form-field">
+                  <label className="schedule-precondition-sr-only" htmlFor="schedule-precondition-script">
+                    {tr('schedules.form.preconditionInline')}
+                  </label>
+                  <textarea
+                    id="schedule-precondition-script"
+                    className="schedule-precondition-editor"
+                    value={preconditionScript}
+                    onChange={e => { setPreconditionScript(e.target.value); setPreconditionError(null); }}
+                    rows={3}
+                    spellCheck={false}
+                    placeholder={tr('schedules.form.preconditionPlaceholder')}
+                  />
+                </div>
+              ) : (
+                <div className="schedule-form-field">
+                  <label className="schedule-precondition-sr-only" htmlFor="schedule-precondition-file-path">
+                    {tr('schedules.form.preconditionFilePath')}
+                  </label>
+                  <input
+                    id="schedule-precondition-file-path"
+                    className="schedule-precondition-file-path"
+                    type="text"
+                    value={preconditionFilePath}
+                    autoComplete="off"
+                    spellCheck={false}
+                    aria-invalid={displayedPreconditionError?.startsWith('file_') || undefined}
+                    aria-describedby={[
+                      'schedule-precondition-file-help',
+                      preconditionFileMigrationRequired ? 'schedule-precondition-file-migration' : '',
+                      preconditionErrorText ? 'schedule-precondition-error' : '',
+                    ].filter(Boolean).join(' ')}
+                    placeholder={preconditionFileExamplePath
+                      || tr('schedules.form.preconditionFilePlaceholder')}
+                    onChange={e => { setPreconditionFilePath(e.currentTarget.value); setPreconditionError(null); }}
+                  />
+                  <small id="schedule-precondition-file-help" className="schedule-form-help">
+                    {preconditionTrustedFileRoot ? (
+                      <>
+                        {tr('schedules.form.preconditionFileVisibleHelp')}{' '}
+                        <code>{preconditionTrustedFileRoot}</code>
+                      </>
+                    ) : (
+                      <span role="status">{tr('schedules.form.preconditionFileRootUnavailable')}</span>
+                    )}
+                  </small>
+                  {preconditionFileMigrationRequired ? (
+                    <p
+                      id="schedule-precondition-file-migration"
+                      className="schedule-precondition-migration"
+                      role="note"
+                    >
+                      {preconditionTrustedFileRoot
+                        ? tr('schedules.form.preconditionFileMigration', {
+                          root: preconditionTrustedFileRoot,
+                        })
+                        : tr('schedules.form.preconditionFileMigrationRootUnavailable')}
+                    </p>
+                  ) : null}
+                </div>
+              )}
+
+              {preconditionMode !== 'keep' ? (
+                <div className="schedule-precondition-test">
+                  <div className="schedule-precondition-test-controls">
+                    <button
+                      type="button"
+                      className={`schedule-precondition-test-button${preconditionTestPending ? ' is-loading' : ''}`}
+                      disabled={!canTestPrecondition}
+                      aria-busy={preconditionTestPending || undefined}
+                      aria-describedby="schedule-precondition-test-warning"
+                      onClick={() => void handleTestPrecondition()}
+                    >
+                      {preconditionTestPending
+                        ? tr('schedules.form.preconditionTesting')
+                        : tr('schedules.form.preconditionTest')}
+                    </button>
+                    <small id="schedule-precondition-test-warning" className="schedule-form-help">
+                      {tr('schedules.form.preconditionTestWarning')}
+                    </small>
+                  </div>
+                  <div
+                    className={`schedule-precondition-test-result${preconditionTestResult
+                      ? ` is-${preconditionTestResult.outcome}`
+                      : ''}`}
+                    role="status"
+                    aria-live="polite"
                   >
-                    {tr('schedules.form.chatBackToSelect')}
-                  </button>
+                    {preconditionTestResult ? (
+                      <>
+                        <span>
+                          {preconditionTestResult.outcome === 'pass'
+                            ? tr(preconditionTestResult.additionalPrompt
+                              ? 'schedules.form.preconditionTestPassedWithPrompt'
+                              : 'schedules.form.preconditionTestPassed')
+                            : preconditionTestResult.outcome === 'skip'
+                              ? tr('schedules.form.preconditionTestSkipped')
+                              : [preconditionTestResult.errorCode, preconditionTestResult.error]
+                                .filter(Boolean)
+                                .join(': ')}
+                        </span>
+                        {preconditionTestResult.durationMs !== undefined ? (
+                          <small>{tr('schedules.form.preconditionTestDuration', {
+                            duration: preconditionTestResult.durationMs,
+                          })}</small>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {preconditionErrorText ? (
+            <small id="schedule-precondition-error" className="schedule-form-error-inline" role="alert">
+              {preconditionErrorText}
+            </small>
+          ) : null}
+        </div>
+        {!localDelivery ? (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">
+              <FieldTitle
+                help={tr('schedules.form.chatBindingHelp')}
+                helpLabel={tr('schedules.form.chatBindingHelp')}
+              >
+                {tr('schedules.form.chatBinding')}
+              </FieldTitle>{' '}
+              <i className="req" aria-hidden="true">*</i>
+            </span>
+            <div
+              className="schedule-chat-picker"
+              ref={chatPickerRef}
+              onBlur={event => {
+                if (!event.currentTarget.contains(event.relatedTarget)) setChatPickerOpen(false);
+              }}
+            >
+              <button
+                type="button"
+                className="schedule-chat-picker-trigger"
+                ref={chatPickerTriggerRef}
+                aria-label={tr('schedules.form.chatBinding')}
+                aria-expanded={chatPickerOpen}
+                aria-controls={chatPickerOpen ? 'schedule-chat-picker-panel' : undefined}
+                aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
+                title={selectedChatLabels.join('\n')}
+                onClick={() => setChatPickerOpen(value => !value)}
+              >
+                <span className="schedule-chat-picker-summary">
+                  {selectedChatLabels.length > 0
+                    ? selectedChatLabels.join('、')
+                    : tr('schedules.form.chatSelectPlaceholder')}
+                </span>
+                {chatIds.length > 0 ? (
+                  <small>{tr('schedules.form.chatSelectedCount', { count: chatIds.length })}</small>
                 ) : null}
-              </>
-            )}
+                <span className="schedule-chat-picker-chevron" aria-hidden="true" />
+              </button>
+              {chatIds.length >= MAX_SCHEDULE_TARGET_CHATS ? (
+                <small className="schedule-form-help">
+                  {tr(chatIds.length > MAX_SCHEDULE_TARGET_CHATS && !chatBindingChanged
+                    ? 'schedules.form.chatLegacyLimitHelp'
+                    : 'schedules.form.chatLimitHelp', { limit: MAX_SCHEDULE_TARGET_CHATS })}
+                </small>
+              ) : null}
+              {chatPickerOpen ? (
+                <div id="schedule-chat-picker-panel" className="schedule-chat-picker-panel">
+                  <input
+                    ref={chatSearchRef}
+                    className="schedule-chat-search"
+                    type="search"
+                    value={chatQuery}
+                    onChange={event => setChatQuery(event.currentTarget.value)}
+                    onKeyDown={event => { if (event.key === 'Enter') event.preventDefault(); }}
+                    placeholder={tr('schedules.form.chatSearchPlaceholder')}
+                    aria-label={tr('schedules.form.chatSearchLabel')}
+                  />
+                  {groupsLoading ? (
+                    <small className="schedule-form-help" role="status">{tr('common.loading')}</small>
+                  ) : null}
+                  {groupsLoadError ? (
+                    <div className="schedule-form-help-with-count">
+                      <small className="schedule-form-error-inline" role="alert">
+                        {tr('schedules.form.chatLoadError')}
+                      </small>
+                      <button
+                        type="button"
+                        disabled={groupsLoading}
+                        onClick={() => setGroupsReloadNonce(value => value + 1)}
+                      >
+                        {tr('schedules.form.chatReload')}
+                      </button>
+                    </div>
+                  ) : null}
+                  <div
+                    className="schedule-chat-selector"
+                    role="group"
+                    aria-label={tr('schedules.form.chatBinding')}
+                    aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                    aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
+                  >
+                    {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
+                      const displayName = group.name ?? chatDisplayTitle({
+                        chatId: group.chatId,
+                        chatDisplayName: editing?.chatId === group.chatId
+                          ? editing.chatDisplayName
+                          : undefined,
+                      });
+                      return (
+                        <label
+                          key={group.chatId}
+                          className={`schedule-chat-option${group.retained ? ' is-retained' : ''}`}
+                          title={displayName ? `${displayName} · ${group.chatId}` : group.chatId}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={chatIds.includes(group.chatId)}
+                            disabled={!chatIds.includes(group.chatId)
+                              && executionPosition !== 'topic'
+                              && chatIds.length >= MAX_SCHEDULE_TARGET_CHATS}
+                            onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}
+                          />
+                          <span>
+                            <strong>{displayName ?? group.chatId}</strong>
+                            {displayName ? <code>{group.chatId}</code> : null}
+                            {group.retained ? <small>{tr('schedules.form.chatRetained')}</small> : null}
+                          </span>
+                        </label>
+                      );
+                    }) : !groupsLoading && !groupsLoadError ? (
+                      <p className="schedule-chat-selector-empty">
+                        {selectorOptions.length > 0
+                          ? tr('schedules.form.chatNoMatch')
+                          : tr('schedules.form.chatEmpty')}
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
             {chatMissing ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errChatRequired')}</small>
+            ) : chatCountInvalid ? (
+              <small id="schedule-chat-limit-error" className="schedule-form-error-inline" role="alert">
+                {tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })}
+              </small>
+            ) : topicChatCountInvalid ? (
+              <small className="schedule-form-error-inline">{tr('schedules.form.errTopicSingleChat')}</small>
             ) : null}
           </div>
         ) : null}
@@ -880,7 +2544,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="top-level"
                   checked={executionPosition === 'top-level'}
-                  onChange={() => setExecutionPosition('top-level')}
+                  onChange={() => updateExecutionPosition('top-level')}
                 />
                 {tr('schedules.deliveryTopLevel')}
               </label>
@@ -890,7 +2554,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="topic"
                   checked={executionPosition === 'topic'}
-                  onChange={() => setExecutionPosition('topic')}
+                  onChange={() => updateExecutionPosition('topic')}
                 />
                 {tr('schedules.deliveryThread')}
               </label>
@@ -900,10 +2564,7 @@ function ScheduleFormModal(props: {
                   name="executionPosition"
                   value="new-topic"
                   checked={executionPosition === 'new-topic'}
-                  onChange={() => {
-                    setExecutionPosition('new-topic');
-                    setSilent(false);
-                  }}
+                  onChange={() => updateExecutionPosition('new-topic')}
                 />
                 {tr('schedules.deliveryNewTopic')}
               </label>
@@ -981,5 +2642,23 @@ function ScheduleFormModal(props: {
         </div>
       </form>
     </dialog>
+    <SchedulePreconditionHelpDialog
+      open={open && preconditionHelpSource !== null}
+      mode={preconditionMode}
+      source={preconditionHelpSource ?? 'inline'}
+      trustedFileRoot={preconditionTrustedFileRoot}
+      tr={tr}
+      returnFocusRef={preconditionHelpReturnFocusRef}
+      onClose={() => setPreconditionHelpSource(null)}
+      onUseSimple={() => {
+        setPreconditionScript(PRECONDITION_SCRIPT_EXAMPLE);
+        setPreconditionError(null);
+      }}
+      onUsePrompt={() => {
+        setPreconditionScript(PRECONDITION_PROMPT_EXAMPLE);
+        setPreconditionError(null);
+      }}
+    />
+    </>
   );
 }

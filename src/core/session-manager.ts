@@ -3276,6 +3276,7 @@ export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
+  additionalPrompt?: string,
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -3504,9 +3505,15 @@ export async function executeScheduledTask(
 
   refreshCliVersion(bot.config);
 
+  // A Bash precondition may provide per-fire context. Keep the durable task and
+  // Dashboard-facing lastUserPrompt unchanged; lastCliInput still records the
+  // exact input sent to the model through the ordinary session lifecycle.
+  const effectivePrompt = additionalPrompt === undefined
+    ? task.prompt
+    : `${task.prompt}\n\n${additionalPrompt}`;
   const firePrompt = silent
-    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
-    : task.prompt;
+    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
+    : effectivePrompt;
   const key = sessionKey(anchor, larkAppId);
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A

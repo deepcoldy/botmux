@@ -98,6 +98,21 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
+import { ensureSchedulePreconditionRoot } from './services/schedule-precondition-store.js';
+import {
+  executeScheduledTaskWithPrecondition,
+  type ScheduledTaskPreconditionObservation,
+} from './services/schedule-precondition-gate.js';
+import { SchedulePreconditionError } from './services/schedule-precondition-runner.js';
+import {
+  appendScheduleRunLog,
+  type ScheduleRunOutcome,
+  type ScheduleRunTargetResult,
+} from './services/schedule-run-log-store.js';
+import {
+  executeScheduledTaskForTargets,
+  ScheduleTargetExecutionError,
+} from './services/schedule-target-executor.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
@@ -131,6 +146,31 @@ import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+
+interface ScheduleRunLogErrorDetails {
+  errorCode: string;
+  error?: string;
+}
+
+function resolveScheduleRunLogErrorDetails(
+  precondition: ScheduledTaskPreconditionObservation['precondition'],
+  error: unknown,
+): ScheduleRunLogErrorDetails {
+  if (precondition !== 'error') {
+    return {
+      errorCode: 'model_dispatch_error',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    errorCode: error instanceof SchedulePreconditionError
+      ? error.code
+      : 'precondition_error',
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+export const __testOnly_resolveScheduleRunLogErrorDetails = resolveScheduleRunLogErrorDetails;
 
 function trustedCallerForTurn(
   larkAppId: string,
@@ -21693,6 +21733,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // Host-executed schedule conditions are authority material. Create and
+  // validate their 0700 root before any restored worker can receive a sandbox
+  // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
+  ensureSchedulePreconditionRoot(config.session.dataDir);
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
   // disabled still opens the shared feedback DB here for turn-completion
   // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
@@ -22926,10 +22970,82 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
   // missing larkAppId falls through to bot-0 as a legacy fallback).
-  scheduler.setExecuteCallback((task) => withBotTurnAdmission(
-    task.larkAppId ?? cfg.larkAppId,
-    () => executeScheduledTask(task, activeSessions, refreshCliVersion),
-  ));
+  scheduler.setExecuteCallback(async (task, executionContext) => {
+    const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    let targetResults: ScheduleRunTargetResult[] | undefined;
+    let precondition: ScheduledTaskPreconditionObservation = {
+      precondition: 'none',
+      additionalPrompt: false,
+    };
+    const appendExecutionLog = (
+      outcome: ScheduleRunOutcome,
+      errorDetails?: ScheduleRunLogErrorDetails,
+    ): void => {
+      const finishedAt = new Date().toISOString();
+      try {
+        appendScheduleRunLog({
+          id: executionContext.runId,
+          taskId: task.id,
+          trigger: executionContext.trigger,
+          outcome,
+          precondition: precondition.precondition,
+          startedAt: executionContext.startedAt,
+          finishedAt,
+          durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(executionContext.startedAt)),
+          additionalPrompt: precondition.additionalPrompt,
+          ...(errorDetails?.errorCode ? { errorCode: errorDetails.errorCode } : {}),
+          ...(errorDetails?.error !== undefined ? { error: errorDetails.error } : {}),
+          ...(targetResults !== undefined ? { targetResults } : {}),
+        }, effectiveAppId);
+      } catch (error) {
+        logger.warn(
+          `[scheduler] Failed to append execution log for task ${task.id}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+
+    try {
+      const outcome = await executeScheduledTaskWithPrecondition(
+        task,
+        effectiveAppId,
+        async (additionalPrompt) => {
+          const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+          try {
+            const results = await executeScheduledTaskForTargets(
+              task,
+              targetChatIds,
+              targetTask => withBotTurnAdmission(
+                effectiveAppId,
+                () => executeScheduledTask(
+                  targetTask,
+                  activeSessions,
+                  refreshCliVersion,
+                  additionalPrompt,
+                ),
+              ),
+            );
+            if (targetChatIds.length > 1) targetResults = results;
+          } catch (error) {
+            if (error instanceof ScheduleTargetExecutionError) {
+              targetResults = error.targetResults;
+            }
+            throw error;
+          }
+        },
+        undefined,
+        observation => { precondition = observation; },
+      );
+      appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+      return outcome;
+    } catch (error) {
+      appendExecutionLog(
+        'error',
+        resolveScheduleRunLogErrorDetails(precondition.precondition, error),
+      );
+      throw error;
+    }
+  });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
 

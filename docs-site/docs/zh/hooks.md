@@ -64,7 +64,7 @@ tail -f /tmp/botmux-hook.log
 | `thread.reply` | 收到已有话题回复 |
 | `outbound.send` | botmux 发送普通消息成功 |
 | `outbound.reply` | botmux 回复话题消息成功 |
-| `schedule.fired` | 定时任务执行完成 |
+| `schedule.fired` | 定时任务的前置检查与提交结束（成功、跳过或报错） |
 | `session.start` | worker / adopt worker 启动成功 |
 | `session.exit` | worker 退出、崩溃或会话被关闭（daemon shutdown 默认静音） |
 | `session.idle` | session 进入或离开 idle，按 session + 状态 10s 去重 |
@@ -87,6 +87,10 @@ tail -f /tmp/botmux-hook.log
 | `session.exit` | `reason`、`code`（worker 退出路径；`dashboard_close` 为 `null`） |
 | `session.idle` | `prevState`、`newState`、`transition`、`source` |
 | `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`multiSelect`、`message` |
+
+`schedule.fired.status` 与任务的 `lastStatus` 使用 `ok`、`error`、`skipped`：`ok` 表示已交给执行器，不代表模型已完成或消息已送达；`error` 表示前置检查或提交报错；`skipped` 表示前置条件未通过、未调用模型。跳过不消耗重复次数，也不删除任务、前置配置或执行日志。已启用的一次性任务跳过后保持启用，等待至少 30 秒后由调度器重新检查；若提前手动运行被跳过，后续自动检查不会早于原定执行时间。周期任务仍按原周期检查。
+
+`skipped` 是新增状态，旧任务无需迁移；只接受 `ok/error` 的自定义 Hook 需增加该分支，不能把它当作执行成功。
 
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 

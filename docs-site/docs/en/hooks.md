@@ -64,7 +64,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `thread.reply` | A reply to an existing topic is received |
 | `outbound.send` | botmux successfully sends a regular message |
 | `outbound.reply` | botmux successfully replies to a topic message |
-| `schedule.fired` | A scheduled task finishes running |
+| `schedule.fired` | A scheduled task finishes its precondition check and dispatch attempt (success, skip, or error) |
 | `session.start` | A worker / adopt worker starts successfully |
 | `session.exit` | A worker exits, crashes, or the session is closed (silenced by default on daemon shutdown) |
 | `session.idle` | A session enters or leaves idle, deduplicated per session + state over 10s |
@@ -87,6 +87,10 @@ Different events carry extra fields:
 | `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
 | `session.idle` | `prevState`, `newState`, `transition`, `source` |
 | `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
+
+`schedule.fired.status` and the task's `lastStatus` use `ok`, `error`, or `skipped`: `ok` means the task was handed to the executor, not that model generation or message delivery has completed; `error` means the precondition check or dispatch failed; `skipped` means the precondition did not pass and no model was called. A skip does not consume the repeat count or delete the task, precondition configuration, or execution logs. Enabled one-shot tasks remain enabled and become eligible for another scheduler check after at least 30 seconds; if an early manual run is skipped, subsequent automatic checks do not precede the original scheduled time. Recurring tasks keep their existing cadence.
+
+`skipped` is a new status and requires no migration of existing tasks. Custom hooks that accept only `ok/error` must handle it separately instead of treating it as a successful execution.
 
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
 
