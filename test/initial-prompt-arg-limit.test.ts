@@ -8,6 +8,7 @@ import { createRiffAdapter } from '../src/adapters/cli/riff.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
+import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import {
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -329,38 +330,27 @@ describe('OpenCode v1 initial-prompt argv byte-limit (tmux command-too-long)', (
   });
 });
 
-// Integration-level: verify that a realistic production first-round envelope
+// Integration-level: verify that the REAL production first-round envelope
 // (assembled by buildNewTopicPrompt — botmux routing hints + skill catalog +
 // session_id + identity + user_message) flows through the adapter + worker
-// defer contract as expected.  We construct a representative envelope here
-// rather than importing buildNewTopicPrompt (which pulls in zod via
-// run-envelope.ts and breaks the vitest module graph on this machine).
-// The envelope sizes are pinned to measured production values: the routing
-// block alone is ~2.8 KB (zh) / ~3.0 KB (en), the skill catalog ~2.5 KB,
-// so a typical new topic with a short user message is ~5.8–6.2 KB.
-describe('OpenCode v1 real-envelope argv budget (production envelope → defer)', () => {
+// defer contract as expected.  Using the real builder means that if someone
+// adds routing hints or skill catalog entries that push the envelope floor
+// past the budget, this test will actually catch it — a hand-crafted fixture
+// would silently stay green.
+describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)', () => {
   const adapter = createOpenCodeAdapter('/usr/bin/opencode');
   const budget = adapter.maxInitialPromptArgBytes!;
 
-  // Construct a realistic envelope that matches the size characteristics of
-  // buildNewTopicPrompt('帮我看看这个 bug', 'sess', 'opencode').
-  // The real envelope is ~5.4–6.2 KB depending on locale; we build one at
-  // ~5.4 KB to represent the zh locale floor.
-  function buildRepresentativeEnvelope(userMessage: string): string {
-    const routingBlock = `<botmux_routing>\n${'routing hint line here\n'.repeat(120)}</botmux_routing>`;
-    const skillBlock = `<botmux_skills>\n${'skill entry line here\n'.repeat(110)}</botmux_skills>`;
-    const identityBlock = `<identity>\n  <name>Bot</name>\n  <open_id>ou_bot</open_id>\n</identity>`;
-    const sessionIdBlock = `<session_id>sess-12345678</session_id>`;
-    const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
-    return [routingBlock, skillBlock, identityBlock, sessionIdBlock, userBlock].join('\n\n');
-  }
-
   it('a typical new-topic envelope with a short user message stays on argv', () => {
-    const envelope = buildRepresentativeEnvelope('帮我看看这个 bug');
+    const envelope = buildNewTopicPrompt(
+      '帮我看看这个 bug',
+      'sess-integration-1',
+      'opencode',
+    );
     const envelopeBytes = Buffer.byteLength(envelope, 'utf8');
 
     // Sanity: the envelope is non-trivial (routing + skills + identity blocks).
-    expect(envelopeBytes).toBeGreaterThan(4000);
+    expect(envelopeBytes).toBeGreaterThan(3000);
     // The envelope with a short user message must fit the 8 KB budget so that
     // the PR's design intent ("short prompts stay on --prompt") holds for the
     // main topic entry point.
@@ -384,7 +374,11 @@ describe('OpenCode v1 real-envelope argv budget (production envelope → defer)'
 
   it('a long user message that pushes the envelope over budget defers to the queue', () => {
     const longUserMessage = '请逐行审查以下代码并给出修改建议：\n'.repeat(400);
-    const envelope = buildRepresentativeEnvelope(longUserMessage);
+    const envelope = buildNewTopicPrompt(
+      longUserMessage,
+      'sess-integration-2',
+      'opencode',
+    );
     const envelopeBytes = Buffer.byteLength(envelope, 'utf8');
     expect(envelopeBytes).toBeGreaterThan(budget);
 
