@@ -213,6 +213,10 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Startup-only private secret-file path. A session CLI is not the local
+  // companion process and must not learn even the credential's location.
+  // Kept as a literal because this boundary module is dependency-free.
+  'BOTMUX_COMPANION_SECRET_FILE',
   // Dashboard-only Feishu H5 login config/credential family — see
   // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
   // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend

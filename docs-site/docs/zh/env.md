@@ -34,6 +34,7 @@
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | 每个 daemon 的 IPC 端口 = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | workflow run 存储目录 |
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | 是否允许无 token 访问 Dashboard 白名单只读 API / SSE；一旦在 Dashboard 设置页保存过该开关，`~/.botmux/config.json` 中的值优先于本环境变量 |
+| `BOTMUX_COMPANION_SECRET_FILE` | _(未设置)_ | 本地 companion 进程的私有密钥文件**路径**。Botmux 启动时仅保存经 trim 的非空路径到 `config.companion.secretFile`；不读取、校验、记录文件内容，不下发给会话 CLI，且未设置/空白时为 `undefined`，绝不回退或复用 `~/.botmux/.dashboard-secret`。建议配置为运行 Botmux 账号持有的绝对 `0600` 普通文件；companion 进程负责安全读取与校验。 |
 
 ## 文件位置
 
