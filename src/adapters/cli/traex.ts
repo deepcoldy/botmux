@@ -106,9 +106,10 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *  - Standalone queue notice: "Too many requests right now. You're in the
  *    queue."
  *
- * TraeX forked from Codex and DELETED the "esc to interrupt" footer hint —
- * `grep -a -c "esc to interrupt"` returns 0 across every local release and
- * the 94MB TUI logs — so the Codex pattern's second anchor is invalid here.
+ * A live TraeX 0.201.6 turn also renders an `esc to interrupt` activity
+ * footer while retaining the visible composer and context bar. Raw PTY and
+ * 100ms screen captures verified seven rotating glyphs and ordinary activity
+ * labels as well as PreToolUse/PostToolUse/UserPromptSubmit hook-runner rows.
  *
  * Three branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
@@ -123,7 +124,13 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *     so the frame anchor must not be required for it. The line anchor keeps
  *     assistant prose quoting the string mid-sentence ("…says Queued for
  *     capacity whenever…") from registering as busy.
- *  3. (staticBusyPattern below) the same queue evidence as a pre-idle latch
+ *  3. Line-anchored activity rows. These require one of the seven observed
+ *     rotating glyphs, a no-parentheses activity label, and an elapsed-time /
+ *     `esc to interrupt` footer in one pair of parentheses. A closing quote
+ *     immediately after the footer is rejected so `◆ Ran echo "(...)"`
+ *     history cannot revive an already-idle session. Hook-runner rows use the
+ *     same footer shape, so they need no event-name-specific arm.
+ *  4. (staticBusyPattern below) the same queue evidence as a pre-idle latch
  *     inside IdleDetector — see TRAEX_STATIC_BUSY_PATTERN.
  *
  * Both states must be covered: the worker's busy-pattern idle probe marks
@@ -169,10 +176,15 @@ const TRAEX_QUEUE_STATIC_ARMS = [
   "Too many requests right now\\. You're in the queue",
 ];
 
+/** TraeX activity footer captured from a live 0.201.6 TUI. Keep it line- and
+ *  glyph-anchored: no-alt-screen history can contain the same words. */
+const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[⋄✧◇✦❖◈◆][ \t]*[^()\r\n]{0,240}\([^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
+
 const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   [
     `[${TRAEX_SPINNER_FRAMES}][ \\t]?(?:${TRAEX_SPINNER_LABELS.join('|')})`,
     ...TRAEX_QUEUE_STATIC_ARMS.map((arm) => `(?:^|[\\n\\r])[ \\t]*${arm}`),
+    TRAEX_ACTIVITY_PATTERN,
   ].join('|'),
   'i',
 );

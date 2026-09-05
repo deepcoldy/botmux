@@ -223,8 +223,8 @@ describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
   //   queue strings:   "Queued for capacity",
   //                    "Too many requests right now. You're in the queue."
   //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
-  // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
-  // (0 hits across all releases + the 94MB TUI logs).
+  // Live 0.201.6 captures verified seven activity glyphs and hook-runner rows
+  // using the same elapsed-time / `esc to interrupt` footer.
   const traexAdapter = createTraexAdapter('/bin/true');
 
   it('flips a queued session back to busy when the capacity-queue string renders after a false idle', () => {
@@ -279,6 +279,36 @@ describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
     detector.fireIdle();
     detector.feed('\x1b[2K⠹ Pondering…');
     expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('flips busy on live hook-runner and activity rows across rotating glyphs', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K\x1b[38;5;2m⋄\x1b[0m Running 4 PreToolUse hooks (7s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K❖ Running 2 PostToolUse hooks (13s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('does not promote transcript prose, commands, or diff history quoting activity text', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('The previous status was ✦ Running 2 PreToolUse hooks');
+    detector.feed('\n◆ Ran rg for esc to interrupt');
+    detector.feed('\n◆ Ran echo "(36m 20s • ↑ 68.7K tokens • esc to interrupt)"');
+    detector.feed('\n◆ Ran grep (2m 3s) for "esc to interrupt" in logs');
+    detector.feed('\n◇ diff (12s): -◈ old (1m 1s • esc to interrupt)');
+    expect(cb).not.toHaveBeenCalled();
     detector.dispose();
   });
 
