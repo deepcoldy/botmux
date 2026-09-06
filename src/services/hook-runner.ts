@@ -147,6 +147,18 @@ function normalizeHookConfig(raw: unknown): HookConfig | null {
   if (typeof rec.timeoutMs === 'number' && Number.isFinite(rec.timeoutMs)) {
     hook.timeoutMs = rec.timeoutMs;
   }
+  // `timeoutMs: 0` 在别处只是「立刻超时」，但在 sync gate 上等于**静默停用这道闸**：
+  // 立即超时 → 没有 verdict → 走 onError（默认 allow）。而「0 = 不限时」是常见的
+  // 外部约定，运维很容易照那个直觉写。本仓库没有任何「0=不限」的先例，光读配置
+  // 读不出这是危险值，所以这里必须出声。
+  if (hook.timeoutMs === 0 && rec.mode === 'sync' && isGateEvent(hook.event)) {
+    logger.warn(
+      `[hooks] timeoutMs:0 on the '${hook.event}' sync gate means INSTANT timeout, `
+      + `not "no timeout": every message will fall through to onError`
+      + `${rec.onError === 'deny' ? ' (deny)' : ' (allow — the gate is effectively disabled)'}. `
+      + 'Set a real budget such as 3000.',
+    );
+  }
   // A `sync` declaration on a non-gate event is an operator mistake worth
   // saying out loud: the emit site there is fire-and-forget, so the hook would
   // run exactly as before while the config claims it gates. Degrade to async
@@ -518,18 +530,19 @@ export function emitHookEventLocal(event: HookEvent, body: Record<string, unknow
   }
 }
 
-function runHooksLocally(payload: HookPayload): void {
-  const event = payload.event;
-  const hooks = loadHookConfigs().filter(hook =>
-    hook.event === event
-    // A sync gate hook already ran (and was awaited) in evaluatePromptGate.
-    // Without this it would spawn a SECOND time here as a notification —
-    // double side effects, and a hook that denied would still see its own
-    // event replayed as if nothing happened.
-    && hook.mode !== 'sync'
-    && filterMatches(hook.filter, payload));
-  if (hooks.length === 0) return;
-
+/** 投递一批 async(通知型) hook：fire-and-forget，绝不 await，绝不抛。
+ *
+ *  两个调用方共用这一段，好让「通知」的投递语义只有一处实现：
+ *    • runHooksLocally —— 普通事件的发射点（emitHookEvent* 进来）
+ *    • evaluatePromptGate —— gate 事件的**唯一**发射点，它必须自己把 async
+ *      那批也投出去（见该处注释）。
+ *  `.catch` 不能省：fireAndForget 的 promise 没人 await，未捕获的 rejection 在
+ *  daemon 里没有 handler，Node v22 会直接终止进程（全机 bot 一起没）。 */
+function runHooksFireAndForget(
+  event: HookEvent,
+  payload: HookPayload,
+  hooks: HookConfig[],
+): void {
   for (const [i, hook] of hooks.entries()) {
     const hookPayload = prepareHookPayload(hook, payload);
     const tag = `${event}[${i}] (${hook.command.slice(0, 60)})`;
@@ -543,6 +556,20 @@ function runHooksLocally(payload: HookPayload): void {
       logger.warn(`[hooks] ${tag} crashed: ${err?.message ?? String(err)}`);
     });
   }
+}
+
+function runHooksLocally(payload: HookPayload): void {
+  const event = payload.event;
+  const hooks = loadHookConfigs().filter(hook =>
+    hook.event === event
+    // A sync gate hook already ran (and was awaited) in evaluatePromptGate.
+    // Without this it would spawn a SECOND time here as a notification —
+    // double side effects, and a hook that denied would still see its own
+    // event replayed as if nothing happened.
+    && hook.mode !== 'sync'
+    && filterMatches(hook.filter, payload));
+  if (hooks.length === 0) return;
+  runHooksFireAndForget(event, payload, hooks);
 }
 
 export function runHookCommandForTest(
@@ -679,10 +706,20 @@ export async function evaluatePromptGate(
       event,
       emittedAt: new Date().toISOString(),
     };
-    const hooks = loadHookConfigs().filter(hook =>
+    const matching = loadHookConfigs().filter(hook =>
       hook.event === event
-      && hook.mode === 'sync'
       && filterMatches(hook.filter, payload));
+    // 同一个事件上两类 hook 都要跑，语义不同：
+    //   • sync  → 裁决，daemon 等它、按它放行/拒绝；
+    //   • async → 通知，fire-and-forget，跑完没人看结果。
+    // gate 事件在生产中**只由这里发射**（没有任何 emitHookEvent 调用点），所以
+    // async 那批必须在这里一并投递——否则「订阅这个事件当通知用」的配置会零触发、
+    // 零日志、零报错，运维以为装上了其实没装。
+    const hooks = matching.filter(hook => hook.mode === 'sync');
+    const observers = matching.filter(hook => hook.mode !== 'sync');
+    // 通知先发：它不参与裁决，不该被 deny 的短路吞掉——「这条消息被拦了」本身
+    // 也是通知类 hook 想知道的事实。fireAndForget，绝不 await。
+    if (observers.length > 0) runHooksFireAndForget(event, payload, observers);
     if (hooks.length === 0) return GATE_ALLOW;
 
     // 记住「有 hook 是坏掉后被兜过去的」。全允许时也要把这一位带出去：

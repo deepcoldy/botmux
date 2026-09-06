@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
+import { logger } from '../src/utils/logger.js';
 
 import {
   filterMatches,
@@ -776,19 +777,107 @@ describe('sync gate hooks (prompt.submit)', () => {
     expect(existsSync(dup)).toBe(false);
   });
 
-  it('still runs async hooks on a gate event (the dedup filter is sync-only)', async () => {
+  // 生产中 gate 事件**没有任何 emitHookEvent 发射点**（grep 全 src/ 为 0），唯一
+  // 产出它的地方就是 evaluatePromptGate。所以「async hook 会不会跑」必须从
+  // evaluatePromptGate 进去验；用 emitHookEventLocal 手工发射等于自造一条生产
+  // 不存在的路径，那样断言无论实现怎样都会绿。
+  it('runs async hooks on a gate event through the gate itself (no emit site exists)', async () => {
     const ran = join(tmpDir, 'async-on-gate-event');
     gateHooks([{
       event: 'prompt.submit',
-      mode: 'async',
+      // 不写 mode —— 运维照事件表配置时最自然的写法，语义即 async。
       command: writeHook('async-notify.js', `
         import { writeFileSync } from 'node:fs';
         writeFileSync(${JSON.stringify(ran)}, 'x');
       `),
     }]);
-    emitHookEventLocal('prompt.submit', {});
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
     await new Promise(resolve => setTimeout(resolve, 600));
+    // 通知型 hook 不参与裁决：它跑了，但不影响放行。
+    expect(decision.allowed).toBe(true);
     expect(existsSync(ran)).toBe(true);
+  });
+
+  it('runs async observers alongside a sync gate without weakening the verdict', async () => {
+    const observed = join(tmpDir, 'observer-ran');
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        command: writeHook('observer.js', `
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(observed)}, 'x');
+        `),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('verdict.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'blocked' }));`),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('blocked');
+    // 被拒也要通知：「这条消息被拦了」正是审计类 hook 想知道的事实，
+    // 不能被 deny 的短路吞掉（通知在短路之前就已投递）。
+    expect(existsSync(observed)).toBe(true);
+  });
+
+  it('keeps async observers on the truncated payload even on a gate event', async () => {
+    // 全文豁免只给做裁决的 sync hook。通知型 hook 不该因为「恰好订阅了 gate 事件」
+    // 就拿到完整正文——那会把隐私边界悄悄放宽。
+    const seen = join(tmpDir, 'observer-payload.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      command: writeHook('observer-payload.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => { writeFileSync(${JSON.stringify(seen)}, input); });
+      `),
+    }]);
+    await evaluatePromptGate('prompt.submit', { content: 'Z'.repeat(900) });
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const payload = JSON.parse(readFileSync(seen, 'utf-8'));
+    expect(payload.content).toHaveLength(600);
+    expect(payload.contentTruncated).toBe(true);
+  });
+
+  it('warns that timeoutMs:0 on a sync gate is an instant timeout, not "no timeout"', () => {
+    const warnings: string[] = [];
+    const original = logger.warn;
+    (logger as any).warn = (msg: string) => { warnings.push(String(msg)); };
+    try {
+      loadHookConfigs({
+        env: {
+          BOTMUX_HOOKS_JSON: JSON.stringify([
+            { event: 'prompt.submit', mode: 'sync', command: '/bin/true', timeoutMs: 0 },
+          ]),
+        },
+      });
+    } finally {
+      (logger as any).warn = original;
+    }
+    expect(warnings.some(w => /timeoutMs:0/.test(w) && /INSTANT timeout/.test(w))).toBe(true);
+  });
+
+  it('does not warn about timeoutMs:0 for a plain async hook (only sync gates are affected)', () => {
+    const warnings: string[] = [];
+    const original = logger.warn;
+    (logger as any).warn = (msg: string) => { warnings.push(String(msg)); };
+    try {
+      loadHookConfigs({
+        env: {
+          BOTMUX_HOOKS_JSON: JSON.stringify([
+            { event: 'session.start', command: '/bin/true', timeoutMs: 0 },
+          ]),
+        },
+      });
+    } finally {
+      (logger as any).warn = original;
+    }
+    expect(warnings.some(w => /timeoutMs:0/.test(w))).toBe(false);
   });
 
   it('captures stdout only for sync hooks', async () => {

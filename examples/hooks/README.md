@@ -55,6 +55,11 @@ Print `{"decision":"deny","reason":"..."}` on stdout to reject (the reason is
 shown to the user), or `{"decision":"allow"}` to permit. A script that prints no
 JSON falls back to its exit code: 0 allows, non-zero denies.
 
+`mode: "sync"` is optional: the same event without it (or with `"async"`) is a
+plain notification hook — dispatched fire-and-forget, unable to affect admission,
+and it still fires for messages a sync gate denies. Observers get the usual
+truncated body; only `sync` adjudicators see the full text.
+
 Keep `timeoutMs` small — the wait lands directly on the inbound message path.
 A hook that times out or cannot be spawned follows `onError`, which defaults to
 `allow` so a broken checker cannot brick the bot. Full contract:

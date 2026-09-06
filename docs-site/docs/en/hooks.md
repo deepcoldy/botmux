@@ -54,7 +54,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `event` | string | Required. The event name to subscribe to (see table below) |
 | `command` | string | Required. The external executable command; supports arguments, but is not run through a shell |
 | `timeoutMs` | number | Optional. Defaults to 5000; on timeout, sends `SIGTERM` first, then falls back to `SIGKILL` |
-| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async`. `sync` is supported **only** on `prompt.submit`; declaring it on any other event degrades to `async` with a warning in the log |
+| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async` (notification, non-blocking). `sync` (awaited, can block) is supported **only on gate events** (currently `prompt.submit`); declaring it on any other event degrades to `async` with a warning in the log. **Gate events also support `async`** — one event can carry both observers and adjudicators |
 | `onError` | `"allow"`｜`"deny"` | Optional, meaningful only with `mode:"sync"`. Fallback direction when the hook itself fails (timeout / missing command / crash). Defaults to `allow` (fail-open) |
 | `filter.chatId` | string｜string[] | Optional. Only match the chat of the specified Lark group / topic |
 | `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
@@ -68,7 +68,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 |------|----------|
 | `topic.new` | A new topic / @mention is received |
 | `thread.reply` | A reply to an existing topic is received |
-| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. The only event that supports `mode:"sync"` blocking |
+| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Usable as a plain notification (default `async`), and the only event that supports `mode:"sync"` blocking |
 | `outbound.send` | botmux successfully sends a regular message |
 | `outbound.reply` | botmux successfully replies to a topic message |
 | `schedule.fired` | A scheduled task finishes its precondition check and dispatch attempt (success, skip, or error) |
@@ -134,6 +134,23 @@ Lark message → built-in permission checks → 🚦 prompt.submit gate → char
 
 The gate runs in the **daemon** process, before the CLI subprocess has this turn's input at all (for a new topic the CLI has not even been forked). A denied message never existed as far as the CLI is concerned.
 
+### Using it as a plain notification (`async`)
+
+`mode:"sync"` is **not** required. With no `mode` (or an explicit `async`) this event behaves like any other notification hook: the daemon does not wait for it and its result cannot affect admission — good for audit trails, metrics and alerting.
+
+```json
+[
+  { "event": "prompt.submit", "command": "/root/bin/audit-log.sh" },
+  { "event": "prompt.submit", "mode": "sync", "command": "/root/bin/prompt-gate.sh", "timeoutMs": 3000 }
+]
+```
+
+Both can coexist — the first only records, the second actually blocks. Three rules:
+
+- **Observers are dispatched before the verdict**, so **a notification hook still sees a message that ends up denied** — "whose message was blocked" is exactly what an audit trail wants.
+- **Observers receive the truncated body** (600 characters by default, same as every other event). Only adjudicating `sync` hooks are exempt from truncation; subscribing to this event does not by itself hand a hook the full message text.
+- An observer's exit code and stdout **never** participate in the verdict.
+
 ### Expressing a verdict
 
 Two ways; **JSON on stdout takes precedence over the exit code**:
@@ -152,12 +169,13 @@ Stdout must be a **whole JSON object** to count as a verdict. Printing an ordina
 - **A rejection tells the user** (with `reason`) instead of dropping silently — an authorized user whose messages vanish is the hardest failure to diagnose.
 - **Multiple sync hooks are ANDed.** Any `deny` rejects; hooks after the first `deny` do not run.
 - **A broken hook is not a rejection.** Timeout, missing command, and crashes all follow `onError`, which defaults to `allow` — a broken checker should not brick the whole bot. Set `onError: "deny"` explicitly for the opposite.
-- **The latency lands directly on the inbound path.** Keep `timeoutMs` small (1–3s). Bot-level admission is concurrent so a slow gate will not stall the whole daemon, but replies **within one topic** hold an ordering lock — a slow gate makes later messages in that topic queue up. Do not lean on a large timeout to paper over a slow service. With no sync hook configured there is zero overhead — no spawn is added per message.
+- ⚠️ **`timeoutMs: 0` does not mean "no timeout" — it means *instant* timeout**: the gate falls straight through to `onError` (default `allow`), i.e. **the gate is effectively disabled**. A warning is logged at load time. There is no "unlimited" option (the gate sits on the inbound path); set a real budget such as `3000`.
+- **The latency lands directly on the inbound path.** Keep `timeoutMs` small (1–3s). Bot-level admission is concurrent so a slow gate will not stall the whole daemon, but it holds up two things: (1) replies **within one topic** hold an ordering lock, so later messages in that topic queue up; (2) the gate runs inside that bot's admission lease, so **that bot's Dashboard operations** (closing/pruning sessions, changing Agent config) may time out until the gate returns. Do not lean on a large timeout to paper over a slow service. With no sync hook configured there is zero overhead — no spawn is added per message.
 - **Message-listener traffic is adjudicated too.** That content comes from third parties (alert bots and the like) and still reaches a CLI, so it is exactly what a gate should inspect. That path never charges quota; a denial is logged only, with no reply (there is no human sender to answer).
 - **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
   ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
 - **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
-- **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks and workflow-generated prompts do not** — those are automation the operator pre-authorized, not external input. Do not read the gate as "everything reaching the CLI was checked".
+- **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks do not** — that is automation the operator pre-authorized, not external input. **v3 saved workflows do pass through the gate, but carry no prompt body** — sender-level rules such as `senderOpenId` still apply; content-level rules are blind to them. Do not read the gate as "everything reaching the CLI was checked".
 - A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
 
 ## Practical: Auto-Update Skills with session.start
