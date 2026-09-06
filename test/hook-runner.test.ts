@@ -482,8 +482,8 @@ describe('runHookCommandForTest', () => {
 
 describe('sync gate hooks (prompt.submit)', () => {
   /** 写一个按参数决定行为的 hook 脚本，返回可直接放进 command 的路径。 */
-  function writeHook(name: string, body: string): string {
-    const script = join(tmpDir, name);
+  function writeHook(name: string, body: string, dir = tmpDir): string {
+    const script = join(dir, name);
     writeFileSync(script, body);
     return `${process.execPath} ${script}`;
   }
@@ -491,6 +491,31 @@ describe('sync gate hooks (prompt.submit)', () => {
   function gateHooks(hooks: HookConfig[]): void {
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify(hooks);
   }
+
+  // async(通知型) hook 是 fire-and-forget 且句柄被 unref，它落盘的时刻**不在**本
+  // 用例的 await 链上。两件事因此不能沿用 suite 的 `tmpDir`：
+  //   • `afterEach` 会在子进程 exec 到脚本之前就把 tmpDir（**连脚本一起**）删掉。
+  //     Bun 下实测 ENOENT——unref 的子进程比 Node 起得慢一步，红的是清理竞态而
+  //     不是被测行为。
+  //   • 固定 sleep 在负载高的机器上同样不稳。
+  // 所以：自己的目录（脚本和产物都放这里）、自己负责删、用轮询等落盘。
+  const observerDirs: string[] = [];
+  function observerDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-hook-observer-'));
+    observerDirs.push(dir);
+    return dir;
+  }
+  async function waitForFile(path: string, timeoutMs = 5_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (existsSync(path)) return true;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    return false;
+  }
+  afterEach(() => {
+    for (const dir of observerDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
 
   afterEach(() => {
     delete process.env.BOTMUX_HOOKS_JSON;
@@ -782,31 +807,32 @@ describe('sync gate hooks (prompt.submit)', () => {
   // evaluatePromptGate 进去验；用 emitHookEventLocal 手工发射等于自造一条生产
   // 不存在的路径，那样断言无论实现怎样都会绿。
   it('runs async hooks on a gate event through the gate itself (no emit site exists)', async () => {
-    const ran = join(tmpDir, 'async-on-gate-event');
+    const dir = observerDir();
+    const ran = join(dir, 'async-on-gate-event');
     gateHooks([{
       event: 'prompt.submit',
       // 不写 mode —— 运维照事件表配置时最自然的写法，语义即 async。
       command: writeHook('async-notify.js', `
         import { writeFileSync } from 'node:fs';
         writeFileSync(${JSON.stringify(ran)}, 'x');
-      `),
+      `, dir),
     }]);
     const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
-    await new Promise(resolve => setTimeout(resolve, 600));
     // 通知型 hook 不参与裁决：它跑了，但不影响放行。
     expect(decision.allowed).toBe(true);
-    expect(existsSync(ran)).toBe(true);
+    expect(await waitForFile(ran)).toBe(true);
   });
 
   it('runs async observers alongside a sync gate without weakening the verdict', async () => {
-    const observed = join(tmpDir, 'observer-ran');
+    const dir = observerDir();
+    const observed = join(dir, 'observer-ran');
     gateHooks([
       {
         event: 'prompt.submit',
         command: writeHook('observer.js', `
           import { writeFileSync } from 'node:fs';
           writeFileSync(${JSON.stringify(observed)}, 'x');
-        `),
+        `, dir),
       },
       {
         event: 'prompt.submit',
@@ -815,18 +841,18 @@ describe('sync gate hooks (prompt.submit)', () => {
       },
     ]);
     const decision = await evaluatePromptGate('prompt.submit', {});
-    await new Promise(resolve => setTimeout(resolve, 600));
     expect(decision.allowed).toBe(false);
     expect(decision.reason).toBe('blocked');
     // 被拒也要通知：「这条消息被拦了」正是审计类 hook 想知道的事实，
     // 不能被 deny 的短路吞掉（通知在短路之前就已投递）。
-    expect(existsSync(observed)).toBe(true);
+    expect(await waitForFile(observed)).toBe(true);
   });
 
   it('keeps async observers on the truncated payload even on a gate event', async () => {
     // 全文豁免只给做裁决的 sync hook。通知型 hook 不该因为「恰好订阅了 gate 事件」
     // 就拿到完整正文——那会把隐私边界悄悄放宽。
-    const seen = join(tmpDir, 'observer-payload.json');
+    const dir = observerDir();
+    const seen = join(dir, 'observer-payload.json');
     gateHooks([{
       event: 'prompt.submit',
       command: writeHook('observer-payload.js', `
@@ -835,10 +861,10 @@ describe('sync gate hooks (prompt.submit)', () => {
         process.stdin.setEncoding('utf8');
         process.stdin.on('data', c => { input += c; });
         process.stdin.on('end', () => { writeFileSync(${JSON.stringify(seen)}, input); });
-      `),
+      `, dir),
     }]);
     await evaluatePromptGate('prompt.submit', { content: 'Z'.repeat(900) });
-    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(await waitForFile(seen)).toBe(true);
     const payload = JSON.parse(readFileSync(seen, 'utf-8'));
     expect(payload.content).toHaveLength(600);
     expect(payload.contentTruncated).toBe(true);
