@@ -34,6 +34,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | Each daemon's IPC port = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | Workflow run storage directory |
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | Allow tokenless access to the Dashboard's allow-listed read-only APIs / SSE. Once this switch has been saved in Dashboard Settings, the value persisted in `~/.botmux/config.json` takes precedence over this environment variable |
+| `BOTMUX_COMPANION_SECRET_FILE` | _(unset)_ | Path to a local companion process's private secret file. At startup, Botmux stores only the trimmed non-empty path in `config.companion.secretFile`; it does not read, validate, or log file contents, and does not pass the path to session CLIs. Unset or blank resolves to `undefined`; there is no fallback to or reuse of `~/.botmux/.dashboard-secret`. Use an absolute `0600` regular file owned by the Botmux account; the companion process is responsible for secure reading and validation. |
 
 ## File locations
 

@@ -22,6 +22,12 @@ describe('companion startup secret-file configuration', () => {
     });
   });
 
+  it('ignores a foreign secret-file var when the dedicated one is unset', () => {
+    expect(resolveCompanionStartupConfig({
+      BOTMUX_DASHBOARD_SECRET_FILE: '/run/secrets/botmux/dashboard',
+    })).toEqual({ secretFile: undefined });
+  });
+
   it('has no fallback when the dedicated path is absent or blank', () => {
     expect(resolveCompanionStartupConfig({})).toEqual({ secretFile: undefined });
     expect(resolveCompanionStartupConfig({ [COMPANION_SECRET_FILE_ENV]: ' \t\n' }))
