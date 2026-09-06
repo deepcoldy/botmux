@@ -3584,10 +3584,15 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
 
   const loc = localeForBot(ds.larkAppId);
   const tools = fresh.map(o => o.tool).join(' / ');
+  // Name the command that actually authorizes each tool. bytedcli goes through
+  // ByteCloud SSO, so a bare `/login` sends the reader to authorize Feishu and
+  // hit this same notice again — the chat-side twin of the wrapper's stderr.
+  const commands = [...new Set(fresh.map(o => o.tool === 'bytedcli' ? '/login bytedcli' : '/login'))]
+    .join(' 和 ');
   try {
     await sessionReply(
       sessionAnchorId(ds),
-      tr('trigger_user_auth.needs_login', { tools }, loc),
+      tr('trigger_user_auth.needs_login', { tools, commands }, loc),
       'text',
       ds.larkAppId,
       turnId,

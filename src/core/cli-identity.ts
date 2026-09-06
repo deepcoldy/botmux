@@ -439,6 +439,61 @@ export function sessionIdentityBinDir(sessionDataDir: string, sessionId: string)
 }
 
 /**
+ * Keep the wrapper dir first even after a LOGIN shell rebuilds PATH.
+ *
+ * Prepending to the child's PATH is not enough. The agent's tool calls run
+ * through a login shell (`bash -lc` / `zsh -lc`), which sources /etc/zprofile,
+ * which runs `/usr/libexec/path_helper`. That helper REBUILDS PATH from
+ * /etc/paths + /etc/paths.d and appends whatever was already there — measured
+ * on macOS 15: the wrapper dir goes from position 1 to position 12, while
+ * /opt/homebrew/bin (owned by /etc/paths.d/homebrew) lands at 10. So the real
+ * lark-cli wins and every governed call silently runs unwrapped.
+ *
+ * The fix is a startup file of our own that re-prepends AFTER path_helper has
+ * had its say:
+ *   - zsh reads $ZDOTDIR/.zprofile then $ZDOTDIR/.zshrc for a login shell;
+ *   - bash reads $BASH_ENV for a non-interactive shell.
+ * Both are per-process env vars, so nothing is written to the user's dotfiles
+ * and no other shell on the machine is affected. Each shim sources the user's
+ * real startup file afterwards, so their own PATH edits still apply — ours just
+ * goes back in front once they are done.
+ *
+ * Verified against the real binaries: with the shim, `zsh -lc 'command -v
+ * lark-cli'` and the bash equivalent both resolve to the wrapper; without it,
+ * both resolve to /opt/homebrew/bin/lark-cli.
+ */
+export function installLoginShellPathShim(binDir: string): { zdotdir: string; bashEnv: string } {
+  const zdotdir = join(binDir, 'shell');
+  mkdirSync(zdotdir, { recursive: true, mode: 0o700 });
+  // `BOTMUX_IDENTITY_BIN` rather than the literal path: one shim text for every
+  // session, and a shell that inherits it without the variable is a no-op
+  // instead of prepending some other session's wrapper dir.
+  const reprepend = [
+    '# botmux trigger-user identity — generated, do not edit.',
+    '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
+    '  case ":$PATH:" in',
+    '    "$BOTMUX_IDENTITY_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
+    '',
+  ].join('\n');
+  // zsh: source the user's own file FIRST, then put ourselves back in front —
+  // their `export PATH=...:$PATH` would otherwise jump ahead of the wrapper.
+  const zshShim = (userFile: string) => [
+    `[ -r "$HOME/${userFile}" ] && . "$HOME/${userFile}"`,
+    reprepend,
+  ].join('\n');
+  atomicWriteFileSync(join(zdotdir, '.zprofile'), zshShim('.zprofile'), { mode: 0o600 });
+  atomicWriteFileSync(join(zdotdir, '.zshrc'), zshShim('.zshrc'), { mode: 0o600 });
+  atomicWriteFileSync(join(zdotdir, '.zshenv'), zshShim('.zshenv'), { mode: 0o600 });
+  const bashEnv = join(zdotdir, 'bash_env.sh');
+  atomicWriteFileSync(bashEnv, reprepend, { mode: 0o600 });
+  return { zdotdir, bashEnv };
+}
+
+/**
  * Install the wrapper for `tool` into `binDir`.
  *
  * `binDir` must be prepended to the session PATH by the caller, so the wrapper
