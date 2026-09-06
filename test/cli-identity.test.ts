@@ -214,12 +214,20 @@ describe('installLoginShellPathShim', () => {
 
   /** CI runners do not all ship zsh. Skip that shell rather than fail on
    *  ENOENT — the bash case still proves the mechanism, and pretending a
-   *  missing shell is a product bug would train people to ignore this suite. */
+   *  missing shell is a product bug would train people to ignore this suite.
+   *
+   *  Resolved by looking on PATH rather than by running the shell: this file
+   *  already spawns a real login shell per case, and every extra process is
+   *  charged against a CI box running the whole suite in parallel. */
+  const shellCache = new Map<string, boolean>();
   function shellAvailable(shell: string): boolean {
-    try {
-      execFileSync('/usr/bin/env', [shell, '-c', 'exit 0'], { stdio: 'ignore' });
-      return true;
-    } catch { return false; }
+    const hit = shellCache.get(shell);
+    if (hit !== undefined) return hit;
+    const found = (process.env.PATH ?? '').split(':').some(d => {
+      try { return d !== '' && statSync(join(d, shell)).isFile(); } catch { return false; }
+    });
+    shellCache.set(shell, found);
+    return found;
   }
   const SHELLS = (['bash', 'zsh'] as const).filter(shellAvailable);
 
