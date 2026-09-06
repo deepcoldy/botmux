@@ -212,13 +212,24 @@ describe('installLoginShellPathShim', () => {
     return `/usr/bin:/bin:${realDir}:${wrapperDir}`;
   }
 
+  /** CI runners do not all ship zsh. Skip that shell rather than fail on
+   *  ENOENT — the bash case still proves the mechanism, and pretending a
+   *  missing shell is a product bug would train people to ignore this suite. */
+  function shellAvailable(shell: string): boolean {
+    try {
+      execFileSync('/usr/bin/env', [shell, '-c', 'exit 0'], { stdio: 'ignore' });
+      return true;
+    } catch { return false; }
+  }
+  const SHELLS = (['bash', 'zsh'] as const).filter(shellAvailable);
+
   function runLogin(shell: 'bash' | 'zsh', env: Record<string, string>): string {
     return execFileSync(shell, ['-lc', 'command -v faketool'], {
       encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   }
 
-  it.each(['bash', 'zsh'] as const)('keeps the wrapper first in a %s login shell', shell => {
+  it.each(SHELLS)('keeps the wrapper first in a %s login shell', shell => {
     const wrapperDir = fakeWrapperDir();
     const realDir = fakeRealDir();
     const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
@@ -235,7 +246,7 @@ describe('installLoginShellPathShim', () => {
 
   // Proves the test above is actually testing something: without the shim, the
   // same login shell picks the real tool.
-  it.each(['bash', 'zsh'] as const)('without the shim, %s resolves the real tool', shell => {
+  it.each(SHELLS)('without the shim, %s resolves the real tool', shell => {
     const wrapperDir = fakeWrapperDir();
     const realDir = fakeRealDir();
     const resolved = runLogin(shell, { PATH: loginShellPath(wrapperDir, realDir), HOME: dir });
@@ -248,7 +259,7 @@ describe('installLoginShellPathShim', () => {
   // is how the agent's tool calls run) reads .zprofile and skips .zshrc
   // entirely. Verified directly. Asserting on .zshrc here would have passed for
   // the wrong reason.
-  it('sources the user\'s startup file but still wins the PATH race', () => {
+  it.skipIf(!shellAvailable('zsh'))('sources the user\'s startup file but still wins the PATH race', () => {
     const wrapperDir = fakeWrapperDir();
     const realDir = fakeRealDir();
     const { zdotdir } = installLoginShellPathShim(wrapperDir);
@@ -264,7 +275,7 @@ describe('installLoginShellPathShim', () => {
 
   // A shell that inherits the shim without the variable (a nested login shell
   // outside a governed session) must not adopt some other session's wrapper.
-  it('is inert without BOTMUX_IDENTITY_BIN', () => {
+  it.skipIf(!shellAvailable('zsh'))('is inert without BOTMUX_IDENTITY_BIN', () => {
     const wrapperDir = fakeWrapperDir();
     const realDir = fakeRealDir();
     const { zdotdir } = installLoginShellPathShim(wrapperDir);
