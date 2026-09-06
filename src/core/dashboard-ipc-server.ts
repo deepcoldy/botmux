@@ -2907,8 +2907,15 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
-  const body = await readJsonBody<{ reconcileStreamingCard?: unknown }>(req, 4_096)
-    .catch(() => ({} as { reconcileStreamingCard?: unknown }));
+  const parsedBody = await readJsonBody<unknown>(req, 4_096).catch(() => ({}));
+  // JSON accepts null, arrays, and scalars. Treat all non-record input as an
+  // empty option bag before resuming, so a malformed optional body can never
+  // turn a successful state transition into a 500 below.
+  const body: { reconcileStreamingCard?: unknown } = parsedBody !== null
+    && typeof parsedBody === 'object'
+    && !Array.isArray(parsedBody)
+    ? parsedBody as { reconcileStreamingCard?: unknown }
+    : {};
   const sessionId = params.sessionId;
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });

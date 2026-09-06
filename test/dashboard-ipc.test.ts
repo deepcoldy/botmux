@@ -3979,6 +3979,41 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('treats a null JSON body as empty and still resumes the closed session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-null-body-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const registry = new Map<string, any>();
+    let handle: IpcServerHandle | undefined;
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume_null', 'om_resume_null', 'resume null body', 'group');
+      Object.assign(session, { scope: 'thread', cliId: 'codex', workingDir: process.cwd() });
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: 'null',
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, sessionId: session.sessionId, wake: false });
+      expect(registry.get(sessionKey('om_resume_null', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('active');
+    } finally {
+      await handle?.close();
+      workerPool.setActiveSessionsRegistry(previousRegistry);
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('reposts the live topic card before withdrawing the closed card when requested by /sessions', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-card-'));
     const prevConfigDataDir = config.session.dataDir;
