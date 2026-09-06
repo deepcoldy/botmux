@@ -427,7 +427,7 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_anonymous': 'botmux: 这一步需要发起人本人的 {provider} 授权，但本轮没有可识别的发起人，{tool} 命令未执行。',
   'trigger_user_auth.denied_howto': 'botmux: 怎么授权 —— 在本会话发一条 {command}，点返回的链接完成授权，然后重试。',
   'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
-  'trigger_user_auth.needs_login': '🔐 这一步要用你自己的权限，但你还没授权过 {tools}。发一条 /login 完成授权后重试；本次会话里这条提示只出现一次。',
+  'trigger_user_auth.needs_login': '🔐 这一步要用你自己的权限，但你还没授权过 {tools}。发一条 {commands} 完成授权后重试；本次会话里这条提示只出现一次。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',
   'cmd.login.step2_auto': '2. 授权完成后浏览器会显示「✅ 授权成功」，到这里就结束了——不需要复制任何东西，回到本话题重试即可。',

@@ -23,6 +23,7 @@ import {
   renderIdentityWrapper,
   IDENTITY_DENIED_EXIT_CODE,
   publishActiveTurn,
+  installLoginShellPathShim,
   writeSessionIdentity,
   clearSessionIdentity,
   clearAllSessionIdentities,
@@ -148,6 +149,105 @@ describe('clearSessionIdentity', () => {
 
 // The wrapper is what actually runs, on every CLI call. These tests execute it
 // against a stub "real binary" that just prints the env it received.
+// ── Login-shell PATH shim ───────────────────────────────────────────────────
+//
+// The regression that made every governed call silently unwrapped in
+// production while every unit test passed. The tests below existed in spirit —
+// they checked that the wrapper BEHAVES correctly — but none checked that the
+// agent's actual invocation REACHES it. The agent's tool calls go through a
+// login shell, /etc/zprofile runs path_helper, and path_helper rebuilds PATH
+// with /etc/paths.d entries first and pre-existing entries appended. A plain
+// prepend therefore loses to /opt/homebrew/bin.
+//
+// So these run REAL login shells rather than asserting on the string we build.
+describe('installLoginShellPathShim', () => {
+  /** A stand-in for the wrapper dir, holding a tool that identifies itself. */
+  function fakeWrapperDir(): string {
+    const bin = join(dir, 'wrapbin');
+    mkdirSync(bin, { recursive: true });
+    const tool = join(bin, 'faketool');
+    writeFileSync(tool, '#!/bin/sh\nprintf wrapper\n');
+    chmodSync(tool, 0o755);
+    return bin;
+  }
+
+  /** And a "real" one further down PATH, like /opt/homebrew/bin. */
+  function fakeRealDir(): string {
+    const bin = join(dir, 'realbin');
+    mkdirSync(bin, { recursive: true });
+    const tool = join(bin, 'faketool');
+    writeFileSync(tool, '#!/bin/sh\nprintf real\n');
+    chmodSync(tool, 0o755);
+    return bin;
+  }
+
+  /** Reproduce what path_helper does: rebuild PATH with system dirs first and
+   *  the inherited entries appended. That reordering is the whole bug. */
+  function loginShellPath(wrapperDir: string, realDir: string): string {
+    return `/usr/bin:/bin:${realDir}:${wrapperDir}`;
+  }
+
+  function runLogin(shell: 'bash' | 'zsh', env: Record<string, string>): string {
+    return execFileSync(shell, ['-lc', 'command -v faketool'], {
+      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  }
+
+  it.each(['bash', 'zsh'] as const)('keeps the wrapper first in a %s login shell', shell => {
+    const wrapperDir = fakeWrapperDir();
+    const realDir = fakeRealDir();
+    const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+
+    const resolved = runLogin(shell, {
+      PATH: loginShellPath(wrapperDir, realDir),
+      HOME: dir,
+      BOTMUX_IDENTITY_BIN: wrapperDir,
+      ZDOTDIR: zdotdir,
+      BASH_ENV: bashEnv,
+    });
+    expect(resolved).toBe(join(wrapperDir, 'faketool'));
+  });
+
+  // Proves the test above is actually testing something: without the shim, the
+  // same login shell picks the real tool.
+  it.each(['bash', 'zsh'] as const)('without the shim, %s resolves the real tool', shell => {
+    const wrapperDir = fakeWrapperDir();
+    const realDir = fakeRealDir();
+    const resolved = runLogin(shell, { PATH: loginShellPath(wrapperDir, realDir), HOME: dir });
+    expect(resolved).toBe(join(realDir, 'faketool'));
+  });
+
+  // The user's own startup file must keep working, and must not be able to jump
+  // ahead of the wrapper by appending to PATH itself.
+  // NOTE .zprofile, not .zshrc: a NON-interactive login shell (`zsh -lc`, which
+  // is how the agent's tool calls run) reads .zprofile and skips .zshrc
+  // entirely. Verified directly. Asserting on .zshrc here would have passed for
+  // the wrong reason.
+  it('sources the user\'s startup file but still wins the PATH race', () => {
+    const wrapperDir = fakeWrapperDir();
+    const realDir = fakeRealDir();
+    const { zdotdir } = installLoginShellPathShim(wrapperDir);
+    writeFileSync(join(dir, '.zprofile'), `export PATH="${realDir}:$PATH"\nexport USER_RC_RAN=1\n`);
+
+    const out = execFileSync('zsh', ['-lc', 'echo "$USER_RC_RAN"; command -v faketool'], {
+      encoding: 'utf8',
+      env: { PATH: loginShellPath(wrapperDir, realDir), HOME: dir, BOTMUX_IDENTITY_BIN: wrapperDir, ZDOTDIR: zdotdir },
+    }).trim().split('\n');
+    expect(out[0]).toBe('1');
+    expect(out[1]).toBe(join(wrapperDir, 'faketool'));
+  });
+
+  // A shell that inherits the shim without the variable (a nested login shell
+  // outside a governed session) must not adopt some other session's wrapper.
+  it('is inert without BOTMUX_IDENTITY_BIN', () => {
+    const wrapperDir = fakeWrapperDir();
+    const realDir = fakeRealDir();
+    const { zdotdir } = installLoginShellPathShim(wrapperDir);
+    const resolved = runLogin('zsh', { PATH: loginShellPath(wrapperDir, realDir), HOME: dir, ZDOTDIR: zdotdir });
+    expect(resolved).toBe(join(realDir, 'faketool'));
+  });
+});
+
 describe('renderIdentityWrapper', () => {
   function stubTool(): string {
     const p = join(dir, 'real-tool.sh');
