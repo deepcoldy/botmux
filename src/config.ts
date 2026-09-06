@@ -116,18 +116,24 @@ export interface HerdrTraexPluginRuntimeConfig {
 
 /** Startup-only handoff for a local companion process.
  *
- * This is deliberately a path, not a secret value: Botmux does not read,
- * validate, log, or fall back to the Dashboard/internal HMAC secret. */
+ * This is deliberately a path, not a secret value: this resolver performs no
+ * file IO. The startup boundary validates/loads the dedicated file and never
+ * logs or falls back to the Dashboard/internal HMAC secret. */
 export interface CompanionStartupConfig {
   secretFile: string | undefined;
+  botAppId: string | undefined;
 }
 
 /** The sole supported private secret-file configuration input. */
 export const COMPANION_SECRET_FILE_ENV = 'BOTMUX_COMPANION_SECRET_FILE';
+export const COMPANION_BOT_APP_ID_ENV = 'BOTMUX_COMPANION_BOT_APP_ID';
 
 /** Resolve the fixed scoped startup handoff without touching the secret file. */
 export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.env): CompanionStartupConfig {
-  return { secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]) };
+  return {
+    secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]),
+    botAppId: nonBlankHost(env[COMPANION_BOT_APP_ID_ENV]),
+  };
 }
 
 /**

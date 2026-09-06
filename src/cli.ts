@@ -7,9 +7,11 @@
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
- *   botmux start          — start daemon and auto plugin services
+ *   botmux start [--companion-secret-file <path> --companion-bot <appId>]
+ *                         — start daemon and optionally its closed local companion API
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
- *   botmux restart [--with-plugin] — restart daemon, then ensure auto plugin services
+ *   botmux restart [--with-plugin] [--companion-secret-file <path> --companion-bot <appId>]
+ *                         — restart daemon, then ensure auto plugin services
  *   botmux logs [--lines] [--bot <i>] [--no-follow] — view/stream per-bot daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version (本地 checkout 则 git pull --ff-only + rebuild + restart)
@@ -2430,10 +2432,22 @@ function preflightNodeSanity(): void {
   }
 }
 
-async function cmdStart(): Promise<void> {
+function applyCompanionOptions(argv: string[]): void {
+  applyCompanionStartupOptions({
+    argv,
+    env: process.env,
+    bots: loadBotsJson(),
+    // Validate without retaining or logging the value. The Dashboard performs
+    // the same fail-closed check before exposing any companion route.
+    validateSecret: loadCompanionSecret,
+  });
+}
+
+async function cmdStart(argv: string[]): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
+  applyCompanionOptions(argv);
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
   // via fleet-state (pid + kill-0 under the fleet mutation lock), so there is no
@@ -2512,6 +2526,9 @@ async function startConfiguredFleet(
       const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
       const result = startFleetViaSupervisor();
       if (result.action === 'already-running') {
+        if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
+          throw new Error('fleet is already running; use `botmux restart` to apply companion options');
+        }
         console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人)`);
       }
     }, { maxWaitMs: 5_000 });
@@ -2633,7 +2650,8 @@ interface RestartLifecycleFlags {
 }
 
 
-async function cmdRestart(): Promise<void> {
+async function cmdRestart(argv: string[]): Promise<void> {
+  applyCompanionOptions(argv);
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
@@ -6099,8 +6117,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   clone <机器人名> [--name <新名称>]
               创建新应用并复制该机器人的行为配置；留空名称自动使用 源名称-copy-时间戳
   start       启动 daemon，并启动 mode=auto 的插件 service
+              可用 --companion-secret-file <绝对路径> --companion-bot <appId> 开启封闭本机 Companion API
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
-  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
+  restart     重启 daemon（同样接受 --companion-secret-file / --companion-bot；--with-plugin 显式先停再启动 auto service）
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
@@ -7314,6 +7333,8 @@ import {
 } from './bot-registry.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
+import { loadCompanionSecret } from './dashboard/companion-api.js';
+import { applyCompanionStartupOptions } from './cli/companion-startup-options.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
@@ -14289,12 +14310,12 @@ switch (command) {
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
-  case 'start':   await cmdStart(); break;
+  case 'start':   await cmdStart(process.argv.slice(3)); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
-  case 'restart': await cmdRestart(); break;
+  case 'restart': await cmdRestart(process.argv.slice(3)); break;
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
   case 'upgrade':
