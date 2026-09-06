@@ -552,6 +552,7 @@ import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
+import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
@@ -4738,6 +4739,59 @@ describe('handleCommand', () => {
     // separate authorizations. Split into begin/done because the device-code
     // flow needs a human to go click something — blocking the session on that
     // would hold the turn open for as long as they take.
+    // Feishu returns a structured `missing_scopes` array on 99991679, so "ask for
+    // exactly what was refused" needs no guessing — and no giant default set
+    // that makes every person approve permissions they will never use.
+    describe('/login --scope', () => {
+      it('builds an authorization URL carrying the requested scopes', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:write_only'), deps, LARK_APP_ID);
+
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:write_only'], 'ou_sender',
+        );
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('docx:document:write_only');
+      });
+
+      it('accepts several scopes at once', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID,
+          makeLarkMessage('/login --scope docx:document:write_only drive:file:upload'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:write_only', 'drive:file:upload'], 'ou_sender',
+        );
+      });
+
+      // A typo does not degrade — Feishu rejects the whole authorize URL with
+      // 20043 and the person is handed a link that just fails to open, with no
+      // hint which word was wrong. Catch it here where we can name it.
+      it('refuses a scope name that does not exist', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID, makeLarkMessage('/login --scope docx:documnet'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('docx:documnet');
+      });
+
+      // Guards the catalog actually loading: if the JSON failed to bundle,
+      // isKnownLarkUserScope accepts everything and the typo test above would
+      // pass for the wrong reason.
+      it('accepts a scope that really exists', () => {
+        expect(isKnownLarkUserScope('docx:document:readonly')).toBe(true);
+        expect(isKnownLarkUserScope('docx:document')).toBe(false); // only :readonly/:create/:write_only
+      });
+
+      it('explains itself when no scope is given', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
+      });
+    });
+
     describe('/login bytedcli', () => {
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
         const deps = makeDeps(makeDaemonSession());

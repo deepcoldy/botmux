@@ -406,6 +406,10 @@ export const messages: Record<string, string> = {
   // authorization is missing and how to supply it, or they just retry.
   // bytedcli uses ByteCloud SSO, a different identity provider from Feishu, so
   // both need authorizing separately.
+  'cmd.login.scope_title': '🔐 Feishu authorization (extra scopes)',
+  'cmd.login.scope_usage': 'Usage: /login --scope <scope> [more scopes]\nFor example: /login --scope docx:document\nCopy the names straight out of the error — Feishu names the scopes it is missing.',
+  'cmd.login.scope_unknown': '❌ Not valid Feishu scope names: {scopes}\nA typo makes the whole authorization link fail. Copy them verbatim from the error\'s missing_scopes.',
+  'cmd.login.scope_footer': 'Requesting in addition: {scopes}\nOnce authorized, retry what you were doing.',
   'cmd.login.bytedcli_title': '🔐 ByteCloud (bytedcli) authorization',
   'cmd.login.bytedcli_step1': '1. Open this link to authorize:',
   'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
@@ -801,6 +805,9 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
   'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',
+  // missing_scope means "authorized, but not for this" — a plain /login re-grants
+  // the same scopes and fails identically. Feishu already names what is missing.
+  'ai.credentials.on_missing_scope': 'If the error is missing_scope (99991679): the person IS authorized but this one permission was not granted. Read back the missing_scopes verbatim and ask them to send "/login --scope <those scopes>", then retry. Do not switch to the bot identity to get around it, and do not send them through a plain /login again.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',
