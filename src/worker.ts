@@ -17,7 +17,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv, publishActiveTurn, installLoginShellPathShim } from './core/cli-identity.js';
+import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv, publishActiveTurn, installLoginShellPathShim, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -14157,6 +14157,29 @@ async function spawnCli(
   const buildArgsWorkingDir = sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
+  // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
+  // runs. Computed here rather than in the wrapper-install block below because
+  // buildArgs runs first; these are pure path derivations, so naming them early
+  // is safe, and the block below is still what actually writes the files.
+  //
+  // Only the shim vars: the wrapper reads the identity file itself, keyed by
+  // SESSION_DATA_DIR + BOTMUX_SESSION_ID, which the pane already carries. No
+  // credential is passed through this channel.
+  const identityShellEnv: Record<string, string> = {};
+  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
+    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
+    identityShellEnv.ZDOTDIR = join(dir, 'shell');
+    identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+    // git runs as a shell subprocess too, so askpass needs the same forwarding
+    // or a push carries the machine's identity. Declared only when bytedcli is
+    // governed — that is the exact condition under which installGitAskpass
+    // writes the file, and pointing GIT_ASKPASS at a missing path would break
+    // git prompts rather than fall back.
+    if (cfg.triggerUserAuth.tools.includes('bytedcli')) {
+      identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
+    }
+  }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -14183,6 +14206,9 @@ async function spawnCli(
     // agent from reading another person's token file today, and the likeliest
     // way that happens is an agent grepping the data dir to debug an auth error.
     triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
+    // Adapters whose CLI filters the environment of the shell commands it runs
+    // (codex) re-declare these; the rest ignore them and inherit normally.
+    ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,
