@@ -47,7 +47,11 @@ vi.mock('../src/utils/logger.js', () => ({
 
 const publish = vi.fn();
 vi.mock('../src/core/dashboard-events.js', () => ({ dashboardEventBus: { publish: (...a: any[]) => publish(...a) } }));
-vi.mock('../src/core/dashboard-rows.js', () => ({ composeRowFromActive: vi.fn(() => ({})) }));
+vi.mock('../src/core/dashboard-rows.js', () => ({
+  composeRowFromActive: vi.fn(() => ({})),
+  composeRowFromClosed: vi.fn(() => ({})),
+  composeRowFromPersistedActive: vi.fn(() => ({})),
+}));
 vi.mock('../src/core/session-message-preview.js', () => ({ buildSessionMessagePreview: vi.fn(() => undefined) }));
 
 const {
