@@ -21,6 +21,14 @@ import { describe, expect, it } from 'vitest';
 // Rather than execute the page (it needs a DOM, a WebSocket and a live worker),
 // this parses it: a SyntaxError anywhere in the script is exactly the failure
 // mode, and `new Function` reports it without running a line.
+//
+// Known gap, deliberately not closed here: a bare `\n` (or the U+2028 / U+2029
+// line separators, named here rather than written literally because they would
+// terminate this very comment) in a `//` comment also becomes a real line break
+// and truncates the comment. If what follows happens to be valid JS there is no
+// SyntaxError, so the parse check passes -- and the CR fingerprint below cannot
+// see it either, because real LFs are everywhere in the emitted document. The
+// bug this file was written for was a `\r`, which both checks do catch.
 
 const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -98,7 +106,11 @@ describe('getTerminalHtml 发出的内联脚本必须是合法 JS', () => {
 
   it('任何 // 注释里都不含真实换行/回车（会截断注释并让整段脚本 SyntaxError）', () => {
     const html = servedHtml();
-    for (const script of inlineScripts(html)) {
+    const scripts = inlineScripts(html);
+    // Same vacuous-pass guard as above: with zero scripts the loop below runs
+    // zero assertions and this test goes green on a broken extractor.
+    expect(scripts.length, '没有解出任何内联脚本，说明提取逻辑坏了').toBeGreaterThan(0);
+    for (const script of scripts) {
       // A CR that is not part of a CRLF pair, anywhere in the emitted script,
       // is the fingerprint: worker.ts writes the whole document with \n.
       const strayCr = /\r(?!\n)/.exec(script);

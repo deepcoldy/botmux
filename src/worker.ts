@@ -18513,6 +18513,9 @@ if(isTouch&&hasToken){(function(){
   // browser — Backspace/Ctrl-C/mode/上屏 all kept focus on #mobile-input).
   // Buttons only: the textarea itself must keep focusing and placing its caret,
   // and Tab focus is unaffected because only pointer-driven focus is cancelled.
+  // Static NodeList, captured once: the bar's buttons must stay in the initial
+  // markup. A button added later would miss this handler AND the disable pass
+  // over 'controls' below, so both regress together rather than silently apart.
   var barBtns=bar.querySelectorAll('button');
   for(var bbi=0;bbi<barBtns.length;bbi++){
     barBtns[bbi].addEventListener('pointerdown',function(e){e.preventDefault();});
