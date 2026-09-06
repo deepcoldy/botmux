@@ -9,6 +9,7 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
 import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -2904,6 +2905,41 @@ export async function handleCommand(
             ));
           }
           await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login --scope a b c` —— 在默认 scope 之外追加申请。
+        //
+        // 飞书被拒时会返回结构化的 missing_scopes（99991679），所以「缺什么补什么」
+        // 不需要猜：把它报的名字原样传进来即可。默认集只覆盖只读，写操作和通讯录
+        // 这类走这条路显式申请——让人在授权页上看见自己批准的到底是什么。
+        //
+        // 名字对着 lark-scopes.json 校验：拼错不会降级，会让整个授权链接 20043 失败，
+        // 那时用户看到的是一个打不开的链接，而不是「这个 scope 不认识」。
+        if (subCmd.startsWith('--scope') || subCmd.startsWith('scope ')) {
+          const raw = subCmd.replace(/^(--scope|scope)\s*/, '').trim();
+          const requested = raw.split(/[\s,]+/).filter(Boolean);
+          if (!requested.length) {
+            await sessionReply(rootId, t('cmd.login.scope_usage', undefined, loc));
+            break;
+          }
+          const unknown = requested.filter(x => !isKnownLarkUserScope(x));
+          if (unknown.length) {
+            await sessionReply(rootId, t('cmd.login.scope_unknown', { scopes: unknown.join(' ') }, loc));
+            break;
+          }
+          const { authUrl: scopedUrl } = generateAuthUrl(
+            botCfg2.larkAppId,
+            botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand),
+            requested,
+            loginOpenId,
+          );
+          await sessionReply(rootId, [
+            ...loginPromptLines(scopedUrl, loc, 'cmd.login.scope_title'),
+            '',
+            t('cmd.login.scope_footer', { scopes: requested.join(' ') }, loc),
+          ].join('\n'));
           break;
         }
 
