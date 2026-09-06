@@ -870,6 +870,40 @@ describe('sync gate hooks (prompt.submit)', () => {
     expect(payload.contentTruncated).toBe(true);
   });
 
+  // 钉住的是：**坏掉的 observer 不能影响裁决**（变异实测：把 observer 也算进
+  // 裁决集合 ⟹ 本例转红）。
+  //
+  // ⚠️ 这条**不能**证明 `runHooksFireAndForget` 里那个 `.catch()` 有效：
+  // `runHookCommand` 是 `new Promise((resolve) => …)`，**根本不会 reject**，
+  // 所以 `.catch()` 只在 `.then()` 回调自身抛错时才可达（那里只有 logger 调用）。
+  // 实测删掉那个 `.catch()`，本用例仍全绿。它是纵深防御 —— 保留的理由是
+  // #1224 的阻断项正是「fire-and-forget 少 .catch() ⟹ unhandledRejection ⟹
+  // daemon 无 handler ⟹ Node v22 终止进程」，而 `.then()` 回调将来一旦加入
+  // 会抛的代码，它就是唯一的兜底。别因为「测试删了也绿」就把它删掉。
+  it('survives a broken async observer without affecting the verdict or leaking a rejection', async () => {
+    const dir = observerDir();
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => { rejections.push(err); };
+    process.on('unhandledRejection', onRejection);
+    try {
+      gateHooks([
+        // spawn 不到（ENOENT）
+        { event: 'prompt.submit', command: join(dir, 'does-not-exist') },
+        // 跑起来了但非 0 退出
+        { event: 'prompt.submit', command: writeHook('boom.js', 'process.exit(7);', dir) },
+        { event: 'prompt.submit', mode: 'sync', command: writeHook('verdict.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'still-works' }));`, dir) },
+      ]);
+      const decision = await evaluatePromptGate('prompt.submit', { content: 'x' });
+      expect(decision.allowed).toBe(false);
+      expect(decision.reason).toBe('still-works');
+      // 给 fire-and-forget 的失败回调跑完的机会，再断言没有漏出去的 rejection。
+      await new Promise(resolve => setTimeout(resolve, 800));
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
   it('warns that timeoutMs:0 on a sync gate is an instant timeout, not "no timeout"', () => {
     const warnings: string[] = [];
     const original = logger.warn;
