@@ -160,6 +160,31 @@ describe('clearSessionIdentity', () => {
 // prepend therefore loses to /opt/homebrew/bin.
 //
 // So these run REAL login shells rather than asserting on the string we build.
+// Every var the wrapper machinery relies on must be on the tmux passthrough
+// allowlist. A tmux pane does NOT inherit childEnv — it takes PATH from the
+// user's rcfile and only the allowlisted keys through `/usr/bin/env`. A var
+// missing here is invisible: the session looks configured and silently runs
+// every governed call as the machine account. That is exactly how this shipped
+// broken.
+describe('tmux env passthrough covers the identity vars', () => {
+  it('forwards the shim and git-attribution vars into a pane', async () => {
+    const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
+    for (const key of ['BOTMUX_IDENTITY_BIN', 'ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT']) {
+      expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
+    }
+  });
+
+  // The numbered git-config keys are listed literally, so the list has to match
+  // however many entries gitIdentityConfigEnv actually emits.
+  it('forwards every numbered git-config key that is actually emitted', async () => {
+    const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
+    const emitted = Object.keys(gitIdentityConfigEnv('/tmp/askpass', 'git.example.com'));
+    for (const key of emitted) {
+      expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
+    }
+  });
+});
+
 describe('installLoginShellPathShim', () => {
   /** A stand-in for the wrapper dir, holding a tool that identifies itself. */
   function fakeWrapperDir(): string {

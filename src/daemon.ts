@@ -3603,7 +3603,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // silently and with their permissions.
   const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
 
-  const outcomes = await publishTurnCliIdentity({
+  await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -3615,34 +3615,20 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     turnId,
   });
 
-  const needsAuth = outcomes.filter(o => o.state === 'needs-authorization');
-  if (!needsAuth.length) return;
-  const notified = (ds.triggerUserAuthNotified ??= new Set<string>());
-  const fresh = needsAuth.filter(o => !notified.has(o.tool));
-  if (!fresh.length) return;
-  for (const o of fresh) notified.add(o.tool);
-
-  const loc = localeForBot(ds.larkAppId);
-  const tools = fresh.map(o => o.tool).join(' / ');
-  // Name the command that actually authorizes each tool. bytedcli goes through
-  // ByteCloud SSO, so a bare `/login` sends the reader to authorize Feishu and
-  // hit this same notice again — the chat-side twin of the wrapper's stderr.
-  const commands = [...new Set(fresh.map(o => o.tool === 'bytedcli' ? '/login bytedcli' : '/login'))]
-    .join(' 和 ');
-  try {
-    await sessionReply(
-      sessionAnchorId(ds),
-      tr('trigger_user_auth.needs_login', { tools, commands }, loc),
-      'text',
-      ds.larkAppId,
-      turnId,
-    );
-  } catch (err) {
-    logger.debug(
-      `[trigger-user-auth] could not deliver the authorize notice: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  // NO chat notice here.
+  //
+  // This ran at message-acceptance, before the agent had decided which tool it
+  // would use, so it announced every governed tool that lacked credentials.
+  // Ask for lark-cli and you were told to authorize bytedcli as well — advice
+  // for something you were not doing. It was also once-per-session, so the one
+  // time it WOULD have been useful (you finally do call bytedcli and it is
+  // refused) it stayed silent.
+  //
+  // The refusal already carries this. The wrapper prints, on stderr, which tool
+  // was refused and which command authorizes it — at the moment of the refusal,
+  // for that tool only, every time it happens. That is strictly better
+  // information than a guess made a second earlier, so the guess is gone rather
+  // than being made narrower.
 }
 
 async function sessionReply(

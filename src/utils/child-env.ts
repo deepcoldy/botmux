@@ -427,6 +427,27 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
+  // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
+  // NOT from childEnv, so the worker's PATH prepend never reaches it — these
+  // three are how the wrapper dir gets back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // Without them on this allowlist the whole feature is inert in a tmux pane:
+  // every governed call silently resolves the real tool and runs as the machine
+  // account.
+  'BOTMUX_IDENTITY_BIN',
+  'ZDOTDIR',
+  'BASH_ENV',
+  // Git attribution for the acting person. Same reason: askpass and the
+  // per-host credential config are set on childEnv, which a tmux pane does not
+  // inherit, so a push would carry the machine's identity instead.
+  'GIT_ASKPASS',
+  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
+  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
+  // a prefix rule here would widen what any session can push into a pane.
+  'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
