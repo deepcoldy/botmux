@@ -85,6 +85,67 @@ describe('owned session systemd scope', () => {
     expect(wrapped.unitName).toBe('botmux-session-abc-123.scope');
   });
 
+  // REGRESSION GUARD (cgroup-v2 gate): a cgroup-v1 host can still satisfy every
+  // DOWNSTREAM check — the delegation reads succeed and the probe scope's
+  // memory.max both exists and holds the probe limit. Only the explicit
+  // /sys/fs/cgroup/cgroup.controllers gate can reject it. Without that gate we
+  // would promise an enforceable MemoryMax that v1 silently drops, so this case
+  // pins the gate itself rather than the checks behind it.
+  it('rejects a cgroup-v1 host even when every downstream check would pass', () => {
+    const run = vi.fn((command: string, args: readonly string[]) => {
+      if (command === 'systemd-run' || command === 'sh') return result(0);
+      if (args.some(arg => arg.includes('-memory.scope'))) {
+        return result(0, '/user.slice/user-1001.slice/user@1001.service/app.slice/probe.scope\n');
+      }
+      return result(0, '/user.slice/user-1001.slice/user@1001.service\n');
+    });
+    const capabilities = probeSessionScopeCapabilities({
+      platform: 'linux',
+      run,
+      // The v2 root marker is ABSENT (this is what makes the host v1) while
+      // memory.max resolves — i.e. delegation + placement would both "pass".
+      exists: path => path.endsWith('/memory.max'),
+      readFile: path => (path.endsWith('/memory.max') ? '16777216' : 'cpu io memory'),
+    });
+    expect(capabilities.cleanupSupported).toBe(true);
+    expect(capabilities.memoryControllerSupported).toBe(false);
+    // And the refusal must actually suppress the property, not just the flag.
+    const wrapped = wrapCommandInSessionScope(
+      'v1-host',
+      '/usr/bin/node',
+      ['cli.js'],
+      { sessionMemoryMaxBytes: 5_000_000 },
+      capabilities,
+    );
+    expect(wrapped.args.some(arg => arg.includes('MemoryMax'))).toBe(false);
+  });
+
+  // REGRESSION GUARD (placement verification): delegation can look correct on
+  // paper (cgroup.controllers lists memory and subtree_control enables it) while
+  // the live scope does NOT land in a memory-enabled cgroup — here the probe
+  // scope's memory.max is missing. Accepting delegation alone would claim an
+  // unenforceable limit, so placement must be verified against the real scope.
+  it('rejects paper-only delegation when the live scope has no memory.max', () => {
+    const run = vi.fn((command: string, args: readonly string[]) => {
+      if (command === 'systemd-run' || command === 'sh') return result(0);
+      if (args.some(arg => arg.includes('-memory.scope'))) {
+        return result(0, '/user.slice/user-1001.slice/user@1001.service/app.slice/probe.scope\n');
+      }
+      return result(0, '/user.slice/user-1001.slice/user@1001.service\n');
+    });
+    const capabilities = probeSessionScopeCapabilities({
+      platform: 'linux',
+      run,
+      // v2 root marker present and delegation readable, but the probe scope's
+      // memory.max never materialises.
+      exists: path => path === '/sys/fs/cgroup/cgroup.controllers',
+      readFile: path => (path.endsWith('cgroup.controllers') ? 'cpu io memory' : 'cpu memory'),
+    });
+    expect(capabilities.cleanupSupported).toBe(true);
+    expect(capabilities.memoryControllerSupported).toBe(false);
+  });
+
+
   it('does not claim or apply MemoryMax when only scope cleanup works', () => {
     const wrapped = wrapCommandInSessionScope(
       'session-1',
