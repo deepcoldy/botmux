@@ -28,6 +28,59 @@ Supports three schedule types plus natural-language input, posting a follow-up m
 /schedule 2026-05-01T10:00 ...
 ```
 
+## Bash Preconditions (Dashboard)
+
+Enable **Bash precondition** when a scheduled task should check external state before calling the model. This setting is available when creating or editing a task in the Dashboard. Turning the switch off disables the precondition, but the scheduled task continues to run and the saved content is retained. Clear the script or file path and save to remove it.
+
+Two source modes are available:
+
+- **Enter Bash directly**: the script content is stored with the task configuration.
+- **Bash file path**: the file must be a readable, regular UTF-8 Bash file on the daemon host and must be inside the `<dataDir>/schedule-preconditions/trusted-files/` directory shown in the Dashboard for the current bot. The page also shows a complete absolute-path example that can be entered directly. Relative paths, paths using `~` expansion, directories, files outside this directory, and symbolic links in any path component are rejected.
+
+### File-path configuration demo
+
+Suppose the Dashboard shows the following values for the current bot:
+
+```text
+Trusted directory: /home/alice/.botmux/data/schedule-preconditions/trusted-files/
+Complete example: /home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh
+```
+
+This is a Linux example. Your actual `dataDir` may differ, so use the values shown in the Dashboard instead of copying the example username. Then:
+
+1. On the **same host that runs the daemon**, create or copy a regular UTF-8 Bash file into the directory shown in the Dashboard. The daemon creates this directory.
+2. Paste the complete absolute path into **Bash file path**. For this example, enter `/home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh`, not `~/...`.
+3. Click **Test precondition**. Save the task after the test passes.
+
+You can start `check-ready.sh` with this minimal content:
+
+```bash
+#!/usr/bin/env bash
+# Replace this with the state path to check on the daemon host.
+if test -f /srv/my-service/ready.flag; then
+  printf '1\n'
+else
+  printf '0\n'
+fi
+```
+
+Botmux validates and reads the file again for every test and scheduled trigger. You do not need to save the task again after changing the file.
+
+Both modes use the same protocol. The script must exit with code `0`, and trimmed stdout must be exactly `1`, before the task calls the model. Output `0`, any other output, empty output, or a script error stops that run.
+
+To append context to the model prompt for this run, write it to file descriptor 3 (FD 3):
+
+```bash
+printf '1\n'
+cat >&3 <<'PROMPT'
+The deployment check passed. Use this status in the analysis.
+PROMPT
+```
+
+Click **Test precondition** to execute the current **unsaved** form content for real on the daemon host. The result shows pass, skip, or the full error and exit codes. Testing does not save the configuration, call the model, write a task execution log, or advance repeat counts. File, network, and other side effects produced by the script still happen for real.
+
+> **Migrating existing configurations:** File paths saved before this upgrade remain configured when they are outside the trusted directory, but tests and scheduled runs fail closed while the precondition is enabled, so the model is not called. Botmux does not copy the file or rewrite the task automatically. Move or copy the file into the current bot's trusted directory, update the field with the new complete absolute path, test it, and save. FD 3 content is sent to the model and may enter session history, so do not output secrets or tokens.
+
 ## A New Topic Per Run
 
 By default every fire continues in **the original topic where the task was created**. To make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
@@ -43,7 +96,7 @@ botmux schedule add "每日17:30" "generate digest" --new-topic
 botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 ```
 
-You can also flip an existing task between "original thread" and "new topic each run" from the **Delivery** column toggle on the dashboard's Schedules page.
+You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, or a new topic for every run.
 
 ## Follow the Active Topic
 

@@ -17,7 +17,7 @@ botmux dashboard rotate   # Rotate the token and print the new URL
 ## Features
 
 - **Sessions**: lists active + closed sessions across all bots, filterable by CLI / status / adopt / text. Open a detail view to copy various IDs, close sessions, and multi-select batch close; "locate topic" has the bot post an **@-mention of the session owner** in the original topic (a bare @, no other text) to help you jump back to the context. Chat-scope session rows also carry a Lark group AppLink straight to the chat.
-- **Schedules**: lists all scheduled tasks, with Run now / Pause / Resume.
+- **Schedules**: creates, edits, and manages scheduled tasks, including Run now, Pause/Resume, multiple target chats, execution logs, and testable [Bash preconditions](/en/schedule#bash-preconditions-dashboard).
 - **Groups**: one-click create a new group (auto @-notifies the invited user), add bots to a group, and auto-transfer group ownership; disband groups and have bots leave groups (associated sessions are cleaned up automatically).
 - **Team / Roles / Bot Defaults**: the Team panel handles [cross-deployment collaboration](/en/roles) (invite someone else's deployment into your team, create cross-deployment groups); Roles manages each bot's per-group persona; Bot Defaults (Bot configuration) sets default behaviors (new-group on-call, card signature, **default role**, etc.).
 - **Workflows control panel**: Run List polling; Run Detail shows the summary / dangling red zone / node-activity / event timeline / concurrent-execution timeline; you can **cancel a run** directly.

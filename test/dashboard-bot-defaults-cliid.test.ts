@@ -207,6 +207,113 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows the claude-code effort picker with all five levels and no ultra', () => {
+    const claudeCliState = {
+      options: [
+        { id: 'claude-code', label: 'Claude Code' },
+        { id: 'codex', label: 'Codex' },
+      ],
+      ttadkModelDefault: '',
+      ttadkModelSuggestions: [],
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+        sessionFallback: 'claude-code',
+        cliState: claudeCliState,
+        patchBot: () => undefined,
+      }));
+    });
+    // Without the dashboard half of the gate the picker is not rendered at all,
+    // so findByProps throwing is itself the regression signal.
+    const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+    expect(picker.props.value).toBe('xhigh');
+    const values = (picker.props.options as Array<{ value: string }>).map(o => o.value);
+    // opus-5 takes both xhigh and max; ultra is codex/traex-only and never offered.
+    expect(values).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it.each(['aiden-x-claude', 'cjadk-x-claude', 'ttadk-x-claude'])(
+    'shows and saves effort for the %s wrapper, which resolves to claude-code',
+    async (selectionKey) => {
+      // Gateway entries are selection keys, not CliIds. Matching the raw key
+      // would hide the selector and blank the stored effort on save, even though
+      // the wrapper only swaps the binary — stripWrapperUnsafeArgs drops
+      // --settings / botmux -c / --dangerously-bypass-hook-trust, never --effort.
+      const previousFetch = globalThis.fetch;
+      const requests: any[] = [];
+      (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+        if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+        if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+        const body = JSON.parse(init?.body ?? '{}');
+        requests.push(body);
+        return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', reasoningEffort: body.reasoningEffort, selectionKey }) } as any;
+      });
+      try {
+        let renderer!: TestRenderer.ReactTestRenderer;
+        act(() => {
+          renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+            bot: { larkAppId: 'cli_wrapped', cliId: 'claude-code', agentSelectionKey: selectionKey, model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+            sessionFallback: selectionKey,
+            cliState: {
+              options: [{ id: selectionKey, label: selectionKey }, { id: 'codex', label: 'Codex' }],
+              ttadkModelDefault: '',
+              ttadkModelSuggestions: [],
+            },
+            patchBot: () => undefined,
+          }));
+        });
+        expect(renderer.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('xhigh');
+        await act(async () => {
+          renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        });
+        expect(requests.at(-1)?.reasoningEffort).toBe('xhigh');
+      } finally {
+        (globalThis as any).fetch = previousFetch;
+      }
+    },
+  );
+
+  it('keeps the claude effort in the save payload instead of blanking it', async () => {
+    // Regression: the selector, its option list and the save payload each had
+    // their own inline CLI predicate. claude-code reached the first two but not
+    // the third, so every save sent reasoningEffort:'' and the daemon read that
+    // explicit empty value as a delete.
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: body.reasoningEffort, selectionKey: 'claude-code' }) } as any;
+    });
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+          sessionFallback: 'claude-code',
+          cliState: {
+            options: [{ id: 'claude-code', label: 'Claude Code' }, { id: 'codex', label: 'Codex' }],
+            ttadkModelDefault: '',
+            ttadkModelSuggestions: [],
+          },
+          patchBot: () => undefined,
+        }));
+      });
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      });
+      const saved = requests.find(r => r.cliId === 'claude-code');
+      expect(saved).toBeTruthy();
+      expect(saved.reasoningEffort).toBe('xhigh');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];

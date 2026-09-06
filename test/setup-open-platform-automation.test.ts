@@ -1291,6 +1291,13 @@ describe('redirect 白名单读→合并→写', () => {
       .toEqual(['https://a/cb']);
     // 读到了、但线上一条都没配 → 空数组（可以放心合并）。
     expect(extractOpenPlatformRedirectUrls(readPayload([]))).toEqual([]);
+    // 新建应用的真实返回：redirectURL 为空时整个键被省略，其余
+    // safe_setting 字段仍在。这同样是「已读到且白名单为空」。
+    expect(extractOpenPlatformRedirectUrls({
+      code: 0,
+      data: { Head: { RespFormat: 1 }, allowRefreshToken: true, ipWhiteList: [], safeServerDomain: [] },
+      msg: '',
+    })).toEqual([]);
     // 读不出来 → null（只能退化成覆盖写）。畸形与端点不存在都归到这一类。
     expect(extractOpenPlatformRedirectUrls(readPayload('not-an-array'))).toBeNull();
     expect(extractOpenPlatformRedirectUrls({ code: 0 })).toBeNull();

@@ -13,11 +13,22 @@ import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
-import { setScheduleScope } from '../src/services/schedule-store.js';
+import * as scheduleStore from '../src/services/schedule-store.js';
+import {
+  ensureSchedulePreconditionRoot,
+  resolveSchedulePrecondition,
+  schedulePreconditionPath,
+  schedulePreconditionRoot,
+  schedulePreconditionTrustedFilesRoot,
+} from '../src/services/schedule-precondition-store.js';
+import {
+  appendScheduleRunLog,
+  scheduleRunLogDirectory,
+} from '../src/services/schedule-run-log-store.js';
 
 // Per-bot schedule stores: the daemon binds the store to its own bot before
 // serving IPC; the schedule endpoints under test assume that binding exists.
-setScheduleScope('cli_ipc_test_bot001');
+scheduleStore.setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -1661,6 +1672,52 @@ describe('POST /api/session-origin/attest', () => {
       fixture.cleanup();
     }
   }, 5_000);
+});
+
+describe('GET /api/bot-default-oncall — schedule host paths', () => {
+  it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-schedule-cwd-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = join(dir, 'daemon-data');
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        defaultWorkingDir: join(dir, 'session-default'),
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const response = await fetch(`${base}/api/bot-default-oncall`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        scheduleWorkingDir: process.cwd(),
+        schedulePreconditionFileRoot: join(
+          config.session.dataDir,
+          'schedule-preconditions',
+          'trusted-files',
+        ),
+        defaultWorkingDir: join(dir, 'session-default'),
+      });
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(persisted).not.toHaveProperty('scheduleWorkingDir');
+      expect(persisted).not.toHaveProperty('schedulePreconditionFileRoot');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
@@ -4351,9 +4408,789 @@ describe('GET /api/schedules', () => {
       parsed: { display: '10 0,12 * * *' },
     });
   });
+
+  it('fails closed without revealing source material when the protected sidecar is damaged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-damaged-precondition-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_damaged_precondition_test';
+    try {
+      config.session.dataDir = join(dir, 'data');
+      scheduleStore.setScheduleScope(appId);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const createdResponse = await fetch(`${base}/api/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: '损坏门禁测试',
+          schedule: 'every 1h',
+          prompt: '不应执行',
+          workingDir: dir,
+          chatId: 'oc_target',
+          preconditionScript: 'printf 1',
+        }),
+      });
+      const created = (await createdResponse.json()).task;
+      writeFileSync(
+        schedulePreconditionPath(appId, created.id, config.session.dataDir),
+        '{damaged',
+      );
+
+      const listResponse = await fetch(`${base}/api/schedules`);
+      expect(listResponse.status).toBe(200);
+      const listed = (await listResponse.json()).schedules.find((task: any) => task.id === created.id);
+      expect(listed).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: true,
+      });
+      expect(listed).not.toHaveProperty('preconditionSource');
+      expect(listed).not.toHaveProperty('preconditionScript');
+      expect(listed).not.toHaveProperty('preconditionFilePath');
+      expect(listed).not.toHaveProperty('preconditionRef');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('GET /api/schedules/:id/logs', () => {
+  it('is trusted-host only and returns a bounded, sensitive-free page for an owned task', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-run-logs-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_ipc_test_bot001';
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      setLarkAppId(appId);
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      const task = scheduleStore.createTask({
+        id: 'schedule-run-logs-owned',
+        name: '巡检执行日志',
+        schedule: '0 0 * * *',
+        parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
+        prompt: '不得出现在日志响应中的任务提示词',
+        workingDir: '/tmp/private-working-dir',
+        chatId: 'oc_schedule_logs',
+        larkAppId: appId,
+      });
+      appendScheduleRunLog({
+        id: 'run-log-1',
+        taskId: task.id,
+        trigger: 'scheduler',
+        outcome: 'precondition_skipped',
+        precondition: 'skipped',
+        startedAt: '2026-08-31T01:00:00.000Z',
+        finishedAt: '2026-08-31T01:00:00.025Z',
+        durationMs: 25,
+        additionalPrompt: false,
+        errorCode: 'non_zero_exit',
+        error: 'Scheduled task precondition failed with exit code 35',
+        prompt: 'secret prompt',
+        script: 'echo 1',
+        filePath: '/tmp/private.sh',
+      } as any, appId);
+      appendScheduleRunLog({
+        id: 'run-log-2',
+        taskId: task.id,
+        trigger: 'dashboard',
+        outcome: 'model_dispatched',
+        precondition: 'passed',
+        startedAt: '2026-08-31T02:00:00.000Z',
+        finishedAt: '2026-08-31T02:00:00.040Z',
+        durationMs: 40,
+        additionalPrompt: true,
+      }, appId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const routePath = `/api/schedules/${task.id}/logs`;
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const anonymous = await fetch(`${base}${routePath}`);
+      expect(anonymous.status).toBe(401);
+
+      const response = await fetch(`${base}${routePath}`, {
+        headers: trustedHostHeaders('GET', routePath, handle.port),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ total: 2, limit: 50, offset: 0, hasMore: false });
+      expect(body.logs.map((entry: any) => entry.id)).toEqual(['run-log-2', 'run-log-1']);
+      expect(body.logs[0]).toEqual({
+        id: 'run-log-2',
+        taskId: task.id,
+        trigger: 'dashboard',
+        outcome: 'model_dispatched',
+        precondition: 'passed',
+        startedAt: '2026-08-31T02:00:00.000Z',
+        finishedAt: '2026-08-31T02:00:00.040Z',
+        durationMs: 40,
+        additionalPrompt: true,
+      });
+      expect(JSON.stringify(body)).not.toContain('secret prompt');
+      expect(JSON.stringify(body)).not.toContain('echo 1');
+      expect(JSON.stringify(body)).not.toContain('/tmp/private');
+
+      const schedulesPath = '/api/schedules';
+      const schedules = await fetch(`${base}${schedulesPath}`, {
+        headers: trustedHostHeaders('GET', schedulesPath, handle.port),
+      });
+      const scheduleRow = (await schedules.json()).schedules.find((row: any) => row.id === task.id);
+      expect(scheduleRow).toBeDefined();
+      expect(scheduleRow).not.toHaveProperty('logs');
+      expect(scheduleRow).not.toHaveProperty('runLogs');
+
+      const paged = await fetch(`${base}${routePath}?limit=1&offset=1`, {
+        headers: trustedHostHeaders('GET', routePath, handle.port),
+      });
+      expect(paged.status).toBe(200);
+      expect(await paged.json()).toMatchObject({
+        total: 2,
+        limit: 1,
+        offset: 1,
+        hasMore: false,
+        logs: [{
+          id: 'run-log-1',
+          errorCode: 'non_zero_exit',
+          error: 'Scheduled task precondition failed with exit code 35',
+        }],
+      });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      setLarkAppId('');
+      setIpcAuthSecret(null);
+      config.session.dataDir = previousDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns 404 before reading history when the task is missing or belongs to another daemon', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-run-logs-owner-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_ipc_test_bot001';
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      setLarkAppId(appId);
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      const task = scheduleStore.createTask({
+        id: 'schedule-run-logs-owner-check',
+        name: '归属校验',
+        schedule: '0 0 * * *',
+        parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
+        prompt: '检查任务归属',
+        workingDir: '/tmp',
+        chatId: 'oc_schedule_logs_owner',
+        larkAppId: appId,
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const missingPath = '/api/schedules/missing-schedule/logs';
+      const missing = await fetch(`${base}${missingPath}`, {
+        headers: trustedHostHeaders('GET', missingPath, handle.port),
+      });
+      expect(missing.status).toBe(404);
+      expect(await missing.json()).toEqual({ ok: false, error: 'unknown_schedule' });
+
+      const ownerSpy = vi.spyOn(scheduler, 'belongsToOwner').mockReturnValueOnce(false);
+      try {
+        const ownedPath = `/api/schedules/${task.id}/logs`;
+        const wrongOwner = await fetch(`${base}${ownedPath}`, {
+          headers: trustedHostHeaders('GET', ownedPath, handle.port),
+        });
+        expect(wrongOwner.status).toBe(404);
+        expect(await wrongOwner.json()).toEqual({ ok: false, error: 'unknown_schedule' });
+      } finally {
+        ownerSpy.mockRestore();
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      setLarkAppId('');
+      setIpcAuthSecret(null);
+      config.session.dataDir = previousDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the central proxy owner-routed and preserves the complete query string', () => {
+    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+    expect(source).toContain("url.pathname.match(/^\\/api\\/schedules\\/([^/]+)\\/logs$/)");
+    expect(source).toContain('const owner = resolveScheduleOwner(id);');
+    expect(source).toContain('`/api/schedules/${encodeURIComponent(id)}/logs${url.search}`');
+  });
+});
+
+describe('POST /api/schedules/precondition/test', () => {
+  it('is trusted-host only and tests an unsaved draft without touching schedules or logs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-precondition-test-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_precondition_draft_test';
+    const marker = join(dir, 'anonymous-must-not-run');
+    const filePath = join(dir, 'data', 'schedule-preconditions', 'trusted-files', 'guard.sh');
+    const routePath = '/api/schedules/precondition/test';
+    const runNowSpy = vi.spyOn(scheduler, 'runNow');
+    try {
+      config.session.dataDir = join(dir, 'data');
+      ensureSchedulePreconditionRoot(config.session.dataDir);
+      scheduleStore.setScheduleScope(appId);
+      setLarkAppId(appId);
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      writeFileSync(filePath, 'printf 0');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const anonymous = await fetch(`${base}${routePath}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          workingDir: dir,
+          source: { kind: 'inline', script: `touch ${JSON.stringify(marker)}; printf 1` },
+        }),
+      });
+      expect(anonymous.status).toBe(401);
+      expect(existsSync(marker)).toBe(false);
+
+      const requestDraft = async (source: unknown) => fetch(`${base}${routePath}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', routePath, handle!.port),
+        },
+        body: JSON.stringify({ larkAppId: appId, workingDir: dir, source }),
+      });
+
+      const passResponse = await requestDraft({
+        kind: 'inline',
+        script: "printf 1; printf 'draft prompt must stay private' >&3",
+      });
+      expect(passResponse.status).toBe(200);
+      const passText = await passResponse.text();
+      expect(passText).not.toContain('draft prompt must stay private');
+      expect(JSON.parse(passText)).toMatchObject({
+        ok: true,
+        result: 'pass',
+        additionalPrompt: true,
+      });
+      expect(JSON.parse(passText).durationMs).toBeGreaterThanOrEqual(0);
+
+      const skipResponse = await requestDraft({ kind: 'file', path: filePath });
+      expect(skipResponse.status).toBe(200);
+      expect(await skipResponse.json()).toMatchObject({
+        ok: true,
+        result: 'skip',
+        additionalPrompt: false,
+      });
+
+      const errorResponse = await requestDraft({ kind: 'inline', script: 'exit 37' });
+      expect(errorResponse.status).toBe(200);
+      expect(await errorResponse.json()).toMatchObject({
+        ok: false,
+        result: 'error',
+        errorCode: 'non_zero_exit',
+        error: 'Scheduled task precondition failed with exit code 37',
+        additionalPrompt: false,
+      });
+
+      const relativeResponse = await requestDraft({ kind: 'file', path: 'guard.sh' });
+      expect(relativeResponse.status).toBe(400);
+      expect(await relativeResponse.json()).toMatchObject({
+        ok: false,
+        result: 'error',
+        errorCode: 'invalid_path',
+        field: 'source',
+      });
+
+      expect(scheduleStore.listTasks(appId)).toEqual([]);
+      expect(existsSync(scheduleRunLogDirectory(appId))).toBe(false);
+      expect(runNowSpy).not.toHaveBeenCalled();
+    } finally {
+      runNowSpy.mockRestore();
+      if (handle) await handle.close();
+      handle = null;
+      setLarkAppId('');
+      setIpcAuthSecret(null);
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the central proxy management-only and routes by larkAppId without a task id', () => {
+    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+    expect(source).toContain("url.pathname === '/api/schedules/precondition/test'");
+    expect(source).toContain("proxyToDaemon(larkAppId, '/api/schedules/precondition/test'");
+    expect(source).toContain("if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });");
+  });
+});
+
+describe('schedule target cap', () => {
+  const appId = 'cli_schedule_target_cap_test';
+  const sixChats = ['oc_one', 'oc_two', 'oc_three', 'oc_four', 'oc_five', 'oc_six'];
+  const fiveChats = sixChats.slice(0, 5);
+  let dir: string;
+  let previousDataDir: string;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-target-cap-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = join(dir, 'data');
+    scheduleStore.setScheduleScope(appId);
+    setLarkAppId(appId);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    config.session.dataDir = previousDataDir;
+    scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function createBody(chatIds: readonly string[]): Record<string, unknown> {
+    return {
+      name: 'Target cap fixture',
+      schedule: 'every 1h',
+      prompt: 'Do not execute this fixture',
+      workingDir: dir,
+      chatId: chatIds[0],
+      chatIds,
+      preconditionScript: 'printf 1',
+    };
+  }
+
+  it('rejects POST with six targets before writing a task or sidecar', async () => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(createBody(sixChats)),
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: 'too_many_target_chats' });
+    expect(scheduleStore.listTasks(appId)).toEqual([]);
+    expect(existsSync(schedulePreconditionRoot(config.session.dataDir))).toBe(false);
+  });
+
+  it.each([
+    ['five distinct targets', fiveChats],
+    ['five targets after deduplication', [...fiveChats, fiveChats[0]]],
+  ] as const)('accepts POST with %s', async (_label, chatIds) => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(createBody(chatIds)),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.json.task).toMatchObject({ chatId: fiveChats[0], chatIds: fiveChats });
+    expect(scheduleStore.listTasks(appId)).toHaveLength(1);
+    expect(resolveSchedulePrecondition(scheduleStore.getTask(response.json.task.id, appId)!, appId))
+      .toMatchObject({ kind: 'configured', source: { kind: 'inline', script: 'printf 1' } });
+  });
+
+  it('rejects PATCH to six targets without changing task fields or sidecar', async () => {
+    const created = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(createBody(fiveChats)),
+    });
+    expect(created.status).toBe(200);
+    const id = created.json.task.id;
+    const before = structuredClone(scheduleStore.getTask(id, appId));
+    const sidecarPath = schedulePreconditionPath(appId, id, config.session.dataDir);
+    const sidecarBefore = readFileSync(sidecarPath, 'utf8');
+
+    const response = await requestJson(handle!.port, `/api/schedules/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Rejected name',
+        prompt: 'Rejected prompt',
+        chatIds: sixChats,
+        preconditionScript: 'printf 0',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: 'too_many_target_chats' });
+    expect(scheduleStore.getTask(id, appId)).toEqual(before);
+    expect(readFileSync(sidecarPath, 'utf8')).toBe(sidecarBefore);
+  });
+
+  it('allows PATCH of an unchanged legacy six-target binding and reduction to five', async () => {
+    // Loading or restoring existing rows bypasses the configuration-write cap.
+    const legacy = scheduleStore.createTask({
+      id: 'legacy-six-targets',
+      name: 'Legacy target cap fixture',
+      schedule: 'every 1h',
+      parsed: { kind: 'interval', minutes: 60, display: 'every 1h' },
+      prompt: 'Do not execute this fixture',
+      workingDir: dir,
+      chatId: sixChats[0],
+      chatIds: sixChats,
+      larkAppId: appId,
+      executionPosition: 'top-level',
+      scope: 'chat',
+    });
+    const renamed = await requestJson(handle!.port, `/api/schedules/${legacy.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Renamed legacy fixture', chatIds: sixChats }),
+    });
+    expect(renamed.status).toBe(200);
+    expect(renamed.json.task).toMatchObject({ name: 'Renamed legacy fixture', chatIds: sixChats });
+    expect(scheduleStore.getTask(legacy.id, appId)).toMatchObject({
+      name: 'Renamed legacy fixture',
+      chatIds: sixChats,
+    });
+
+    const reduced = await requestJson(handle!.port, `/api/schedules/${legacy.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatIds: fiveChats }),
+    });
+    expect(reduced.status).toBe(200);
+    expect(reduced.json.task).toMatchObject({ name: 'Renamed legacy fixture', chatIds: fiveChats });
+    expect(scheduleStore.getTask(legacy.id, appId)).toMatchObject({
+      name: 'Renamed legacy fixture',
+      chatId: fiveChats[0],
+      chatIds: fiveChats,
+    });
+  });
 });
 
 describe('POST /api/schedules execution position', () => {
+  it('returns protected precondition values to management across create, keep, pause, replace, resume, and clear', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-precondition-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_precondition_test';
+    const preconditionEvents: any[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => {
+      if (event.type === 'schedule.created' || event.type === 'schedule.updated') {
+        preconditionEvents.push(event);
+      }
+    });
+    try {
+      config.session.dataDir = join(dir, 'data');
+      scheduleStore.setScheduleScope(appId);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const createdResponse = await fetch(`${base}/api/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: '带门禁巡检',
+          schedule: 'every 30m',
+          prompt: '检查发布状态',
+          workingDir: dir,
+          chatId: 'oc_target',
+          preconditionScript: 'printf 1',
+        }),
+      });
+      expect(createdResponse.status).toBe(200);
+      const created = (await createdResponse.json()).task;
+      expect(created).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: true,
+        preconditionSource: 'inline',
+        preconditionScript: 'printf 1',
+      });
+      expect(created).not.toHaveProperty('preconditionFilePath');
+      for (const hidden of ['preconditionRef', 'preconditionHash', 'preconditionDefinition']) {
+        expect(created).not.toHaveProperty(hidden);
+      }
+      expect(preconditionEvents.find(event => event.type === 'schedule.created')?.body.schedule)
+        .toMatchObject({
+          preconditionSource: 'inline',
+          preconditionScript: 'printf 1',
+        });
+
+      const taskAfterCreate = scheduleStore.getTask(created.id, appId);
+      expect(taskAfterCreate).toBeDefined();
+      expect(resolveSchedulePrecondition(taskAfterCreate!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: true,
+        source: { kind: 'inline', script: 'printf 1' },
+      });
+
+      // A normal edit sends no precondition mutation. The protected source and
+      // enabled value remain unchanged while its canonical task binding moves.
+      const ordinaryEditResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '带门禁巡检（已编辑）' }),
+      });
+      expect(ordinaryEditResponse.status).toBe(200);
+      expect((await ordinaryEditResponse.json()).task).toMatchObject({
+        name: '带门禁巡检（已编辑）',
+        hasPrecondition: true,
+        preconditionEnabled: true,
+        preconditionSource: 'inline',
+        preconditionScript: 'printf 1',
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: true,
+        source: { kind: 'inline', script: 'printf 1' },
+      });
+
+      // Target groups are editable without changing the owning bot. The
+      // protected precondition must be rebound atomically to the new canonical
+      // task input instead of becoming mismatched.
+      const targetEditResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chatId: 'oc_target',
+          chatIds: ['oc_target', 'oc_second', 'oc_second'],
+        }),
+      });
+      expect(targetEditResponse.status).toBe(200);
+      expect((await targetEditResponse.json()).task).toMatchObject({
+        chatId: 'oc_target',
+        chatIds: ['oc_target', 'oc_second'],
+        hasPrecondition: true,
+      });
+      expect(scheduleStore.getTask(created.id, appId)).toMatchObject({
+        chatId: 'oc_target',
+        chatIds: ['oc_target', 'oc_second'],
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        source: { kind: 'inline', script: 'printf 1' },
+      });
+
+      const filePath = join(schedulePreconditionTrustedFilesRoot(config.session.dataDir), 'check-ready.sh');
+      const outsideFilePath = join(dir, 'scripts', 'check-ready.sh');
+
+      const pausedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: false }),
+      });
+      expect(pausedResponse.status).toBe(200);
+      expect((await pausedResponse.json()).task).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: false,
+        preconditionSource: 'inline',
+        preconditionScript: 'printf 1',
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: false,
+        source: { kind: 'inline', script: 'printf 1' },
+      });
+
+      const sidecarPath = schedulePreconditionPath(appId, created.id, config.session.dataDir);
+      const sidecarBeforeRejectedReplace = readFileSync(sidecarPath, 'utf8');
+      const outsideReplacement = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: outsideFilePath }),
+      });
+      expect(outsideReplacement.status).toBe(400);
+      expect(await outsideReplacement.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+      expect(readFileSync(sidecarPath, 'utf8')).toBe(sidecarBeforeRejectedReplace);
+
+      const replacedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: filePath }),
+      });
+      expect(replacedResponse.status).toBe(200);
+      const replaced = (await replacedResponse.json()).task;
+      // Replacing a source without an enabled field preserves the paused state.
+      expect(replaced).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: false,
+        preconditionSource: 'file',
+        preconditionFilePath: filePath,
+      });
+      expect(replaced).not.toHaveProperty('preconditionScript');
+      expect(replaced).not.toHaveProperty('preconditionRef');
+      expect(preconditionEvents.filter(event =>
+        event.type === 'schedule.updated'
+        && Object.hasOwn(event.body.patch, 'preconditionSource')
+      ).at(-1)?.body.patch).toMatchObject({
+        preconditionSource: 'file',
+        preconditionScript: null,
+        preconditionFilePath: filePath,
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: false,
+        source: { kind: 'file', path: filePath },
+      });
+
+      const listResponse = await fetch(`${base}/api/schedules`);
+      const listed = (await listResponse.json()).schedules.find((task: any) => task.id === created.id);
+      expect(listed).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: false,
+        preconditionSource: 'file',
+        preconditionFilePath: filePath,
+      });
+      expect(JSON.stringify(listed)).not.toContain('printf 1');
+      expect(listed).not.toHaveProperty('preconditionRef');
+
+      const resumedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: true }),
+      });
+      expect(resumedResponse.status).toBe(200);
+      expect((await resumedResponse.json()).task).toMatchObject({
+        hasPrecondition: true,
+        preconditionEnabled: true,
+        preconditionSource: 'file',
+        preconditionFilePath: filePath,
+      });
+
+      const mutuallyExclusive = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          preconditionScript: 'printf 1',
+          preconditionFilePath: filePath,
+        }),
+      });
+      expect(mutuallyExclusive.status).toBe(400);
+      expect(await mutuallyExclusive.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+
+      const relativePath = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: 'scripts/check-ready.sh' }),
+      });
+      expect(relativePath.status).toBe(400);
+      expect(await relativePath.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+
+      const unsupportedTilde = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionFilePath: '~/check-ready.sh' }),
+      });
+      expect(unsupportedTilde.status).toBe(400);
+      expect(await unsupportedTilde.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+
+      const pausedLegacyResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: false }),
+      });
+      expect(pausedLegacyResponse.status).toBe(200);
+      const legacyRecord = JSON.parse(readFileSync(sidecarPath, 'utf8'));
+      legacyRecord.source = { kind: 'file', path: outsideFilePath };
+      writeFileSync(sidecarPath, JSON.stringify(legacyRecord));
+
+      const rejectedLegacyResume = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: true }),
+      });
+      expect(rejectedLegacyResume.status).toBe(400);
+      expect(await rejectedLegacyResume.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(created.id, appId)!, appId)).toMatchObject({
+        kind: 'configured',
+        enabled: false,
+        source: { kind: 'file', path: outsideFilePath },
+      });
+
+      const clearedResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionScript: null }),
+      });
+      expect(clearedResponse.status).toBe(200);
+      const cleared = (await clearedResponse.json()).task;
+      expect(cleared).toMatchObject({ hasPrecondition: false });
+      expect(cleared).not.toHaveProperty('preconditionEnabled');
+      expect(cleared).not.toHaveProperty('preconditionSource');
+      expect(cleared).not.toHaveProperty('preconditionScript');
+      expect(cleared).not.toHaveProperty('preconditionFilePath');
+      expect(preconditionEvents.filter(event =>
+        event.type === 'schedule.updated'
+        && Object.hasOwn(event.body.patch, 'preconditionSource')
+      ).at(-1)?.body.patch).toMatchObject({
+        hasPrecondition: false,
+        preconditionSource: null,
+        preconditionScript: null,
+        preconditionFilePath: null,
+      });
+
+      const toggleMissingResponse = await fetch(`${base}/api/schedules/${created.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ preconditionEnabled: true }),
+      });
+      expect(toggleMissingResponse.status).toBe(400);
+      expect(await toggleMissingResponse.json()).toMatchObject({
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionEnabled',
+      });
+
+      const defaultOffResponse = await fetch(`${base}/api/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: '无门禁巡检',
+          schedule: 'every 1h',
+          prompt: '普通巡检',
+          workingDir: dir,
+          chatId: 'oc_target',
+          preconditionEnabled: false,
+        }),
+      });
+      expect(defaultOffResponse.status).toBe(200);
+      const defaultOff = (await defaultOffResponse.json()).task;
+      expect(defaultOff).toMatchObject({ hasPrecondition: false });
+      expect(defaultOff).not.toHaveProperty('preconditionEnabled');
+      expect(defaultOff).not.toHaveProperty('preconditionSource');
+      expect(defaultOff).not.toHaveProperty('preconditionScript');
+      expect(defaultOff).not.toHaveProperty('preconditionFilePath');
+      expect(resolveSchedulePrecondition(scheduleStore.getTask(defaultOff.id, appId)!, appId))
+        .toEqual({ kind: 'none' });
+    } finally {
+      unsubscribe();
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('accepts fresh-topic execution with a custom title and no retained root', async () => {
     setLarkAppId('cli_schedule_test');
     const addSpy = vi.spyOn(scheduler, 'addTask').mockImplementation((params: any) => ({
@@ -4391,6 +5228,68 @@ describe('POST /api/schedules execution position', () => {
       topicTitle: '每日发布巡检',
     });
     addSpy.mockRestore();
+  });
+
+  it('creates one task with multiple top-level target chats and projects legacy plus array fields', async () => {
+    setLarkAppId('cli_schedule_test');
+    const addSpy = vi.spyOn(scheduler, 'addTask').mockImplementation((params: any) => ({
+      ...params,
+      id: 'multi-chat-1',
+      parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+      enabled: true,
+      createdAt: '2026-09-02T00:00:00.000Z',
+      deliver: 'origin',
+    }));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: '多群巡检',
+        schedule: 'every 30m',
+        prompt: '检查发布状态',
+        chatId: 'oc_first',
+        chatIds: ['oc_first', 'oc_second', 'oc_second'],
+        executionPosition: 'top-level',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(addSpy).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'oc_first',
+      chatIds: ['oc_first', 'oc_second'],
+      executionPosition: 'top-level',
+    }));
+    expect((await res.json()).task).toMatchObject({
+      chatId: 'oc_first',
+      chatIds: ['oc_first', 'oc_second'],
+    });
+    addSpy.mockRestore();
+  });
+
+  it('rejects multiple target chats for an existing-topic execution', async () => {
+    setLarkAppId('cli_schedule_test');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: '错误多话题巡检',
+        schedule: 'every 30m',
+        prompt: '检查发布状态',
+        chatIds: ['oc_first', 'oc_second'],
+        executionPosition: 'topic',
+        rootMessageId: 'om_existing',
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'multiple_chats_topic_unsupported',
+      field: 'chatIds',
+    });
   });
 
   it('accepts fresh-topic + silent as a lazily materialized topic', async () => {

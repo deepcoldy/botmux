@@ -28,6 +28,59 @@
 /schedule 2026-05-01T10:00 ...
 ```
 
+## Bash 前置条件（Dashboard）
+
+需要先检查外部状态、仅在满足条件时调用模型，可以在 Dashboard 新建或编辑定时任务时启用「Bash 前置条件」。关闭开关会停用前置条件，但定时任务仍按原计划执行，已填写的脚本也会保留；清空脚本或文件路径并保存，才会移除配置。
+
+可选择两种配置方式：
+
+- **直接填写 Bash**：脚本内容保存在任务配置中。
+- **Bash 文件路径**：文件必须是 daemon 主机上可读的普通 UTF-8 Bash 文件，并位于 Dashboard 为当前 Bot 显示的 `<dataDir>/schedule-preconditions/trusted-files/` 目录中。页面同时显示可直接填写的完整绝对路径示例。相对路径、使用 `~` 展开的路径、目录本身、目录外文件和任一路径段中的符号链接均会被拒绝。
+
+### 文件路径配置 Demo
+
+假设 Dashboard 为当前 Bot 显示以下内容：
+
+```text
+受信目录：/home/alice/.botmux/data/schedule-preconditions/trusted-files/
+完整示例：/home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh
+```
+
+这是 Linux 示例；实际 `dataDir` 可能不同，请使用 Dashboard 显示的值，不要照抄示例用户名。然后：
+
+1. 在**运行 daemon 的同一台主机**上，将普通 UTF-8 Bash 文件创建或复制到 Dashboard 显示的目录中。该目录由 daemon 创建。
+2. 将完整绝对路径粘贴到「Bash 文件路径」。本例应填写 `/home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh`，不能写成 `~/...`。
+3. 点击「测试前置条件」。测试通过后再保存任务。
+
+`check-ready.sh` 可以从这个最小内容开始：
+
+```bash
+#!/usr/bin/env bash
+# 请替换为 daemon 主机上实际要检查的状态路径
+if test -f /srv/my-service/ready.flag; then
+  printf '1\n'
+else
+  printf '0\n'
+fi
+```
+
+Botmux 会在每次测试和每次定时触发时重新校验并读取该文件；修改文件后无需重新保存任务。
+
+两种配置方式使用同一个执行协议：脚本退出码必须为 `0`，且标准输出去除首尾空白后必须严格等于 `1`，任务才会继续调用模型。输出 `0`、其他内容、空输出或脚本报错都会停止本次任务。
+
+如需给本次模型调用追加 Prompt，将内容写入文件描述符 3（FD 3）：
+
+```bash
+printf '1\n'
+cat >&3 <<'PROMPT'
+部署检查已通过，请结合这一状态继续分析。
+PROMPT
+```
+
+点击「测试前置条件」会在 daemon 主机真实执行当前表单中**尚未保存**的内容，并显示通过、未通过，或完整错误码与退出码。测试不会保存配置、调用模型、写入任务执行日志或计入重复次数；但脚本产生的文件、网络等副作用仍会真实发生。
+
+> **存量配置迁移**：升级前保存在受信目录外的文件路径会继续保留，但启用该前置条件时，测试和定时执行都会 fail closed，不会调用模型。Botmux 不会自动复制文件或修改任务；请手动把文件移入当前 Bot 的受信目录，更新为新的完整绝对路径，测试通过后保存。FD 3 的内容会发送给模型并可能进入会话记录，不要输出密钥或令牌。
+
 ## 每次开新话题
 
 默认每次触发都续在**创建任务的原话题**里。如果想让每次执行都落在同群的一个**全新话题**、起一个独立会话（适合日报这类"每天一篇、各自独立"的任务），有三种写法：
@@ -43,7 +96,7 @@ botmux schedule add "每日17:30" "生成日报" --new-topic
 botmux schedule add "每日17:30" "生成日报" --deliver new-topic
 ```
 
-也可以在 dashboard 的「定时」页用「投递」列的切换按钮，把已有任务在「原话题 / 每次新话题」之间切换。
+也可以在 Dashboard 的「定时任务」页编辑任务，通过「执行位置」切换原话题、群消息顶层或每次新话题。
 
 ## 跟随活跃话题
 

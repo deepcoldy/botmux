@@ -256,6 +256,108 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
   });
 });
 
+describe('bot-facing schedule reads strip all precondition material', () => {
+  const sensitiveFields = [
+    'preconditionSource',
+    'preconditionScript',
+    'preconditionFilePath',
+    'preconditionFile',
+    'preconditionPath',
+    'preconditionDefinition',
+    'preconditionRef',
+    'preconditionHash',
+    'precondition',
+  ] as const;
+
+  function schedule(id: string, larkAppId?: string): Record<string, unknown> {
+    return {
+      id,
+      ...(larkAppId ? { larkAppId } : {}),
+      prompt: `prompt-${id}`,
+      workingDir: `/repos/${id}`,
+      hasPrecondition: true,
+      preconditionEnabled: true,
+      preconditionSource: 'inline',
+      preconditionScript: `echo ${id}`,
+      preconditionFilePath: `/private/${id}.sh`,
+      preconditionFile: `/legacy/${id}.sh`,
+      preconditionPath: `/legacy-path/${id}.sh`,
+      preconditionDefinition: { source: { kind: 'inline', script: `echo ${id}` } },
+      preconditionRef: `ref-${id}`,
+      preconditionHash: `hash-${id}`,
+      precondition: { script: `echo ${id}` },
+    };
+  }
+
+  function assertSafeSchedules(
+    rows: unknown[],
+    expectedIds: string[],
+  ): void {
+    expect(rows.map(row => (row as { id: string }).id).sort()).toEqual(expectedIds.slice().sort());
+    for (const row of rows as Array<Record<string, unknown>>) {
+      for (const field of sensitiveFields) expect(row).not.toHaveProperty(field);
+      expect(row.prompt).toBe(`prompt-${row.id}`);
+      expect(row.workingDir).toBe(`/repos/${row.id}`);
+      expect(row.hasPrecondition).toBe(true);
+      expect(row.preconditionEnabled).toBe(true);
+    }
+  }
+
+  function sensitiveDeps(): {
+    deps: DaemonInternalApiDeps;
+    source: Array<Record<string, unknown>>;
+    before: Array<Record<string, unknown>>;
+  } {
+    const source = [schedule('schA', 'cli_a'), schedule('schB', 'cli_b'), schedule('legacy')];
+    const before = structuredClone(source);
+    return {
+      deps: makeDeps({ getSchedules: () => source }),
+      source,
+      before,
+    };
+  }
+
+  it('schedules-list strips material after per-bot scoping without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list'), '', 'cli_a');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('schedules-list strips material from every global row without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list?scope=global'), '', 'cli_a');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'schB', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('overview-snapshot strips material after per-bot scoping without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot'), '', 'cli_b');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schB', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('overview-snapshot strips material from every global row without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot?scope=global'), '', 'cli_b');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'schB', 'legacy']);
+    expect(source).toEqual(before);
+  });
+});
+
 /** ─── groups-matrix: codex strict per-bot scope (PR3 groups slice 1) ────
  *  Unlike sessions / schedules where a legacy row (no `larkAppId`) is KEPT,
  *  the groups matrix is fail-closed: bots without `larkAppId` are dropped,

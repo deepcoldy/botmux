@@ -110,6 +110,48 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it('keeps daemon host-only roots denied even under broad or nested allows', () => {
+    const root = '/Users/u/.botmux/data/schedule-preconditions';
+    const externalServiceCredential = '/Users/u/.service/credential.json';
+    const p = buildFsPolicy(ctx({
+      workingDir: '/Users/u',
+      hostOnlyDenyPaths: [root],
+      userPaths: {
+        readWrite: [`${root}/nested`],
+        readOnly: [`${root}/inspect`],
+      },
+      readonlyRoots: [`${root}/adapter-view`],
+      serviceCredentialReadOnlyPaths: [
+        `${root}/service-credential.json`,
+        externalServiceCredential,
+      ],
+      mandatoryReadOnlyPaths: [`${root}/late-readonly-carveout`],
+    }));
+
+    expect(accessForPath(p.rules, `${root}/record.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${root}/nested/file`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${root}/service-credential.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, externalServiceCredential).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(externalServiceCredential);
+    expect(p.finalReadOnlyPaths).not.toContain(`${root}/service-credential.json`);
+    expect(p.finalReadOnlyPaths).not.toContain(`${root}/late-readonly-carveout`);
+    expect(p.suppressedHostOnlyPaths).toEqual([
+      `${root}/adapter-view`,
+      `${root}/inspect`,
+      `${root}/late-readonly-carveout`,
+      `${root}/nested`,
+      `${root}/service-credential.json`,
+    ]);
+  });
+
+  it('rejects a sandbox workingDir inside a daemon host-only root', () => {
+    const root = '/Users/u/.botmux/data/schedule-preconditions';
+    expect(() => buildFsPolicy(ctx({
+      workingDir: `${root}/nested`,
+      hostOnlyDenyPaths: [root],
+    }))).toThrow(/workingDir .* daemon-owned host-only root/);
+  });
+
   it('isolates OMP transcripts while keeping shared agent state and only the current sid writable', () => {
     const adapter = createOhMyPiAdapter('/usr/bin/omp');
     const sessionsRoot = '/home/u/.omp/agent/sessions';

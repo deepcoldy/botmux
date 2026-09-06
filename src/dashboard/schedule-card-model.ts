@@ -52,7 +52,7 @@ export interface ScheduleCardTaskInput {
   nextRunAt?: string;
   /** ISO of the last completed run. */
   lastRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   /** Repeat counter shape mirrors `ScheduledTask.repeat` (`src/types.ts:212`):
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
@@ -130,7 +130,7 @@ export interface ScheduleDetailDto {
   nextRuns: string[];
   nextRunAt?: string;
   lastRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   errorIndicator: boolean;
   /** Passthrough of `ScheduledTask.repeat`. */
   repeat?: { times: number | null; completed: number };

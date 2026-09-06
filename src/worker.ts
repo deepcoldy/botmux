@@ -14807,6 +14807,7 @@ async function spawnCli(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
+    const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -15064,6 +15065,7 @@ async function spawnCli(
       userPaths,
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
+      hostOnlyDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
       net: cfg.sandboxNetwork !== false,
@@ -15094,6 +15096,9 @@ async function spawnCli(
     // it's diagnosable rather than a silent hole (codex).
     if (policy.suppressedAuthorityPaths?.length) {
       log(`[file-sandbox] no-transport suppressed ${policy.suppressedAuthorityPaths.length} allow path(s) inside a Feishu-authority root: ${policy.suppressedAuthorityPaths.join(', ')}`);
+    }
+    if (policy.suppressedHostOnlyPaths?.length) {
+      log(`[file-sandbox] suppressed ${policy.suppressedHostOnlyPaths.length} allow path(s) inside daemon-owned host-only roots: ${policy.suppressedHostOnlyPaths.join(', ')}`);
     }
     // Existence-filter only the ALLOW rules (baseline entries are candidates,
     // not guarantees): a non-existent allow path has nothing to expose, and

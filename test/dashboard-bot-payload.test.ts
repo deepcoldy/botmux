@@ -346,6 +346,16 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, { workingDir: 123 }).workingDir).toBeNull();
   });
 
+  it('projects the daemon schedule working directory as a non-empty string or null', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '/srv/botmux' })).toMatchObject({
+      scheduleWorkingDir: '/srv/botmux',
+    });
+    expect(botDefaultsPayload(daemon, {}).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: 123 }).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '   ' }).scheduleWorkingDir).toBeNull();
+  });
+
   it('defaults auto grant request cards on and preserves explicit off', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({

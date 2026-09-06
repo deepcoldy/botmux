@@ -1,13 +1,23 @@
 import { Cron } from 'croner';
+import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
+import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
+import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+export interface ScheduleExecutionContext {
+  runId: string;
+  trigger: 'scheduler' | 'dashboard';
+  startedAt: string;
+}
+
 // Callback set by daemon to execute a scheduled task
-let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
+let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -26,7 +36,10 @@ const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
 const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
 
-function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error' | 'skipped', error?: unknown): void {
+  const chatIds = task.chatIds
+    ? scheduleStore.effectiveScheduleChatIds(task)
+    : [task.chatId];
   emitHookEvent('schedule.fired', {
     id: task.id,
     name: task.name,
@@ -34,6 +47,9 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
     status,
     error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
     chatId: task.chatId,
+    // Preserve the exact legacy hook payload for single-chat tasks while
+    // exposing every independently dispatched target for multi-chat tasks.
+    ...(chatIds.length > 1 ? { chatIds } : {}),
     rootMessageId: task.rootMessageId,
     chatType: task.chatType,
     scope: task.scope,
@@ -42,8 +58,75 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
   });
 }
 
-export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
+export function setExecuteCallback(
+  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>,
+): void {
   executeCallback = cb;
+}
+
+function createExecutionContext(
+  trigger: ScheduleExecutionContext['trigger'],
+  startedAt = new Date().toISOString(),
+): ScheduleExecutionContext {
+  return { runId: randomUUID(), trigger, startedAt };
+}
+
+function cleanupRemovedTaskPrecondition(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeSchedulePrecondition(appId, task.id);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove protected precondition for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskRunLogs(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeScheduleRunLogs(task.id, appId);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove execution logs for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
+  cleanupRemovedTaskPrecondition(task);
+  cleanupRemovedTaskRunLogs(task);
+}
+
+function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
+  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+}
+
+function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPreconditionOutcome | void): void {
+  const status = outcome === 'skipped' ? 'skipped' : 'ok';
+  if (status === 'skipped') {
+    let nextRunAt: string | undefined;
+    if (task.parsed.kind === 'once') {
+      // Keep a one-shot eligible after a skipped check, including runNow,
+      // which clears nextRunAt before dispatch. Do not bring a future plan forward.
+      const scheduledAt = task.nextRunAt ?? task.parsed.runAt;
+      const retryAt = Date.now() + TICK_INTERVAL_MS;
+      nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
+    }
+    scheduleStore.markSkipped(task.id, nextRunAt);
+  } else {
+    scheduleStore.markRun(task.id, true);
+    cleanupIfTaskWasAutoRemoved(task);
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id: task.id, runAt: Date.now(), status },
+  });
+  emitScheduleFiredHook(task, status);
 }
 
 /**
@@ -456,22 +539,17 @@ async function tick(): Promise<void> {
 
     // Execute
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
-    scheduleStore.updateTask(task.id, { lastRunAt: new Date().toISOString() });
+    const executionContext = createExecutionContext('scheduler');
+    scheduleStore.updateTask(task.id, { lastRunAt: executionContext.startedAt });
 
     if (executeCallback) {
       const taskId = task.id;
-      executeCallback(task)
-        .then(() => {
-          scheduleStore.markRun(taskId, true);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: { id: taskId, runAt: Date.now(), status: 'ok' },
-          });
-          emitScheduleFiredHook(task, 'ok');
-        })
+      executeCallback(task, executionContext)
+        .then(outcome => recordDispatchOutcome(task, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
           scheduleStore.markRun(taskId, false, err.message);
+          cleanupIfTaskWasAutoRemoved(task);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -560,12 +638,26 @@ export function stopScheduler(): void {
   logger.info('[scheduler] Stopped');
 }
 
+/** Limit configuration writes, not loading, dispatch or trusted rollback of
+ * legacy tasks. The first chat is the primary target, so order matters. */
+export function assertScheduleChatTargetLimit(chatIds: readonly string[], previous?: readonly string[]): void {
+  if (
+    chatIds.length > 5
+    && (!previous || chatIds.length !== previous.length || chatIds.some((id, index) => id !== previous[index]))
+  ) {
+    throw new Error('too_many_target_chats');
+  }
+}
+
 export function addTask(params: {
+  id?: string;
+  preconditionRef?: string;
   name: string;
   schedule: string;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -590,6 +682,13 @@ export function addTask(params: {
   /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
   followActive?: boolean;
 }): ScheduledTask {
+  const targets = params.chatIds === undefined
+    ? { chatId: params.chatId }
+    : scheduleStore.normalizeScheduleChatTargets({
+        chatId: params.chatId,
+        chatIds: params.chatIds,
+      });
+  assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
@@ -598,7 +697,10 @@ export function addTask(params: {
       : params.scope === 'chat'
         ? 'top-level'
         : params.rootMessageId ? 'topic' : 'top-level');
-  if (executionPosition === 'topic' && !params.rootMessageId) {
+  if (executionPosition === 'topic' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_topic_unsupported');
+  }
+  if (executionPosition === 'topic' && !params.rootMessageId?.trim()) {
     throw new Error('topic_root_required');
   }
   // Following the active topic only makes sense when the task lands in a
@@ -609,12 +711,15 @@ export function addTask(params: {
   const topicTitle = normalizeTopicTitle(params.topicTitle);
   const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
+    id: params.id,
+    preconditionRef: params.preconditionRef,
     name: params.name,
     schedule: params.schedule,
     parsed,
     prompt: params.prompt,
     workingDir: params.workingDir,
-    chatId: params.chatId,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
     rootMessageId: params.rootMessageId,
     scope,
     executionPosition,
@@ -658,7 +763,11 @@ export function resolveTaskExecutionPosition(
 }
 
 export function removeTask(id: string): boolean {
-  return scheduleStore.removeTask(id);
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  const removed = scheduleStore.removeTask(id);
+  if (removed) cleanupRemovedTaskSidecars(task);
+  return removed;
 }
 
 export function enableTask(id: string): boolean {
@@ -702,7 +811,7 @@ export function getNextRun(id: string): Date | null {
 /**
  * Fire a scheduled task immediately. Returns ok=false if id not found or the
  * scheduler hasn't been initialised with an executeCallback yet.  Emits a
- * `schedule.fired` event on completion (success or error).
+ * `schedule.fired` event on completion (success, skip or error).
  */
 export function runNow(id: string): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
@@ -710,27 +819,21 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
-  const nowIso = new Date().toISOString();
-  const next = computeNextRun(task.parsed, nowIso);
+  const executionContext = createExecutionContext('dashboard');
+  const next = computeNextRun(task.parsed, executionContext.startedAt);
   scheduleStore.updateTask(id, {
-    lastRunAt: nowIso,
+    lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
   });
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task)).then(
-    () => {
-      scheduleStore.markRun(task.id, true);
-      dashboardEventBus.publish({
-        type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'ok' },
-      });
-      emitScheduleFiredHook(task, 'ok');
-    },
+  void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
+    outcome => recordDispatchOutcome(task, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
       scheduleStore.markRun(task.id, false, msg);
+      cleanupIfTaskWasAutoRemoved(task);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
@@ -807,7 +910,7 @@ export function toggleDelivery(id: string): {
 
 /**
  * Update editable fields of a scheduled task (name, prompt, schedule, silent,
- * execution position and retained topic root).
+ * execution targets, position and retained topic root).
  * Re-parses the schedule expression and recomputes nextRunAt when the schedule
  * string changes. A legacy `deliver` input is accepted and normalized to
  * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
@@ -826,8 +929,11 @@ export function updateTask(
     rootMessageId?: string;
     topicTitle?: string;
     followActive?: boolean;
+    chatId?: string;
+    chatIds?: readonly string[] | null;
   },
-): { ok: boolean; error?: string } {
+  options: { deferEvent?: boolean } = {},
+): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
@@ -844,8 +950,32 @@ export function updateTask(
     ? 'new-topic'
     : undefined;
   const executionPosition = updates.executionPosition ?? legacyPosition;
-  const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
-  if (executionPosition === 'topic' && !nextRootMessageId) {
+  const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+  let targets: scheduleStore.ScheduleChatTargets;
+  try {
+    targets = targetUpdate
+      ? scheduleStore.normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : { chatId: task.chatId, chatIds: task.chatIds };
+    if (targetUpdate) {
+      assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId], task.chatIds ?? [task.chatId]);
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const finalExecutionPosition = executionPosition ?? resolveTaskExecutionPosition(task);
+  const targetChatIds = targets.chatIds ?? [targets.chatId];
+  if (finalExecutionPosition === 'topic' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_topic_unsupported' };
+  }
+  const primaryChatChanged = targetUpdate && targets.chatId !== task.chatId;
+  const explicitRootMessageId = updates.rootMessageId?.trim();
+  const nextRootMessageId = primaryChatChanged
+    ? explicitRootMessageId
+    : updates.rootMessageId ?? task.rootMessageId;
+  if (finalExecutionPosition === 'topic' && !nextRootMessageId) {
     return { ok: false, error: 'topic_root_required' };
   }
   const nextPosition = executionPosition ?? resolveTaskExecutionPosition(task);
@@ -862,6 +992,14 @@ export function updateTask(
     // there is no topic to follow at top level / new-topic.
     patch.followActive = undefined;
     eventPatch.followActive = false;
+  }
+  if (targetUpdate) {
+    patch.chatId = targets.chatId;
+    patch.chatIds = targets.chatIds;
+    eventPatch.chatId = targets.chatId;
+    // JSON/SSE omit undefined, so null is required to clear a cached prior
+    // multi-chat array when an edit collapses back to one target.
+    eventPatch.chatIds = targets.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) {
     try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
@@ -882,6 +1020,10 @@ export function updateTask(
   } else if (updates.deliver !== undefined) {
     patch.deliver = 'origin';
   }
+  if (primaryChatChanged && finalExecutionPosition !== 'topic' && task.rootMessageId !== undefined) {
+    patch.rootMessageId = undefined;
+    eventPatch.rootMessageId = null;
+  }
 
   // Re-parse + recompute next run when the schedule expression changes.
   if (updates.schedule !== undefined && updates.schedule !== task.schedule) {
@@ -898,11 +1040,23 @@ export function updateTask(
   }
 
   scheduleStore.updateTask(id, patch);
+  const publishedPatch = { ...patch, ...eventPatch };
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  publishScheduleTaskUpdated(id, publishedPatch);
+  return { ok: true };
+}
+
+/** Publish a task patch after a compound configuration operation has fully
+ * committed. Keeping this separate lets the protected-precondition wrapper
+ * roll back its task row without first exposing a transient target change. */
+export function publishScheduleTaskUpdated(
+  id: string,
+  patch: Record<string, unknown>,
+): void {
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch: { ...patch, ...eventPatch } },
+    body: { id, patch },
   });
-  return { ok: true };
 }
 
 /**
@@ -910,9 +1064,7 @@ export function updateTask(
  * drops the row immediately without waiting for the next poll.
  */
 export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
-  const task = scheduleStore.getTask(id);
-  if (!task) return { ok: false, error: 'not_found' };
-  scheduleStore.removeTask(id);
+  if (!removeTask(id)) return { ok: false, error: 'not_found' };
   dashboardEventBus.publish({
     type: 'schedule.deleted',
     body: { id },
