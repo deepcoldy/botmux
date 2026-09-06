@@ -189,7 +189,9 @@ function writeDenial(
 ): void {
   try {
     const name = senderOpenId && botConfig.larkAppId
-      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId)
+      // Brand matters: the lookup checks it, so a Lark-brand bot with the
+      // default 'feishu' finds nothing and the refusal loses the person's name.
+      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId, normalizeBrand(botConfig.brand))
       : undefined;
     // Name the right provider. bytedcli authenticates against ByteCloud, so
     // saying "Feishu authorization" would send the reader to authorize the

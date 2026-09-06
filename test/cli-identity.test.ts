@@ -244,13 +244,28 @@ describe('installLoginShellPathShim', () => {
     expect(resolved).toBe(join(wrapperDir, 'faketool'));
   });
 
-  // Proves the test above is actually testing something: without the shim, the
-  // same login shell picks the real tool.
-  it.each(SHELLS)('without the shim, %s resolves the real tool', shell => {
+  // Proves the test above is actually testing something: without the shim the
+  // wrapper does NOT win.
+  //
+  // Asserting "resolves to realDir" was too strong. botmux's own fleet runs as
+  // root, and this machine's /etc/profile has a root branch that OVERWRITES
+  // PATH with a fixed string — so neither directory survives the login shell
+  // and `command -v` finds nothing at all. The negative control's own premise
+  // fails there, and skipping would switch it off on exactly the machines that
+  // matter most. "The wrapper did not win" holds in both environments and still
+  // catches the regression it exists for: if the shim were unnecessary, the
+  // wrapper would win here and the positive test above would be vacuous.
+  it.each(SHELLS)('without the shim, %s does not resolve the wrapper', shell => {
     const wrapperDir = fakeWrapperDir();
     const realDir = fakeRealDir();
-    const resolved = runLogin(shell, { PATH: loginShellPath(wrapperDir, realDir), HOME: dir });
-    expect(resolved).toBe(join(realDir, 'faketool'));
+    let resolved: string;
+    try {
+      resolved = runLogin(shell, { PATH: loginShellPath(wrapperDir, realDir), HOME: dir });
+    } catch {
+      // command-not-found: the rcfile dropped both dirs. Still a valid negative.
+      resolved = '';
+    }
+    expect(resolved).not.toBe(join(wrapperDir, 'faketool'));
   });
 
   // The user's own startup file must keep working, and must not be able to jump
