@@ -18075,6 +18075,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -19544,6 +19545,7 @@ async function handleThreadReplyAdmitted(
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, anchor, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;

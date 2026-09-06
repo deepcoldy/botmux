@@ -276,3 +276,68 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     expect(msg).toContain('/login');
   });
 });
+
+/**
+ * The readers, not the writer.
+ *
+ * Per-person storage is only half a feature: `/login` writes
+ * `user-token-<app>-<openId>.json`, and every consumer that looks a token up
+ * WITHOUT the openId then finds nothing. The failure is invisible in the worst
+ * way — the person authorizes, is told it worked, and the feature still reports
+ * "not logged in" with no error anywhere.
+ *
+ * It also does not wait for the feature to be switched on. Three of the
+ * affected readers are on the default path, and the trigger is ordinary: the
+ * legacy per-app file keeps working until it expires, so the breakage arrives
+ * the first time someone re-authorizes.
+ *
+ * These tests pin the shape of the contract — a token written the way /login
+ * writes it must be readable by the callers that consume it — rather than
+ * asserting on any one call site's arguments, which a later refactor would
+ * silently drift away from.
+ */
+describe('per-person tokens must be readable by the code that consumes them', () => {
+  beforeEach(() => { files.clear(); vi.unstubAllGlobals(); });
+
+  /** Exactly what a completed /login leaves on disk. */
+  function authorizedAs(openId: string, token = 'TOK') {
+    files.set(perUserPath(APP, openId), tokenFor({
+      access_token: token, appId: APP, brand: 'feishu', openId, userName: '孙晓雪',
+    }));
+  }
+
+  it('finds the token when the reader passes the person', async () => {
+    authorizedAs(ALICE, 'TOK_ALICE');
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBe('TOK_ALICE');
+  });
+
+  // The regression itself. A reader that forgets the openId gets null even
+  // though that exact person just authorized — which is how "/login says OK,
+  // feature still broken" happens.
+  it('finds nothing when the reader omits the person', async () => {
+    authorizedAs(ALICE, 'TOK_ALICE');
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken(APP, 'sec', 'feishu')).toBeNull();
+  });
+
+  it('reports status per person, not per app', async () => {
+    authorizedAs(ALICE);
+    const { getTokenStatus } = await fresh();
+    expect(getTokenStatus(APP, 'feishu', ALICE)).toContain('已登录');
+    // Without the openId the same store reads as empty.
+    expect(getTokenStatus(APP, 'feishu')).toContain('未登录');
+  });
+
+  // The Dashboard feed-group badge reads this. With no owner resolved it asks
+  // with `undefined` and shows "not authorized" to someone who just authorized.
+  it('reports feed-group auth per owner', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK', appId: APP, brand: 'feishu', openId: ALICE,
+      scope: 'im:feed_group_v1:write im:feed_group_v1:read',
+    }));
+    const { getFeedGroupAuthStatus } = await fresh();
+    expect(getFeedGroupAuthStatus(APP, 'feishu', ALICE).authorized).toBe(true);
+    expect(getFeedGroupAuthStatus(APP, 'feishu', undefined).authorized).toBe(false);
+  });
+});

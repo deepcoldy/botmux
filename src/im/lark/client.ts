@@ -1394,13 +1394,17 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Fallback: User Token from botmux OAuth (/login)
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
-  // With trigger-user auth on, use the SENDER's own token: they posted this
-  // attachment, so their credentials are the right ones and the download is
-  // attributed to them. Without a sender (or with the policy off) this keeps the
-  // historical bot-level lookup.
-  const userToken = bot.config.triggerUserAuth?.enabled
-    ? await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId)
-    : await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+  // Use the SENDER's own token: they posted this attachment, so their
+  // credentials are the right ones and the download is attributed to them.
+  //
+  // Not gated on the policy. Tokens are stored per person now, so the old
+  // no-openId lookup finds nothing once someone re-authorizes — they would have
+  // just run /login, be told it succeeded, and still get "no User Token". The
+  // openId is only ever a lookup key here; with the policy off it simply picks
+  // the same person's token it always meant to.
+  const userToken = await resolveUserToken(
+    bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId,
+  );
   if (!userToken) {
     throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +

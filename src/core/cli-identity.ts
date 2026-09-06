@@ -518,26 +518,6 @@ export function installIdentityWrapper(
 /**
  * Git credential helper, so a push is attributed to the person who asked for it.
  *
- * `git` over HTTPS to Codebase authenticates with a Codebase JWT, which is
- * derived from the acting ByteCloud identity. It does not read any of the env
- * vars above, so without this a commit pushed on someone's behalf would carry
- * the machine's identity — and "who opened this MR" is exactly the attribution
- * this feature exists to fix.
- *
- * The script asks the WRAPPED `bytedcli` for the token, which means it inherits
- * the per-turn identity for free: no second credential path to keep in sync, and
- * nothing here needs to know whose turn it is.
- *
- * `GIT_ASKPASS` is called once for the username and once for the password, with
- * the prompt text as $1 — matching on "Username" is git's own contract.
- *
- * Deliberately: the JWT is fetched fresh per invocation and never written to
- * disk, never placed in a URL, and never logged. A JWT embedded in a remote URL
- * would persist in `.git/config` and in any error message git prints.
- */
-/**
- * Git credential helper, so a push is attributed to the person who asked for it.
- *
  * `git` over HTTPS to a Codebase host authenticates with a Codebase JWT, which
  * is derived from the acting ByteCloud identity. It does not read any of the env
  * vars above, so without this a commit pushed on someone's behalf would carry

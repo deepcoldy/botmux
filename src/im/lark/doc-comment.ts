@@ -159,6 +159,10 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
   if (!ref) throw new Error(`无法从「${input.slice(0, 40)}」识别出飞书文档链接或 token`);
 
   if (ref.kind === 'wiki') {
+    // No `fileTokenForIdentity` here, and that is not an oversight: this call
+    // is how the file token is obtained, so there is no subscription to look an
+    // owner up by yet. Resolution runs before any subscription exists (and for
+    // documents that never get one), so it uses the bot's own identity.
     const res = await driveApiCall(larkAppId, {
       method: 'GET',
       path: '/open-apis/wiki/v2/spaces/get_node',
@@ -365,12 +369,18 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   // opt-in would silently fall back to the bot-level token wherever it was
   // forgotten. An explicit `userOpenId` wins; otherwise it comes from the
   // subscription record for this document.
-  const actingUserOpenId = bot.config.triggerUserAuth?.enabled
-    ? (opts.userOpenId ?? subscriptionOwnerOpenId(larkAppId, opts.fileTokenForIdentity))
-    : undefined;
-  const resolveActingUserToken = () => bot.config.triggerUserAuth?.enabled
-    ? resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, actingUserOpenId)
-    : resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+  //
+  // NOT gated on the policy. `ownerOpenId` on the subscription record predates
+  // this feature, and tokens are stored per person regardless of it — so the
+  // ungated branch was a lookup with no key, which returns nothing the moment
+  // the subscriber re-authorizes. Comments then silently degrade to the tenant
+  // identity: the API still answers, so nothing looks broken, and attribution
+  // is quietly wrong. Resolving by owner in both cases is the same behavior the
+  // policy wanted, and strictly better than a keyless lookup when it is off.
+  const actingUserOpenId = opts.userOpenId
+    ?? subscriptionOwnerOpenId(larkAppId, opts.fileTokenForIdentity);
+  const resolveActingUserToken = () =>
+    resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, actingUserOpenId);
 
   // tenant（应用身份）：走 SDK client.request（带 token/缓存/GET 空 body 守卫）。
   const callTenant = async () => {
@@ -671,6 +681,7 @@ async function hydrateTruncatedReplies(
       const res = await driveApiCall(larkAppId, {
         method: 'GET',
         path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(comment.commentId)}/replies`,
+        fileTokenForIdentity: file.fileToken,
         params: {
           file_type: file.fileType,
           user_id_type: 'open_id',

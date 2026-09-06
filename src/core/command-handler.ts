@@ -3066,7 +3066,14 @@ export async function handleCommand(
             loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
           );
         };
-        const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
+        // Keyed by the sender: the authorize link this command hands out is
+        // generated for `message.senderId`, so the token it produces lands in
+        // that person's file. Looking it back up without the openId finds
+        // nothing, and the user loops — authorize, retry, be asked to authorize
+        // again — with no error to explain why.
+        const userTok = await resolveUserToken(
+          subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), message.senderId,
+        );
         if (!userTok) { await replyDocLogin(); break; }
 
         try {
