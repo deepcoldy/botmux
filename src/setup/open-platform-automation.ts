@@ -19,6 +19,7 @@ import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 import { BOTMUX_APP_ICON_BASE64, BOTMUX_APP_ICON_BYTES } from './app-icon-data.js';
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import { logger } from '../utils/logger.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
   parseOnlineVisibility,
@@ -870,6 +871,13 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
       && typeof data.allowRefreshToken === 'boolean'
       && Array.isArray(data.ipWhiteList)
       && Array.isArray(data.safeServerDomain);
+    // 留一条痕迹：这条分支是从「键缺失」**推断**出空集的，依据是服务端
+    // 「空列表就省略该键」的约定，而不是读到了 `[]`。约定一旦变了，这里会
+    // 静默把「其实有内容」当成空集去合并写，且没有回读校验能兜住。日志是
+    // 事后唯一能把线上白名单异常追回到这次推断的线索。
+    if (omittedEmptyList) {
+      logger.info('[open-platform] safe_setting 未返回 redirectURL 键，按服务端约定视为空白名单（其余字段形状已校验）');
+    }
     return omittedEmptyList ? [] : null;
   }
   return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
