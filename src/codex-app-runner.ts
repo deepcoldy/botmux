@@ -52,6 +52,7 @@ interface Args {
   controlSocketPath?: string;
   controlLocatorPath?: string;
   threadId?: string;
+  strictResume?: boolean;
   botName?: string;
   botOpenId?: string;
   locale?: string;
@@ -258,6 +259,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--codex-bin' && val !== undefined) { out.codexBin = val; i++; }
     else if (key === '--cwd' && val !== undefined) { out.cwd = val; i++; }
     else if (key === '--thread-id' && val !== undefined) { out.threadId = val; i++; }
+    else if (key === '--strict-resume') out.strictResume = true;
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
@@ -267,6 +269,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
+  if (out.strictResume && !out.threadId) throw new Error('--strict-resume requires --thread-id');
   if (!controlBootstrapPath) throw new Error(`${CODEX_APP_CONTROL_BOOTSTRAP_ENV} is required`);
   const control = consumeCodexAppControlBootstrap(controlBootstrapPath, out.sessionId);
   out.controlGeneration = control.generation;
@@ -1496,6 +1499,9 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         persistExtendedHistory: true,
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
+      if (args.strictResume && resumedThreadId !== threadId) {
+        throw new Error(`Strict resume expected thread ${threadId}, received ${resumedThreadId}`);
+      }
       threadId = resumedThreadId;
       threadReady = true;
       emitMarker('thread', { threadId: resumedThreadId });
@@ -1503,9 +1509,10 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     } catch (err: any) {
       // A transport error or timeout is an ambiguous acceptance boundary. It
       // must never fork history by silently creating a fresh thread. Only an
-      // explicit app-server "missing thread" rejection permits fallback.
+      // explicit app-server "missing thread" rejection permits normal fallback;
+      // maintenance resumes must preserve the original thread in every case.
       if (isActiveWriterConflict(err)) throw new CodexAppActiveWriterError(threadId, err);
-      if (!isExplicitMissingThread(err)) throw err;
+      if (args.strictResume || !isExplicitMissingThread(err)) throw err;
       writeLine(`[codex-app] resume failed, starting a fresh thread: ${err?.message ?? err}`);
       threadId = undefined;
       threadReady = false;

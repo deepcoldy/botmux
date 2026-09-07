@@ -131,6 +131,9 @@ export interface CliAdapter {
     workingDir?: string;
     /** CLI-native session id used for resume when it differs from botmux's session id. */
     resumeSessionId?: string;
+    /** Maintenance resume with no new input: suppress automatic recap/inference
+     *  and require the original thread where the adapter supports strict resume. */
+    quietResume?: boolean;
     /** When true, resume the `resumeSessionId` transcript but write forward into a
      *  NEW CLI-native session id instead of the resumed one, leaving the source
      *  transcript untouched — the native "fork/branch a session" primitive

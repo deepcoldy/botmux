@@ -572,6 +572,22 @@ describe('codex buildArgs', () => {
     expect(configIdx).toBeLessThan(args.indexOf('codex-session-id'));
   });
 
+  it('disables automatic recap for a quiet resume without adding a prompt', () => {
+    const normal = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing' });
+    const quiet = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing', quietResume: true });
+    expect(normal).not.toContain('tui.auto_recap=false');
+    expect(quiet).toEqual([...normal.slice(0, -1), '-c', 'tui.auto_recap=false', 'codex-existing']);
+    expect(adapter.buildArgs({ sessionId: 'sess-quiet', resume: false, quietResume: true })).not.toContain('tui.auto_recap=false');
+  });
+
+  it('also suppresses automatic recap when quietly attaching the RPC viewer', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-quiet-rpc', resume: true, quietResume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9933', remoteThreadId: 'thread-existing',
+    });
+    expect(args.slice(-3)).toEqual(['-c', 'tui.auto_recap=false', 'thread-existing']);
+  });
+
   it('passes configured model with --model', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, model: 'gpt-5-codex' });
     const idx = args.indexOf('--model');
@@ -612,6 +628,13 @@ describe('codex-app buildArgs', () => {
     });
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
+    expect(args).not.toContain('--strict-resume');
+  });
+
+  it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
+    const normal = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123' });
+    const quiet = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123', quietResume: true });
+    expect(quiet).toEqual([...normal, '--strict-resume']);
   });
 
   it('canonicalizes a symlinked codex so --codex-bin matches the sandbox-authorized path', () => {

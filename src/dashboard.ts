@@ -993,6 +993,7 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1594,6 +1595,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions !== false,
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     codexNotifier: {

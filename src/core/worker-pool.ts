@@ -12109,6 +12109,19 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'cli_runtime_version': {
+        if (!ownsLifecycleMutation()) break;
+        ds.cliVersion = msg.version;
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: {
+            sessionId: ds.session.sessionId,
+            patch: { cliVersion: msg.version },
+          },
+        });
+        break;
+      }
+
       case 'runner_build_ready': {
         const identity = runtimeBuildIdentity();
         if (

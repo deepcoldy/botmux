@@ -327,6 +327,9 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Default ON; read live so a Dashboard change gates the next session upgrade
+  // without restarting daemons or changing the current turn.
+  get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions !== false; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without

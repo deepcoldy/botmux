@@ -1440,6 +1440,7 @@ export type WorkerToDaemon =
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
   | { type: 'prompt_ready' }
+  | { type: 'cli_runtime_version'; version: string }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';

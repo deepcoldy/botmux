@@ -282,6 +282,10 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Automatically replace outdated Codex session processes when safely idle
+   *  and resume the same thread without sending a new prompt. Default ON;
+   *  read live so an explicit false stops scheduling upgrades without restart. */
+  autoUpgradeCodexSessions?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -433,6 +437,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.

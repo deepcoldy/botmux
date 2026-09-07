@@ -2163,6 +2163,106 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('strictly resumes the original thread to ready with no input, inference request, or usage output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-quiet-resume-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex, dir, logPath, '0.153.4', 'success', control.bootstrap.path,
+      {
+        threadId: 'thread-existing',
+        extraArgs: ['--strict-resume'],
+        // Any accidental turn would produce a usage-bearing final in this fixture.
+        env: { FAKE_TOKEN_USAGE: '1' },
+      },
+    );
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      // Observe the ready runner without sending even an empty input record.
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 150));
+      const requests = readRequests(logPath);
+      expect(requests.filter(request => request.method === 'thread/resume')).toEqual([
+        expect.objectContaining({ params: expect.objectContaining({ threadId: 'thread-existing' }) }),
+      ]);
+      expect(requests.filter(request => ['thread/start', 'turn/start', 'turn/steer'].includes(request.method))).toEqual([]);
+      expect(control.markers.filter(marker => marker.kind === 'thread')).toEqual([
+        { kind: 'thread', payload: { threadId: 'thread-existing' } },
+      ]);
+      expect(control.states).toHaveLength(1);
+      expect(control.activities).toEqual([]);
+      expect(control.finals).toEqual([]);
+      expect(control.markers.some(marker => 'usage' in marker.payload || 'tokenUsage' in marker.payload)).toBe(false);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { behavior: 'resume-not-found', threadId: 'thread-existing', error: 'not found', exitCode: 1 },
+    { behavior: 'resume-different-thread', threadId: 'thread-existing', error: 'Strict resume expected thread thread-existing, received thread-unexpected', exitCode: 1 },
+    { behavior: 'success', threadId: undefined, error: '--strict-resume requires --thread-id', exitCode: 2 },
+  ])('strict resume fails closed for $behavior / $threadId', async ({ behavior, threadId, error, exitCode }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-strict-resume-rejection-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex, dir, logPath, '0.153.4', behavior, control.bootstrap.path,
+      { threadId, extraArgs: ['--strict-resume'] },
+    );
+    try {
+      const actualExitCode = await new Promise<number | null>(resolvePromise => harness.child.once('exit', resolvePromise));
+      const requests = readRequests(logPath);
+      expect(actualExitCode).toBe(exitCode);
+      expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(threadId ? 1 : 0);
+      expect(requests.filter(request => ['thread/start', 'turn/start'].includes(request.method))).toEqual([]);
+      expect(control.states).toEqual([]);
+      expect(control.finals).toEqual([]);
+      expect(harness.stdout).not.toContain('Codex App connected.');
+      expect(harness.stderr).toContain(error);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the normal missing-thread recovery when strict resume is not requested', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-normal-resume-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex, dir, logPath, '0.153.4', 'resume-not-found', control.bootstrap.path,
+      { threadId: 'thread-missing' },
+    );
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      const requests = readRequests(logPath);
+      expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(1);
+      expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(1);
+      expect(requests.filter(request => request.method === 'turn/start')).toEqual([]);
+      expect(control.markers).toContainEqual({ kind: 'thread', payload: { threadId: 'thread-fake' } });
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('does not turn an ambiguous resume timeout into a fresh thread', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-resume-timeout-'));
     const fakeCodex = join(dir, 'fake-codex');
