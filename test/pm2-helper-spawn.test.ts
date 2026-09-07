@@ -100,4 +100,24 @@ describe('PM2 helper spawn resolution', () => {
       ],
     });
   });
+
+  it('runs TypeScript helpers directly under Bun source execution', () => {
+    const pkgRoot = tmpRoot();
+    const spawn = buildPm2HelperSpawn({
+      pkgRoot,
+      clientName: 'pm2-readonly-client',
+      clientSubcommand: PM2_READONLY_CLIENT_SUBCOMMAND,
+      clientArgs: ['jlist'],
+      runningFromDist: false,
+      standalone: false,
+      bunRuntime: true,
+    });
+
+    expect(spawn).toEqual({
+      command: process.execPath,
+      args: [join(pkgRoot, 'src', 'cli', 'pm2-readonly-client.ts'), 'jlist'],
+    });
+    expect(spawn.args).not.toContain('--import');
+    expect(spawn.args).not.toContain('tsx');
+  });
 });
