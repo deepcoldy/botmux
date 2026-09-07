@@ -7,6 +7,11 @@
 // Sharding only slices the file list (sha1 of the path, then a contiguous
 // range) — it does not change isolate/forks. A mid-file crash still shows
 // `Test Files … failed` and is NOT retried.
+//
+// The retry reruns the whole shard (~400 files), not "the failed file":
+// this flake class has zero failed files (that's the predicate). A
+// failed-file rerun would have nothing to run. Worst measured ~7m23s;
+// the job timeout is 20m.
 
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';

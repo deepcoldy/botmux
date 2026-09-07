@@ -28,4 +28,17 @@ describe('isWorkerExitAfterAllFilesPassed', () => {
     expect(isWorkerExitAfterAllFilesPassed(' Test Files  10 passed (10)\n')).toBe(false);
     expect(isWorkerExitAfterAllFilesPassed('Worker exited unexpectedly\nno summary\n')).toBe(false);
   });
+
+  // `passed` is load-bearing. Dropping it makes these two summaries flip
+  // false → true (measured): a shard that ran zero cases would be retried.
+  it('does not retry worker-exit when the shard ran no passing files', () => {
+    expect(isWorkerExitAfterAllFilesPassed([
+      'Error: Worker exited unexpectedly',
+      ' Test Files  no tests',
+    ].join('\n'))).toBe(false);
+    expect(isWorkerExitAfterAllFilesPassed([
+      'Error: Worker exited unexpectedly',
+      ' Test Files  3 skipped (3)',
+    ].join('\n'))).toBe(false);
+  });
 });
