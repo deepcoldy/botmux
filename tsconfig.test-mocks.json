@@ -10,7 +10,6 @@
     "test/ensure-herdr-integrations.test.ts",
     "test/hermes-transcript.test.ts",
     "test/mtr-transcript.test.ts",
-    "test/plugin-pm2-env.test.ts",
     "test/tmux-pipe-backend.test.ts",
     "test/transient-snapshot.test.ts",
     "test/vc-agent-polling-source.test.ts"
