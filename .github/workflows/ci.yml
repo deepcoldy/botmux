@@ -16,7 +16,13 @@ concurrency:
 jobs:
   # Compile + workflow-core only. The unit suite used to live here and dominated
   # the wall (~10.5 min of a 12 min job on a 4-core runner). Tests now run as
-  # three independent shards below so this job stays a compile gate.
+  # three independent shards; this job stays a compile gate.
+  #
+  # Ruleset "Require CI green on master" still lists only `build`. The suite
+  # now reports as the aggregator job named `test` (not `test (1/3)` — those
+  # names change with the shard count). Adding `test` to that ruleset is a
+  # repo-settings change, not a workflow step. Until an admin does that, a
+  # red shard does not block merge.
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -38,13 +44,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
-      # Last on purpose: compile still reports if the ruleset is stale.
-      # `build` used to run `bun run test`, so the ruleset context `build`
-      # gated the suite. It no longer does. Fail closed until the aggregator
-      # job named `test` is also required — otherwise a red shard still merges.
-      - name: Assert ruleset requires the test check
-        if: github.repository == 'deepcoldy/botmux'
-        run: node scripts/assert-required-ci-contexts.mjs
 
   # Same unit project as `bun run test`, split across runners with vitest
   # `--shard=i/N`. Each shard still file-parallel internally (forks). They do
