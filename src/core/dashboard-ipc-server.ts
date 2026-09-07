@@ -296,6 +296,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -2070,7 +2071,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const trigger = proactive ? 'ai_proactive' : 'user_explicit';
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
   await chatRenameSerialQueue.run(cooldownKey, async () => {
-    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+    const response = await executeChatRename({
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      name: normalized.name,
+      trigger,
+      sessionId: ds.session.sessionId,
+      botOpenId: getBotOpenId(ds.larkAppId),
       beforeUpdate: proactive
         ? () => {
             const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
@@ -2079,43 +2086,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
               : { ...cooldown, error: 'rate_limited' as const };
           }
         : undefined,
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
     });
-    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
-    if (!result.ok) {
-      const status = result.error === 'bot_not_in_chat' ? 403
-        : result.error === 'permission_denied' ? 403
-          : result.error === 'rate_limited' ? 429
-            : 502;
-      logger.warn(
-        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
-        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
-      );
-      return jsonRes(res, status, result);
+    if (proactive && response.body.ok && response.body.changed) {
+      proactiveChatRenameCooldown.record(cooldownKey);
     }
-    if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
-      // FR-7: the Lark write already succeeded, so a local cache-refresh
-      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
-      // outcome into an HTTP 500 — best-effort per session, warn and keep the
-      // rename a success. Catch per-session so one bad write can't skip the rest.
-      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-        if (active.chatId !== ds.chatId) continue;
-        active.session.chatDisplayName = result.newName;
-        try {
-          sessionStore.updateSession(active.session);
-        } catch (e) {
-          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      logger.info(
-        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
-      );
-    }
-    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+    return jsonRes(res, response.status, response.body);
   });
 });
 
@@ -4090,6 +4070,40 @@ ipcRoute('GET', '/api/groups/:chatId/membership', async (_req, res, p) => {
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
+});
+
+/** Host-only rename through this daemon's exact bot identity. */
+ipcRoute('PUT', '/api/groups/:chatId/name', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some(key => key !== 'name')) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  }
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const larkAppId = cachedLarkAppId;
+  await chatRenameSerialQueue.run(`${larkAppId}:${p.chatId}`, async () => {
+    const response = await executeChatRename({
+      larkAppId,
+      chatId: p.chatId,
+      name: normalized.name,
+      trigger: 'host_api',
+      botOpenId: getBotOpenId(larkAppId),
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
+    });
+    return jsonRes(res, response.status, response.body);
+  });
 });
 
 ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {

@@ -366,7 +366,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // Region-scoped per route (NOT file-wide count): each write route's body
     // must call the gate, so deleting one seam fails.
     const routes: Array<[string, string, string]> = [
-      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
+      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'executeChatRename('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
       ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'sendSessionOwnerThreadNotification('],
     ];
