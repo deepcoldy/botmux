@@ -895,7 +895,7 @@ export function buildCardBodyElements(
   const layoutBudget = { promotedHeadings: 0 };
   for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
-    else if (seg.type === 'img') elements.push(singleImgElement(seg.key, imageMode, seg.alt));
+    else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
     else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
@@ -1005,9 +1005,34 @@ function buildMarkdownElements(
   return elements;
 }
 
-/** A single uploaded image; full-width by default for compatibility. */
-function singleImgElement(imgKey: string, mode = 'fit_horizontal', alt = ''): any {
-  return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt }, mode, preview: true };
+// Existing multi-image rows retain their legacy payload for compatibility.
+function singleImgElement(imgKey: string): any {
+  return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/** Botmux width presets, not Feishu's square/cropping `size` presets. */
+function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const img = {
+    tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
+    scale_type: mode === 'crop_center' ? 'crop_center' : 'fit_horizontal',
+    ...(mode === 'crop_center' ? { size: 'stretch' } : {}),
+    preview: true,
+  };
+  const weights: Record<string, [number, number]> = {
+    large: [3, 1], medium: [1, 1], small: [1, 2], tiny: [1, 3],
+  };
+  const ratio = weights[mode];
+  if (!ratio) return img;
+  // `none` preserves the ratio on narrow screens too. The second column is
+  // intentionally empty; the image fits its column without cropping or a
+  // fixed height. `size` only applies to crop modes in card schema 2.0.
+  return {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
+    columns: [
+      { tag: 'column', width: 'weighted', weight: ratio[0], elements: [img] },
+      { tag: 'column', width: 'weighted', weight: ratio[1], elements: [] },
+    ],
+  };
 }
 
 /**
@@ -1134,7 +1159,7 @@ export function buildImageCardElements(
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode?: string,
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>

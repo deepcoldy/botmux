@@ -1361,10 +1361,27 @@ describe('buildCardBodyElements image rows', () => {
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
-  it.each(['crop_center', 'large', 'medium', 'small', 'tiny'])('renders standalone uploads with mode %s', mode => {
-    const out = buildImageCardElements('截图', [K[0]], undefined, undefined, mode);
-    expect(out.find(e => e.tag === 'img')).toMatchObject({ img_key: K[0], mode, preview: true });
-    expect(mdElements(out).map(e => e.content).join('')).toBe('截图');
+  it.each([
+    ['large', 3, 1], ['medium', 1, 1], ['small', 1, 2], ['tiny', 1, 3],
+  ])('fits the whole image in a proportional column: %s', (mode, imageWeight, spacerWeight) => {
+    for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
+      const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
+      const row = out.find(e => e.tag === 'column_set');
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px', columns: [
+        { width: 'weighted', weight: imageWeight }, { width: 'weighted', weight: spacerWeight, elements: [] },
+      ] });
+      const img = row.columns[0].elements[0];
+      expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
+      expect(img).not.toHaveProperty('mode');
+      expect(img).not.toHaveProperty('size');
+      expect(img).not.toHaveProperty('custom_width');
+    }
+  });
+
+  it('keeps explicit cropping separate from proportional width presets', () => {
+    expect(buildImageCardElements('', [K[0]], undefined, undefined, 'crop_center')).toEqual([
+      { tag: 'img', img_key: K[0], alt: { tag: 'plain_text', content: '' }, scale_type: 'crop_center', size: 'stretch', preview: true },
+    ]);
   });
 
   it('keeps the default output identical, including explicit fit_horizontal', () => {
@@ -1375,11 +1392,10 @@ describe('buildImageCardElements', () => {
 
   it('sizes standalone placeholders and trailing images without resizing a grid', () => {
     const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
-    expect(out.filter(e => e.tag === 'img')).toMatchObject([
-      { img_key: K[0], mode: 'tiny', alt: { content: '预览' } },
-      { img_key: K[3], mode: 'tiny' },
-    ]);
-    expect(out.find(e => e.tag === 'column_set').columns.every((c: any) => c.elements[0].mode === 'fit_horizontal')).toBe(true);
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows[0].columns[0].elements[0]).toMatchObject({ img_key: K[0], scale_type: 'fit_horizontal', alt: { content: '预览' } });
+    expect(rows[2].columns[0].elements[0]).toMatchObject({ img_key: K[3], scale_type: 'fit_horizontal' });
+    expect(rows[1]).toEqual(buildImageCardElements('![](img:0,1)', [K[1], K[2]])[0]);
   });
 
   it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
