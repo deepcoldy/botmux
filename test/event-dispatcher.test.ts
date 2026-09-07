@@ -5583,6 +5583,7 @@ describe('managed Agent clone owner boundary', () => {
       'chatReplyModes',
       'chatFeedbackPolicies',
       'noCardChats',
+      'quotaFallbackBot',
       'activationPending',
       'activationDeactivating',
       'activationStarting',

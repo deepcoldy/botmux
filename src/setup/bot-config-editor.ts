@@ -442,7 +442,8 @@ export function parseBotSelection(
  *    chat_id 是租户级共享的，把它们带进新应用既无意义（多为死条目），又会
  *    产生意外行为——例如 `oncallChats` 让新 Bot 在源绑定过的群里直接被
  *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
- *    绑定被误判成「已花掉」而不触发。
+ *    绑定被误判成「已花掉」而不触发。`quotaFallbackBot` 也是源 Bot 的交接
+ *    拓扑；复制到目标 Bot 可能变成自指或错误链路，必须由目标单独配置。
  *
  * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
  * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
@@ -463,6 +464,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'chatReplyModes',
   'chatFeedbackPolicies',
   'noCardChats',
+  'quotaFallbackBot',
   'activationPending',
   'activationDeactivating',
   'activationStarting',

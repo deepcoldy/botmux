@@ -114,8 +114,6 @@ function targetDeps(overrides: Partial<QuotaFallbackTargetDeps> = {}): QuotaFall
   return {
     isLocalConfigured: vi.fn(() => false),
     resolveLocal: vi.fn(async () => ({ ok: false as const, detail: 'not local' })),
-    listTrustedTeamBots: vi.fn(async () => []),
-    listLiveChatBots: vi.fn(async () => []),
     ...overrides,
   };
 }
@@ -128,7 +126,6 @@ describe('quota fallback target resolution', () => {
     });
     await expect(resolveQuotaFallbackTarget('cli_source', 'oc_chat', 'cli_target', deps))
       .resolves.toEqual({ ok: true, openId: 'ou_target', source: 'local-peer' });
-    expect(deps.listTrustedTeamBots).not.toHaveBeenCalled();
   });
 
   it('fails local membership / ambiguity errors closed without a text fallback', async () => {
@@ -140,58 +137,25 @@ describe('quota fallback target resolution', () => {
       .resolves.toMatchObject({ ok: false, reason: 'local_resolution_failed' });
   });
 
-  it('binds a trusted remote team app by one unique live roster name', async () => {
-    const deps = targetDeps({
-      listTrustedTeamBots: vi.fn(async () => [
-        { larkAppId: 'cli_source', botName: 'Primary' },
-        { larkAppId: 'cli_target', botName: 'Backup' },
-      ]),
-      listLiveChatBots: vi.fn(async () => [
-        { openId: 'ou_primary', displayName: 'Primary' },
-        { openId: 'ou_backup', displayName: 'Backup' },
-      ]),
-    });
+  it('fails a remote target closed even when an unrelated live bot has the same display name', async () => {
+    const listTrustedTeamBots = vi.fn(async () => [
+      { larkAppId: 'cli_target', botName: 'Backup' },
+    ]);
+    const listLiveChatBots = vi.fn(async () => [
+      { openId: 'ou_IMPOSTOR', displayName: 'Backup' },
+    ]);
+    const deps = {
+      isLocalConfigured: vi.fn(() => false),
+      resolveLocal: vi.fn(async () => ({ ok: false as const, detail: 'not local' })),
+      // Keep the old remote inputs in the fixture so this exact exploit stays
+      // pinned: neither a trusted team row nor a same-name live row may be used.
+      listTrustedTeamBots,
+      listLiveChatBots,
+    };
     await expect(resolveQuotaFallbackTarget('cli_source', 'oc_chat', 'cli_target', deps))
-      .resolves.toEqual({ ok: true, openId: 'ou_backup', name: 'Backup', source: 'team' });
-  });
-
-  it.each([
-    {
-      name: 'untrusted target',
-      team: [],
-      live: [{ openId: 'ou_backup', displayName: 'Backup' }],
-      reason: 'untrusted_target',
-    },
-    {
-      name: 'target absent from current chat',
-      team: [{ larkAppId: 'cli_target', botName: 'Backup' }],
-      live: [],
-      reason: 'target_not_in_chat',
-    },
-    {
-      name: 'ambiguous trusted name',
-      team: [
-        { larkAppId: 'cli_target', botName: 'Backup' },
-        { larkAppId: 'cli_other', botName: 'Backup' },
-      ],
-      live: [{ openId: 'ou_backup', displayName: 'Backup' }],
-      reason: 'ambiguous_target',
-    },
-    {
-      name: 'ambiguous live rows',
-      team: [{ larkAppId: 'cli_target', botName: 'Backup' }],
-      live: [
-        { openId: 'ou_backup_a', displayName: 'Backup' },
-        { openId: 'ou_backup_b', displayName: 'Backup' },
-      ],
-      reason: 'ambiguous_target',
-    },
-  ])('rejects $name', async ({ team, live, reason }) => {
-    const deps = targetDeps({
-      listTrustedTeamBots: vi.fn(async () => team),
-      listLiveChatBots: vi.fn(async () => live),
-    });
-    await expect(resolveQuotaFallbackTarget('cli_source', 'oc_chat', 'cli_target', deps))
-      .resolves.toMatchObject({ ok: false, reason });
+      .resolves.toEqual({ ok: false, reason: 'target_not_local' });
+    expect(deps.resolveLocal).not.toHaveBeenCalled();
+    expect(listTrustedTeamBots).not.toHaveBeenCalled();
+    expect(listLiveChatBots).not.toHaveBeenCalled();
   });
 });

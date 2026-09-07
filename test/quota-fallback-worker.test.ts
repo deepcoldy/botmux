@@ -11,7 +11,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   resolveCurrent: vi.fn(),
-  listCurrent: vi.fn(),
   updateMessage: vi.fn(),
   deleteMessage: vi.fn(),
 }));
@@ -36,7 +35,6 @@ vi.mock('../src/im/lark/client.js', async () => {
   return {
     ...actual,
     resolveCurrentChatBotOpenIdsByLarkAppIds: mocks.resolveCurrent,
-    listCurrentChatBotMembers: mocks.listCurrent,
     updateMessage: mocks.updateMessage,
     deleteMessage: mocks.deleteMessage,
   };
@@ -149,7 +147,6 @@ describe('daemon quota fallback handoff', () => {
       ok: true,
       mappings: [{ larkAppId: TARGET, subjectOpenId: TARGET_OPEN_ID }],
     });
-    mocks.listCurrent.mockResolvedValue([]);
     mocks.updateMessage.mockResolvedValue('ok');
     mocks.deleteMessage.mockResolvedValue('ok');
   });

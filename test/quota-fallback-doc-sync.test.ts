@@ -19,6 +19,8 @@ describe('quotaFallbackBot public documentation', () => {
     }
     expect(zh).toContain('不要配置或复制 `ou_xxx`');
     expect(en).toContain('Never configure or copy an `ou_xxx`');
+    expect(zh).toContain('跨部署 / 团队目录目标暂不支持');
+    expect(en).toContain('Cross-deployment/team-directory targets are not supported yet');
     expect(zh).toContain('同一个限额 episode 最多尝试一次');
     expect(en).toContain('A limit episode is attempted at most once');
     expect(zh).toContain('不会继续级联');

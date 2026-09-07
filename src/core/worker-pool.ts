@@ -30,7 +30,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, listCurrentChatBotMembers, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -488,7 +488,6 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
-import { fetchTeamBotDirectory } from '../services/team-bot-directory.js';
 import {
   quotaFallbackTurnOrigin,
   resolveQuotaFallbackTarget,
@@ -2004,8 +2003,7 @@ function isConfiguredLarkBot(appId: string): boolean {
 
 /** Resolve the configured stable target App ID into one live mention handle.
  * The strict local-peer path proves app identity + current membership. Remote
- * peers must instead be present in the trusted team directory and bind by a
- * unique team name to one current live roster row. */
+ * peers fail closed until an equivalent identity proof exists. */
 async function resolveQuotaFallbackForSession(
   ds: DaemonSession,
   targetAppId: string,
@@ -2026,8 +2024,6 @@ async function resolveQuotaFallbackForSession(
         ? { ok: true as const, openId: mapping.subjectOpenId }
         : { ok: false as const, detail: 'strict resolver returned no target mapping' };
     },
-    listTrustedTeamBots: async () => fetchTeamBotDirectory(config.session.dataDir),
-    listLiveChatBots: listCurrentChatBotMembers,
   });
 }
 

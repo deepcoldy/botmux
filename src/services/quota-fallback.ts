@@ -118,16 +118,13 @@ export function quotaFallbackTurnOrigin(
 }
 
 export type QuotaFallbackTargetResolution =
-  | { ok: true; openId: string; name?: string; source: 'local-peer' | 'team' }
+  | { ok: true; openId: string; source: 'local-peer' }
   | {
       ok: false;
       reason:
         | 'self_target'
         | 'local_resolution_failed'
-        | 'untrusted_target'
-        | 'ambiguous_target'
-        | 'target_not_in_chat'
-        | 'live_membership_unavailable';
+        | 'target_not_local';
       detail?: string;
     };
 
@@ -138,18 +135,14 @@ export interface QuotaFallbackTargetDeps {
     chatId: string,
     targetAppId: string,
   ): Promise<{ ok: true; openId: string } | { ok: false; detail?: string }>;
-  listTrustedTeamBots(): Promise<Array<{ larkAppId: string; botName: string }>>;
-  listLiveChatBots(
-    receiverAppId: string,
-    chatId: string,
-  ): Promise<Array<{ openId: string; displayName: string }>>;
 }
 
 /**
  * Bind a stable target app id to one live, receiver-scoped mention handle.
- * Local peers use the existing authorization-grade app-id resolver. Remote
- * targets must be present in the trusted team directory and bind by a globally
- * unique team name to exactly one current live chat row.
+ * Only local peers are supported: the existing authorization-grade resolver
+ * proves both the target application identity and its current chat membership.
+ * A remote/team entry cannot provide an equivalent app-id-to-open-id proof, so
+ * it must fail closed instead of binding an untrusted live row by display name.
  */
 export async function resolveQuotaFallbackTarget(
   sourceAppId: string,
@@ -159,58 +152,24 @@ export async function resolveQuotaFallbackTarget(
 ): Promise<QuotaFallbackTargetResolution> {
   if (sourceAppId === targetAppId) return { ok: false, reason: 'self_target' };
 
-  if (deps.isLocalConfigured(targetAppId)) {
-    try {
-      const resolved = await deps.resolveLocal(sourceAppId, chatId, targetAppId);
-      if (!resolved.ok) {
-        return { ok: false, reason: 'local_resolution_failed', detail: resolved.detail };
-      }
-      if (!resolved.openId.startsWith('ou_')) {
-        return { ok: false, reason: 'local_resolution_failed', detail: 'resolved handle is not an open_id' };
-      }
-      return { ok: true, openId: resolved.openId, source: 'local-peer' };
-    } catch (error) {
-      return {
-        ok: false,
-        reason: 'local_resolution_failed',
-        detail: error instanceof Error ? error.message : String(error),
-      };
+  if (!deps.isLocalConfigured(targetAppId)) {
+    return { ok: false, reason: 'target_not_local' };
+  }
+
+  try {
+    const resolved = await deps.resolveLocal(sourceAppId, chatId, targetAppId);
+    if (!resolved.ok) {
+      return { ok: false, reason: 'local_resolution_failed', detail: resolved.detail };
     }
-  }
-
-  let directory: Array<{ larkAppId: string; botName: string }>;
-  try {
-    directory = await deps.listTrustedTeamBots();
+    if (!resolved.openId.startsWith('ou_')) {
+      return { ok: false, reason: 'local_resolution_failed', detail: 'resolved handle is not an open_id' };
+    }
+    return { ok: true, openId: resolved.openId, source: 'local-peer' };
   } catch (error) {
     return {
       ok: false,
-      reason: 'untrusted_target',
+      reason: 'local_resolution_failed',
       detail: error instanceof Error ? error.message : String(error),
     };
   }
-  const targetRows = directory.filter(row => row.larkAppId === targetAppId);
-  if (targetRows.length === 0) return { ok: false, reason: 'untrusted_target' };
-  const targetNames = [...new Set(targetRows.map(row => row.botName.trim()).filter(Boolean))];
-  if (targetNames.length !== 1) return { ok: false, reason: 'ambiguous_target' };
-  const targetName = targetNames[0];
-  if (directory.some(row => row.larkAppId !== targetAppId && row.botName.trim() === targetName)) {
-    return { ok: false, reason: 'ambiguous_target' };
-  }
-
-  let live: Array<{ openId: string; displayName: string }>;
-  try {
-    live = await deps.listLiveChatBots(sourceAppId, chatId);
-  } catch (error) {
-    return {
-      ok: false,
-      reason: 'live_membership_unavailable',
-      detail: error instanceof Error ? error.message : String(error),
-    };
-  }
-  const matches = live.filter(row => row.displayName.trim() === targetName);
-  if (matches.length === 0) return { ok: false, reason: 'target_not_in_chat' };
-  if (matches.length !== 1 || !matches[0].openId.startsWith('ou_')) {
-    return { ok: false, reason: 'ambiguous_target' };
-  }
-  return { ok: true, openId: matches[0].openId, name: targetName, source: 'team' };
 }
