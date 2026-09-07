@@ -309,6 +309,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
+  'minimax': 'MiniMax',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
