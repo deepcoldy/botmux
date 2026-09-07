@@ -1729,6 +1729,10 @@ textarea {
   transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
 }
 
+input[type=search]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  padding-left: 32px;
+}
+
 textarea {
   min-height: 84px;
   resize: vertical;
@@ -18445,6 +18449,78 @@ form.dashboard-toolbar > input[type="text"]:focus {
   white-space: nowrap;
 }
 
+.connector-bot-picker-chips {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  overflow: visible !important;
+}
+
+.connector-bot-picker-chip {
+  position: relative;
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  max-width: 140px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  color: var(--accent-strong);
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-remove {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -3px;
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.connector-bot-picker-chip-remove:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent-strong);
+}
+
+.connector-bot-picker-chip[data-full]:hover::after {
+  content: attr(data-full);
+  position: absolute;
+  z-index: 1700;
+  top: calc(100% + 7px);
+  left: 0;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 48px));
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  pointer-events: none;
+}
+
 .connector-group-picker-trigger:hover,
 .connector-group-picker.open .connector-group-picker-trigger {
   border-color: var(--accent);
@@ -18511,8 +18587,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .connector-group-search-icon::after {
   content: '';
   position: absolute;
-  right: -4px;
-  bottom: -3px;
+  right: -5px;
+  bottom: -1px;
   width: 5px;
   border-bottom: 1.5px solid var(--muted);
   transform: rotate(45deg);
