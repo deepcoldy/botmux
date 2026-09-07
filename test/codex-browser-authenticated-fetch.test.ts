@@ -1,6 +1,9 @@
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { resolveBunExecutable, resolveNodeExecutable, spawnSyncBunTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexBrowserAuthenticatedFetch, resolveBrowserFetchRuntime } from '../src/services/codex-browser-authenticated-fetch.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { handleRpc } from '../src/services/codex-browser-fetch-service.js';
@@ -58,9 +61,14 @@ describe('CodexBrowserAuthenticatedFetch', () => {
     expect(call.arguments.code).toContain('"body":"aGVsbG8="');
     expect(call.arguments.code).toContain('"x-test","value"');
     const env = mock.transport.mock.calls[0]![0].env;
-    expect(JSON.parse(env.NODE_REPL_TRUSTED_SERVICES).botmux_browser_fetch).toMatch(/codex-browser-fetch-service\.js$/);
-    expect(env.NODE_REPL_TRUSTED_CODE_PATHS).toMatch(/codex-browser-fetch-service\.js$/);
+    expect(JSON.parse(env.NODE_REPL_TRUSTED_SERVICES).botmux_browser_fetch).toMatch(/codex-browser-fetch-service\.mjs$/);
+    expect(env.NODE_REPL_TRUSTED_CODE_PATHS).toMatch(/codex-browser-fetch-service\.mjs$/);
     expect(env.LARK_APP_SECRET).toBeUndefined();
+    const service = JSON.parse(env.NODE_REPL_TRUSTED_SERVICES).botmux_browser_fetch;
+    expect(readFileSync(service, 'utf8')).toContain('export const handleRpc');
+    if (process.platform !== 'win32') expect(statSync(service).mode & 0o777).toBe(0o600);
+    await fetcher.close();
+    expect(existsSync(service)).toBe(false);
   });
 
   it('serializes concurrent requests and reuses one authenticated process', async () => {
@@ -84,6 +92,8 @@ describe('CodexBrowserAuthenticatedFetch', () => {
   it('retries a failed runtime startup', async () => {
     mock.connect.mockRejectedValueOnce(new Error('offline'));
     await expect(fetcher.fetch('https://chatgpt.com/')).rejects.toThrow('offline');
+    const service = JSON.parse(mock.transport.mock.calls[0]![0].env.NODE_REPL_TRUSTED_SERVICES).botmux_browser_fetch;
+    expect(existsSync(service)).toBe(false);
     await expect(fetcher.fetch('https://chatgpt.com/')).resolves.toBeInstanceOf(Response);
     expect(mock.connect).toHaveBeenCalledTimes(2);
   });
@@ -158,3 +168,38 @@ describe('trusted fetch service', () => {
     } finally { globals.nodeRepl = previous; }
   });
 });
+
+// This must cross a real process boundary: Bun's virtual filesystem is only
+// visible inside the compiled executable. Minification matches release builds.
+it.skipIf(!resolveBunExecutable())('materializes an executable trusted service from a minified Bun binary', () => {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-browser-compiled-'));
+  try {
+    const entry = join(root, 'entry.ts');
+    const binary = join(root, process.platform === 'win32' ? 'probe.exe' : 'probe');
+    writeFileSync(entry, `
+      import { materializeBrowserFetchService } from ${JSON.stringify(resolve('src/services/codex-browser-fetch-service.ts'))};
+      import { spawnSync } from 'node:child_process';
+      import { existsSync } from 'node:fs';
+      import { pathToFileURL } from 'node:url';
+      const service = materializeBrowserFetchService();
+      try {
+        const code = 'globalThis.nodeRepl = { fetch: async () => new Response("compiled-ok", {status: 201}) };' +
+          'const {handleRpc} = await import(' + JSON.stringify(pathToFileURL(service.path).href) + ');' +
+          'const result = await handleRpc({method:"fetch",params:{url:"https://example.test",method:"GET",headers:[]}});' +
+          'if(result.status !== 201 || Buffer.from(result.body,"base64").toString() !== "compiled-ok") throw Error("bad response");';
+        const child = spawnSync(process.argv[2], ['--input-type=module', '-e', code], {encoding:'utf8'});
+        if(child.status !== 0) throw Error(child.stderr || String(child.error));
+      } finally { service.dispose(); }
+      if(existsSync(service.path)) throw Error('service was not cleaned up');
+      console.log('compiled service passed');
+    `);
+    const build = spawnSyncBunTsEvalWithRepoImports(`
+      const result = await Bun.build({entrypoints:[${JSON.stringify(entry)}], compile:{outfile:${JSON.stringify(binary)}}, minify:true});
+      if(!result.success) throw Error(String(result.logs));
+    `, { encoding: 'utf8', timeout: 60_000 });
+    expect(build.status, String(build.stderr)).toBe(0);
+    const run = spawnSync(binary, [resolveNodeExecutable()!], { encoding: 'utf8', timeout: 20_000 });
+    expect(run.status, String(run.stderr)).toBe(0);
+    expect(run.stdout).toContain('compiled service passed');
+  } finally { rmSync(root, {recursive:true, force:true}); }
+}, 90_000);

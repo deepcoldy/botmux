@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { materializeBrowserFetchService } from './codex-browser-fetch-service.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -47,6 +47,7 @@ export class CodexBrowserAuthenticatedFetch {
   private transport?: StdioClientTransport;
   private starting?: Promise<Client>;
   private closed = false;
+  private disposeService?: () => void;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: Options) {}
@@ -120,42 +121,49 @@ export class CodexBrowserAuthenticatedFetch {
     const result = await this.options.readConfig();
     const runtime = resolveBrowserFetchRuntime(result.config ?? {});
     if (this.closed) throw new Error('Codex browser authenticated runtime is closed');
-    const service = fileURLToPath(new URL('./codex-browser-fetch-service.js', import.meta.url));
-    const env = { ...getDefaultEnvironment() };
-    for (const [key, value] of Object.entries(runtime.env ?? {})) {
-      if (typeof value === 'string') env[key] = value;
-    }
-    env.CODEX_HOME = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
-    if (this.options.codexBin) env.CODEX_CLI_PATH = this.options.codexBin;
-    // Scope the extra trusted code entry to this single transport module. Do
-    // not grant trust to the checkout, working directory, or model input.
-    env.NODE_REPL_TRUSTED_CODE_PATHS = [env.NODE_REPL_TRUSTED_CODE_PATHS, service].filter(Boolean).join(delimiter);
-    env.NODE_REPL_TRUSTED_SERVICES = JSON.stringify({ botmux_browser_fetch: service });
-    const transport = new StdioClientTransport({
-      command: runtime.command,
-      args: Array.isArray(runtime.args) ? runtime.args : [],
-      env,
-      stderr: 'pipe',
-    });
-    // Drain diagnostics without forwarding credentials or server bodies into
-    // a Lark transcript. Errors are reported via the structured MCP response.
-    transport.stderr?.on('data', () => {});
-    const client = new Client({ name: 'botmux-browser-fetch', version: '1.0.0' }, { capabilities: {} });
-    client.onclose = () => {
-      if (this.client === client) {
-        this.client = undefined;
-        this.starting = undefined;
-        this.transport = undefined;
-      }
-    };
-    this.transport = transport;
+    const serviceModule = materializeBrowserFetchService();
+    const service = serviceModule.path;
+    this.disposeService = serviceModule.dispose;
+    let transport: StdioClientTransport | undefined;
+    let client: Client | undefined;
     try {
+      const env = { ...getDefaultEnvironment() };
+      for (const [key, value] of Object.entries(runtime.env ?? {})) {
+        if (typeof value === 'string') env[key] = value;
+      }
+      env.CODEX_HOME = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+      if (this.options.codexBin) env.CODEX_CLI_PATH = this.options.codexBin;
+      // Scope the extra trusted code entry to this single transport module. Do
+      // not grant trust to the checkout, working directory, or model input.
+      env.NODE_REPL_TRUSTED_CODE_PATHS = [env.NODE_REPL_TRUSTED_CODE_PATHS, service].filter(Boolean).join(delimiter);
+      env.NODE_REPL_TRUSTED_SERVICES = JSON.stringify({ botmux_browser_fetch: service });
+      transport = new StdioClientTransport({
+        command: runtime.command,
+        args: Array.isArray(runtime.args) ? runtime.args : [],
+        env,
+        stderr: 'pipe',
+      });
+      // Drain diagnostics without forwarding credentials or server bodies into
+      // a Lark transcript. Errors are reported via the structured MCP response.
+      transport.stderr?.on('data', () => {});
+      client = new Client({ name: 'botmux-browser-fetch', version: '1.0.0' }, { capabilities: {} });
+      const connectedClient = client;
+      client.onclose = () => {
+        serviceModule.dispose();
+        if (this.client === connectedClient) {
+          this.client = undefined;
+          this.starting = undefined;
+          this.transport = undefined;
+        }
+      };
+      this.transport = transport;
       await client.connect(transport, { timeout: 10_000 });
       if (this.closed) throw new Error('Codex browser authenticated runtime is closed');
       this.client = client;
       return client;
     } catch (error) {
-      await client.close().catch(() => {});
+      await client?.close().catch(() => {});
+      serviceModule.dispose();
       if (this.transport === transport) this.transport = undefined;
       throw error;
     }
@@ -163,8 +171,12 @@ export class CodexBrowserAuthenticatedFetch {
 
   async close(): Promise<void> {
     this.closed = true;
-    await this.transport?.close();
-    this.client = undefined;
-    this.transport = undefined;
+    try { await this.transport?.close(); }
+    finally {
+      this.disposeService?.();
+      this.disposeService = undefined;
+      this.client = undefined;
+      this.transport = undefined;
+    }
   }
 }

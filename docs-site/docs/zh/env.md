@@ -8,6 +8,7 @@
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
+| `BOTMUX_CODEX_NODE_REPL_PATH` | — | 未配置有效 MCP 运行时时，指定已安装的 Codex `node_repl` 可执行文件绝对路径；仅供显式启用的浏览器功能使用。 |
 | `BOTS_CONFIG` | _(未设置)_ | 指定 bots.json 路径（覆盖默认位置） |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
 | `WEB_EXTERNAL_HOST` | _(自动探测局域网 IP)_ | 终端链接中的外部主机名/IP（公网/内网域名访问见 [Web 终端](/web-terminal)） |

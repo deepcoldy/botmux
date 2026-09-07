@@ -8,6 +8,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 
 | Variable | Default | Description |
 |------|------|------|
+| `BOTMUX_CODEX_NODE_REPL_PATH` | — | Absolute path to the installed Codex `node_repl` executable when no valid MCP runtime is configured; used only by opt-in browser support. |
 | `BOTS_CONFIG` | _(unset)_ | Path to bots.json (overrides the default location) |
 | `WEB_HOST` | `0.0.0.0` | HTTP service bind address |
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP used in terminal links (for public/intranet-domain access, see [Web Terminal](/en/web-terminal)) |

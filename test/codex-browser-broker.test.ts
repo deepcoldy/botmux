@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+const approvalExec = vi.hoisted(() => vi.fn((...args: any[]) => {
+  args.at(-1)(null, JSON.stringify({ answer: 'approve' }), '');
+}));
+vi.mock('node:child_process', async importOriginal => ({
+  ...await importOriginal<typeof import('node:child_process')>(), execFile: approvalExec,
+}));
 import {
   CODEX_BROWSER_TOOL_NAME,
   CodexBrowserBroker,
@@ -80,6 +86,7 @@ describe.sequential('CodexBrowserBroker', () => {
   afterEach(() => {
     broker?.close();
     broker = undefined;
+    vi.unstubAllEnvs();
   });
 
   it('lists and claims only explicitly requested user tabs', async () => {
@@ -323,6 +330,43 @@ describe.sequential('CodexBrowserBroker', () => {
     await new Promise(resolve => setImmediate(resolve));
   });
 
+  it('downloads through the locator and returns the downloaded path', async () => {
+    const fake = fakeModules();
+    const path = vi.fn(async () => '/tmp/report.csv');
+    const click = vi.fn(async () => {});
+    const waitForEvent = vi.fn(async () => ({ path }));
+    Object.assign(fake.tab, { playwright: { locator: () => ({ click }), waitForEvent } });
+    broker = new CodexBrowserBroker({ sessionId: 'download', family: 'chrome', modules: fake.modules });
+    const result = await broker.handleToolCall(call({ operation: 'locator_download', tabId: 'claimed-7', selector: 'button', timeoutMs: 5000 }));
+    expect(result.success).toBe(true);
+    expect(waitForEvent).toHaveBeenCalledWith('download', { timeoutMs: 5000 });
+    expect(path).toHaveBeenCalledWith({ timeoutMs: 5000 });
+  });
+
+  it('attaches a download rejection handler before clicking, including when the click fails', async () => {
+    const fake = fakeModules();
+    let rejectDownload!: (reason: Error) => void;
+    const waiter = new Promise<never>((_, reject) => { rejectDownload = reject; });
+    // Inspect registration directly: vi.fn returning a promise can otherwise
+    // mask an unhandled rejection in Vitest's bookkeeping.
+    const consume = vi.spyOn(waiter, 'catch');
+    let attachedBeforeClick = false;
+    Object.assign(fake.tab, { playwright: {
+      locator: () => ({ click: async () => {
+        attachedBeforeClick = consume.mock.calls.length > 0;
+        throw new Error('download click failed');
+      } }),
+      waitForEvent: () => waiter,
+    } });
+    broker = new CodexBrowserBroker({ sessionId: 'download-failure', family: 'chrome', modules: fake.modules });
+    const result = await broker.handleToolCall(call({ operation: 'locator_download', tabId: 'claimed-7', selector: 'button' }));
+    expect(result.success).toBe(false);
+    expect((result.contentItems[0] as { text: string }).text).toContain('download click failed');
+    expect(attachedBeforeClick).toBe(true);
+    rejectDownload(new Error('late download timeout'));
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
   it('rejects a hidden upload input before starting a file chooser waiter', async () => {
     const fake = fakeModules();
     const waitForEvent = vi.fn();
@@ -436,6 +480,10 @@ describe.sequential('CodexBrowserBroker', () => {
   });
 
   it('fails closed for secure browser authentication elicitations', async () => {
+    for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_ROOT_MESSAGE_ID']) {
+      vi.stubEnv(key, 'browser-auth-test');
+    }
+    approvalExec.mockClear();
     const fake = fakeModules();
     broker = new CodexBrowserBroker({
       sessionId: 'session-auth',
@@ -447,6 +495,7 @@ describe.sequential('CodexBrowserBroker', () => {
       message: 'Enter credentials',
       meta: { codex_approval_kind: 'browser_auth' },
     })).resolves.toEqual({ action: 'cancel' });
+    expect(approvalExec).not.toHaveBeenCalled();
   });
 
   it('fails closed for a different tool or namespace', async () => {

@@ -5,6 +5,7 @@ import { homedir, platform, tmpdir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { findMissingAskEnv } from '../core/ask-args.js';
 import type { CodexBrowserFamily } from '../core/codex-browser-config.js';
 import { CodexBrowserAuthenticatedFetch } from './codex-browser-authenticated-fetch.js';
 
@@ -403,9 +404,9 @@ function sessionApprovalKey(request: BrowserElicitationRequest): string | undefi
   return JSON.stringify({
     kind: typeof meta.codex_approval_kind === 'string' ? meta.codex_approval_kind : 'browser',
     origin,
-    risk: typeof meta.riskLevel === 'string'
-      ? meta.riskLevel
-      : typeof meta.risk_level === 'string' ? meta.risk_level : undefined,
+    risk: typeof meta.risk_level === 'string'
+      ? meta.risk_level
+      : typeof meta.riskLevel === 'string' ? meta.riskLevel : undefined,
     tool,
   });
 }
@@ -419,7 +420,7 @@ async function requestLarkBrowserApproval(
     // secure challenge broker. An ordinary Lark card must never impersonate it.
     return { action: 'cancel' };
   }
-  if (!process.env.BOTMUX_SESSION_ID || !process.env.BOTMUX_CHAT_ID || !process.env.BOTMUX_LARK_APP_ID) {
+  if (findMissingAskEnv(process.env) !== null) {
     return { action: 'cancel' };
   }
   try {
@@ -1044,6 +1045,8 @@ export class CodexBrowserBroker {
     const playwright = requireCapability(tab.playwright, 'Playwright');
     const timeoutMs = operationTimeout(input.timeoutMs);
     const downloadPromise = playwright.waitForEvent('download', { timeoutMs });
+    // Attach immediately: the waiter may reject before the click settles.
+    void downloadPromise.catch(() => {});
     await this.locator(tab, input).click(this.locatorClickOptions(input));
     return (await downloadPromise).path({ timeoutMs });
   }
@@ -1063,6 +1066,7 @@ export class CodexBrowserBroker {
       );
     }
     const chooserPromise = playwright.waitForEvent('filechooser', { timeoutMs });
+    void chooserPromise.catch(() => {});
     try {
       await locator.click({
         ...this.locatorClickOptions(input),
