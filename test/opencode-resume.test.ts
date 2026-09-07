@@ -307,7 +307,12 @@ describe('opencode writeInput DB verification', () => {
     }
   });
 
-  it.each(['short follow-up', '/session'])('keeps raw PTY typing for %s', async (content) => {
+  it.each([
+    ['short follow-up', 'short follow-up'],
+    ['short slash command', '/session'],
+    ['long slash command', `/compact ${'a'.repeat(300)}`],
+    ['multiline slash command', '/ask first line\nsecond line'],
+  ])('keeps raw PTY typing for %s', async (_label, content) => {
     const writes: string[] = [];
     await createOpenCodeAdapter().writeInput({ write(data) { writes.push(data); } }, content);
     expect(writes).toEqual([content, '\r']);
