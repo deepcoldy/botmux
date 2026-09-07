@@ -144,6 +144,30 @@ jobs:
         with:
           node-version: 22
 
+      # Same step as the `test` job above (it moved there with the 3-way unit
+      # shard, #1288), repeated because jobs share no filesystem. WITHOUT IT this
+      # leg is a runner lottery: `prepareDirectSandbox()`
+      # returns null when bwrap is missing, so `overlayTargets()` in
+      # test/sandbox-shim-compiled-form.test.ts yields [] and 4 cases fail on an
+      # image that happens not to ship bubblewrap — MEASURED on two runs of the
+      # same commit range, one printing `bwrap missing` 5 times and failing, the
+      # other printing it 0 times and passing. The failures look like a code
+      # regression and are not one, which is the expensive part.
+      #
+      # ⚠️ Unlike vitest, `bun test` has no host-level skip gate here: the suite
+      # under `describe.skipIf(process.platform !== 'linux')` DOES run on this
+      # linux runner and can only fail once bwrap is absent. Keep this step in
+      # sync with the `test` job's copy.
+      - name: Enable bwrap sandbox for integration tests (best-effort)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+            echo "bwrap userns OK — sandbox integration tests will run for real"
+          else
+            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
+          fi
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.1
