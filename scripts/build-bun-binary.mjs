@@ -133,6 +133,73 @@ function resolveNodePtyNative(platform, arch) {
   return { ptyNode, spawnHelper: spawnHelper && existsSync(spawnHelper) ? spawnHelper : null };
 }
 
+/** Run a tool, returning exit code + stderr instead of throwing on ENOENT. */
+function runTool(argv) {
+  try {
+    const p = Bun.spawnSync(argv, { stdout: 'pipe', stderr: 'pipe' });
+    return { code: p.exitCode, err: p.stderr.toString().trim() };
+  } catch (e) {
+    return { code: -1, err: `could not run \`${argv[0]}\`: ${e?.message ?? e}` };
+  }
+}
+
+/**
+ * Ad-hoc re-sign a compiled darwin binary, then verify it.
+ *
+ * WHY: `bun build --compile` ad-hoc-signs its own darwin output, but the signer
+ * only gets the HOST arch right. On the macos-14 (arm64) release runner,
+ * `--target=bun-darwin-x64` therefore lands an INVALID signature. Measured on
+ * the v3.19.0 release run, where `codesign --verify --strict` reported:
+ *
+ *     botmux-darwin-arm64: valid on disk                                  ← native, fine
+ *     botmux-darwin-x64: invalid signature (code or signature have been modified)
+ *     In architecture: x86_64
+ *
+ * ...with bun 1.4.1 on the runner — i.e. AFTER the version bump this was
+ * supposed to be fixed by. oven-sh/bun#39837 is titled "compile: fix invalid
+ * ad-hoc code signature on darwin-arm64" and its test only compiles
+ * `--target=bun-darwin-arm64`; nothing upstream covers x86_64. So bumping bun
+ * again does NOT close this — don't read "we're on 1.4.1" as "already fixed".
+ * `codesign --force --sign -` is the re-signing fix confirmed in
+ * oven-sh/bun#39764 (`BUN_NO_CODESIGN_MACHO_BINARY=1` and `--remove-signature`
+ * were both reported there as NOT working).
+ *
+ * WHY IT MATTERS: recent macOS SIGKILLs a bad-signature binary before `main()`,
+ * so 3.18.14 shipped a darwin-x64 build that could not start at all — all
+ * `botmux upgrade` saw was a dead process. Nothing caught it, because
+ * release.yml's `Smoke-test the host-arch binary` runs only the host arch
+ * (arm64), and the arm64 binary was always fine.
+ *
+ * Idempotent, so this runs for BOTH darwin targets rather than special-casing
+ * x64: re-signing the already-valid native output just rewrites an equivalent
+ * signature, and not depending on "which arch is currently broken upstream"
+ * keeps this correct if the arch-conditional bug moves.
+ *
+ * Signing needs macOS (`codesign` is an Apple tool), so a darwin binary
+ * cross-built from Linux stays unsigned — warn loudly rather than fail, since
+ * release.yml builds darwin only on macOS (so the shipped path is always
+ * signed) while `--all` on a Linux dev box is a legitimate workflow.
+ */
+function adhocResignDarwin(outfile) {
+  if (process.platform !== 'darwin') {
+    console.warn(
+      `⚠️  ${outfile}: darwin target cross-built on ${process.platform} — cannot ad-hoc sign, ` +
+      `codesign is macOS-only. Recent macOS will SIGKILL this binary before main(). ` +
+      `Release builds compile darwin on macOS (release.yml \`bun-binaries\`) and are signed there.`,
+    );
+    return;
+  }
+  const signed = runTool(['codesign', '--force', '--sign', '-', outfile]);
+  if (signed.code !== 0) throw new Error(`ad-hoc codesign failed for ${outfile}: ${signed.err}`);
+  // Verify with the strictness newer macOS applies at exec time, so a bad
+  // signature fails the build here instead of on a user's machine. release.yml
+  // re-checks this independently after the compile loop; that gate is the
+  // fail-closed backstop for the release lane, this one covers every caller.
+  const ok = runTool(['codesign', '--verify', '--strict', '--verbose=2', outfile]);
+  if (ok.code !== 0) throw new Error(`codesign --verify --strict failed for ${outfile}: ${ok.err}`);
+  console.log(`🔐 ad-hoc signed ${outfile}`);
+}
+
 async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
   const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
@@ -162,6 +229,7 @@ async function buildOne({ target, out }) {
     for (const log of result.logs) console.error(log);
     throw new Error(`bun build failed for ${target ?? 'host'}`);
   }
+  if (platform === 'darwin') adhocResignDarwin(outfile);
   console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''})`);
   return outfile;
 }
