@@ -25,6 +25,26 @@ import { delay } from '../../utils/timing.js';
  * dir is the authPath so a sandboxed first login persists). The `--api-key`
  * flag and `MMX_CONFIG_DIR` env are alternative resolution paths; we do not
  * bake a key into argv.
+ *
+ * Region (CN vs. global) — supported, resolved by mmx itself:
+ *   `mmx` picks the API host by precedence `--base-url` > `--region` >
+ *   the `region` field in `~/.mmx/config.json` (written at login, default
+ *   `global`). `cn` → api.minimaxi.com, `global` → api.minimax.io. This
+ *   adapter does NOT pass `--region`, so a bot follows whichever region you
+ *   chose at `mmx auth login`:
+ *     mmx auth login --api-key sk-... --region cn        # China
+ *     mmx auth login --api-key sk-... --region global    # international
+ *
+ *   Running a CN bot and a global bot on the SAME host: `~/.mmx` holds one
+ *   region, so give each bot its own credential dir via the per-bot `env`
+ *   field in bots.json (`MMX_CONFIG_DIR`), each logged into its own region:
+ *     bot-cn:      env: { "MMX_CONFIG_DIR": "~/.mmx-cn" }
+ *     bot-global:  env: { "MMX_CONFIG_DIR": "~/.mmx-global" }
+ *   Prepare each once, e.g.
+ *     MMX_CONFIG_DIR=~/.mmx-cn mmx auth login --api-key sk-... --region cn
+ *   (Under the file sandbox, `authPaths` is the static `~/.mmx`; a
+ *   redirected MMX_CONFIG_DIR would additionally need that dir exposed —
+ *   irrelevant to the default non-sandboxed setup.)
  */
 export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
