@@ -8,6 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -67,7 +68,11 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    rmSync(root, { recursive: true, force: true });
+    // prepareDirectSandbox() chmods its deny-mask sources to 000 under `root`, and
+    // a 000 directory cannot be traversed — so a plain recursive delete throws
+    // `EACCES: permission denied, rm` for any NON-root uid (measured: green as
+    // root, red on Node and Bun alike as a normal user, i.e. what CI runs as).
+    rmSandboxScratch(root);
   });
 
   it.each(['default', 'custom'] as const)(
