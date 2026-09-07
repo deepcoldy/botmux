@@ -197,13 +197,53 @@ describe('redactChildEnv()', () => {
       const script =
         'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
         `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve) => {
+      const out: string = await new Promise((resolve, reject) => {
         const p = pty.spawn('/bin/sh', ['-c', script], {
           name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
         });
         let buf = '';
-        p.onData((d) => { buf += d; });
-        p.onExit(() => resolve(buf));
+        let settled = false;
+        // node-pty delivers onData and onExit on independent paths: the child can
+        // be reaped before the pty's pending output has been drained, so
+        // resolving straight from onExit can hand back an empty string. That
+        // surfaces as `Expected to contain "R=UNSET" / Received: ""` under CI
+        // load, which reads like a real leak but is only a lost read.
+        //
+        // So settle on having BOTH answers, and let exit only START a short grace
+        // period rather than decide. If the grace period expires with the output
+        // still incomplete, REJECT with the raw buffer instead of resolving it:
+        // the whole point is that a lost read must never again be reported as a
+        // leak-shaped assertion failure. Resolving '' here would rebuild the very
+        // trap this guard exists to remove.
+        const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
+        const finish = (settle: () => void) => {
+          if (settled) return;
+          settled = true;
+          settle();
+        };
+        const fail = () => finish(() => reject(new Error(
+          'pty output incomplete — a lost read, not an env leak. '
+          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+        )));
+        const guard = setTimeout(fail, 10_000);
+        guard.unref?.();
+        p.onData((d) => {
+          buf += d;
+          if (hasBothAnswers()) {
+            clearTimeout(guard);
+            finish(() => resolve(buf));
+          }
+        });
+        p.onExit(() => {
+          // Exit is a deadline, not the signal: give already-queued reads a
+          // moment to land, then decide — complete output resolves, incomplete
+          // output fails loudly as a fixture problem.
+          setTimeout(() => {
+            clearTimeout(guard);
+            if (hasBothAnswers()) finish(() => resolve(buf));
+            else fail();
+          }, 250);
+        });
       });
       expect(out).toContain('R=UNSET');
       expect(out).toContain('S=UNSET');
