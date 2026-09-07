@@ -1361,6 +1361,34 @@ describe('buildCardBodyElements image rows', () => {
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
+  it.each(['crop_center', 'large', 'medium', 'small', 'tiny'])('renders standalone uploads with mode %s', mode => {
+    const out = buildImageCardElements('截图', [K[0]], undefined, undefined, mode);
+    expect(out.find(e => e.tag === 'img')).toMatchObject({ img_key: K[0], mode, preview: true });
+    expect(mdElements(out).map(e => e.content).join('')).toBe('截图');
+  });
+
+  it('keeps the default output identical, including explicit fit_horizontal', () => {
+    const legacy = buildCardBodyElements('截图\n\n![](img_v2_a)');
+    expect(buildImageCardElements('截图', [K[0]])).toEqual(legacy);
+    expect(buildImageCardElements('截图', [K[0]], undefined, undefined, 'fit_horizontal')).toEqual(legacy);
+  });
+
+  it('sizes standalone placeholders and trailing images without resizing a grid', () => {
+    const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
+    expect(out.filter(e => e.tag === 'img')).toMatchObject([
+      { img_key: K[0], mode: 'tiny', alt: { content: '预览' } },
+      { img_key: K[3], mode: 'tiny' },
+    ]);
+    expect(out.find(e => e.tag === 'column_set').columns.every((c: any) => c.elements[0].mode === 'fit_horizontal')).toBe(true);
+  });
+
+  it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
+    for (const markdown of ['```\n![](img_v2_a)\n```', '    ![](img_v2_a)', 'see ![](img_v2_a) here', '![](https://example.com/a.png)']) {
+      expect(buildCardBodyElements(markdown, undefined, undefined, 'small')).toEqual(buildCardBodyElements(markdown));
+    }
+  });
+
+
   it('no images → identical to buildCardBodyElements', () => {
     expect(buildImageCardElements('hello **world**', [])).toEqual(
       buildCardBodyElements('hello **world**'),
