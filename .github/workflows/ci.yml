@@ -81,8 +81,11 @@ jobs:
           bun-version: 1.4.1
       - run: bun install --frozen-lockfile
       - run: bun run build
+      # Wrapper retries once only when every file already passed and vitest's
+      # fork pool then reports "Worker exited unexpectedly" (teardown flake;
+      # measured on this PR's first shard-3 run). A real failed file is not retried.
       - name: Unit tests (shard ${{ matrix.shard }}/3)
-        run: bun run test -- --shard=${{ matrix.shard }}/3
+        run: node scripts/run-unit-shard.mjs ${{ matrix.shard }}/3
 
   # One status for branch protection. The matrix jobs stay visible so we can
   # compare per-shard wall; this job is just AND-of-shards.
