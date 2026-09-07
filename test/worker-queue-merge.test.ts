@@ -205,6 +205,15 @@ describe('durable turn queue boundary', () => {
     expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
   });
 
+  it('stops after one input for interrupting adapters so a backlog cannot cascade-cancel', () => {
+    const written = { content: 'interrupt current turn', turnId: 'user-1' };
+    const next = { content: 'must wait for another edge', turnId: 'user-2' };
+
+    expect(shouldStopPendingBatch(written, next, 'interrupt')).toBe(true);
+    expect(shouldStopPendingBatch(written, next, 'queue')).toBe(false);
+    expect(shouldStopPendingBatch(written, next, 'steer')).toBe(false);
+  });
+
   it('does not cross an unresolved durable boundary on a screen-idle edge', () => {
     expect(pendingInputMayFlush(true)).toBe(false);
     expect(pendingInputMayFlush(false)).toBe(true);

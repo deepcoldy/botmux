@@ -1,4 +1,5 @@
 import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
+import type { BusyInputBehavior } from '../adapters/cli/types.js';
 
 export interface PendingCliInput {
   content: string;
@@ -240,8 +241,10 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  busyInputBehavior?: BusyInputBehavior,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return busyInputBehavior === 'interrupt'
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

@@ -17,6 +17,7 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  resolveWriteInputSubmissionMode,
   shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
@@ -64,6 +65,28 @@ describe('shouldWriteNow', () => {
 
   it('queues when the CLI is busy and does not support type-ahead', () => {
     expect(shouldWriteNow({ ...base, supportsTypeAhead: false, awaitingFirstPrompt: false })).toBe(false);
+  });
+});
+
+describe('resolveWriteInputSubmissionMode', () => {
+  it('interrupts only when an interrupting adapter is actually busy', () => {
+    expect(resolveWriteInputSubmissionMode({
+      isPromptReady: false,
+      busyInputBehavior: 'interrupt',
+    })).toBe('interrupt');
+    expect(resolveWriteInputSubmissionMode({
+      isPromptReady: true,
+      busyInputBehavior: 'interrupt',
+    })).toBe('default');
+  });
+
+  it('preserves legacy queue and steer submit keys while busy', () => {
+    for (const busyInputBehavior of [undefined, 'queue', 'steer'] as const) {
+      expect(resolveWriteInputSubmissionMode({
+        isPromptReady: false,
+        busyInputBehavior,
+      })).toBe('default');
+    }
   });
 });
 

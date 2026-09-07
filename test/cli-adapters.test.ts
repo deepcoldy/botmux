@@ -3077,6 +3077,7 @@ describe('grok buildArgs', () => {
 
   it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.busyInputBehavior).toBe('interrupt');
     expect(adapter.injectsReadyHook).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.readyPattern?.test('│ ❯')).toBe(true);

@@ -84,6 +84,23 @@ describe('worker structured-turn status wiring', () => {
     expect(adopt.slice(adoptWrite)).not.toContain('idleDetector?.reset();');
   });
 
+  it('captures busy state before re-arming and gives interrupt adapters one write per flush', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const capture = flush.indexOf('const inputWasPromptReady = isPromptReady');
+    const outerCycle = flush.indexOf('beginCliWriteCycle()', capture);
+    const mode = flush.indexOf('resolveWriteInputSubmissionMode(', outerCycle);
+    const write = flush.indexOf('writeAdapter.writeInput(', mode);
+    const batchStop = flush.indexOf('shouldStopPendingBatch(', write);
+
+    expect(capture).toBeGreaterThanOrEqual(0);
+    expect(outerCycle).toBeGreaterThan(capture);
+    expect(mode).toBeGreaterThan(outerCycle);
+    expect(write).toBeGreaterThan(mode);
+    expect(flush.slice(mode, write)).toContain('inputWasPromptReady');
+    expect(flush.slice(write, batchStop)).toContain('submissionMode');
+    expect(flush.slice(batchStop, batchStop + 180)).toContain('writeAdapter.busyInputBehavior');
+  });
+
   it('uses the same lifecycle-aware projection for periodic and screenshot updates', () => {
     const screenshot = functionSlice('captureAndUpload', 'applyDisplayMode');
     const periodic = functionSlice('startScreenUpdates', 'stopScreenUpdates');

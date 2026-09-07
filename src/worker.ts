@@ -69,6 +69,7 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  resolveWriteInputSubmissionMode,
   shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
@@ -11328,6 +11329,10 @@ async function flushPending(): Promise<void> {
   if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
 
+  // Capture the real prompt state before beginCliWriteCycle re-arms it to
+  // false. Interrupt-capable adapters need to distinguish an idle submit from
+  // a human follow-up that arrived during an active turn.
+  const inputWasPromptReady = isPromptReady;
   isFlushing = true;
   const codexAppPromptReplay = new CodexAppFlushPromptReplay();
   // Raw input and native rename own their explicit command-line/session gates;
@@ -11468,6 +11473,10 @@ async function flushPending(): Promise<void> {
       const writeGeneration = cliSpawnGeneration;
       const writeBackend = backend;
       const writeAdapter = cliAdapter;
+      const submissionMode = resolveWriteInputSubmissionMode({
+        isPromptReady: inputWasPromptReady,
+        busyInputBehavior: writeAdapter.busyInputBehavior,
+      });
       const writeRpcEngine = codexRpcEngine;
       const writeContinuationIsCurrent = (): boolean => (
         cliSpawnGeneration === writeGeneration
@@ -11689,6 +11698,7 @@ async function flushPending(): Promise<void> {
               item.codexAppInput!,
               {
                 turnId: item.turnId,
+                submissionMode,
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
               },
@@ -11707,6 +11717,7 @@ async function flushPending(): Promise<void> {
               msg,
               {
                 turnId: item.turnId,
+                submissionMode,
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
               },
@@ -12033,7 +12044,11 @@ async function flushPending(): Promise<void> {
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
-      if (shouldStopPendingBatch(item, pendingMessages[0])) break;
+      if (shouldStopPendingBatch(
+        item,
+        pendingMessages[0],
+        writeAdapter.busyInputBehavior,
+      )) break;
     }
   } finally {
     isFlushing = false;

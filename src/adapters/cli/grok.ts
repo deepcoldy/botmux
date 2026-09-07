@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, WriteInputContext } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import {
@@ -47,14 +47,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *    `initialPromptArgsIgnoredOnResume`.
  *
  *  ## Type-ahead
- *  Grok's interactive TUI accepts mid-turn Enter as a follow-up. Although its
- *  UI describes this as queued, 0.2.99 transcripts can contain multiple
- *  `user_message_chunk`s before one `turn_completed` (active-turn merge).
- *  `supportsTypeAhead: true` remains useful for ordinary IM turns and
- *  CodexBridgeQueue's HOL-block-drop attributes the one merged final to the
- *  newest matching turn. Durable deliveries are explicitly excluded from
- *  type-ahead on both sides by the worker's queue policy, so an exact receipt
- *  can never be merged away.
+ *  Grok's default mid-turn Enter queues a follow-up until the active turn ends.
+ *  Botmux human follow-ups instead use Grok's explicit send-now action:
+ *  Ctrl+I, the documented terminal-stable alias of Ctrl+Enter. The worker
+ *  captures readiness before resetting the write cycle and passes
+ *  `submissionMode=interrupt` only for a genuinely busy submit. Idle submits
+ *  keep Enter. Durable deliveries remain excluded from type-ahead, and the
+ *  worker drains at most one item per flush for this interrupting adapter so a
+ *  pre-existing backlog cannot cascade-cancel each newly started turn.
  *
  *  ## Input delivery: bracketed paste
  *  The body is delivered via BRACKETED PASTE (tmux load-buffer +
@@ -133,6 +133,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     supportsTypeAhead: true,
+    busyInputBehavior: 'interrupt',
     // updates.jsonl provides a session-scoped, explicit `turn_completed`
     // boundary. The bridge preserves empty finals and maps error/cancelled
     // stop reasons, so meeting delivery never relies on prompt-looking screen
@@ -248,7 +249,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       return discoverGrokSessions(limit, exclude);
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       // Submit verify against the bucket-level prompt_history.jsonl (one
       // {timestamp, session_id, prompt} line per submit; idle-composer
       // submits append at submit time, mid-turn queued submits only at
@@ -264,12 +265,13 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       //
       // TmuxPipeBackend (adopt) returns false on failed writes instead of
       // throwing — treat false as definite failure.
-      const trySendEnter = (): boolean => {
+      const submissionKey = context?.submissionMode === 'interrupt' ? 'C-i' : 'Enter';
+      const trySubmit = (): boolean => {
         try {
           if (pty.sendSpecialKeys) {
-            return pty.sendSpecialKeys('Enter') !== false;
+            return pty.sendSpecialKeys(submissionKey) !== false;
           }
-          pty.write('\r');
+          pty.write(submissionKey === 'C-i' ? '\t' : '\r');
           return true;
         } catch {
           // tmux session gone mid-write — bail cleanly.
@@ -300,7 +302,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (!cwd) {
         if (!deliverBody()) return { submitted: false };
         await delay(scaleMs(200));
-        trySendEnter();
+        trySubmit();
         return { submitted: false };
       }
 
@@ -309,14 +311,12 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       if (!deliverBody()) return { submitted: false };
       await delay(scaleMs(200));
-      // One paste + one Enter per call, and NEVER an Enter without a paste
-      // in the same call: `submitted:false` is not proof the body is parked
-      // in the composer (every mid-turn submit verifies late — see header),
-      // and a bare Enter on an empty composer with a queued follow-up is
-      // send-now (cancels the running turn). An unconfirmed submit is
-      // recovered by the worker's flush retry (full re-paste) and the
-      // deferred recheck, never by extra in-band Enters.
-      if (!trySendEnter()) return { submitted: false };
+      // Exactly one semantic submit per call, always paired with this paste.
+      // Idle uses Enter. A worker-proven busy human follow-up uses Ctrl+I,
+      // Grok's terminal-stable Ctrl+Enter alias, to cancel-and-send directly.
+      // We still never emit a bare retry key: `submitted:false` does not prove
+      // where the body landed, which is the #865 send-now regression boundary.
+      if (!trySubmit()) return { submitted: false };
 
       // First submit in a fresh bucket creates the file after our snapshot —
       // re-stat base as 0 when the path appears mid-poll. Re-resolve prefer

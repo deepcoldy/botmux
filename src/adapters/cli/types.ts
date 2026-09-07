@@ -59,12 +59,24 @@ export type RunnerSubmissionDisposition =
   | 'flushed_invalid'
   | 'dirty_unknown';
 
+/** Semantic result of submitting text while the CLI already has an active
+ * turn. This is deliberately separate from supportsTypeAhead: accepting PTY
+ * bytes says nothing about whether the CLI queues, steers, or interrupts. */
+export type BusyInputBehavior = 'queue' | 'steer' | 'interrupt';
+
+/** Per-write submission action selected by the worker from prompt readiness
+ * and the adapter's busy-input contract. */
+export type InputSubmissionMode = 'default' | 'interrupt';
+
 /** Optional per-input correlation metadata. Adapters that do not need it may
  * ignore it; runner-based adapters use the immutable botmux/Lark turn id to
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
   trustedCaller?: TrustedCaller;
+  /** Use the CLI's explicit cancel-and-send action for a busy human follow-up.
+   * Missing/default preserves every adapter's legacy submit key. */
+  submissionMode?: InputSubmissionMode;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
 }
@@ -464,6 +476,12 @@ export interface CliAdapter {
    *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
+
+  /** What a submit must do when supportsTypeAhead admits input during an
+   * active turn. Undefined preserves the adapter's existing submit behavior.
+   * `interrupt` also makes the worker stop after one queued item per flush, so
+   * an already-buffered backlog cannot repeatedly cancel the replacement turn. */
+  readonly busyInputBehavior?: BusyInputBehavior;
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible

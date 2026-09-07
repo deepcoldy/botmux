@@ -1,3 +1,5 @@
+import type { BusyInputBehavior, InputSubmissionMode } from '../adapters/cli/types.js';
+
 /**
  * Worker input-gate — decide whether an incoming Lark message is written to the
  * CLI's PTY now, or queued until the CLI is ready.
@@ -34,6 +36,18 @@ export function shouldWriteNow(state: {
   if (state.isPromptReady || state.isFlushing) return true;
   // Type-ahead is only safe after the TUI has booted at least once.
   return state.supportsTypeAhead && !state.awaitingFirstPrompt;
+}
+
+/** Select the semantic submit action before beginCliWriteCycle clears the
+ * worker's readiness bit. Only adapters that explicitly declare interrupt
+ * behavior receive the interrupt action; every legacy adapter stays default. */
+export function resolveWriteInputSubmissionMode(state: {
+  isPromptReady: boolean;
+  busyInputBehavior?: BusyInputBehavior;
+}): InputSubmissionMode {
+  return !state.isPromptReady && state.busyInputBehavior === 'interrupt'
+    ? 'interrupt'
+    : 'default';
 }
 
 /**

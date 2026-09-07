@@ -24,9 +24,9 @@ import type { PtyHandle } from '../src/adapters/cli/types.js';
 // 1.0.5 a bare Enter with a queued follow-up is send-now (cancels the
 // running turn), and an Enter-only "retry" for an identical resend would
 // swallow the new message entirely. The mock composer below is honest about
-// both: mid-turn submits queue and append only on flushQueue(), and a bare
-// Enter on an empty composer with a non-empty queue counts a send-now
-// cancellation instead of pretending to be a no-op.
+// both: mid-turn Enter submits queue and append only on flushQueue(), while
+// Ctrl+I models Grok's documented Ctrl+Enter "send now" fallback and commits
+// the pasted body as the next turn immediately.
 
 const SID = '00000000-0000-7000-8000-00000000aaaa';
 const CWD = '/fake/grok-project';
@@ -78,6 +78,16 @@ function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number; mid
     pasteText: vi.fn((text: string) => { composer += text; }),
     sendText: vi.fn(),
     sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'C-i') {
+        // Grok's send-now chord is deliberately idle-no-op; the worker must
+        // select it only from a captured busy state.
+        if (!opts.midTurn) return;
+        if (!composer) return;
+        sendNowCancels += 1;
+        appendPrompt(opts.sid ?? SID, composer);
+        composer = '';
+        return;
+      }
       if (key !== 'Enter') return;
       if (swallowLeft > 0) {
         swallowLeft -= 1;
@@ -128,6 +138,46 @@ describe.sequential('grok adapter submit delivery (prompt_history.jsonl)', () =>
     expect(pty.pasteText).toHaveBeenCalledTimes(1);
     expect(pty.pasteText).toHaveBeenCalledWith('第一条多行消息\n第二行');
     expect(pty.sendText).not.toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('C-i');
+  });
+
+  it('interrupts a busy turn with Ctrl+I send-now instead of queueing with Enter', async () => {
+    const adapter = createGrokAdapter('/bin/grok');
+    const pty = makePty({ midTurn: true });
+
+    const result = await adapter.writeInput(
+      pty,
+      '停下当前任务，先回答这个问题',
+      { submissionMode: 'interrupt' },
+    );
+
+    expect(result).toEqual({ submitted: true, cliSessionId: SID });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('C-i');
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    expect(pty.sendNowCancels()).toBe(1);
+  });
+
+  it('uses the Ctrl+I byte on raw PTY backends too', async () => {
+    const adapter = createGrokAdapter('/bin/grok');
+    const writes: string[] = [];
+    const pty = {
+      write(data: string) { writes.push(data); },
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(
+      pty,
+      'raw backend interrupt',
+      { submissionMode: 'interrupt' },
+    );
+
+    expect(result).toEqual({ submitted: false });
+    expect(writes).toEqual([
+      '\x1b[200~raw backend interrupt\x1b[201~',
+      '\t',
+    ]);
   });
 
   it('confirms the very first submit of a lazy-created bucket (history file did not exist yet)', async () => {
