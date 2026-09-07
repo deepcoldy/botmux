@@ -18,8 +18,10 @@
  *   2. Subsequent updates → PUT AG-UI events. The worker sends the FULL
  *      cumulative ENTRY LIST (thinking paragraphs + tool calls/results in
  *      transcript order, append-only); this module pushes each unseen entry
- *      as its own node — thinking as a reasoning message (START/CONTENT/END
- *      with a distinct messageId), tool calls as TOOL_CALL_START/ARGS/END,
+ *      as its own node — thinking AND interim assistant narration as reasoning
+ *      messages (START/CONTENT/END with a distinct messageId; a turn that
+ *      starts straight into tooling gets one placeholder node first, see
+ *      {@link thinkingPlaceholderEvents}), tool calls as TOOL_CALL_START/ARGS/END,
  *      tool output as TOOL_CALL_RESULT. The client does not render
  *      TOOL_CALL_ARGS (verified by live A/B: sending full args and sending
  *      none render identically), so the command line / file path travels in
@@ -473,11 +475,41 @@ function resultLanguage(toolName: string | undefined, subject: string | undefine
   return ext ? COT_EXT_LANGUAGES[ext] : undefined;
 }
 
-/** AG-UI events for one CoT entry. Thinking → a complete reasoning message
- *  (its own node); tool_call → START(+ARGS)+END; tool_result → RESULT in
- *  code style (tool output is command/file content — monospace fits). */
+/**
+ * The bubble's opening node for a turn that starts straight into tooling.
+ *
+ * Extended thinking is OFF by default on Claude Code, so a plain turn ships
+ * no `thinking` block at all — its first entry is a tool_call. That left the
+ * bubble with two defects at once: nothing readable at the head (just a row
+ * of tool nodes), and no reasoning node for those nodes to hang under, since
+ * `parentMessageId` is only attached when `lastReasoningId` is set. One
+ * placeholder reasoning node fixes both.
+ *
+ * Inserted at most once per turn — `lastReasoningId` being unset IS the
+ * "this turn has produced no reasoning node yet" test, so a turn whose real
+ * thinking or narration arrives first never sees it. It claims index 0's id,
+ * which is free in exactly that case (no entry-0 reasoning node exists) and
+ * is the same id the prologue's REASONING_START opened the section with.
+ */
+function thinkingPlaceholderEvents(ds: DaemonSession, state: CotState): CotEvent[] {
+  const mid = reasoningId(state, 0);
+  state.lastReasoningId = mid;
+  return [
+    ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
+    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.thinking_placeholder', undefined, localeForBot(ds.larkAppId)) }),
+    ev('REASONING_MESSAGE_END', { messageId: mid }),
+  ];
+}
+
+/** AG-UI events for one CoT entry. Thinking and interim narration (`text`)
+ *  → a complete reasoning message (its own node); tool_call → START(+ARGS)+END,
+ *  preceded by the placeholder node when the turn has no reasoning node yet;
+ *  tool_result → RESULT in code style (tool output is command/file content —
+ *  monospace fits). */
 function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index: number): CotEvent[] {
-  if (entry.kind === 'thinking') {
+  // 两者在气泡里同为 reasoning 段落：thinking 是模型的内心独白，text 是它在工具
+  // 之间写给用户的旁白。渲染一致，但协议上分开，占位判据与未来的差异化留有余地。
+  if (entry.kind === 'thinking' || entry.kind === 'text') {
     const mid = reasoningId(state, index);
     state.lastReasoningId = mid;
     return [
@@ -487,6 +519,9 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
     ];
   }
   if (entry.kind === 'tool_call') {
+    // 必须在构造 TOOL_CALL_START 之前求值：它会补上 lastReasoningId，
+    // 下面的 parentMessageId 才挂得住。
+    const placeholder = state.lastReasoningId ? [] : thinkingPlaceholderEvents(ds, state);
     const meta = toolMeta(entry.name);
     const subject = toolTitleSubject(entry);
     // A tool_result entry carries only {id, result} — no tool name — so the
@@ -501,6 +536,7 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       state.resultLanguages.set(entry.id, lang);
     }
     return [
+      ...placeholder,
       ev('TOOL_CALL_START', {
         toolCallId: entry.id,
         icon: meta.icon,

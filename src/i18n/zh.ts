@@ -1579,5 +1579,6 @@ export const messages: Record<string, string> = {
   'cot.tool.task': '任务管理',
   'cot.tool.default': '调用 {name}',
   'cot.tool.result_done': '✓ 已完成',
+  'cot.thinking_placeholder': '思考中…',
   'cot.interrupted': '⚠️ 服务重启，本轮思考已中断',
 };

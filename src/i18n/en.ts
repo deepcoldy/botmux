@@ -1577,5 +1577,6 @@ export const messages: Record<string, string> = {
   'cot.tool.task': 'Manage tasks',
   'cot.tool.default': 'Call {name}',
   'cot.tool.result_done': '✓ Done',
+  'cot.thinking_placeholder': 'Thinking…',
   'cot.interrupted': '⚠️ Interrupted by a service restart — this turn\'s thinking never finished',
 };
