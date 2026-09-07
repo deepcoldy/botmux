@@ -187,16 +187,10 @@ export interface DaemonSession {
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */
   initialStartClaimToken?: string;
-  /** Number of activation-tail arrivals that reserved FIFO order before an
-   * asynchronous prompt/sender build and have not yet durably admitted or
-   * failed. An opening ACK must not clear the route while this is non-zero. */
-  queuedActivationTailAdmissionsOutstanding?: number;
-  /** An opening ACK (or ordinary cold-start handoff) observed while an
-   * asynchronous tail admission was outstanding. The final settler replays
-   * this release so a late durable successor cannot be stranded. */
-  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
-  /** Retry timer for an ordinary cold-start handoff whose durable promotion
-   * failed after all asynchronous admissions had settled. */
+  /** Retry timer for a route release whose durable promotion failed while the
+   * route was still held. Ordering between a follower still being built and
+   * the opening's release is the session turn queue's job
+   * (core/session-turn-queue.ts), not a field here. */
   queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
@@ -273,18 +267,6 @@ export interface DaemonSession {
    * Used only when a literal raw cold start must fold followers onto the same
    * text→Enter IPC boundary. */
   pendingCodexAppFollowUpGateAccepted?: boolean[];
-  /** Exact turns that arrived while a previously attempted queued activation
-   * was re-parked. They remain separate FIFO items behind the retained opening
-   * payload and advance only after worker acceptance. In-memory only. */
-  pendingQueuedActivationFollowUps?: Array<{
-    userPrompt: string;
-    cliInput: CliTurnPayload;
-    turnId: string;
-    dispatchAttempt?: number;
-    /** Legacy volatile entries already crossed the clean-input gate when they
-     * were staged. Migration must preserve that exact sidecar decision. */
-    codexAppInputGateFrozen?: true;
-  }>;
   /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
    *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access

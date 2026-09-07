@@ -205,6 +205,7 @@ import {
   larkTransportEnabled,
 } from './core/types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/pending-repo-journal.js';
+import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -17030,28 +17031,17 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
   if (token !== undefined && ds.initialStartClaimToken !== token) return false;
   ds.initialStartClaimToken = undefined;
   ds.initialStartPending = false;
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) === 0) {
-    ds.queuedActivationTailReleasePending = undefined;
-    if (ds.queuedActivationTailReleaseRetryTimer) {
-      clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
-      ds.queuedActivationTailReleaseRetryTimer = undefined;
-    }
+  if (ds.queuedActivationTailReleaseRetryTimer) {
+    clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
+    ds.queuedActivationTailReleaseRetryTimer = undefined;
   }
   return true;
 }
 
-/** Fence an arrival before any sender/prompt await. Besides reserving durable
- * FIFO order, keep the opening route owned until this reservation either lands
- * in the durable tail or fails. */
-function reserveAsyncQueuedActivationTailAdmission(
-  ds: DaemonSession,
-): QueuedActivationTailReservation {
-  const reservation = reserveQueuedActivationTailAdmission(ds);
-  ds.queuedActivationTailAdmissionsOutstanding =
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) + 1;
-  return reservation;
-}
-
+/** Retry a route release whose durable promotion failed (a store write or the
+ * worker IPC) while the route is still held. The retry is one more command on
+ * the session's turn queue, so it cannot overtake an admission that arrived in
+ * the meantime. */
 function scheduleQueuedActivationTailReleaseRetry(
   ds: DaemonSession,
   acknowledgedToken?: string,
@@ -17061,49 +17051,62 @@ function scheduleQueuedActivationTailReleaseRetry(
     if (ds.queuedActivationTailReleaseRetryTimer !== timer) return;
     ds.queuedActivationTailReleaseRetryTimer = undefined;
     if (!ds.initialStartPending) return;
-    if (!releaseQueuedActivationReservation(ds, acknowledgedToken)) {
-      scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
-    }
+    void releaseQueuedActivationReservation(ds, acknowledgedToken).then(released => {
+      if (!released) scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
+    }, err => {
+      logger.error(
+        `[${ds.session.sessionId.slice(0, 8)}] Queued activation release retry failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }, 100);
   timer.unref?.();
   ds.queuedActivationTailReleaseRetryTimer = timer;
 }
 
-/** Complete one async reservation. If the predecessor ACK arrived during its
- * await, the final settler performs the deferred handoff immediately. */
-function settleAsyncQueuedActivationTailAdmission(ds: DaemonSession): void {
-  const outstanding = Math.max(
-    0,
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) - 1,
-  );
-  ds.queuedActivationTailAdmissionsOutstanding = outstanding || undefined;
-  if (outstanding > 0 || !ds.queuedActivationTailReleasePending) return;
-  const pending = ds.queuedActivationTailReleasePending;
-  ds.queuedActivationTailReleasePending = undefined;
-  if (!releaseQueuedActivationReservation(ds, pending.acknowledgedToken)) {
-    scheduleQueuedActivationTailReleaseRetry(ds, pending.acknowledgedToken);
-  }
+/** Admit one same-anchor follower behind the opening it arrived after.
+ *
+ * Its FIFO order was stamped at arrival (`reservation`); the prompt build
+ * awaits (sender lookup), so build + durable admission run as ONE command on
+ * the session's turn queue — neither a later arrival nor the opening's ACK can
+ * act on the session in between. If the opening released its route while this
+ * follower was still queued (its ACK or ordinary fork ran ahead on the same
+ * queue and found an empty tail), nothing else will promote the entry, so the
+ * same command promotes it inline — never through the queue again. */
+async function admitFollowerBehindOpening(
+  ds: DaemonSession,
+  reservation: QueuedActivationTailReservation,
+  follower: { userPrompt: string; turnId: string; build: () => Promise<CliTurnPayload> },
+): Promise<void> {
+  await runSessionTurn(ds.session.sessionId, async () => {
+    const cliInput = await follower.build();
+    admitQueuedActivationTail(ds, {
+      userPrompt: follower.userPrompt,
+      cliInput,
+      turnId: follower.turnId,
+    }, reservation);
+    if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
+      scheduleQueuedActivationTailReleaseRetry(ds);
+    }
+  });
 }
-
-export const __testOnly_reserveAsyncQueuedActivationTailAdmission =
-  reserveAsyncQueuedActivationTailAdmission;
-export const __testOnly_settleAsyncQueuedActivationTailAdmission =
-  settleAsyncQueuedActivationTailAdmission;
 
 /** Release a queued activation's runtime route reservation only after the
  * worker ACKs actual adapter submission. Turns that arrived meanwhile are sent
- * as one ordered follow-up, never allowed to overtake the opening item. */
-function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken?: string): boolean {
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0) {
-    // The worker may ACK while N+1 is still awaiting sender/resource prompt
-    // construction. Keep the route gate and replay this release when the last
-    // reserved arrival either persists or fails.
-    ds.queuedActivationTailReleasePending = acknowledgedToken === undefined
-      ? {}
-      : { acknowledgedToken };
-    return false;
-  }
-  ds.queuedActivationTailReleasePending = undefined;
+ * as one ordered follow-up, never allowed to overtake the opening item.
+ *
+ * One command on the session's turn queue: a follower whose build + admission
+ * is still in flight was enqueued before this release, so the release runs
+ * after its durable tail entry exists — no outstanding counter, no deferred
+ * replay. */
+function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken?: string): Promise<boolean> {
+  return runSessionTurn(ds.session.sessionId, () => releaseQueuedActivationReservationNow(ds, acknowledgedToken));
+}
+
+/** The release itself. Only for a caller already running on the session's turn
+ * queue (a follower admission that found the route released); every other
+ * caller goes through {@link releaseQueuedActivationReservation}. */
+function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedToken?: string): boolean {
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
@@ -17178,27 +17181,6 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     ds.pendingCodexAppApplicationContext = undefined;
   }
 
-  // Migrate pre-durable runtime tails (and tests/rolling-upgrade state) before
-  // advancing. Persistence happens before the volatile cursor is cleared.
-  for (const staged of ds.pendingQueuedActivationFollowUps ?? []) {
-    const reservation = reserveQueuedActivationTailAdmission(ds);
-    try {
-      admitQueuedActivationTail(ds, {
-        userPrompt: staged.userPrompt,
-        cliInput: staged.cliInput,
-        turnId: staged.turnId,
-        dispatchAttempt: staged.dispatchAttempt,
-      }, reservation, { codexAppInputGateFrozen: true });
-    } catch (err) {
-      logger.error(
-        `[${ds.session.sessionId.slice(0, 8)}] Failed to migrate activation successor: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
-    }
-  }
-  ds.pendingQueuedActivationFollowUps = undefined;
-
   if ((ds.session.queuedActivationTail?.length ?? 0) === 0) {
     clearInitialStartBuffers(ds);
     clearInitialStartClaim(ds);
@@ -17230,11 +17212,12 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
 }
 
 export const __testOnly_releaseQueuedActivationReservation = releaseQueuedActivationReservation;
+export const __testOnly_admitFollowerBehindOpening = admitFollowerBehindOpening;
 
 /** Exact production callback passed to initWorkerPool. Keep the boolean return:
  * false means the worker did not accept the staged FIFO head and the pool must
  * retry instead of silently dropping the activation reservation. */
-function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string): boolean {
+function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string): Promise<boolean> {
   return releaseQueuedActivationReservation(ds, activationToken);
 }
 
@@ -17259,12 +17242,19 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   const waitsForQueuedAck = ds.session.queuedActivationPending === true;
   ds.initialStartPending = waitsForQueuedAck
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0;
+    || hasPendingSessionTurns(ds.session.sessionId);
   clearInitialStartBuffers(ds);
   if (!waitsForQueuedAck && ds.initialStartPending) {
-    // A follower may have reserved FIFO order while the opening prompt was
-    // still being built. Hand off now, or defer until its reservation settles.
-    void releaseQueuedActivationReservation(ds);
+    // A follower may still be building its prompt behind this opening. The
+    // release is queued behind it, so the handoff sees every admitted entry.
+    void releaseQueuedActivationReservation(ds).then(released => {
+      if (!released) scheduleQueuedActivationTailReleaseRetry(ds);
+    }, err => {
+      logger.error(
+        `[${ds.session.sessionId.slice(0, 8)}] Failed to release the opening route after fork: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 }
 
@@ -17306,7 +17296,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
   // both the raw text and Enter have crossed the adapter boundary.
   const armRawActivationAck = !ds.session.queuedActivationPending
     && ((ds.session.queuedActivationTail?.length ?? 0) > 0
-      || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0);
+      || hasPendingSessionTurns(ds.session.sessionId));
   if (armRawActivationAck) ds.session.queued = true;
   try {
     forkWorker(ds, '', false);
@@ -20166,39 +20156,41 @@ async function handleThreadReplyAdmitted(
     && !ownsInitialStartClaim()
     && !liveTakeoverReady;
   if (ds && initialStartPending && !ds.pendingRepo) {
-    const tailReservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    try {
-      const botCfg = getBot(ds.larkAppId).config;
-      const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-        attachments,
-        mentions: parsed.mentions,
-        isAdoptMode: false,
-        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
-        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
-        sender: await getThreadSender(),
-        larkAppId,
-        chatId: ds.session.chatId,
-        whiteboardId: ds.session.whiteboardId,
-        substituteTrigger,
-        codexAppText: parsed.content,
-        codexAppApplicationContext,
-        codexAppMessageContext,
-      sessionBackendType: ds.session.backendType,
+    // FIFO order is stamped now, at arrival; the prompt build (sender lookup)
+    // and the durable admission then run as one command on the session's turn
+    // queue, so neither a later arrival nor the opening's ACK can act on the
+    // session in between.
+    const tailReservation = reserveQueuedActivationTailAdmission(ds);
+    await admitFollowerBehindOpening(ds, tailReservation, {
+      userPrompt: promptContent,
       turnId: parsed.messageId,
-      });
-      // R5-B1-1: freeze the admission-time steer authorization onto this earliest
-      // (initialStartPending follower) tail entry — the strip-proof admit rebuild
-      // then preserves it through promote/repark. Only a plain-human turn is true.
-      if (codexAppSteerable) followUp.codexAppSteerable = true;
-      admitQueuedActivationTail(ds, {
-        userPrompt: promptContent,
-        cliInput: followUp,
-        turnId: parsed.messageId,
-      }, tailReservation);
-      markIngressAdmitted(ctx);
-    } finally {
-      settleAsyncQueuedActivationTailAdmission(ds);
-    }
+      build: async () => {
+        const botCfg = getBot(ds.larkAppId).config;
+        const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          attachments,
+          mentions: parsed.mentions,
+          isAdoptMode: false,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+          sender: await getThreadSender(),
+          larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
+          codexAppText: parsed.content,
+          codexAppApplicationContext,
+          codexAppMessageContext,
+          sessionBackendType: ds.session.backendType,
+          turnId: parsed.messageId,
+        });
+        // R5-B1-1: freeze the admission-time steer authorization onto this earliest
+        // (initialStartPending follower) tail entry — the strip-proof admit rebuild
+        // then preserves it through promote/repark. Only a plain-human turn is true.
+        if (codexAppSteerable) followUp.codexAppSteerable = true;
+        return followUp;
+      },
+    });
+    markIngressAdmitted(ctx);
     logger.info(
       `[${tag(ds)}] buffered same-anchor turn ${parsed.messageId.substring(0, 12)} `
       + 'behind queued activation submission ACK',
@@ -20227,13 +20219,9 @@ async function handleThreadReplyAdmitted(
     return;
   }
   if (ds?.pendingRepo || initialStartPending) {
-    const durableTailReservation = ds.pendingRepo
-      ? reserveAsyncQueuedActivationTailAdmission(ds)
-      : undefined;
     const bufferedCodexAppInputAccepted = initialStartPending && !ds.pendingRepo
       ? codexAppCleanInputAcceptedForSession(ds)
       : undefined;
-    try {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
@@ -20331,11 +20319,13 @@ async function handleThreadReplyAdmitted(
         ds.session.queuedCodexAppMessageContext ??= ds.pendingCodexAppMessageContext;
         // R5-B1-1: freeze steer authorization onto the pending-repo follower tail.
         if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
+        // No await separates this arrival from its admission, so the FIFO
+        // order is stamped by the admit itself.
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: exactFollowUp,
           turnId: parsed.messageId,
-        }, durableTailReservation!);
+        });
       }
       // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
       // 失败也不得诱导重发（PR #846 review）。
@@ -20411,9 +20401,6 @@ async function handleThreadReplyAdmitted(
       : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
-    } finally {
-      if (durableTailReservation) settleAsyncQueuedActivationTailAdmission(ds);
-    }
   }
 
   if (!ds) {
@@ -20826,42 +20813,40 @@ async function handleThreadReplyAdmitted(
     // <whiteboard> block in its refork prompt) that its live turns never had.
     if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
     const stageCurrentBehindQueuedActivation = async (): Promise<void> => {
-      const tailReservation = reserveAsyncQueuedActivationTailAdmission(ds);
-      try {
-        const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          attachments,
-          mentions: parsed.mentions,
-          isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
-          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-          sender: await getThreadSender(),
-          larkAppId,
-          chatId: ds.session.chatId,
-          whiteboardId: ds.session.whiteboardId,
-          substituteTrigger,
-          codexAppText: parsed.content,
-          codexAppApplicationContext,
-          codexAppMessageContext,
-        sessionBackendType: ds.session.backendType,
+      const tailReservation = reserveQueuedActivationTailAdmission(ds);
+      await admitFollowerBehindOpening(ds, tailReservation, {
+        userPrompt: promptContent,
         turnId: parsed.messageId,
-        });
-        // R4-B1: freeze the admission-time steer authorization onto the queued
-        // opening payload so the worker-null re-fork path carries it exactly like
-        // the live-worker path (admission computed once at line ~18431; COPIED
-        // here, never re-inferred). System/recovery openings keep it absent.
-        if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
-        if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
-        admitQueuedActivationTail(ds, {
-          userPrompt: promptContent,
-          cliInput: currentFollowUp,
-          turnId: parsed.messageId,
-        }, tailReservation);
-        // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
-        // 不得再诱导重发。
-        markIngressAdmitted(ctx);
-      } finally {
-        settleAsyncQueuedActivationTailAdmission(ds);
-      }
+        build: async () => {
+          const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+            attachments,
+            mentions: parsed.mentions,
+            isAdoptMode: false,
+            cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+            cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+            sender: await getThreadSender(),
+            larkAppId,
+            chatId: ds.session.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger,
+            codexAppText: parsed.content,
+            codexAppApplicationContext,
+            codexAppMessageContext,
+            sessionBackendType: ds.session.backendType,
+            turnId: parsed.messageId,
+          });
+          // R4-B1: freeze the admission-time steer authorization onto the queued
+          // opening payload so the worker-null re-fork path carries it exactly like
+          // the live-worker path (admission computed once at line ~18431; COPIED
+          // here, never re-inferred). System/recovery openings keep it absent.
+          if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
+          if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
+          return currentFollowUp;
+        },
+      });
+      // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
+      // 不得再诱导重发。
+      markIngressAdmitted(ctx);
       ds.initialStartPending = true;
       await noteTurnReceived(
         ds,
@@ -21085,7 +21070,7 @@ async function handleThreadReplyAdmitted(
         // Ordinary cold reforks have no adapter-submission ACK. The child owns
         // the opening init after forkWorker returns, so hand any concurrently
         // buffered followers to its IPC queue now in exact arrival order.
-        retainInitialStartClaim = !releaseQueuedActivationReservation(ds);
+        retainInitialStartClaim = !(await releaseQueuedActivationReservation(ds));
       }
     }
   }

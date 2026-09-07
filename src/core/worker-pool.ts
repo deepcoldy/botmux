@@ -526,6 +526,7 @@ import {
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
@@ -9163,71 +9164,6 @@ function reparkUnsubmittedQueuedActivation(ds: DaemonSession, reason: string): b
   return true;
 }
 
-/** The opening activation was ACKed, but one of the turns held behind its
- * runtime reservation was not accepted before that worker exited. Promote the
- * exact FIFO head into a new durable queued activation so the next inbound or
- * Dashboard activation reforks it before every remaining tail item. */
-function reparkQueuedActivationFollowUpTail(ds: DaemonSession, reason: string): boolean {
-  if (!ds.initialStartPending || ds.session.queuedActivationPending) return false;
-  const next = ds.pendingQueuedActivationFollowUps?.[0];
-  if (!next) return false;
-  const matchingCodexEntries = ds.session.cliId === 'codex-app'
-    ? (ds.session.codexAppDispatchLedger ?? []).filter(entry =>
-      (entry.state === 'accepted' || entry.state === 'prepared')
-      && entry.turnId === next.turnId
-      && entry.dispatchAttempt === next.dispatchAttempt)
-    : [];
-  if (matchingCodexEntries.length > 1) {
-    logger.error(
-      `[${tag(ds)}] Cannot re-park queued follow-up after ${reason}: `
-      + `${matchingCodexEntries.length} Codex entries match turn ${next.turnId}`,
-    );
-    return false;
-  }
-  const retainedCodexEntry = matchingCodexEntries[0];
-  const retainedCodexToken = retainedCodexEntry
-    ? (retainedCodexEntry.queuedActivationToken ?? randomUUID())
-    : undefined;
-  // A failed daemon→worker IPC normally rolls its newly accepted Codex entry
-  // back. If that rollback persistence itself failed, the durable FIFO remains
-  // authoritative: recover it through a tokened ACK journal instead of
-  // creating an invalid queued+unsettled hybrid.
-  ds.session.queued = !retainedCodexEntry;
-  ds.session.queuedPrompt = next.cliInput.content;
-  ds.session.queuedCodexAppText = next.cliInput.codexAppInput?.text;
-  ds.session.queuedCodexAppMessageContext = undefined;
-  ds.session.queuedActivationInput = next.cliInput;
-  ds.session.queuedActivationTurnId = next.turnId;
-  ds.session.queuedActivationDispatchAttempt = next.dispatchAttempt;
-  ds.session.queuedActivationPending = retainedCodexEntry ? true : undefined;
-  ds.session.queuedActivationToken = retainedCodexToken;
-  if (retainedCodexEntry && retainedCodexToken) {
-    retainedCodexEntry.queuedActivationToken = retainedCodexToken;
-  }
-  ds.pendingQueuedActivationFollowUps!.shift();
-  if (ds.pendingQueuedActivationFollowUps!.length === 0) {
-    ds.pendingQueuedActivationFollowUps = undefined;
-  }
-  ds.pendingPrompt = next.cliInput.content;
-  ds.initialStartPending = false;
-  ds.initialStartClaimToken = undefined;
-  try {
-    sessionStore.updateSession(ds.session);
-  } catch (err) {
-    // Keep the exact head parked in memory. The caller has already fenced the
-    // dead worker, so a later inbound can safely retry this owner even if the
-    // durable projection is temporarily unavailable.
-    logger.error(
-      `[${tag(ds)}] Failed to persist queued follow-up re-park after ${reason}: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  logger.warn(`[${tag(ds)}] Re-parked unaccepted queued activation follow-up after ${reason}`);
-  return true;
-}
-
-export const __testOnly_reparkQueuedActivationFollowUpTail = reparkQueuedActivationFollowUpTail;
-
 type AcceptedWorkerForkDispatch = {
   dispatchId: string;
   turnId: string;
@@ -9953,12 +9889,13 @@ export function admitQueuedActivationTail(
 
 /** True while a live worker's opening activation still owns submission order.
  * Every ingress that sees this state must use admitQueuedActivationTail rather
- * than ordinary worker IPC. */
+ * than ordinary worker IPC. A command still queued for the session (a follower
+ * whose prompt is being built, the opening's own release) holds the gate too:
+ * an ordinary turn arriving now must land behind it, not overtake it. */
 export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
-    || ds.queuedActivationTailReleasePending !== undefined
+    || hasPendingSessionTurns(ds.session.sessionId)
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
 }
@@ -10723,8 +10660,6 @@ export function forkWorker(
         // claim so the next generation can replay that exact head.
         ds.initialStartPending = false;
         ds.initialStartClaimToken = undefined;
-      } else {
-        reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
       const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
         || ds.remoteCloseState !== undefined;
@@ -14298,8 +14233,6 @@ function setupWorkerHandlers(
         // this exact head with queuedActivationResume before durable tail N+1.
         ds.initialStartPending = false;
         ds.initialStartClaimToken = undefined;
-      } else {
-        reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
       }
       ds.worker = null;
       ds.workerReady = false;
