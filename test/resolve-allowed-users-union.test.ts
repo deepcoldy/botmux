@@ -196,6 +196,95 @@ describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', (
   });
 });
 
+// B-2: a code-0 batch that OMITS an entry is a definitive miss (no such user /
+// not visible). It used to be completely silent — the entry vanished from the
+// runtime allowlist with no signal at all. The resolver must now (a) list the
+// raw entry in `definitiveMisses` (config order, ou_ literals never included)
+// and (b) log a WARN naming the entry + app. Transient failures must NOT land
+// in definitiveMisses (retry may still recover them).
+describe('resolveAllowedUsersWithMap — definitiveMisses surfacing (B-2)', () => {
+  it('email code-0 batch omitting an entry → definitiveMisses contains it + WARN names entry and app', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_alice', email: 'alice@corp.com' }] } }),
+    );
+
+    const { definitiveMisses, resolved, entryStatus, errored } = await resolveAllowedUsersWithMap(
+      APP, ['alice@corp.com', 'ghost@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['ghost@corp.com']);
+    expect(resolved).toEqual(['ou_alice']);
+    expect(entryStatus.get('ghost@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy(); // definitive, not transient
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ghost@corp.com'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(APP));
+    warn.mockRestore();
+  });
+
+  it('mobile code-0 batch omitting an entry → definitiveMisses contains the RAW config entry', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_bob', mobile: '13800000000' }] } }),
+    );
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(
+      APP, ['13800000000', '13900000000'],
+    );
+
+    expect(definitiveMisses).toEqual(['13900000000']);
+    expect(resolved).toEqual(['ou_bob']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('13900000000'));
+    warn.mockRestore();
+  });
+
+  it('union_id code-0 without open_id → definitiveMisses contains the on_ entry', async () => {
+    stubClient(async ({ path }: any) => ({ code: 0, data: { user: { union_id: path.user_id } } }));
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(APP, ['on_ghost']);
+
+    expect(definitiveMisses).toEqual(['on_ghost']);
+  });
+
+  it('literal ou_ entries NEVER appear in definitiveMisses (always kept as resolved)', async () => {
+    // Even a cross-app ou_ (99992361) is kept as-is by design; the runtime write
+    // path guards it separately (B-3). The resolver must not list it as a miss.
+    stubClient(async () => ({ code: 99992361, msg: 'cross app' }));
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(APP, ['ou_other_app']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(resolved).toEqual(['ou_other_app']);
+  });
+
+  it('transient batch failure (code!=0) → definitiveMisses stays empty (entries are transient, retry-eligible)', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 500, msg: 'batch down' }),
+    );
+
+    const { definitiveMisses, errored } = await resolveAllowedUsersWithMap(APP, ['a@corp.com', 'b@corp.com']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(errored).toBe(true);
+  });
+
+  it('definitiveMisses preserves raw config order and excludes resolved entries', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_keep', email: 'keep@corp.com' }] } }),
+    );
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(
+      APP, ['gone1@corp.com', 'keep@corp.com', 'gone2@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['gone1@corp.com', 'gone2@corp.com']);
+  });
+});
+
 // End-to-end: resolver → applyAllowedUsersResolve → cache decision, for the exact
 // scenario codex flagged — an email-only owner + a batch-wide error (incl 40001)
 // must NOT be locked out. The whole-request error is transient, so the pure fn

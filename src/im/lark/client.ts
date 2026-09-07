@@ -1515,9 +1515,36 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
  */
 export type EntryResolveStatus = 'resolved' | 'transient' | 'definitive';
 
+/**
+ * Result of an allowedUsers resolve. `resolved` / `map` feed the runtime
+ * allowlist and `/revoke` reverse-lookup; `errored` + `entryStatus` drive the
+ * last-known-good cache merge (see allowed-users-apply.ts); `definitiveMisses`
+ * surfaces entries that this pass PROVED unresolvable so callers can warn
+ * instead of silently dropping them.
+ */
+export interface AllowedUsersResolveResult {
+  /** Runtime allowlist: `ou_` only, deduped, raw config order preserved. */
+  resolved: string[];
+  /** `raw entry → ou_` map; key equals the literal string in allowedUsers. */
+  map: Map<string, string>;
+  /** True when contact API hit a transient failure (network / 5xx / rate limit). */
+  errored?: boolean;
+  /** Per-raw-entry outcome; entries absent from the map are treated as `definitive`. */
+  entryStatus: Map<string, EntryResolveStatus>;
+  /**
+   * Raw entries (email / mobile / on_) that this pass DEFINITIVELY could not
+   * resolve (a code-0 batch omitted them, or a definitive contact code such as
+   * 41050 / 41012 / 40001). These are NOT transient — no retry will help and
+   * they must never be revived from the last-known-good cache. Literal `ou_`
+   * entries are always 'resolved' (kept as-is) and never appear here.
+   * Callers surface them as warnings / notices rather than failing the resolve.
+   */
+  definitiveMisses: string[];
+}
+
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
-): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {
+): Promise<AllowedUsersResolveResult> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
   // requested item — the caller can then say "resolution failed, retry" instead
@@ -1647,6 +1674,10 @@ export async function resolveAllowedUsersWithMap(
               // the returned user_list → definitive miss (no such user / not
               // visible), NOT a transient failure. Do not fall back to cache.
               entryStatus.set(rawEmail, 'definitive');
+              // B-2: a definitive miss used to be completely silent — the entry
+              // vanished from the runtime allowlist with no log line at all.
+              logger.warn(`allowedUsers email ${rawEmail} definitively unresolved for ${larkAppId} ` +
+                `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -1713,6 +1744,9 @@ export async function resolveAllowedUsersWithMap(
               // code-0 but this mobile absent from user_list → definitive miss
               // (no such user / not visible), same as the email case.
               entryStatus.set(rawEntry, 'definitive');
+              // B-2: same silent-drop fix as the email branch above.
+              logger.warn(`allowedUsers mobile ${rawEntry} definitively unresolved for ${larkAppId} ` +
+                `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -1740,7 +1774,17 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored, entryStatus };
+  // B-2: collect every entry this pass DEFINITIVELY could not resolve, in raw
+  // config order, so callers (runtime write → user-facing warning; startup path
+  // → owner DM) can surface them. Computed from entryStatus at the end so every
+  // definitive-marking site above (email batch / mobile batch / union_id
+  // single-get) is covered by one list. Literal ou_ is always 'resolved' and
+  // never appears; transient entries are excluded (retry may still recover them).
+  const definitiveMisses: string[] = [];
+  for (const v of raw) {
+    if (entryStatus.get(v) === 'definitive') definitiveMisses.push(v);
+  }
+  return { resolved, map, errored, entryStatus, definitiveMisses };
 }
 
 /**
