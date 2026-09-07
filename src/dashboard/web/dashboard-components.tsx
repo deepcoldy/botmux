@@ -514,12 +514,15 @@ function clippingAncestorBoxes(el: HTMLElement): { top: number; bottom: number }
     // `overflow: hidden` grandparent). Stop, or a modal would be budgeted
     // against a container it visibly escapes.
     //
-    // Its own box is already recorded above but rarely changes the outcome:
-    // popupClipFrame starts from the viewport and a fixed box cannot leave it,
-    // so the viewport clamp usually supplies the same bound (measured on the
-    // dashboard's four modal dropdowns: at most 6px tighter, well under the
-    // 140px floor). Recorded anyway so the frame stays correct if a modal ever
-    // drops the inner scroll container that currently does the cropping.
+    // Its own box is already recorded above. On today's four modal dropdowns
+    // that changes the frame by at most a few pixels — but only because each of
+    // them also has an inner scroll container, clamped to roughly the same
+    // height, that was recorded before we got here. The viewport does not
+    // supply that bound: a fixed box centred in a taller viewport sits strictly
+    // inside it (measured: a 219-380 dialog against a 0-599 viewport), so the
+    // clamp contributes nothing. Drop the inner container from such a modal and
+    // skipping this box would over-budget the popup by ~200px, straight back to
+    // the overshoot this whole walk exists to prevent.
     if (style.position === 'fixed') break;
   }
   return boxes;
