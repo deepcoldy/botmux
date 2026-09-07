@@ -219,4 +219,27 @@ describe('dropdown popup respects clipping ancestors, not just the viewport', ()
     expect(source).toMatch(/frameTop: frame\.top/);
     expect(source).toMatch(/frameBottom: frame\.bottom/);
   });
+
+  it('records a fixed ancestor own box before stopping at it', () => {
+    // `showModal()` makes a <dialog> `position: fixed` via the UA stylesheet, and
+    // the dashboard's modals add their own overflow, so the stopping node is
+    // itself a clipper. Breaking before the push would drop it: today the
+    // viewport clamp hides that (a fixed box cannot leave the viewport), but a
+    // modal that dropped its inner scroll container would silently regress.
+    const source = readFileSync(new URL('../src/dashboard/web/dashboard-components.tsx', import.meta.url), 'utf8');
+    const walk = source.slice(
+      source.indexOf('function clippingAncestorBoxes'),
+      source.indexOf('export function DropdownMenu'));
+    expect(walk).not.toBe('');
+    const pushAt = walk.indexOf('boxes.push(');
+    const breakAt = walk.indexOf("if (style.position === 'fixed') break;");
+    expect(pushAt).toBeGreaterThan(-1);
+    expect(breakAt).toBeGreaterThan(-1);
+    // Order is the whole point: record, then stop.
+    expect(pushAt).toBeLessThan(breakAt);
+    // And the push must not be nested under the fixed check (which would make
+    // the ordering vacuous) — it is gated on cropping only.
+    expect(walk).toMatch(/const crops = !\(style\.overflowY === 'visible' && style\.overflowX === 'visible'\);/);
+    expect(walk).toMatch(/if \(crops\) \{/);
+  });
 });

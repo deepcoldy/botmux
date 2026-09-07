@@ -489,23 +489,38 @@ export function dropdownPlacement(input: {
  * the popup. Should a popup ever be re-parented out of the menu, or the menu
  * be made `position: static`, this walk would need the containing block
  * checked per ancestor rather than assumed.
+ *
+ * Two distinct things happen at a `position: fixed` ancestor, and conflating
+ * them drops a real clipper: boxes *above* it stop applying, but the fixed box
+ * *itself* still crops its own descendants — a `<dialog>` opened with
+ * `showModal()` is exactly that (the UA stylesheet makes it fixed, and the
+ * dashboard's modals add their own `overflow`). So record it, then stop.
  */
 function clippingAncestorBoxes(el: HTMLElement): { top: number; bottom: number }[] {
   const boxes: { top: number; bottom: number }[] = [];
   for (let node = el.parentElement; node && node !== document.documentElement; node = node.parentElement) {
     const style = window.getComputedStyle(node);
-    // A `fixed` box is positioned against the viewport, so overflow boxes above
-    // it in the tree do not crop it (verified in Chromium: a popup inside a
-    // `position: fixed` panel stays visible and hit-testable well outside an
-    // `overflow: hidden` grandparent). Stop here or a modal/panel would be
-    // budgeted against a container it visibly escapes.
-    if (style.position === 'fixed') break;
     // `clip`/`hidden`/`auto`/`scroll` all crop; only `visible` lets the popup out.
     // A single axis is enough: `overflow-x: hidden` forces the other axis to a
     // scrolling value too, so reading both keeps mixed pairs from slipping past.
-    if (style.overflowY === 'visible' && style.overflowX === 'visible') continue;
-    const box = node.getBoundingClientRect();
-    boxes.push({ top: box.top, bottom: box.bottom });
+    const crops = !(style.overflowY === 'visible' && style.overflowX === 'visible');
+    if (crops) {
+      const box = node.getBoundingClientRect();
+      boxes.push({ top: box.top, bottom: box.bottom });
+    }
+    // A `fixed` box is positioned against the viewport, so overflow boxes above
+    // it in the tree do not crop it (verified in Chromium: a popup inside a
+    // `position: fixed` panel stays visible and hit-testable well outside an
+    // `overflow: hidden` grandparent). Stop, or a modal would be budgeted
+    // against a container it visibly escapes.
+    //
+    // Its own box is already recorded above but rarely changes the outcome:
+    // popupClipFrame starts from the viewport and a fixed box cannot leave it,
+    // so the viewport clamp usually supplies the same bound (measured on the
+    // dashboard's four modal dropdowns: at most 6px tighter, well under the
+    // 140px floor). Recorded anyway so the frame stays correct if a modal ever
+    // drops the inner scroll container that currently does the cropping.
+    if (style.position === 'fixed') break;
   }
   return boxes;
 }
