@@ -13383,6 +13383,9 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
+  // Internal helper: importing the top-level script executes its read-only PM2
+  // observer. Keep this static so Bun includes it in the compiled module graph.
+  else if (__entrySubcommand === 'pm2-readonly-client') await import('./cli/pm2-readonly-client.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch

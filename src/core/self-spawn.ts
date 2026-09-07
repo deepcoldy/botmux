@@ -33,7 +33,10 @@ export type BotmuxEntry =
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
-  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner';
+  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
+  // Internal helpers are neither fleet processes nor CLI session runners, but
+  // still need a hidden self-spawn entry in the standalone binary.
+  | 'pm2-readonly-client';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -46,6 +49,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
   'mir-runner': '__mir-runner',
+  'pm2-readonly-client': '__pm2-readonly-client',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -59,6 +63,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',
   'mir-runner': 'mir-runner.js',
+  'pm2-readonly-client': 'cli/pm2-readonly-client.js',
 };
 
 /**
@@ -80,6 +85,11 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
   'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
+] as const;
+
+/** Internal subprocess helpers that are not user-facing CLI session runners. */
+export const INTERNAL_HELPER_ENTRIES: readonly BotmuxEntry[] = [
+  'pm2-readonly-client',
 ] as const;
 
 /**
@@ -170,6 +180,11 @@ export function resolveCliSpawn(
 
 /** The set of hidden subcommand tokens, so the CLI dispatcher can recognize them. */
 export const ENTRY_SUBCOMMANDS: ReadonlySet<string> = new Set(Object.values(ENTRY_SUBCOMMAND));
+
+/** Map an entry to the hidden subcommand used for standalone self-spawn. */
+export function subcommandForEntry(entry: BotmuxEntry): string {
+  return ENTRY_SUBCOMMAND[entry];
+}
 
 /**
  * The hidden token a compiled binary is launched with to become a worker, i.e.

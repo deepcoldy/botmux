@@ -2,10 +2,14 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LinuxPm2GodProcess } from '../core/pm2-lifecycle-owner.js';
+import { isStandaloneBinary, subcommandForEntry } from '../core/self-spawn.js';
 
 const ABSENT_EXIT_CODE = 3;
 
-function helperArgs(pkgRoot: string, modeArgs: string[]): string[] {
+export function helperArgs(pkgRoot: string, modeArgs: string[]): string[] {
+  if (isStandaloneBinary()) {
+    return [subcommandForEntry('pm2-readonly-client'), ...modeArgs];
+  }
   const built = join(pkgRoot, 'dist', 'cli', 'pm2-readonly-client.js');
   if (import.meta.url.includes('/dist/cli/pm2-readonly.js') && existsSync(built)) {
     return [built, ...modeArgs];
