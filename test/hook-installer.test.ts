@@ -126,8 +126,45 @@ describe('installHook — claude-settings', () => {
     const botmuxReady = ss.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('session-ready')));
     expect(botmuxReady.length).toBe(1);
     expect(botmuxReady[0].hooks[0].command).toBe(readyCmd2);
-    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(false);
+    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(true);
     expect(hasInstalledSessionReadyHook({ ...hookInstall, sessionStartCommand: readyCmd2 })).toBe(true);
+  });
+
+  it('ready preflight recognizes a standalone hook after switching to a Node launch path', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '/home/u/.botmux/bin/botmux session-ready' }] },
+        ],
+      },
+    }));
+
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: '/usr/bin/node /opt/botmux/dist/cli.js session-ready',
+    })).toBe(true);
+  });
+
+  it.each([
+    '/repo/dist-bin/botmux-linux-x64 session-ready',
+    '/repo/dist-bin/botmux-future-riscv64 session-ready',
+  ])('ready preflight preserves an exact command match: %s', (installedCommand) => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: installedCommand }] },
+        ],
+      },
+    }));
+
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: installedCommand,
+    })).toBe(true);
   });
 
   it('ready preflight fails closed for malformed or unrelated SessionStart config', () => {
@@ -137,6 +174,22 @@ describe('installHook — claude-settings', () => {
         SessionStart: [
           { matcher: 'malformed-without-hooks' },
           { hooks: [{ type: 'command', command: '/usr/bin/unrelated-ready-hook' }] },
+        ],
+      },
+    }));
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: '/usr/bin/node /path/to/cli.js session-ready',
+    })).toBe(false);
+  });
+
+  it('ready preflight does not accept a third-party command with the same suffix', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '/usr/bin/botmux-helper session-ready' }] },
         ],
       },
     }));
@@ -180,7 +233,7 @@ describe('installHook — claude-settings', () => {
     const botmuxUps = ups.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('user-prompt-hook')));
     expect(botmuxUps.length).toBe(1);
     expect(botmuxUps[0].hooks[0].command).toBe(promptCmd2);
-    // 结构化识别：换路径后 preflight 仍为 true（与 hasInstalledSessionReadyHook 的精确字符串匹配不同）
+    // 结构化识别：换路径后 preflight 仍为 true。
     expect(hasInstalledPromptHook({ configPath, format: 'claude-settings', userPromptSubmitCommand: promptCmd2 })).toBe(true);
   });
 

@@ -2,9 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:child_process';
+import { textSpawnResult } from './helpers/spawn-result.js';
+
+type TextSpawnSync = (
+  command: string,
+  args?: readonly string[],
+  options?: SpawnSyncOptionsWithStringEncoding,
+) => SpawnSyncReturns<string>;
 
 const childProcess = vi.hoisted(() => ({
-  spawnSync: vi.fn(),
+  spawnSync: vi.fn<TextSpawnSync>(),
   ownershipProcesses: [
     { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
   ] as Array<{ pid: number; cgroup: string; startIdentity: string }>,
@@ -43,7 +51,7 @@ describe('plugin PM2 environment', () => {
     childProcess.ownershipProcesses = [
       { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
     ];
-    childProcess.spawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+    childProcess.spawnSync.mockReturnValue(textSpawnResult({ status: 0 }));
   });
 
   afterEach(() => {

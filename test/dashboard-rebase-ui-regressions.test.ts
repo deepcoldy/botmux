@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { cssRuleBody } from './helpers/css-rule.js';
 
 function dashboardSource(file: string): string {
   return readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8');
@@ -88,7 +89,9 @@ describe('dashboard master feature integration', () => {
     // DropdownMenu is shared by Bots, Roles, Settings, and Sessions. Its disabled
     // appearance belongs to the shared selector rather than a page-specific override.
     expect(css).toContain('.sect-sort-menu.is-disabled > summary,');
-    expect(css).toMatch(/\.sect-sort-menu\.is-disabled > summary:hover \{[\s\S]*?cursor: not-allowed;[\s\S]*?opacity: 0\.62;/);
+    const disabledSummary = cssRuleBody(css, '.sect-sort-menu.is-disabled > summary:hover');
+    expect(disabledSummary).toMatch(/cursor:\s*not-allowed;/);
+    expect(disabledSummary).toMatch(/opacity:\s*0\.62;/);
     expect(css).not.toContain('.kanban-team-menu.is-disabled > summary');
   });
 

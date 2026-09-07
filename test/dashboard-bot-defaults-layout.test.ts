@@ -1,50 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { cssRuleBody } from './helpers/css-rule.js';
 
 const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
-
-// Slice out ONE rule body, ending at its own closing brace.
-//
-// Bounding the slice on the *next* landmark instead (`@media`, the following
-// selector) makes the window wider than the rule: any declaration in a rule
-// that later gets inserted into that gap satisfies the assertions, while the
-// property they are meant to pin has already been deleted. Verified: dropping
-// `align-content: start` from .bd-roster-list and adding an unrelated rule
-// carrying it before the @media kept all assertions green.
-//
-// `.bd-roster-list` is declared TWICE — once at top level for desktop, once
-// inside @media (max-width: 980px). Every caller here wants the desktop rule,
-// which is the first match, so this takes the first and does not offer a
-// choice.
-//
-// This is NOT a safety net for a rename, and the gap is only partial: rename
-// the desktop rule and the mobile copy becomes the first match. Only the
-// `align-content: start` assertion then fails, because the mobile body has no
-// such declaration; `min-height: 0`, `overflow-y: auto` and
-// `overscroll-behavior: contain` all happen to be present in the mobile body
-// too, so those three keep passing against the wrong rule. Measured, not
-// assumed. Pinning a declaration that both copies share needs a check the
-// slice cannot give you.
-//
-// These rule bodies contain no nested blocks, so the first `}` after the
-// selector is the closing brace. Throw rather than slice from -1.
-//
-// Every rule assertion in this file goes through here. Leaving even one
-// landmark-bounded slice behind is what let the pattern spread in the first
-// place: the fill-height shell block used to be sliced as one 800-char window
-// spanning five rules, and deleting `overflow: hidden` from `main:has(...)`
-// alone kept every assertion green, because the very next rule carries the
-// same declaration and `[\s\S]*?` walked into it. That window needed no
-// planted decoy at all — the duplicates were already there.
-function ruleBody(selector: string): string {
-  const start = css.indexOf(selector);
-  if (start === -1) throw new Error(`selector not found in style.css: ${selector}`);
-  const end = css.indexOf('}', start);
-  if (end === -1) throw new Error(`unterminated rule in style.css: ${selector}`);
-  return css.slice(start, end);
-}
 
 describe('bot defaults focused layout', () => {
   it('keeps every task panel mounted while hiding inactive categories', () => {
@@ -75,7 +35,7 @@ describe('bot defaults focused layout', () => {
     // CSS: single column + auto rows by default, 2 cols + 1px row track in the container query
     expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?grid-auto-rows:\s*auto;/);
     expect(css).toMatch(/@container \(min-width: 1024px\)\s*\{[\s\S]*?\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?grid-auto-rows:\s*1px;/);
-    expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid > \.bd-tile-wide\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-tab-grid > .bd-tile-wide')).toMatch(/grid-column:\s*1 \/ -1;/);
   });
 
   it('fills the desktop main so the roster cannot be shoved under the search box', () => {
@@ -84,21 +44,21 @@ describe('bot defaults focused layout', () => {
     // sliding it up and clips #bd-filters. Desktop therefore uses the same
     // fill-height shell as roles-page: main does not scroll, both columns
     // stretch, the list and the detail pane are the scrollports.
-    const desktop = ruleBody('main:has(.bot-defaults-page) {');
+    const desktop = cssRuleBody(css, 'main:has(.bot-defaults-page)');
     expect(desktop).toMatch(/overflow:\s*hidden;/);
-    expect(ruleBody('main:has(.bot-defaults-page) .bot-defaults-page {')).toMatch(/grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
-    expect(ruleBody('main:has(.bot-defaults-page) .bd-layout {')).toMatch(/align-items:\s*stretch;/);
-    const shellRoster = ruleBody('main:has(.bot-defaults-page) .bd-roster {');
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bot-defaults-page')).toMatch(/grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-layout')).toMatch(/align-items:\s*stretch;/);
+    const shellRoster = cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-roster');
     expect(shellRoster).toMatch(/position:\s*static;/);
     expect(shellRoster).toMatch(/height:\s*100%;/);
-    expect(ruleBody('main:has(.bot-defaults-page) .bd-detail {')).toMatch(/overflow-y:\s*auto;/);
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-detail')).toMatch(/overflow-y:\s*auto;/);
 
-    const roster = ruleBody('.bot-defaults-page .bd-roster {');
+    const roster = cssRuleBody(css, '.bot-defaults-page .bd-roster');
     expect(roster).toMatch(/grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
     expect(roster).toMatch(/overflow:\s*hidden;/);
     expect(roster).not.toMatch(/max-height:\s*calc\(100dvh/);
 
-    const list = ruleBody('.bot-defaults-page .bd-roster-list {');
+    const list = cssRuleBody(css, '.bot-defaults-page .bd-roster-list');
     expect(list).toMatch(/min-height:\s*0;/);
     expect(list).toMatch(/overflow-y:\s*auto;/);
     expect(list).toMatch(/overscroll-behavior:\s*contain;/);
@@ -111,7 +71,7 @@ describe('bot defaults focused layout', () => {
     // per row instead of 54.4px, so the selected row rendered as a tall block
     // and the last row sank to the panel floor. align-content:start makes the
     // rows keep their content height and leaves the slack as empty space.
-    const list = ruleBody('.bot-defaults-page .bd-roster-list {');
+    const list = cssRuleBody(css, '.bot-defaults-page .bd-roster-list');
     expect(list).toMatch(/align-content:\s*start;/);
   });
 
@@ -189,7 +149,7 @@ describe('bot defaults focused layout', () => {
     const profileHead = page.slice(profileStart, tabsStart);
 
     expect(profileHead).toContain('<BotDescriptionControl bot={bot} />');
-    expect(css).toMatch(/\.bot-defaults-page \.bd-description-preview\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-description-preview')).toMatch(/-webkit-line-clamp:\s*2;/);
     expect(css).toMatch(/\.bot-defaults-page \.bd-description-modal\s*\{[\s\S]*?max-height:\s*min\(720px,\s*calc\(100vh - 32px\)\);/);
   });
 
@@ -222,7 +182,7 @@ describe('bot defaults focused layout', () => {
     expect(i18n).not.toContain('产品默认 3 条');
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
-    expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-grant-defaults > .actions')).toMatch(/justify-content:\s*flex-end;/);
   });
 
   it('offers granular Session owner reminder controls in advanced settings', () => {

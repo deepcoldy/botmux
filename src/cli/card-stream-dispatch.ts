@@ -7,6 +7,7 @@ import type {
   CardStreamRecord,
   CardStreamSequenceLease,
 } from '../services/card-stream-store.js';
+import { flagPresentButValueMissing } from './arg-utils.js';
 
 const STREAM_ID_RE = /^cs_[0-9a-f]{32}$/;
 const ELEMENT_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,19}$/;
@@ -43,14 +44,6 @@ export function cardStreamArgsWantHelp(args: string[]): boolean {
   return args.includes('--help') || args.includes('-h');
 }
 
-function flagPresentButValueMissing(args: string[], flag: string): boolean {
-  const i = args.findIndex(a => a === flag || a.startsWith(`${flag}=`));
-  if (i < 0) return false;
-  if (args[i].startsWith(`${flag}=`)) return args[i].slice(flag.length + 1) === '';
-  const next = args[i + 1];
-  return next === undefined || (next.startsWith('-') && next !== '-');
-}
-
 function flagValue(args: string[], flag: string): string | undefined {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -61,7 +54,7 @@ function flagValue(args: string[], flag: string): string | undefined {
 }
 
 function optionalSessionId(args: string[]): { ok: true; sessionId?: string } | { ok: false; error: string } {
-  if (flagPresentButValueMissing(args, '--session-id')) {
+  if (flagPresentButValueMissing(args, '--session-id', false)) {
     return { ok: false, error: '--session-id 需要会话 id 参数' };
   }
   const sessionId = flagValue(args, '--session-id');
@@ -181,7 +174,7 @@ export function parseCardStreamArgs(args: string[]): CardStreamParsedArgs {
   if (flagPresentButValueMissing(flags, '--content')) {
     return { ok: false, error: '--content 需要文本参数' };
   }
-  if (flagPresentButValueMissing(flags, '--content-file')) {
+  if (flagPresentButValueMissing(flags, '--content-file', true)) {
     return { ok: false, error: '--content-file 需要路径或 -' };
   }
   const content = flagValue(flags, '--content');

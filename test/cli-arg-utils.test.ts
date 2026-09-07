@@ -6,7 +6,12 @@
  * Run:  pnpm vitest run test/cli-arg-utils.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { firstPositional, hasFlagOrEq, unknownFlags } from '../src/cli/arg-utils.js';
+import {
+  firstPositional,
+  flagPresentButValueMissing,
+  hasFlagOrEq,
+  unknownFlags,
+} from '../src/cli/arg-utils.js';
 
 describe('firstPositional', () => {
   it('returns the first non-flag token in a plain positional list', () => {
@@ -59,6 +64,28 @@ describe('hasFlagOrEq', () => {
     // `--teammate` must not satisfy a `--team` check.
     expect(hasFlagOrEq(['--teammate', 'x'], '--team')).toBe(false);
     expect(hasFlagOrEq(['--teammate=x'], '--team')).toBe(false);
+  });
+});
+
+describe('flagPresentButValueMissing', () => {
+  it('rejects absent bare and empty equals values', () => {
+    expect(flagPresentButValueMissing(['--session-id'], '--session-id')).toBe(true);
+    expect(flagPresentButValueMissing(['--session-id='], '--session-id')).toBe(true);
+  });
+
+  it('rejects a following flag but can allow the stdin dash sentinel', () => {
+    expect(flagPresentButValueMissing(
+      ['--session-id', '--stream-id', 'cs_1'],
+      '--session-id',
+    )).toBe(true);
+    expect(flagPresentButValueMissing(['--content-file', '-'], '--content-file', true)).toBe(false);
+    expect(flagPresentButValueMissing(['--session-id', '-'], '--session-id', false)).toBe(true);
+    expect(flagPresentButValueMissing(['--session-id=-'], '--session-id', false)).toBe(true);
+  });
+
+  it('accepts ordinary values and absent flags', () => {
+    expect(flagPresentButValueMissing(['--session-id', 'sid_1'], '--session-id')).toBe(false);
+    expect(flagPresentButValueMissing([], '--session-id')).toBe(false);
   });
 });
 

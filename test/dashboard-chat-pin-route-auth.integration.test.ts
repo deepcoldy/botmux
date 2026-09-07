@@ -90,7 +90,7 @@ async function stopChild(child: ChildProcess | undefined): Promise<void> {
   }
 }
 
-describe('dashboard pin-streaming-card route auth', () => {
+describe('dashboard group mutation route auth', () => {
   let rootDir = '';
   let fakeDaemon: Server | undefined;
   let dashboardChild: ChildProcess | undefined;
@@ -122,13 +122,19 @@ describe('dashboard pin-streaming-card route auth', () => {
     }], null, 2));
     const dashboardToken = loadOrCreatePersistedToken(join(botmuxDir, '.dashboard-token'));
 
-    const pinWrites: Array<{ method: string; url: string }> = [];
-    fakeDaemon = createServer((req, res) => {
+    const daemonWrites: Array<{ method: string; url: string; body: string }> = [];
+    fakeDaemon = createServer(async (req, res) => {
       const url = req.url ?? '/';
-      if (req.method === 'PUT' && url === '/api/chat-pin-streaming-card/oc%20auth%2Ftopic') {
-        pinWrites.push({ method: req.method, url });
+      const bodyChunks: Buffer[] = [];
+      for await (const chunk of req) bodyChunks.push(chunk as Buffer);
+      const body = Buffer.concat(bodyChunks).toString('utf8');
+      if (req.method === 'PUT' && (
+        url === '/api/chat-pin-streaming-card/oc%20auth%2Ftopic'
+        || url === '/api/groups/oc%20auth%2Ftopic/name'
+      )) {
+        daemonWrites.push({ method: req.method, url, body });
         res.writeHead(202, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, enabled: false }));
+        res.end(JSON.stringify({ ok: true, changed: true }));
         return;
       }
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -176,6 +182,8 @@ describe('dashboard pin-streaming-card route auth', () => {
     const base = `http://127.0.0.1:${dashboardPort}`;
     const pinRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
       + `/pin-streaming-card/${encodeURIComponent('cli auth-test-app')}`;
+    const renameRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
+      + `/name/${encodeURIComponent('cli auth-test-app')}`;
     const anonymousPin = () => requestLoopback(pinRoute, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -189,20 +197,56 @@ describe('dashboard pin-streaming-card route auth', () => {
       },
       body: JSON.stringify({ enabled: false }),
     });
-    expect({ status: authenticatedPin.status, pinWrites }, stderr).toEqual({
+    expect({ status: authenticatedPin.status, daemonWrites }, stderr).toEqual({
       status: 202,
-      pinWrites: [{
+      daemonWrites: [{
         method: 'PUT',
         url: '/api/chat-pin-streaming-card/oc%20auth%2Ftopic',
+        body: '{"enabled":false}',
       }],
     });
-    pinWrites.length = 0;
+    daemonWrites.length = 0;
+
+    const authenticatedRename = await requestLoopback(renameRoute, {
+      method: 'PUT',
+      headers: {
+        cookie: `botmux_dashboard_token=${dashboardToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'New name' }),
+    });
+    expect({ status: authenticatedRename.status, daemonWrites }, stderr).toEqual({
+      status: 202,
+      daemonWrites: [{
+        method: 'PUT',
+        url: '/api/groups/oc%20auth%2Ftopic/name',
+        body: '{"name":"New name"}',
+      }],
+    });
+    daemonWrites.length = 0;
+
+    const oversizedRename = await requestLoopback(renameRoute, {
+      method: 'PUT',
+      headers: {
+        cookie: `botmux_dashboard_token=${dashboardToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'x'.repeat(4_096) }),
+    });
+    expect(JSON.parse(oversizedRename.bodyText)).toEqual({ ok: false, error: 'body_too_large' });
+    expect({ status: oversizedRename.status, daemonWrites }, stderr).toEqual({ status: 413, daemonWrites: [] });
 
     const privateModeDenied = await anonymousPin();
-    expect({ status: privateModeDenied.status, pinWrites }, stderr).toEqual({
+    expect({ status: privateModeDenied.status, daemonWrites }, stderr).toEqual({
       status: 401,
-      pinWrites: [],
+      daemonWrites: [],
     });
+    const privateRenameDenied = await requestLoopback(renameRoute, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Denied' }),
+    });
+    expect({ status: privateRenameDenied.status, daemonWrites }, stderr).toEqual({ status: 401, daemonWrites: [] });
 
     const enablePublicReadOnly = await requestLoopback(`${base}/api/settings`, {
       method: 'PUT',
@@ -222,9 +266,15 @@ describe('dashboard pin-streaming-card route auth', () => {
     });
 
     const publicModeDenied = await anonymousPin();
-    expect({ status: publicModeDenied.status, pinWrites }, stderr).toEqual({
+    expect({ status: publicModeDenied.status, daemonWrites }, stderr).toEqual({
       status: 401,
-      pinWrites: [],
+      daemonWrites: [],
     });
+    const publicRenameDenied = await requestLoopback(renameRoute, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Denied' }),
+    });
+    expect({ status: publicRenameDenied.status, daemonWrites }, stderr).toEqual({ status: 401, daemonWrites: [] });
   }, 20_000);
 });

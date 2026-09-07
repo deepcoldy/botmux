@@ -265,3 +265,139 @@ jobs:
           for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
           ls -la
           echo "✅ host user wrote checksums into a container-produced directory"
+
+  # The darwin binaries are shipped artifacts that NO pre-release gate touched
+  # until this job existed: `darwin`/`macos` appeared zero times in this file, so
+  # every macOS-only failure mode was first observed during a release — after the
+  # tag had been pushed. Two reached that point:
+  #   • 3.18.14's darwin-arm64 shipped an INVALID ad-hoc Mach-O signature (bun
+  #     1.4.0, oven-sh/bun#39764). Recent macOS SIGKILLs such a binary before
+  #     main(), so all `botmux upgrade` saw was a dead process (exit 137).
+  #   • v3.19.0 was stopped by release.yml's codesign gate on darwin-x64: bun
+  #     1.4.1 fixed the HOST arch only, and the cross-compiled x64 output still
+  #     left ~25 MB outside its signed range (CodeDirectory codeLimit 68776432
+  #     vs signature start 94548464). The tag is now permanently burned with no
+  #     Release behind it, and the fix had to ship as v3.19.1.
+  # Neither was visible to any other leg: vitest runs on Linux, and the
+  # linux/musl binary jobs cannot invoke `codesign` because it is an Apple tool
+  # that does not exist there. The signature path was reachable ONLY in a
+  # release run, which is precisely why it kept escaping to users.
+  #
+  # WHY macos-14 SPECIFICALLY, and not "some macOS runner": it is arm64, which
+  # is what makes darwin-x64 a CROSS-COMPILE — and cross-compiling is the only
+  # configuration that reproduces the v3.19.0 defect at all (the native arm64
+  # output was valid on the very same run). On an x64 macOS runner the broken
+  # output would be darwin-arm64 instead; the loop below verifies BOTH, so the
+  # gate stays correct either way, but the runner must track release.yml's or
+  # this stops exercising the cell the release actually ships from.
+  #
+  # Free for this repo: macOS runners bill 10× minutes on private repos, but
+  # public repos consume no included minutes at all.
+  bun-binary-darwin:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.1
+
+      # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
+      # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
+      # both arches — unlike linux, where the native is node-gyp'd for the host
+      # arch only. This install is also the only place in CI where the darwin
+      # branch of scripts/build-bun-binary.mjs (`resolveNodePtyNative` picking a
+      # prebuild, and the spawn-helper embed) is exercised at all.
+      - run: bun install --frozen-lockfile
+
+      # Same reason and same ORDER as the linux/musl legs: the compiled binary
+      # has no package.json on disk, so the version is baked at compile time,
+      # and the repo's 0.0.0 placeholder is deliberately read as "nothing baked"
+      # — compiling from it yields `--version: unknown`, which the smoke gate
+      # fails. Must come AFTER install so --frozen-lockfile sees the committed
+      # manifest, and BEFORE the compile that bakes the value in.
+      - run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
+
+      - run: bun run build
+
+      - name: Compile both darwin binaries
+        # BOTH arches, because the shipped set is both and the defect lives in
+        # the cross-built one. Mirrors release.yml's `bun-binaries` macOS leg
+        # (same script, same --out naming) so this gate cannot drift into
+        # testing a different artifact than the one that ships.
+        run: |
+          mkdir -p dist-bin
+          for t in bun-darwin-x64 bun-darwin-arm64; do
+            bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+          done
+
+      - name: Prove each binary really is the arch it is named after
+        # Without this the signature verdict below can be VACUOUS. If `--target`
+        # were ignored, or the native resolution fell back to the host prebuild,
+        # both outputs would be native arm64 — `codesign` would validate them
+        # happily (native signing was never the broken case) and this job would
+        # be green while darwin-x64 users received an arm64 binary that cannot
+        # execute. The defect this job exists for lives ONLY in the cross-built
+        # output, so "the cross-built output is genuinely cross-built" is
+        # load-bearing, not decoration.
+        #
+        # Also fails closed when only ONE of the two was produced: the verify
+        # loop's own `found=0` guard cannot see a half-empty dist-bin.
+        run: |
+          set -e
+          for pair in "x64:x86_64" "arm64:arm64"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            f="dist-bin/botmux-darwin-$name"
+            test -f "$f" || { echo "REFUSING: $f was not produced"; exit 1; }
+            # Whitespace-stripped rather than compared raw: `lipo -archs` prints
+            # arch names space-separated, so this also rejects a FAT binary that
+            # merely contains the wanted arch (we ship thin, one arch per file).
+            got="$(lipo -archs "$f" | tr -d '[:space:]')"
+            echo "$f: lipo -archs → $got (want $want)"
+            [ "$got" = "$want" ] || { echo "REFUSING: $f is $got, not $want"; exit 1; }
+          done
+
+      - name: Verify Mach-O signatures on every darwin binary
+        # The gate this whole job exists for. Byte-for-byte the same check
+        # release.yml runs after its darwin compile, so the PR gate can never be
+        # the weaker one — including the `*.map|*.sha256` skip (`sourcemap:
+        # 'linked'` drops a .map next to each binary, and codesign would reject
+        # it as "not a Mach-O file") and the fail-closed `found=0`, which stops a
+        # glob that matches nothing from reading as a pass.
+        #
+        # `--strict` is the parameter that matters: it is what newer macOS
+        # loaders effectively enforce, and it is what separates "rejects
+        # v3.19.0's darwin-x64" from "lets it through".
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            echo "verifying signature: $f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
+      - name: Smoke-test the host-arch binary
+        # A runner can only execute its own arch, so this runs the arm64 output;
+        # the cross-built x64 one is covered by the signature + arch checks
+        # above. Shares scripts/smoke-bun-binary.mjs with the release leg and the
+        # linux/musl jobs, so no platform gets a weaker smoke — and on darwin
+        # that script ALSO re-verifies the signature as its check 0, before
+        # anything else runs.
+        #
+        # What only this platform can prove: the embedded darwin native actually
+        # loads. node-pty dlopens pty.node at module scope and needs its
+        # spawn-helper sidecar on macOS (linux uses forkpty() and has none), so
+        # a mis-embedded darwin native surfaces here and nowhere else.
+        run: |
+          BIN="dist-bin/botmux-darwin-$(node -e 'process.stdout.write(process.arch)')"
+          test -x "$BIN" || { echo "host-arch binary $BIN not built on this runner"; exit 1; }
+          node scripts/smoke-bun-binary.mjs "$BIN"

@@ -31,6 +31,25 @@ Authenticated administrators can manage botmux background-service auto-start und
 
 The toggle reuses the existing `botmux autostart` behavior. It only manages the entry used at the next boot/login and does not start, stop, or restart the current daemon.
 
+## Authenticated integration actions
+
+An authenticated host integration can rename a Lark group through one explicit
+bot identity:
+
+```http
+PUT /api/groups/{chatId}/name/{larkAppId}
+Content-Type: application/json
+
+{"name":"New group name"}
+```
+
+Both path segments must be URL-encoded. The selected bot must currently be in
+the group; botmux never falls back to another configured bot. The name follows
+Lark's 100-code-point limit and rejects control or invisible formatting
+characters. The request body is limited to 4 KiB and accepts only `name`.
+Authentication uses the existing Dashboard management boundary described
+below; `publicReadOnly` never makes this mutation anonymous.
+
 ## External read-only queries
 
 The primary external observation surfaces documented here are:
@@ -110,7 +129,7 @@ The following fields belong only to the richer `/api/sessions` rows and `/events
 
 `publicReadOnly` is on by default. While it is enabled, allow-listed reads including `GET /api/dashboard/v1/summary`, `GET /api/sessions`, and `GET /events` are reachable **without a token** on the Dashboard listener. The summary contains only the strongly redacted aggregate above; session names, titles, backends, and the other session/event row metadata must be treated as public to that network.
 
-- Every POST / PATCH / DELETE mutation, every GET outside the read-only allow-list, and every raw PTY / diagnostic log still requires the current token issued by `botmux dashboard`. The allow-list is fail-closed: a newly added GET endpoint does not become public merely because public read-only mode is enabled.
+- Every POST / PUT / PATCH / DELETE mutation, every GET outside the read-only allow-list, and every raw PTY / diagnostic log still requires the current token issued by `botmux dashboard`. The allow-list is fail-closed: a newly added GET endpoint does not become public merely because public read-only mode is enabled.
 - When `publicReadOnly` is off, a tokenless summary request returns 401. A request carrying the current token remains available and is exempt from the anonymous rate limit. In public read-only mode, an incorrect or rotated old token is treated as anonymous.
 - `botmux dashboard` and `botmux dashboard current` reuse the current token (creating the first one when absent); `botmux dashboard rotate` explicitly replaces it and invalidates the previous link. The token is application-layer Dashboard access, not a replacement for host firewall, VPN, or reverse-proxy authentication.
 - If tokenless observation is unnecessary, turn off **Public read-only** under Dashboard Settings. You can also start with `BOTMUX_DASHBOARD_PUBLIC_READONLY=false`; once the setting has been saved in the UI, the persisted value in `~/.botmux/config.json` takes precedence over the environment variable.

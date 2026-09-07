@@ -1,4 +1,5 @@
 import type { ScreenStatus } from '../types.js';
+import { flagPresentButValueMissing } from './arg-utils.js';
 
 const STREAM_ID_RE = /^cs_[0-9a-f]{32}$/;
 const ELEMENT_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,19}$/;
@@ -42,6 +43,9 @@ export function parseCardRuntimeStatusArgs(args: string[]): CardRuntimeStatusPar
   const stream = required(args, '--stream-id');
   if (!stream.ok) return stream;
   if (!STREAM_ID_RE.test(stream.value)) return { ok: false, error: `streamId 格式无效: ${stream.value}` };
+  if (flagPresentButValueMissing(args, '--session-id', false)) {
+    return { ok: false, error: '--session-id 需要会话 id 参数' };
+  }
   const sessionId = flagValue(args, '--session-id');
   if (operation === 'unbind-runtime') {
     return { ok: true, operation, streamId: stream.value, ...(sessionId ? { sessionId } : {}) };

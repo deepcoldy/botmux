@@ -24,6 +24,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
 | `/quote` | Pop a picker of this chat's topics; choosing one reads that topic's transcript into the current session. This fills a gap in Feishu itself — its quote-reply UI can only reference a single message, never a whole topic. The bot replies with a short acknowledgement (how many messages, time span, subject) and waits for your next instruction |
 | `/quote <instruction>` | Same, but runs your instruction as soon as you pick a topic, saving a round trip. The transcript is still injected explicitly labelled as material rather than instructions |
+| `/sessions` | List this bot's active topic sessions in the current group and jump directly back to a topic (legacy sessions use a safe locate fallback) |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
@@ -34,6 +35,10 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
 | `/issue release` | Run inside the group created when the task was claimed: hands the task back to the platform's todo pool so someone else can take it. The group and session are **not** disbanded — the conversation is kept. Also limited to the bot's `allowedUsers` |
+
+`/sessions` card preview:
+
+![Current-group active topic sessions card](/img/sessions-command-card.png)
 
 See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`. You can also make `/repo` the new topic's first command:
 

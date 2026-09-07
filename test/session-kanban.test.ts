@@ -48,6 +48,9 @@ describe('session-board normalizers', () => {
     expect(normalizeSessionTitle('安全\r\n标题\t\u001b[31m\u0000\u009b')).toBe('安全 标题 [31m');
     expect(normalizeSessionTitle('\x1b]52;c;payload\x07安全\t标题\u009b2J')).toBe(']52;c;payload 安全 标题 2J');
     expect(normalizeSessionTitle('a'.repeat(300))).toHaveLength(200);
+    const emojiBoundary = normalizeSessionTitle('a'.repeat(199) + '😀x');
+    expect(emojiBoundary?.isWellFormed()).toBe(true);
+    expect(emojiBoundary).toBe('a'.repeat(199));
     expect(normalizeSessionTitle('   ')).toBeNull();
     expect(normalizeSessionTitle('')).toBeNull();
     expect(normalizeSessionTitle(42)).toBeNull();

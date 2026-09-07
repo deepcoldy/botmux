@@ -56,6 +56,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { snapshotToPng, snapshotToText, tryCapturePipeSnapshot } from '../src/utils/transient-snapshot.js';
 import { captureToPng } from '../src/utils/screenshot-renderer.js';
+import { bufferSpawnResult } from './helpers/spawn-result.js';
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
@@ -70,7 +71,7 @@ function spawnedBackend() {
 beforeEach(() => {
   mockedExecSync.mockReset();
   mockedSpawnSync.mockReset();
-  mockedSpawnSync.mockReturnValue({ status: 0 } as any);
+  mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedCaptureToPng.mockClear();
 });
