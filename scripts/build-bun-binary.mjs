@@ -159,7 +159,16 @@ function runTool(argv) {
  * supposed to be fixed by. oven-sh/bun#39837 is titled "compile: fix invalid
  * ad-hoc code signature on darwin-arm64" and its test only compiles
  * `--target=bun-darwin-arm64`; nothing upstream covers x86_64. So bumping bun
- * again does NOT close this — don't read "we're on 1.4.1" as "already fixed".
+ * again does NOT close this — don't read "we're on 1.4.2" as "already fixed".
+ *
+ * RE-MEASURED when the pin moved 1.4.1 → 1.4.2, by cross-compiling a two-line
+ * hello-world from linux and recomputing the CodeDirectory page hashes (no
+ * macOS required), with 1.4.0 as a control so the check is known to discriminate:
+ *   1.4.0 → darwin-arm64: INVALID (1/15483)   darwin-x64: INVALID (2/17124)
+ *   1.4.2 → darwin-arm64: VALID   (15075/15075)  darwin-x64: INVALID (2/16792, incl. slot 0)
+ * So 1.4.2 changes nothing for the cross-compiled x64 cell: the arch-specific
+ * defect is still there and this re-sign is still what makes the shipped
+ * darwin-x64 binary runnable.
  * `codesign --force --sign -` is the re-signing fix confirmed in
  * oven-sh/bun#39764 (`BUN_NO_CODESIGN_MACHO_BINARY=1` and `--remove-signature`
  * were both reported there as NOT working).
