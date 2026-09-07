@@ -489,7 +489,7 @@ import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import {
-  quotaFallbackTurnOrigin,
+  claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
 } from '../services/quota-fallback.js';
 import type {
@@ -2036,10 +2036,8 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
   ds.rateLimitNotifiedKey = undefined;
-  // The configured backup handoff shares the same episode boundary, but keeps
-  // its own latch so notification and handoff failures cannot retrigger each
-  // other on periodic screen frames.
-  ds.quotaFallbackAttemptedKey = undefined;
+  // Only the async ownership token is session-local. Cross-session duplicate
+  // handoffs are suppressed by the source-bot five-minute event window.
   ds.quotaFallbackAttemptToken = undefined;
   persistStreamCardState(ds);
 }
@@ -12437,9 +12435,9 @@ function setupWorkerHandlers(
         // Optional daemon-side backup-Bot handoff. This deliberately sits next
         // to (but does not share) the owner-notification latch: the daemon sends
         // one fixed message with one real <at>, without asking the exhausted CLI
-        // to generate or replay anything. Claim BEFORE the asynchronous identity
-        // resolution/send so repeated screen ticks and a rejected API call cannot
-        // produce a retry storm. clearUsageLimitState re-arms the next episode.
+        // to generate or replay anything. Claim the source-bot/kind five-minute
+        // window BEFORE asynchronous identity resolution/send, so repeated
+        // screen ticks and concurrent limited sessions cannot produce a storm.
         const quotaFallback = botCfg.quotaFallbackBot;
         if (
           ds.lastScreenStatus === 'limited'
@@ -12448,26 +12446,19 @@ function setupWorkerHandlers(
           && !ds.suppressRecoveryCard
           && quotaFallback?.enabled === true
           && quotaFallback.kinds.includes(ds.usageLimit.kind)
-          && ds.quotaFallbackAttemptedKey !== usageLimitStateKey(ds.usageLimit)
         ) {
           const limitKey = usageLimitStateKey(ds.usageLimit);
           const fallbackTurn = fallbackTurnId(ds, msg.turnId);
-          const origin = quotaFallbackTurnOrigin(ds.session, fallbackTurn);
-          if (origin !== 'human') {
-            // One-hop loop fence: a fallback message is bot-authored, so its
-            // receiving turn lands here as origin=bot and cannot cascade. An
-            // unknown/pruned/synthetic origin is also refused fail-closed.
+          if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
             logger.info(
-              `[${t}] Quota fallback suppressed for ${origin} turn `
-              + `${fallbackTurn?.slice(0, 12) ?? '-'} (target=${quotaFallback.targetAppId})`,
+              `[${t}] Quota fallback deduplicated within five minutes `
+              + `(kind=${ds.usageLimit.kind}, target=${quotaFallback.targetAppId})`,
             );
           } else {
             const attemptToken = randomUUID();
-            ds.quotaFallbackAttemptedKey = limitKey;
             ds.quotaFallbackAttemptToken = attemptToken;
             const ownsFallbackAttempt = (): boolean =>
               ownsLifecycleMutation()
-              && ds.quotaFallbackAttemptedKey === limitKey
               && ds.quotaFallbackAttemptToken === attemptToken
               && ds.lastScreenStatus === 'limited'
               && !!ds.usageLimit
@@ -12500,9 +12491,9 @@ function setupWorkerHandlers(
                     + `(${resolved.source}) for episode=${limitKey}`,
                   );
                 } catch (err: any) {
-                  // Keep the attempt latch claimed. A later screen frame must
-                  // not retry and spam the same peer; the existing owner notice
-                  // and manual retry controls remain available.
+                  // Keep the daemon-wide five-minute claim. A later frame/session
+                  // must not retry and spam the same peer; owner notice and manual
+                  // retry controls remain available.
                   logger.warn(
                     `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
                     + `${err?.message ?? err}`,

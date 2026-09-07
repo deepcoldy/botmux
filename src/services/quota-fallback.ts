@@ -11,12 +11,59 @@ export type QuotaFallbackKind = 'usage' | 'rate';
 export const DEFAULT_QUOTA_FALLBACK_MESSAGE =
   '主 Bot 当前额度已耗尽，请接手本会话并结合上下文继续处理。';
 export const MAX_QUOTA_FALLBACK_MESSAGE_LENGTH = 1_000;
+export const QUOTA_FALLBACK_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
+
+const recentQuotaFallbackEvents = new Map<string, number>();
+
+/** Claim one source-bot/kind event across all of this daemon's sessions. */
+export function claimQuotaFallbackEvent(
+  sourceAppId: string,
+  kind: QuotaFallbackKind,
+  now = Date.now(),
+): boolean {
+  const cutoff = now - QUOTA_FALLBACK_DEDUPE_WINDOW_MS;
+  for (const [key, claimedAt] of recentQuotaFallbackEvents) {
+    if (claimedAt <= cutoff) recentQuotaFallbackEvents.delete(key);
+  }
+  const key = `${sourceAppId}:${kind}`;
+  const claimedAt = recentQuotaFallbackEvents.get(key);
+  if (claimedAt !== undefined && claimedAt > cutoff) return false;
+  recentQuotaFallbackEvents.set(key, now);
+  return true;
+}
+
+export function __testOnly_resetQuotaFallbackEvents(): void {
+  recentQuotaFallbackEvents.clear();
+}
 
 export interface QuotaFallbackBotConfig {
   enabled: true;
   targetAppId: string;
   kinds: QuotaFallbackKind[];
   message: string;
+}
+
+export type QuotaFallbackGraphEntry = {
+  larkAppId?: unknown;
+  apiOnly?: unknown;
+  activationPending?: unknown;
+  activationDeactivating?: unknown;
+  activationStarting?: unknown;
+  activationCommitted?: unknown;
+  quotaFallbackBot?: unknown;
+};
+
+export class QuotaFallbackCycleError extends Error {
+  readonly cycle: string[];
+
+  constructor(cycle: string[]) {
+    super(
+      `额度耗尽交接配置存在循环: ${cycle.join(' -> ')}。`
+      + ` 请在 Dashboard「Bot 配置 → 高级 → 额度耗尽交接」中修改。`,
+    );
+    this.name = 'QuotaFallbackCycleError';
+    this.cycle = cycle;
+  }
 }
 
 export type QuotaFallbackConfigNormalization =
@@ -91,30 +138,72 @@ export function normalizeQuotaFallbackBotConfig(
   return { config: { enabled: true, targetAppId, kinds, message } };
 }
 
-export type QuotaFallbackTurnOrigin = 'human' | 'bot' | 'unknown';
-
 /**
- * Resolve the exact turn's sender from the durable reply-target record. Only a
- * positively identified human may start an automatic handoff. This conservative
- * gate makes bot-origin, synthetic, restored and pruned turns stop after one hop.
+ * Return the first executable cycle in the local quota-fallback graph.
+ *
+ * The input is intentionally the raw, impending bots.json array: save/clone
+ * paths can validate the exact generation they are about to commit while they
+ * still hold the file lock. Pending/starting onboarding rows and apiOnly bots
+ * cannot receive a Lark handoff, so they do not participate. Invalid enabled
+ * blocks remain inert exactly as the runtime parser treats them, except direct
+ * self-reference which is itself a cycle and is reported explicitly.
  */
-export function quotaFallbackTurnOrigin(
-  session: {
-    replyTargets?: Record<string, {
-      senderOpenId?: string;
-      participants?: Array<{ openId?: string; isBot?: boolean }>;
-      participantsIncomplete?: boolean;
-    }>;
-  },
-  turnId: string | undefined,
-): QuotaFallbackTurnOrigin {
-  if (!turnId) return 'unknown';
-  const target = session.replyTargets?.[turnId];
-  if (!target?.senderOpenId || target.participantsIncomplete) return 'unknown';
-  const sender = target.participants?.find(p => p.openId === target.senderOpenId);
-  if (sender?.isBot === true) return 'bot';
-  if (sender?.isBot === false) return 'human';
-  return 'unknown';
+export function findQuotaFallbackCycle(
+  entries: readonly QuotaFallbackGraphEntry[],
+): string[] | null {
+  const active = entries.filter(entry =>
+    entry
+    && typeof entry === 'object'
+    && typeof entry.larkAppId === 'string'
+    && entry.apiOnly !== true
+    && entry.activationPending !== true
+    && entry.activationDeactivating === undefined
+    && entry.activationStarting === undefined
+    && entry.activationCommitted === undefined,
+  );
+  const activeIds = new Set(active.map(entry => String(entry.larkAppId)));
+  const edges = new Map<string, string>();
+  for (const entry of active) {
+    const sourceAppId = String(entry.larkAppId);
+    const raw = entry.quotaFallbackBot;
+    const rawTarget = raw && typeof raw === 'object' && !Array.isArray(raw)
+      && (raw as Record<string, unknown>).enabled === true
+      && typeof (raw as Record<string, unknown>).targetAppId === 'string'
+      ? ((raw as Record<string, unknown>).targetAppId as string).trim()
+      : '';
+    if (rawTarget === sourceAppId && activeIds.has(rawTarget)) {
+      edges.set(sourceAppId, rawTarget);
+      continue;
+    }
+    const normalized = normalizeQuotaFallbackBotConfig(raw, sourceAppId).config;
+    if (normalized && activeIds.has(normalized.targetAppId)) {
+      edges.set(sourceAppId, normalized.targetAppId);
+    }
+  }
+
+  const done = new Set<string>();
+  for (const start of activeIds) {
+    if (done.has(start)) continue;
+    const path: string[] = [];
+    const pathIndex = new Map<string, number>();
+    let current: string | undefined = start;
+    while (current && !done.has(current)) {
+      const index = pathIndex.get(current);
+      if (index !== undefined) return [...path.slice(index), current];
+      pathIndex.set(current, path.length);
+      path.push(current);
+      current = edges.get(current);
+    }
+    for (const appId of path) done.add(appId);
+  }
+  return null;
+}
+
+export function assertQuotaFallbackGraphAcyclic(
+  entries: readonly QuotaFallbackGraphEntry[],
+): void {
+  const cycle = findQuotaFallbackCycle(entries);
+  if (cycle) throw new QuotaFallbackCycleError(cycle);
 }
 
 export type QuotaFallbackTargetResolution =

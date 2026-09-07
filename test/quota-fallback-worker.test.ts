@@ -48,6 +48,7 @@ import {
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { __testOnly_resetQuotaFallbackEvents } from '../src/services/quota-fallback.js';
 
 const SOURCE = 'cli_qfsource';
 const TARGET = 'cli_qftarget';
@@ -123,6 +124,7 @@ function fallbackReplies(sessionReply: ReturnType<typeof vi.fn>) {
 describe('daemon quota fallback handoff', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetQuotaFallbackEvents();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-quota-fallback-'));
     registerBot({
       larkAppId: SOURCE,
@@ -194,7 +196,7 @@ describe('daemon quota fallback handoff', () => {
     expect(worker.send).not.toHaveBeenCalled();
   });
 
-  it('deduplicates repeated frames, rearms after clear, and supports a same-key later episode', async () => {
+  it('deduplicates repeated frames and a same-bot event in another session for five minutes', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     setup(sessionReply);
     const worker = fakeWorker();
@@ -213,11 +215,19 @@ describe('daemon quota fallback handoff', () => {
     ds.lastScreenStatus = 'working';
     worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: state, turnId: TURN });
     await flush();
-    expect(fallbackReplies(sessionReply)).toHaveLength(2);
-    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(2);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(1);
+
+    const otherWorker = fakeWorker();
+    const other = makeDs({ worker: otherWorker, workerPort: 9998 });
+    __testOnly_setupWorkerHandlers(other, otherWorker);
+    otherWorker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: state, turnId: TURN });
+    await flush();
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(1);
   });
 
-  it('drops a stale async lookup after a same-key later episode takes ownership', async () => {
+  it('drops a stale async lookup after its episode clears', async () => {
     let finishFirst!: (value: {
       ok: true;
       mappings: Array<{ larkAppId: string; subjectOpenId: string }>;
@@ -248,17 +258,17 @@ describe('daemon quota fallback handoff', () => {
     ds.lastScreenStatus = 'working';
     worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: state, turnId: TURN });
     await flush();
-    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    expect(fallbackReplies(sessionReply)).toHaveLength(0);
 
     finishFirst({
       ok: true,
       mappings: [{ larkAppId: TARGET, subjectOpenId: TARGET_OPEN_ID }],
     });
     await flush();
-    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    expect(fallbackReplies(sessionReply)).toHaveLength(0);
   });
 
-  it('never cascades a bot-origin handoff to a second backup', async () => {
+  it('allows an acyclic bot-origin handoff to a second backup', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     setup(sessionReply);
     const worker = fakeWorker();
@@ -273,8 +283,8 @@ describe('daemon quota fallback handoff', () => {
     worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit(), turnId: TURN });
     await flush();
 
-    expect(fallbackReplies(sessionReply)).toHaveLength(0);
-    expect(mocks.resolveCurrent).not.toHaveBeenCalled();
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(1);
   });
 
   it('respects the configured limit kinds', async () => {
@@ -330,14 +340,17 @@ describe('daemon quota fallback handoff', () => {
     expect(fallbackReplies(sessionReply)).toHaveLength(0);
     expect(mocks.resolveCurrent).toHaveBeenCalledTimes(1);
 
-    // Re-project an edge without clearing the episode. The attempted-key latch
-    // still forbids another resolution/send.
+    // Re-project an edge without clearing the episode. The daemon-wide event
+    // window still forbids another resolution/send.
     ds.lastScreenStatus = 'working';
     worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: state, turnId: TURN });
     await flush();
     expect(mocks.resolveCurrent).toHaveBeenCalledTimes(1);
 
     clearUsageLimitState(ds);
+    // Advance to a later dedupe window; this branch is about send-failure
+    // behavior after a fresh claim, not the five-minute suppression itself.
+    __testOnly_resetQuotaFallbackEvents();
     ds.lastScreenStatus = 'working';
     failFallbackSend = true;
     mocks.resolveCurrent.mockResolvedValue({

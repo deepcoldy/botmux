@@ -6487,6 +6487,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    let mBotQuotaFallback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotQuotaFallback = url.pathname.match(/^\/api\/bots\/([^/]+)\/quota-fallback$/))) {
+      const appId = decodeURIComponent(mBotQuotaFallback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-quota-fallback`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/working-dir-mode — proxy to that bot's daemon. Body
     // `{ mode: 'off'|'default'|'oncall', workingDir }` — sets the 3-way
     // mutually-exclusive default-dir mode (defaultWorkingDir vs defaultOncall).

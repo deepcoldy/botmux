@@ -41,6 +41,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -877,6 +878,7 @@ export function BotDefaultsPage() {
       <BotDefaultsCard
         key={`${selectedBot.larkAppId}:${profileRoleVersion}`}
         bot={selectedBot}
+        bots={bots}
         cliState={cliState}
         patchBot={patchBot}
         activeTab={activeTab}
@@ -997,6 +999,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
 
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
+  bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
   activeTab: BotDefaultsTab;
@@ -1156,6 +1159,7 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1266,6 +1270,139 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
           </div>
         </details>
       ) : null}
+    </section>
+  );
+}
+
+type QuotaFallbackKind = 'usage' | 'rate';
+
+function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow[]; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackBot ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [targetAppId, setTargetAppId] = useState(initial?.targetAppId ?? '');
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [message, setMessage] = useState(initial?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackBot ?? null;
+    setEnabled(next?.enabled === true);
+    setTargetAppId(next?.targetAppId ?? '');
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setMessage(next?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  }, [props.bot.quotaFallbackBot, tr]);
+
+  const targetOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackTargetPlaceholder') },
+    ...props.bots
+      .filter(candidate => candidate.larkAppId !== props.bot.larkAppId && !candidate.error)
+      .map(candidate => ({
+        value: candidate.larkAppId,
+        label: `${candidate.botName ?? candidate.larkAppId} · ${candidate.larkAppId}`,
+      })),
+  ], [props.bot.larkAppId, props.bots, tr]);
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    const cleanMessage = message.trim();
+    if (enabled && !targetAppId) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackTargetRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    if (enabled && (!cleanMessage || Array.from(cleanMessage).length > 1000 || /<\s*at\b/i.test(cleanMessage))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackMessageInvalid')}` });
+      return;
+    }
+
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback`,
+        { enabled, targetAppId, kinds, message: cleanMessage },
+      );
+      if (res.ok && res.body.ok) {
+        const config = res.body.quotaFallbackBot ?? null;
+        props.patchBot(props.bot.larkAppId, { quotaFallbackBot: config });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else if (res.body?.error === 'quota_fallback_cycle') {
+        const cycle = Array.isArray(res.body?.cycle) ? res.body.cycle.join(' → ') : '';
+        const text = tr('botDefaults.quotaFallbackCycle', { cycle });
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error', duration: 8_000 });
+      } else if (res.body?.error === 'quota_fallback_target_not_local') {
+        const text = tr('botDefaults.quotaFallbackTargetNotLocal');
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error' });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback" data-quota-fallback>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackHelp')}>{tr('botDefaults.quotaFallbackTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback"
+        title={tr('botDefaults.quotaFallbackEnabled')}
+        help={tr('botDefaults.quotaFallbackEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.quotaFallbackTargetHelp')}>{tr('botDefaults.quotaFallbackTarget')}</FieldTitle>
+          <DropdownField<string>
+            dataInput="quotaFallbackTarget"
+            ariaLabel={tr('botDefaults.quotaFallbackTarget')}
+            value={targetAppId}
+            disabled={busy || !enabled}
+            options={targetOptions}
+            searchable
+            onChange={setTargetAppId}
+          />
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.quotaFallbackMessageHelp')}>{tr('botDefaults.quotaFallbackMessage')}</FieldTitle></span>
+          <textarea rows={3} maxLength={1000} data-input="quotaFallbackMessage" value={message} disabled={busy || !enabled} onChange={event => setMessage(event.currentTarget.value)} />
+        </label>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackCycleNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
     </section>
   );
 }

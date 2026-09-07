@@ -2059,6 +2059,25 @@ describe('loadBotConfigs', () => {
     expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
   });
 
+  it('validates the full fallback graph before starting one indexed daemon', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'cli_a',
+        larkAppSecret: 'a-secret',
+        quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' },
+      },
+      {
+        larkAppId: 'cli_b',
+        larkAppSecret: 'b-secret',
+        quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' },
+      },
+    ]));
+
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('cli_a -> cli_b -> cli_a');
+  });
+
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
     // No BOTS_CONFIG env var
     // existsSync: first call (for BOTS_CONFIG) won't happen since env isn't set,

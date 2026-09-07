@@ -108,6 +108,8 @@ describe('bot defaults focused layout', () => {
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
     expect(advanced).toContain('<SessionOwnerReminderSection');
+    expect(advanced).toContain('<QuotaFallbackSection');
+    expect(sessions).not.toContain('<QuotaFallbackSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -191,6 +193,17 @@ describe('bot defaults focused layout', () => {
       expect(page).toContain(`value: '${state}'`);
     }
     for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
+  });
+
+  it('offers quota fallback controls and a visible cycle error in advanced settings', () => {
+    expect(page).toContain('function QuotaFallbackSection');
+    expect(page).toContain('dataInput="quotaFallbackTarget"');
+    expect(page).toContain('data-input="quotaFallbackMessage"');
+    expect(page).toContain("res.body?.error === 'quota_fallback_cycle'");
+    expect(page).toContain("toast(text, { kind: 'error', duration: 8_000 })");
+    for (const key of ['quotaFallbackTitle', 'quotaFallbackTarget', 'quotaFallbackCycle', 'quotaFallbackSave']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
   });

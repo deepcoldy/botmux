@@ -4,6 +4,7 @@
  */
 import { promises as fsp } from 'node:fs';
 import { getLoadedConfigPath } from '../bot-registry.js';
+import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
@@ -13,6 +14,9 @@ export async function readRawConfig(path: string): Promise<any[]> {
 }
 
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
+  // Validate the complete next generation, not the currently loaded registry.
+  // Callers invoke this while holding the cross-process lock.
+  assertQuotaFallbackGraphAcyclic(raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
   await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });

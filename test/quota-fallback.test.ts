@@ -3,8 +3,12 @@ import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import {
   DEFAULT_QUOTA_FALLBACK_MESSAGE,
   MAX_QUOTA_FALLBACK_MESSAGE_LENGTH,
+  QUOTA_FALLBACK_DEDUPE_WINDOW_MS,
+  __testOnly_resetQuotaFallbackEvents,
+  assertQuotaFallbackGraphAcyclic,
+  claimQuotaFallbackEvent,
+  findQuotaFallbackCycle,
   normalizeQuotaFallbackBotConfig,
-  quotaFallbackTurnOrigin,
   resolveQuotaFallbackTarget,
   type QuotaFallbackTargetDeps,
 } from '../src/services/quota-fallback.js';
@@ -90,23 +94,60 @@ describe('quota fallback bots.json parsing', () => {
   });
 });
 
-describe('quota fallback turn origin', () => {
-  const session = (isBot: boolean | undefined, incomplete = false) => ({
-    replyTargets: {
-      om_turn: {
-        senderOpenId: 'ou_sender',
-        participants: [{ openId: 'ou_sender', isBot }],
-        participantsIncomplete: incomplete,
-      },
-    },
+describe('quota fallback graph validation', () => {
+  const bot = (larkAppId: string, targetAppId?: string) => ({
+    larkAppId,
+    larkAppSecret: 'secret',
+    ...(targetAppId ? {
+      quotaFallbackBot: { enabled: true, targetAppId },
+    } : {}),
   });
 
-  it('allows only a positively identified human turn', () => {
-    expect(quotaFallbackTurnOrigin(session(false), 'om_turn')).toBe('human');
-    expect(quotaFallbackTurnOrigin(session(true), 'om_turn')).toBe('bot');
-    expect(quotaFallbackTurnOrigin(session(undefined), 'om_turn')).toBe('unknown');
-    expect(quotaFallbackTurnOrigin(session(false, true), 'om_turn')).toBe('unknown');
-    expect(quotaFallbackTurnOrigin({}, undefined)).toBe('unknown');
+  it('returns the complete cycle and accepts an acyclic chain', () => {
+    expect(findQuotaFallbackCycle([
+      bot('cli_a', 'cli_b'),
+      bot('cli_b', 'cli_c'),
+      bot('cli_c', 'cli_a'),
+    ])).toEqual(['cli_a', 'cli_b', 'cli_c', 'cli_a']);
+    expect(findQuotaFallbackCycle([
+      bot('cli_a', 'cli_b'),
+      bot('cli_b', 'cli_c'),
+      bot('cli_c'),
+    ])).toBeNull();
+  });
+
+  it('rejects self cycles and ignores non-executable onboarding/api-only rows', () => {
+    expect(() => assertQuotaFallbackGraphAcyclic([bot('cli_a', 'cli_a')]))
+      .toThrow('cli_a -> cli_a');
+    expect(findQuotaFallbackCycle([
+      { ...bot('cli_a', 'cli_b'), activationPending: true },
+      { ...bot('cli_b', 'cli_c'), apiOnly: true },
+      { ...bot('cli_c', 'cli_d'), activationStarting: { jobId: 'start-c' } },
+      { ...bot('cli_d', 'cli_e'), activationCommitted: { jobId: 'start-d' } },
+      { ...bot('cli_e', 'cli_a'), activationDeactivating: { jobId: 'stop-e' } },
+    ])).toBeNull();
+  });
+
+  it('makes startup parsing fail with an actionable cycle path', () => {
+    expect(() => parseBotConfigsFromText(JSON.stringify([
+      bot('cli_a', 'cli_b'),
+      bot('cli_b', 'cli_a'),
+    ]))).toThrow(/cli_a -> cli_b -> cli_a/);
+  });
+});
+
+describe('quota fallback event dedupe', () => {
+  it('deduplicates one source bot and limit kind for five minutes', () => {
+    __testOnly_resetQuotaFallbackEvents();
+    expect(claimQuotaFallbackEvent('cli_a', 'rate', 10_000)).toBe(true);
+    expect(claimQuotaFallbackEvent('cli_a', 'rate', 10_001)).toBe(false);
+    expect(claimQuotaFallbackEvent('cli_a', 'usage', 10_001)).toBe(true);
+    expect(claimQuotaFallbackEvent('cli_b', 'rate', 10_001)).toBe(true);
+    expect(claimQuotaFallbackEvent(
+      'cli_a',
+      'rate',
+      10_000 + QUOTA_FALLBACK_DEDUPE_WINDOW_MS,
+    )).toBe(true);
   });
 });
 

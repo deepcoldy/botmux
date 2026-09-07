@@ -202,6 +202,69 @@ afterEach(async () => {
 });
 
 describe('dashboard IPC server', () => {
+  it('persists an acyclic quota fallback and rejects an impending cycle atomically', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quota-fallback-'));
+    const configPath = join(dir, 'bots.json');
+    const source = 'cli_quotasource';
+    const target = 'cli_quotatarget';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([
+        { larkAppId: source, larkAppSecret: 'source-secret' },
+        { larkAppId: target, larkAppSecret: 'target-secret' },
+      ], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(source);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const saved = await fetch(`${base}/api/bot-quota-fallback`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true, targetAppId: target, kinds: ['rate'], message: 'Take over.' }),
+      });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({
+        ok: true,
+        quotaFallbackBot: { enabled: true, targetAppId: target, kinds: ['rate'], message: 'Take over.' },
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].quotaFallbackBot.targetAppId).toBe(target);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).quotaFallbackBot)
+        .toMatchObject({ targetAppId: target });
+
+      // Put target → source on disk, then remove source's edge so the current
+      // generation is valid. Saving source → target would create a two-node
+      // cycle and must leave the file byte-for-byte at that valid generation.
+      const valid = JSON.parse(readFileSync(configPath, 'utf8'));
+      delete valid[0].quotaFallbackBot;
+      valid[1].quotaFallbackBot = {
+        enabled: true,
+        targetAppId: source,
+        kinds: ['usage', 'rate'],
+        message: 'Back to source.',
+      };
+      writeFileSync(configPath, JSON.stringify(valid, null, 2));
+      const before = readFileSync(configPath, 'utf8');
+      const rejected = await fetch(`${base}/api/bot-quota-fallback`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true, targetAppId: target, kinds: ['usage'], message: 'Cycle.' }),
+      });
+      expect(rejected.status).toBe(409);
+      expect(await rejected.json()).toMatchObject({
+        ok: false,
+        error: 'quota_fallback_cycle',
+        cycle: [source, target, source],
+      });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('writes bot-scoped chat feedback and returns an effective trace', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-feedback-'));
     const configPath = join(dir, 'bots.json');

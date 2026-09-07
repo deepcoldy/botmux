@@ -56,7 +56,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
-| `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; this release supports manual `bots.json` configuration only. See below |
+| `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
 | `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Set to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
 
@@ -65,6 +65,8 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 ### Automatic CLI quota handoff
 
 `quotaFallbackBot` lets the daemon post one fixed, real `@` to a backup Bot at the original session landing point once the current CLI is confirmed quota-limited. It does not call the exhausted primary model, and the existing limit card and owner notification remain unchanged.
+
+![Quota-limit handoff under Dashboard Bot Configuration → Advanced](/img/quota-fallback-dashboard.png)
 
 ```json
 {
@@ -80,9 +82,10 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 - `targetAppId` is the backup Bot's stable Lark App ID. Never configure or copy an `ou_xxx`: open IDs are scoped to the sending application. At send time, the daemon resolves a receiver-scoped mention handle from the current chat's live membership.
 - `kinds` accepts `usage` and/or `rate`; omitting it enables both. Omitting `message` uses the built-in Chinese handoff text. The message is limited to 1000 characters and must be non-blank without a native `<at>` tag.
 - The target must be a locally configured Bot that is currently in the chat. Cross-deployment/team-directory targets are not supported yet because the daemon cannot safely prove which live `open_id` belongs to a remote App ID. Non-local, self, absent, and live-resolution failures all fail closed.
-- A limit episode is attempted at most once, even if identity resolution or delivery fails. Only a turn positively identified as human-authored can trigger the handoff, so the bot-authored handoff cannot cascade if the backup Bot also hits a limit.
+- Save, Bot clone, and daemon startup validate the complete impending handoff graph and reject self-reference or cycles such as `A → B → C → A`; an acyclic chain may continue cascading. The Dashboard shows the complete cycle, `botmux start/restart` reports the cause and repair location before changing processes, and each daemon repeats the check while loading configuration.
+- Within a daemon, the source Bot and limit kind are deduplicated across all sessions for five minutes. A failed identity lookup or delivery still occupies that window to prevent a short retry storm.
 - Chat-scoped sessions land in the original chat and thread-scoped sessions land in the original thread. The backup Bot reads context from the existing history. Restoring a daemon with an already-limited session does not backfill an old handoff.
-- The whole feature is inert when the block is absent or `enabled` is not exactly `true`, preserving previous behavior. The Dashboard does not write this field yet; edit `bots.json` manually and restart the daemon as described on this page.
+- The whole feature is inert when the block is absent or `enabled` is not exactly `true`, preserving previous behavior. Configure it under Dashboard "Bot Configuration → Advanced → Quota-limit handoff," or edit `bots.json` manually.
 
 ### Codex-compatible distributions
 

@@ -56,7 +56,7 @@
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
-| `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；当前版本只支持手工编辑 `bots.json`。详见下方 |
+| `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
 
@@ -65,6 +65,8 @@
 ### CLI 限额自动交接
 
 `quotaFallbackBot` 让 daemon 在当前 CLI 确认进入额度限制状态时，用固定文案在原会话落点真实 `@` 一个备用 Bot。它不调用已耗尽额度的主模型，也不会改变原有的限额卡片或 owner 通知。
+
+![Dashboard「Bot 配置 → 高级」中的额度耗尽交接配置](/img/quota-fallback-dashboard.png)
 
 ```json
 {
@@ -80,9 +82,10 @@
 - `targetAppId` 必须是备用 Bot 的稳定飞书 App ID；不要配置或复制 `ou_xxx`，因为 `open_id` 按发送应用隔离。daemon 会在发送时从当前群的实时成员解析接收方视角下的 mention handle。
 - `kinds` 可选 `usage`（用量上限）和 / 或 `rate`（速率限制）；省略时两类都处理。`message` 省略时使用示例中的默认文案，最多 1000 字符，不能为空或包含原生 `<at>` 标签。
 - 目标必须是本机已配置且当前确实在群内的 Bot；跨部署 / 团队目录目标暂不支持，因为 daemon 目前无法安全证明远端 App ID 对应哪个实时 `open_id`。非本机目标、self、不在群或实时解析失败都会安全跳过。
-- 同一个限额 episode 最多尝试一次，即使解析或发送失败也不循环重试。只有明确由人发起的 turn 才能触发，所以备用 Bot 收到这条 bot-origin 消息后即使也耗尽额度，也不会继续级联。
+- 保存、复制 Bot 和 daemon 启动时都会用「即将落盘」的完整配置检查交接图，拒绝 self 和 `A → B → C → A` 这类环路；无环链可以继续级联。Dashboard 会展示完整环路，`botmux start/restart` 会在改动进程前给出原因和修复入口，daemon 加载时还会再做一次兜底检查。
+- daemon 内按「源 Bot + 限额类型」在所有会话间做 5 分钟去重；身份解析或发送失败也会占用这个去重窗口，避免短时重试风暴。
 - chat-scope 会落回原群，thread-scope 会落回原话题；上下文由备用 Bot 自己读取当前历史。daemon 重启恢复旧限额状态时不会补发历史交接。
-- 整个配置块缺省或 `enabled` 不为 `true` 时完全关闭，保持旧行为。当前 Dashboard 不写这个字段，请手工编辑 `bots.json` 并按本页说明重启 daemon。
+- 整个配置块缺省或 `enabled` 不为 `true` 时完全关闭，保持旧行为。可在 Dashboard「Bot 配置 → 高级 → 额度耗尽交接」配置，也可手工编辑 `bots.json`。
 
 ### Codex 兼容发行版
 

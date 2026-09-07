@@ -62,6 +62,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { findQuotaFallbackCycle } from './services/quota-fallback.js';
 import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
@@ -404,6 +405,18 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+function preflightQuotaFallbackTopology(bots: any[], action: 'start' | 'restart'): void {
+  const cycle = findQuotaFallbackCycle(bots);
+  if (!cycle) return;
+  console.error(`\n❌ daemon ${action} 前自检失败：额度耗尽交接配置存在循环。`);
+  console.error(`   环路: ${cycle.join(' → ')}`);
+  console.error('   修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
+  console.error(action === 'restart'
+    ? '   已中止重启，当前运行中的 daemon 未停止。'
+    : '   已中止启动，未创建新的 daemon 进程。');
+  process.exit(1);
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -2474,6 +2487,7 @@ async function cmdStart(): Promise<void> {
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
 async function preflightConfiguredBotCredentials() {
   const botsForCheck = loadBotsJson();
+  preflightQuotaFallbackTopology(botsForCheck, 'start');
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
     const invalid: Array<{ appId: string; reason: string }> = [];
@@ -2665,6 +2679,10 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    // Fail before dependency cleanup, legacy-supervisor cleanup, plugin stops,
+    // or any live-fleet mutation. The locked check below repeats against the
+    // exact generation used for restart.
+    preflightQuotaFallbackTopology(loadBotsJson(), 'restart');
     const includePluginServices = process.argv.includes('--with-plugin');
 
     const restartIntentDir = resolveDataDir();
@@ -2681,6 +2699,9 @@ async function cmdRestart(): Promise<void> {
 
     await withFileLock(BOTS_JSON_FILE, async () => {
       const restartBots = loadBotsJson();
+      // Must run before restartFleet stops the existing supervisor: a bad
+      // topology is a predictable config failure, so preserve the live fleet.
+      preflightQuotaFallbackTopology(restartBots, 'restart');
       const restartAttemptId = randomBytes(16).toString('hex');
       let restartIntentPrepared = false;
       try {

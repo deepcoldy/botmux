@@ -112,6 +112,11 @@ import { config } from '../config.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
+import {
+  findQuotaFallbackCycle,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -5068,6 +5073,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    quotaFallbackBot: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
+      catch { return null; }
+    })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
@@ -5099,6 +5108,74 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
+});
+
+type QuotaFallbackDashboardUpdate =
+  | { ok: true; config: QuotaFallbackBotConfig | null }
+  | { ok: false; error: string; reason?: string; cycle?: string[] };
+
+// Per-bot quota fallback topology. The complete next bots.json generation is
+// checked while the cross-process config lock is held, so two concurrent saves
+// cannot each validate against stale state and jointly create A→B→A.
+ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+
+  try {
+    const result = await rmwBotEntry<QuotaFallbackDashboardUpdate>(cachedLarkAppId, (entry, all) => {
+      if (body.enabled !== true) {
+        delete entry.quotaFallbackBot;
+        const cycle = findQuotaFallbackCycle(all);
+        return cycle
+          ? { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } }
+          : { write: true, result: { ok: true, config: null } };
+      }
+
+      const normalized = normalizeQuotaFallbackBotConfig(body, cachedLarkAppId);
+      if (!normalized.config) {
+        return {
+          write: false,
+          result: { ok: false, error: 'invalid_quota_fallback', reason: normalized.error },
+        };
+      }
+      const target = all.find(candidate =>
+        candidate?.larkAppId === normalized.config!.targetAppId
+        && candidate?.apiOnly !== true
+        && candidate?.activationPending !== true
+        && candidate?.activationDeactivating === undefined
+        && candidate?.activationStarting === undefined
+        && candidate?.activationCommitted === undefined,
+      );
+      if (!target) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_target_not_local' } };
+      }
+
+      entry.quotaFallbackBot = normalized.config;
+      const cycle = findQuotaFallbackCycle(all);
+      if (cycle) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } };
+      }
+      return { write: true, result: { ok: true, config: normalized.config } };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    if (!result.result.ok) {
+      const status = result.result.error === 'quota_fallback_cycle' ? 409 : 400;
+      return jsonRes(res, status, result.result);
+    }
+    getBot(cachedLarkAppId).config.quotaFallbackBot = result.result.config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackBot: result.result.config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_save_failed', reason: error?.message ?? String(error) });
+  }
 });
 
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only

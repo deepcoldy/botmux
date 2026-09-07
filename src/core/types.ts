@@ -434,16 +434,9 @@ export interface DaemonSession {
    *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
    *  notify again. In-memory only. */
   rateLimitNotifiedKey?: string;
-  /**
-   * Limit-episode key whose configured backup-bot handoff was already claimed.
-   * Claimed before identity resolution / send and retained on failure so a bad
-   * target or transient API error cannot turn periodic screen frames into a
-   * retry storm. Reset only when the limit episode is cleared. In-memory only.
-   */
-  quotaFallbackAttemptedKey?: string;
   /** Unique claim for the current handoff attempt. Guards an asynchronous
    * target lookup from posting after this episode cleared and a same-key later
-   * episode started. Cleared together with quotaFallbackAttemptedKey. */
+   * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the

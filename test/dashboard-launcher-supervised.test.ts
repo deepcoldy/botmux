@@ -116,6 +116,21 @@ describe('dashboard launcher — source pins', () => {
     expect(cli).toContain('fleetMemberNames');
   });
 
+  it('preflights quota fallback cycles before restart mutates the live fleet', () => {
+    const cli = read('cli.ts');
+    const restart = cli.slice(
+      cli.indexOf('async function cmdRestart()'),
+      cli.indexOf('\nexport type StartBotLiveResult'),
+    );
+    const preflight = restart.indexOf("preflightQuotaFallbackTopology(loadBotsJson(), 'restart')");
+    expect(preflight).toBeGreaterThanOrEqual(0);
+    expect(preflight).toBeLessThan(restart.indexOf("cleanupLegacyPm2('restart')"));
+    expect(preflight).toBeLessThan(restart.indexOf('stopPluginServicesForCli'));
+    expect(preflight).toBeLessThan(restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })'));
+    expect(cli).toContain('已中止重启，当前运行中的 daemon 未停止。');
+    expect(cli).toContain('修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
+  });
+
   it('bot-onboarding.ts STATIC-imports qrcode vendor files so the compiled binary embeds them', () => {
     // The compiled (bun --compile) dashboard crashed with "Cannot find module
     // 'qrcode-terminal/vendor/QRCode'" because a `createRequire(...)` of a bare

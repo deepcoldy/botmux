@@ -123,6 +123,12 @@ export type BotDefaultsRow = {
   senderTag?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
+  quotaFallbackBot?: {
+    enabled: true;
+    targetAppId: string;
+    kinds: Array<'usage' | 'rate'>;
+    message: string;
+  } | null;
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;
   summaryMemoryPath?: string;

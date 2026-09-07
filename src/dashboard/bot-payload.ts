@@ -5,6 +5,7 @@ import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -129,6 +130,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     senderTag: j?.senderTag !== false,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
+    quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',

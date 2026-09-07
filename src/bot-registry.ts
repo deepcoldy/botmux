@@ -54,6 +54,7 @@ import {
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
 import {
+  assertQuotaFallbackGraphAcyclic,
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
@@ -2923,6 +2924,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
   }
+  // A daemon selected by durable array index still validates the complete
+  // impending topology. Parsing only its singleton row would miss A→B→A.
+  assertQuotaFallbackGraphAcyclic(parsed);
   const entry = parsed[index];
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
@@ -3058,6 +3062,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
+  assertQuotaFallbackGraphAcyclic(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
