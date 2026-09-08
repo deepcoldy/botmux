@@ -10,6 +10,19 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
 
+## Pinning The Current Live Card
+
+When a bot enables `pinStreamingCard`, Botmux tries to pin the **current public live-status card** to the top of the chat so the close-session and terminal entry points stay easy to reach.
+
+- This is a **per-bot, opt-in, default-off** setting.
+- Pinning is still **chat-wide** at the Feishu layer, while each active session keeps its own current/frozen streaming-card lifecycle. If the same chat has multiple active topics or multiple bots, you may therefore see multiple independently managed group-level Pin entries.
+- Only the current public live-status real `streamCardId` participates.
+- Repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay **out of scope**.
+- After the switch changes through the dashboard or `/botconfig set pinStreamingCard on/off`, Botmux immediately runs a best-effort hot reconciliation across that bot's **existing active sessions**; the configuration response itself does not wait for Feishu Pin/Unpin completion.
+- `/card pin off` is the **per-chat escape hatch**: it stops Botmux from pinning streaming cards in the current chat while keeping live cards themselves enabled. `/card pin on` restores Pin for that chat, and `/card pin status` reports whether Pin is off at the bot level, opted out for this chat, or effectively on.
+- Failures are **fail-open**: they never interrupt card publication, transfer, resume, close, or the configuration write. During exceptional periods you may temporarily see zero Pins or multiple Pins.
+- The feature keeps no durable retry journal, and startup recovery remains deliberately narrow. On restart, Botmux lists the chat's current Pins as the single ownership authority for persisted cards: a remote Pin counts only when Feishu reports `operator_id_type: "app_id"` for the same `larkAppId`, and cleanup is further restricted to the strict intersection with the enqueue-time local candidate IDs already known to this process. An already-Pinned current card with human, other-app, mixed, or malformed provenance is left untouched and is not re-pinned. If the current card is absent, Botmux accepts a create only when the returned `data.pin` repeats both the exact message ID and same-app provenance. Botmux never broad-cleans arbitrary remote Pins, and any lookup or Pin API failure stays fail-open. Explicit bot-wide/per-chat off cleans process-owned IDs plus locally known IDs freshly proven same-app; ordinary disable, close, and transfer clean process-owned IDs only.
+
 > **Open terminal = read-only**: the card's main "🖥️ Open Web Terminal" button is read-only viewing; for **writable** control, tap "🔑 Get operation link" — delivered **privately**: a flat group prefers an in-chat "visible-to-you" ephemeral card (so you never leave the conversation), falling back to a DM only for topic/thread or p2p chats, or when the ephemeral card fails. Management buttons like "🔄 Restart" and "apply profile" live on the **session card**, not on each turn's streaming card.
 
 ## Interrupting / correcting a running turn

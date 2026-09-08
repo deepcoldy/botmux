@@ -12,6 +12,19 @@ import {
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
 
+function rmTree(root: string): void {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== 'ENOTEMPTY' && code !== 'EBUSY') || attempt === 7) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
+
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
@@ -100,7 +113,7 @@ describe('Riff worker session environment', () => {
       });
     } finally {
       stop();
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   });
 
@@ -220,6 +233,7 @@ describe('Riff worker session environment', () => {
             // resolved value after the merge — otherwise this would desync the
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
+            BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
           },
         },
         prompt: 'verify remote session environment',
@@ -241,6 +255,12 @@ describe('Riff worker session environment', () => {
           },
           allowReselect: false,
         },
+        replyStyle: {
+          recipes: false,
+          layout: false,
+          theme: 'minimal',
+          layoutTags: { blocked: '请处理' },
+        },
       };
       child.send(init);
 
@@ -258,6 +278,14 @@ describe('Riff worker session environment', () => {
       // worker env), so the stale backendConfig.env `false` must NOT survive
       // into the remote pane.
       expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
+      // replyStyle is another host-normalized spawn snapshot. The raw Riff env
+      // tries to replace it above, but the worker must re-freeze the init value.
+      expect(JSON.parse(request.config?.env?.BOTMUX_REPLY_STYLE)).toEqual({
+        recipes: false,
+        layout: false,
+        theme: 'minimal',
+        layoutTags: { blocked: '请处理' },
+      });
       expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
         enabled: true,
         buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
@@ -266,7 +294,7 @@ describe('Riff worker session environment', () => {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   }, 25_000);
 });

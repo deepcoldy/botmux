@@ -1,0 +1,1813 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { DaemonSession, FrozenCard } from '../src/core/types.js';
+import { activeSessionKey } from '../src/core/types.js';
+
+function sameAppPin(larkAppId: string, messageId: string) {
+  return { messageId, operatorId: larkAppId, operatorIdType: 'app_id' };
+}
+const remotelySameAppPinIds = new Set<string>();
+const pinMessageMock = vi.fn(async (larkAppId: string, messageId: string) => {
+  remotelySameAppPinIds.add(messageId);
+  return sameAppPin(larkAppId, messageId);
+});
+const unpinMessageMock = vi.fn(async (_appId: string, messageId: string) => {
+  remotelySameAppPinIds.delete(messageId);
+  return true;
+});
+const listChatPinsMock = vi.fn(async (larkAppId: string, chatId: string) =>
+  [...remotelySameAppPinIds].map(messageId => ({ ...sameAppPin(larkAppId, messageId), chatId })));
+
+vi.mock('../src/im/lark/client.js', () => ({
+  pinMessage: (...args: any[]) => pinMessageMock(...args),
+  unpinMessage: (...args: any[]) => unpinMessageMock(...args),
+  listChatPins: (...args: any[]) => listChatPinsMock(...args),
+  deleteMessage: vi.fn(async () => {}),
+  updateMessage: vi.fn(async () => {}),
+  MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+}));
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true } })),
+  getAllBots: vi.fn(() => []),
+  resolveUsageDisplay: vi.fn(() => 'streaming'),
+}));
+vi.mock('../src/services/frozen-card-store.js', () => ({ loadFrozenCards: vi.fn(() => new Map()), saveFrozenCards: vi.fn() }));
+vi.mock('../src/core/session-manager.js', () => ({ persistStreamCardState: vi.fn() }));
+const loggerDebugMock = vi.fn();
+vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), debug: (...args: any[]) => loggerDebugMock(...args), error: vi.fn() } }));
+vi.mock('../src/config.js', () => ({ config: { web: { externalHost: 'localhost' }, session: { dataDir: '/tmp' } } }));
+vi.mock('../src/global-config.js', () => ({ isRemoteAccessEnabled: vi.fn(() => false) }));
+vi.mock('../src/platform/binding.js', () => ({ platformMachineBaseUrl: vi.fn(() => null), publicReverseProxyBaseUrl: vi.fn(() => null) }));
+vi.mock('../src/services/session-store.js', () => ({ registerSessionBridgeSendMarkerCleanupFence: vi.fn(), cleanupSessionBridgeSendMarkers: vi.fn(), cleanupSessionBridgeSendMarkersNow: vi.fn(), closeSession: vi.fn(), updateSession: vi.fn() }));
+vi.mock('../src/core/dashboard-events.js', () => ({ dashboardEventBus: { publish: vi.fn() } }));
+vi.mock('../src/core/dashboard-rows.js', () => ({ composeRowFromActive: vi.fn() }));
+vi.mock('../src/skills/installer.js', () => ({ ensureSkills: vi.fn() }));
+vi.mock('../src/adapters/cli/registry.js', () => ({ createCliAdapterSync: vi.fn() }));
+vi.mock('../src/adapters/cli/claude-code.js', () => ({ claudeJsonlPathForSession: vi.fn() }));
+vi.mock('../src/adapters/backend/tmux-backend.js', () => ({ TmuxBackend: class {} }));
+vi.mock('../src/im/lark/card-builder.js', () => ({ buildStreamingCard: vi.fn(() => '{}'), buildSessionCard: vi.fn(() => '{}'), buildTuiPromptCard: vi.fn(() => '{}'), buildTuiPromptResolvedCard: vi.fn(() => '{}'), getCliDisplayName: vi.fn(() => 'Claude') }));
+
+import {
+  __testOnly_resetPinStreamingCardReconcileQueue,
+  __testOnly_waitForPinStreamingCardIdle,
+  CARD_POSTING_SENTINEL,
+  pinStreamingCardIfEnabled,
+  reconcileBotStreamingCardPins,
+  reconcileRestoredStreamingCardPins,
+  reconcileStreamingCardPins,
+  setActiveSessionsRegistry,
+} from '../src/core/worker-pool.js';
+import { getBot } from '../src/bot-registry.js';
+
+const getBotMock = getBot as ReturnType<typeof vi.fn>;
+
+async function drainMicrotasks(times = 2): Promise<void> {
+  for (let i = 0; i < times; i += 1) {
+    await Promise.resolve();
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function makeDs(
+  card = 'om_current',
+  frozenCards?: Map<string, FrozenCard>,
+  sessionId = 'pin-session',
+  rootMessageId = 'om_root',
+): DaemonSession {
+  if (card && card !== CARD_POSTING_SENTINEL) remotelySameAppPinIds.add(card);
+  for (const frozen of frozenCards?.values() ?? []) remotelySameAppPinIds.add(frozen.messageId);
+  return { session: { sessionId, rootMessageId, chatId: 'oc_chat', title: 'pin', status: 'active', createdAt: Date.now(), updatedAt: Date.now(), pid: null, chatType: 'group' }, worker: null, workerPort: null, workerToken: null, larkAppId: 'app-pin', chatId: 'oc_chat', chatType: 'group', spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(), hasHistory: true, scope: 'thread', streamCardId: card, frozenCards } as any;
+}
+function withChat(ds: DaemonSession, chatId: string): DaemonSession {
+  return {
+    ...ds,
+    chatId,
+    session: { ...ds.session, chatId },
+  } as DaemonSession;
+}
+function activate(ds: DaemonSession) { setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]])); }
+
+describe('streaming-card pin policy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    remotelySameAppPinIds.clear();
+    __testOnly_resetPinStreamingCardReconcileQueue();
+    setActiveSessionsRegistry(new Map());
+    pinMessageMock.mockImplementation(async (larkAppId: string, messageId: string) => {
+      remotelySameAppPinIds.add(messageId);
+      return sameAppPin(larkAppId, messageId);
+    });
+    unpinMessageMock.mockImplementation(async (_appId: string, messageId: string) => {
+      remotelySameAppPinIds.delete(messageId);
+      return true;
+    });
+    listChatPinsMock.mockImplementation(async (larkAppId: string, chatId: string) =>
+      [...remotelySameAppPinIds].map(messageId => ({ ...sameAppPin(larkAppId, messageId), chatId })));
+    loggerDebugMock.mockReset();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true } } as any);
+  });
+  it('does nothing when disabled, sentinel, inactive, displaced, or changed', async () => {
+    const ds = makeDs(); activate(ds);
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: false } } as any);
+    expect(await pinStreamingCardIfEnabled(ds, 'om_current')).toBe(false);
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true } } as any);
+    ds.streamCardId = CARD_POSTING_SENTINEL; expect(await pinStreamingCardIfEnabled(ds, CARD_POSTING_SENTINEL)).toBe(false);
+    ds.streamCardId = 'om_current'; ds.session.status = 'closed'; expect(await pinStreamingCardIfEnabled(ds, 'om_current')).toBe(false);
+    ds.session.status = 'active'; setActiveSessionsRegistry(new Map()); expect(await pinStreamingCardIfEnabled(ds, 'om_current')).toBe(false);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not pin when the chat is opted out even if the bot-level master switch is on', async () => {
+    const ds = makeDs();
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: ['oc_chat'],
+      },
+    } as any);
+
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(false);
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the active session registry is unavailable', async () => {
+    const ds = makeDs();
+    setActiveSessionsRegistry(undefined as any);
+
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(false);
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+  it('pins only the active owned current card and compensates a stale success', async () => {
+    const ds = makeDs(); activate(ds);
+    let resolvePin!: (value: ReturnType<typeof sameAppPin>) => void; pinMessageMock.mockImplementation(() => new Promise(resolve => { resolvePin = resolve; }));
+    const pending = pinStreamingCardIfEnabled(ds, 'om_current');
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current'));
+    ds.streamCardId = 'om_new'; resolvePin(sameAppPin('app-pin', 'om_current'));
+    expect(await pending).toBe(false);
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+  });
+  it('reconciles enabled in pin-then-session-wide-frozen-unpin order and disable unpins every unique real id', async () => {
+    const frozen = new Map<string, FrozenCard>([['a', { messageId: 'om_same_topic', content: '', title: '', displayMode: 'hidden', replyTargetKey: 'one' }], ['b', { messageId: 'om_other_topic', content: '', title: '', displayMode: 'hidden', replyTargetKey: 'two' }], ['c', { messageId: 'om_current', content: '', title: '', displayMode: 'hidden' }]]);
+    const ds = makeDs('om_current', frozen); activate(ds);
+    remotelySameAppPinIds.delete('om_current');
+    await reconcileStreamingCardPins(ds, true);
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock.mock.calls.map(c => c[1])).toEqual(['om_same_topic', 'om_other_topic']);
+    pinMessageMock.mockClear(); unpinMessageMock.mockClear();
+    await reconcileStreamingCardPins(ds, false);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(new Set(unpinMessageMock.mock.calls.map(c => c[1]))).toEqual(new Set(['om_current']));
+  });
+
+  it('default-off with no feature-owned ids is zero-call and leaves manual pins untouched', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+    );
+    activate(ds);
+
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('ordinary disable revalidates process ownership immediately before Unpin', async () => {
+    const ds = makeDs('om_owned_then_replaced');
+    activate(ds);
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_owned_then_replaced',
+      chatId: 'oc_chat',
+      operatorId: 'app-pin',
+      operatorIdType: 'app_id',
+    }]);
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    pinMessageMock.mockClear();
+    listChatPinsMock.mockClear();
+    const calls: string[] = [];
+    listChatPinsMock.mockImplementation(async () => {
+      calls.push('list');
+      return [{
+        messageId: 'om_owned_then_replaced',
+        chatId: 'oc_chat',
+        operatorId: 'ou_human',
+        operatorIdType: 'open_id',
+      }];
+    });
+    unpinMessageMock.mockImplementation(async () => {
+      calls.push('unpin');
+      return true;
+    });
+
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(calls).toEqual(['list']);
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('ordinary disable lists same-app provenance before deleting an owned Pin', async () => {
+    const ds = makeDs('om_owned_current');
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_owned_current')).resolves.toBe(true);
+    const calls: string[] = [];
+    listChatPinsMock.mockImplementation(async () => {
+      calls.push('list');
+      return [{
+        messageId: 'om_owned_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-pin',
+        operatorIdType: 'app_id',
+      }];
+    });
+    unpinMessageMock.mockImplementation(async () => {
+      calls.push('unpin');
+      return true;
+    });
+
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(calls).toEqual(['list', 'unpin']);
+  });
+
+  it('hot enable leaves an existing foreign current Pin untouched', async () => {
+    const ds = makeDs('om_foreign_hot_enable');
+    activate(ds);
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_foreign_hot_enable',
+      chatId: 'oc_chat',
+      operatorId: 'app-other',
+      operatorIdType: 'app_id',
+    }]);
+
+    await reconcileStreamingCardPins(ds, true);
+
+    expect(listChatPinsMock).toHaveBeenCalledWith('app-pin', 'oc_chat');
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+
+    await reconcileStreamingCardPins(ds, false);
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('explicit on-to-off toggle cleans same-app proven current and frozen ids after provenance reset', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+    );
+    activate(ds);
+    let pinStreamingCard = true;
+    getBotMock.mockImplementation(() => ({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard },
+    } as any));
+
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(true);
+
+    __testOnly_resetPinStreamingCardReconcileQueue();
+    activate(ds);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+    ]);
+
+    pinStreamingCard = false;
+    reconcileBotStreamingCardPins('app-pin', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(new Set(unpinMessageMock.mock.calls.map(call => call[1]))).toEqual(new Set([
+      'om_current',
+      'om_frozen',
+    ]));
+  });
+
+  it('explicit off remains fail-open when remote ownership revalidation fails', async () => {
+    const ds = makeDs(
+      'om_owned_current',
+      new Map<string, FrozenCard>([[
+        'ambiguous',
+        { messageId: 'om_ambiguous_frozen', content: '', title: '', displayMode: 'hidden' },
+      ]]),
+    );
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_owned_current')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockRejectedValue(new Error('proof unavailable'));
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: false },
+    } as any);
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_owned_current');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_ambiguous_frozen');
+    expect(loggerDebugMock).toHaveBeenCalledWith(
+      '[app-pin] streaming-card pre-Unpin proof list failed for chat oc_chat: proof unavailable',
+    );
+  });
+
+  it.each([
+    { label: 'bot-wide', chatId: undefined, chatEnabled: undefined },
+    { label: 'per-chat', chatId: 'oc_chat', chatEnabled: false },
+  ])('explicit $label off revalidates stale process ownership before Unpin', async ({ chatId, chatEnabled }) => {
+    const ds = makeDs('om_explicit_replaced');
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_explicit_replaced')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_explicit_replaced',
+      chatId: 'oc_chat',
+      operatorId: 'app-other',
+      operatorIdType: 'app_id',
+    }]);
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: chatId !== undefined,
+        ...(chatId ? { noPinStreamingCardChats: [chatId] } : {}),
+      },
+    } as any);
+
+    reconcileBotStreamingCardPins('app-pin', chatId !== undefined, chatId, chatEnabled);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledWith('app-pin', 'oc_chat');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_explicit_replaced');
+  });
+
+  it('reconcile is a zero-call no-op for apiOnly and HTTP virtual transports', async () => {
+    const ds = makeDs();
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true, apiOnly: true },
+    } as any);
+
+    await reconcileStreamingCardPins(ds, true);
+    await reconcileStreamingCardPins(ds, false);
+
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    ds.chatId = 'http_async_pin_reconcile';
+    activate(ds);
+    await reconcileStreamingCardPins(ds, true);
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('forgets ownership only after a successful Unpin so a failed cleanup can retry', async () => {
+    const ds = makeDs();
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(true);
+    unpinMessageMock.mockResolvedValueOnce(false);
+
+    await reconcileStreamingCardPins(ds, false);
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(unpinMessageMock.mock.calls.map(call => call[1])).toEqual(['om_current', 'om_current']);
+  });
+
+  it('retains ownership after a thrown Unpin so a later cleanup retries', async () => {
+    const ds = makeDs();
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(true);
+    unpinMessageMock.mockRejectedValueOnce(new Error('transport reset'));
+
+    await reconcileStreamingCardPins(ds, false);
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(unpinMessageMock.mock.calls.map(call => call[1])).toEqual(['om_current', 'om_current']);
+  });
+
+  it('serializes a close cleanup Unpin before a same-card resume Pin', async () => {
+    const ds = makeDs();
+    activate(ds);
+    await expect(pinStreamingCardIfEnabled(ds, 'om_current')).resolves.toBe(true);
+    const releaseUnpin = deferred<boolean>();
+    const unpinStarted = deferred<void>();
+    const calls: string[] = [];
+    unpinMessageMock.mockImplementationOnce(() => {
+      calls.push('unpin');
+      unpinStarted.resolve();
+      return releaseUnpin.promise;
+    });
+    pinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      calls.push('pin');
+      return Promise.resolve(sameAppPin(appId, messageId));
+    });
+
+    const closing = reconcileStreamingCardPins(ds, false);
+    // This explicit test barrier proves the queued Unpin has been issued
+    // before resuming; no timing-sensitive microtask or timer flushing.
+    await unpinStarted.promise;
+    expect(calls).toEqual(['unpin']);
+    const resuming = pinStreamingCardIfEnabled(ds, 'om_current');
+    expect(calls).toEqual(['unpin']);
+
+    releaseUnpin.resolve(true);
+    await closing;
+    await expect(resuming).resolves.toBe(true);
+    expect(calls).toEqual(['unpin', 'pin']);
+  });
+
+  it('does not let a pre-reset deferred Unpin forget replacement provenance', async () => {
+    const original = makeDs();
+    activate(original);
+    await expect(pinStreamingCardIfEnabled(original, 'om_current')).resolves.toBe(true);
+    const unpinStarted = deferred<void>();
+    const releaseUnpin = deferred<boolean>();
+    unpinMessageMock.mockImplementationOnce(() => {
+      unpinStarted.resolve();
+      return releaseUnpin.promise;
+    });
+    const retiring = reconcileStreamingCardPins(original, false);
+    await unpinStarted.promise;
+
+    __testOnly_resetPinStreamingCardReconcileQueue();
+    const replacement = makeDs('om_current');
+    activate(replacement);
+    await expect(pinStreamingCardIfEnabled(replacement, 'om_current')).resolves.toBe(true);
+    releaseUnpin.resolve(true);
+    await retiring;
+
+    unpinMessageMock.mockClear();
+    await reconcileStreamingCardPins(replacement, false);
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+  });
+
+  it('reconciles all active sessions for the matching bot, ignores other bots, and isolates one session failure', async () => {
+    const first = makeDs('om_first', undefined, 'pin-session-1', 'om_root_1');
+    const second = makeDs('om_second', undefined, 'pin-session-2', 'om_root_2');
+    const otherBot = { ...makeDs('om_other', undefined, 'pin-session-3', 'om_root_3'), larkAppId: 'app-other' } as DaemonSession;
+    const inactive = { ...makeDs('om_inactive', undefined, 'pin-session-4', 'om_root_4'), session: { ...makeDs('om_inactive', undefined, 'pin-session-4', 'om_root_4').session, status: 'closed' } } as DaemonSession;
+    const displaced = makeDs('om_displaced', undefined, 'pin-session-5', 'om_root_shared');
+    const winner = makeDs('om_winner', undefined, 'pin-session-6', 'om_root_shared');
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+      [activeSessionKey(otherBot), otherBot],
+      [activeSessionKey(inactive), inactive],
+      [activeSessionKey(displaced), displaced],
+      [activeSessionKey(winner), winner],
+    ]));
+
+    pinMessageMock.mockImplementation(async (_appId: string, messageId: string) => {
+      if (messageId === 'om_first') throw new Error('pin failed');
+      return sameAppPin(_appId, messageId);
+    });
+    remotelySameAppPinIds.delete('om_first');
+    remotelySameAppPinIds.delete('om_second');
+    remotelySameAppPinIds.delete('om_winner');
+
+    reconcileBotStreamingCardPins('app-pin', true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_first'],
+      ['app-pin', 'om_second'],
+      ['app-pin', 'om_winner'],
+    ]);
+    expect(pinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_inactive');
+    expect(pinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_displaced');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-other', 'om_other');
+  });
+
+  it('bounds bot-wide reconciliation to at most 20 concurrent sessions', async () => {
+    const sessions = Array.from({ length: 45 }, (_, index) =>
+      makeDs(`om_card_${index}`, undefined, `pin-session-${index}`, `om_root_${index}`));
+    setActiveSessionsRegistry(new Map(sessions.map(ds => [activeSessionKey(ds), ds])));
+    for (const ds of sessions) remotelySameAppPinIds.delete(ds.streamCardId!);
+    const releasePins = deferred<void>();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    pinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await releasePins.promise;
+      concurrent -= 1;
+      return sameAppPin(appId, messageId);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', true);
+    await drainMicrotasks(5);
+    const observedBeforeRelease = maxConcurrent;
+    releasePins.resolve();
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(observedBeforeRelease).toBeGreaterThan(0);
+    expect(observedBeforeRelease).toBeLessThanOrEqual(20);
+    expect(pinMessageMock).toHaveBeenCalledTimes(45);
+  });
+
+  it('bounds Pin mutations to at most 20 across concurrent bot queues', async () => {
+    const firstBot = Array.from({ length: 25 }, (_, index) =>
+      makeDs(`om_first_bot_${index}`, undefined, `pin-first-bot-${index}`, `om_first_root_${index}`));
+    const secondBot = Array.from({ length: 25 }, (_, index) => {
+      const ds = makeDs(
+        `om_second_bot_${index}`,
+        undefined,
+        `pin-second-bot-${index}`,
+        `om_second_root_${index}`,
+      );
+      ds.larkAppId = 'app-pin-second';
+      return ds;
+    });
+    setActiveSessionsRegistry(new Map(
+      [...firstBot, ...secondBot].map(ds => [activeSessionKey(ds), ds]),
+    ));
+    getBotMock.mockImplementation((larkAppId: string) => ({
+      config: { larkAppId, cliId: 'claude-code', pinStreamingCard: true },
+    }) as any);
+    for (const ds of [...firstBot, ...secondBot]) remotelySameAppPinIds.delete(ds.streamCardId!);
+    const releasePins = deferred<void>();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    pinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await releasePins.promise;
+      concurrent -= 1;
+      return sameAppPin(appId, messageId);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', true);
+    reconcileBotStreamingCardPins('app-pin-second', true);
+    await vi.waitFor(() => expect(pinMessageMock.mock.calls.length).toBeGreaterThanOrEqual(20));
+    const observedBeforeRelease = maxConcurrent;
+    releasePins.resolve();
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(observedBeforeRelease).toBeLessThanOrEqual(20);
+    expect(pinMessageMock).toHaveBeenCalledTimes(50);
+  });
+
+  it('admits every queued Pin that fits after a 20-permit Unpin wave releases', async () => {
+    const cleanupSessions = Array.from({ length: 20 }, (_, index) =>
+      makeDs(`om_cleanup_wave_${index}`, undefined, `pin-cleanup-wave-${index}`, `om_cleanup_wave_root_${index}`));
+    const firstPin = makeDs('om_waiting_pin_1', undefined, 'pin-waiting-1', 'om_waiting_root_1');
+    firstPin.larkAppId = 'app-pin-waiting';
+    const secondPin = makeDs('om_waiting_pin_2', undefined, 'pin-waiting-2', 'om_waiting_root_2');
+    secondPin.larkAppId = 'app-pin-waiting';
+    setActiveSessionsRegistry(new Map(
+      [...cleanupSessions, firstPin, secondPin].map(ds => [activeSessionKey(ds), ds]),
+    ));
+    getBotMock.mockImplementation((larkAppId: string) => ({
+      config: { larkAppId, cliId: 'claude-code', pinStreamingCard: true },
+    }) as any);
+    const releaseUnpins = deferred<void>();
+    unpinMessageMock.mockImplementation(async (_appId: string, messageId: string) => {
+      await releaseUnpins.promise;
+      remotelySameAppPinIds.delete(messageId);
+      return true;
+    });
+    const releasePins = deferred<void>();
+    pinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      await releasePins.promise;
+      return sameAppPin(appId, messageId);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    await vi.waitFor(() => expect(unpinMessageMock).toHaveBeenCalledTimes(20));
+    const firstPending = pinStreamingCardIfEnabled(firstPin, firstPin.streamCardId!);
+    const secondPending = pinStreamingCardIfEnabled(secondPin, secondPin.streamCardId!);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+
+    releaseUnpins.resolve();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalledTimes(2));
+    releasePins.resolve();
+    await expect(Promise.all([firstPending, secondPending])).resolves.toEqual([true, true]);
+    await __testOnly_waitForPinStreamingCardIdle();
+  });
+
+  it('bounds same-chat bot-wide cleanup to at most 20 concurrent Unpins', async () => {
+    const sessions = Array.from({ length: 45 }, (_, index) =>
+      makeDs(`om_cleanup_${index}`, undefined, `pin-cleanup-${index}`, `om_cleanup_root_${index}`));
+    setActiveSessionsRegistry(new Map(sessions.map(ds => [activeSessionKey(ds), ds])));
+    const releaseUnpins = deferred<void>();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    unpinMessageMock.mockImplementation(async (_appId: string, messageId: string) => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await releaseUnpins.promise;
+      concurrent -= 1;
+      remotelySameAppPinIds.delete(messageId);
+      return true;
+    });
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    await vi.waitFor(() => expect(unpinMessageMock.mock.calls.length).toBeGreaterThanOrEqual(20));
+    const observedBeforeRelease = maxConcurrent;
+    releaseUnpins.resolve();
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(observedBeforeRelease).toBeLessThanOrEqual(20);
+    expect(unpinMessageMock).toHaveBeenCalledTimes(45);
+    expect(listChatPinsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('bounds same-chat restored entries to at most 20 concurrent Pin creates', async () => {
+    const sessions = Array.from({ length: 45 }, (_, index) =>
+      makeDs(`om_restore_${index}`, undefined, `pin-restore-${index}`, `om_restore_root_${index}`));
+    setActiveSessionsRegistry(new Map(sessions.map(ds => [activeSessionKey(ds), ds])));
+    listChatPinsMock.mockResolvedValue([]);
+    const releasePins = deferred<void>();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    pinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await releasePins.promise;
+      concurrent -= 1;
+      return sameAppPin(appId, messageId);
+    });
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await vi.waitFor(() => expect(pinMessageMock.mock.calls.length).toBeGreaterThanOrEqual(20));
+    const observedBeforeRelease = maxConcurrent;
+    releasePins.resolve();
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(observedBeforeRelease).toBeLessThanOrEqual(20);
+    expect(pinMessageMock).toHaveBeenCalledTimes(45);
+  });
+
+  it('serializes bot-wide disable then enable and reruns the latest desired state after deferred unpin completes', async () => {
+    const first = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+      'pin-session-1',
+      'om_root_1',
+    );
+    const second = makeDs('om_second', undefined, 'pin-session-2', 'om_root_2');
+    remotelySameAppPinIds.delete('om_second');
+    activate(first);
+    await reconcileStreamingCardPins(first, true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockImplementation(async (appId: string, chatId: string) =>
+      [...remotelySameAppPinIds].map(messageId => ({ ...sameAppPin(appId, messageId), chatId })));
+    const currentUnpinStarted = deferred<void>();
+    let resolveCurrentUnpin!: (value: boolean) => void;
+    unpinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_current') {
+        currentUnpinStarted.resolve();
+        const result = await new Promise<boolean>(resolve => { resolveCurrentUnpin = resolve; });
+        if (result) remotelySameAppPinIds.delete(messageId);
+        return result;
+      }
+      remotelySameAppPinIds.delete(messageId);
+      return Promise.resolve(true);
+    });
+
+    setActiveSessionsRegistry(new Map([[activeSessionKey(first), first]]));
+    reconcileBotStreamingCardPins('app-pin', false);
+    await currentUnpinStarted.promise;
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(pinMessageMock).not.toHaveBeenCalled();
+
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    remotelySameAppPinIds.delete('om_current');
+    reconcileBotStreamingCardPins('app-pin', true);
+    await drainMicrotasks(1);
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+
+    resolveCurrentUnpin(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_current'],
+      ['app-pin', 'om_second'],
+    ]);
+  });
+
+  it('serializes bot-wide enable then disable and ends at the latest off state after deferred pin completes', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+    );
+    activate(ds);
+    const pinStarted = deferred<void>();
+    let resolvePin!: (value: ReturnType<typeof sameAppPin>) => void;
+    pinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_current') {
+        pinStarted.resolve();
+        return new Promise<ReturnType<typeof sameAppPin>>(resolve => { resolvePin = resolve; });
+      }
+      return Promise.resolve(sameAppPin(appId, messageId));
+    });
+
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true } } as any);
+    remotelySameAppPinIds.delete('om_current');
+    reconcileBotStreamingCardPins('app-pin', true);
+    await pinStarted.promise;
+
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: false } } as any);
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+    ]);
+    reconcileBotStreamingCardPins('app-pin', false);
+    await drainMicrotasks(1);
+
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+
+    resolvePin(sameAppPin('app-pin', 'om_current'));
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).toHaveBeenCalledTimes(1);
+    expect(unpinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_current'],
+      ['app-pin', 'om_current'],
+      ['app-pin', 'om_frozen'],
+    ]);
+  });
+
+  it('chat-scoped opt-out reconciles only matching chat sessions while another chat remains enabled', async () => {
+    const first = makeDs('om_chat_one', undefined, 'pin-session-1', 'om_root_1');
+    const second = { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2'), chatId: 'oc_chat_2', session: { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2').session, chatId: 'oc_chat_2' } } as DaemonSession;
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    await expect(pinStreamingCardIfEnabled(first, 'om_chat_one')).resolves.toBe(true);
+    await expect(pinStreamingCardIfEnabled(second, 'om_chat_two')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+
+    getBotMock.mockImplementation(((larkAppId: string) => ({
+      config: {
+        larkAppId,
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: ['oc_chat'],
+      },
+    })) as any);
+
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_chat_one'],
+    ]);
+    expect(pinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_chat_two');
+  });
+
+  it('rapid mixed bot/chat writes converge in serialized order to the live effective policy', async () => {
+    const first = makeDs('om_chat_one', undefined, 'pin-session-1', 'om_root_1');
+    const second = { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2'), chatId: 'oc_chat_2', session: { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2').session, chatId: 'oc_chat_2' } } as DaemonSession;
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    const desiredStates: Array<{ master: boolean; disabledChats?: string[] }> = [
+      { master: false },
+      { master: true, disabledChats: ['oc_chat'] },
+      { master: true },
+    ];
+    let index = 0;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: desiredStates[index]?.master === true,
+        noPinStreamingCardChats: desiredStates[index]?.disabledChats,
+      },
+    }) as any);
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    index = 1;
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat', false);
+    index = 2;
+    reconcileBotStreamingCardPins('app-pin', true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock.mock.calls.map(c => c[1])).toContain('om_chat_one');
+    expect(pinMessageMock.mock.calls.map(c => c[1])).toContain('om_chat_two');
+  });
+
+  it('preserves authoritative cleanup for each deferred chat-scope effective on-to-off while coalescing later chat requests', async () => {
+    const first = makeDs('om_chat_one', undefined, 'pin-session-1', 'om_root_1');
+    const second = {
+      ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2'),
+      chatId: 'oc_chat_2',
+      session: { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2').session, chatId: 'oc_chat_2' },
+    } as DaemonSession;
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    await expect(pinStreamingCardIfEnabled(first, 'om_chat_one')).resolves.toBe(true);
+    await expect(pinStreamingCardIfEnabled(second, 'om_chat_two')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+
+    let disabledChats: string[] = ['oc_chat'];
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    const releaseFirstUnpin = deferred<boolean>();
+    const firstUnpinStarted = deferred<void>();
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_chat_one') {
+        firstUnpinStarted.resolve();
+        return releaseFirstUnpin.promise;
+      }
+      return Promise.resolve(true);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat', false);
+    await firstUnpinStarted.promise;
+
+    disabledChats = ['oc_chat', 'oc_chat_2'];
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat_2', false);
+    await drainMicrotasks(1);
+    expect(unpinMessageMock.mock.calls.map(c => c[1])).toEqual(['om_chat_one']);
+
+    releaseFirstUnpin.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_chat_one'],
+      ['app-pin', 'om_chat_two'],
+    ]);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('global off revalidates and cleans opted-out chats before global on keeps them disabled', async () => {
+    const first = makeDs('om_chat_one', undefined, 'pin-session-1', 'om_root_1');
+    const second = {
+      ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2'),
+      chatId: 'oc_chat_2',
+      session: { ...makeDs('om_chat_two', undefined, 'pin-session-2', 'om_root_2').session, chatId: 'oc_chat_2' },
+    } as DaemonSession;
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    await expect(pinStreamingCardIfEnabled(first, 'om_chat_one')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockImplementation(async (appId: string, chatId: string) => {
+      const messageId = chatId === 'oc_chat' ? 'om_chat_one' : 'om_chat_two';
+      return remotelySameAppPinIds.has(messageId)
+        ? [{ ...sameAppPin(appId, messageId), chatId }]
+        : [];
+    });
+
+    const desiredStates: Array<{ master: boolean; disabledChats?: string[] }> = [
+      { master: false, disabledChats: ['oc_chat_2'] },
+      { master: true, disabledChats: ['oc_chat_2'] },
+    ];
+    let index = 0;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: desiredStates[index]?.master === true,
+        noPinStreamingCardChats: desiredStates[index]?.disabledChats,
+      },
+    }) as any);
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    index = 1;
+    reconcileBotStreamingCardPins('app-pin', true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_chat_one'],
+      ['app-pin', 'om_chat_two'],
+    ]);
+    expect(pinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_chat_one'],
+    ]);
+  });
+
+  it('global-off later-batch cleanup keeps transition-time authority even if master-off opt-out mutates live noPin afterwards', async () => {
+    const leading = Array.from({ length: 20 }, (_, index) =>
+      makeDs(`om_leading_${index}`, undefined, `pin-leading-${index}`, `om_root_leading_${index}`));
+    const target = withChat(
+      makeDs('om_target_late', undefined, 'pin-target-late', 'om_root_target_late'),
+      'oc_target_late',
+    );
+    setActiveSessionsRegistry(new Map([
+      ...leading.map(ds => [activeSessionKey(ds), ds] as const),
+      [activeSessionKey(target), target] as const,
+    ]));
+
+    let masterEnabled = true;
+    let disabledChats: string[] | undefined;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: masterEnabled,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    await expect(pinStreamingCardIfEnabled(target, 'om_target_late')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockImplementation(async (_appId: string, chatId: string) => {
+      if (chatId === 'oc_chat') {
+        return leading.map(ds => ({
+          messageId: ds.streamCardId!, chatId, operatorId: 'app-pin', operatorIdType: 'app_id',
+        }));
+      }
+      return chatId === 'oc_target_late'
+        ? [{ messageId: 'om_target_late', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' }]
+        : [];
+    });
+
+    const firstBatchStarted = deferred<void>();
+    const releaseFirstBatch = deferred<boolean>();
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_leading_0') {
+        firstBatchStarted.resolve();
+        return releaseFirstBatch.promise;
+      }
+      return Promise.resolve(true);
+    });
+
+    masterEnabled = false;
+    reconcileBotStreamingCardPins('app-pin', false);
+    await firstBatchStarted.promise;
+
+    disabledChats = ['oc_target_late'];
+    await drainMicrotasks(1);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_late');
+
+    releaseFirstBatch.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_target_late');
+  });
+
+  it('global-off later-batch cleanup does not gain authority when a previously opted-out chat is re-enabled under master-off', async () => {
+    const leading = Array.from({ length: 20 }, (_, index) =>
+      makeDs(`om_leading_${index}`, undefined, `pin-leading-${index}`, `om_root_leading_${index}`));
+    const target = withChat(
+      makeDs('om_target_manual', undefined, 'pin-target-manual', 'om_root_target_manual'),
+      'oc_target_manual',
+    );
+    setActiveSessionsRegistry(new Map([
+      ...leading.map(ds => [activeSessionKey(ds), ds] as const),
+      [activeSessionKey(target), target] as const,
+    ]));
+
+    let masterEnabled = true;
+    let disabledChats: string[] | undefined = ['oc_target_manual'];
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: masterEnabled,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    listChatPinsMock.mockImplementation(async (_appId: string, chatId: string) =>
+      chatId === 'oc_chat'
+        ? leading.map(ds => ({
+          messageId: ds.streamCardId!, chatId, operatorId: 'app-pin', operatorIdType: 'app_id',
+        }))
+        : []);
+
+    const firstBatchStarted = deferred<void>();
+    const releaseFirstBatch = deferred<boolean>();
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_leading_0') {
+        firstBatchStarted.resolve();
+        return releaseFirstBatch.promise;
+      }
+      return Promise.resolve(true);
+    });
+
+    masterEnabled = false;
+    reconcileBotStreamingCardPins('app-pin', false);
+    await firstBatchStarted.promise;
+
+    disabledChats = undefined;
+    await drainMicrotasks(1);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_manual');
+
+    releaseFirstBatch.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_manual');
+  });
+
+  it('chat-off authority applies only to sessions active at that transition, not newer same-chat sessions', async () => {
+    const first = withChat(
+      makeDs('om_chat_old', undefined, 'pin-session-old', 'om_root_old'),
+      'oc_chat_shared',
+    );
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+    ]));
+    await expect(pinStreamingCardIfEnabled(first, 'om_chat_old')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+
+    let disabledChats: string[] | undefined = ['oc_chat_shared'];
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    const releaseOldUnpin = deferred<boolean>();
+    const oldUnpinStarted = deferred<void>();
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_chat_old') {
+        oldUnpinStarted.resolve();
+        return releaseOldUnpin.promise;
+      }
+      return Promise.resolve(true);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat_shared', false);
+    await oldUnpinStarted.promise;
+
+    const replacement = withChat(
+      makeDs('om_chat_new', undefined, 'pin-session-new', 'om_root_new'),
+      'oc_chat_shared',
+    );
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(replacement), replacement],
+    ]));
+
+    releaseOldUnpin.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock.mock.calls.map(c => [c[0], c[1]])).toEqual([
+      ['app-pin', 'om_chat_old'],
+    ]);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_chat_new');
+  });
+
+  it('chat-off queued cleanup snapshots exact transition-time ids, not a later replacement current card on the same session', async () => {
+    const leading = Array.from({ length: 20 }, (_, index) =>
+      withChat(
+        makeDs(`om_leading_${index}`, undefined, `pin-leading-${index}`, `om_root_leading_${index}`),
+        'oc_target_shared',
+      ));
+    const target = withChat(
+      makeDs(
+        'om_target_old',
+        new Map<string, FrozenCard>([['frozen', { messageId: 'om_target_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+        'pin-target-shared',
+        'om_root_target_shared',
+      ),
+      'oc_target_shared',
+    );
+    setActiveSessionsRegistry(new Map([
+      ...leading.map(ds => [activeSessionKey(ds), ds] as const),
+      [activeSessionKey(target), target] as const,
+    ]));
+
+    let disabledChats: string[] | undefined;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    await expect(pinStreamingCardIfEnabled(leading[0]!, 'om_leading_0')).resolves.toBe(true);
+    await expect(pinStreamingCardIfEnabled(target, 'om_target_old')).resolves.toBe(true);
+    pinMessageMock.mockClear();
+    unpinMessageMock.mockClear();
+    const proofRequested = deferred<void>();
+    const releaseProof = deferred<void>();
+    listChatPinsMock.mockImplementation(async () => {
+      proofRequested.resolve();
+      await releaseProof.promise;
+      return [
+        ...leading.map(ds => ({
+          messageId: ds.streamCardId!,
+          chatId: 'oc_target_shared',
+          operatorId: 'app-pin',
+          operatorIdType: 'app_id',
+        })),
+        { messageId: 'om_target_old', chatId: 'oc_target_shared', operatorId: 'app-pin', operatorIdType: 'app_id' },
+        { messageId: 'om_target_frozen', chatId: 'oc_target_shared', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      ];
+    });
+
+    disabledChats = ['oc_target_shared'];
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_target_shared', false);
+    await proofRequested.promise;
+
+    target.streamCardId = 'om_target_new_manual';
+    await drainMicrotasks(1);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_old');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_new_manual');
+
+    releaseProof.resolve();
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_target_old');
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_target_frozen');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_target_new_manual');
+  });
+
+  it('chat-off drains captured later-batch ids after their queued session vanishes from the active registry', async () => {
+    const leading = Array.from({ length: 20 }, (_, index) =>
+      withChat(
+        makeDs(`om_vanished_leading_${index}`, undefined, `pin-vanished-leading-${index}`, `om_root_vanished_leading_${index}`),
+        'oc_vanished',
+      ));
+    const target = withChat(
+      makeDs('om_vanished_target_old', undefined, 'pin-vanished-target', 'om_root_vanished_target'),
+      'oc_vanished',
+    );
+    setActiveSessionsRegistry(new Map([
+      ...leading.map(ds => [activeSessionKey(ds), ds] as const),
+      [activeSessionKey(target), target] as const,
+    ]));
+
+    let disabledChats: string[] | undefined;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    const firstReconcileStarted = deferred<void>();
+    const releaseFirstReconcile = deferred<boolean>();
+    pinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_vanished_leading_0') {
+        firstReconcileStarted.resolve();
+        return releaseFirstReconcile.promise;
+      }
+      return Promise.resolve(sameAppPin(appId, messageId));
+    });
+    listChatPinsMock.mockResolvedValue([]);
+    for (const ds of [...leading, target]) remotelySameAppPinIds.delete(ds.streamCardId!);
+
+    reconcileBotStreamingCardPins('app-pin', true);
+    await firstReconcileStarted.promise;
+
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_vanished_target_old', chatId: 'oc_vanished', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_vanished_leading_0', chatId: 'oc_vanished', operatorId: 'app-pin', operatorIdType: 'app_id' },
+    ]);
+    disabledChats = ['oc_vanished'];
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_vanished', false);
+
+    setActiveSessionsRegistry(new Map([
+      ...leading.map(ds => [activeSessionKey(ds), ds] as const),
+    ]));
+
+    releaseFirstReconcile.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_vanished_target_old');
+  });
+
+  it('does not unpin captured authoritative ids for an apiOnly session', async () => {
+    const ds = makeDs('om_api_only_captured');
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        apiOnly: true,
+        noPinStreamingCardChats: ['oc_chat'],
+      },
+    } as any);
+
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not unpin captured authoritative ids when transport becomes apiOnly before queued drain', async () => {
+    const leading = withChat(
+      makeDs('om_transport_drift_leading', undefined, 'pin-transport-drift-leading', 'om_transport_drift_leading_root'),
+      'oc_transport_leading',
+    );
+    const target = withChat(
+      makeDs('om_transport_drift', undefined, 'pin-transport-drift-target', 'om_transport_drift_target_root'),
+      'oc_transport_target',
+    );
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(leading), leading],
+      [activeSessionKey(target), target],
+    ]));
+    let apiOnly = false;
+    let disabledChats: string[] | undefined = ['oc_transport_leading'];
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        apiOnly,
+        noPinStreamingCardChats: disabledChats,
+      },
+    }) as any);
+
+    const firstReconcileStarted = deferred<void>();
+    const releaseFirstReconcile = deferred<boolean>();
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      if (appId === 'app-pin' && messageId === 'om_transport_drift_leading') {
+        firstReconcileStarted.resolve();
+        return releaseFirstReconcile.promise;
+      }
+      return Promise.resolve(true);
+    });
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_transport_drift_leading', chatId: 'oc_transport_leading', operatorId: 'app-pin', operatorIdType: 'app_id' },
+    ]);
+
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_transport_leading', false);
+    await firstReconcileStarted.promise;
+
+    disabledChats = ['oc_transport_leading', 'oc_transport_target'];
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_transport_target', false);
+    apiOnly = true;
+    releaseFirstReconcile.resolve(true);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_transport_drift');
+  });
+
+  it('restores enabled ownership after restart only from same-app remote pins that intersect local candidates', async () => {
+    const first = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([
+        ['frozen-a', { messageId: 'om_frozen_a', content: '', title: '', displayMode: 'hidden' }],
+        ['frozen-b', { messageId: 'om_frozen_b', content: '', title: '', displayMode: 'hidden' }],
+      ]),
+      'pin-session-1',
+      'om_root_1',
+    );
+    const second = withChat(
+      makeDs(
+        'om_chat2_current',
+        new Map<string, FrozenCard>([
+          ['frozen-c', { messageId: 'om_chat2_frozen', content: '', title: '', displayMode: 'hidden' }],
+        ]),
+        'pin-session-2',
+        'om_root_2',
+      ),
+      'oc_chat_2',
+    );
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(second), second],
+    ]));
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    listChatPinsMock.mockImplementation(async (_appId: string, chatId: string) => {
+      if (chatId === 'oc_chat') {
+        return [
+          { messageId: 'om_current', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+          { messageId: 'om_frozen_a', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+          { messageId: 'om_manual_other', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+          { messageId: 'om_frozen_b', chatId, operatorId: 'app-other', operatorIdType: 'app_id' },
+          { messageId: 'om_open_id_same_bot', chatId, operatorId: 'ou_bot_self', operatorIdType: 'open_id' },
+          { messageId: 'om_blank_type', chatId, operatorId: 'app-pin', operatorIdType: '' },
+        ];
+      }
+      return [
+        { messageId: 'om_chat2_current', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+        { messageId: 'om_chat2_frozen', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+      ];
+    });
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock.mock.calls.map(call => [call[0], call[1]])).toEqual([
+      ['app-pin', 'oc_chat'],
+      ['app-pin', 'oc_chat'],
+      ['app-pin', 'oc_chat_2'],
+      ['app-pin', 'oc_chat_2'],
+    ]);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(new Set(unpinMessageMock.mock.calls.map(call => call[1]))).toEqual(new Set([
+      'om_frozen_a',
+      'om_chat2_frozen',
+    ]));
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_manual_other');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_frozen_b');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_open_id_same_bot');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_blank_type');
+
+    unpinMessageMock.mockClear();
+    await reconcileStreamingCardPins(first, false);
+    await reconcileStreamingCardPins(second, false);
+    expect(new Set(unpinMessageMock.mock.calls.map(call => call[1]))).toEqual(new Set([
+      'om_current',
+      'om_chat2_current',
+    ]));
+  });
+
+  it('does not claim or remove an other-app current Pin during recovery then bot-wide off', async () => {
+    const ds = makeDs('om_foreign_current');
+    activate(ds);
+    let enabled = true;
+    getBotMock.mockImplementation(() => ({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: enabled },
+    } as any));
+    listChatPinsMock.mockResolvedValue([
+      {
+        messageId: 'om_foreign_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-other',
+        operatorIdType: 'app_id',
+      },
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    await reconcileStreamingCardPins(ds, false);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_foreign_current');
+
+    enabled = false;
+    reconcileBotStreamingCardPins('app-pin', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_foreign_current');
+  });
+
+  it('does not claim or remove a malformed current Pin during recovery then per-chat off', async () => {
+    const ds = makeDs('om_malformed_current');
+    activate(ds);
+    let disabledChats: string[] | undefined;
+    getBotMock.mockImplementation(() => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        noPinStreamingCardChats: disabledChats,
+      },
+    } as any));
+    listChatPinsMock.mockResolvedValue([
+      {
+        messageId: 'om_malformed_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-pin',
+        operatorIdType: 'app_id',
+      },
+      {
+        messageId: 'om_malformed_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-pin',
+        operatorIdType: undefined,
+      },
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+
+    disabledChats = ['oc_chat'];
+    reconcileBotStreamingCardPins('app-pin', true, 'oc_chat', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_malformed_current');
+  });
+
+  it.each([
+    {
+      label: 'foreign',
+      currentPins: [{
+        messageId: 'om_blocked_current', chatId: 'oc_chat', operatorId: 'app-other', operatorIdType: 'app_id',
+      }],
+      createResult: undefined,
+    },
+    {
+      label: 'malformed',
+      currentPins: [{
+        messageId: 'om_blocked_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: undefined,
+      }],
+      createResult: undefined,
+    },
+    {
+      label: 'absent with rejected create provenance',
+      currentPins: [],
+      createResult: {
+        messageId: 'om_blocked_current', operatorId: 'ou_human', operatorIdType: 'open_id',
+      },
+    },
+  ])('enabled recovery cleans proven frozen IDs independently when current is $label', async ({ currentPins, createResult }) => {
+    const ds = makeDs(
+      'om_blocked_current',
+      new Map<string, FrozenCard>([[
+        'frozen',
+        { messageId: 'om_owned_frozen', content: '', title: '', displayMode: 'hidden' },
+      ]]),
+    );
+    activate(ds);
+    listChatPinsMock.mockResolvedValue([
+      ...currentPins,
+      { messageId: 'om_owned_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+    ]);
+    if (createResult) pinMessageMock.mockResolvedValueOnce(createResult);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_owned_frozen');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_blocked_current');
+  });
+
+  it.each([
+    {
+      label: 'other-app provenance',
+      createdPin: {
+        messageId: 'om_raced_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-other',
+        operatorIdType: 'app_id',
+      },
+    },
+    {
+      label: 'open_id provenance',
+      createdPin: {
+        messageId: 'om_raced_current',
+        chatId: 'oc_chat',
+        operatorId: 'ou_human',
+        operatorIdType: 'open_id',
+      },
+    },
+    {
+      label: 'mismatched message id',
+      createdPin: {
+        messageId: 'om_different',
+        chatId: 'oc_chat',
+        operatorId: 'app-pin',
+        operatorIdType: 'app_id',
+      },
+    },
+    {
+      label: 'missing operator type',
+      createdPin: {
+        messageId: 'om_raced_current',
+        chatId: 'oc_chat',
+        operatorId: 'app-pin',
+        operatorIdType: undefined,
+      },
+    },
+  ])('does not own a list-to-create race resolved with $label', async ({ createdPin }) => {
+    const ds = makeDs('om_raced_current');
+    activate(ds);
+    listChatPinsMock.mockResolvedValue([]);
+    pinMessageMock.mockResolvedValueOnce(createdPin);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_raced_current');
+
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_raced_current');
+  });
+
+  it('enabled startup recovery still pins the local current card when only a frozen predecessor has same-app remote proof', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([
+        ['proven', { messageId: 'om_frozen_proven', content: '', title: '', displayMode: 'hidden' }],
+        ['human', { messageId: 'om_frozen_human', content: '', title: '', displayMode: 'hidden' }],
+        ['other-app', { messageId: 'om_frozen_other_app', content: '', title: '', displayMode: 'hidden' }],
+      ]),
+    );
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_frozen_proven', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_frozen_human', chatId: 'oc_chat', operatorId: 'ou_human', operatorIdType: 'open_id' },
+      { messageId: 'om_frozen_other_app', chatId: 'oc_chat', operatorId: 'app-other', operatorIdType: 'app_id' },
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_frozen_proven');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_frozen_human');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_frozen_other_app');
+  });
+
+  it('enabled startup recovery still pins the local current card when remote proof has no matching local candidates', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([
+        ['human', { messageId: 'om_frozen_human', content: '', title: '', displayMode: 'hidden' }],
+      ]),
+    );
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    let currentCreated = false;
+    pinMessageMock.mockImplementation(async (appId: string, messageId: string) => {
+      currentCreated = true;
+      return sameAppPin(appId, messageId);
+    });
+    listChatPinsMock.mockImplementation(async () => [
+      { messageId: 'om_remote_manual', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_frozen_human', chatId: 'oc_chat', operatorId: 'ou_human', operatorIdType: 'open_id' },
+      ...(currentCreated
+        ? [{ messageId: 'om_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' }]
+        : []),
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_frozen_human');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_remote_manual');
+
+    unpinMessageMock.mockClear();
+    await reconcileStreamingCardPins(ds, false);
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_current');
+  });
+
+  it('restores bot-wide off cleanup for opted-out chats only when remote proof intersects local candidates', async () => {
+    const optedOut = makeDs(
+      'om_opted_current',
+      new Map<string, FrozenCard>([
+        ['frozen', { messageId: 'om_opted_frozen', content: '', title: '', displayMode: 'hidden' }],
+      ]),
+      'pin-session-opted',
+      'om_root_opted',
+    );
+    setActiveSessionsRegistry(new Map([[activeSessionKey(optedOut), optedOut]]));
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: false,
+        noPinStreamingCardChats: ['oc_chat'],
+      },
+    } as any);
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_opted_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_manual_other', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      { messageId: 'om_opted_current', chatId: 'oc_chat', operatorId: 'app-other', operatorIdType: 'app_id' },
+      { messageId: 'om_opted_current', chatId: 'oc_chat', operatorId: 'ou_bot_self', operatorIdType: 'open_id' },
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledTimes(2);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock.mock.calls.map(call => [call[0], call[1]])).toEqual([
+      ['app-pin', 'om_opted_frozen'],
+    ]);
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_manual_other');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_opted_current');
+  });
+
+  it('actual bot-wide off retries same-app proven candidates in already opted-out chats', async () => {
+    const ds = makeDs('om_opted_current');
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: false,
+        noPinStreamingCardChats: ['oc_chat'],
+      },
+    } as any);
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_opted_current',
+      chatId: 'oc_chat',
+      operatorId: 'app-pin',
+      operatorIdType: 'app_id',
+    }]);
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledWith('app-pin', 'oc_chat');
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_opted_current');
+  });
+
+  it('disabled startup recovery does not clean matching candidate ids when remote provenance uses open_id even if the operator id string equals the app id', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([
+        ['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }],
+      ]),
+    );
+    activate(ds);
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: false,
+      },
+    } as any);
+    listChatPinsMock.mockResolvedValue([
+      { messageId: 'om_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'open_id' },
+      { messageId: 'om_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'open_id' },
+    ]);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledTimes(1);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_current');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_frozen');
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('lists each chat at most once per restore run and isolates one chat failure from others', async () => {
+    const first = makeDs('om_first', undefined, 'pin-session-1', 'om_root_1');
+    const secondSameChat = makeDs('om_second', undefined, 'pin-session-2', 'om_root_2');
+    const otherChat = withChat(makeDs('om_other', undefined, 'pin-session-3', 'om_root_3'), 'oc_chat_2');
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(first), first],
+      [activeSessionKey(secondSameChat), secondSameChat],
+      [activeSessionKey(otherChat), otherChat],
+    ]));
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app-pin', cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    listChatPinsMock.mockImplementation(async (_appId: string, chatId: string) => {
+      if (chatId === 'oc_chat') throw new Error('chat list failed');
+      return [
+        { messageId: 'om_other', chatId, operatorId: 'app-pin', operatorIdType: 'app_id' },
+      ];
+    });
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock.mock.calls.map(call => call[1])).toEqual(['oc_chat', 'oc_chat_2']);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    unpinMessageMock.mockClear();
+    await reconcileStreamingCardPins(otherChat, false);
+    expect(unpinMessageMock).toHaveBeenCalledWith('app-pin', 'om_other');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_first');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('app-pin', 'om_second');
+    expect(loggerDebugMock).toHaveBeenCalledWith('[app-pin] streaming-card restore pin proof list failed for chat oc_chat: chat list failed');
+  });
+
+  it('restore is zero-call when every active session has no Lark transport', async () => {
+    const apiOnly = makeDs('om_api', undefined, 'pin-session-api', 'om_root_api');
+    const httpVirtual = withChat(makeDs('om_http', undefined, 'pin-session-http', 'om_root_http'), 'http_virtual_chat');
+    setActiveSessionsRegistry(new Map([
+      [activeSessionKey(apiOnly), apiOnly],
+      [activeSessionKey(httpVirtual), httpVirtual],
+    ]));
+    getBotMock.mockImplementation((_larkAppId: string) => ({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: true,
+        apiOnly: true,
+      },
+    }) as any);
+
+    reconcileRestoredStreamingCardPins('app-pin');
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).not.toHaveBeenCalled();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('serializes bot-wide off cleanup before queued restore recovery on the same message ids', async () => {
+    const ds = makeDs(
+      'om_current',
+      new Map<string, FrozenCard>([['frozen', { messageId: 'om_frozen', content: '', title: '', displayMode: 'hidden' }]]),
+    );
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    const releaseCurrentUnpin = deferred<boolean>();
+    const releaseFrozenUnpin = deferred<boolean>();
+    const currentUnpinStarted = deferred<void>();
+    const frozenUnpinStarted = deferred<void>();
+    const currentUnpinCompleted = deferred<void>();
+    const frozenUnpinCompleted = deferred<void>();
+    const calls: string[] = [];
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app-pin',
+        cliId: 'claude-code',
+        pinStreamingCard: false,
+      },
+    } as any);
+    let listCall = 0;
+    listChatPinsMock.mockImplementation(async () => {
+      listCall += 1;
+      calls.push(`list:${listCall}`);
+      return [
+        { messageId: 'om_current', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+        { messageId: 'om_frozen', chatId: 'oc_chat', operatorId: 'app-pin', operatorIdType: 'app_id' },
+      ];
+    });
+    let currentUnpinCalls = 0;
+    let frozenUnpinCalls = 0;
+    unpinMessageMock.mockImplementation((appId: string, messageId: string) => {
+      calls.push(`unpin:${messageId}`);
+      if (appId === 'app-pin' && messageId === 'om_current' && currentUnpinCalls++ === 0) {
+        currentUnpinStarted.resolve();
+        return releaseCurrentUnpin.promise.then((result) => {
+          calls.push('done:om_current');
+          currentUnpinCompleted.resolve();
+          return result;
+        });
+      }
+      if (appId === 'app-pin' && messageId === 'om_frozen' && frozenUnpinCalls++ === 0) {
+        frozenUnpinStarted.resolve();
+        return releaseFrozenUnpin.promise.then((result) => {
+          calls.push('done:om_frozen');
+          frozenUnpinCompleted.resolve();
+          return result;
+        });
+      }
+      return Promise.resolve(true);
+    });
+
+    reconcileBotStreamingCardPins('app-pin', false);
+    await Promise.all([currentUnpinStarted.promise, frozenUnpinStarted.promise]);
+    reconcileRestoredStreamingCardPins('app-pin');
+    await drainMicrotasks(2);
+
+    expect(listChatPinsMock).toHaveBeenCalledTimes(1);
+    expect(pinMessageMock).not.toHaveBeenCalled();
+
+    releaseCurrentUnpin.resolve(true);
+    await currentUnpinCompleted.promise;
+    expect(listChatPinsMock).toHaveBeenCalledTimes(1);
+
+    releaseFrozenUnpin.resolve(true);
+    await frozenUnpinCompleted.promise;
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledTimes(3);
+    expect(calls.indexOf('list:2')).toBeGreaterThan(calls.indexOf('done:om_current'));
+    expect(calls.indexOf('list:2')).toBeGreaterThan(calls.indexOf('done:om_frozen'));
+    expect(unpinMessageMock.mock.calls.slice(0, 2).map(call => call[1])).toEqual([
+      'om_current', 'om_frozen',
+    ]);
+    expect(new Set(unpinMessageMock.mock.calls.slice(2).map(call => call[1]))).toEqual(
+      new Set(['om_current', 'om_frozen']),
+    );
+    expect(pinMessageMock).not.toHaveBeenCalled();
+  });
+});

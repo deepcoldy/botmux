@@ -9,8 +9,9 @@
  *                                 /grant 申请卡给 owner（默认开启；false 显式关闭）
  *   • p2pOpen                   — 私聊对话全开：任何人都能私聊本 bot（talk-only），免逐个
  *                                 加 globalGrants。只放行 canTalk，管理操作仍只认 allowedUsers。
- *   • messageQuota.defaultLimit — 消息额度覆盖值。缺省时授权卡使用内置 3 条、Oncall
- *                                 不限额；正整数同时覆盖授权卡默认值并限制 Oncall。
+ *   • messageQuota.defaultLimit — 授权卡/自助申请授权放进来的**访客**默认额度。缺省时
+ *                                 使用内置 3 条。**Oncall 群恒不限额、不读此值**
+ *                                 （历史上读过，见 event-dispatcher 的 oncallTalk）。
  *                                 显式 `/grant @x N` 恒生效，与此无关。
  *   • grantDefaultDurationMs    — 新授权卡默认有限时长。缺省 = 产品默认 1 小时；
  *                                 只接受授权卡已有的四个有限时长。
@@ -27,7 +28,7 @@ export interface BotGrantPrefs {
   autoGrantRequestCards: boolean;
   /** 私聊对话全开（talk-only，不授管理权）。默认 false。 */
   p2pOpen: boolean;
-  /** 消息额度覆盖值：null = 授权卡内置 3 条、Oncall 不限；正整数 = 两者共同使用。 */
+  /** 访客消息额度覆盖值：null = 授权卡内置 3 条；正整数 = 授权卡按该值。Oncall 恒不限额。 */
   messageQuotaDefaultLimit: number | null;
   /** 新授权默认有效期：null = 产品默认 1 小时；number = 卡片支持的有限时长（毫秒）。 */
   grantDefaultDurationMs: number | null;
@@ -68,7 +69,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
  *   • restrictGrantCommands=false → 删 key（bots.json 保持干净，缺省即默认）
  *   • autoGrantRequestCards=true  → 删 key（默认开启）；false → 显式写 false
  *   • p2pOpen=false → 删 key（缺省即关闭）；true → 显式写 true
- *   • messageQuotaDefaultLimit=null → 删整个 messageQuota（恢复授权卡内置 3 条、Oncall 不限；不动 quotaState）
+ *   • messageQuotaDefaultLimit=null → 删整个 messageQuota（恢复授权卡内置 3 条；不动 quotaState）
  *   • messageQuotaDefaultLimit=1–1000 的整数 → 写入；其它值直接拒绝，返回 bad_quota
  *   • grantDefaultDurationMs=null → 删 key（恢复产品默认 1 小时）；合法有限时长 → 写入
  * 返回写后解析出的完整 prefs。

@@ -1291,6 +1291,13 @@ describe('redirect 白名单读→合并→写', () => {
       .toEqual(['https://a/cb']);
     // 读到了、但线上一条都没配 → 空数组（可以放心合并）。
     expect(extractOpenPlatformRedirectUrls(readPayload([]))).toEqual([]);
+    // 新建应用的真实返回：redirectURL 为空时整个键被省略，其余
+    // safe_setting 字段仍在。这同样是「已读到且白名单为空」。
+    expect(extractOpenPlatformRedirectUrls({
+      code: 0,
+      data: { Head: { RespFormat: 1 }, allowRefreshToken: true, ipWhiteList: [], safeServerDomain: [] },
+      msg: '',
+    })).toEqual([]);
     // 读不出来 → null（只能退化成覆盖写）。畸形与端点不存在都归到这一类。
     expect(extractOpenPlatformRedirectUrls(readPayload('not-an-array'))).toBeNull();
     expect(extractOpenPlatformRedirectUrls({ code: 0 })).toBeNull();
@@ -3295,7 +3302,7 @@ describe('automateOpenPlatformSetup', () => {
 
     // 锁生产链路：走**真实默认 manifest**（不注入 scopeManifest）+ 已授权集合。
     // 这是维护者复审揪出的空白——之前 3 例都注入空 manifest，恰好绕开了唯一有意义
-    // 的那条路径（默认 171+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
+    // 的那条路径（默认 169+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
     // 永不触发）。这里用「manifest 全部已授权」模拟「配置本就齐全」的重启自检。
     const defaultManifest = JSON.parse(
       readFileSync(join(fileURLToPath(new URL('../src/setup/lark-scopes.json', import.meta.url))), 'utf-8'),

@@ -93,6 +93,12 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
       .filter((e: any) => e.tag === 'interactive_container')
       .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
 
+  it('uses Card JSON 2.0 fill width instead of the legacy wide-screen field', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en'));
+    expect(card.schema).toBe('2.0');
+    expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+  });
+
   it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
@@ -466,7 +472,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(quotaEdit.text.content).toBe('Set message quota');
-    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(text).toContain('Default: grant card 3 / Oncall unmetered');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -477,7 +483,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(text).toContain(`${current} messages per person on grant cards (Oncall unmetered)`);
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -488,7 +494,7 @@ describe('buildConfigCard', () => {
       .map((element: any) => element.text?.content ?? '')
       .join('\n');
 
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
     expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
   });
 
@@ -513,7 +519,7 @@ describe('buildConfigCard', () => {
       .join('\n');
 
     expect(input.default_value).toBe('');
-    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(text).toContain('The quota 5000 exceeds the maximum, so grant cards use 1000');
   });
 });
 
@@ -1295,17 +1301,20 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
+      // （没有 turn 在跑），handler 侧只要求 worker 活着。
+      expect(actions.map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
     });

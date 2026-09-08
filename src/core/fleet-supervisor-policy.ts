@@ -63,11 +63,15 @@ export interface FleetProcState {
    * same semantics, different storage.
    */
   configHash?: string;
+  /** Birth identity for recovering external children after supervisor death. */
+  processStart?: string;
 }
 
 export interface FleetState {
   supervisorPid: number;
   supervisorStartedAt: string;
+  /** Real entry path, used by Desktop to identify the owning installation. */
+  supervisorEntry?: string;
   procs: FleetProcState[];
 }
 

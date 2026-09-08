@@ -95,6 +95,9 @@ export class FeishuLoginManager {
   private async run(): Promise<void> {
     try {
       const result = await this.prepareSession({
+        // 这是用户明确点击的「扫码刷新登录态」。若继续复用粗检通过但
+        // console 已拒绝的旧 cookie，会「假成功 → 自动重试 → 再失败」死循环。
+        forceQrLogin: true,
         maxWaitMs: this.maxWaitMs,
         onQrCode: ({ qrPayload }) => {
           this.patch({

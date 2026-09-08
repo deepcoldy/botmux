@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { delay, scaleMs } from '../../utils/timing.js';
+import { delay } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 
@@ -112,15 +112,22 @@ function historyDeltaContains(path: string, fromByte: number, marker: string): b
   return false;
 }
 
+const HISTORY_POLL_MS = 100;
+
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + scaleMs(timeoutMs);
-  while (Date.now() < deadline) {
+  // Count poll attempts, don't use Date.now()+budget. Under load the event
+  // loop slips; a wall deadline expires while `delay()` callbacks are still
+  // queued, so a history line that landed in-budget is missed and the
+  // worker shows a false "submit not confirmed". Same number of delay(100)
+  // waits as the unscaled timeout.
+  const polls = Math.max(1, Math.round(timeoutMs / HISTORY_POLL_MS));
+  for (let i = 0; i < polls; i++) {
     if (historyDeltaContains(path, fromByte, marker)) return true;
-    await delay(100);
+    await delay(HISTORY_POLL_MS);
   }
-  return false;
+  return historyDeltaContains(path, fromByte, marker);
 }
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {

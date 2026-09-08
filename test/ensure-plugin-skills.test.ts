@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ensurePluginSkills, removeGlobalBotmuxSkills } from '../src/skills/installer.js';
 import { BUILTIN_SKILLS, ASK_SKILL_NAME, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS } from '../src/skills/definitions.js';
+import { SEND_SKILL_SESSION_LOADER } from '../src/skills/reply-style-guide.js';
+import { builtinSkillContent } from '../src/skills/injection-mode.js';
 
 describe('ensurePluginSkills', () => {
   let dir: string;
@@ -18,12 +20,14 @@ describe('ensurePluginSkills', () => {
     expect(manifest.name).toBe('botmux');
   });
 
-  it('每个内置 skill 写到 skills/<name>/SKILL.md，内容与定义一致', () => {
+  it('每个内置 skill 写到 skills/<name>/SKILL.md，send 使用稳定会话加载器', () => {
     ensurePluginSkills('claude-code', dir);
     for (const skill of BUILTIN_SKILLS) {
       const skillFile = join(dir, 'skills', skill.name, 'SKILL.md');
       expect(existsSync(skillFile)).toBe(true);
-      expect(readFileSync(skillFile, 'utf-8')).toBe(skill.content);
+      expect(readFileSync(skillFile, 'utf-8')).toBe(
+        skill.name === 'botmux-send' ? SEND_SKILL_SESSION_LOADER : skill.content,
+      );
     }
   });
 
@@ -116,12 +120,14 @@ describe('removeGlobalBotmuxSkills', () => {
 describe('ensurePluginSkills reflects live customization (no restart)', () => {
   let dir: string;
   let prevDataDir: string | undefined;
+  let prevReplyStyle: string | undefined;
   let store: typeof import('../src/services/customization-store.js');
   const TARGET = BUILTIN_SKILLS[0].name; // e.g. botmux-chat-rename
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'plugin-skills-live-'));
     prevDataDir = process.env.SESSION_DATA_DIR;
+    prevReplyStyle = process.env.BOTMUX_REPLY_STYLE;
     // Isolate the customization store to a scratch dataDir.
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'cust-data-'));
     store = await import('../src/services/customization-store.js');
@@ -131,6 +137,8 @@ describe('ensurePluginSkills reflects live customization (no restart)', () => {
     try { store.resetAllToFactory(); } catch { /* ignore */ }
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = prevDataDir;
+    if (prevReplyStyle === undefined) delete process.env.BOTMUX_REPLY_STYLE;
+    else process.env.BOTMUX_REPLY_STYLE = prevReplyStyle;
     store.invalidateCustomizationCache();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -173,5 +181,34 @@ describe('ensurePluginSkills reflects live customization (no restart)', () => {
     ensurePluginSkills('claude-code', dir);
     const file = join(dir, 'skills', TARGET, 'SKILL.md');
     expect(readFileSync(file, 'utf-8')).toBe(BUILTIN_SKILLS[0].content);
+  });
+
+  it('send 默认写稳定加载器，显式用户正文覆盖加载器，停用后删除', () => {
+    const name = 'botmux-send';
+    const file = join(dir, 'skills', name, 'SKILL.md');
+    const skillDir = join(dir, 'skills', name);
+
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ recipes: false, layout: false });
+    ensurePluginSkills('claude-code', dir);
+    expect(readFileSync(file, 'utf-8')).toBe(SEND_SKILL_SESSION_LOADER);
+
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ recipes: true, layout: true });
+    ensurePluginSkills('claude-code', dir);
+    expect(readFileSync(file, 'utf-8')).toBe(SEND_SKILL_SESSION_LOADER);
+
+    const custom = '---\nname: botmux-send\ndescription: 自定义\n---\n# 自定义发送规则';
+    store.setSkillOverrideBody(name, custom);
+    store.invalidateCustomizationCache();
+    ensurePluginSkills('claude-code', dir);
+    expect(readFileSync(file, 'utf-8')).toBe(custom);
+    expect(builtinSkillContent(name, {
+      BOTMUX_REPLY_STYLE: JSON.stringify({ recipes: false, layout: false }),
+    })).toBe(custom);
+
+    store.setSkillDisabled(name, true);
+    store.invalidateCustomizationCache();
+    ensurePluginSkills('claude-code', dir);
+    expect(existsSync(skillDir)).toBe(false);
+    expect(builtinSkillContent(name, {})).toBeUndefined();
   });
 });

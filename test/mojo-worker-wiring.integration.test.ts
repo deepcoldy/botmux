@@ -49,6 +49,7 @@ node -e '
       PER_BOT_TOKEN: process.env.PER_BOT_TOKEN,
       MOJO_BLOCK_ONLY: process.env.MOJO_BLOCK_ONLY,
       BOTMUX_SESSION_ID: process.env.BOTMUX_SESSION_ID,
+      BOTMUX_REPLY_STYLE: process.env.BOTMUX_REPLY_STYLE,
       AGENT_LOCAL_DAEMON: process.env.AGENT_LOCAL_DAEMON,
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
       WRAPPER_MARK: process.env.WRAPPER_MARK,
@@ -361,6 +362,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       init: {
         model: 'gpt-5.5-2026-04-24',
         env: { PER_BOT_TOKEN: 'per-bot-value' },
+        replyStyle: { recipes: false, layout: false, theme: 'minimal' },
         backendConfig: { cloud: true, env: { MOJO_BLOCK_ONLY: 'mojo-block-value' } },
       },
     });
@@ -375,6 +377,11 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // Per-bot env and the mojo-specific env block both land in the child.
     expect(invocation.env.PER_BOT_TOKEN).toBe('per-bot-value');
     expect(invocation.env.MOJO_BLOCK_ONLY).toBe('mojo-block-value');
+    expect(JSON.parse(invocation.env.BOTMUX_REPLY_STYLE ?? '')).toEqual({
+      recipes: false,
+      layout: false,
+      theme: 'minimal',
+    });
     // cloud=true (localDaemon unset) is the fully-remote shape — no host daemon.
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
   }, 40_000);

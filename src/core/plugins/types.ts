@@ -59,12 +59,21 @@ export interface PluginServiceContribution extends PluginRuntimeEntrypoint {
   mode: PluginServiceMode;
 }
 
+/** Public, install-time allowlist for card actions handled by a plugin service. */
+export interface PluginCardActionsContribution {
+  schemaVersion: 1;
+  actions?: string[];
+  actionPrefixes?: string[];
+  endpoint: string;
+}
+
 export interface PluginContributions {
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
   mcp?: PluginMcpContribution;
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
+  cardActions?: PluginCardActionsContribution;
 }
 
 /** Installation-time scan result before MCP details are moved to private
@@ -141,4 +150,5 @@ export interface PluginMaterializedFile {
   cli?: Array<{ name: string }>;
   dashboard?: Array<{ id: string; entry: string }>;
   service?: Array<{ name: string }>;
+  cardActions?: PluginCardActionsContribution;
 }

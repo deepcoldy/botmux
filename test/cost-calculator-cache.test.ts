@@ -7,8 +7,11 @@
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-vi.mock('node:fs', async (importOriginal) => {
-  const original = await importOriginal<typeof import('node:fs')>();
+vi.mock('node:fs', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const original = require('node:fs') as typeof import('node:fs');
   return {
     ...original,
     fstatSync: vi.fn(original.fstatSync),

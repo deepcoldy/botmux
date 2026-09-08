@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from './definitions.js';
-import { effectiveBuiltinSkills } from './effective-builtins.js';
+import { effectiveBuiltinSkills, isBuiltinSkillBodyOverridden } from './effective-builtins.js';
+import { SEND_SKILL_SESSION_LOADER } from './reply-style-guide.js';
 
 // This module only manages botmux-owned bridge/ask skills. User-defined skills
 // live in src/core/skills/* and services/skill-registry-store.ts so their
@@ -201,10 +202,15 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
   const dir = expandHome(skillsDir);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
 
-  // Apply user overrides: replaced bodies + user-disabled skills removed. When
-  // nothing is customized this equals BUILTIN_SKILLS, so the on-disk files are
-  // byte-identical to the pre-feature baseline.
-  const effective = effectiveBuiltinSkills([...BUILTIN_SKILLS]);
+  // Apply user overrides: replaced bodies + user-disabled skills removed. The
+  // shipped botmux-send body is the one exception to direct materialisation:
+  // shared skill dirs receive a stable loader, while `botmux skill show` renders
+  // the per-session guide from BOTMUX_REPLY_STYLE. Explicit user bodies still
+  // win and are written verbatim.
+  const effective = effectiveBuiltinSkills([...BUILTIN_SKILLS]).map((skill) => {
+    if (skill.name !== 'botmux-send' || isBuiltinSkillBodyOverridden(skill.name)) return skill;
+    return { ...skill, content: SEND_SKILL_SESSION_LOADER };
+  });
   const effectiveNames = new Set(effective.map((s) => s.name));
 
   for (const skill of effective) {

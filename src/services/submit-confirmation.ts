@@ -2,6 +2,48 @@ import type { SubmitRecheckResult } from '../adapters/cli/types.js';
 
 export type SubmitActivityEvidence = 'pty-output' | 'structured-transcript' | 'botmux-send';
 
+export interface SubmitEvidenceIdentity {
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+
+export interface SubmitActivityEvidenceInput {
+  target?: SubmitEvidenceIdentity;
+  ptyActive: boolean;
+  structuredTurns: readonly SubmitEvidenceIdentity[];
+  sendMarkers: readonly SubmitEvidenceIdentity[];
+}
+
+function matchesExactEvidence(
+  target: SubmitEvidenceIdentity,
+  evidence: SubmitEvidenceIdentity,
+): boolean {
+  return target.turnId !== undefined
+    && evidence.turnId === target.turnId
+    && evidence.dispatchAttempt === target.dispatchAttempt;
+}
+
+export function selectSubmitActivityEvidence(
+  input: SubmitActivityEvidenceInput,
+): SubmitActivityEvidence | undefined {
+  const target = input.target;
+  if (target) {
+    if (input.structuredTurns.some(turn => matchesExactEvidence(target, turn))) {
+      return 'structured-transcript';
+    }
+    if (input.sendMarkers.some(marker => matchesExactEvidence(target, marker))) {
+      return 'botmux-send';
+    }
+  }
+  return input.ptyActive ? 'pty-output' : undefined;
+}
+
+export function combineSubmitCurrentFences(
+  ...fences: readonly (() => boolean)[]
+): () => boolean {
+  return () => fences.every(fence => fence());
+}
+
 export type SubmitConfirmationAction =
   | { kind: 'notify-hard-failure'; reason: string }
   | { kind: 'suppress-confirmed' }

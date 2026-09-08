@@ -177,6 +177,7 @@ interface CloseResultWire {
  * boundary, independently of how the daemon chose to interpret it.
  */
 let closeResults: CloseResultWire[] = [];
+let closeRequestIds: string[] = [];
 
 async function waitFor(
   predicate: () => boolean,
@@ -189,6 +190,61 @@ async function waitFor(
     await new Promise<void>(r => setTimeout(r, 50));
   }
   throw new Error(describeFailure());
+}
+
+/**
+ * Await THIS test's `close_result`, then return it.
+ *
+ * `close_result` reaches the test through an extra `child.on('message')`
+ * observer, which is NOT synchronised with `closeSession()` resolving. Under CI
+ * load the message lands after the await returns, so reading `closeResults`
+ * synchronously saw `[]` and every field assertion degraded into
+ * `undefined === <expected>` -- the intermittent `expected undefined to be
+ * 'retryable'` that made this file flaky on the blocking `build` leg.
+ *
+ * Waiting on `closeResults.length > 0` is NOT enough: the array is shared across
+ * tests and each test boots its own child, so a late message from an ALREADY
+ * KILLED child can satisfy that predicate and hand the next test a verdict from
+ * the previous one (observed: a probe that delayed the push turned this into
+ * `expected 'uncertain' to be 'retryable'`, borrowing a neighbour's verdict
+ * rather than reporting a missing message).
+ *
+ * Waiting for "a message that arrived after this close" is also not enough: two
+ * late messages from a dead child -- one landing after the snapshot, one right
+ * behind it -- still satisfy that. So key on identity instead: the daemon sends
+ * `{ type: 'close', requestId }` and the worker echoes that id back on
+ * `close_result`, so waiting for THAT id is the only predicate a neighbour's
+ * wire cannot satisfy.
+ */
+async function closeAndAwaitWire(
+  sessionId: string,
+): Promise<{ result: Awaited<ReturnType<typeof closeSession>>; wire: CloseResultWire | undefined }> {
+  const seenIds = new Set(closeRequestIds);
+  const result = await closeSession(sessionId);
+  // The requestId the daemon just sent for THIS close, if it reached the worker.
+  //
+  // Both callers currently go through the explicit-close path, which always sends
+  // a requestId, so the `undefined` branch below is dead code today. It is kept
+  // as a guard for a future close path that sends none: there is no id to key on
+  // there, so it can only fall back to the weaker "any message arrived" predicate
+  // -- i.e. it re-opens the neighbour-verdict hole described above. If such a path
+  // appears, prefer giving it an id over relying on this branch. The failure
+  // message prints `requestId=never sent` so the weak branch is identifiable.
+  const mine = closeRequestIds.find(id => !seenIds.has(id));
+  await waitFor(
+    () => (mine !== undefined
+      ? closeResults.some(r => r.requestId === mine)
+      : closeResults.length > 0),
+    10_000,
+    () => `no close_result crossed the worker boundary for this close`
+      + ` (requestId=${mine ?? 'never sent'})\n${workerLogs.join('')}`,
+  );
+  return {
+    result,
+    wire: mine !== undefined
+      ? closeResults.find(r => r.requestId === mine)
+      : closeResults.at(-1),
+  };
 }
 
 /**
@@ -312,7 +368,12 @@ exit 0
   // real child.send still delivers it.
   const realSend = child.send.bind(child);
   (child as unknown as { send: ChildProcess['send'] }).send = ((message: unknown, ...rest: unknown[]) => {
-    sentToWorker.push((message as { type?: string })?.type ?? 'unknown');
+    const sent = message as { type?: string; requestId?: string };
+    sentToWorker.push(sent?.type ?? 'unknown');
+    // The explicit-close path sends `{ type: 'close', requestId }` and the worker
+    // echoes that id back on `close_result`; recording it lets a test wait for
+    // ITS OWN wire instead of whatever landed in the shared array.
+    if (sent?.type === 'close' && sent.requestId) closeRequestIds.push(sent.requestId);
     return (realSend as (...args: unknown[]) => boolean)(message, ...rest);
   }) as ChildProcess['send'];
 
@@ -393,6 +454,7 @@ beforeEach(() => {
   workerLogs.length = 0;
   sentToWorker = [];
   closeResults = [];
+  closeRequestIds = [];
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-mojo-e2e-'));
   workerRoot = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-e2e-worker-')));
   previousDataDir = config.session.dataDir;
@@ -444,10 +506,9 @@ describe('mojo close: a local residual must survive the worker IPC boundary', ()
   it('carries residual across real IPC and publishes a residual close, not a plain one', async () => {
     const { sessionId } = await bootRealWorker({ mode: 'localResidual', cancellable: true });
 
-    const result = await closeSession(sessionId);
+    const { result, wire } = await closeAndAwaitWire(sessionId);
 
     // 1. The producer side: the field crossed the process boundary at all.
-    const wire = closeResults.at(-1);
     expect(wire).toBeDefined();
     expect(wire?.ok).toBe(true);
     expect(wire?.residual).toBe('local_subtree_boundary_unproven');
@@ -573,12 +634,12 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     // a credentialed process may still be alive (so writes must stay fenced).
     const { sessionId } = await bootRealWorker({ mode: 'unscannable' });
 
-    const result = await closeSession(sessionId);
+    const { result, wire } = await closeAndAwaitWire(sessionId);
 
     expect(result.ok).toBe(false);
     // Proof both fields crossed the process boundary independently, i.e. that
     // `admission` is NOT a function of `recovery`.
-    const wire = closeResults.at(-1);
+    expect(wire).toBeDefined();
     expect(wire?.recovery).toBe('retryable');
     expect(wire?.admission).toBe('fenced');
     // The decisive consequence: a retryable close whose admission is fenced must

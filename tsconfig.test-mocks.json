@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "src/**/*",
+    "test/helpers/spawn-result.ts",
+    "test/ensure-herdr-integrations.test.ts",
+    "test/hermes-transcript.test.ts",
+    "test/mtr-transcript.test.ts",
+    "test/tmux-pipe-backend.test.ts",
+    "test/transient-snapshot.test.ts",
+    "test/vc-agent-polling-source.test.ts"
+  ]
+}

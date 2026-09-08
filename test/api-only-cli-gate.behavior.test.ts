@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
@@ -23,10 +24,11 @@ const VIRTUAL_SID = 'sess_behavior_virtual';
 const REAL_SID = 'sess_behavior_real';
 
 function writeSession(sid: string, chatId: string, larkAppId: string) {
-  const fp = join(DATA_DIR, 'sessions.json');
-  const existing = existsSync(fp) ? JSON.parse(readFileSync(fp, 'utf8')) : [];
-  existing.push({ sessionId: sid, chatId, larkAppId, rootMessageId: '', scope: 'chat', status: 'active' });
-  writeFileSync(fp, JSON.stringify(existing));
+  // 会话行只有 SQLite 一种持久层，且按 larkAppId 分库；旧夹具往单个
+  // sessions.json 里 push 数组的写法（靠 JSON 读侧容忍数组形状）已不适用。
+  seedPersistedSessionRows(DATA_DIR, larkAppId, {
+    [sid]: { sessionId: sid, chatId, larkAppId, rootMessageId: '', scope: 'chat', status: 'active' },
+  });
 }
 
 /** Put a marker at THIS process's pid so a spawned child (whose ppid == our pid)

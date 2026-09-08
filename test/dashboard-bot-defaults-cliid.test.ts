@@ -137,6 +137,24 @@ describe('Codex-compatible runtime editor', () => {
     return { renderer, root: renderer.root, patchBot };
   }
 
+  async function flushEffects(cycles = 1): Promise<void> {
+    for (let i = 0; i < cycles; i += 1) {
+      await act(async () => {
+        await new Promise<void>(resolve => queueMicrotask(resolve));
+      });
+    }
+  }
+
+  async function waitForObserved<T>(read: () => T, done: (value: T) => boolean, tries = 20): Promise<T> {
+    let last = read();
+    for (let i = 0; i < tries; i += 1) {
+      if (done(last)) return last;
+      await flushEffects();
+      last = read();
+    }
+    throw new Error(`condition not reached: ${JSON.stringify(last)}`);
+  }
+
   it('defaults old payloads to Official Codex and keeps wrapper or non-Codex selections unchanged', () => {
     const official = renderAgent({ cliId: 'codex' });
     expect(official.root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
@@ -164,6 +182,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -188,6 +207,113 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows the claude-code effort picker with all five levels and no ultra', () => {
+    const claudeCliState = {
+      options: [
+        { id: 'claude-code', label: 'Claude Code' },
+        { id: 'codex', label: 'Codex' },
+      ],
+      ttadkModelDefault: '',
+      ttadkModelSuggestions: [],
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+        sessionFallback: 'claude-code',
+        cliState: claudeCliState,
+        patchBot: () => undefined,
+      }));
+    });
+    // Without the dashboard half of the gate the picker is not rendered at all,
+    // so findByProps throwing is itself the regression signal.
+    const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+    expect(picker.props.value).toBe('xhigh');
+    const values = (picker.props.options as Array<{ value: string }>).map(o => o.value);
+    // opus-5 takes both xhigh and max; ultra is codex/traex-only and never offered.
+    expect(values).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it.each(['aiden-x-claude', 'cjadk-x-claude', 'ttadk-x-claude'])(
+    'shows and saves effort for the %s wrapper, which resolves to claude-code',
+    async (selectionKey) => {
+      // Gateway entries are selection keys, not CliIds. Matching the raw key
+      // would hide the selector and blank the stored effort on save, even though
+      // the wrapper only swaps the binary — stripWrapperUnsafeArgs drops
+      // --settings / botmux -c / --dangerously-bypass-hook-trust, never --effort.
+      const previousFetch = globalThis.fetch;
+      const requests: any[] = [];
+      (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+        if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+        if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+        const body = JSON.parse(init?.body ?? '{}');
+        requests.push(body);
+        return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', reasoningEffort: body.reasoningEffort, selectionKey }) } as any;
+      });
+      try {
+        let renderer!: TestRenderer.ReactTestRenderer;
+        act(() => {
+          renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+            bot: { larkAppId: 'cli_wrapped', cliId: 'claude-code', agentSelectionKey: selectionKey, model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+            sessionFallback: selectionKey,
+            cliState: {
+              options: [{ id: selectionKey, label: selectionKey }, { id: 'codex', label: 'Codex' }],
+              ttadkModelDefault: '',
+              ttadkModelSuggestions: [],
+            },
+            patchBot: () => undefined,
+          }));
+        });
+        expect(renderer.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('xhigh');
+        await act(async () => {
+          renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        });
+        expect(requests.at(-1)?.reasoningEffort).toBe('xhigh');
+      } finally {
+        (globalThis as any).fetch = previousFetch;
+      }
+    },
+  );
+
+  it('keeps the claude effort in the save payload instead of blanking it', async () => {
+    // Regression: the selector, its option list and the save payload each had
+    // their own inline CLI predicate. claude-code reached the first two but not
+    // the third, so every save sent reasoningEffort:'' and the daemon read that
+    // explicit empty value as a delete.
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: body.reasoningEffort, selectionKey: 'claude-code' }) } as any;
+    });
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_claude', cliId: 'claude-code', model: 'claude-opus-5', reasoningEffort: 'xhigh' },
+          sessionFallback: 'claude-code',
+          cliState: {
+            options: [{ id: 'claude-code', label: 'Claude Code' }, { id: 'codex', label: 'Codex' }],
+            ttadkModelDefault: '',
+            ttadkModelSuggestions: [],
+          },
+          patchBot: () => undefined,
+        }));
+      });
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      });
+      const saved = requests.find(r => r.cliId === 'claude-code');
+      expect(saved).toBeTruthy();
+      expect(saved.reasoningEffort).toBe('xhigh');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
@@ -195,6 +321,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -245,6 +372,7 @@ describe('Codex-compatible runtime editor', () => {
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -288,6 +416,421 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows and saves a TraeX-only backend variant', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'traex',
+          model: body.model,
+          reasoningEffort: body.reasoningEffort,
+          modelBackendVariant: body.modelBackendVariant,
+          selectionKey: 'traex',
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+      const picker = root.findByProps({ dataInput: 'agentModelBackendVariant' });
+      expect(picker.props.value).toBe('max');
+      expect((picker.props.options as Array<{ value: string }>).map(option => option.value)).toEqual(['', 'standard', 'max']);
+      act(() => picker.props.onChange('standard'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'standard',
+      }]);
+
+      const codex = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol' });
+      expect(codex.root.findAllByProps({ dataInput: 'agentModelBackendVariant' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows independent pass-through/custom modes only for TraeX and rehydrates them', () => {
+    const trae = renderAgent({
+      cliId: 'traex',
+      agentSelectionKey: 'traex',
+      nativeSubagentRuntime: {
+        model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+        // Legacy short-lived builds could persist this now-unsupported mode.
+        reasoningEffort: { mode: 'inherit' } as any,
+      },
+    });
+    expect(trae.root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.value).toBe('custom');
+    expect(trae.root.findByProps({ 'data-input': 'nativeSubagentModel' }).props.value).toBe('GPT-5.6-Sol');
+    const modelMode = trae.root.findByProps({ dataInput: 'nativeSubagentModelMode' });
+    const effortMode = trae.root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' });
+    expect(modelMode.props.options.map((option: { value: string }) => option.value)).toEqual(['passthrough', 'custom']);
+    expect(effortMode.props.options.map((option: { value: string }) => option.value)).toEqual(['passthrough', 'custom']);
+    expect(effortMode.props.value).toBe('passthrough');
+    expect(trae.root.findAllByProps({ dataInput: 'nativeSubagentReasoningEffort' })).toHaveLength(0);
+
+    const codex = renderAgent({ cliId: 'codex' });
+    expect(codex.root.findAllByProps({ 'data-native-subagent-runtime': '' })).toHaveLength(0);
+
+    act(() => trae.root.findByProps({ dataInput: 'agentCliId' }).props.onChange('codex'));
+    expect(trae.root.findAllByProps({ 'data-native-subagent-runtime': '' })).toHaveLength(0);
+  });
+
+  it('limits a custom native-subagent DeepSeek model to its supported effort options', () => {
+    const { root } = renderAgent({
+      cliId: 'traex',
+      agentSelectionKey: 'traex',
+      nativeSubagentRuntime: {
+        model: { mode: 'custom', value: 'DeepSeek-V4-Pro' },
+        reasoningEffort: { mode: 'custom', value: 'high' },
+      },
+    });
+    const effort = root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' });
+    expect(effort.props.value).toBe('high');
+    expect(effort.props.options.map((option: { value: string }) => option.value))
+      .toEqual(['low', 'medium', 'high']);
+  });
+
+  it('omits untouched native-subagent policy and sends null when both dimensions become pass-through', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({ ...body, ok: true, selectionKey: body.cliId, nativeSubagentRuntime: null }),
+      } as any;
+    });
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({
+        cliId: 'traex', agentSelectionKey: 'traex',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
+      }, patchBot);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+      expect(requests[0]).not.toHaveProperty('nativeSubagentRuntime');
+
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('passthrough'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+      expect(requests[1]).toMatchObject({ nativeSubagentRuntime: null });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ nativeSubagentRuntime: undefined }));
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('clears a TraeX backend variant when switching away and back before save', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: body.cliId,
+          model: body.model,
+          reasoningEffort: body.reasoningEffort,
+          modelBackendVariant: null,
+          selectionKey: body.cliId,
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+      const cliPicker = root.findByProps({ dataInput: 'agentCliId' });
+      act(() => cliPicker.props.onChange('codex'));
+      act(() => cliPicker.props.onChange('traex'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{
+        cliId: 'traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: '',
+        cliRuntime: null,
+      }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('builds independent custom native-subagent fields and patches the authoritative response', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    const authoritative = {
+      model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom', value: 'ultra' },
+    };
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: ['GPT-5.6-Sol'], source: 'live' }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({ ...body, ok: true, selectionKey: 'traex', nativeSubagentRuntime: authoritative }) } as any;
+    });
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' }, patchBot);
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ 'data-input': 'nativeSubagentModel' }).props.onChange({ currentTarget: { value: 'GPT-5.6-Sol' } }));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.onChange('ultra'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+      expect(requests[0]).toMatchObject({ nativeSubagentRuntime: authoritative });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ nativeSubagentRuntime: authoritative }));
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('blocks save and shows inline errors when native custom fields are incomplete', async () => {
+    const previousFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (_url: string, _init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      throw new Error('save should not be attempted');
+    });
+    (globalThis as any).fetch = fetchSpy;
+    try {
+      const { root } = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' });
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.onChange('custom'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+
+      const errors = root.findAll(node => node.props?.['data-native-subagent-error'] === '');
+      expect(errors.map(node => node.children.join(''))).toEqual([
+        '请输入自定义 subagent model',
+        '请选择自定义 subagent reasoning effort',
+      ]);
+      expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('请先修正 native subagent runtime 的必填项');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('does not erase a valid loaded native custom effort during initial model hydration', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async (_url: string, _init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: ['DeepSeek-V4-Pro'], source: 'live' }) } as any;
+      }
+      throw new Error('save should not be attempted');
+    });
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      const patchBot = vi.fn();
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_runtime', cliId: 'traex', agentSelectionKey: 'traex', model: '' },
+          sessionFallback: 'codex',
+          cliState,
+          patchBot,
+        }));
+      });
+
+      act(() => {
+        renderer.update(React.createElement(BotAgentSection, {
+          bot: {
+            larkAppId: 'cli_runtime',
+            cliId: 'traex',
+            agentSelectionKey: 'traex',
+            model: '',
+            nativeSubagentRuntime: {
+              model: { mode: 'custom', value: 'DeepSeek-V4-Pro' },
+              // Persisted payload can be temporarily incompatible with the
+              // hydrated model, but must survive untouched initial hydration.
+              reasoningEffort: { mode: 'custom', value: 'ultra' },
+            },
+          },
+          sessionFallback: 'codex',
+          cliState,
+          patchBot,
+        }));
+      });
+
+      const root = renderer.root;
+      await waitForObserved(
+        () => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value,
+        value => value === 'custom',
+      );
+      const effortValue = await waitForObserved(
+        () => root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.value,
+        value => value === 'ultra',
+      );
+
+      expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value).toBe('custom');
+      expect(effortValue).toBe('ultra');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('resets native custom effort to pass-through when the custom model no longer allows it', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: ['GPT-5.6-Sol', 'DeepSeek-V4-Pro'], source: 'live' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: body.cliId,
+          model: body.model ?? '',
+          reasoningEffort: body.reasoningEffort ?? '',
+          selectionKey: body.cliId,
+          nativeSubagentRuntime: body.nativeSubagentRuntime ?? null,
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        agentSelectionKey: 'traex',
+        nativeSubagentRuntime: {
+          model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+          reasoningEffort: { mode: 'custom', value: 'ultra' },
+        },
+      });
+
+      act(() => root.findByProps({ 'data-input': 'nativeSubagentModel' }).props.onChange({ currentTarget: { value: 'DeepSeek-V4-Pro' } }));
+
+      await waitForObserved(
+        () => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value,
+        value => value === 'passthrough',
+      );
+
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      });
+      await waitForObserved(() => requests.length, value => value === 1);
+
+      expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value).toBe('passthrough');
+      expect(root.findAllByProps({ dataInput: 'nativeSubagentReasoningEffort' })).toHaveLength(0);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        cliId: 'traex',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'DeepSeek-V4-Pro' } },
+      });
+      expect(requests[0].nativeSubagentRuntime).not.toHaveProperty('reasoningEffort');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('does not let hidden native draft validation block saving another cli', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: body.cliId, model: body.model ?? '', reasoningEffort: body.reasoningEffort ?? '', selectionKey: body.cliId }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' });
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('codex'));
+
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      });
+
+      await waitForObserved(
+        () => requests.length,
+        value => value === 1,
+      );
+
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      await waitForObserved(
+        () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
+        text => text.includes('已保存'),
+      );
+      expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('已保存');
+      expect(root.findAll(node => node.props?.['data-native-subagent-error'] === '')).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('offers every canonical effort for an effort-only override when the model passes through', () => {
+    const { root } = renderAgent({
+      cliId: 'traex', agentSelectionKey: 'traex', model: 'DeepSeek-V4-Pro',
+    });
+    act(() => root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.onChange('custom'));
+    const values = root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.options
+      .map((option: { value: string }) => option.value);
+    expect(values).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  });
+
+  it('rehydrates an effort-only ultra override while the model passes through', () => {
+    const { root } = renderAgent({
+      cliId: 'traex', agentSelectionKey: 'traex', model: 'DeepSeek-V4-Pro',
+      nativeSubagentRuntime: { reasoningEffort: { mode: 'custom', value: 'ultra' } },
+    });
+    expect(root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.value).toBe('passthrough');
+    expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value).toBe('custom');
+    expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.value).toBe('ultra');
+  });
+
   const dshCliState = {
     options: [
       { id: 'codex', label: 'Codex' },
@@ -317,6 +860,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -350,6 +894,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -387,6 +932,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -426,6 +972,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -460,6 +1007,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -488,6 +1036,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -516,6 +1065,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -753,6 +1303,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -802,6 +1353,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -865,6 +1417,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -907,6 +1460,7 @@ describe('Codex-compatible runtime editor', () => {
     };
     (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
       if (String(url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push({ url: String(url), body: JSON.parse(init?.body ?? '{}') });
       return {
         ok: true,
@@ -958,6 +1512,7 @@ describe('Codex-compatible runtime editor', () => {
       // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
       // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -1074,6 +1629,65 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
     expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+  });
+
+  it('resets the native-subagent editor from the authoritative Trae-to-Riff response', async () => {
+    const previousFetch = globalThis.fetch;
+    const agentRequests: any[] = [];
+    (globalThis as any).fetch = async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      if (String(url).endsWith('/agent')) {
+        const body = JSON.parse(init?.body ?? '{}');
+        agentRequests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            cliId: body.cliId,
+            wrapperCli: null,
+            model: '',
+            reasoningEffort: null,
+            selectionKey: body.cliId,
+            nativeSubagentRuntime: null,
+          }),
+        } as any;
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, riff: JSON.stringify({ baseUrl: 'https://riff.example' }) }) } as any;
+    };
+    try {
+      const patchBot = vi.fn();
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: {
+            larkAppId: 'cli_x', cliId: 'traex', agentSelectionKey: 'traex', reasoningEffort: 'high',
+            nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' }, reasoningEffort: { mode: 'custom', value: 'ultra' } },
+          },
+          sessionFallback: 'traex',
+          cliState: {
+            options: [{ id: 'traex', label: 'TraeX' }, { id: 'riff', label: 'Riff' }],
+            ttadkModelDefault: '', ttadkModelSuggestions: [],
+          },
+          patchBot,
+        }));
+      });
+      const root = renderer.root;
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'));
+      await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+      expect(patchBot).toHaveBeenCalledWith('cli_x', expect.objectContaining({ reasoningEffort: undefined }));
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('traex'));
+      expect(root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.value).toBe('passthrough');
+      expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffortMode' }).props.value).toBe('passthrough');
+      expect(root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('');
+      await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
+      expect(agentRequests).toHaveLength(2);
+      expect(agentRequests[1]).toMatchObject({ cliId: 'traex', reasoningEffort: '' });
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
   });
 });
 
@@ -1313,11 +1927,51 @@ describe('card behavior defaults', () => {
     expect(cardOff.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(false);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(true);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.disabled).toBe(false);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-writable-link' }).props.disabled).toBe(false);
     expect(cardOff.root.findByProps({ 'data-card-pref-status': '' }).props).toMatchObject({
       role: 'status',
       'aria-live': 'polite',
     });
+  });
+
+  it('pin streaming toggle defaults unchecked when the payload omits it', () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_pin_absent' },
+        putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
+    expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
+  });
+
+  it('toggling pin streaming on persists pinStreamingCard=true', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_pin_toggle' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ pinStreamingCard: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(true);
   });
 
   it('enabling automatic cards persists disableStreamingCard=false', async () => {
@@ -1383,7 +2037,7 @@ describe('card behavior defaults', () => {
       }));
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
       const before = renderer.root.findByProps({ 'data-action': action }).props.checked;
       await act(async () => {
         renderer.root.findByProps({ 'data-action': action }).props.onChange({ currentTarget: { checked: !before } });
@@ -1410,7 +2064,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);

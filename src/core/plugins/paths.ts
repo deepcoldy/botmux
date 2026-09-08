@@ -31,6 +31,10 @@ export function pluginMcpPrivatePath(pluginId: string): string {
   return join(pluginPrivateDir(pluginId), 'mcp.json');
 }
 
+export function pluginCardActionTokenPath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'card-actions.token');
+}
+
 export function pluginConfigPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'config.json');
 }
@@ -41,10 +45,6 @@ export function pluginSettingsPath(pluginId: string): string {
 
 export function pluginServiceStatePath(pluginId: string): string {
   return join(pluginHome(pluginId), 'service.json');
-}
-
-export function pluginServicePm2ConfigPath(pluginId: string): string {
-  return join(pluginHome(pluginId), 'service.pm2.json');
 }
 
 export function pluginMaterializedPath(pluginId: string): string {

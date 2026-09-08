@@ -149,6 +149,55 @@ fill('runAllTimersAsync', async () => {
   return vi;
 });
 
+// ---------------------------------------------------------------------------
+// `clearAllTimers` when fake timers were never installed.
+//
+// ⚠️ This one is an OVERRIDE, not a `fill`: Bun DOES define
+// `vi.clearAllTimers`, so `fill` would skip it — and Bun's implementation
+// THROWS `Fake timers are not active. Call useFakeTimers() first.` when no fake
+// timers are installed. vitest treats the same call as a no-op.
+//
+// MEASURED, the two runners on one 4-line file (`vi.clearAllTimers()` with no
+// `useFakeTimers`, and again after `useRealTimers`):
+//     vitest   → 2 passed
+//     bun test → 2 failed
+//
+// This is not a theoretical gap: an unconditional `vi.clearAllTimers()` in an
+// `afterEach` is the single largest cause of the bun-test leg being red — 50 of
+// its failures in one CI run, e.g. test/recall-frozen-cards.test.ts:189, where
+// the test body itself passed and only the teardown threw.
+//
+// We track installation ourselves because neither runner exposes "are fake
+// timers active?". Erring toward CALLING through is deliberate: if our flag ever
+// disagrees with reality, a spurious call throws loudly (visible) rather than a
+// skipped clear leaking timers into the next test (silent cross-test pollution).
+let fakeTimersInstalled = false;
+const realUseFakeTimers = anyVi.useFakeTimers as ((...a: unknown[]) => unknown) | undefined;
+const realUseRealTimers = anyVi.useRealTimers as ((...a: unknown[]) => unknown) | undefined;
+if (typeof realUseFakeTimers === 'function') {
+  anyVi.useFakeTimers = (...args: unknown[]) => {
+    const r = realUseFakeTimers(...args);
+    fakeTimersInstalled = true;
+    return r === undefined ? vi : r;
+  };
+}
+if (typeof realUseRealTimers === 'function') {
+  anyVi.useRealTimers = (...args: unknown[]) => {
+    const r = realUseRealTimers(...args);
+    fakeTimersInstalled = false;
+    return r === undefined ? vi : r;
+  };
+}
+const realClearAllTimers = anyVi.clearAllTimers as ((...a: unknown[]) => unknown) | undefined;
+anyVi.clearAllTimers = (...args: unknown[]) => {
+  // No fake timers installed ⇒ there is nothing to clear, which is exactly what
+  // vitest does. Swallowing here cannot hide a real failure: the only thing
+  // Bun's version would have done is throw.
+  if (!fakeTimersInstalled) return vi;
+  const r = realClearAllTimers?.(...args);
+  return r === undefined ? vi : r;
+};
+
 // Per-file config. `bun test` takes the timeout as a CLI flag, so there is no
 // runtime knob to forward this to — and scripts/run-bun-tests.mjs already passes
 // a `--timeout` at least as large as anything a file asks for, so accepting

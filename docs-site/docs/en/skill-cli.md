@@ -22,7 +22,7 @@ A `botmux send` **must carry an @-decision**, or it refuses to send: `--mention 
 
 ## Wrapper Mechanism
 
-In-session commands rely on the wrapper script at `~/.botmux/bin/botmux` — **written automatically by the daemon at startup** and added to the worker's PATH. The wrapper is an extremely thin `exec node <this daemon's dist/cli.js>` shim, so its **version always matches the daemon** and no separate `npm i -g` is needed. (Dev helpers like `bun run use:here` re-point it manually with identical, idempotent content.)
+In-session commands rely on `~/.botmux/bin/botmux` — **maintained automatically by the daemon at startup** and added to the worker's PATH, so its **version always matches the daemon** and no separate install is needed. What it points at depends on how the daemon itself is running: with a curl install that path **is the self-contained binary** (the daemon detects this and skips rewriting, so it never overwrites itself with a script); with an npm install it's a one-line `exec "<binary inside the platform subpackage>"` shim; in a source checkout it's `exec node <this daemon's dist/cli.js>`. (Dev helpers like `bun run use:here` re-point it manually with identical, idempotent content.)
 
 Session info is inferred automatically from **ancestor-process markers**: when the worker launches the CLI it writes a marker keyed by the child PID (carrying sessionId / turnId), and the agent's commands walk up the process tree to the nearest marker to know which session they belong to — so the agent never passes a session id. If the process tree is broken (detached / `setsid` / deeply nested), it falls back to the `BOTMUX_SESSION_ID` environment variable.
 

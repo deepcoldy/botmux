@@ -8,6 +8,7 @@ import type {
   DaemonToWorker,
   LarkAttachment,
   LarkMention,
+  ModelFallbackState,
   DisplayMode,
   StreamStatus,
   VcMeetingImTurnOrigin,
@@ -88,6 +89,8 @@ export interface DaemonSession {
   spawnedAt: number;
   cliVersion: string;
   lastMessageAt: number;
+  /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
+  lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
@@ -184,16 +187,10 @@ export interface DaemonSession {
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */
   initialStartClaimToken?: string;
-  /** Number of activation-tail arrivals that reserved FIFO order before an
-   * asynchronous prompt/sender build and have not yet durably admitted or
-   * failed. An opening ACK must not clear the route while this is non-zero. */
-  queuedActivationTailAdmissionsOutstanding?: number;
-  /** An opening ACK (or ordinary cold-start handoff) observed while an
-   * asynchronous tail admission was outstanding. The final settler replays
-   * this release so a late durable successor cannot be stranded. */
-  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
-  /** Retry timer for an ordinary cold-start handoff whose durable promotion
-   * failed after all asynchronous admissions had settled. */
+  /** Retry timer for a route release whose durable promotion failed while the
+   * route was still held. Ordering between a follower still being built and
+   * the opening's release is the session turn queue's job
+   * (core/session-turn-queue.ts), not a field here. */
   queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
@@ -270,18 +267,6 @@ export interface DaemonSession {
    * Used only when a literal raw cold start must fold followers onto the same
    * text→Enter IPC boundary. */
   pendingCodexAppFollowUpGateAccepted?: boolean[];
-  /** Exact turns that arrived while a previously attempted queued activation
-   * was re-parked. They remain separate FIFO items behind the retained opening
-   * payload and advance only after worker acceptance. In-memory only. */
-  pendingQueuedActivationFollowUps?: Array<{
-    userPrompt: string;
-    cliInput: CliTurnPayload;
-    turnId: string;
-    dispatchAttempt?: number;
-    /** Legacy volatile entries already crossed the clean-input gate when they
-     * were staged. Migration must preserve that exact sidecar decision. */
-    codexAppInputGateFrozen?: true;
-  }>;
   /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
    *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
@@ -387,6 +372,14 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Claude model fallback still in effect, reported by the worker from the
+   *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
+   *  without a live worker keeps the notice. Unlike the other runtime facts it
+   *  is NOT owned by a worker generation and survives every respawn: it is
+   *  bound to a Claude session id instead, and only positive evidence moves it
+   *  — a reply served by a different model, a newer switch record, a message
+   *  from another Claude session, or a role switch away from claude-code. */
+  modelFallback?: ModelFallbackState;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
   /** Queued suspend: the request arrived while the session was producing
@@ -520,6 +513,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Session-lifetime runtime-policy lookup authority. */
+    policyCapability?: string;
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
@@ -735,8 +730,12 @@ export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>):
  * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
  * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
  * targeting it (sendMessage / card / reply / roster probe) would fail — these
- * sessions are request/response only and must never touch Lark transport. */
-export function isHttpVirtualSession(chatId: string): boolean {
+ * sessions are request/response only and must never touch Lark transport.
+ * Tolerates a nullish chatId (returns false — a missing surface is not an
+ * HTTP virtual chat), so callers converging onto this predicate can pass an
+ * optional chatId without a separate `?.` guard. */
+export function isHttpVirtualSession(chatId: string | undefined | null): boolean {
+  if (!chatId) return false;
   return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
 }
 
@@ -747,9 +746,16 @@ export function isHttpVirtualSession(chatId: string): boolean {
  * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
  * instead of re-deriving the condition, so a new no-Feishu surface is covered
  * everywhere by construction. `doc:` sessions keep their own dedicated routing
- * (comment API), so they are intentionally NOT folded in here. */
+ * (comment API), so they are intentionally NOT folded in here.
+ *
+ * `chatId` is REQUIRED-but-nullable on purpose: a caller holding an optional
+ * chatId may pass `undefined`/`null` (tolerated — see isHttpVirtualSession),
+ * but OMITTING the key entirely stays a compile error. This is a fail-closed
+ * gate, and a forgotten `chatId` would land on the permissive side (an
+ * apiOnly-less object would read as "transport enabled"), so the missing-key
+ * case must not typecheck. Do not relax to `chatId?:`. */
 export function larkTransportEnabled(
-  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+  ds: { chatId: string | null | undefined; apiOnly?: boolean },
 ): boolean {
   if (ds.apiOnly === true) return false;
   if (isHttpVirtualSession(ds.chatId)) return false;

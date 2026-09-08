@@ -17,6 +17,8 @@
  *                       `unknown` sentinel. Compiled mode has no package.json on
  *                       disk, so every version read failed and 3.18.0-canary.2
  *                       shipped printing `botmux vunknown`.
+ *   1d. plugin service — install/start/stop/update/uninstall work with the
+ *                       built-in supervisor, without Node/Bun/PM2 on PATH.
  *   2. self-spawn     — the `__supervisor` hidden entry re-execs THIS binary
  *                       (the /$bunfs argv[1] path), starts a fleet, and the
  *                       supervisor stays alive.
@@ -35,7 +37,7 @@
  * Exit 0 = all checks passed; non-zero + a diagnostic on the first failure.
  */
 
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -71,8 +73,19 @@ mkdirSync(join(home, '.botmux'), { recursive: true });
 // dashboard to add their first bot" state — and it needs no credentials.
 writeFileSync(join(home, '.botmux', 'bots.json'), '[]');
 
+// Drop every inherited BOTMUX_* variable before layering the scratch config on
+// top. When this script runs INSIDE a botmux-managed CLI session (a bot doing a
+// local repro), the shell carries the live fleet's BOTMUX_DAEMON_IPC_PORT,
+// BOTMUX_LARK_APP_ID, BOTMUX_SESSION_ID, … — and the smoke supervisor inherits
+// them, so a scratch-HOME test fleet can end up addressing the REAL daemon's IPC
+// port. Measured: a leftover smoke supervisor carried BOTMUX_DAEMON_IPC_PORT=7950
+// (the live daemon) while its own base port had been set to 19950.
+const inheritedEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([k]) => !k.startsWith('BOTMUX_')
+    && !['BOTMUX', 'BOTS_CONFIG', 'SESSION_DATA_DIR', 'PM2_HOME', 'PLUGIN_PM2_HOME', 'BUN_BE_BUN'].includes(k)),
+);
 const childEnv = {
-  ...process.env,
+  ...inheritedEnv,
   HOME: home,
   BOTMUX_DAEMON_IPC_BASE_PORT: String(PORTS.ipc),
   BOTMUX_WEB_PROXY_BASE_PORT: String(PORTS.proxy),
@@ -80,6 +93,7 @@ const childEnv = {
 };
 
 let supervisor;
+let pluginSupervisorPid;
 
 /**
  * Reap the supervisor AND the members it spawned.
@@ -125,6 +139,19 @@ const sleepSync = (ms) => {
 
 const cleanup = () => {
   const members = memberPids();
+  try {
+    const state = JSON.parse(readFileSync(join(home, '.botmux', 'plugin-supervisor', 'state.json'), 'utf8'));
+    members.push(...state.procs.map(p => p.pid).filter(pid => pid > 1));
+    // stopAll clears supervisorPid before the entry itself exits. Retain the
+    // observed PID so a failed exit assertion cannot escape failure cleanup.
+    pluginSupervisorPid ||= state.supervisorPid;
+    if (pluginSupervisorPid > 1 && alive(pluginSupervisorPid)) {
+      process.kill(pluginSupervisorPid, 'SIGTERM');
+      const deadline = Date.now() + 3_000;
+      while (alive(pluginSupervisorPid) && Date.now() < deadline) sleepSync(50);
+      if (alive(pluginSupervisorPid)) process.kill(pluginSupervisorPid, 'SIGKILL');
+    }
+  } catch { /* absent, or already exited */ }
   if (supervisor && supervisor.exitCode === null) {
     // Graceful first: lets the supervisor tear down its own members.
     try { supervisor.kill('SIGTERM'); } catch { /* already gone */ }
@@ -149,6 +176,32 @@ const fail = (step, detail) => {
   process.exit(1);
 };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── 0. darwin: the Mach-O ad-hoc signature is valid ──────────────────────────
+// `bun build --compile` writes an ad-hoc code signature into every darwin
+// binary. Bun 1.4.0 wrote an INVALID one (last page hashed zero-padded, stale
+// signature bytes left past the new one — oven-sh/bun#39764, fixed in #39837 /
+// 1.4.1). Older macOS tolerated it, so the binary still ran here on the
+// macos-14 runner and every check below passed, while macOS 27 SIGKILLs the
+// process before main() — `botmux upgrade` to 3.18.14 died with `exit SIGKILL`
+// and nothing else. Verify the signature explicitly so a release gate never
+// again depends on the runner's macOS being lenient. `--strict` is what Apple's
+// newer loaders effectively enforce.
+if (process.platform === 'darwin') {
+  try {
+    // codesign reports on stderr even on success; a zero exit is the verdict.
+    execFileSync('codesign', ['--verify', '--strict', '--verbose=2', binary], {
+      encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    console.log('smoke: ✅ codesign — ad-hoc Mach-O signature valid (--strict)');
+  } catch (err) {
+    const detail = err && typeof err === 'object' && 'stderr' in err && err.stderr
+      ? String(err.stderr).trim()
+      : (err instanceof Error ? err.message : String(err));
+    fail('codesign', `invalid Mach-O signature — newer macOS will SIGKILL this binary before it runs. ` +
+      `Check the Bun that compiled it (1.4.0 is known-bad, need >= 1.4.1). codesign said: ${detail}`);
+  }
+}
 
 // ── 1. capabilities: the CLI graph loads ─────────────────────────────────────
 // Run from a scratch cwd with NO node_modules so a missing native/embedded
@@ -216,6 +269,109 @@ try {
   console.log(`smoke: ✅ selfcheck — lark-scopes manifest loads + writes in the binary (tenant=${parsed.tenant}, user=${parsed.user})`);
 } catch (err) {
   fail('selfcheck', err instanceof Error ? err.message : String(err));
+}
+
+// ── 1d. A real plugin service, entirely outside the source tree ──────────────
+// Removing Node/Bun/PM2 from PATH proves both the supervisor and the installed
+// JS service re-exec the compiled binary. HTTP readiness catches a child that
+// merely prints CLI help and exits, which a successful spawn cannot detect.
+try {
+  const plugin = join(home, 'smoke-plugin');
+  const marker = join(home, 'plugin-ready.json');
+  const pluginState = join(home, '.botmux', 'plugin-supervisor', 'state.json');
+  const emptyPath = join(home, 'empty-path');
+  mkdirSync(emptyPath);
+  const pluginEnv = { ...childEnv, PATH: emptyPath };
+  mkdirSync(join(plugin, 'dist', 'service'), { recursive: true });
+  writeFileSync(join(plugin, 'package.json'), JSON.stringify({
+    name: '@botmux-ai/plugin-binary-smoke', version: '1.0.0', keywords: ['botmux-plugin'],
+    botmux: { schemaVersion: 1, id: 'binary-smoke', service: { mode: 'manual' } },
+  }));
+  writeFileSync(join(plugin, 'dist', 'package.json'), '{"type":"commonjs"}');
+  writeFileSync(join(plugin, 'dist', 'service', 'index.js'), `module.exports = {
+    pm2: { script: './service/server.cjs', args: ['argument with spaces'], killTimeoutMs: 500,
+      env: { SMOKE_MARKER: ${JSON.stringify(marker)} } }
+  };`);
+  writeFileSync(join(plugin, 'dist', 'service', 'server.cjs'), `
+    if (process.env.BUN_BE_BUN !== undefined) throw new Error('bootstrap env leaked');
+    if (require.main !== module) throw new Error('service is not the main module');
+    const nested = require('node:child_process').execFileSync(process.execPath, ['capabilities', '--json'],
+      { encoding: 'utf8', timeout: 5000 });
+    JSON.parse(nested); // nested botmux must not enter Bun CLI or print help
+    const server = require('node:http').createServer((req, res) => res.end(process.argv[2]));
+    server.listen(0, '127.0.0.1', () => require('node:fs').writeFileSync(process.env.SMOKE_MARKER,
+      JSON.stringify({ pid: process.pid, port: server.address().port })));
+    process.on('SIGTERM', () => server.close(() => process.exit(0)));
+  `);
+  const cli = (args, expected = 0) => {
+    const result = spawnSync(binary, ['plugin', ...args], {
+      cwd: home, env: pluginEnv, encoding: 'utf8', timeout: 40_000,
+    });
+    if (result.error || result.status !== expected) {
+      throw new Error(`${args.join(' ')}: ${result.error?.message ?? result.stderr ?? result.stdout}`);
+    }
+  };
+  const ready = async (previousPid = 0) => {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (existsSync(marker)) {
+        const value = JSON.parse(readFileSync(marker, 'utf8'));
+        if (value.pid !== previousPid && alive(value.pid)) {
+          const response = await fetch(`http://127.0.0.1:${value.port}`, { signal: AbortSignal.timeout(2_000) });
+          if (await response.text() !== 'argument with spaces') throw new Error('service argv corrupted');
+          return value.pid;
+        }
+      }
+      await delay(50);
+    }
+    throw new Error('plugin service did not become ready');
+  };
+  cli(['install', plugin]);
+  cli(['service', 'status']);
+  if (existsSync(pluginState)) throw new Error('install/status started a supervisor');
+  cli(['service', 'start', 'binary-smoke']);
+  const firstPid = await ready();
+  pluginSupervisorPid = JSON.parse(readFileSync(pluginState, 'utf8')).supervisorPid;
+  cli(['uninstall', 'binary-smoke'], 1); // runtime must remain intact while live
+  cli(['service', 'stop', 'binary-smoke']);
+  if (alive(firstPid)) throw new Error('stop returned with a live service');
+  cli(['install', plugin]); // stopped service permits replacement
+  cli(['service', 'start', 'binary-smoke']);
+  const secondPid = await ready(firstPid);
+  cli(['service', 'stop', 'binary-smoke']);
+  cli(['uninstall', 'binary-smoke']);
+  await delay(750);
+  if (alive(secondPid) || JSON.parse(readFileSync(pluginState, 'utf8')).procs.length !== 0) {
+    throw new Error('uninstall left a process or restartable member');
+  }
+  if ([join(home, '.botmux', 'pm2'), join(home, '.pm2')].some(dir => existsSync(join(dir, 'pm2.pid')))) {
+    throw new Error('plugin lifecycle created PM2');
+  }
+  console.log('smoke: ✅ plugin service — install/start/HTTP/guard/stop/update/uninstall without PM2');
+
+  process.kill(pluginSupervisorPid, 'SIGTERM');
+  const shutdownDeadline = Date.now() + 5_000;
+  while (alive(pluginSupervisorPid) && Date.now() < shutdownDeadline) await delay(50);
+  if (alive(pluginSupervisorPid)) throw new Error('plugin supervisor did not exit after graceful shutdown');
+  pluginSupervisorPid = undefined;
+  const ownerLock = join(home, '.botmux', 'plugin-supervisor', 'owner.lock');
+  if (existsSync(ownerLock)) throw new Error('plugin supervisor exited without releasing its lifetime lock');
+  console.log('smoke: ✅ plugin supervisor — graceful exit releases lifetime lock');
+
+  // A malformed desired state fails after the owner lock and fleet timer are
+  // acquired. The hidden CLI entry must exit non-zero AFTER both are cleaned up.
+  writeFileSync(join(home, '.botmux', 'plugin-supervisor', 'desired.json'), '{}');
+  const failedStart = spawnSync(binary, ['__plugin-supervisor'], {
+    cwd: home, env: pluginEnv, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL',
+  });
+  if (failedStart.error || failedStart.status !== 1
+    || !failedStart.stderr.includes('plugin_supervisor_invalid_desired_state')) {
+    throw new Error(`plugin supervisor startup failure did not exit 1: ${failedStart.error?.message ?? failedStart.stderr}`);
+  }
+  if (existsSync(ownerLock)) throw new Error('failed plugin supervisor left its lifetime lock');
+  console.log('smoke: ✅ plugin supervisor — startup failure exits 1 and releases lifetime lock');
+} catch (error) {
+  fail('plugin-service', error instanceof Error ? error.message : String(error));
 }
 
 // ── 2/3. self-spawn + dashboard boots and reaches online ─────────────────────

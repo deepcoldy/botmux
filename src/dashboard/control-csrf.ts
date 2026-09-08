@@ -413,6 +413,14 @@ export class ControlCsrfTokens {
     return true;
   }
 
+  /** 当前有票据在册的全部认证会话。解绑吊销要按前缀筛平台身份。
+   *  ⚠️ 新增持有 authSessionId 状态的注册表必须同时接进
+   *  `dashboard.ts#syncPlatformBindingRevocation` 的并集 —— 见
+   *  `TerminalControlManager.authSessionIds` 的完整说明与当前的四个成员。 */
+  authSessionIds(): string[] {
+    return [...this.hashesByAuthSession.keys()];
+  }
+
   /** 认证结束（logout / 到期 / rotate / 解绑）时作废该会话的全部票据。 */
   revokeAuthSession(authSessionId: string): number {
     const hashes = this.hashesByAuthSession.get(authSessionId);

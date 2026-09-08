@@ -192,6 +192,65 @@ describe('drainTraexRollout', () => {
     });
   });
 
+  it('ignores model-like non-turn_context records during incremental drain', () => {
+    writeFileSync(path, [
+      line({
+        type: 'turn_context',
+        payload: { model: 'parent-model', reasoning_effort: 'ultra' },
+      }),
+      line({
+        type: 'event_msg',
+        payload: {
+          type: 'collab_agent_spawn_end',
+          model: 'subagent-model',
+          reasoning_effort: 'medium',
+        },
+      }),
+      line({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          model: 'message-model',
+          effort: 'low',
+        },
+      }),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.latestModel).toBe('parent-model');
+    expect(result.latestReasoningEffort).toBe('ultra');
+  });
+
+  it('ignores model-like non-turn_context records during backward runtime scan', () => {
+    writeFileSync(path, [
+      line({
+        type: 'turn_context',
+        payload: { model: 'parent-model', reasoning_effort: 'ultra' },
+      }),
+      line({
+        type: 'event_msg',
+        payload: {
+          type: 'collab_agent_spawn_end',
+          model: 'subagent-model',
+          reasoning_effort: 'medium',
+        },
+      }),
+      line({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          model: 'message-model',
+          effort: 'low',
+        },
+      }),
+    ].join(''));
+
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'parent-model',
+      reasoningEffort: 'ultra',
+    });
+  });
+
   it('ignores a partial trailing model record until it is complete', () => {
     writeFileSync(path, line({ type: 'turn_context', payload: { model: 'stable-model' } }));
     appendFileSync(path, JSON.stringify({

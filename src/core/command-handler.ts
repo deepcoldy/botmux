@@ -6,7 +6,10 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
@@ -18,6 +21,7 @@ import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
+import { handleGroupSessionsCommand } from './group-sessions-command.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
@@ -46,7 +50,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -73,6 +77,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -119,7 +124,7 @@ import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-tur
 // normalization without a circular import; imported for internal use and
 // re-exported to keep callers (daemon.ts, tests) importing from command-handler
 // unchanged.
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput } from './passthrough-commands.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput, cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 
 /**
@@ -130,7 +135,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -159,7 +164,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist', '/quote']);
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -176,6 +181,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
     wrapperCli: null,
     model: null,
     reasoningEffort: null,
+    modelBackendVariant: null,
     launchShell: null,
     startupCommands: [],
   };
@@ -231,12 +237,11 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
 /** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
  * requires every user message to pass through its service-user envelope and
  * structured turn ledger. Both the routing and /list-slash-command display must
- * agree on CLIs with no raw passthrough surface. */
-const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
-
-export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
-  return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
-}
+ * agree on CLIs with no raw passthrough surface — and so must the Lark card's
+ * `/compact` button, which is why the set + predicate live in the dependency-free
+ * `passthrough-commands` leaf (card-builder cannot import this module: it would
+ * cycle). Re-exported here so existing callers are unaffected. */
+export { cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 
 export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
@@ -833,6 +838,7 @@ async function handleScheduleCommand(
   deps: CommandHandlerDeps,
   larkAppId?: string,
   senderOpenId?: string,
+  senderUnionId?: string,
 ): Promise<void> {
   const { activeSessions } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -858,7 +864,13 @@ async function handleScheduleCommand(
       const nextStr = next ? t('schedule.next_label', { time: next.toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const lastStr = task.lastRunAt ? t('schedule.last_label', { time: new Date(task.lastRunAt).toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const display = task.parsed?.display ?? task.schedule;
-      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
+      // Whose identity this task's turns run as. Worth a line of its own: with
+      // it absent the task still runs, but identity-bound tools fail closed,
+      // and that is otherwise only discoverable at fire time.
+      const runAsStr = task.ownerUnionId
+        ? `\n   runAs: ${task.ownerOpenId ?? task.ownerUnionId}`
+        : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
+      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
     return;
@@ -950,6 +962,11 @@ async function handleScheduleCommand(
       // allowed at every run mutation; the default non-sandbox route does
       // not re-check membership.
       ownerOpenId: senderOpenId,
+      // union_id is the tenant-stable half of the same identity; it is what a
+      // scheduled turn presents to per-user backends. Only stamped for human
+      // creators (see the call site) — a task created by a bot deliberately
+      // keeps no user identity.
+      ownerUnionId: senderUnionId,
       deliver: 'origin',
       silent,
     });
@@ -1055,6 +1072,97 @@ async function applyAllowedUsersSet(
  * `/botconfig` —— owner/allowedUsers 远程改本 bot 运营字段。sessionless：只认 larkAppId，
  * 不需活跃会话。严格 admin 闸（拒绝开放模式 bot），写盘 + 内存热更新，无需重启。
  */
+/**
+ * `/status` lines describing whose credentials the CLI is acting with.
+ *
+ * Answers the question a shared bot actually raises: "is it using MY permissions
+ * right now?" Reports only about the ASKING person — the roster of who else
+ * authorized is not something a group member should learn from /status, and
+ * `/login status` already covers "did I authorize".
+ *
+ * Empty when the policy is off: the answer would then be "the machine's login",
+ * which is the historical behavior and not something /status has ever claimed.
+ */
+/**
+ * The body of a `/login` prompt, matching the callback mode actually in effect.
+ *
+ * `oauthRedirectBase` decides whether the browser can complete the exchange on
+ * its own. Without branching on it, one of the two audiences always gets wrong
+ * instructions — and the wrong-but-scary version ("the page will fail to load,
+ * that's normal, now copy the address bar, and if you can't see it open
+ * DevTools") is what stops a colleague from ever finishing authorization.
+ *
+ * The auto path still mentions the paste fallback in one line: the redirect can
+ * be momentarily unreachable, and a user staring at an error page with no
+ * recourse is exactly the dead end this exists to remove.
+ */
+function loginPromptLines(
+  authUrl: string,
+  loc: Locale | undefined,
+  titleKey = 'cmd.login.title',
+): string[] {
+  const autoCallback = !resolveOAuthRedirectUri().startsWith('http://127.0.0.1:');
+  return [
+    t(titleKey, undefined, loc),
+    '',
+    t('cmd.login.step1', undefined, loc),
+    authUrl,
+    '',
+    ...(autoCallback
+      ? [
+        t('cmd.login.step2_auto', undefined, loc),
+        t('cmd.login.step2_auto_fallback', undefined, loc),
+      ]
+      : [
+        t('cmd.login.step2', undefined, loc),
+        t('cmd.login.step3', undefined, loc),
+      ]),
+  ];
+}
+
+/**
+ * Whose credentials this session's CLI calls use right now — per tool.
+ *
+ * Per tool because the answer genuinely differs between them. `/login` grants
+ * Lark only; bytedcli authenticates against ByteCloud SSO, so the same person
+ * can be authorized for one and refused by the other. Printing the tools on one
+ * line above a single verdict said "you are authorized" about a tool the token
+ * has no bearing on — the reader then discovers otherwise only when a command
+ * fails.
+ */
+function triggerUserAuthStatusLines(
+  botCfg: BotConfig,
+  senderOpenId: string | undefined,
+): string[] {
+  const policy = botCfg.triggerUserAuth;
+  if (!policy?.enabled || !policy.tools.length) return [];
+  const brand = normalizeBrand(botCfg.brand);
+  const larkAuthorized = senderOpenId
+    ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
+    : undefined;
+  const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
+
+  const lines = ['Trigger-user auth: 已开启'];
+  for (const tool of policy.tools) {
+    lines.push(`  ${tool}: ${
+      tool === 'lark-cli'
+        ? larkAuthorized
+          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
+          : botFallback
+            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
+            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+        // ByteCloud is a separate identity provider, so this is a genuinely
+        // different verdict from the Lark line above — the same person can be
+        // authorized for one and not the other. There is no bot identity to
+        // degrade to here, so unauthorized always means the command is refused.
+        : hasBytedcliHome(senderOpenId ?? '')
+          ? '以你自己的身份调用'
+          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
+    }`);
+  }
+  return lines;
+}
+
 async function handleConfigCommand(
   message: LarkMessage,
   rootId: string,
@@ -1243,6 +1351,34 @@ export async function handleCardCommand(
 
   const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
+  const botConfig = getBot(larkAppId).config;
+
+  if (sub === 'pin off') {
+    const r = await setChatStreamingCardPin(larkAppId, chatId, false);
+    await reply(r.ok ? t('cmd.card.pin.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'pin on') {
+    const r = await setChatStreamingCardPin(larkAppId, chatId, true);
+    await reply(r.ok
+      ? (botConfig.pinStreamingCard === true
+        ? t('cmd.card.pin.on_ok', undefined, loc)
+        : t('cmd.card.pin.on_master_off', undefined, loc))
+      : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'pin status') {
+    if (botConfig.pinStreamingCard !== true) {
+      await reply(t('cmd.card.pin.status_master_off', undefined, loc));
+      return;
+    }
+    if (botConfig.noPinStreamingCardChats?.includes(chatId)) {
+      await reply(t('cmd.card.pin.status_chat_off', undefined, loc));
+      return;
+    }
+    await reply(t('cmd.card.pin.status_on', undefined, loc));
+    return;
+  }
 
   if (sub === 'off') {
     const r = await setCardMode(larkAppId, chatId, true);
@@ -2586,6 +2722,11 @@ export async function handleCommand(
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
+            // Trigger-user auth: whose credentials this session's CLI calls are
+            // using RIGHT NOW. Shown only when the policy is on — otherwise the
+            // answer is "the machine's", which is the historical behavior and
+            // not something /status has ever claimed to report.
+            ...triggerUserAuthStatusLines(botCfg, message.senderId),
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
@@ -2611,7 +2752,15 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
-        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId);
+        await handleScheduleCommand(
+          scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId,
+          // Non-human senders (bots, and anything else Lark reports as an app)
+          // must not hand their own identity to a task: a bot-created task that
+          // could query as itself would let any caller of that bot borrow its
+          // access, with the audit trail pointing at the bot. Withholding the
+          // union_id here is what makes such a task fail closed later.
+          message.senderType === 'user' ? message.senderUnionId : undefined,
+        );
         logger.info(`[${logTag}] Schedule command handled`);
         break;
       }
@@ -2621,6 +2770,13 @@ export async function handleCommand(
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
+        break;
+      }
+
+      case '/sessions': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleGroupSessionsCommand(message, rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Current-group sessions command handled`);
         break;
       }
 
@@ -2730,8 +2886,100 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
+        // 授权归属到「发起这条 /login 的人」。token 代表一个人而不是一个 bot：不带
+        // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
+        // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
+        const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
-          await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
+          // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
+          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
+          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
+          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+            lines.push(t(
+              hasBytedcliHome(loginOpenId)
+                ? 'cmd.login.bytedcli_status_yes'
+                : 'cmd.login.bytedcli_status_no',
+              undefined,
+              loc,
+            ));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login --scope a b c` —— 在默认 scope 之外追加申请。
+        //
+        // 飞书被拒时会返回结构化的 missing_scopes（99991679），所以「缺什么补什么」
+        // 不需要猜：把它报的名字原样传进来即可。默认集只覆盖只读，写操作和通讯录
+        // 这类走这条路显式申请——让人在授权页上看见自己批准的到底是什么。
+        //
+        // 名字对着 lark-scopes.json 校验：拼错不会降级，会让整个授权链接 20043 失败，
+        // 那时用户看到的是一个打不开的链接，而不是「这个 scope 不认识」。
+        if (subCmd.startsWith('--scope') || subCmd.startsWith('scope ')) {
+          const raw = subCmd.replace(/^(--scope|scope)\s*/, '').trim();
+          const requested = raw.split(/[\s,]+/).filter(Boolean);
+          if (!requested.length) {
+            await sessionReply(rootId, t('cmd.login.scope_usage', undefined, loc));
+            break;
+          }
+          const unknown = requested.filter(x => !isKnownLarkUserScope(x));
+          if (unknown.length) {
+            await sessionReply(rootId, t('cmd.login.scope_unknown', { scopes: unknown.join(' ') }, loc));
+            break;
+          }
+          const { authUrl: scopedUrl } = generateAuthUrl(
+            botCfg2.larkAppId,
+            botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand),
+            requested,
+            loginOpenId,
+          );
+          await sessionReply(rootId, [
+            ...loginPromptLines(scopedUrl, loc, 'cmd.login.scope_title'),
+            '',
+            t('cmd.login.scope_footer', { scopes: requested.join(' ') }, loc),
+          ].join('\n'));
+          break;
+        }
+
+        // `/login bytedcli` —— ByteCloud SSO 授权。跟飞书 OAuth 是两个身份提供方，
+        // 换不过来，所以必须各授权一次；这条命令只管 ByteCloud 那一半。
+        //
+        // 分两步而不是一步等：设备码流程要人去点链接，阻塞等待会把会话卡住，所以
+        // `--begin` 拿链接先回，人点完再发 `done` 收尾。
+        if (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ')) {
+          if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
+          const done = subCmd.slice('bytedcli'.length).trim();
+          if (done === 'done' || done === '完成') {
+            const challenge = pendingBytedcliChallenge(loginOpenId);
+            if (!challenge) {
+              await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
+              break;
+            }
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
+            await sessionReply(rootId, state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          const started = await beginBytedcliLogin(loginOpenId);
+          if (!started) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+            break;
+          }
+          await sessionReply(rootId, [
+            t('cmd.login.bytedcli_title', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_step1', undefined, loc),
+            started.authUrl,
+            '',
+            t('cmd.login.bytedcli_step2', undefined, loc),
+            '',
+            t('cmd.login.bytedcli_note', undefined, loc),
+          ].join('\n'));
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
@@ -2743,29 +2991,24 @@ export async function handleCommand(
             botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand),
             FEED_GROUP_OAUTH_SCOPES,
+            loginOpenId,
           );
           await sessionReply(rootId, [
-            t('cmd.login.tags_title', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            tagAuthUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
+            ...loginPromptLines(tagAuthUrl, loc, 'cmd.login.tags_title'),
             '',
             t('cmd.login.tags_footer', undefined, loc),
           ].join('\n'));
           break;
         }
-        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
+        const { authUrl } = generateAuthUrl(
+          botCfg2.larkAppId,
+          botCfg2.larkAppSecret,
+          normalizeBrand(botCfg2.brand),
+          [],
+          loginOpenId,
+        );
         await sessionReply(rootId, [
-          t('cmd.login.title', undefined, loc),
-          '',
-          t('cmd.login.step1', undefined, loc),
-          authUrl,
-          '',
-          t('cmd.login.step2', undefined, loc),
-          t('cmd.login.step3', undefined, loc),
+          ...loginPromptLines(authUrl, loc),
           '',
           t('cmd.login.footer', undefined, loc),
           t('cmd.login.status_hint', undefined, loc),
@@ -2809,18 +3052,28 @@ export async function handleCommand(
         // 旧流程：文档 scope 不污染通用 /login；缺少时由本命令发专用 OAuth 链接。
         const subCfg = getBot(larkAppId).config;
         const replyDocLogin = async () => {
-          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
-          await sessionReply(rootId, [
-            t('cmd.subdoc.need_login', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            authUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
-          ].join('\n'));
+          const { authUrl } = generateAuthUrl(
+            subCfg.larkAppId,
+            subCfg.larkAppSecret,
+            normalizeBrand(subCfg.brand),
+            DOC_COMMENT_OAUTH_SCOPES,
+            // 归属到下这条 /subscribe-lark-doc 的人：订阅是他建立的，之后的评论
+            // 读写就按他的权限走。
+            message.senderId,
+          );
+          await sessionReply(
+            rootId,
+            loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
+          );
         };
-        const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
+        // Keyed by the sender: the authorize link this command hands out is
+        // generated for `message.senderId`, so the token it produces lands in
+        // that person's file. Looking it back up without the openId finds
+        // nothing, and the user loops — authorize, retry, be asked to authorize
+        // again — with no error to explain why.
+        const userTok = await resolveUserToken(
+          subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), message.senderId,
+        );
         if (!userTok) { await replyDocLogin(); break; }
 
         try {
@@ -4406,6 +4659,72 @@ export async function handleCommand(
         break;
       }
 
+      // ─── /quote：把本群另一个话题读进当前会话 ──────────────────────────
+      //
+      // 补的是飞书本身的缺口：飞书的「引用」只能引单条消息，没有「引用整个话题」
+      // 的入口，所以用户想让 bot 看隔壁话题聊了什么时，无从指认。/quote 弹一张
+      // 本群话题的选择卡，点一个就把那个话题的聊天记录读进当前会话。
+      //
+      // 能读到哪些话题，完全由「本 bot 在不在这个群」决定——话题里有没有 bot、
+      // 是不是别的 bot 的话题都无所谓，因为读的是群容器，不是会话。群外的话题
+      // 飞书自己会用 230002 拒掉，不需要在这里再造一层权限模型。
+      case '/quote': {
+        const appId = ds?.larkAppId ?? larkAppId;
+        const chatId = ds?.chatId;
+        if (!appId || !chatId) {
+          await sessionReply(rootId, t('cmd.quote.no_chat', undefined, loc));
+          break;
+        }
+        const operatorOpenId = message.senderId;
+        if (!operatorOpenId) {
+          await sessionReply(rootId, t('cmd.relay.no_sender', undefined, loc));
+          break;
+        }
+        // 跟在命令后面的文字是「读完顺手做的事」（一轮模式）。它不进卡片
+        // payload——飞书对 action value 有大小限制，指令长了要么撑爆卡片要么
+        // 被悄悄截断，而被截断的指令比没有指令更危险。这里只把它寄存在 daemon
+        // 里，卡片带一个短 token。
+        const followUpText = message.content.replace(/^\/quote\s*/i, '').trim();
+        const { collectQuoteTopics, stashQuoteFollowUp } = await import('../services/quote-topic-picker.js');
+        // 排除「当前所在话题」——把自己引进自己只会让上下文重复一遍。
+        // 两个 id 都要给：真话题按 thread_id（omt_）分桶，普通群回复链按根消息
+        // id（om_）分桶，而会话只记了 rootMessageId。只给后者的话，真话题永远
+        // 排不掉——它的桶键根本不是这个 id。chat-scope 会话不属于任何话题，两个
+        // 都是空。
+        const currentContainerIds = ds?.session.scope === 'chat'
+          ? []
+          : [ds?.session.rootMessageId, message.threadId];
+        let topics;
+        try {
+          topics = await collectQuoteTopics(appId, chatId, currentContainerIds);
+        } catch (err) {
+          logger.warn(`[${logTag}] /quote topic scan failed: ${err instanceof Error ? err.message : err}`);
+          await sessionReply(rootId, t('card.quote.toast_failed', { error: err instanceof Error ? err.message : String(err) }, loc));
+          break;
+        }
+        const followUpToken = followUpText ? stashQuoteFollowUp(followUpText) : '';
+        const { buildQuotePickerCard } = await import('../im/lark/card-builder.js');
+        const card = buildQuotePickerCard(
+          topics, chatId, rootId, operatorOpenId, loc, undefined, followUpToken, 'public',
+          currentContainerIds.filter(Boolean).join(','),
+        );
+        // 回在用户敲 /quote 的地方，而不是 sessionReply 决定的落点。chat-scope
+        // 群里 sessionReply 会把卡片发到群顶层（或当前 turn 的话题），都可能不是
+        // 用户发命令的位置——/relay 为同一问题自建了 replyAtInvocation（见该分支
+        // 注释里的线上反馈）。这里用引用回复钉在命令消息上：卡片上的按钮回调靠
+        // value 里的 chat_id/root_id 定位，与消息落点无关，所以钉住是安全的。
+        try {
+          const { replyMessage } = await import('../im/lark/client.js');
+          await replyMessage(appId, message.messageId, card, 'interactive', /*replyInThread*/ false);
+        } catch (err) {
+          // 命令消息被撤回等情况下 reply 会失败——回落到 sessionReply，宁可落点
+          // 不理想也要把卡片发出去。
+          logger.warn(`[${logTag}] /quote reply-at-invocation failed (${err instanceof Error ? err.message : err}); falling back to sessionReply`);
+          await sessionReply(rootId, card, 'interactive');
+        }
+        break;
+      }
+
       case '/term': {
         // Existing-session path. New topics route /term via handleTermLinkCommand
         // at the router (daemon.ts) so no phantom worker=null session is created.
@@ -4504,6 +4823,8 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.quote', undefined, loc),
+          t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),

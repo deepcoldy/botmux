@@ -16,6 +16,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -24,6 +25,7 @@ import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
+import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
@@ -38,11 +40,20 @@ import {
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import {
+  normalizeReplyStyleConfig,
+  type ReplyStyleConfig,
+} from './im/lark/reply-card-style.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeNativeSubagentRuntimePolicy,
+  type NativeSubagentRuntimePolicy,
+} from './services/native-subagent-runtime-policy.js';
 import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -243,6 +254,45 @@ export interface MessageListenerConfig {
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
+}
+
+/**
+ * 免@ 斜杠命令：普通群里旁人直接发一条配置内的命令（如 `/solve`，未 @ 任何 bot）
+ * 时，把它当作对本 bot 的寻址，喂进该群已有的 chat-scope 会话续聊。
+ *
+ * 与 `messageListeners` 的分工：listener 是**观察者**（把消息包成
+ * `<observed_message trusted="false">` + 配置的 prompt，每条命中新开一个话题会话）；
+ * 这里是**命令通道**（原文直投既有会话）。两者语义不同，刻意不合并。
+ *
+ * 生效范围沿用 substituteMode 的惯用形状：`chats` 为空 = 所有群，非空 = 白名单；
+ * `excludedChats` deny-wins。判定见 services/command-trigger.ts。
+ */
+export interface CommandTriggerCommand {
+  /** 小写、`/` 开头的裸命令词。botmux 保留命令在运行期被硬拒
+   *  （reservedCommandKind），dashboard 保存时也会拒绝写入。 */
+  cmd: string;
+  /**
+   * 命中后交给 Agent 的 prompt 模板 —— 命令的**行为定义**。
+   *
+   * 不填则把用户原文投给会话（Agent 只看到 `/solve xxx` 这段文本，做什么由模型
+   * 自己判断）。填了则用模板替换原文：`{args}` 会被替换成命令后面那段文本；模板
+   * 里没有 `{args}` 时，参数追加在模板末尾（宁可多一段也不静默丢掉用户输入）。
+   *
+   * 模板对 **@ 与免@ 两条路径同样生效**：一条命令的含义不该取决于发的时候有没有
+   * @ bot，否则「@ 了就变成另一种行为」反而是特例。免@ 放行是寻址问题，模板是
+   * 行为问题，两者正交。
+   */
+  prompt?: string;
+}
+
+export interface CommandTriggerConfig {
+  enabled: boolean;
+  /** 免@ 生效的命令白名单，每条可带自己的 prompt 模板。 */
+  commands: CommandTriggerCommand[];
+  /** 可选的群白名单。留空/缺省 = 所有普通群。 */
+  chats?: string[];
+  /** 可选的群黑名单。deny-wins（同时出现在 chats 里也不生效）。 */
+  excludedChats?: string[];
 }
 
 export interface SummaryRangeConfig {
@@ -1272,8 +1322,10 @@ export interface SessionGroupConfig {
    *   afterwards; works on any tenant — no tenant scope catalog involved.
    * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
    *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
-   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
-   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes —
+   *   a capability Feishu has not opened yet, so they are absent from the
+   *   scope catalog (verified on our tenant) and setup cannot even apply for
+   *   them (hence not the default). See services/feed-group-tagger.ts.
    * 'off' — no tagging.
    */
   tag?: {
@@ -1323,6 +1375,13 @@ export interface BotConfig {
    * 具体 app/租户，不在运行时切换（要换平台 = 重新配/加一个 bot）。
    */
   brand?: Brand;
+  /**
+   * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
+   * handler is still running at this point, Botmux ACKs with a background-work
+   * toast and applies a later card result via message.patch. Valid range is
+   * 500–2500 ms; unset or invalid values keep the 2500 ms default.
+   */
+  cardActionAckTimeoutMs?: number;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
   /**
@@ -1381,6 +1440,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Optional TraeX backend variant. Missing inherits TraeX global config. */
+  modelBackendVariant?: 'standard' | 'max';
   /**
    * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
    * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
@@ -1389,6 +1450,13 @@ export interface BotConfig {
    * adapter; other adapters ignore the field.
    */
   turnTimeoutMs?: number;
+  /**
+   * Per-bot dsh profile name. Only meaningful when `cliId === 'dsh'`:
+   * the profile lives under ~/.dsh/profiles/<name>/ and contains the plugin
+   * composition (cordis.yml + cordis.patch.yml). Defaults to 'botmux'.
+   * Non-dsh CLIs ignore the field.
+   */
+  dshProfile?: string;
   /**
    * Per-bot dsh runtime variant. Only meaningful when `cliId === 'dsh'`:
    *   - `'official'` (default): the headless JSON-RPC runner (dsh-runner.ts).
@@ -1399,6 +1467,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Native TraeCode spawn_agent model/effort override policy. */
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -1472,6 +1542,14 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
+   * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
+   * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
+   * `bytedcli` run as the person who sent the current message, and a sender who
+   * has not authorized gets the bot's own tenant identity (or a failure, per
+   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   */
+  triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -1657,9 +1735,10 @@ export interface BotConfig {
    */
   acceptSlashFromBots?: boolean;
   /**
-   * 消息额度覆盖配置：
-   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
-   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
+   * 消息额度覆盖配置 —— **只约束「授权卡 / 自助申请授权」放进来的访客**：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条。
+   *   • 配置正整数 D    → 卡片默认 D 条。
+   * **Oncall 群恒不限额、不读本字段**（历史上读过，病史见 event-dispatcher.oncallTalk）。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
@@ -1753,6 +1832,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Sparse per-bot reply-writing/card-style overrides. Missing fields inherit
+   * the built-in recipe and theme defaults; malformed hand-edited fields are
+   * dropped independently by {@link normalizeReplyStyleConfig}.
+   *
+   * Workers freeze the normalized sparse object into BOTMUX_REPLY_STYLE when a
+   * session starts so the guide an Agent reads and the card renderer it invokes
+   * cannot drift halfway through a long-lived pane.
+   */
+  replyStyle?: ReplyStyleConfig;
+  /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
    *   • `'footer'`                      → in the ordinary reply-card footer
@@ -1771,6 +1860,14 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * Pin the current public streaming card. Default false; best-effort only.
+   */
+  pinStreamingCard?: boolean;
+  /** chat_id list: chats where streaming-card Pin is disabled even when the
+   *  bot-level {@link pinStreamingCard} master switch is on. Written by
+   *  `/card pin off|on`. */
+  noPinStreamingCardChats?: string[];
   /**
    * Stream the model's thinking process (CoT) into a native Feishu CoT
    * message per turn: a fixed-height scrolling bubble showing thinking
@@ -1907,6 +2004,11 @@ export interface BotConfig {
    */
   messageListeners?: Record<string, MessageListenerConfig>;
   /**
+   * 免@ 斜杠命令。per-bot 一份命令表 + 生效群范围（chats 空 = 所有群，
+   * excludedChats deny-wins）。见 {@link CommandTriggerConfig}。
+   */
+  commandTriggers?: CommandTriggerConfig;
+  /**
    * Worktree picker mode on the repo-select card. When true, the worktree
    * control renders the multi-repo selector (pick N repos + branch) instead of
    * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
@@ -1946,6 +2048,17 @@ export interface BotConfig {
    * is the mode's defining behavior, not affected by this policy).
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /**
+   * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
+   * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
+   * --mention 只接受字面 open_id，传入邮箱等非 open_id 标识会被拒绝，避免模型
+   * 自主决定 @ 谁时“乱发”。开启后：
+   *   1. --mention 的每个值先经 resolveAllowedUsersWithMap 解析成本 app open_id；
+   *   2. 解析结果再与目标群的成员列表（listChatMemberOpenIds）做交集校验，
+   *      只有确实在群里的人才会被 @，不在群里的直接拒绝发送。
+   * 是否开放由配置该 bot 的人决定。
+   */
+  allowArbitraryMention?: boolean;
   /**
    * Regular-group substitute trigger. When enabled, an @mention of one of the
    * configured people is treated as an address to this bot when the sender can
@@ -2000,6 +2113,10 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
+  /** In-memory parser outcome for nativeSubagentRuntime. Invalid persisted input
+   * is intentionally omitted from `config`, so this bounded marker is the only
+   * authoritative way to distinguish it from an absent policy after startup. */
+  nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
   /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
    *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
    *  "appSecret or clientAssertionProvider is required" on an empty secret. An
@@ -2021,16 +2138,25 @@ export interface BotState {
   rawAllowedUserResolution: Map<string, string>;
 }
 
+export type NativeSubagentRuntimeConfigState =
+  | { status: 'absent' }
+  | { status: 'valid'; policy: NativeSubagentRuntimePolicy }
+  | { status: 'invalid' };
+
 const bots = new Map<string, BotState>();
+let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
 
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
+  parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
   loadedConfigProvenance = undefined;
+  registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
   usageDisplayCache = null;
+  replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -2183,6 +2309,22 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
+  const normalizedRuntime = cfg.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
+    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
+      ? { status: 'invalid' }
+      : !normalizedRuntime.ok
+        ? { status: 'invalid' }
+        : normalizedRuntime.value
+          ? { status: 'valid', policy: normalizedRuntime.value }
+          : { status: 'absent' };
+  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
+  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
+    ? nativeSubagentRuntimeState.policy
+    : undefined;
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -2213,6 +2355,7 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   const state: BotState = {
     config: cfg,
+    nativeSubagentRuntimeState,
     client,
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
@@ -2226,6 +2369,29 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** Publish the persisted native-subagent policy and its diagnostic metadata as
+ * one synchronous registry operation. Call only after the corresponding
+ * bots.json mutation commits; no request can observe a half-updated snapshot. */
+export function updateBotNativeSubagentRuntime(
+  larkAppId: string,
+  next: NativeSubagentRuntimeConfigState,
+): void {
+  const bot = getBot(larkAppId);
+  const result = next.status === 'valid'
+    ? normalizeNativeSubagentRuntimePolicy(next.policy)
+    : undefined;
+  if (result && (!result.ok || !result.value)) {
+    throw new Error('native subagent runtime registry update requires a valid policy');
+  }
+  const normalized: NativeSubagentRuntimeConfigState = next.status === 'valid'
+    ? { status: 'valid', policy: result!.value! }
+    : { status: next.status };
+  bot.config.nativeSubagentRuntime = normalized.status === 'valid'
+    ? normalized.policy
+    : undefined;
+  bot.nativeSubagentRuntimeState = normalized;
 }
 
 export function getBot(larkAppId: string): BotState {
@@ -2343,8 +2509,57 @@ export function effectiveBotDisplayName(state: BotState): string {
   return state.config.displayName || state.botName || state.config.larkAppId;
 }
 
+// Exact-bot oncall bindings can be written by another process. The main case is
+// `botmux create-group --working-dir`: the one-shot creator process persists a
+// binding for every invited bot, then immediately sends the kickoff message.
+// Each target bot daemon must observe that write before it resolves the new
+// session's working directory. Keep the registered configs fresh with one
+// stat() per lookup and only re-read bots.json when its mtime changes.
+let registeredOncallConfigMtimeMs: number | null = null;
+let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
+
+function refreshRegisteredOncallChatsFromDisk(): void {
+  if (underReadIsolation()) return;
+  const path = loadedConfigProvenance === 'loaded' ? loadedConfigPath : undefined;
+  if (!path) return;
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (registeredOncallConfigMtimeMs === mtimeMs) return;
+
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!Array.isArray(raw)) return;
+
+    const byAppId = new Map<string, OncallChat[]>();
+    const chats = new Map<string, OncallChat>();
+    for (const entry of raw) {
+      if (!entry || typeof entry.larkAppId !== 'string') continue;
+      const botChats: OncallChat[] = [];
+      if (Array.isArray(entry.oncallChats)) {
+        for (const chat of entry.oncallChats) {
+          if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
+            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            botChats.push(normalized);
+            chats.set(normalized.chatId, normalized);
+          }
+        }
+      }
+      byAppId.set(entry.larkAppId, botChats);
+    }
+
+    for (const [larkAppId, bot] of bots) {
+      const chats = byAppId.get(larkAppId);
+      if (chats) bot.config.oncallChats = chats;
+    }
+    oncallChatCache = { mtimeMs, chats };
+    registeredOncallConfigMtimeMs = mtimeMs;
+  } catch {
+    // Keep the last known-good in-memory snapshot during transient read errors.
+  }
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
@@ -2385,39 +2600,15 @@ export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
 // map only sees this daemon's own bot — sibling bots' bindings live only on
 // disk in the shared bots.json. Re-read that file lazily, keyed by mtime,
 // so the hot path is a single stat() once the cache is warm.
-let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
-
 export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   // Fast path: this daemon's own bot(s). Covers single-daemon setups and any
   // case where the receiving bot itself is bound.
   for (const bot of bots.values()) {
     const entry = bot.config.oncallChats?.find(c => c.chatId === chatId);
     if (entry) return entry;
   }
-  // Slow path: scan the shared bots.json for sibling bots' bindings.
-  const path = loadedConfigPath;
-  if (!path) return undefined;
-  try {
-    const stat = statSync(path);
-    if (!oncallChatCache || oncallChatCache.mtimeMs !== stat.mtimeMs) {
-      const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      const chats = new Map<string, OncallChat>();
-      if (Array.isArray(raw)) {
-        for (const entry of raw) {
-          if (!Array.isArray(entry?.oncallChats)) continue;
-          for (const c of entry.oncallChats) {
-            if (c && typeof c.chatId === 'string' && typeof c.workingDir === 'string') {
-              chats.set(c.chatId, { chatId: c.chatId, workingDir: c.workingDir });
-            }
-          }
-        }
-      }
-      oncallChatCache = { mtimeMs: stat.mtimeMs, chats };
-    }
-    return oncallChatCache.chats.get(chatId);
-  } catch {
-    return undefined;
-  }
+  return oncallChatCache?.chats.get(chatId);
 }
 
 export function isChatOncallBoundForAnyBot(chatId: string): boolean {
@@ -2428,6 +2619,7 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -2528,6 +2720,52 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
     return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
   } catch {
     return DEFAULT_USAGE_DISPLAY;
+  }
+}
+
+/**
+ * Resolve the normalized sparse reply-style snapshot for a bot.
+ *
+ * Unlike hot display-only settings, a running CLI pane must keep the same
+ * replyStyle it learned through the botmux-send guide when it later invokes
+ * `botmux send`. Therefore the spawn-time env snapshot intentionally wins for
+ * the current app; daemon callers without that snapshot use the loaded registry,
+ * and one-shot host CLIs fall back to an mtime-cached bots.json read.
+ */
+export function resolveReplyStyleConfig(larkAppId: string): ReplyStyleConfig | undefined {
+  if (process.env.BOTMUX_SESSION_ID
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_REPLY_STYLE' in process.env) {
+    try {
+      const parsed = JSON.parse(process.env.BOTMUX_REPLY_STYLE || '{}');
+      return normalizeReplyStyleConfig(parsed).config;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.replyStyle;
+
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path);
+    if (!replyStyleCache || replyStyleCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, ReplyStyleConfig | undefined>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeReplyStyleConfig(entry.replyStyle).config);
+          }
+        }
+      }
+      replyStyleCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return replyStyleCache.map.get(larkAppId);
+  } catch {
+    return undefined;
   }
 }
 
@@ -2875,6 +3113,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    // Malformed input throws instead of degrading to off: an operator who typo'd
+    // a tool name would otherwise believe a credential boundary is enforced
+    // when it is not — worse than not having the feature.
+    let triggerUserAuth;
+    try {
+      triggerUserAuth = parseTriggerUserAuthConfig(entry.triggerUserAuth) ?? undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -3107,6 +3354,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
+    const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
+    for (const warning of normalizedReplyStyle.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3118,7 +3370,16 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
+      entry.nativeSubagentRuntime,
+    );
+    if (!normalizedNativeSubagentRuntime.ok) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] nativeSubagentRuntime ignored: ${normalizedNativeSubagentRuntime.error}`,
+      );
+    }
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
@@ -3158,7 +3419,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // 非法/缺字段返回 null。
     const budget = parseBudgetConfig(entry.budget);
 
-    configs.push({
+    const config: BotConfig = {
       larkAppId: entry.larkAppId,
       // apiOnly bots may omit the secret (never used — no Feishu connection);
       // fall back to '' so downstream env plumbing stays a string. Feishu image
@@ -3175,6 +3436,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entryCliId,
@@ -3191,6 +3453,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      modelBackendVariant: entryCliId === 'traex'
+        && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
+        ? entry.modelBackendVariant
+        : undefined,
       // Positive integer within the arm-able bound only; anything else → undefined
       // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
@@ -3204,6 +3470,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      nativeSubagentRuntime: entryCliId === 'traex' && normalizedNativeSubagentRuntime.ok
+        ? normalizedNativeSubagentRuntime.value
+        : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexBrowser,
@@ -3211,6 +3480,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -3283,6 +3553,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      replyStyle: normalizedReplyStyle.config,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.
@@ -3290,11 +3561,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
+      noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
+        ? (() => {
+          const filtered = entry.noPinStreamingCardChats
+            .filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0)
+            .map((x: string) => x.trim());
+          const normalized = Array.from(new Set<string>(filtered));
+          return normalized.length > 0 ? normalized : undefined;
+        })()
+        : undefined,
       noCotChats: Array.isArray(entry.noCotChats)
         ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
@@ -3333,7 +3614,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
+      // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
+      allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
       messageListeners,
+      commandTriggers,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
       // 连续会话；群内原生话题各自独立会话), so only the NON-default modes
@@ -3370,7 +3655,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       voice,
       pricing,
       budget: budget ?? undefined,
-    });
+    };
+    const nativeSubagentRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
+      entryCliId !== 'traex' || (normalizedNativeSubagentRuntime.ok && !normalizedNativeSubagentRuntime.value)
+        ? 'absent'
+        : normalizedNativeSubagentRuntime.ok
+          ? 'valid'
+          : 'invalid';
+    parsedNativeSubagentRuntimeStatus.set(config, nativeSubagentRuntimeStatus);
+    configs.push(config);
   }
 
   return configs;

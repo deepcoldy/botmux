@@ -186,6 +186,45 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     }
   });
 
+  it('clearAllTimers is a NO-OP when fake timers were never installed', () => {
+    // REGRESSION for the single largest cause of the bun-test leg being red.
+    // Bun's `vi.clearAllTimers` THROWS `Fake timers are not active. Call
+    // useFakeTimers() first.` when no fake timers are installed; vitest treats
+    // the same call as a no-op. An unconditional `vi.clearAllTimers()` in an
+    // `afterEach` is an extremely common teardown, so under bun the test BODY
+    // passed and only the teardown threw — MEASURED on
+    // test/recall-frozen-cards.test.ts: 10 pass / 50 fail before, 60 pass / 0
+    // fail after, and the whole-leg failing-file count went 39 → 38 with nothing
+    // newly failing (same machine, same command, only the shim swapped).
+    //
+    // This case runs under BOTH runners, so it pins the shim to vitest's real
+    // behaviour rather than to what we believe it to be.
+    expect(() => vi.clearAllTimers()).not.toThrow();
+  });
+
+  it('clearAllTimers is also a no-op AFTER useRealTimers, and still works while faking', () => {
+    // The other two positions around the flag we track. Installing then
+    // uninstalling must return to the no-op state (otherwise a file that fakes
+    // timers in one test and clears in a later teardown starts throwing again),
+    // and while fake timers ARE installed the call must still reach through and
+    // actually clear — a shim that always swallowed would silently leak timers
+    // into the next test, which is worse than the throw it replaced.
+    vi.useFakeTimers();
+    vi.useRealTimers();
+    expect(() => vi.clearAllTimers()).not.toThrow();
+
+    vi.useFakeTimers();
+    try {
+      const seen: string[] = [];
+      setTimeout(() => seen.push('should-not-fire'), 10);
+      vi.clearAllTimers();
+      vi.advanceTimersByTime(50);
+      expect(seen).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // NOTE: the hoisting helper is intentionally NOT asserted here, for two
   // reasons. (1) vitest's transform physically lifts that call to the top of the
   // module, above the imports — so merely writing it inside a test body makes the

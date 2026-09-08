@@ -18,9 +18,15 @@ const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
 const updateSessionMock = vi.fn();
+const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: string[]) => ({
+  resolved: entries,
+  map: new Map(entries.map(entry => [entry, entry])),
+  entryStatus: new Map(entries.map(entry => [entry, 'resolved' as const])),
+}));
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
+  resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
   removeReaction: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
@@ -238,6 +244,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
+      resolved: entries,
+      map: new Map(entries.map(entry => [entry, entry])),
+      entryStatus: new Map(entries.map(entry => [entry, 'resolved' as const])),
+    }));
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
       resolvedAllowedUsers: [],
@@ -423,6 +434,73 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('renders everyone feedback for an ownerless final output', async () => {
+    const sessionReply = vi.fn(async () => 'om_everyone_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    expect((await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_everyone_feedback'))
+      .toMatchObject({ policy: { audience: 'everyone', reviewers: [] } });
+  });
+
+  it('resolves an email reviewer before rendering and freezes only the open_id', async () => {
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: ['ou_email_reviewer'],
+      map: new Map([['reviewer@example.com', 'ou_email_reviewer']]),
+      entryStatus: new Map([['reviewer@example.com', 'resolved' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_email_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['reviewer@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(resolveAllowedUsersWithMapMock).toHaveBeenCalledWith('app_test', ['reviewer@example.com']);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_email_feedback');
+    expect(delivery?.policy?.reviewers).toEqual(['ou_email_reviewer']);
+    expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
+  });
+
+  it('does not render a reviewers card when every email is unresolved', async () => {
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      entryStatus: new Map([['ghost@example.com', 'definitive' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_unresolved_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['ghost@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
   });
 

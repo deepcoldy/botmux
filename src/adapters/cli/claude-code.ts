@@ -23,6 +23,7 @@ import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -362,6 +363,12 @@ export function syncClaudeResumeTargetToCwd(
  *  the spawn-time flag. */
 const CLAUDE_PLUGIN_DIR = join(homedir(), '.botmux', 'claude-plugin');
 
+/** Effort levels Claude Code's `--effort` flag accepts (claude 2.1.259), taken
+ *  from the same catalog the config gate and the dashboard selector read, so the
+ *  accepted set cannot drift between them. The shared `reasoningEffort` type is a
+ *  superset — `ultra` is a codex/traex level Claude rejects. */
+const CLAUDE_EFFORT_LEVELS = new Set<string>(CLAUDE_REASONING_EFFORTS);
+
 /** Substrings that indicate Claude Code received our submit. We accept either:
  *  - `"role":"user","content":"` — direct submission while idle (the canonical
  *    user-message line; tool-result lines have array content `"content":[{...`
@@ -577,6 +584,14 @@ function findJsonlAcrossProjectsRoot(
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
+/** Busy footer for idle detection: the working-state status bar carries an
+ *  extra 「· esc to interrupt ·」 segment the idle composer lacks. Anchored to
+ *  the footer's STRUCTURE — a leading mode glyph (⏵⏵/⏸, mode name NOT
+ *  enumerated: manual/bypass strings are runtime-assembled, absent from the
+ *  binary) or a retry segment, joined by mid-dots — because the bare phrase
+ *  also appears in transcript prose on the same screen (busyProbeRegion scans
+ *  the bottom third), which would pin an idle session busy forever. */
+const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc to interrupt\b/m;
 /** Escape hatch: force a specific chat:submit key regardless of
  *  keybindings.json. Accepts the same spellings as the config (e.g.
  *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
@@ -730,6 +745,11 @@ export interface ClaudeFamilyVariant {
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
   readonly reliableTurnTerminal?: boolean;
+  /** True when this variant's CLI accepts `--effort <level>` (Claude Code
+   *  2.1.x). Forks and gateway variants whose flag surface is not Claude's
+   *  own leave it undefined, so `reasoningEffort` is silently ignored for
+   *  them rather than producing an unknown-flag launch. */
+  readonly supportsEffortFlag?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
@@ -740,6 +760,8 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // refuses durable submits unless it has first installed an attributable
     // bridge mark, and failure/exit paths share the same terminal deduper.
     reliableTurnTerminal: true,
+    // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
+    supportsEffortFlag: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -830,7 +852,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, noTransport }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -852,6 +874,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
       if (model && model.trim()) {
         args.push('--model', model.trim());
+      }
+      // Per-bot reasoning effort. Claude's flag is `--effort` (not grok's
+      // `--reasoning-effort`), and its accepted set is low|medium|high|xhigh|max
+      // — `ultra` is NOT one of them: claude 2.1.259 answers an unknown value
+      // with `Warning: Unknown --effort value '<v>' — ignoring it and using the
+      // default effort.` and runs on regardless, so passing the shared type's
+      // `ultra` through would be a silent no-op plus a warning on every spawn.
+      // (Claude's own `ultracode` level is deliberately not mapped here: it is
+      // session-scoped — `/effort ultracode` inside the TUI — and additionally
+      // gated, so a declarative config value would silently resolve to `high`.)
+      if (variant.supportsEffortFlag && reasoningEffort && CLAUDE_EFFORT_LEVELS.has(reasoningEffort)) {
+        args.push('--effort', reasoningEffort);
       }
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
@@ -890,7 +924,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth }));
       return args;
     },
 
@@ -1160,6 +1194,24 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
+    // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
+    // idle 判定只剩 2s 静默这一条负证据——长思考/网关延迟造成的一次 ≥2s 停顿
+    // 就会把工作中的会话错翻成 idle，且没有拉回手段。工作时 footer 比空闲态
+    // （⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents）多出
+    // 「· esc to interrupt ·」一段：busyPattern 让 deferPromptReadyWhileBusy
+    // 在翻绿前先查一次屏幕（否决错翻），idleToBusyPattern 让已错翻的绿卡在
+    // 下一帧拉回工作中。
+    //
+    // ⚠️ 必须锚 footer 的结构而不是裸短语：transcript 与 footer 同屏，busyProbeRegion
+    // 扫的是末 max(12, ⌈行数/3⌉) 行——正文只要出现裸短语（讨论中断快捷键、贴 diff、
+    // grep 源码）就会命中，把已空闲的会话钉死在「工作中」（probe 重试无上限）。
+    // 行首模式字形（⏵⏵/⏸，不枚举 mode 名——binary 里 manual/bypass 是运行时拼的）
+    // 或重试段「next try」+ `·` 分隔联合锚定：真 footer 7/7 命中（5 种模式 + 重试
+    // footer + ctrl+t 变体），散文 8/8 不误报（reviewer 与本机双向实测）。
+    // 窄视口（<80 列）footer 截断时拿不到中断段——安全降级回 2s 静默裸奔，
+    // 不产生误报。本机 242 个 tmux pane 扫末行实测 0 误报。
+    busyPattern: CLAUDE_BUSY_FOOTER_RE,
+    idleToBusyPattern: CLAUDE_BUSY_FOOTER_RE,
     // Claude 家族在 spawn 时注入 SessionStart hook，回调
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
@@ -1175,6 +1227,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       : undefined,
     systemHints: [],
     altScreen: false,
+    // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux
+    // 两边都无 scrollback；只读 Web 终端要把滚轮转成 SGR wheel 发回 CLI 才能翻页。
+    // 只读滚动走 worker 侧严格校验 + 限流的 `type:'scroll'` 通路（见 web-terminal-scroll.ts），
+    // 与 write 权限完全隔离，安全上与 opencode 一致。
+    readOnlyRemoteScroll: true,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.

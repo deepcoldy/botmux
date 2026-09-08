@@ -47,6 +47,7 @@
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
 | `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
 | `reasoningEffort` | 新会话默认思考强度。仅对 `codex` / `codex-app` / `traex` / `grok` 这类有结构化思考强度控制的 CLI 生效；按 CLI 与模型能力校验，不支持或未声明支持的组合会被拒绝或忽略 |
+| `nativeSubagentRuntime` | 仅 `traex` 生效的原生子代理运行策略。`model` 与 `reasoningEffort` 可独立省略以透传子代理请求，或设为 `{ "mode": "custom", "value": "..." }` 以指定固定值；两个维度都透传时应删除整个字段。`inherit` 不是受支持的模式 |
 | `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
 | `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
@@ -57,6 +58,8 @@
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
+
+`nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
 
 ### Codex 兼容发行版
 
@@ -143,8 +146,11 @@
 ```
 
 - 需要先在同一 OS 用户的 Chrome / Edge 中安装并启用 Codex 浏览器扩展；Botmux 默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存中选择最新完整版本。只有维护自定义插件目录时才填写绝对路径 `pluginRoot`。
-- 开启后仅给新建的 Codex App thread 注册一个 `botmux_browser` 动态工具。旧 thread 不会被原地改写，请新开一个飞书话题 / 会话验证。
-- 工具只暴露标签页、可访问性树交互、导航和截图等高层操作，不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史、剪贴板或文件传输。
+- 需要安装 Codex 桌面端附带的浏览器运行时。桥接优先使用 `mcp_servers.node_repl` 配置；桌面端移除该 MCP 注册项时，会从已安装的桌面端定位运行时，自定义安装位置可设置 `BOTMUX_CODEX_NODE_REPL_PATH`。身份、站点安全状态和功能配置均走官方认证请求通道，不自行读取或保存登录令牌；运行时缺失或登录失败时会中止操作，不降级为匿名请求。
+- 开启后会在新建和恢复 Codex App thread 时注册 `botmux_browser` 动态工具。已运行的 runner 需重启或重新恢复会话，才能加载更新后的工具定义。
+- 工具先按标签页探测能力：优先使用可访问性树；AX 不可用时自动回退到可见 DOM / Playwright DOM，并提供受类型约束的 Playwright locator、DOM 和坐标交互。不会因为某个后端缺少 `tab.ax` 而中断整个 Chrome 连接。
+- Browser Use 发出的站点访问、上传、下载等安全确认会阻塞当前操作并投射为飞书授权卡；只有通过 Botmux `canTalk` 校验的用户可以选择“本会话允许 / 始终允许 / 拒绝”，回答和回答人由 Botmux ask 记录。普通“允许”也只授予当前 runner 会话，后续同一站点、操作类型和风险上下文自动复用；不同站点、操作类型、风险上下文或新会话仍会重新确认。拒绝、超时、daemon 不可达均 fail closed。
+- 工具不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史或剪贴板。上传/下载只通过 Browser Use 的受控文件选择器和安全确认执行；需要密码等秘密输入的 secure browser-auth 流程不会降级到普通飞书卡片，必须由支持安全凭证 broker 的客户端处理。
 - 每个 Botmux runner 独立持有浏览器会话状态；默认关闭，未配置的 bot 启动参数和行为完全不变。
 - 当前不支持与 `existingAppServer`、`sandbox` 或 `readIsolation` 组合，配置冲突会在启动时直接报错，避免以不完整隔离边界运行。
 
@@ -167,7 +173,7 @@
 | `defaultOncall` | 该 bot 的默认：新群聊首条新话题自动绑定 oncall。`{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`；`since` 之前已存在的老群不受影响 |
 | `globalGrants` | 全局可对话名单（`ou_xxx`，人或 bot）。任意群可对话，仅 `canTalk` |
 | `chatGrants` | 按群的 per-user 授权 `{ "oc_xxx": ["ou_yyy"] }`，仅放行 `canTalk`。一般由 `/grant` 卡片写入，也可手配 |
-| `messageQuota` | 消息额度覆盖 `{ "defaultLimit": N }`：配了正整数后，新授权卡与 Oncall 都使用 N 条额度；未配置时，新授权卡默认每人 3 条，Oncall 不设额度。显式 `/grant @用户 N` 始终使用 N。仅约束 talk 授权，不影响 `canOperate` |
+| `messageQuota` | 消息额度覆盖 `{ "defaultLimit": N }`：**只约束授权卡/自助申请授权放进来的访客**——配了正整数后新授权卡使用 N 条额度；未配置时新授权卡默认每人 3 条。**Oncall 群恒不设额度、不读此值**。显式 `/grant @用户 N` 始终使用 N。仅约束 talk 授权，不影响 `canOperate` |
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 
@@ -189,6 +195,8 @@
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
+| `pinStreamingCard` | `true` 时为该 bot **置顶当前公开的实时状态卡片**；默认关闭，只有显式 `true` 才开启。只认当前公开 live-status 的真实 `streamCardId`，repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡、以及其它交互卡都不参与。开关支持热更新：通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 成功写盘且有效值发生变化后，会对这个 bot 的**现有活跃会话**做 best-effort 热重算；daemon 重启后还会在 `restoreActiveSessions` 完成后，为当前 bot 额外安排一次 fire-and-forget 恢复。配置响应和 daemon readiness **都不会等待**飞书 Pin/Unpin 完成。失败不会中断发卡、转移、恢复、关闭、启动或配置本身；异常期间可能暂时出现 0 个或多个 Pin。该功能**不维护持久重试日志，也不会做宽泛的远端清理**：重启恢复只信任飞书返回里 `app_id === 当前 larkAppId` 的操作来源，然后再与本进程入队瞬间已知的本地候选 ID 做严格交集。人工、其它应用、混合或来源字段不完整的同 ID 当前 Pin 既不会被认领，也不会被重复 Pin；只有列表中不存在当前卡时才创建，且 create 返回必须精确匹配消息 ID 与同应用来源。显式关闭只清理进程内已拥有的 ID 与远端刚证明属于同应用的本地候选；普通 disable、关闭会话和转移只清理进程内已拥有的 ID |
+| `noPinStreamingCardChats` | 一个 `chatId` 数组，表示即使 bot 已开启 `pinStreamingCard`，这些群里也**不要自动置顶**流式卡片。它就是 `/card pin off|on` 背后的 negative set。实时流式卡片本身仍照常发送，只是当前群不再触发 Pin 副作用；为空或缺省表示没有按群关闭 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
 | `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |
 | `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |

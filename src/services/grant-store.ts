@@ -277,16 +277,15 @@ export async function removeExpiredGrant(
  * 正常递增 → allow:true，exhausted=（used 恰好达 limit），调用方放行本条、若 exhausted 则处理后 revoke。
  * 基础设施失败（getBot / RMW）会 throw —— 调用方 catch 后 fail-closed（拒发以保硬上限）。
  *
- * defaultLimit>0 且 quotaKey 对应记录不存在时：懒初始化 {limit:defaultLimit, used:1}
- * （oncall 群默认额度场景，避免每条消息都要显式 /grant 才落记录）。
+ * defaultLimit>0 且 quotaKey 对应记录不存在时：懒初始化 {limit:defaultLimit, used:1}。
+ * **当前生产路径下没有调用方会传入 defaultLimit**：它原是 oncall 腿的兜底，而 oncall 现在恒不挂
+ * quotaKey（见 event-dispatcher.oncallTalk）；访客额度记录是发卡那一刻按 `defaultLimit ?? 3` 写好的。
+ * 参数保留是为了不改签名（留作独立 cleanup），懒初始化分支因此也不再有生产调用方。
  *
- * `expiredGrant`（可选）：oncall ∩ chatGrant 交集用。传入时**锁内**以「本 key 的**当前** expiry」
- *   为唯一权威判定（不看调用方 evaluate 时的观察值——那可能已陈旧）：
- *   • 当前 expiry 存在且 <= now → grant 确已过期 → 同一把锁内原子清「成员+quota+expiry」，本条
- *     按「grant 已消失」处理（回落 defaultLimit 懒初始化 / 无 default 则 tracked:false）。
- *   • 当前无 expiry / expiry 在未来（永久/已续期）→ 仍是成员则 grant **live**：不兜 default，按现有
- *     记录消费（无记录=显式不限→tracked:false）；已非成员（被 revoke/整条清）→ 普通 oncall→回落 default。
- * 这样「过期清理 + 本次 oncall 额度决策」收口在同一原子 RMW，杜绝跨 await 用陈旧 ev 决策。
+ * `expiredGrant`（可选）：**同样已无生产产出方**。原是「oncall ∩ chatGrant 交集」用——传入时锁内以
+ *   「本 key 的当前 expiry」为唯一权威判定，过期则原子清「成员+quota+expiry」并回落 default。
+ *   oncall 不再挂 quotaKey 后这个描述符不再被产生（纯 chatGrant / globalGrant 的过期一直走
+ *   grantNotExpired 拒发 + 条件式清理，与本参数无关）。逻辑保留、行为未改。
  */
 export async function consumeQuota(
   larkAppId: string,

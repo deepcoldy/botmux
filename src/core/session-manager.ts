@@ -16,7 +16,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -71,6 +71,7 @@ import {
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -625,7 +626,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -647,7 +648,10 @@ export async function downloadResources(larkAppId: string, messageId: string, re
     const savePath = join(dir, res.name);
     try {
       const resMessageId = res.messageId ?? messageId;
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
+      // Whose token backs the user-token fallback: the person who sent the
+      // attachment. They can see what they just posted, and the download is
+      // attributed to them rather than to whoever happens to be logged in.
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.
@@ -698,8 +702,12 @@ export async function getAvailableBots(
 /** XML-escape a string for use as element text content or attribute value.
  *  Covers the five XML-mandated entities; sufficient for our use case
  *  (paths, names, open_ids, bot identifiers) since we never embed raw user
- *  input in attribute values. */
-function xmlEscape(s: string): string {
+ *  input in attribute values.
+ *
+ *  Exported for `/quote`, which embeds genuinely untrusted content (message
+ *  bodies and display names from a Feishu 话题) inside a `<quoted_topic>`
+ *  fence. Reuse this rather than adding a third private copy. */
+export function xmlEscape(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -1087,7 +1095,38 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
-export function buildNewTopicPrompt(
+/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
+ *  Absent bot / unreadable config → false: an uncertain answer must not add a
+ *  block claiming a boundary that is not configured. */
+function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
+/** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
+ *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
+ *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
+ *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
+type NewTopicOpts = {
+  larkAppId?: string;
+  chatId?: string;
+  whiteboardId?: string;
+  substituteTrigger?: SubstituteTrigger;
+  chatContext?: ChatContext;
+  turnId?: string;
+  sessionBackendType?: BackendType;
+};
+
+type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
+  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
+  | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
+  | 'mentions' | 'availableBots';
+
+/** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
+ *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
+ *  sidecar/claim 机制。inline 模式（hookMode=false）输出与历史完全一致。 */
+function buildNewTopicBlocks(
   userMessage: string,
   sessionId: string,
   cliId: CliId,
@@ -1099,11 +1138,15 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
-): string {
+  opts?: NewTopicOpts,
+  hookMode = false,
+): Array<{ key: NewTopicBlockKey; text: string }> {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
-    return buildServiceUserPrompt([userMessage, ...(followUps ?? [])].join('\n\n'));
+    // service-user 适配器（ebsd）自带完整外壳，不参与分块：包成单块返回，
+    // join 后与历史字符串逐字一致；hook 模式下该块不在 ENVELOPE_KEYS 里，
+    // 全部留在 PTY 文本（且 service-user 适配器本就不满足 hook 模式前置条件）。
+    return [{ key: 'userMessage', text: buildServiceUserPrompt([userMessage, ...(followUps ?? [])].join('\n\n')) }];
   }
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
   // (Claude Code builds its own via --append-system-prompt). Source hints
@@ -1180,8 +1223,11 @@ export function buildNewTopicPrompt(
   const mergedMessage = followUps && followUps.length > 0
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
-  const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
-  const parts: string[] = [];
+  // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
+  // 理由同 follow-up：会话发现主防线是 collectBotmuxSessionIdentities 按文件名排除，
+  // 标题提取有 ?? rawContent 兜底。inline 模式保持原样。
+  const userBlock = hookMode ? mergedMessage : `<user_message>\n${mergedMessage}\n</user_message>`;
+  const blocks: Array<{ key: NewTopicBlockKey; text: string }> = [];
 
   // Put stable, instruction-like context before the user's first turn. This
   // improves salience without moving per-turn attribution (sender/mentions)
@@ -1190,40 +1236,79 @@ export function buildNewTopicPrompt(
   // message — same position as in follow-ups — not after it, where it could be
   // misread as part of the user's text.
   if (!adapter.injectsSessionContext) {
-    if (routingBlock) parts.push(routingBlock);
-    if (skillBlock) parts.push(skillBlock);
-    if (identityBlock) parts.push(identityBlock);
-    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+    if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
+    if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
+    if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+    // Trigger-user auth: the same credential boundary the claude-family adapters
+    // get via --append-system-prompt. Without it the inline-prompt CLIs
+    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // this release's only protection, a missing block there is a silent hole.
+    //
+    // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:
+    // hook mode requires `supportsInvisiblePromptHook`, which only claude-code
+    // has, and claude-code has `injectsSessionContext` — so this whole branch is
+    // skipped for it and a `credentials` block is never produced in hook mode
+    // (verified: claude-code's opening prompt carries no <botmux_credentials>;
+    // it gets the block via --append-system-prompt instead).
+    //
+    // Kept out of the envelope anyway, because the day another CLI becomes
+    // hook-capable this is the difference between the agent seeing the boundary
+    // and not. An envelope the CLI cannot read drops the block silently —
+    // nothing errors when a constraint is merely absent.
+    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
+      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
+    }
+    blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
-  if (roleBlock) parts.push(roleBlock);
-  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
-  if (whiteboardBlock) parts.push(whiteboardBlock);
-  if (chatContextPolicyBlock) parts.push(chatContextPolicyBlock);
-  if (chatContextBlock) parts.push(chatContextBlock);
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
+  if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
+  if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
 
-  parts.push(userBlock);
+  blocks.push({ key: 'userMessage', text: userBlock });
 
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
-  if (senderBlock) parts.push(senderBlock);
+  if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
-  if (substituteBlock) parts.push(substituteBlock);
+  if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
   const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
-  if (senderNote) parts.push(senderNote);
+  if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = formatAttachmentsHint(attachments, locale);
-  if (attachHint) parts.push(attachHint);
+  if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
-  if (mentionBlock) parts.push(mentionBlock);
-  if (botBlock) parts.push(botBlock);
+  if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
+  if (botBlock) blocks.push({ key: 'availableBots', text: botBlock });
   // The per-session skill catalog block is appended later in the worker-pool
   // fork path (prepareSessionSkillPrompt), which also writes the manifest and
   // resolves delivery — keeping a single injection site avoids double-rendering.
 
-  return parts.join('\n\n');
+  return blocks;
+}
+
+export function buildNewTopicPrompt(
+  userMessage: string,
+  sessionId: string,
+  cliId: CliId,
+  cliPathOverride?: string,
+  attachments?: LarkAttachment[],
+  mentions?: LarkMention[],
+  availableBots?: Array<{ name: string; displayName: string; openId: string }>,
+  followUps?: string[],
+  botIdentity?: { name?: string; openId?: string },
+  locale?: Locale,
+  sender?: ResolvedSender,
+  opts?: NewTopicOpts,
+): string {
+  return buildNewTopicBlocks(
+    userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
+    availableBots, followUps, botIdentity, locale, sender, opts,
+  ).map((b) => b.text).join('\n\n');
 }
 
 /** Build the legacy opening prompt plus a Codex App structured sidecar. The
@@ -1254,15 +1339,55 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    /** Host-resolved identity for this turn. Only the caller knows where the
+     *  turn came from, so it is passed in rather than derived here. */
+    trustedCaller?: CliTurnPayload['trustedCaller'];
+    /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
+     *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
+    turnId?: string;
+    /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
+    sessionBackendType?: BackendType;
   },
 ): CliTurnPayload {
+  // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions
+  // 写入 per-turn sidecar，PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。
+  // 与 follow-up 同一套 sidecar/claim 机制；turnId 是 claim 的权威键，缺失或条件
+  // 不满足时回退 inline（legacy 路径），行为与历史完全一致。
+  const hookTurnId = opts?.turnId;
+  if (resolveEnvelopeInjectionMode({
+    cliId,
+    cliPathOverride,
+    sessionBackendType: opts?.sessionBackendType,
+    larkAppId: opts?.larkAppId,
+  }) === 'hook' && hookTurnId) {
+    const blocks = buildNewTopicBlocks(
+      userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
+      availableBots, followUps, botIdentity, locale, sender, opts, true,
+    );
+    const ENVELOPE_KEYS = new Set<NewTopicBlockKey>(['whiteboard', 'sender', 'mentions']);
+    const ptyText = blocks
+      .filter((b) => !ENVELOPE_KEYS.has(b.key))
+      .map((b) => b.text)
+      .join('\n\n');
+    const hookEnvelope = blocks
+      .filter((b) => ENVELOPE_KEYS.has(b.key))
+      .map((b) => b.text)
+      .join('\n\n');
+    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
+      return { content: ptyText };
+    }
+    // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
+  }
   const content = buildNewTopicPrompt(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
   );
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
-  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
+    return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
@@ -1279,6 +1404,7 @@ export function buildNewTopicCliInput(
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
   return {
     content,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
@@ -1334,6 +1460,8 @@ type FollowUpOpts = {
    *  hook 模式下 sidecar 按 (turnId, fingerprint) 绑定，claim 时按权威 turnId 精确取。
    *  缺失时无法做 turn 绑定，回退 inline（避免 reminder 被剥离却无 sidecar 可领）。 */
   turnId?: string;
+  /** Host-resolved identity for this turn (see buildNewTopicCliInput). */
+  trustedCaller?: CliTurnPayload['trustedCaller'];
 };
 
 function buildFollowUpBlocks(
@@ -1388,7 +1516,12 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
+  // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
+  // 外壳的唯一作用是给 transcript 消费方（会话发现 / 标题提取）做结构标记，
+  // 但会话发现的主防线是 collectBotmuxSessionIdentities 的按文件名排除（不依赖
+  // transcript 内容），标题提取有 ?? rawContent 兜底，所以 hook 模式下可以去掉。
+  // inline 模式保持原样（其它 CLI 与旧会话发现正则仍依赖外壳）。
+  blocks.push({ key: 'userMessage', text: hookMode ? content : `<user_message>\n${content}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender, opts?.larkAppId);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
@@ -1447,9 +1580,19 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
  *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
  * 任一不满足 → inline（现状字节不变）。
+ *
+ * opening（buildNewTopicCliInput）复用同一判定：cfg 字段是 FollowUpOpts /
+ * NewTopicOpts 的结构化子集，两边都满足。
  */
-function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
-  if (!opts?.cliId) return 'inline';
+type EnvelopeInjectionCfg = {
+  cliId?: CliId;
+  cliPathOverride?: string;
+  sessionBackendType?: BackendType;
+  larkAppId?: string;
+};
+
+function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
+  if (!cfg?.cliId) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
@@ -1458,19 +1601,19 @@ function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
   // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
   // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
   // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
-  if (!opts.sessionBackendType || !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
+  if (!cfg.sessionBackendType || !LOCAL_BACKENDS.has(cfg.sessionBackendType)) return 'inline';
   let adapter: CliAdapter;
   try {
-    adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
+    adapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
   } catch { return 'inline'; }
   if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
-  if (!opts.larkAppId) return 'inline';
+  if (!cfg.larkAppId) return 'inline';
   let botConfig: BotConfig;
   try {
-    botConfig = getBot(opts.larkAppId).config;
+    botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId, opts.sessionBackendType);
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
@@ -1522,25 +1665,33 @@ export function buildFollowUpCliInput(
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
   // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被
   // 剥离却无 sidecar 可领）。
+  //
+  // #794 后续：sender/mentions 也搬进 hook envelope，PTY 文本只剩用户正文（+ role/
+  // summaryMemory 等稳定上下文）。模型经 system-reminder 仍看得到发送者与提及，
+  // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
+  // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
+    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['reminder', 'whiteboard', 'sender', 'mentions']);
     const ptyText = blocks
-      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
     const hookEnvelope = blocks
-      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .filter((b) => ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText };
+      return { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
     }
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
-  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
+  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
+    return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
@@ -1554,6 +1705,7 @@ export function buildFollowUpCliInput(
   const mentionBlock = renderMentionBlock(opts.mentions);
   return {
     content: legacyContent,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
@@ -1776,6 +1928,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    s.modelFallback?.uuid === ds.modelFallback?.uuid &&
+    s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
     JSON.stringify(s.lastCodexAppInput ?? null) === JSON.stringify(ds.lastCodexAppInput ?? null) &&
@@ -1789,6 +1943,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
+  s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
   if (ds.lastCodexAppInput) s.lastCodexAppInput = ds.lastCodexAppInput;
@@ -2201,6 +2356,7 @@ export async function restoreActiveSessions(
           currentImageKey: session.currentImageKey,
           currentTurnTitle: session.currentTurnTitle,
           usageLimit: session.usageLimit,
+          modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
           lastCodexAppInput: session.lastCodexAppInput,
@@ -2406,6 +2562,7 @@ export async function restoreActiveSessions(
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
       usageLimit: session.usageLimit,
+      modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
       lastCodexAppInput: session.lastCodexAppInput,
@@ -3108,6 +3265,7 @@ export async function resumeSession(
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
     usageLimit: session.usageLimit,
+    modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
     lastCodexAppInput: session.lastCodexAppInput,
@@ -3199,6 +3357,32 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
+/**
+ * Identity a scheduled turn runs as: the task's creator, as captured at
+ * creation time. The turn itself is authenticated by the daemon-minted
+ * `schedule:<taskId>:<uuid>` turn id (see scheduled-turn-provenance) — this
+ * only decides WHICH identity that authenticated turn carries.
+ *
+ * Returns undefined when the task has no creator union_id (legacy tasks,
+ * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
+ * fail-closed story: with no identity on the turn, identity-bound tools refuse
+ * to run instead of falling back to the bot's own access, while everything that
+ * does not need a user identity keeps working.
+ */
+function trustedCallerForScheduledTask(
+  task: ScheduledTask,
+  larkAppId: string,
+): CliTurnPayload['trustedCaller'] | undefined {
+  if (!task.ownerUnionId) return undefined;
+  return {
+    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
+    requestUserUnionId: task.ownerUnionId,
+    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    source: 'schedule_creator',
+    taskId: task.id,
+  };
+}
+
 async function buildScheduledTargetNotice(params: {
   kind: 'chat' | 'thread';
   taskName: string;
@@ -3234,6 +3418,7 @@ export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
+  additionalPrompt?: string,
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -3255,6 +3440,17 @@ export async function executeScheduledTask(
   }
   const larkAppId = bot.config.larkAppId;
 
+  // --follow-active: keep the last landing point while a human holds it open;
+  // otherwise re-target to where a human spoke most recently (persisting the
+  // new landing point); with no human-active topic, stay in the landing point
+  // if it is still open (bot-only); with nothing open, run this fire as
+  // new-topic.
+  // Runs before position/scope resolution so the rest of the fire path sees
+  // an ordinary retained-topic / new-topic task.
+  const taskBeforeFollowActive = task;
+  task = applyFollowActive(task);
+  const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
+
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
   // Prefer the explicit three-state position, with scope/deliver fallbacks for
@@ -3271,6 +3467,7 @@ export async function executeScheduledTask(
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -3320,6 +3517,11 @@ export async function executeScheduledTask(
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
+      // Follow-active step 4: the fresh topic becomes the landing point, so the
+      // next fire stays here (step 3) instead of opening one more topic. A
+      // silent fresh topic has no real root yet (deferred until the first
+      // `botmux send`), so it is not recorded and the next fire re-resolves.
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.
@@ -3382,10 +3584,16 @@ export async function executeScheduledTask(
     }
   } else {
     // thread-scope path (existing logic)
-    const isCrossThread =
-      !!task.creatorRootMessageId &&
-      !!task.rootMessageId &&
-      task.creatorRootMessageId !== task.rootMessageId;
+    // A follow-active task moves its landing point by design, so "creator root
+    // ≠ landing root" would read as cross-thread forever after the first move
+    // (a notice into the closed creation topic on every fire, and no banner in
+    // the topic it actually landed in). For those, only a different CHAT is
+    // "somewhere else"; inside the creator's chat the fire is in-thread.
+    const isCrossThread = task.followActive === true
+      ? (!!task.creatorRootMessageId && !!task.creatorChatId && task.creatorChatId !== task.chatId)
+      : (!!task.creatorRootMessageId &&
+        !!task.rootMessageId &&
+        task.creatorRootMessageId !== task.rootMessageId);
 
     if (isCrossThread) {
       if (!silent) {
@@ -3439,9 +3647,15 @@ export async function executeScheduledTask(
 
   refreshCliVersion(bot.config);
 
+  // A Bash precondition may provide per-fire context. Keep the durable task and
+  // Dashboard-facing lastUserPrompt unchanged; lastCliInput still records the
+  // exact input sent to the model through the ordinary session lifecycle.
+  const effectivePrompt = additionalPrompt === undefined
+    ? task.prompt
+    : `${task.prompt}\n\n${additionalPrompt}`;
   const firePrompt = silent
-    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
-    : task.prompt;
+    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
+    : effectivePrompt;
   const key = sessionKey(anchor, larkAppId);
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
@@ -3504,12 +3718,24 @@ export async function executeScheduledTask(
           whiteboardId: existing.session.whiteboardId,
           sessionBackendType: existing.session.backendType,
           turnId: scheduledTurnId,
+          trustedCaller: scheduledTrustedCaller,
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
           try {
-            if (sendWorkerInput(existing, input, scheduledTurnId)) {
+            // sendWorkerInput reads the identity from OPTS, never from the
+            // payload (unlike forkWorker, which reads payload ?? opts). Passing
+            // it on `input` alone type-checks and then silently drops it — and
+            // this is the steady-state path for a recurring task (first fire
+            // creates the session, every later fire injects into it), so the
+            // failure shape would be "worked once, silently identity-less after".
+            if (sendWorkerInput(
+              existing,
+              input,
+              scheduledTurnId,
+              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
+            )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
               return;
             }
@@ -3592,7 +3818,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's

@@ -27,11 +27,12 @@ vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
 }));
 
-vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(() => ({
-    config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+const getBotMock = vi.hoisted(() => vi.fn(() => ({
+    config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: false },
     botName: 'TestBot',
-  })),
+  })));
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (...args: any[]) => getBotMock(...args),
   getAllBots: vi.fn(() => []),
   getBotBrand: vi.fn(() => 'feishu'),
 }));
@@ -44,8 +45,16 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 // (replace the live streaming card with an inert "已搬迁" snapshot before
 // clearing streamCardId). Mock it so tests don't try real Lark API calls.
 const updateMessageMock = vi.fn(async () => undefined);
+const pinMessageMock = vi.fn(async (larkAppId: string, messageId: string) => ({
+  messageId, operatorId: larkAppId, operatorIdType: 'app_id',
+}));
+const unpinMessageMock = vi.fn(async () => true);
+const listChatPinsMock = vi.fn(async () => []);
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...a: any[]) => updateMessageMock(...a),
+  pinMessage: (...a: any[]) => pinMessageMock(...a),
+  unpinMessage: (...a: any[]) => unpinMessageMock(...a),
+  listChatPins: (...a: any[]) => listChatPinsMock(...a),
   deleteMessage: vi.fn(),
   MessageWithdrawnError: class extends Error {},
 }));
@@ -83,6 +92,11 @@ import {
   suspendWorker,
   transferSession,
   __testOnly_setupWorkerHandlers,
+  __testOnly_resetPinStreamingCardReconcileQueue,
+  __testOnly_waitForPinStreamingCardIdle,
+  pinStreamingCardIfEnabled,
+  reconcileStreamingCardPins,
+  reconcileRestoredStreamingCardPins,
   setActiveSessionsRegistry,
   setActiveSessionIfActive,
   setActiveSessionSafe,
@@ -170,6 +184,13 @@ describe('transferSession', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: false },
+      botName: 'TestBot',
+    });
+    __testOnly_resetPinStreamingCardReconcileQueue();
+    listChatPinsMock.mockReset();
+    listChatPinsMock.mockResolvedValue([]);
     __testOnly_resetBotTurnMutationGates();
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     resetDeviceIsolationActivationForTest();
@@ -1501,6 +1522,142 @@ describe('transferSession', () => {
     // embed an img element referencing it (preferred over the text fallback).
     expect(body).toMatch(/"tag":\s*"img"/);
     expect(body).toMatch(/"img_key":\s*"old_image_key"/);
+  });
+
+  it('leaves manual source Pins untouched when streaming-card Pin was never enabled', async () => {
+    const ds = makeDs({ frozenCards: new Map([
+      ['prior', { messageId: 'om_frozen_card', content: '', title: '', displayMode: 'hidden' }],
+    ]) });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(ds);
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not infer source Pin ownership from enabled config during transfer', async () => {
+    const ds = makeDs({ frozenCards: new Map([
+      ['prior', { messageId: 'om_frozen_card', content: '', title: '', displayMode: 'hidden' }],
+    ]) });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: true },
+      botName: 'TestBot',
+    });
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target')).resolves.toEqual({ ok: true });
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('makes zero Pin or Unpin calls for an enabled transfer on an apiOnly transport', async () => {
+    const ds = makeDs({ frozenCards: new Map([
+      ['prior', { messageId: 'om_frozen_card', content: '', title: '', displayMode: 'hidden' }],
+    ]) });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: true, apiOnly: true },
+      botName: 'TestBot',
+    });
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target')).resolves.toEqual({ ok: true });
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('returns committed transfer success before a slow feature-owned source Unpin settles', async () => {
+    const ds = makeDs({ frozenCards: new Map([
+      ['prior', { messageId: 'om_frozen_card', content: '', title: '', displayMode: 'hidden' }],
+    ]) });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: true },
+      botName: 'TestBot',
+    });
+    await expect(pinStreamingCardIfEnabled(ds, 'om_old_card')).resolves.toBe(true);
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_old_card',
+      chatId: 'oc_source',
+      operatorId: 'cli_app_test',
+      operatorIdType: 'app_id',
+    }]);
+
+    const unpinStarted = deferred<void>();
+    const releaseUnpin = deferred<boolean>();
+    unpinMessageMock.mockImplementationOnce(() => {
+      unpinStarted.resolve();
+      return releaseUnpin.promise;
+    });
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target')).resolves.toEqual({ ok: true });
+    await unpinStarted.promise;
+    expect(unpinMessageMock).toHaveBeenCalledWith('cli_app_test', 'om_old_card');
+
+    releaseUnpin.resolve(false);
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    listChatPinsMock.mockClear();
+    unpinMessageMock.mockClear();
+    unpinMessageMock.mockResolvedValue(true);
+    await reconcileStreamingCardPins(ds, false);
+
+    expect(listChatPinsMock).toHaveBeenCalledWith('cli_app_test', 'oc_source');
+    expect(unpinMessageMock).toHaveBeenCalledWith('cli_app_test', 'om_old_card');
+  });
+
+  it('revalidates a process-owned Pin and preserves a human replacement on transfer', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: true },
+      botName: 'TestBot',
+    });
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_old_card',
+      chatId: 'oc_source',
+      operatorId: 'cli_app_test',
+      operatorIdType: 'app_id',
+    }]);
+    reconcileRestoredStreamingCardPins('cli_app_test');
+    await __testOnly_waitForPinStreamingCardIdle();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    pinMessageMock.mockClear();
+    listChatPinsMock.mockClear();
+    listChatPinsMock.mockResolvedValue([{
+      messageId: 'om_old_card',
+      chatId: 'oc_source',
+      operatorId: 'ou_human',
+      operatorIdType: 'open_id',
+    }]);
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target')).resolves.toEqual({ ok: true });
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(listChatPinsMock).toHaveBeenCalledWith('cli_app_test', 'oc_source');
+    expect(unpinMessageMock).not.toHaveBeenCalledWith('cli_app_test', 'om_old_card');
+  });
+
+  it('does not start source Pin cleanup when an enabled transfer is refused', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    registry.set(sessionKey('oc_target', 'cli_app_test'), makeDs({
+      session: { ...ds.session, sessionId: 'target-existing', chatId: 'oc_target', rootMessageId: 'om_M1_target', scope: 'chat' },
+      chatId: 'oc_target',
+      scope: 'chat',
+    }));
+    getBotMock.mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: true },
+      botName: 'TestBot',
+    });
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target')).resolves.toEqual({
+      ok: false, error: 'target_chat_has_session',
+    });
+    expect(unpinMessageMock).not.toHaveBeenCalled();
   });
 
   it('reattaches at the routing commit before awaiting the source-card patch', async () => {

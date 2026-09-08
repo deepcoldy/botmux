@@ -4,10 +4,13 @@ import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
+  CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
+  COMPANION_STARTUP_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
+  PROXY_ENV_KEYS,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
@@ -19,12 +22,14 @@ import {
   FLOW_WORKER_ENV_KEYS as FLOW_WORKER_ENV_KEYS_LOCAL,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
+  stripCompanionStartupEnv,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { FLOW_WORKER_ENV_KEYS as FLOW_WORKER_ENV_KEYS_CANONICAL } from '../src/flow/types.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
 describe('applySessionOwnerEnv()', () => {
@@ -56,6 +61,7 @@ describe('redactChildEnv()', () => {
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
+      GOFLAGS: '-p=4',
     });
     // The bug this guards: `{ ...env, LARK_APP_ID: undefined }` leaves the key
     // PRESENT (`'LARK_APP_ID' in obj === true`), and node-pty then stringifies
@@ -67,6 +73,8 @@ describe('redactChildEnv()', () => {
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
     expect(out.PATH).toBe('/usr/bin');
+    // Host-scoped build policy reaches the CLI through the ordinary child env.
+    expect(out.GOFLAGS).toBe('-p=4');
   });
 
   it('does not mutate the input env', () => {
@@ -89,6 +97,27 @@ describe('redactChildEnv()', () => {
     }
     // Behavior knob, not an identity marker — must survive.
     expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('removes companion authority from non-serving process environments', () => {
+    const env = Object.fromEntries(COMPANION_STARTUP_ENV_KEYS.map(key => [key, 'private']));
+    stripCompanionStartupEnv(env);
+    for (const key of COMPANION_STARTUP_ENV_KEYS) expect(key in env, key).toBe(false);
+    const daemonEntry = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
+    expect(daemonEntry).toContain('stripCompanionStartupEnv(process.env)');
+  });
+
+  it('removes the companion secret-file path from child env', () => {
+    const out = redactChildEnv({
+      [COMPANION_SECRET_FILE_ENV]: '/run/secrets/botmux/companion',
+      [COMPANION_BOT_APP_ID_ENV]: 'local_test_bot',
+      KEEP: 'v',
+    });
+    expect(COMPANION_SECRET_FILE_ENV in out).toBe(false);
+    expect(COMPANION_BOT_APP_ID_ENV in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_SECRET_FILE_ENV);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_BOT_APP_ID_ENV);
     expect(out.KEEP).toBe('v');
   });
 
@@ -198,13 +227,53 @@ describe('redactChildEnv()', () => {
       const script =
         'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
         `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve) => {
+      const out: string = await new Promise((resolve, reject) => {
         const p = pty.spawn('/bin/sh', ['-c', script], {
           name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
         });
         let buf = '';
-        p.onData((d) => { buf += d; });
-        p.onExit(() => resolve(buf));
+        let settled = false;
+        // node-pty delivers onData and onExit on independent paths: the child can
+        // be reaped before the pty's pending output has been drained, so
+        // resolving straight from onExit can hand back an empty string. That
+        // surfaces as `Expected to contain "R=UNSET" / Received: ""` under CI
+        // load, which reads like a real leak but is only a lost read.
+        //
+        // So settle on having BOTH answers, and let exit only START a short grace
+        // period rather than decide. If the grace period expires with the output
+        // still incomplete, REJECT with the raw buffer instead of resolving it:
+        // the whole point is that a lost read must never again be reported as a
+        // leak-shaped assertion failure. Resolving '' here would rebuild the very
+        // trap this guard exists to remove.
+        const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
+        const finish = (settle: () => void) => {
+          if (settled) return;
+          settled = true;
+          settle();
+        };
+        const fail = () => finish(() => reject(new Error(
+          'pty output incomplete — a lost read, not an env leak. '
+          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+        )));
+        const guard = setTimeout(fail, 10_000);
+        guard.unref?.();
+        p.onData((d) => {
+          buf += d;
+          if (hasBothAnswers()) {
+            clearTimeout(guard);
+            finish(() => resolve(buf));
+          }
+        });
+        p.onExit(() => {
+          // Exit is a deadline, not the signal: give already-queued reads a
+          // moment to land, then decide — complete output resolves, incomplete
+          // output fails loudly as a fixture problem.
+          setTimeout(() => {
+            clearTimeout(guard);
+            if (hasBothAnswers()) finish(() => resolve(buf));
+            else fail();
+          }, 250);
+        });
       });
       expect(out).toContain('R=UNSET');
       expect(out).toContain('S=UNSET');
@@ -260,6 +329,17 @@ describe('stripDashboardH5Env()', () => {
     const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
     expect(dotenvAt).toBeGreaterThan(-1);
     expect(stripAt).toBeGreaterThan(dotenvAt);
+  });
+
+  it('is called by index-supervisor.ts without wholesale dotenv loading (source pin)', () => {
+    // The supervisor scrubs any inherited H5 credentials before it seeds the
+    // fleet, but deliberately does NOT wholesale-load ~/.botmux/.env: doing so
+    // would place dashboard-only secrets in a long-lived parent of every bot.
+    // The dashboard remains the only entry that loads those settings from disk.
+    const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
+    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
+    expect(stripAt).toBeGreaterThan(-1);
+    expect(src).not.toContain('dotenvConfig(');
   });
 
   it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
@@ -455,6 +535,7 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('__OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_SESSION_ID');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
   });
 
   it('covers session-only capabilities AND routing keys the pane transport never carries', () => {
@@ -629,8 +710,9 @@ describe('session CLI home scrub call sites', () => {
     // TERM is re-pinned (not left absent) inside the shared scrub so pm2
     // CLIENT output on a real TTY keeps supports-color detection.
     expect(fnBody).toContain("env.TERM = 'xterm-256color'");
-    const pluginPm2 = read('core/plugins/pm2.ts');
-    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
+    const pluginSupervisor = read('core/plugins/supervisor-client.ts');
+    expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
+    expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
     // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked
@@ -638,6 +720,22 @@ describe('session CLI home scrub call sites', () => {
     // TERM-less — the zmx backend's sessions inherit that env verbatim (no
     // node-pty `name` to force TERM) and their CLIs render colorless.
     expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
+  });
+
+  it('the fleet supervisor and dashboard entry also scrub invoker-terminal fingerprints and turn markers', () => {
+    // Same two key families as the daemon-boot pin above, at the two other
+    // long-lived boundaries: resolveFleetDaemonEnv() bakes the supervisor's
+    // own (post-scrub) process.env into every daemon child + the dashboard,
+    // and the dashboard entry forks debug terminals / start-stop-bot CLI runs
+    // straight from its own process.env. Both used to scrub only a hand-picked
+    // 7-key subset of session identity and never touched invoker-terminal
+    // fingerprints at all — the gap this test closes.
+    for (const rel of ['index-supervisor.ts', 'index-dashboard.ts']) {
+      const src = read(rel);
+      expect(src, rel).toContain('scrubInvokerTerminalEnv(process.env)');
+      expect(src, rel).toContain('scrubSessionTurnMarkerEnv(process.env)');
+      expect(src, rel).toContain("process.env.TERM = 'xterm-256color'");
+    }
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
@@ -662,9 +760,23 @@ describe('session CLI home scrub call sites', () => {
  * the kind of coupling that is invisible from the call site.)
  */
 describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
-  it('includes BOTMUX_READ_ISOLATION and BOTMUX_API_ONLY', () => {
+  it('includes sandbox verdicts and the per-session reply-style snapshot', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
+  });
+
+  it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {
+    // BOTMUX_INJECTED_ENV_KEYS also drives the pane `unset` clause and
+    // scrubTmuxServerGlobalEnv(), so a standard, user-ownable variable listed
+    // there would delete the CA bundle a user configured for their own tmux
+    // server — for every CLI, on every platform. Same reason PROXY_ENV_KEYS is
+    // kept out. Per-pane forwarding happens in buildBotmuxEnvAssignments.
+    expect(BOTMUX_INJECTED_ENV_KEYS).not.toContain('SSL_CERT_FILE');
+    expect(CA_BUNDLE_ENV_KEYS).toContain('SSL_CERT_FILE');
+    expect(PROXY_ENV_KEYS as readonly string[]).not.toContain('SSL_CERT_FILE');
   });
 });
 

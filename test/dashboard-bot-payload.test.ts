@@ -10,25 +10,49 @@ describe('dashboard bot payload helpers', () => {
         cliId: 'codex',
         cliRuntime: { id: 'vendor-codex', executable: 'vendor-codex' },
         model: 'gpt-5',
+        modelBackendVariant: 'max',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
       },
       {},
     );
     const editableFields = [
-      'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
-      'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
-      'autoStartOnNewTopic', 'backendType',
-      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput', 'codexAuthSync',
-      'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
-      'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'envelopeInjection', 'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
-      'feedback',
-      'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
-      'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
-      'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'senderTag', 'writableTerminalLinkInCard',
+      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'modelBackendVariant', 'agentSelectionKey', 'online',
+      'displayName', 'larkBotName',
+      'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
+      'autoboundChatCount', 'brandLabel',
+      'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
+      'usageDisplay', 'usageSupported',
+      'disableStreamingCard', 'pinStreamingCard', 'silentTurnReactions',
+      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
+      'thinkingCard', 'senderTag', 'overloadAlert', 'botToBotSameDir',
+      'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
+      'autoStartOnNewTopic',
+      'summaryRange', 'summaryMemory', 'summaryMemoryPath',
+      'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
+      'substituteMode', 'feedback', 'replyStyle',
+      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
+      'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
+      'envelopeInjection', 'codexAuthSync',
+      'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
+      'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
+      'nativeSubagentRuntime',
       'sessionOwnerReminder',
+      'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env',
+      'riff', 'skills',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('exposes native subagent policy only in private Bot Defaults payloads', () => {
+    const nativeSubagentRuntime = {
+      model: { mode: 'custom' as const, value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom' as const, value: 'ultra' as const },
+    };
+    const descriptor = { larkAppId: 'app_traex', cliId: 'traex', nativeSubagentRuntime };
+
+    expect(botDefaultsPayload(descriptor, {})).toMatchObject({ nativeSubagentRuntime });
+    expect(botDefaultsPayload(descriptor, undefined, 'offline')).toMatchObject({ nativeSubagentRuntime });
+    expect(botSummaryPayload(descriptor)).not.toHaveProperty('nativeSubagentRuntime');
   });
 
   it('normalizes the Codex auth policy to the upgrade-compatible shared default', () => {
@@ -41,6 +65,28 @@ describe('dashboard bot payload helpers', () => {
     const feedback = { enabled: true, audience: 'requester' };
     expect(botDefaultsPayload({ larkAppId: 'app' }, { feedback })).toMatchObject({ feedback });
     expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('feedback');
+  });
+
+  it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {
+    const replyStyle = {
+      recipes: false,
+      theme: 'vivid',
+      recipePrompt: '  先说风险  ',
+      layoutColors: { result: 'green', blocked: 'laser', unknown: 'blue' },
+      layoutTags: { result: '', risk: '请确认', progress: 42 },
+    };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle })).toMatchObject({
+      replyStyle: {
+        recipes: false,
+        theme: 'vivid',
+        recipePrompt: '先说风险',
+        layoutColors: { result: 'green' },
+        layoutTags: { result: '', risk: '请确认' },
+      },
+    });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle: 'secret-looking-invalid' }))
+      .toMatchObject({ replyStyle: null });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('replyStyle');
   });
 
   it('keeps executable runtime details out of public group roster summaries', () => {
@@ -182,6 +228,21 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ codexAppCleanInput: true });
   });
 
+  it('projects pinStreamingCard as an explicit default-off boolean', () => {
+    const daemon = { larkAppId: 'app_pin', botName: 'Pin', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: true }))
+      .toMatchObject({ pinStreamingCard: true });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: false }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: 'true' }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: 1 }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: null }))
+      .toMatchObject({ pinStreamingCard: false });
+  });
+
   it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
     const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
@@ -283,6 +344,16 @@ describe('dashboard bot payload helpers', () => {
     // Missing / non-string → null（fixed 形态的 bot 不带 workingDir）。
     expect(botDefaultsPayload(daemon, {}).workingDir).toBeNull();
     expect(botDefaultsPayload(daemon, { workingDir: 123 }).workingDir).toBeNull();
+  });
+
+  it('projects the daemon schedule working directory as a non-empty string or null', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '/srv/botmux' })).toMatchObject({
+      scheduleWorkingDir: '/srv/botmux',
+    });
+    expect(botDefaultsPayload(daemon, {}).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: 123 }).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '   ' }).scheduleWorkingDir).toBeNull();
   });
 
   it('defaults auto grant request cards on and preserves explicit off', () => {

@@ -14,6 +14,8 @@ import {
   type LinuxPm2GodProcess,
 } from '../core/pm2-lifecycle-owner.js';
 
+// Legacy desktop runtimes may still have PM2 on disk. Modern plugin services
+// use the built-in supervisor; this optional observer is never embedded.
 const require = createRequire(import.meta.url);
 const pm2 = require('pm2') as any;
 const mode = process.argv[2];

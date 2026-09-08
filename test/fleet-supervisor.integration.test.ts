@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
@@ -66,6 +66,34 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 }
 
 describe('FleetSupervisor (live, integration)', () => {
+  it('does not forget a live external member when signalling fails', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const spec: FleetBotSpec = {
+      name: 'botmux-plugin-denied-stop', appId: '', botIndex: -1,
+      external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], killTimeoutMs: 0 },
+    };
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([]);
+    await sup.upsertExternal(spec);
+    const pid = readFleetState(statePath)!.procs[0].pid;
+    killLater(pid);
+    const kill = ChildProcess.prototype.kill;
+    ChildProcess.prototype.kill = function () {
+      this.emit('error', Object.assign(new Error('kill EPERM'), { code: 'EPERM' }));
+      return false;
+    };
+    try {
+      await expect(sup.removeExternal(spec.name)).rejects.toThrow('stop not confirmed');
+      expect(pidAlive(pid)).toBe(true);
+      expect(readFleetState(statePath)!.procs[0]).toMatchObject({ pid, status: 'online' });
+    } finally {
+      ChildProcess.prototype.kill = kill;
+      await sup.removeExternal(spec.name);
+      await sup.stopAll();
+    }
+  }, 15_000); // includes the real 5-second stop-confirmation deadline
+
   it('starts all bots online, idempotent re-start is a no-op', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

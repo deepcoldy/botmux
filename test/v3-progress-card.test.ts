@@ -312,6 +312,54 @@ describe('buildV3ProgressCard', () => {
     expect(url).toContain('/#/v3/run%20with%20space');
   });
 
+  it('有终端会话时渲染「终端」按钮，URL 直连 worker 端口', () => {
+    const card = parse(baseView({
+      terminal: { sessionId: 'sess-terminal-1', webPort: 8765, viewToken: 'view token&1' },
+    }));
+    const terminalBtn = card.elements.find(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
+    );
+    expect(terminalBtn).toBeDefined();
+    const url = terminalBtn.actions[0].multi_url.url;
+    // LAN 部署：直连 worker webPort；sessionId 不进 URL（按端口直达）。
+    expect(url).toContain(':8765');
+    expect(url).toContain('?viewToken=view%20token%261');
+    // 终端按钮在 Web 详情按钮之前
+    const terminalIdx = card.elements.indexOf(terminalBtn);
+    const detailIdx = card.elements.findIndex(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === 'Web 详情（需登录）',
+    );
+    expect(terminalIdx).toBeLessThan(detailIdx);
+  });
+
+  it('无终端会话时不渲染「终端」按钮', () => {
+    const card = parse(baseView());
+    const hasTerminal = card.elements.some(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
+    );
+    expect(hasTerminal).toBe(false);
+  });
+
+  it('终端会话无 webPort 且非远程部署时不渲染死链', () => {
+    const card = parse(baseView({
+      terminal: { sessionId: 'sess-no-port', viewToken: 'view-token' },
+    }));
+    const hasTerminal = card.elements.some(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
+    );
+    expect(hasTerminal).toBe(false);
+  });
+
+  it('终端会话缺少只读凭证时不渲染 403 死链', () => {
+    const card = parse(baseView({
+      terminal: { sessionId: 'sess-no-capability', webPort: 8765 },
+    }));
+    const hasTerminal = card.elements.some(
+      (element: any) => element.tag === 'action' && element.actions?.[0]?.text?.content === '终端（手机可看）',
+    );
+    expect(hasTerminal).toBe(false);
+  });
+
   it.each([
     [{ kind: 'manual_cli' } as const, '本地 CLI'],
     [{ kind: 'legacy_v3' } as const, '旧版 v3'],

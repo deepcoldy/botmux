@@ -90,7 +90,7 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => factory.lastOpts !== undefined);
     expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'active' });
     await worker.waitForInit();
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(worker.rawInputs).toEqual([]);
     worker.emitMessage({ type: 'prompt_ready' });
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
@@ -109,7 +109,7 @@ describe('v3 ephemeral pool', () => {
     expect(result).toMatchObject({
       status: 'ok',
       manifestPath: join(req.attemptDir, 'manifest.json'),
-      sessionInfo: { webPort: 3001, token: 'tok' },
+      sessionInfo: { webPort: 3001, token: 'tok', viewToken: 'view-tok' },
     });
     expect(factory.lastOpts?.cwd).toBe('/work/repo');
     expect(factory.lastOpts?.env[GOAL_ENV.V3_MARKER]).toBe('1');
@@ -271,11 +271,12 @@ describe('v3 ephemeral pool', () => {
     await worker.waitForInit();
     expect(readyInfos).toEqual([]);
 
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(readyInfos).toEqual([{
       sessionId: expect.any(String),
       webPort: 3001,
       token: 'tok',
+      viewToken: 'view-tok',
       ptyLogPath: join(req.attemptDir, 'pty.log'),
     }]);
     expect(factory.lastOpts?.env.BOTMUX_WORKFLOW_PTY_LOG_PATH).toBe(join(req.attemptDir, 'pty.log'));

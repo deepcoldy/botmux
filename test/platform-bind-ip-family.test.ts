@@ -33,13 +33,19 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
     postJson.mockReset();
     readPlatformBinding.mockReset().mockReturnValue(null);
     writePlatformBinding.mockReset();
-    process.exitCode = undefined;
+    process.exitCode = 0;
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(console.log).mockClear();
+    vi.mocked(console.error).mockClear();
   });
 
   afterEach(() => {
-    process.exitCode = undefined;
+    // bun test 把进程的 exitCode 当成文件退出码：最后一条用例把 exitCode 设成 2
+    // 之后，即使 5 个 it 全绿，文件仍会被 runner 标 FAIL。清成 0，不是 undefined。
+    process.exitCode = 0;
+    vi.mocked(console.log).mockRestore();
+    vi.mocked(console.error).mockRestore();
   });
 
   it('默认路径成功：不写 ipFamily', async () => {
@@ -87,6 +93,7 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
     expect(postJson).not.toHaveBeenCalled();
     expect(readPlatformBinding).not.toHaveBeenCalled();
     expect(writePlatformBinding).not.toHaveBeenCalled();
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('宿主终端'));
+    expect(console.error).toHaveBeenCalled();
+    expect(vi.mocked(console.error).mock.calls.some(c => String(c[0]).includes('宿主终端'))).toBe(true);
   });
 });

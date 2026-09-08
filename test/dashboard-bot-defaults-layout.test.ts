@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { cssRuleBody } from './helpers/css-rule.js';
 
 const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
@@ -34,7 +35,7 @@ describe('bot defaults focused layout', () => {
     // CSS: single column + auto rows by default, 2 cols + 1px row track in the container query
     expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?grid-auto-rows:\s*auto;/);
     expect(css).toMatch(/@container \(min-width: 1024px\)\s*\{[\s\S]*?\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?grid-auto-rows:\s*1px;/);
-    expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid > \.bd-tile-wide\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-tab-grid > .bd-tile-wide')).toMatch(/grid-column:\s*1 \/ -1;/);
   });
 
   it('fills the desktop main so the roster cannot be shoved under the search box', () => {
@@ -43,24 +44,35 @@ describe('bot defaults focused layout', () => {
     // sliding it up and clips #bd-filters. Desktop therefore uses the same
     // fill-height shell as roles-page: main does not scroll, both columns
     // stretch, the list and the detail pane are the scrollports.
-    const desktop = css.slice(css.indexOf('main:has(.bot-defaults-page)'), css.indexOf('main:has(.bot-defaults-page) .bd-detail') + 280);
-    expect(desktop).toMatch(/main:has\(\.bot-defaults-page\)\s*\{[\s\S]*?overflow:\s*hidden;/);
-    expect(desktop).toMatch(/\.bot-defaults-page\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
-    expect(desktop).toMatch(/\.bd-layout\s*\{[\s\S]*?align-items:\s*stretch;/);
-    expect(desktop).toMatch(/\.bd-roster\s*\{[\s\S]*?position:\s*static;[\s\S]*?height:\s*100%;/);
-    expect(desktop).toMatch(/\.bd-detail\s*\{[\s\S]*?overflow-y:\s*auto;/);
+    const desktop = cssRuleBody(css, 'main:has(.bot-defaults-page)');
+    expect(desktop).toMatch(/overflow:\s*hidden;/);
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bot-defaults-page')).toMatch(/grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-layout')).toMatch(/align-items:\s*stretch;/);
+    const shellRoster = cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-roster');
+    expect(shellRoster).toMatch(/position:\s*static;/);
+    expect(shellRoster).toMatch(/height:\s*100%;/);
+    expect(cssRuleBody(css, 'main:has(.bot-defaults-page) .bd-detail')).toMatch(/overflow-y:\s*auto;/);
 
-    const rosterStart = css.indexOf('.bot-defaults-page .bd-roster {');
-    const roster = css.slice(rosterStart, css.indexOf('.bot-defaults-page #bd-filters', rosterStart));
+    const roster = cssRuleBody(css, '.bot-defaults-page .bd-roster');
     expect(roster).toMatch(/grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
     expect(roster).toMatch(/overflow:\s*hidden;/);
     expect(roster).not.toMatch(/max-height:\s*calc\(100dvh/);
 
-    const listStart = css.indexOf('.bot-defaults-page .bd-roster-list {');
-    const list = css.slice(listStart, css.indexOf('@media (max-width: 980px)', listStart));
+    const list = cssRuleBody(css, '.bot-defaults-page .bd-roster-list');
     expect(list).toMatch(/min-height:\s*0;/);
     expect(list).toMatch(/overflow-y:\s*auto;/);
     expect(list).toMatch(/overscroll-behavior:\s*contain;/);
+  });
+
+  it('keeps roster rows at their natural height when the filter leaves only a few', () => {
+    // The desktop shell hands the list row the whole remaining column height.
+    // A grid defaults to align-content:normal (=stretch), which splits that
+    // slack across the auto rows: filtering 56 bots down to 2 measured 348px
+    // per row instead of 54.4px, so the selected row rendered as a tall block
+    // and the last row sank to the panel floor. align-content:start makes the
+    // rows keep their content height and leaves the slack as empty space.
+    const list = cssRuleBody(css, '.bot-defaults-page .bd-roster-list');
+    expect(list).toMatch(/align-content:\s*start;/);
   });
 
   it('keeps the mobile roster bounded with a real scrollport instead of clipping', () => {
@@ -137,7 +149,7 @@ describe('bot defaults focused layout', () => {
     const profileHead = page.slice(profileStart, tabsStart);
 
     expect(profileHead).toContain('<BotDescriptionControl bot={bot} />');
-    expect(css).toMatch(/\.bot-defaults-page \.bd-description-preview\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-description-preview')).toMatch(/-webkit-line-clamp:\s*2;/);
     expect(css).toMatch(/\.bot-defaults-page \.bd-description-modal\s*\{[\s\S]*?max-height:\s*min\(720px,\s*calc\(100vh - 32px\)\);/);
   });
 
@@ -163,14 +175,14 @@ describe('bot defaults focused layout', () => {
     expect(page).not.toContain('data-action="toggle-grant-quota-oncall"');
     expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝内置默认：授权卡每人 {count} 条'");
     expect(i18n).toContain("'botDefaults.quotaDefault': '消息额度覆盖'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 每人 {count} 条（授权卡与 Oncall）'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限额'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 授权卡每人 {count} 条；Oncall 不限额'");
     expect(i18n).not.toContain("'botDefaults.grantDefaultsReset'");
     expect(i18n).not.toContain('点击“恢复默认限制”');
     expect(i18n).not.toContain('产品默认 3 条');
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
-    expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-grant-defaults > .actions')).toMatch(/justify-content:\s*flex-end;/);
   });
 
   it('offers granular Session owner reminder controls in advanced settings', () => {

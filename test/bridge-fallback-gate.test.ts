@@ -118,7 +118,7 @@ function workerFunctionSlice(name: string, nextName: string): string {
 }
 
 describe('worker submit-failure retry wiring', () => {
-  it('reschedules ordinary IM turns after active evidence and keeps structured-target state', () => {
+  it('re-arms ordinary IM turns after active evidence through the bounded chain', () => {
     const schedule = workerFunctionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
     const activeStart = schedule.indexOf("case 'suppress-active':");
     const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
@@ -126,10 +126,10 @@ describe('worker submit-failure retry wiring', () => {
     expect(activeEnd).toBeGreaterThan(activeStart);
 
     const active = schedule.slice(activeStart, activeEnd);
-    const recursiveCall = active.indexOf('scheduleSubmitFailureNotify(');
-    expect(recursiveCall).toBeGreaterThanOrEqual(0);
-    expect(active.slice(0, recursiveCall)).not.toContain('dispatchAttempt !== undefined');
-    expect(active.slice(recursiveCall, active.indexOf(');', recursiveCall) + 2)).toContain('structuredTarget');
+    const rearm = active.indexOf('armDeferredRecheck()');
+    expect(rearm).toBeGreaterThanOrEqual(0);
+    expect(active.slice(0, rearm)).not.toContain('dispatchAttempt !== undefined');
+    expect(active).toContain('deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS');
 
     const notifyStuck = schedule.slice(schedule.indexOf("case 'notify-stuck':"));
     expect(notifyStuck).toContain('if (turnIdentity?.dispatchAttempt === undefined)');

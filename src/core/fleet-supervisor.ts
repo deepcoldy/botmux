@@ -14,8 +14,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { openSync, closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
+import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   decideOnExit,
   freshProc,
@@ -83,6 +84,8 @@ export interface FleetBotSpec {
      *  fleet-state so a later reconcile can detect "running from a stale config"
      *  and restart it. See FleetProcState.configHash. */
     configHash?: string;
+    autorestart?: boolean;
+    killTimeoutMs?: number;
   };
 }
 
@@ -114,6 +117,7 @@ export function pidAlive(pid: number): boolean {
 
 export class FleetSupervisor {
   private readonly children = new Map<string, ChildProcess>();
+  private readonly spawnReady = new WeakMap<ChildProcess, Promise<void>>();
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -180,6 +184,7 @@ export class FleetSupervisor {
       // start forever, so status/uptime would misreport across restarts. Keep it
       // only when the SAME supervisor re-reconciles (idempotent re-start).
       const recordedPid = cur.supervisorPid;
+      cur.supervisorEntry = isStandaloneBinary() ? process.execPath : process.argv[1];
       if (recordedPid !== process.pid || !cur.supervisorStartedAt) {
         cur.supervisorStartedAt = new Date().toISOString();
       }
@@ -228,6 +233,34 @@ export class FleetSupervisor {
       return;
     }
     this.spawnBot(spec, /* isRestart */ false);
+  }
+
+  /** Replace one external definition only after its previous child has exited.
+   * Callers serialize this with remove/stop; a matching live definition is a no-op. */
+  async upsertExternal(spec: FleetBotSpec): Promise<void> {
+    if (!spec.external) throw new Error('fleet: external spec required');
+    const known = this.knownSpecs.get(spec.name);
+    if (known && JSON.stringify(known.external) !== JSON.stringify(spec.external)) {
+      await this.stopOneBot(spec.name);
+    }
+    this.startOneBot(spec);
+    const child = this.children.get(spec.name);
+    if (!child) throw new Error(`fleet: failed to start ${spec.name}`);
+    // spawn() returns before exec succeeds. A command acknowledgement must not
+    // turn ENOENT/EACCES into a successful plugin install/start.
+    await this.spawnReady.get(child);
+  }
+
+  async removeExternal(name: string): Promise<void> {
+    const spec = this.knownSpecs.get(name);
+    if (spec && !spec.external) throw new Error(`fleet: not an external member: ${name}`);
+    await this.stopOneBot(name);
+    this.knownSpecs.delete(name);
+    this.liveGeneration.delete(name);
+    mutateFleetState(this.opts.statePath, (cur) => {
+      cur.procs = cur.procs.filter(p => p.name !== name);
+      return cur;
+    });
   }
 
   /** Stop ONE bot without touching the rest — the live side of `botmux stop-bot`.
@@ -331,7 +364,7 @@ export class FleetSupervisor {
     // the scrub has the last word and a plugin manifest cannot revive a key we
     // deliberately strip. This is the order the pm2 path used and stated outright
     // ("applies it AFTER the manifest env merge, so a plugin manifest cannot
-    // revive a scrubbed key" — plugins/pm2.ts), with a test pinning it. Merging
+    // revive a scrubbed key"), with a test pinning it. Merging
     // after the scrub would silently undo it for exactly the keys that matter
     // (a sibling's CLI home, the dashboard app secret, the graceful sentinel).
     // A service needing its own data root must resolve it internally.
@@ -350,6 +383,15 @@ export class FleetSupervisor {
       env: childEnv,
       windowsHide: true,
     });
+    let spawned = false;
+    const ready = new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => { spawned = true; resolve(); });
+      child.once('error', reject);
+    });
+    // Automatic restarts have no awaiting caller; onChildExit still records
+    // their failures. Explicit plugin starts await the same exec boundary.
+    void ready.catch(() => {});
+    this.spawnReady.set(child, ready);
     // The child dup'd the fds; close our copies so we don't leak one per respawn.
     if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
     if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
@@ -376,8 +418,10 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
+        if (spec.external && child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
       } else {
         cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
+        if (spec.external && child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;
@@ -388,8 +432,10 @@ export class FleetSupervisor {
 
     child.on('exit', (code, signal) => this.onChildExit(spec, generation, { code, signal }));
     child.on('error', (err) => {
-      this.log(`${spec.name} spawn error: ${err.message}`);
-      this.onChildExit(spec, generation, { code: 1, signal: null });
+      this.log(`${spec.name} child error: ${err.message}`);
+      // A failed kill/send is not evidence of exit. Keep tracking a spawned
+      // child until its exit event, especially when removal must fail closed.
+      if (!spawned) this.onChildExit(spec, generation, { code: 1, signal: null });
     });
   }
 
@@ -411,6 +457,10 @@ export class FleetSupervisor {
     }
 
     const current = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
+    if (spec.external?.autorestart === false) {
+      this.markStopped(spec.name, exit, 'stopped');
+      return;
+    }
     // An external member does not get the 90-is-graceful sentinel: it is not our
     // code and may use 90 as an ordinary failure code, in which case honouring it
     // would silently retire the service instead of restarting it (see
@@ -479,13 +529,21 @@ export class FleetSupervisor {
   }
 
   private stopOne(name: string, child: ChildProcess): Promise<void> {
-    return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise((resolve, reject) => {
       let done = false;
-      const finish = () => { if (done) return; done = true; clearTimeout(killTimer); resolve(); };
-      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, this.killTimeoutMs);
+      const finish = () => { if (done) return; done = true; clearTimeout(killTimer); clearTimeout(deadline); resolve(); };
+      const timeout = this.knownSpecs.get(name)?.external?.killTimeoutMs ?? this.killTimeoutMs;
+      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
       killTimer.unref?.();
+      const deadline = setTimeout(() => {
+        if (done) return;
+        done = true;
+        child.removeListener('exit', finish);
+        reject(new Error(`fleet: stop not confirmed for ${name}`));
+      }, timeout + 5_000);
       child.once('exit', finish);
-      try { child.kill('SIGTERM'); } catch { finish(); }
+      try { child.kill('SIGTERM'); } catch { /* wait for exit or the deadline */ }
     });
   }
 }

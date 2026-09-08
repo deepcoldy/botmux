@@ -14,8 +14,11 @@ const execFileCalls: { file: string; args: string[] }[] = [];
 let execFileStdout = '';
 let execFileError: Error | null = null;
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
+vi.mock('node:child_process', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
     execFile: (

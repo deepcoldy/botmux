@@ -77,12 +77,22 @@ const CODEX_APP: CliSelectOption = { key: 'codex-app', label: 'Codex App', cliId
 const CODEX_VARIANTS: ReadonlyArray<CliSelectOption> = [CODEX_NATIVE, CODEX_APP];
 
 // ─── TRAE 选项 ───────────────────────────────────────────────────────────────
-// TRAE 家族合并成一个「TRAE (CoCo)」二级菜单（都是原生 cliId，无 wrapperCli）：
-//   - TRAE CLI (CoCo) → cliId `coco`  ：Trae CLI 的 CoCo 形态
-//   - traex           → cliId `traex` ：TRAE CLI（traecli）
-const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', cliId: 'coco' };
-const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
-const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
+// 新旧两代 TRAE CLI 是不同协议的 adapter，合并展示但不能混用 cliId：
+//   - TRAE CLI 2.0 → cliId `traex`：当前版本；共存期用不冲突的 `traex` 启动，
+//                    面向用户的正式命令名 `traecli` 作为选择 alias 接受
+//   - TRAE CLI 1.0 → cliId `coco` ：旧版 Coco，保留用于已有配置与历史 session
+// 新版必须排在前面，避免安装当前 TRAE CLI 后误选 legacy adapter。
+const TRAE_X: CliSelectOption = {
+  key: 'traex',
+  label: 'TRAE CLI 2.0（推荐；traex / traecli）',
+  cliId: 'traex',
+};
+const TRAE_COCO: CliSelectOption = {
+  key: 'coco',
+  label: 'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+  cliId: 'coco',
+};
+const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_X, TRAE_COCO];
 
 // ─── OpenCode 选项 ──────────────────────────────────────────────────────────
 // OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
@@ -169,8 +179,9 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
     // codex + codex-app collapse into one「Codex」二级菜单 at codex's position.
     if (o.id === 'codex') return [{ key: 'codex', label: 'Codex', children: CODEX_VARIANTS }];
     if (o.id === 'codex-app') return [];
-    // coco + traex collapse into one「TRAE (CoCo)」二级菜单 at coco's position.
-    if (o.id === 'coco') return [{ key: 'trae', label: 'TRAE (CoCo)', children: TRAE_VARIANTS }];
+    // coco + traex collapse into one「TRAE CLI」submenu at coco's position.
+    // Keep the underlying CLI_OPTIONS / numeric cliId mapping untouched.
+    if (o.id === 'coco') return [{ key: 'trae', label: 'TRAE CLI', children: TRAE_VARIANTS }];
     if (o.id === 'traex') return [];
     // Pi and Oh My Pi are kept as adjacent leaves (emitted together at pi's spot).
     if (o.id === 'pi') return [
@@ -197,7 +208,7 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'mir') return [];               // already included via MIRA_VARIANTS
     if (o.id === 'codex') return CODEX_VARIANTS;  // expands to Codex + Codex App
     if (o.id === 'codex-app') return [];
-    if (o.id === 'coco') return TRAE_VARIANTS;    // expands to TRAE CLI (CoCo) + traex
+    if (o.id === 'coco') return TRAE_VARIANTS;    // expands to TRAE CLI 2.0 + legacy Coco
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
@@ -213,9 +224,18 @@ const OPTION_BY_KEY: ReadonlyMap<string, CliSelectOption> = new Map(
   CLI_SELECT_OPTIONS.map((o) => [o.key, o]),
 );
 
+/**
+ * 用户文档中的命令名到稳定选择键的 alias。alias 只参与输入解析，不生成重复菜单项；
+ * Bot 配置仍落已有 cliId，避免迁移 adapter 注册、配置和历史 session。
+ */
+export const CLI_SELECTION_ALIASES: Readonly<Record<string, string>> = {
+  traecli: 'traex',
+};
+
 /** 按 key 查选项；非法 key 返回 undefined。 */
 export function lookupCliSelection(key: string): CliSelectOption | undefined {
-  return OPTION_BY_KEY.get(key.trim());
+  const normalized = key.trim();
+  return OPTION_BY_KEY.get(CLI_SELECTION_ALIASES[normalized] ?? normalized);
 }
 
 /** 反查：由一个 bot 现有的 cliId + wrapperCli 得到对应的选择键（供编辑时高亮默认）。 */
@@ -233,8 +253,9 @@ export function selectionKeyForBot(cliId: string, wrapperCli?: string): string {
 export function resolveCliSelection(key: string): ResolvedCliSelection {
   const opt = lookupCliSelection(key);
   if (!opt) {
+    const legalKeys = [...CLI_SELECT_OPTIONS.map((o) => o.key), ...Object.keys(CLI_SELECTION_ALIASES)];
     throw new Error(
-      `未知 CLI 选择项 "${key}"。合法值：${CLI_SELECT_OPTIONS.map((o) => o.key).join(', ')}`,
+      `未知 CLI 选择项 "${key}"。合法值：${legalKeys.join(', ')}`,
     );
   }
   return opt.wrapperCli ? { cliId: opt.cliId, wrapperCli: opt.wrapperCli } : { cliId: opt.cliId };

@@ -26,17 +26,53 @@ import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
+import type { ModelFallbackState } from '../../types.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
+  replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { ReplyCardHeader } from './reply-card-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
+/** Keep structured replies readable without letting heading-heavy model output
+ *  multiply schema-v2 body elements without bound. Each promoted heading can
+ *  split one prose buffer into another element, so six keeps ordinary cards
+ *  bounded while still covering the sections in a typical result report. */
+const MAX_PROMOTED_CARD_HEADINGS = 6;
+
+/** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
+ *  and daemon final-output fallback both spread this object so layout cannot
+ *  drift between an explicit `botmux send` and an automatic fallback reply. */
+export const REPLY_CARD_CONFIG = {
+  update_multi: true,
+  width_mode: 'fill',
+} as const;
+
+export interface ReplyCardV2 {
+  schema: '2.0';
+  config: { update_multi: true; width_mode: 'fill' };
+  header?: ReplyCardHeader;
+  body: { direction: 'vertical'; elements: any[] };
+}
+
+/** Single envelope shared by direct sends and fallback reply-card builders. */
+export function createReplyCard(
+  elements: any[],
+  header?: ReplyCardHeader,
+): ReplyCardV2 {
+  return {
+    schema: '2.0',
+    config: { ...REPLY_CARD_CONFIG },
+    ...(header ? { header } : {}),
+    body: { direction: 'vertical', elements },
+  };
+}
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
@@ -64,6 +100,14 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Frozen TraeX backend variant selected for this session. */
+  modelBackendVariant?: string;
+  /** Claude model fallback in effect, rendered as its own notice line on the
+   *  live card. It rides this snapshot rather than a 23rd positional arg on
+   *  buildStreamingCard: every call site already forwards the snapshot (locked
+   *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
+   *  Not a usage metric, but the same class of runtime identity as `model`. */
+  modelFallback?: ModelFallbackState;
 }
 
 export interface ReplyCardFooter {
@@ -73,7 +117,7 @@ export interface ReplyCardFooter {
   element: {
     tag: 'markdown';
     element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
-    text_size: 'notation_small_v2';
+    text_size: 'notation';
     content: string;
   };
 }
@@ -348,10 +392,43 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
  *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
  *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
  *     refreshes during execution. */
+/**
+ * True when a context snapshot is at/over the compact threshold — the single
+ * source of truth for BOTH the `建议压缩` hint appended by
+ * {@link cardUsageFooterSegment} and the streaming card's red line colour.
+ *
+ * ⚠️ Callers must NOT re-derive this by string-matching the rendered segment for
+ * the hint text: the hint is user-customizable copy (an override may even be the
+ * empty string, which makes `includes()` match unconditionally and paints every
+ * card red), and coupling colour to copy means editing a translation silently
+ * changes behaviour. Ask this predicate instead.
+ *
+ * No percentage (a CLI that reports usedTokens but no window — Claude Code's
+ * transcript has no context-window field) or no threshold ⇒ false, so the hint
+ * and the colour can never fire on a snapshot that cannot be over any limit.
+ */
+export function contextOverCompactThreshold(
+  usage: CardUsageSnapshot,
+  threshold: number | undefined,
+): boolean {
+  const pct = contextPercentUsed(usage);
+  return pct !== undefined && isNonNegativeFinite(threshold) && pct >= threshold;
+}
+
+/** Rounded, clamped context percentage, or undefined when the CLI reports no
+ *  window (⇒ no percentage to show). Shared so the footer text and
+ *  {@link contextOverCompactThreshold} can never disagree on the value. */
+function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
+  return isNonNegativeFinite(usage.context?.percentUsed)
+    ? Math.min(100, Math.round(usage.context.percentUsed))
+    : undefined;
+}
+
 export function cardUsageFooterSegment(
   usage: CardUsageSnapshot,
   locale?: Locale,
   variant: 'footer' | 'streaming' = 'footer',
+  opts?: { compactHintThreshold?: number },
 ): string | null {
   const parts: string[] = [];
   if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
@@ -360,11 +437,18 @@ export function cardUsageFooterSegment(
     const windowSuffix = isNonNegativeFinite(window) && window > 0
       ? `/${compactTokenCount(window)}`
       : '';
-    const percentSuffix = isNonNegativeFinite(usage.context.percentUsed)
-      ? ` (${Math.min(100, Math.round(usage.context.percentUsed))}%)`
-      : '';
+    const pct = contextPercentUsed(usage);
+    const percentSuffix = pct !== undefined ? ` (${pct}%)` : '';
     const suffix = `${windowSuffix}${percentSuffix}`;
-    parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
+    // 「建议压缩」提示（streaming 卡片）。曾经它是**独立一行** `📊 上下文 N%`，
+    // 与本 footer 同源（都读 percentUsed）⟹ 同一个百分比在一张卡上出现两次，
+    // 且那一行还比这里少了绝对值。现在只在这一行的上下文段尾追加提示，不再多占一行。
+    // 无百分比（Claude Code 的 transcript 没有上下文窗口字段）时天然不触发。
+    const overThreshold = contextOverCompactThreshold(usage, opts?.compactHintThreshold);
+    parts.push(
+      `${t('card.usage.context', undefined, locale)} ${used}${suffix}`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
@@ -403,7 +487,7 @@ export function cardUsageFooterSegment(
 }
 
 /** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
+ * {@link cardUsageFooterSegment}'s metric text. Returns `**model** variant · effort`
  * (model bolded within the shared grey markdown) or null when there is no model.
  * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
  * standalone runtime-only row when native usage is unavailable. The
@@ -419,8 +503,95 @@ export function cardUsageRuntimeSegment(
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
   const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
   if (!model) return null;
+  const variant = usage.modelBackendVariant === 'standard'
+    ? 'Standard'
+    : usage.modelBackendVariant === 'max'
+      ? 'Max'
+      : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
+  const tail = [variant, reasoningEffort].filter(Boolean);
+  return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
+}
+
+/** Friendly Claude model name for card copy: `claude-fable-5-1[1m]` → `Fable 5.1`,
+ *  `claude-opus-5` → `Opus 5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`.
+ *  Anything that is not a recognised `claude-<family>-<major>[-<minor>][-<date>]`
+ *  id keeps its raw form.
+ *
+ *  The minor is capped at TWO digits on purpose. Date-suffixed ids without a
+ *  minor (`claude-opus-4-20250514`) otherwise let the minor group swallow the
+ *  date and render "Opus 4.20250514"; with the cap the regex backtracks into
+ *  the date branch and the id reads as plain "Opus 4". No real Claude minor has
+ *  ever been longer than two digits. */
+function claudeModelLabel(id: string): string {
+  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
+  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{6,})?$/i.exec(bare);
+  if (!m) return id.trim();
+  const family = m[1].toLowerCase();
+  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
+}
+
+/** Escape markdown control characters without the non-breaking-space rewrite
+ *  compactRuntimeLabel applies — this notice is prose, not a compact tail. */
+function escapeCardPlainText(value: string): string {
+  return value.replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`);
+}
+
+const MODEL_FALLBACK_LABEL_MAX = 32;
+/** Tighter than the model cap: `trigger` / `apiRefusalCategory` are raw
+ *  provider strings that ride in parentheses at the end of an already-full
+ *  line, and unlike a model id nothing about them is worth more than a glance.
+ *  Real values (`overloaded`, `model_not_found`, `cyber`) fit easily. */
+const MODEL_FALLBACK_REASON_MAX = 24;
+
+/** Bound one transcript-derived token of the notice and force it onto ONE line.
+ *  Every token here comes from Claude's own record, so it can carry newlines,
+ *  control characters or an arbitrarily long `/model` alias — any of which
+ *  would break the single-line footnote the notice is. Real values are well
+ *  under the caps (the longest Claude id, `claude-haiku-4-5-20251001`, is 25
+ *  chars), so this only ever bites a pathological value. */
+function compactNoticeToken(value: string, maxLength: number): string {
+  const normalized = value
+    // C0/C1 controls (newlines included) plus the Unicode line/paragraph
+    // separators, flattened to a space before whitespace is collapsed.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}\u2026`
+    : normalized;
+  return escapeCardPlainText(compact);
+}
+
+function fallbackModelText(id: string): string {
+  return compactNoticeToken(claudeModelLabel(id), MODEL_FALLBACK_LABEL_MAX);
+}
+
+/** One-line notice for a model fallback still in effect, or null when there is
+ *  none. Only the model ids and the reason are rendered — Claude's own record
+ *  carries a full paragraph of prose, which would swamp a status line. */
+export function cardModelFallbackNotice(
+  fallback: ModelFallbackState | undefined,
+  locale?: Locale,
+): string | null {
+  if (!fallback?.originalModel || !fallback.fallbackModel) return null;
+  const rawReason = fallback.kind === 'refusal'
+    ? fallback.apiRefusalCategory
+    : fallback.kind === 'unavailable' ? fallback.trigger : undefined;
+  // The reason is a raw provider string straight out of the transcript, so it
+  // gets the same one-line + bounded + escaped treatment as the model labels;
+  // a multi-line or novel-length trigger would otherwise wreck the footnote.
+  const compactReason = rawReason
+    ? compactNoticeToken(rawReason, MODEL_FALLBACK_REASON_MAX)
+    : '';
+  const reason = compactReason
+    ? t('card.model_fallback.reason', { reason: compactReason }, locale)
+    : t('card.model_fallback.no_reason', undefined, locale);
+  return t(`card.model_fallback.${fallback.kind}`, {
+    originalModel: fallbackModelText(fallback.originalModel),
+    fallbackModel: fallbackModelText(fallback.fallbackModel),
+    reason,
+  }, locale);
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.
@@ -450,25 +621,27 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  // The marker is a visible, versioned link that lets the parser identify a
-  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
-  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
-  // common case now that usageDisplay defaults to the streaming card body and
-  // the reply-card footer is context-only) needs no marker: appending it renders
-  // a dangling "botmux ·". The default/repository brand is plain link text with
-  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
-  // ownership marker (the parser already treats a bare repo link as ordinary
-  // content, matching the long-standing "brand-only is undecidable, keep it"
-  // contract). Any footer carrying usage or a recipient is still signed.
+  // The marker lets the parser identify a card's footer (and strip it before a
+  // bot-to-bot relay). Keep it as invisible text beside the first ordinary
+  // separator: a Markdown-link marker makes Lark render the separator dot as a
+  // clickable Botmux website link. But a BRAND-ONLY footer (no usage or
+  // recipient — the common case now that usageDisplay defaults to the streaming
+  // card body and the reply-card footer is context-only) needs no marker:
+  // appending it renders a dangling "botmux ·". The default/repository brand is
+  // plain link text with no mention, so it cannot trigger bot-to-bot pollution
+  // and does not need the ownership marker (the parser already treats a bare
+  // repo link as ordinary content, matching the long-standing "brand-only is
+  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // is still signed.
   const signMarker = hasUsage || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
   } else if (parts.length > 1) {
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+    signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
     // usage-only / recipient-only (brand disabled) — still marked for parsing.
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+    signedContent = `${parts[0]}${REPLY_CARD_FOOTER_MARKER}`;
   }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {
@@ -476,7 +649,7 @@ export function buildReplyCardFooter(opts: {
     element: {
       tag: 'markdown',
       element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content,
     },
   };
@@ -638,18 +811,71 @@ export function prepareCardMarkdown(
   return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
 }
 
+export interface ExtractedReplyCardHeading {
+  /** Markdown body with the selected heading source line removed. */
+  markdown: string;
+  /** Plain visible text for `header.title`; absent when no eligible heading exists. */
+  heading?: string;
+}
+
+function inlineTokenPlainText(token: Token | undefined): string {
+  if (!token) return '';
+  if (!Array.isArray(token.children)) return token.content.trim();
+  return token.children
+    .map(child => {
+      if (child.type === 'text' || child.type === 'code_inline') return child.content;
+      if (child.type === 'softbreak' || child.type === 'hardbreak') return ' ';
+      if (child.type === 'image') return child.content;
+      return '';
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Consume the first heading that the ordinary body renderer would promote:
+ * a top-level ATX H1/H2 outside code fences. The exact source line is removed
+ * so the Card 2.0 header and body do not repeat it. No other markdown changes.
+ */
+export function extractFirstReplyCardHeading(input: string): ExtractedReplyCardHeading {
+  if (!input) return { markdown: input };
+  const parseInput = unescapeFenceLines(input);
+  const tokens = md.parse(parseInput, {});
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (
+      token.level !== 0
+      || token.type !== 'heading_open'
+      || !/^h[12]$/.test(token.tag)
+      || !/^#{1,2}$/.test(token.markup)
+      || !token.map
+    ) {
+      continue;
+    }
+    const heading = inlineTokenPlainText(tokens[index + 1]);
+    if (!heading) continue;
+    const lines = input.split('\n');
+    const [start, end] = token.map as [number, number];
+    lines.splice(start, Math.max(1, end - start));
+    return { markdown: lines.join('\n'), heading };
+  }
+  return { markdown: input };
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
  *      render them as a grid).
- *   2. Headings → bold (Feishu's markdown widget doesn't render ATX `#`).
+ *   2. H1/H2 → bounded standalone heading widgets; H3-H6 → bold (Feishu's
+ *      markdown widget doesn't render ATX `#`).
  *   3. Code fences → re-emitted with the original backtick run, joined with
  *      blank lines on either side (Feishu's widget needs them to recognise the
  *      fence).
  *   4. Everything else → original source slice, glued by blank lines.
  *
- * All non-table blocks are merged into a single `markdown` element to keep
- * card element counts modest.
+ * Prose between promoted headings/tables/image rows is merged into one
+ * `markdown` element to keep card element counts modest.
  */
 export function buildCardBodyElements(
   input: string,
@@ -665,14 +891,18 @@ export function buildCardBodyElements(
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
+  const layoutBudget = { promotedHeadings: 0 };
   for (const seg of splitImageRowSegments(input)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
-    else elements.push(...buildMarkdownElements(seg.content));
+    else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
 }
 
-function buildMarkdownElements(input: string): any[] {
+function buildMarkdownElements(
+  input: string,
+  layoutBudget: { promotedHeadings: number },
+): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
   const tokens = md.parse(input, {});
@@ -705,7 +935,33 @@ function buildMarkdownElements(input: string): any[] {
     if (t.type === 'heading_open') {
       const inline = tokens[i + 1];
       const text = (inline?.content ?? '').replace(/^#{1,6}\s+/, '').trim();
-      if (text) buf.push(`**${text}**`);
+      const level = Number.parseInt(t.tag.slice(1), 10);
+      const promote = text
+        && level <= 2
+        && /^#{1,2}$/.test(t.markup)
+        && layoutBudget.promotedHeadings < MAX_PROMOTED_CARD_HEADINGS;
+      if (promote) {
+        // Feishu's markdown widget does not render ATX markers. A standalone
+        // Card JSON 2.0 20px heading restores hierarchy without making H1
+        // model output dominate the card. The element id carries the original
+        // ATX level because message reads strip `text_size` — without it the
+        // heading would come back as bare glued text.
+        flushBuf();
+        layoutBudget.promotedHeadings++;
+        elements.push({
+          tag: 'markdown',
+          element_id: replyCardHeadingElementId(
+            level as 1 | 2,
+            layoutBudget.promotedHeadings,
+          ),
+          text_size: 'heading-2',
+          content: text,
+        });
+      } else if (text) {
+        // H3-H6 and headings beyond the safety budget retain the established
+        // compact fallback instead of increasing the component count further.
+        buf.push(`**${text}**`);
+      }
       i += 3; // heading_open, inline, heading_close
       continue;
     }
@@ -954,11 +1210,7 @@ export function buildMarkdownCard(
     elements.push({ tag: 'hr' });
     elements.push(footer.element);
   }
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Build the canonical final-answer card. Streaming/progress/session cards
@@ -984,7 +1236,7 @@ export function buildCanonicalFinalReplyCard(opts: {
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
-  return JSON.stringify({ schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements } });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -1040,7 +1292,7 @@ export function buildContextualReplyCard(opts: {
 
   elements.push({
     tag: 'markdown',
-    text_size: 'heading_2_v2',
+    text_size: 'heading-2',
     content: title,
   });
 
@@ -1076,9 +1328,5 @@ export function buildContextualReplyCard(opts: {
     elements.push(footer.element);
   }
 
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }

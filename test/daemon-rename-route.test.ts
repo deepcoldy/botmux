@@ -42,10 +42,12 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+    daemonRequest: vi.fn(async () => ({ status: 200, raw: '', body: { sessions: [] } })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -112,12 +114,18 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
+    getChatModeStrict: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
 });
+
+vi.mock('../src/daemon-internal-client-wrapper.js', () => ({
+  createDaemonClientFor: vi.fn(() => ({ request: mocks.daemonRequest })),
+}));
 
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
@@ -183,6 +191,7 @@ import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
+  __testOnly_admitFollowerBehindOpening as admitFollowerBehindOpening,
   __testOnly_claimNewDaemonSession as claimNewDaemonSession,
   __testOnly_handleChatModeConverted as handleChatModeConverted,
   __testOnly_handleDocComment as handleDocComment,
@@ -191,11 +200,14 @@ import {
   __testOnly_onQueuedActivationSubmitted as onQueuedActivationSubmitted,
   __testOnly_prewarmDocCommentSession as prewarmDocCommentSession,
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
-  __testOnly_reserveAsyncQueuedActivationTailAdmission as reserveAsyncQueuedActivationTailAdmission,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
-  __testOnly_settleAsyncQueuedActivationTailAdmission as settleAsyncQueuedActivationTailAdmission,
 } from '../src/daemon.js';
-import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
+import {
+  admitQueuedActivationTail,
+  hasQueuedActivationAdmissionGate,
+  reserveQueuedActivationTailAdmission,
+} from '../src/core/worker-pool.js';
+import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -333,6 +345,14 @@ function makeCtx(anchor: string, messageId: string): any {
     anchor,
     larkAppId: APP,
   };
+}
+
+/** A hand-released promise: parks a queued follower's prompt build so an
+ *  opening ACK can be modelled as landing while that build is still awaiting. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>(res => { resolve = res; });
+  return { promise, resolve };
 }
 
 function seedThreadSession(anchor: string, title: string): DaemonSession {
@@ -505,6 +525,7 @@ function resetRouteTestState(): void {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   activeSessions.clear();
+  __testOnly_resetSessionTurnQueues();
   rmSync(crossRefPath(), { force: true });
   rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
@@ -525,6 +546,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.sendEphemeralCard.mockResolvedValue('om_ephemeral');
+    mocks.daemonRequest.mockResolvedValue({ status: 200, raw: '', body: { sessions: [] } });
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
@@ -550,6 +572,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
+    __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
     // master: clear per-bot store files so a seeded cross-ref / bots config from
     // one test can't leak into the next (see the known-peer + /fast tests).
@@ -641,6 +664,75 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` is available at canTalk level without creating a session', async (_label, reply) => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_sessions_root' : 'om_sessions_new';
+    const messageId = reply ? 'om_sessions_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_talk_only' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    await vi.waitFor(() => expect(repliedText()).toContain('本群话题'));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('regular-group top-level `/sessions` stays top-level even after new-topic routing', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_sessions_regular_group_top';
+    const data = makeEventData(messageId, '/sessions');
+
+    await handleNewTopic(data, {
+      ...makeCtx(messageId, messageId),
+      regularGroupTopLevel: true,
+    });
+
+    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage.mock.calls[0]?.[1]).toBe(CHAT);
+    expect(String(mocks.sendMessage.mock.calls[0]?.[2])).toContain('本群话题');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` still denies a sender without canTalk', async (_label, reply) => {
+    const rootId = reply ? 'om_sessions_denied_root' : 'om_sessions_denied_new';
+    const messageId = reply ? 'om_sessions_denied_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_stranger' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
   });
 
   it('pinned cwd + bare `/t` seeds the thread without creating an empty Session', async () => {
@@ -1705,7 +1797,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationResume: undefined,
       pendingRepoSetup: undefined,
     });
-    expect(onQueuedActivationSubmitted(owner, openingToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(owner, openingToken)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -1771,7 +1863,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationResume: undefined,
       pendingRepoSetup: undefined,
     });
-    expect(onQueuedActivationSubmitted(owner, openingToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(owner, openingToken)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -1846,7 +1938,7 @@ describe('/rename production routing — must not pre-create a session (review P
     ]);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+    await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
       turnId: 'om_later_n_plus_1',
@@ -1870,7 +1962,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, successorToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, successorToken)).resolves.toBe(true);
     expect(ds.initialStartPending).toBe(false);
   });
 
@@ -1899,7 +1991,7 @@ describe('/rename production routing — must not pre-create a session (review P
     // into a steer authorization at any layer.
     ds.pendingCodexAppFollowUpGateAccepted = [...gates];
 
-    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+    await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
 
     // release admits the coalesced tail then promotes+sends it. After that, the
     // three durable/live surfaces all persist on ds — assert steerable is absent
@@ -2260,7 +2352,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.initialStartClaimToken).toBe(ownerToken);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(onQueuedActivationSubmitted(ds)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -2279,7 +2371,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, successorToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, successorToken)).resolves.toBe(true);
     expect(ds.initialStartPending).toBe(false);
     expect(ds.initialStartClaimToken).toBeUndefined();
   });
@@ -2288,8 +2380,8 @@ describe('/rename production routing — must not pre-create a session (review P
     { arrivalGate: true, laterGate: false, expectsSidecar: true, label: 'ON→OFF' },
     { arrivalGate: false, laterGate: true, expectsSidecar: false, label: 'OFF→ON' },
   ])(
-    'freezes a queued follower clean-input decision at reservation time ($label)',
-    ({ arrivalGate, laterGate, expectsSidecar }) => {
+    'freezes a queued follower clean-input decision at arrival, even when N\'s ACK lands mid-build ($label)',
+    async ({ arrivalGate, laterGate, expectsSidecar }) => {
       const bot = registerBot({
         larkAppId: APP,
         larkAppSecret: 's',
@@ -2305,34 +2397,43 @@ describe('/rename production routing — must not pre-create a session (review P
       ds.hasHistory = true;
       ds.session.cliId = 'codex-app';
 
-      const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBe(1);
+      // Arrival: FIFO order and the clean-input decision are stamped synchronously.
+      const reservation = reserveQueuedActivationTailAdmission(ds);
       bot.config.codexAppCleanInput = laterGate;
 
-      // Model N's ACK landing while N+1 is still awaiting prompt materialization.
-      expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+      // N+1's prompt build is still awaiting when N's ACK lands. Both are
+      // commands on the session's turn queue, in arrival order: the release
+      // must not run until the follower's admission has landed.
+      const build = deferred();
       const sidecar = {
         text: 'FOLLOWER_CLEAN_N1',
         additionalContext: {
           hidden: { kind: 'application' as const, value: '<hidden>arrival</hidden>' },
         },
       };
-      admitQueuedActivationTail(ds, {
-        userPrompt: 'FOLLOWER_CLEAN_N1',
-        cliInput: {
-          content: '<user_message>FOLLOWER_LEGACY_N1</user_message>',
-          codexAppInput: sidecar,
-        },
-        turnId: 'turn-clean-follower',
-        dispatchAttempt: 2,
-      }, reservation);
-      settleAsyncQueuedActivationTailAdmission(ds);
+      const admission = runSessionTurn(ds.session.sessionId, async () => {
+        await build.promise;
+        admitQueuedActivationTail(ds, {
+          userPrompt: 'FOLLOWER_CLEAN_N1',
+          cliInput: {
+            content: '<user_message>FOLLOWER_LEGACY_N1</user_message>',
+            codexAppInput: sidecar,
+          },
+          turnId: 'turn-clean-follower',
+          dispatchAttempt: 2,
+        }, reservation);
+      });
+      const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+      await Promise.resolve();
+      expect(send).not.toHaveBeenCalled();
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      build.resolve();
+      await admission;
+      await expect(ack).resolves.toBe(true);
 
       const expectedSidecar = expectsSidecar
         ? { ...sidecar, clientUserMessageId: 'turn-clean-follower' }
         : undefined;
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-      expect(ds.queuedActivationTailReleasePending).toBeUndefined();
       expect(ds.session.queuedActivationTail).toBeUndefined();
       expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(expectedSidecar);
       expect(ds.session.codexAppDispatchLedger?.at(-1)?.codexAppInput)
@@ -2359,16 +2460,22 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
 
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    const build = deferred();
+    const admission = runSessionTurn(ds.session.sessionId, async () => {
+      await build.promise;
+      admitQueuedActivationTail(ds, {
+        userPrompt: 'LATE_N_PLUS_1',
+        cliInput: { content: 'LATE_N_PLUS_1' },
+        turnId: 'turn-late-n1',
+      }, reservation);
+    });
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
     // N's worker exits after its ACK but before the reserved N+1 finishes.
     ds.worker = null;
-    admitQueuedActivationTail(ds, {
-      userPrompt: 'LATE_N_PLUS_1',
-      cliInput: { content: 'LATE_N_PLUS_1' },
-      turnId: 'turn-late-n1',
-    }, reservation);
-    settleAsyncQueuedActivationTailAdmission(ds);
+    build.resolve();
+    await admission;
+    await expect(ack).resolves.toBe(true);
 
     expect(ds.session).toMatchObject({
       queuedActivationPending: true,
@@ -2399,35 +2506,122 @@ describe('/rename production routing — must not pre-create a session (review P
     ]);
   });
 
-  it('releases the route when a post-ACK async follower admission fails', () => {
+  it('releases the route when a follower admission queued ahead of the ACK fails', async () => {
     const ds = seedThreadSession('om_failed_late_admission', 'failed late admission');
     ds.session.cliId = 'claude-code';
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    const reservation = reserveQueuedActivationTailAdmission(ds);
     mocks.updateSession.mockImplementationOnce(() => {
       throw new Error('tail persistence unavailable');
     });
 
-    expect(() => {
-      try {
-        admitQueuedActivationTail(ds, {
-          userPrompt: 'FAILED_N_PLUS_1',
-          cliInput: { content: 'FAILED_N_PLUS_1' },
-          turnId: 'turn-failed-n1',
-        }, reservation);
-      } finally {
-        settleAsyncQueuedActivationTailAdmission(ds);
-      }
-    }).toThrow('tail persistence unavailable');
+    const admission = runSessionTurn(ds.session.sessionId, () => admitQueuedActivationTail(ds, {
+      userPrompt: 'FAILED_N_PLUS_1',
+      cliInput: { content: 'FAILED_N_PLUS_1' },
+      turnId: 'turn-failed-n1',
+    }, reservation));
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    await expect(admission).rejects.toThrow('tail persistence unavailable');
+    // The failed command never blocks the release queued behind it.
+    await expect(ack).resolves.toBe(true);
 
     expect(ds.session.queuedActivationTail).toBeUndefined();
-    expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-    expect(ds.queuedActivationTailReleasePending).toBeUndefined();
     expect(ds.initialStartPending).toBe(false);
     expect(ds.initialStartClaimToken).toBeUndefined();
     expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
+  });
+
+  it('promotes a follower whose admission ran after the opening ACK had already released the route', async () => {
+    const ds = seedThreadSession('om_ack_before_follower', 'ACK before follower admission');
+    ds.session.cliId = 'claude-code';
+    ds.initialStartPending = true;
+    ds.hasHistory = true;
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    // N's ACK is enqueued first; the follower arrived in the same tick — its
+    // order is stamped now, its build + admission queued behind the release.
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    let routeHeldAtAdmission: boolean | undefined;
+    const admission = admitFollowerBehindOpening(ds, reservation, {
+      userPrompt: 'AFTER_RELEASE_N_PLUS_1',
+      turnId: 'turn-after-release-n1',
+      build: async () => {
+        // The release ran ahead and found an empty tail: the route is gone by
+        // the time this follower is built, so nothing else will promote it.
+        routeHeldAtAdmission = ds.initialStartPending;
+        return { content: 'AFTER_RELEASE_N_PLUS_1' };
+      },
+    });
+    await expect(ack).resolves.toBe(true);
+    await admission;
+    expect(routeHeldAtAdmission).toBe(false);
+    // …so the same command promoted it inline, with no separate release call.
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-after-release-n1',
+      content: 'AFTER_RELEASE_N_PLUS_1',
+      queuedActivationToken: expect.any(String),
+    }));
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+  });
+
+  it('retries inline promote when the opening already released and the store write fails', async () => {
+    const ds = seedThreadSession('om_inline_promote_retry', 'inline promote retry');
+    ds.session.cliId = 'claude-code';
+    ds.initialStartPending = true;
+    ds.hasHistory = true;
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    mocks.updateSession
+      .mockImplementationOnce((session: any) => { mocks.sessions.set(session.sessionId, session); })
+      .mockImplementationOnce(() => { throw new Error('promote persist unavailable'); });
+    const admission = admitFollowerBehindOpening(ds, reservation, {
+      userPrompt: 'AFTER_RELEASE_RETRY',
+      turnId: 'turn-after-release-retry',
+      build: async () => ({ content: 'AFTER_RELEASE_RETRY' }),
+    });
+    await expect(ack).resolves.toBe(true);
+    await admission;
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'turn-after-release-retry' }),
+    ]);
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeDefined();
+
+    const deadline = Date.now() + 1_000;
+    while (!ds.session.queuedActivationPending && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('turn-after-release-retry');
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-after-release-retry',
+      content: 'AFTER_RELEASE_RETRY',
+    }));
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
+  });
+
+  it('holds the admission gate while a follower is still being built, so a live-worker turn cannot overtake it', async () => {
+    const ds = seedThreadSession('om_gate_follows_queue', 'gate follows the turn queue');
+    ds.session.cliId = 'claude-code';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(false);
+
+    const build = deferred();
+    const admission = runSessionTurn(ds.session.sessionId, async () => { await build.promise; });
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(true);
+    build.resolve();
+    await admission;
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(false);
   });
 
   it('releases a failed queued-refork claim so a later inbound can become the owner', async () => {
@@ -2486,7 +2680,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     // Promotion is already a durable acceptance boundary: an IPC throw fences
     // this child but keeps one tokened journal owner for exact recovery.
-    expect(onQueuedActivationSubmitted(ds)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds)).resolves.toBe(true);
     expect(failedSend).toHaveBeenCalledTimes(1);
     expect(kill).toHaveBeenCalledTimes(1);
     expect(ds.pendingFollowUps).toBeUndefined();
@@ -2532,7 +2726,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, retainedToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, retainedToken)).resolves.toBe(true);
     expect(resumedSend).toHaveBeenCalledTimes(1);
     expect(resumedSend).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',

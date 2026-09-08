@@ -7,8 +7,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Counting settings-file reads is the only way to pin the gate ORDER: on an
 // ordinary host the verdict is null either way, so only the syscall is
 // observable. Wraps the real implementation — nothing is stubbed out.
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>();
+vi.mock('node:fs', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('node:fs') as typeof import('node:fs');
   return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
 });
 

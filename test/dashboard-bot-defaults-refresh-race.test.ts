@@ -10,8 +10,11 @@ import TestRenderer, { act } from 'react-test-renderer';
 // stays discoverable; production keeps its real createPortal behavior untouched. Only
 // createPortal is overridden — everything else in react-dom (which react-test-renderer
 // depends on) passes through.
-vi.mock('react-dom', async (importActual) => {
-  const actual = await importActual<typeof import('react-dom')>();
+vi.mock('react-dom', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('react-dom') as typeof import('react-dom');
   return { ...actual, createPortal: (children: React.ReactNode) => children };
 });
 

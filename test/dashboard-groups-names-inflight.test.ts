@@ -28,6 +28,24 @@ function payload() {
   };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => body,
+  } as Response;
+}
+
 let urls: string[] = [];
 
 beforeEach(() => {
@@ -97,6 +115,51 @@ describe('启动链只发一次请求（app.tsx 的 Promise.all 并发形态）'
     await api.fetchGroupsSnapshot();
     // 必须真的发出 full 请求，不能拿 cachedNames 顶
     expect(urls.filter(u => u === FULL_URL)).toHaveLength(1);
+  });
+});
+
+describe('完整群组快照共享缓存顺序', () => {
+  it('较新的强制刷新失败后，仍复用较早但成功的完整快照，不额外发第三次请求', async () => {
+    const olderSuccess = {
+      chats: [{ chatId: 'oc_a', name: 'Older success', memberBots: [] }],
+      bots: [{ larkAppId: 'cli_1', botName: 'bot-one' }],
+    };
+    const unexpectedThirdRequest = {
+      chats: [{ chatId: 'oc_c', name: 'Unexpected third request', memberBots: [] }],
+      bots: [{ larkAppId: 'cli_3', botName: 'bot-three' }],
+    };
+    const forcedA = deferred<Response>();
+    const forcedB = deferred<Response>();
+    const requests: string[] = [];
+    let forcedCount = 0;
+
+    vi.resetModules();
+    vi.stubGlobal('fetch', vi.fn((url: unknown) => {
+      const requestUrl = String(url);
+      requests.push(requestUrl);
+      if (requestUrl === FULL_URL) {
+        return Promise.resolve(jsonResponse(unexpectedThirdRequest));
+      }
+      if (requestUrl === '/api/groups?refresh=1') {
+        forcedCount += 1;
+        if (forcedCount === 1) return forcedA.promise;
+        if (forcedCount === 2) return forcedB.promise;
+      }
+      throw new Error(`Unexpected request: ${requestUrl}`);
+    }));
+
+    const api = await import('../src/dashboard/web/groups-api.js');
+    const requestA = api.fetchGroupsSnapshot({ force: true });
+    const requestB = api.fetchGroupsSnapshot({ force: true });
+
+    forcedB.reject(new Error('latest_failed'));
+    await expect(requestB).rejects.toThrow('latest_failed');
+
+    forcedA.resolve(jsonResponse(olderSuccess));
+    await expect(requestA).resolves.toEqual(olderSuccess);
+
+    await expect(api.fetchGroupsSnapshot()).resolves.toEqual(olderSuccess);
+    expect(requests).toEqual(['/api/groups?refresh=1', '/api/groups?refresh=1']);
   });
 });
 

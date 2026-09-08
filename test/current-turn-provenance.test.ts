@@ -8,6 +8,7 @@ import {
   resolveCurrentTurnProvenance,
 } from '../src/core/current-turn-provenance.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const SCHED_TASK_ID = 'abcdef12';
 const SCHED_TURN_ID = `schedule:${SCHED_TASK_ID}:12345678-1234-1234-1234-123456789abc`;
@@ -53,10 +54,9 @@ describe('resolveCurrentTurnProvenance', () => {
       quoteTargetId: 'turn-current',
       ...overrides,
     };
-    writeFileSync(
-      join(dataDir, 'sessions-cli_real.json'),
-      JSON.stringify({ [session.sessionId]: session }),
-    );
+    // The durable session record lives in the per-bot SQLite store; the frozen
+    // `sessions-<appId>.json` is only an import source and is never read here.
+    seedPersistedSessionRows(dataDir, 'cli_real', { [session.sessionId]: session });
   }
 
   function writeScheduledTask(overrides: Record<string, unknown> = {}): void {

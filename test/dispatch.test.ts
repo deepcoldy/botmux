@@ -994,6 +994,26 @@ describe('acceptedDispatchBotAppIds', () => {
     })).toEqual(['cli_repo']);
   });
 
+  it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_stale_trace_root',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+    };
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(session.dispatchInputReceipts).toBeUndefined();
+  });
+
   it('rejects a receipt from the previous worker generation after replacement', () => {
     const session = {
       larkAppId: 'cli_repo',

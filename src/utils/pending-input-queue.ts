@@ -17,6 +17,13 @@ export interface PendingCliInput {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   trustedCaller?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
+  /** Best-effort CLI-native title to apply after this exact user input has
+   * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
+   * does not fall back to Botmux's injected routing envelope. */
+  nativeSessionTitle?: string;
+  /** Source text for Codex App semantic title generation. Plain TUI adapters
+   * keep only nativeSessionTitle and ignore this prompt. */
+  nativeSessionTitlePrompt?: string;
   /**
    * mojo only: the credential snapshot that arrived WITH this turn.
    *
@@ -95,6 +102,8 @@ export function mergeQueuedCliInput(
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
+    || tail.nativeSessionTitle || next.nativeSessionTitle
+    || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;

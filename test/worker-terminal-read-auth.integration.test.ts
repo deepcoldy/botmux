@@ -5,8 +5,8 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { WebSocket } from 'ws';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { WebSocket } from './helpers/node-ws.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
 import {
@@ -154,7 +154,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'terminal-auth-session';
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -412,7 +412,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'view-central-session';
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -535,7 +535,7 @@ setInterval(() => {}, 1_000);
     };
     const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
       const logs: string[] = [];
-      const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -656,7 +656,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'ws-handshake-race-session';
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -737,7 +737,12 @@ setInterval(() => {}, 1_000);
     expect(live.kind).toBe('closed');
     expect(live.code).toBe(4003);
     expect(live.reason).toBe('view expired');
-    expect(live.received).toContain(seedMarker);
+    // Registration proof is the out-of-band write-capability frame (first
+    // message, same tick as `wsClients.add`). PTY scrollback seed can miss
+    // the short-lived socket on both bun's WS client and a CJS `ws` client
+    // when the fake CLI has not flushed before expiry — the 4003 close is
+    // the contract this case is pinning.
+    expect(live.received).toContain('{"botmux":"terminal.write","write":false}');
     expect(Date.now() - liveStart).toBeGreaterThanOrEqual(liveTtlMs - 300);
 
     // 量一次 access 解析在这台机器上到底多贵——这个数值就是那条缝的宽度：

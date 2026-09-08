@@ -48,12 +48,12 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--silent]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 
 ### 查看
 
@@ -268,9 +268,9 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 - 合并转发消息会自动展开（内嵌子卡片只有文本渲染，\`--raw\` 不覆盖子消息）
 `;
 
-const SEND_SKILL = `---
+export const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -279,7 +279,7 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 
 **发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
 
-**格式自动处理**：内容含 markdown 语法时自动用飞书卡片（schema 2.0）发送，原生渲染；纯文本走普通消息。**该用 md 就用 md**——结构化内容（列表、表格、代码块）不要手撸成纯文本。
+**格式自动处理**：普通回复统一用飞书卡片（schema 2.0）发送；单句纯文本仍保持轻量正文，Markdown 标题和表格转换为独立组件，代码块由富文本组件原生渲染。**该用 md 就用 md**——结构化内容不要手撸成纯文本或 ASCII 表格。
 
 ## 什么时候用
 
@@ -293,6 +293,30 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 - 中间过程的调试输出
 - 给自己看的分析笔记
 - 纯粹的代码操作（编辑/运行命令）
+
+## 输出排版：按信息复杂度分流
+
+- **单句确认 / 简短状态**：直接写一段，不强加标题、表格或“结论/详情”空壳。
+- **复杂结果 / 方案 / 风险**：先用一个简短的 \`#\` 或 \`##\` 标题，再用一句话给结论；正文只保留 2–4 个有信息量的分节。
+- **多项同类事实**用列表，对比或字段映射用 pipe 表格，命令与代码用 fenced code block；不要靠连续空格、全角符号或 ASCII 线框对齐。
+- **需要用户继续动作**时，把“下一步 / 需要你确认”放在最后一节；状态 emoji 只作少量语义提示，不堆装饰。
+
+短消息保持轻，只有信息确实需要层级时才使用结构化 Markdown。
+
+### 可选排版配方（参考，不是强制模板）
+
+默认使用自由 Markdown；根据回复的真实语义选择配方，不匹配就不用，也可以混搭。标题名称、区块顺序、语气和少量 emoji 都可以个性化，**不要输出没有内容的占位区块**。
+
+| 语义信号 | 参考配方 | 示例骨架 |
+|---|---|---|
+| 已完成并交付 | 结果摘要 | \`# 结果\` → 一句话结论 → \`## 变更\` → \`## 验证\` → 可选的下一步 |
+| 任务仍在运行，需要汇报走到哪 | 进度更新 | \`# 进度\`（仅有可靠数据时附 N%）→ 当前状态 → 已完成 / 进行中 / 下一步 |
+| 两个以上方案需要比较 | 方案对比 | \`# 方案对比\` → 一句话判断 → 对比表格 → 推荐与理由 |
+| 存在风险或需要用户拍板 | 风险 / 待确认 | \`# 需要确认\` → 影响 → 选项或风险表 → 明确请用户决定什么 |
+| 任务失败或被硬阻塞（需要人介入） | 风险 / 待确认 | 失败 / 阻塞原因 → 影响 → 需要用户做什么；发送时加 \`--attention\` |
+| 交给下一个 Agent 或人继续 | 交接说明 | \`# 交接\` → 已完成与产物 → 剩余事项 / 风险 → 下一位执行者和动作 |
+
+配方提供稳定的信息结构，不规定 Agent 的口吻：表中的标题、顺序、emoji 和具体骨架都只是示例，可以改名、删减、重排或组合，保留自己的表达风格。单句确认和简短状态仍直接回复；对不上这五类时继续用自由 Markdown，不为“使用模板”而使用模板。配方只影响 Markdown 写法，不自动选择彩色卡头、状态色或特殊布局；需要用户从选项中做真实选择时使用 \`botmux ask\`，不要在普通回复里画不能点击的按钮。
 
 ## 卡住了需要人介入：\`--attention\`
 
@@ -363,7 +387,8 @@ botmux send --content-file $msg
 
 | 语法 | 渲染 |
 |---|---|
-| \`# / ## / ###\` 标题 | 转**加粗**（v2 markdown 元素不支持 ATX 标题） |
+| \`# / ##\` 标题 | 独立标题组件（最多提升前 6 个，超出后回退为加粗） |
+| \`###\`–\`######\` 标题 | 转**加粗**，避免把卡片拆得过碎 |
 | \`**加粗**\` / \`*斜体*\` / \`~~删除线~~\` | 原生渲染 |
 | \`\\\`inline code\\\`\` / \\\`\\\`\\\` 代码块 \\\`\\\`\\\` | 原生渲染（代码块内 \`#\` 和 \`|\` 不会被误解析） |
 | \`- 项\` / \`1. 项\` / 嵌套列表 | 原生渲染 |
@@ -449,6 +474,24 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 
 成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
 
+#### 原生打字机流式更新：\`botmux card stream\`
+
+需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
+STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
+
+# write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
+\`\`\`
+
+如果同一任务需要跟随较新的用户输入，先用当前完整卡片内容发出新卡，再调用 \`stream reanchor --stream-id <旧流> --message-id <新卡>\`。Botmux 会在新流就绪后拒绝旧流的迟到写入、迁移已绑定的运行状态，并尽力撤回旧消息。成功输出会返回新的 \`messageId\` / \`streamId\`，调用方必须立即更新自己的持久化状态。是否跟随新输入由调用 Skill 决定，Core 不自动撤回任意卡片。
+
+多行内容也可用 \`--content-file -\` 从 stdin 读取。核心命令只负责 transport、会话归属、顺序与幂等；阶段、公开工作摘要、工具事件和 UI 语义应由机器人自己的 Skill 决定。不要把模型私有原始 CoT 写进卡片，只展示可公开、可验证的工作摘要。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -517,6 +560,19 @@ botmux send --top-level "📢 重要更新：xxx"
 # 跨群顶层发布（任意群，给定 chat_id）
 botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 \`\`\`
+
+文件 sandbox 内不会把跨群/顶层路由静默降级：上述
+\`send --chat-id/--top-level\` 会明确返回
+\`ROUTING_NOT_SUPPORTED\`。跨 Bot 投递请改用稳定 App ID 的受管派单：
+
+\`\`\`bash
+botmux dispatch --chat-id oc_xxxxxxxxxxxx --bot-app cli_xxxxxxxxxxxx \\
+  --title "子任务" --brief "任务内容"
+\`\`\`
+
+sandbox dispatch 暂不支持
+\`--into\`；需要追加既有话题时由宿主侧会话执行，避免把已校验群与实际
+\`om_\` 线程拆成两个独立授权目标。
 
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 

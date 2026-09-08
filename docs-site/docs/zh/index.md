@@ -4,7 +4,7 @@
 
 botmux 是一座桥：一个常驻 **daemon** 监听飞书消息，为每个新话题自动启动一个独立的 AI 编程 CLI 进程（Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity 等），把终端输出实时渲染成飞书**流式卡片**，并提供一个可交互的 **Web 终端**。手机、电脑、飞书三端同步——人在哪儿，编程会话就跟到哪儿。
 
-> 项目地址：<https://github.com/deepcoldy/botmux> ｜ npm：`npm install -g botmux`
+> 项目地址：<https://github.com/deepcoldy/botmux> ｜ 安装：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh`（自包含二进制，不需要 Node；也可 `npm i -g botmux`）
 
 ## 设计理念：不做 SDK wrapper，直接桥接 CLI
 

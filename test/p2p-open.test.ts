@@ -71,6 +71,53 @@ describe('p2pOpen', () => {
     expect(canOperate('p3', 'oc_group', 'ou_anyone')).toBe(false);
   });
 
+  // /quote 的 confirm 按钮能触发真实 CLI turn（sendWorkerInput / forkWorker），
+  // 所以点击时要现场复查权限。这里钉住 chatType 被传进那道复查：漏了它，
+  // canRunDaemonCommand 的 p2pOpen 腿失效（docstring 明写 chatType 省略即 fail-closed），
+  // 配了 p2pOpen 的 bot 在私聊里会变成「卡片能召唤、点确认永远被拒」。
+  // 与上面「chatType 缺省时按原语义（不放行）」是同一道防线在新调用点上的延续。
+  it('/quote confirm 的权限复查把 chatType 传进 canRunDaemonCommand', () => {
+    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("if (value?.action === 'quote_confirm'");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const block = source.slice(start, start + 4000);
+    // 闸必须在，且必须真的是「取反后守卫一个 return」的形状。
+    // 只断言 `canRunDaemonCommand(` 出现是不够的：我实测把条件改成
+    // `if (false && !canRunDaemonCommand(...))` 时那种断言照样绿——调用还在，
+    // 但闸已失效。所以这里钉住 `if (!canRunDaemonCommand(` 这个开头，
+    // 并要求它后面紧跟着拒绝分支。
+    expect(block).toMatch(/if \(!canRunDaemonCommand\(/);
+    // chatType 实参必须是 ds.chatType，不能省（省了 p2pOpen 腿失效）
+    expect(block).toMatch(/if \(!canRunDaemonCommand\([\s\S]*?ds\.chatType,\s*\)\) \{/);
+    // 命中时必须拒绝（返回 toast），不能只记日志放行
+    const gateBody = block.slice(block.indexOf('if (!canRunDaemonCommand('));
+    expect(gateBody.slice(0, 600)).toMatch(/return \{ toast:/);
+  });
+
+  // operator 缺失时必须拒绝。re-render 分支已经是 fail-closed（要求 operatorOpenId），
+  // 而 confirm 是真正触发 CLI turn 的那条，不能比它更松。
+  it('/quote confirm 的 invoker 校验在 operator 缺失时 fail-closed', () => {
+    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("if (value?.action === 'quote_confirm'");
+    const block = source.slice(start, start + 4000);
+    // 必须以 !operatorOpenId 起头短路；旧形状 `invokerOpenId && operatorOpenId && …`
+    // 在 operator 缺失时整个条件为 false，等于放行。
+    expect(block).toMatch(/if \(!operatorOpenId \|\| \(invokerOpenId && invokerOpenId !== operatorOpenId\)\)/);
+    expect(block).not.toMatch(/if \(invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId\)/);
+  });
+
+  it('/quote confirm 用命令入口的同一个谓词，不是硬 canOperate', () => {
+    // canRunDaemonCommand = canOperate ∪ (cmd ∈ canTalkDaemonCommands && canTalk)。
+    // /quote 可以被 owner 配进 canTalkDaemonCommands 交给 talk-only 用户，此时若
+    // confirm 处用硬 canOperate，这类 bot 上会「能召唤、点确认必拒」。
+    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("if (value?.action === 'quote_confirm'");
+    const block = source.slice(start, start + 4000);
+    const gate = block.slice(block.indexOf('canRunDaemonCommand('));
+    // 判据是 '/quote'（与命令入口同一条命令），而不是别的命令名
+    expect(gate).toMatch(/'\/quote'/);
+  });
+
   it('Saved Workflow 的独立 quota 闸把 chatType 传进 canTalk 复查', () => {
     const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     const start = source.indexOf('async function handleV3SavedWorkflowCommandIfAny(');

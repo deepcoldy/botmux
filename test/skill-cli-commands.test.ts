@@ -55,6 +55,28 @@ describe('botmux skill session command', () => {
     expect(runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 's1' }).stdout).toContain('# Deploy');
   });
 
+  it('renders botmux-send from the explicit per-session reply style env', () => {
+    const result = runSkillSessionCommand(['show', 'botmux-send'], {
+      BOTMUX_SESSION_ID: 's1',
+      BOTMUX_LARK_APP_ID: 'app-1',
+      BOTMUX_REPLY_STYLE: JSON.stringify({ recipes: false, layout: false }),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('name: botmux-send');
+    expect(result.stdout).not.toContain('可选排版配方');
+    expect(result.stdout).not.toContain('结果摘要');
+    expect(result.stdout).not.toContain('--layout');
+  });
+
+  it('renders the default guide outside an injected session even with a stale ambient style', () => {
+    const result = runSkillSessionCommand(['show', 'botmux-send'], {
+      BOTMUX_REPLY_STYLE: JSON.stringify({ recipes: false, layout: false }),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('可选排版配方');
+    expect(result.stdout).toContain('--layout result');
+  });
+
   it('reads relative resources', () => {
     expect(runSkillSessionCommand(['read', 'deploy', 'references/release.md'], { BOTMUX_SESSION_ID: 's1' }).stdout).toContain('# Release');
   });

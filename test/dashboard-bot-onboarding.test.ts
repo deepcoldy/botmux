@@ -6,10 +6,10 @@ import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
 import type { RegisterAppOptions, RegisterAppResult } from '../src/setup/register-app.js';
 import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
 
-const { userGetMock, batchGetIdMock } = vi.hoisted(() => ({
+const { userGetMock, batchGetIdMock } = {
   userGetMock: vi.fn(),
   batchGetIdMock: vi.fn(),
-}));
+};
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class {

@@ -8,7 +8,8 @@
 
 ## 环境 / 安装
 
-- **Node 太老**：v18 等没内置全局 `fetch`，`botmux setup` 会报 `fetch is not defined` / `fetch failed` 且不写 `bots.json`。→ 升级到 **Node ≥ 22**。
+- **装完 `botmux: command not found`**：`~/.botmux/bin` 没进 PATH。两种安装方式都会写你当前 shell 的启动文件，但**要开个新终端（或 source 一下）才生效**。⚠️ 已知限制：如果执行安装时 `~/.botmux/bin` 恰好已在当前进程的 PATH 里（**在 botmux 自己的 CLI 会话里装就是这种情况**——daemon 会把它注入每个会话的 PATH），`install.sh` 会认为无需处理而**不写启动文件**，于是新终端里仍然找不到。→ 在**普通终端**里装，或手动把 `export PATH="$HOME/.botmux/bin:$PATH"` 加进启动文件。
+- **Node 太老**（仅 npm 安装路径）：v18 等没内置全局 `fetch`，`npm i -g botmux` 的 postinstall 或 `botmux setup` 会报 `fetch is not defined` / `fetch failed`。→ 升级到 **Node ≥ 22**，或改用 curl 安装方式（自包含二进制，不需要 Node）。
 - **首次启动卡在人工确认**：CLI（如 Claude Code）首次会弹"信任目录 / bypass 权限"确认，没人工点过会卡住、报 `tmux send-keys` 错。→ 首次手动确认一次，之后不再出现。
 
 ## 环境变量丢失（高频）

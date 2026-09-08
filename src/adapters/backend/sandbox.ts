@@ -25,12 +25,13 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
-import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { isValidPluginId } from '../../core/plugins/ids.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -94,6 +95,7 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  const privateReadonlyByParent = new Map<string, string[]>();
   for (const entry of input.privateReadonlyDirectories ?? []) {
     const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
     const directory = assertCredentialIsolationPath(
@@ -103,10 +105,18 @@ export function buildCredentialOnlySandboxArgs(input: {
     if (!directory.startsWith(`${parent}/`)) {
       throw new Error(`private readonly directory must be below its parent: ${directory}`);
     }
-    // Hide every sibling channel first, then expose only the owning directory.
+    const existing = privateReadonlyByParent.get(parent) ?? [];
+    if (!existing.includes(directory)) existing.push(directory);
+    privateReadonlyByParent.set(parent, existing);
+  }
+  for (const parent of [...privateReadonlyByParent.keys()].sort()) {
+    // Hide every sibling channel first, then expose only the owning directories.
     // A directory bind (rather than a file bind) observes the worker's atomic
     // rename-based capability rotations without pinning the old inode.
-    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+    args.push('--tmpfs', parent);
+    for (const directory of privateReadonlyByParent.get(parent)!.sort()) {
+      args.push('--ro-bind', directory, directory);
+    }
   }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
@@ -779,8 +789,9 @@ export function prepareDirectSandbox(opts: {
     const target = resolve(rawTarget);
     try {
       if (!lstatSync(target).isFile()) continue;
+      const resolvedTarget = realpathSync(target);
       // Compare resolved paths: either side may be reached through a symlink.
-      if (selfExec !== undefined && realpathSync(target) === selfExec) continue;
+      if (selfExec !== undefined && resolvedTarget === selfExec) continue;
       args.push('--ro-bind', shim, target);
     } catch { /* missing/stale config target — PATH shim remains available */ }
   }
@@ -836,6 +847,13 @@ export function prepareDirectSandbox(opts: {
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
   }
   for (const k of PROXY_ENV_KEYS) {
+    const v = process.env[k];
+    if (typeof v === 'string' && v) env[k] = v;
+  }
+  // Authority-symmetric with the proxy keys: a CA bundle the operator set (or
+  // the worker resolved) must survive into the bwrap child, or TLS breaks for
+  // the same reason this feature exists on darwin.
+  for (const k of CA_BUNDLE_ENV_KEYS) {
     const v = process.env[k];
     if (typeof v === 'string' && v) env[k] = v;
   }
@@ -961,7 +979,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   }
 }
 
-// ─────────────────────── botmux send relay (unchanged) ───────────────────────
+// ─────────────────────── botmux send / dispatch relay ───────────────────────
 
 // Relay request schema (written by cli.ts relaySend, validated here). The
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
@@ -969,6 +987,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // write any outbox file, so everything here is treated as untrusted.
 //   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
+  command?: unknown;
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
@@ -980,15 +999,23 @@ export interface RelayRequest {
   originDispatchAttempt?: unknown;
   originCapability?: unknown;
 }
-// Presentation-only flags the sandbox may pass through. Path-bearing flags
+// Presentation flags plus the plugin id required to authorize a callback card.
+// Path-bearing flags
 // (--content-file/--file(s)/--image(s)/--video(s)), routing flags
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+const RELAY_FLAGS_VAL = new Set([
+  '--mention',
+  '--quote',
+  '--response-kind',
+  '--layout',
+  '--plugin-card-action',
+]);
 
 export interface ValidatedRelay {
+  command: 'send' | 'dispatch';
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
@@ -1045,11 +1072,42 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     if (!safeName(a)) return { ok: false, error: 'video cover must be a plain outbox basename' };
     videoCoverNames.push(a);
   }
+  const command = req.command === undefined || req.command === 'send'
+    ? 'send'
+    : req.command === 'dispatch'
+      ? 'dispatch'
+      : null;
+  if (command === null) return { ok: false, error: 'command must be send or dispatch' };
+  if (command === 'dispatch' && (
+    preparedContentName !== undefined
+    || cardName !== undefined
+    || attachmentNames.length > 0
+    || videoNames.length > 0
+    || videoCoverNames.length > 0
+  )) {
+    return { ok: false, error: 'dispatch relay does not accept cards or attachments' };
+  }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
+    if (command === 'dispatch') {
+      if (f === '--steer') { flags.push(f); continue; }
+      if (!dispatchValueFlags.has(f)) return { ok: false, error: `dispatch flag not allowed: ${f}` };
+      const v = rawFlags[i + 1];
+      if (typeof v !== 'string' || !v || v.startsWith('--') || v.length > 512) {
+        return { ok: false, error: `dispatch flag ${f} needs a bounded string value` };
+      }
+      if (f === '--bot-app' && !/^cli_[A-Za-z0-9_-]{1,128}(?::[^\0]{1,200})?$/.test(v)) {
+        return { ok: false, error: 'dispatch --bot-app must be a stable app id' };
+      }
+      if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
+        return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      flags.push(f, v); i++; continue;
+    }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
     if (RELAY_FLAGS_VAL.has(f)) {
       const v = rawFlags[i + 1];
@@ -1061,9 +1119,18 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
       }
+      if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
+        return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
+      }
+      if (f === '--plugin-card-action' && !isValidPluginId(v)) {
+        return { ok: false, error: 'flag --plugin-card-action must be a valid plugin id' };
+      }
       flags.push(f, v); i++; continue;
     }
     return { ok: false, error: `flag not allowed: ${f}` };
+  }
+  if (flags.includes('--plugin-card-action') && cardName === undefined) {
+    return { ok: false, error: 'flag --plugin-card-action requires a card file' };
   }
   const originTurnId = req.originTurnId === undefined
     ? undefined
@@ -1092,6 +1159,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   return {
     ok: true,
     value: {
+      command,
       contentName: req.contentFile,
       preparedContentName,
       cardName,
@@ -1283,10 +1351,12 @@ export function startOutboxWatcher(
 
       const hostArgs = [
         ...v.value.flags,
-        ...(cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
-        ...attPaths.flatMap(a => ['--files', a]),
-        ...videoPaths.flatMap(a => ['--videos', a]),
-        ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
+        ...(v.value.command === 'dispatch'
+          ? ['--brief-file', contentDest]
+          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+        ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
+        ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
+        ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
       // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
@@ -1316,7 +1386,7 @@ export function startOutboxWatcher(
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
-      const child = spawn(cliInvocation.command, [...cliInvocation.args, 'send', ...hostArgs], { env: requestEnv });
+      const child = spawn(cliInvocation.command, [...cliInvocation.args, v.value.command, ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });

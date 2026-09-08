@@ -5,9 +5,9 @@ Manage the daemon and sessions from the terminal.
 | Command | Description |
 |------|------|
 | `botmux setup` | Interactive configuration (first run / add / edit / delete a bot) |
-| `botmux start` | Start the daemon (managed by PM2) |
+| `botmux start [--companion-secret-file <path> --companion-bot <appId>]` | Start the daemon. Supplying both companion options enables the closed local API for exactly one isolated test Bot; see [Local Companion API](/en/companion-api) |
 | `botmux stop` | Stop the daemon |
-| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` additionally retires botmux's PM2 God daemon after the fleet is safely shut down, so the whole process tree restarts from the invoking shell's clean environment (plugin services are gracefully stopped first; auto ones come back after the restart) |
+| `botmux restart [--companion-secret-file <path> --companion-bot <appId>]` | Restart the daemon and restore active sessions; accepts the same closed Companion API options as `start` |
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |

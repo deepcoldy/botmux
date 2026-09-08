@@ -77,13 +77,19 @@ Agent 在会话里执行 `botmux preview 5173` 之类的命令注册预览后，
 botmux dashboard
 ```
 
-输出的第一行是 Dashboard 登录 URL，第二行就是工作台直达链接：
+输出的第一行是 Dashboard 登录 URL，第二行就是工作台直达链接。形态取决于这台机器有没有绑定中心化平台：
 
 ```text
-工作台: <base>/workbench?t=<token>
+# 未由中心平台托管（局域网 / 自建反代 / Devbox 短链）—— token 是唯一入口，保留
+工作台: http://<lan-ip>:7891/workbench?t=<token>
+
+# 已绑定中心平台 —— 不带 token，身份由平台注入 + SSO 认
+工作台: https://m-<machineId>.<平台域名>/#/agent-workbench
 ```
 
-浏览器打开即进入工作台（`/workbench` 会自动跳转到 `/#/agent-workbench`）。怀疑链接泄露时可用 `botmux dashboard rotate` 轮换 token，旧链接与已发出的卡片按钮立即作废。
+两种形态浏览器打开都直达工作台（带 token 的 `/workbench` 会 302 到 `/#/agent-workbench`；不带 token 的直接就是 hash 路由，因为 `/workbench` 在无凭证时会被门禁 401）。
+
+绑定平台后链接不再带 token 是有意的：走平台子域时 `?t=` 会被服务端压制成无效，token 对访问毫无贡献、只剩被转发截图的泄漏风险。注意判据是「**是否由中心平台托管**」而非「有没有远程基址」——自建反代与 Devbox 短链没有人注入身份，token 仍是唯一凭证，对它们摘 token 会摘成死链。那条带 token 的本地直连兜底链接默认不打印，需要时按命令输出里提示的参数取回（该参数不进 `--help`，避免 AI 顺手带上）。怀疑链接泄露时可用 `botmux dashboard rotate` 轮换 token，旧链接与已发出的卡片按钮立即作废。
 
 ### 3.3 浏览器直接输地址
 

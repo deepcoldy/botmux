@@ -41,7 +41,7 @@ import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
-import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
 import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
@@ -456,6 +456,40 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
   });
 
+  // Codex does NOT hand its own environment to the shell commands it runs, so
+  // the trigger-user wrapper vars have to be declared explicitly or `lark-cli`
+  // resolves the machine's login instead of the acting person's. Shipped broken
+  // exactly this way: worker set them, tmux forwarded them, codex stripped them.
+  it('forwards the trigger-user identity vars to shell subprocesses', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua',
+      resume: false,
+      shellSubprocessEnv: {
+        BOTMUX_IDENTITY_BIN: '/data/cli-identity/sess-tua.bin',
+        ZDOTDIR: '/data/cli-identity/sess-tua.bin/shell',
+      },
+    });
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/data/cli-identity/sess-tua.bin"');
+    expect(args).toContain('shell_environment_policy.set.ZDOTDIR="/data/cli-identity/sess-tua.bin/shell"');
+  });
+
+  // `.set` per key, never `inherit="all"`: that would hand every shell command
+  // the entire worker environment for a need that is exactly three variables.
+  it('does not widen the policy to inherit everything', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua', resume: false,
+      shellSubprocessEnv: { BOTMUX_IDENTITY_BIN: '/data/x.bin' },
+    });
+    expect(args).not.toContain('shell_environment_policy.inherit="all"');
+  });
+
+  it('adds nothing when trigger-user auth is off', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-plain', resume: false });
+    expect(args.filter(a => a.startsWith('shell_environment_policy.set.'))).toEqual([
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-plain"',
+    ]);
+  });
+
   it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-rpc', resume: true,
@@ -702,7 +736,17 @@ describe('mira buildArgs', () => {
 });
 
 describe('dsh buildArgs (runner model)', () => {
-  const adapter = createDshAdapter('/opt/dsh/bin/dsh-jsonrpc-agent');
+  const adapter = createDshAdapter('/opt/dsh/bin/dsh');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the node runner and passes the dsh runtime binary', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
@@ -711,7 +755,7 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain('--session-id');
     expect(args).toContain('sess-dsh');
     expect(args).toContain('--dsh-bin');
-    expect(args).toContain('/opt/dsh/bin/dsh-jsonrpc-agent');
+    expect(args).toContain('/opt/dsh/bin/dsh');
     expect(args).toContain('--cwd');
     expect(args).toContain('/repo/root');
   });
@@ -741,6 +785,50 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain(String(30 * 60 * 1000));
   });
 
+  it('passes the question bridge patch to the runner when enabled for the default botmux profile', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false });
+      const patchIdx = args.indexOf('--bridge-patch');
+      expect(patchIdx).toBeGreaterThanOrEqual(0);
+      expect(args[patchIdx + 1]).toContain(join(root, '.botmux', 'dsh-question-bridge'));
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('materializes the question bridge for sandbox readonly paths even before buildArgs runs', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not inject the question bridge into custom dsh profiles', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+    const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false, dshProfile: 'custom' });
+    expect(args).toContain('--dsh-profile');
+    expect(args).toContain('custom');
+    expect(args).not.toContain('--bridge-patch');
+    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(homedir(), '.botmux', 'dsh-question-bridge'))]);
+  });
+
   it('omits --turn-timeout-ms when unset or non-positive', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
     expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
@@ -749,6 +837,26 @@ describe('dsh buildArgs (runner model)', () => {
 
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
+  });
+
+  it('exposes and pre-creates configured DSH_HOME for sandboxed profile state', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(configured.authPaths).toContain(customHome);
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+      expect(existsSync(join(customHome, 'sessions', 'botmux'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('readyPattern matches the runner prompt indicator', () => {
@@ -768,7 +876,7 @@ describe('dsh buildArgs (runner model)', () => {
   });
 
   it('canonicalizes a symlinked bin so --dsh-bin matches the sandbox-authorized path', () => {
-    // Regression: a symlink-installed dsh-jsonrpc-agent (e.g. ~/.local/bin →
+    // Regression: a symlink-installed dsh (e.g. ~/.local/bin →
     // SDK package dir) plus a symlinked HOME made the runner spawn the raw
     // symlink path, which the file sandbox never exposes (it authorizes only
     // dirname(realpath(bin))) → `spawn ... ENOENT` crash-loop under sandbox=true.
@@ -777,11 +885,11 @@ describe('dsh buildArgs (runner model)', () => {
     try {
       const realDir = join(root, 'opt', 'runtime');
       mkdirSync(realDir, { recursive: true });
-      const realBin = join(realDir, 'dsh-jsonrpc-agent-pkg-linux-x64');
+      const realBin = join(realDir, 'dsh-pkg-linux-x64');
       writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
       const linkDir = join(root, 'local', 'bin');
       mkdirSync(linkDir, { recursive: true });
-      const linkBin = join(linkDir, 'dsh-jsonrpc-agent');
+      const linkBin = join(linkDir, 'dsh');
       symlinkSync(realBin, linkBin);
 
       const symlinkAdapter = createDshAdapter(linkBin);
@@ -814,6 +922,16 @@ describe('dsh buildArgs (runner model)', () => {
 
 describe('dsh-tui buildArgs (PTY TUI model)', () => {
   const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the dsh-tui binary directly (no runner)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
@@ -833,8 +951,41 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args).toEqual(['--resume']);
   });
 
-  it('omits --resume on fresh spawn', () => {
+  it('omits --resume on fresh spawn when the question bridge is disabled', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('injects the question bridge patch as a single --patch= token when available', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-bridge-profile-'));
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = root;
+      const pkgRoot = join(root, 'profiles', 'dsh-tui', 'node_modules', '@deepseek-harness-tui', 'dsh-tui');
+      mkdirSync(join(pkgRoot, 'lib', 'types'), { recursive: true });
+      writeFileSync(join(root, 'profiles', 'dsh-tui', 'package.json'), JSON.stringify({ name: 'profile' }) + '\n');
+      writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+        name: '@deepseek-harness-tui/dsh-tui',
+        type: 'module',
+        exports: { '.': { import: './lib/types/index.js' } },
+      }) + '\n');
+      writeFileSync(join(pkgRoot, 'lib', 'types', 'index.js'), 'export function apply(){}\n');
+
+      const bridgeAdapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+      const patchArg = args.find(arg => arg.startsWith('--patch='));
+      expect(patchArg).toBeDefined();
+      expect(args).not.toContain('--patch');
+      expect(args).toContain('--resume');
+      expect(args).toContain('abc-123');
+      const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
+      expect(readonly?.length).toBe(1);
+      expect(patchArg).toContain(readonly![0]);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('has no portable copy-paste resume command (session id not tracked)', () => {
@@ -853,21 +1004,164 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });
 
-  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+  it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     expect(adapter.authPaths).toContain('~/.dsh-tui');
+    const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-home-'));
+    const customHome = join(root, 'custom-dsh-home');
+    try {
+      process.env.DSH_HOME = customHome;
+      const configured = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      expect(configured.authPaths).toContain(customHome);
+      expect(configured.authPaths).toContain('~/.dsh-tui');
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it('writeInput types text and presses Enter', async () => {
-    const sent: string[] = [];
-    const keys: string[][] = [];
+  it('writeInput frames multiline text itself and presses one Enter', async () => {
+    const content = 'line1\nline2\nline3';
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
     const pty = {
-      sendText: (t: string) => { sent.push(t); return true; },
-      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
     } as unknown as PtyHandle;
-    await adapter.writeInput!(pty, 'hello tui');
-    expect(sent).toEqual(['hello tui']);
-    expect(keys).toEqual([['Enter']]);
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput pastes a long botmux prompt as a single draft', async () => {
+    const content = [
+      '<botmux_routing>',
+      '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出。',
+      '</botmux_routing>',
+      '',
+      '<user_message>',
+      '请处理这个多行请求',
+      '</user_message>',
+      '',
+      '<botmux_skills>',
+      '  <skill name="botmux-send">',
+      '    <description>向飞书话题发送消息。</description>',
+      '  </skill>',
+      '</botmux_skills>',
+    ].join('\n');
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    await adapter.writeInput!(pty, content);
+
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput ignores void-returning pasteText and treats void sends as successful', async () => {
+    const content = 'line1\nline2';
+    const sendText = vi.fn(() => undefined);
+    const pasteText = vi.fn(() => undefined);
+    const sendSpecialKeys = vi.fn(() => undefined);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste with write when sendText is unavailable', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste on raw PTY fallback', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const pty = { write } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(write).toHaveBeenNthCalledWith(1, `\x1b[200~${content}\x1b[201~`);
+    expect(write).toHaveBeenNthCalledWith(2, '\r');
+  });
+
+  it('writeInput returns submitted false when paste, write, or Enter is rejected', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'paste rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+    } as unknown as PtyHandle, 'raw write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => true),
+      sendSpecialKeys: vi.fn(() => false),
+    } as unknown as PtyHandle, 'enter rejected')).resolves.toEqual({ submitted: false });
+  });
+
+  it('writeInput returns submitted false when bracketed paste send throws', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => { throw new Error('paste failed'); }),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'boom')).resolves.toEqual({ submitted: false });
   });
 });
 
@@ -1226,6 +1520,14 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // OpenCode bakes the full first-round prompt into `--prompt <content>`.
+    // tmux new-session rejects long command strings well below OS ARG_MAX,
+    // so the adapter must declare a byte budget: short prompts keep --prompt,
+    // over-limit prompts defer to the post-start input queue.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
+  });
+
   it('exposes paste-line raw command delivery capability', () => {
     const rawAdapter = createOpenCodeAdapter('/bin/opencode');
 
@@ -1257,6 +1559,21 @@ describe('pi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
     expect(adapter.altScreen).toBe(true);
+  });
+
+  it('passes botmux native titles through Pi launch-time --name', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      nativeSessionTitle: '  [BotMux·Lark] Fix login flow  ',
+      initialPrompt: 'hello pi',
+    });
+    expect(args.slice(2)).toEqual([
+      '--session-id', 'sess-pi',
+      '--name', '[BotMux·Lark] Fix login flow',
+      'hello pi',
+    ]);
+    expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
   });
 
   it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
@@ -1795,7 +2112,11 @@ describe('hermes buildArgs', () => {
     // Hermes must NOT arm the gate; its ❯ readyPattern (input box up in ~3.6s) is
     // the earliest reliable readiness signal.
     expect(adapter.injectsReadyHook).toBeFalsy();
-    expect(adapter.readyPattern?.source).toBe('❯');
+    // Bun's `RegExp#source` serializes U+276F as `\\u276F` while Node keeps the
+    // literal `❯`. Matching the glyph (not `.source ===`) is the dual-runtime
+    // form of "this pattern is exactly the Hermes prompt symbol".
+    expect(adapter.readyPattern?.test('❯')).toBe(true);
+    expect(adapter.readyPattern?.test('x')).toBe(false);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBeFalsy();
   });
@@ -1975,6 +2296,63 @@ describe('busyPattern', () => {
     expect(busy!.test('› Ask anything                                      97% left')).toBe(false);
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('claude-code matches the working footer structure and self-heals a false idle, but not prose or the idle composer', () => {
+    // Regression: claude-code only had a readyPattern (❯ is resident while
+    // Claude works), so a single ≥2s PTY stall flipped a busy session to idle
+    // with no path back. The working footer carries an extra
+    // 「· esc to interrupt ·」 segment the idle composer lacks.
+    const claude = createCliAdapterSync('claude-code');
+    const busy = claude.busyPattern;
+    expect(busy).toBeDefined();
+    expect(claude.idleToBusyPattern).toBeDefined();
+    expect(claude.idleToBusyPattern!.source).toBe(busy!.source);
+    // Real footer lines (5 permission modes — mode names are runtime-assembled,
+    // do NOT enumerate them in the anchor — plus the ctrl+t variant and the
+    // retry footer), extracted from live panes.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  manual mode on · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  plan mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to hide tasks · ← for agents')).toBe(true);
+    expect(busy!.test(' · next try in 3s · attempt 2 · esc to interrupt')).toBe(true);
+    // Idle composer: no interrupt segment.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents')).toBe(false);
+    expect(busy!.test('❯')).toBe(false);
+    // Prose quoting the hint must not flip an idle card back to busy. The
+    // transcript shares the screen with the footer and busyProbeRegion scans
+    // the bottom third, so the BARE phrase in prose (prompt echo, assistant
+    // reply, mid-dot decoration, "on" + hint shape, prompt-then-help form)
+    // must all stay inert — a loose /esc to interrupt/ anchor pinned idle
+    // sessions busy forever (probe retries have no deadline).
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+    expect(busy!.test('❯ Reply with exactly this one line and nothing else: docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('● docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('· esc to interrupt ·')).toBe(false);
+    expect(busy!.test('the mode is on · esc to interrupt is documented in the docs')).toBe(false);
+    expect(busy!.test('next try: please esc to interrupt yourself')).toBe(false);
+    // Multi-line probe region: prose above must not rescue a busy verdict,
+    // and a busy footer must be found mid-region.
+    const region = [
+      '❯ docs say esc to interrupt works',
+      '● docs say esc to interrupt works',
+      '✻ Cogitated for 19s · done 10:36 PM',
+      '────────────────────────────────',
+      '❯',
+      '────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(busy!.test(region)).toBe(false);
+    const busyRegion = region.replace(
+      '· ← for agents',
+      '· esc to interrupt · ← for agents',
+    );
+    expect(busy!.test(busyRegion)).toBe(true);
+    // Shared def: seed/relay render the same Claude Code footer.
+    expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy!.source);
+    expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
   });
 
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
@@ -2230,6 +2608,64 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('injects an explicit TraeX backend variant as a process config', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-variant',
+      resume: false,
+      modelBackendVariant: 'max',
+    });
+    const i = args.indexOf('model_backend_variant="max"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits the TraeX backend-variant config when inheriting', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-variant',
+      resume: false,
+    });
+    expect(args.join(' ')).not.toContain('model_backend_variant');
+  });
+
+  it('renders the process hook command as a TOML-safe string', () => {
+    const config = traexNativeSubagentHookConfig('/opt/botmux "quoted"');
+    expect(config).toContain('command="/opt/botmux \\"quoted\\""');
+  });
+
+  it.each([false, true])('adds one process-scoped native subagent hook for resume=%s', (resume) => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-hook',
+      resume,
+      resumeSessionId: resume ? 'native-session' : undefined,
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    const overrides = args.filter(arg => arg.startsWith('hooks.PreToolUse='));
+    expect(overrides).toEqual([
+      'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[{type="command",command="/opt/botmux hook runtime"}]}]',
+    ]);
+    expect(args[args.indexOf(overrides[0]) - 1]).toBe('-c');
+  });
+
+  it('does not attach the native subagent hook to the remote viewer', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-hook-viewer',
+      resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9876',
+      remoteThreadId: 'thread-1',
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    expect(args.join(' ')).not.toContain('hooks.PreToolUse');
+  });
+
+  it('does not attach the Trae-only hook argument to another adapter', () => {
+    const args = createCodexAdapter('/bin/codex').buildArgs({
+      sessionId: 'codex-hook',
+      resume: false,
+      nativeSubagentRuntimeHookCommand: '/opt/botmux hook runtime',
+    });
+    expect(args.join(' ')).not.toContain('hooks.PreToolUse');
+  });
+
   it('injects structured reasoning effort as a TraeX launch config', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({
       sessionId: 'traex-effort',
@@ -2374,6 +2810,14 @@ describe('altScreen property', () => {
 
   it('claude-code does not use alt screen', () => {
     expect(createClaudeCodeAdapter('/bin/claude').altScreen).toBe(false);
+  });
+
+  it('claude-code read-only viewers may forward wheel-only scroll', () => {
+    // Claude's TUI self-manages its transcript (no xterm/tmux scrollback), so the
+    // read-only web terminal can only page history by forwarding SGR wheel events
+    // back to the CLI. This opt-in gates that narrow, rate-limited `type:'scroll'`
+    // path (worker.ts / web-terminal-scroll.ts), mirroring opencode.
+    expect(createClaudeCodeAdapter('/bin/claude').readOnlyRemoteScroll).toBe(true);
   });
 
   it('aiden does not use alt screen', () => {
@@ -2546,13 +2990,17 @@ describe('buildResumeCommand', () => {
 });
 
 describe('native session rename capability', () => {
-  it('is declared only by the verified Codex, Claude Code, and Grok adapters', () => {
+  it('is declared only by verified adapters', () => {
     expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
+    expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('TraeX 标题'))
+      .toBe('/rename TraeX 标题');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
       .toBe('/rename 新标题');
+    expect(createPiAdapter('/bin/pi').buildSessionRenameCommand?.('Pi 标题'))
+      .toBe('/name Pi 标题');
 
     expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
     expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();

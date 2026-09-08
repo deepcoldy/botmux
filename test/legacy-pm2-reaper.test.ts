@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
+import { spinMs, waitForPidCmdline } from './helpers/proc-ready.js';
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'legacy-pm2-')); dirs.push(d); return d; }
@@ -176,21 +178,20 @@ function spawnBystander(): number {
 function spawnTagged(n: number, tag: string, script = 'setTimeout(()=>{},60_000)',
                     opts: { group?: boolean } = {}): number[] {
   const pids: number[] = [];
+  // bun test 下 process.execPath 是 bun，子进程起来比 Node 慢，reaper 同步读
+  // /proc/cmdline 会拿到空串 → looksLikeLegacyBotmuxDaemon 失败 → deleted=[]。
+  // 等 cmdline 真的带上 tag 再返回；解释器也钉成 Node，和 Linux daemon 一致。
+  const runner = resolveNodeExecutable() ?? process.execPath;
   for (let i = 0; i < n; i++) {
     // The trailing arg only shapes the visible cmdline; the file need not exist
     // since the script itself comes from -e.
-    const p = spawn(process.execPath, ['-e', script, tag], { stdio: 'ignore', detached: !!opts.group });
+    const p = spawn(runner, ['-e', script, tag], { stdio: 'ignore', detached: !!opts.group });
     if (opts.group) groupLeaders.push(p.pid!);
     spawned.push(p);
     pids.push(p.pid!);
+    waitForPidCmdline(p.pid!, tag);
   }
   return pids;
-}
-
-/** Block for `ms` without an async boundary — these tests drive a synchronous
- *  reaper and need real elapsed time for signals/respawns to land. */
-function spinMs(ms: number): void {
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB */ }
 }
 
 /** pm2 records one pid file per app as `pids/<name>-<id>.pid`. */
@@ -711,6 +712,9 @@ describe('reapLegacyPm2', () => {
     while (Date.now() < deadline && !existsSync(pidFile)) spinMs(50);
     expect(existsSync(pidFile)).toBe(true);
     const firstChild = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    // pidfile is written at spawn(); cmdline can still be empty — same race as
+    // spawnTagged, and the reaper fail-closes the child if we reap too early.
+    waitForPidCmdline(firstChild, '/fake/dist/index-daemon.js');
     expect(alive(firstChild)).toBe(true);
     writeFileSync(join(home, 'pm2.pid'), String(god));
 

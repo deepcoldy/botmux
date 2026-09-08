@@ -1,16 +1,22 @@
 # 5-minute quick setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
+> 💡 **TL;DR**: `curl -fsSL .../install.sh | sh` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
 
-**Before you start**: confirm the [Prerequisites](/en/prerequisites) (Node ≥ 22, target CLI installed and logged in) — a missing prerequisite here is the most common cause of "installed but won't connect."
+**Before you start**: confirm the [Prerequisites](/en/prerequisites) (target CLI installed and logged in, tmux) — a missing prerequisite here is the most common cause of "installed but won't connect."
 
 ## Step 1 · Install
 
 ```bash
-npm install -g botmux
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 ```
 
-Requires **Node.js ≥ 22**, with at least one AI coding CLI already installed and signed in locally (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc.). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
+botmux is a **self-contained single-file binary** with its runtime embedded — **neither installing nor running it needs Node**. It installs to `~/.botmux/bin/botmux` (override with `BOTMUX_INSTALL_DIR`), picks the binary for your OS/arch, verifies its SHA-256, and adds `~/.botmux/bin` to the startup file your shell actually reads (zsh / bash / fish each get the correct one), so **a new terminal has the command**. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2.**
+
+> 🔁 **Upgrading**: `botmux upgrade` (replaces the binary in place), or just re-run the curl command — also an in-place upgrade, and it won't append a second PATH line. To install a specific version: `BOTMUX_VERSION=v3.18.8 curl … | sh`.
+
+> 📦 **npm works too** (`npm install -g botmux`, needs Node ≥ 22 to run the install itself): the npm package carries **the same self-contained binary** (verified byte-identical to the GitHub Release asset by SHA-256; only the one matching your os/arch is installed), and its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. The only difference is **who installs it and who upgrades it later**: the npm path needs Node and hands upgrades back to `npm i -g botmux@latest`; the curl path never touches Node. Once running, the two are identical.
+
+Running botmux itself needs no Node, but you do need **at least one AI coding CLI installed and signed in locally** (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc. — each with its own runtime requirements). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
 
 ## Step 2 · Configure (`botmux setup`)
 

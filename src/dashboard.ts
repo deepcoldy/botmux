@@ -3,7 +3,7 @@ import { createServer, get as httpGet, type IncomingMessage, type ServerResponse
 import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
+  readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -15,6 +15,15 @@ import { isStandaloneBinary } from './core/self-spawn.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
+import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
+import {
+  deleteTeamRoleFile,
+  readTeamRoleInjectMode,
+  resolveTeamRoleFile,
+  writeTeamRoleFile,
+  writeTeamRoleInjectMode,
+} from './core/role-resolver.js';
+import { readBotsJsonOrEmpty } from './setup/bots-store.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
@@ -23,6 +32,8 @@ import {
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import {
+  isPlatformDashboardAuthSessionId,
+  platformAuthSessionsToRevoke,
   resolveDashboardIdentity,
   resolveDashboardRequestGate,
   type DashboardRequestIdentity,
@@ -76,7 +87,10 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
-import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
+import {
+  defaultRunsDir as v3RunsDir,
+  liveV3TerminalPortForSession,
+} from './workflows/v3/ops-projection.js';
 import {
   verifyWorkflowDaemonIpcResponse,
   workflowDaemonIpcHeaders,
@@ -84,12 +98,14 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  stripSchedulePreconditionMaterial,
   redactSettingsForPublic,
   sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
@@ -204,6 +220,7 @@ import {
   claimRestartLease,
   clearRestartIntent,
   clearRestartLease,
+  clearRestartLeaseLocked,
   hasActiveRestartLease,
   writeManualIntentIfAbsent,
   writeRestartIntent,
@@ -212,7 +229,7 @@ import { withFileLock } from './utils/file-lock.js';
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
-import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
+import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -224,6 +241,8 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  renameGroup,
+  setPinStreamingCardForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -231,7 +250,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -326,6 +345,7 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import { createLazyTopicLinkBackfill } from './dashboard/lazy-topic-link-backfill.js';
 import {
   buildDashboardSummary,
   parseDashboardSummaryRows,
@@ -451,10 +471,11 @@ function terminalAuthSessionLive(authSessionId: string): boolean {
   if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
   const binding = readPlatformBinding();
   if (binding) {
-    const scope = platformDashboardActorScope(binding.machineId);
-    if (authSessionId === `${scope}:owner`
-      || authSessionId === `${scope}:teammate`
-      || authSessionId === `${scope}:guest`) {
+    // ⚠️ 不要在这里硬枚举 `${scope}:owner|teammate|guest`：平台注入
+    // `X-Botmux-Actor` 后，协管者的 authSessionId 多出一段 actor
+    // （`<scope>:<actor>:<role>`），三个字面量会全部落空 → 协管者的终端只读链接
+    // 被判成「认证已结束」而 403。识别交给 request-identity 的同一份格式定义。
+    if (isPlatformDashboardAuthSessionId(authSessionId, platformDashboardActorScope(binding.machineId))) {
       return true;
     }
   }
@@ -475,6 +496,8 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
     // there is no module-level mirror to compare against any more.
     activeToken: currentDashboardToken(),
     roleHeader: req.headers['x-botmux-role'],
+    actorHeader: req.headers['x-botmux-actor'],
+    scopesHeader: req.headers['x-botmux-scopes'],
     platformMachineId: readPlatformBinding()?.machineId ?? null,
     platformActorScope: platformDashboardActorScope,
     legacyAuthSessionId: legacyDashboardAuthSessionId,
@@ -511,8 +534,22 @@ function syncPlatformBindingRevocation(): void {
   const current = readPlatformBinding()?.machineId ?? null;
   if (observedPlatformMachineId && observedPlatformMachineId !== current) {
     const scope = platformDashboardActorScope(observedPlatformMachineId);
-    for (const role of ['owner', 'teammate', 'guest'] as const) {
-      endDashboardAuthSession(`${scope}:${role}`);
+    // ⚠️ 不要硬枚举 `${scope}:owner|teammate|guest`：平台注入 `X-Botmux-Actor`
+    // 后协管者的 authSessionId 里含 union_id（`<scope>:<actor>:<role>`），而「有
+    // 哪些人」本进程不可能预先知道 —— 硬枚举扫不到他们，解绑后协管者**已建立的
+    // 写连接不会被断开**，正是本函数要堵的那扇后窗。
+    // 所以反过来做：把四个注册表里在册的认证会话取并集，按本机 scope 筛出平台
+    // 身份逐个吊销。取并集是因为一个会话可能只在其中一个表里有状态（例如只开了
+    // SSE、还没拿写租约）。
+    // 实现抽在 request-identity 的 platformAuthSessionsToRevoke（纯函数），
+    // 这样测试能直接调生产实现，而不是各自复刻一份「四表并集 + 筛选」。
+    for (const authSessionId of platformAuthSessionsToRevoke(scope, [
+      terminalControl,
+      previewInteraction,
+      authSessionConnections,
+      controlCsrfTokens,
+    ])) {
+      endDashboardAuthSession(authSessionId);
     }
   }
   observedPlatformMachineId = current;
@@ -577,6 +614,25 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
+const lazyTopicLinkBackfill = createLazyTopicLinkBackfill({
+  resolve: async (larkAppId, sessionId) => {
+    const daemon = registry.getByAppId(larkAppId);
+    if (!daemon) return false;
+    try {
+      const response = await fetchDaemonIpc(
+        daemon.ipcPort,
+        `/api/sessions/${encodeURIComponent(sessionId)}/resolve-thread-id`,
+        { method: 'POST', signal: AbortSignal.timeout(5_000) },
+      );
+      if (!response.ok) return false;
+      const body = await response.json() as { ok?: boolean; status?: string };
+      return body.ok === true && body.status !== 'unresolved';
+    } catch (error) {
+      logger.debug(`[dashboard] lazy topic link backfill ${larkAppId}/${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  },
+});
 const aggregator = new Aggregator();
 /**
  * P1-13：一个会话的预览目标失效时的收口动作（本进程侧）。
@@ -714,7 +770,9 @@ const previewGuardPage = createPreviewGuardPage({
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
 const terminalFrontProxy = createTerminalFrontProxy({
-  resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
+  resolvePort: sessionId => (
+    aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
+  ),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -826,6 +884,91 @@ function listDirLocally(rawPath: string): {
   }
   const parent = resolved === '/' ? null : dirname(resolved);
   return { ok: true, path: resolved, parent, entries };
+}
+
+function listDshProfiles(): string[] {
+  const profilesDir = join(homedir(), '.dsh', 'profiles');
+  try {
+    return readdirSync(profilesDir, { withFileTypes: true })
+      .filter(d => d.isDirectory() && !d.name.startsWith('.') && !d.name.startsWith('_'))
+      .filter(d => {
+        try { return existsSync(join(profilesDir, d.name, 'cordis.yml')); }
+        catch { return false; }
+      })
+      .map(d => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function createDshProfile(name: string): string {
+  const profilesDir = join(homedir(), '.dsh', 'profiles');
+  const profileDir = join(profilesDir, name);
+  mkdirSync(profileDir, { recursive: true });
+
+  // dsh judges a profile's existence by its package.json (not the directory
+  // or cordis.yml). Non-shipped profiles must include the dsh-base bundle.
+  const pkgJson = join(profileDir, 'package.json');
+  const isNewSkeleton = !existsSync(pkgJson);
+  if (isNewSkeleton) {
+    const pkg = {
+      name: `dsh-profile-${name}`,
+      private: true,
+      dependencies: {
+        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.1.1-rc.1',
+        '@deepseek-ai/dsh-sdk-protocol': '^0.1.1-rc.1',
+      },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+    };
+    writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+  }
+
+  const cordisYml = join(profileDir, 'cordis.yml');
+  if (!existsSync(cordisYml)) {
+    writeFileSync(cordisYml, '# dsh profile root — edit cordis.patch.yml, not this file.\n[]\n', 'utf8');
+  }
+
+  const cordisPatchYml = join(profileDir, 'cordis.patch.yml');
+  if (!existsSync(cordisPatchYml)) {
+    // Minimal headless SDK profile. dsh-base provides the full plugin tree
+    // (agent, llm, bash, fs, sessions, sandbox, subagent, etc.). This layer
+    // only disables the Web GUI and inserts the JSON-RPC server.
+    // Community plugins are added by the user with `dsh plugin add`.
+    const patch = [
+      `# DSH profile: ${name} (headless JSON-RPC server)`,
+      `# Auto-generated by botmux. dsh-base provides the full plugin tree;`,
+      `# this layer only disables the Web GUI and inserts the SDK server.`,
+      `# Add community plugins with: dsh plugin --profile ${name} add <pkg>`,
+      ``,
+      `- id: hmr`,
+      `  disabled: true`,
+      `- id: web`,
+      `  disabled: true`,
+      `- id: web-search-deepseek`,
+      `  disabled: true`,
+      `- id: tool-web`,
+      `  disabled: true`,
+      ``,
+      `- insert:`,
+      `    - id: sdk-jsonrpc-server`,
+      `      name: '@deepseek-ai/dsh-sdk-jsonrpc-server'`,
+      ``,
+    ].join('\n');
+    writeFileSync(cordisPatchYml, patch, 'utf8');
+  }
+
+  // Install profile dependencies. Keyed on node_modules existence, not
+  // package.json — if the install fails the skeleton files are on disk but
+  // node_modules is not, so the next run retries. Fails loud on error so the
+  // dashboard POST handler can surface it to the caller.
+  const nodeModules = join(profileDir, 'node_modules');
+  if (!existsSync(nodeModules)) {
+    const dshBin = resolveCommandReal('dsh');
+    installDshProfileDeps(name, dshBin);
+  }
+
+  return name;
 }
 
 function resolveScheduleOwner(id: string): string | undefined {
@@ -1571,9 +1714,26 @@ const daemonInternalApi = createDaemonInternalApi({
   sessionExists: (sessionId) => aggregator.sessionExists(sessionId),
 });
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+class DashboardJsonBodyTooLargeError extends Error {}
+
+async function readJsonBody(req: IncomingMessage, maxBytes?: number): Promise<unknown> {
+  const declared = req.headers['content-length'];
+  if (maxBytes !== undefined && typeof declared === 'string' && /^\d+$/.test(declared)
+    && Number(declared) > maxBytes) {
+    req.resume();
+    throw new DashboardJsonBodyTooLargeError('request body too large');
+  }
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let totalBytes = 0;
+  for await (const raw of req) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    totalBytes += chunk.byteLength;
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      req.resume();
+      throw new DashboardJsonBodyTooLargeError('request body too large');
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
 }
@@ -1589,7 +1749,7 @@ let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
 // Local-dev counterpart: the checkout a successful /api/update/run built, and
 // its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
-// build's target — not a wrapper that a concurrent `pnpm use:here` in another
+// build's target — not a wrapper that a concurrent `bun run use:here` in another
 // worktree may have re-pointed between the two requests (run builds B, wrapper
 // flips to C, restart would otherwise restart C or fall back to A). Cleared
 // once consumed by a restart. A plain "restart" (no preceding run) still
@@ -1675,7 +1835,7 @@ function currentInstalledVersion(): string {
 
 /**
  * Local-dev update: git-clean check (fail closed) → git pull --ff-only →
- * pnpm build, all in the checkout the global wrapper points at. Mirrors the CLI
+ * bun run build, all in the checkout the global wrapper points at. Mirrors the CLI
  * `cmdUpgradeLocalDev` via the shared local-dev-update helpers. Returns the
  * checkout dir, its version before/after, and whether HEAD advanced; the caller
  * applies the restart through the existing lease/intent path. A successful
@@ -2525,7 +2685,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2536,21 +2696,24 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
+      modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
+      nativeSubagentRuntime: b.nativeSubagentRuntime,
       turnTimeoutMs: b.turnTimeoutMs,
       dshRuntime: b.dshRuntime,
+      dshProfile: b.dshProfile,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2558,9 +2721,12 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
+    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
     dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
+    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
   };
 }
 
@@ -2768,7 +2934,17 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
-        const { oncallChat, firstSeenAt, hasRole, hasMessageListener, observedBotNames, ...chatBase } = c;
+        const {
+          oncallChat,
+          firstSeenAt,
+          hasRole,
+          hasMessageListener,
+          observedBotNames,
+          pinStreamingCardMasterEnabled,
+          pinStreamingCardChatEnabled,
+          pinStreamingCardEffectiveEnabled,
+          ...chatBase
+        } = c;
         const cur = out.get(c.chatId) ?? {
           ...chatBase,
           memberBots: [] as any[],
@@ -2786,6 +2962,9 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: oncallChat ?? null,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
+          pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
+          pinStreamingCardChatEnabled: pinStreamingCardChatEnabled ?? true,
+          pinStreamingCardEffectiveEnabled: pinStreamingCardEffectiveEnabled ?? false,
         });
         if (typeof firstSeenAt === 'number') {
           cur._firstSeenAt = cur._firstSeenAt === null
@@ -2800,7 +2979,15 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
     const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
     for (const b of onlineBots) {
       if (!present.has(b.larkAppId)) {
-        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false, hasMessageListener: false });
+        c.memberBots.push({
+          larkAppId: b.larkAppId,
+          botName: b.botName,
+          cliId: b.cliId,
+          inChat: false,
+          oncallChat: null,
+          hasRole: false,
+          hasMessageListener: false,
+        });
       }
     }
   }
@@ -2882,7 +3069,10 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
 
 /** Build the dashboard URL(s) for a token, using the actually-bound port. The
  *  primary `url` routes through the central-platform machine subdomain when
- *  远程访问 is on and this host is bound (see buildDashboardUrls); `localUrl`
+ *  远程访问 is on and this host is bound (see buildDashboardUrls). The response
+ *  also carries `platformHosted`, which tells the CLI whether the token may be
+ *  stripped from a link shown to a human — only THIS process knows which base it
+ *  used, so it must say so rather than let callers re-derive it. `localUrl`
  *  carries the direct host:port fallback in that case (undefined otherwise). */
 function dashboardUrlsFor(token: string): DashboardUrls {
   return buildDashboardUrls({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
@@ -3246,9 +3436,81 @@ function analyticsService(): FeedbackAnalyticsService {
   return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
 }
 
+const companionApi = (() => {
+  try {
+    const secretFile = config.companion.secretFile;
+  const appId = config.companion.botAppId;
+  if (!secretFile && !appId) return null;
+  if (!secretFile || !appId) throw new Error('companion_configuration_incomplete');
+  const requireBoundBot = () => {
+    const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
+    const bot = matches.length === 1 ? matches[0] : undefined;
+    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+      throw new Error('companion_bound_bot_invalid');
+    }
+    return bot;
+  };
+  requireBoundBot();
+  const readRuntime = (): CompanionRuntime => {
+    const bound = requireBoundBot();
+    return {
+      provider: bound.cliId === 'traex' ? 'traecli' : 'codex',
+      ...(typeof bound.model === 'string' && bound.model.trim() ? { model: bound.model.trim() } : {}),
+      ...(typeof bound.reasoningEffort === 'string' && bound.reasoningEffort ? { reasoning: bound.reasoningEffort } : {}),
+    };
+  };
+  return createCompanionApi({
+    secret: loadCompanionSecret(secretFile),
+    operations: {
+      readRole: () => {
+        requireBoundBot();
+        return { role: resolveTeamRoleFile(appId) ?? '', injectMode: readTeamRoleInjectMode(appId), revision: null };
+      },
+      writeRole: ({ role, injectMode }) => {
+        requireBoundBot();
+        if (role.trim()) writeTeamRoleFile(appId, role);
+        else deleteTeamRoleFile(appId);
+        writeTeamRoleInjectMode(appId, injectMode);
+        return { role: resolveTeamRoleFile(appId) ?? '', injectMode: readTeamRoleInjectMode(appId), revision: null };
+      },
+      readRuntime,
+      writeRuntime: async (runtime) => {
+        requireBoundBot();
+        const upstream = await proxyToDaemon(appId, '/api/bot-agent', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cliId: runtime.provider === 'traecli' ? 'traex' : 'codex',
+            model: runtime.model ?? '',
+            reasoningEffort: runtime.reasoning ?? '',
+          }),
+        });
+        if (!upstream.ok) throw new Error('companion_runtime_update_failed');
+        const body = await upstream.json() as Record<string, unknown>;
+        return {
+          provider: body.cliId === 'traex' ? 'traecli' : 'codex',
+          ...(typeof body.model === 'string' && body.model ? { model: body.model } : {}),
+          ...(typeof body.reasoningEffort === 'string' && body.reasoningEffort ? { reasoning: body.reasoningEffort } : {}),
+        };
+      },
+    },
+    });
+  } catch (error) {
+    logger.warn(`[companion] disabled: ${error instanceof Error ? error.message : 'configuration_invalid'}`);
+    return null;
+  }
+})();
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+    // Closed companion surface: it buffers bodies only for this exact prefix,
+    // before the ordinary Dashboard auth/router touches the request stream.
+    if (companionApi && await companionApi(req, res, url.search ? `${url.pathname}${url.search}` : url.pathname)) return;
+    if (!companionApi && url.pathname.startsWith('/__companion/')) {
+      return jsonRes(res, 404, { ok: false, error: 'companion_disabled' });
+    }
 
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
@@ -3476,7 +3738,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -3485,11 +3747,17 @@ const server = createServer(async (req, res) => {
       activeToken,
       publicReadOnly,
     });
-    // `authed` is deliberately the local management capability, not merely a
-    // valid Workbench/platform identity. Privileged mutations and management
-    // reads (settings, schedules, groups) therefore cannot be widened by H5
-    // authentication.
-    const authed = legacyAuthed;
+    // `authed` is the HOST MANAGEMENT capability: the local management cookie, or
+    // a platform co-manager the platform granted `dashboard:manage`. It is still
+    // NOT "any valid Workbench/platform identity" — H5 authentication cannot widen
+    // it, and neither can a co-manager without that scope.
+    //
+    // Deliberately NOT the same thing as `legacyAuthed` any more. The three
+    // capabilities that hand over the whole host — debug shell, write-link
+    // (a stable token) and spawn-command (credential-bearing) — keep querying
+    // `legacyAuthed` directly, so a co-manager can help maintain settings /
+    // schedules / groups without being able to run arbitrary commands.
+    const authed = canManageHost;
     // The session board is the one surface where `!authed` must NOT mean
     // "anonymous". `/api/sessions` and `/events` are exactly the two paths
     // workbenchH5Capability grants as `workbench.view`, and the same identity
@@ -3852,6 +4120,7 @@ const server = createServer(async (req, res) => {
           : s;
       }), groupsMatrixSnapshot.peekPresentation());
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
+      lazyTopicLinkBackfill.trigger(browserSessions);
       return jsonRes(res, 200, {
         sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
@@ -3977,9 +4246,10 @@ const server = createServer(async (req, res) => {
       // instructions) and a bound `workingDir` (repo/customer path) — strip
       // both for anonymous visitors. The schedules page only renders
       // name/timing/status, so nothing degrades.
+      const rawSchedules = aggregator.getSchedules();
       const schedules = authed
-        ? aggregator.getSchedules()
-        : redactSchedulesForPublic(aggregator.getSchedules());
+        ? rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))
+        : redactSchedulesForPublic(rawSchedules);
       // Effective schedule timezone: nextRunAt/lastRunAt instants must be
       // rendered in the zone the scheduler fires in (not the viewer's browser
       // zone), so the web schedule/overview lists match cron/card/CLI displays.
@@ -4030,6 +4300,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/autostart') {
+      // 开机自启是机器级**运营配置**，与 settings/schedules/groups 同档，
+      // 所以随 dashboard:manage 一起放开给协管者（刻意，不是漏改）。
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       res.setHeader('cache-control', 'no-store');
       return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
@@ -4168,8 +4440,11 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
-      // 本地 checkout：走 git pull --ff-only + pnpm build（与 CLI cmdUpgradeLocalDev
+      // owner-only：这条会 git pull + 重建，等于改机器上实际运行的代码。协管者的
+      // `dashboard:manage` 只覆盖「运营配置」（settings/schedules/groups/autostart），
+      // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
       if (isLocalDevInstall()) {
@@ -4331,7 +4606,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/rollback') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // owner-only，同 /api/update/run（回滚同样改运行中的代码）。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
 
       let targetVersion = '';
@@ -4491,7 +4767,9 @@ const server = createServer(async (req, res) => {
         }
         return;
       } catch (error) {
-        if (leaseId) clearRestartLease(leaseId);
+        if (leaseId && !clearRestartLeaseLocked(leaseId)) {
+          logger.warn('[dashboard] rollback lease cleanup deferred because the update lock is busy');
+        }
         if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         if (!res.headersSent) {
           return jsonRes(res, 500, {
@@ -4508,7 +4786,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
-      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      // owner-only：重启会打断 owner 正在跑的所有会话。
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
       // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
@@ -4600,7 +4879,9 @@ const server = createServer(async (req, res) => {
             const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId!);
             if (!child.pid) throw new Error('restart driver did not start');
           } catch (error) {
-            clearRestartLease(leaseId!);
+            if (!clearRestartLeaseLocked(leaseId!)) {
+              logger.warn('[dashboard] restart lease cleanup deferred because the update lock is busy');
+            }
             logger.error(`[dashboard] restart launch failed: ${error instanceof Error ? error.message : error}`);
           }
         };
@@ -4889,7 +5170,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'DELETE' && mWhiteboard) {
       try {
         const id = decodeURIComponent(mWhiteboard[1]);
-        return jsonRes(res, 200, deleteWhiteboard(id));
+        return jsonRes(res, 200, await deleteWhiteboard(id));
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
       }
@@ -5476,6 +5757,20 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/logs$/))) {
+      const id = decodeURIComponent(m[1]);
+      const owner = resolveScheduleOwner(id);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+      const upstream = await proxyToDaemon(
+        owner,
+        `/api/schedules/${encodeURIComponent(id)}/logs${url.search}`,
+        { method: 'GET' },
+      );
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume|delivery)$/))) {
       const id = decodeURIComponent(m[1]); const op = m[2];
       const owner = resolveScheduleOwner(id);
@@ -5491,6 +5786,29 @@ const server = createServer(async (req, res) => {
         };
       }
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, init);
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Test the current unsaved Bash precondition draft on the selected bot's
+    // daemon. This remains a management-only mutation route and intentionally
+    // has no schedule id, so testing cannot alter any task or dispatch a model.
+    if (req.method === 'POST' && url.pathname === '/api/schedules/precondition/test') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+      }
+      const larkAppId = typeof (body as Record<string, unknown>).larkAppId === 'string'
+        ? (body as Record<string, unknown>).larkAppId as string
+        : '';
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, '/api/schedules/precondition/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -5715,6 +6033,61 @@ const server = createServer(async (req, res) => {
       }
       if (req.method === 'DELETE') {
         const upstream = await proxyToDaemon(larkAppId, `/api/message-listeners/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    // ─── 免@ 斜杠命令 commandTriggers (proxy to daemon) ─────────────────────
+    // GET /api/command-triggers/:larkAppId
+    // PUT /api/command-triggers/:larkAppId
+    // PUT /api/command-triggers/:larkAppId/chats/:chatId
+    // GET /api/command-triggers/:larkAppId/conflicts?cmds=/solve,/clear
+    let mCommandTrigger: RegExpMatchArray | null;
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)\/conflicts$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/command-triggers/conflicts${url.search}`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)\/chats\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      const chatId = decodeURIComponent(mCommandTrigger[2]);
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/command-triggers/chats/${encodeURIComponent(chatId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, '/api/command-triggers', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, '/api/command-triggers', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
         res.end(await upstream.text());
         return;
@@ -5993,6 +6366,26 @@ const server = createServer(async (req, res) => {
       return writeHandlerResult(res, result);
     }
 
+    // Host integrations can select one exact configured bot for the write;
+    // the daemon still enforces membership before calling Lark.
+    let mRename: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mRename = url.pathname.match(/^\/api\/groups\/([^/]+)\/name\/([^/]+)$/))) {
+      const chatId = decodeURIComponent(mRename[1]);
+      const appId = decodeURIComponent(mRename[2]);
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req, 4_096);
+      } catch (error) {
+        const tooLarge = error instanceof DashboardJsonBodyTooLargeError;
+        return jsonRes(res, tooLarge ? 413 : 400, {
+          ok: false,
+          error: tooLarge ? 'body_too_large' : 'bad_json',
+        });
+      }
+      const result = await renameGroup(chatId, appId, JSON.stringify(parsed) || '{}', groupsActionDeps);
+      return writeHandlerResult(res, result);
+    }
+
     // ─── Oncall bindings (per chat × bot) ────────────────────────────────────
     // External: PUT/DELETE /api/groups/:chatId/oncall/:larkAppId
     // Internal: PUT/DELETE /api/oncall/:chatId (on the named bot's daemon).
@@ -6011,6 +6404,17 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mPinStreamingCard: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mPinStreamingCard = url.pathname.match(/^\/api\/groups\/([^/]+)\/pin-streaming-card\/([^/]+)$/))) {
+      const chatId = decodeURIComponent(mPinStreamingCard[1]);
+      const appId = decodeURIComponent(mPinStreamingCard[2]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const result = await setPinStreamingCardForGroup(chatId, appId, raw, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // ─── Per-bot defaults (Bot Defaults tab) ─────────────────────────────────
@@ -6050,7 +6454,13 @@ const server = createServer(async (req, res) => {
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
+            modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
+              ? j.modelBackendVariant ?? undefined
+              : d.modelBackendVariant,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            nativeSubagentRuntime: Object.prototype.hasOwnProperty.call(j, 'nativeSubagentRuntime')
+              ? j.nativeSubagentRuntime ?? undefined
+              : d.nativeSubagentRuntime,
             turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
             dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
           }, j);
@@ -6141,6 +6551,32 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/reply-style — proxy the sparse reply-card style
+    // override to the target bot's daemon. The daemon owns validation, atomic
+    // bots.json persistence, and its in-memory config update for future worker
+    // spawns. Running workers intentionally retain their session snapshot.
+    let mBotReplyStyle: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReplyStyle = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-style$/))) {
+      const appId = decodeURIComponent(mBotReplyStyle[1]);
+      let raw: string;
+      try {
+        raw = JSON.stringify(await readJsonBody(req, REPLY_STYLE_REQUEST_MAX_BYTES));
+      } catch (err) {
+        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
+        return;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-reply-style`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -6281,6 +6717,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Trigger-user CLI auth: per-bot switch + status. Proxied to that bot's
+    // daemon, which owns the shared validation path (/botconfig uses the same).
+    let mBotTriggerUserAuth: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTriggerUserAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuth[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    let mBotTriggerUserAuthStatus: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBotTriggerUserAuthStatus = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth-status$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuthStatus[1]);
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth-status`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
     // `{ riff: string }` (raw JSON text; '' = clear).
     let mBotRiff: RegExpMatchArray | null;
@@ -6324,6 +6786,37 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/fs/list') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(listDirLocally(url.searchParams.get('path') ?? '')));
+      return;
+    }
+
+    // GET /api/dsh/profiles — list available DSH profiles under ~/.dsh/profiles/
+    if (req.method === 'GET' && url.pathname === '/api/dsh/profiles') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ profiles: listDshProfiles() }));
+      return;
+    }
+
+    // POST /api/dsh/profiles — create a new DSH profile with default base plugins
+    if (req.method === 'POST' && url.pathname === '/api/dsh/profiles') {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      let body: { name?: string } = {};
+      try { body = JSON.parse(raw); } catch { /* ignore */ }
+      const name = (body.name ?? '').trim();
+      if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_name' }));
+        return;
+      }
+      try {
+        const created = createDshProfile(name);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name: created }));
+      } catch (err) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
       return;
     }
 
@@ -6693,7 +7186,14 @@ const server = createServer(async (req, res) => {
       try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
       catch { /* handled below */ }
       if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
-      const { authUrl } = generateAuthUrl(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), [...FEED_GROUP_SCOPES]);
+      const { authUrl } = generateAuthUrl(
+        bot.larkAppId,
+        bot.larkAppSecret,
+        normalizeBrand(bot.brand),
+        [...FEED_GROUP_SCOPES],
+        // 标签属于 owner 个人的收件箱，授权归属写明本人。
+        bot.ownerOpenId,
+      );
       return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, authUrl });
     }
 
@@ -7057,6 +7557,20 @@ const server = createServer(async (req, res) => {
           projectedBody,
           sessionBoardAudience,
         ) as typeof ev.body;
+        // Authenticated management browsers may edit the flat source value,
+        // but daemon-side references/hashes/nested records must never leave the
+        // dashboard. Patch nulls are retained so merge-based clients clear the
+        // prior source after inline↔file replacement or removal.
+        if (ev.type === 'schedule.created' || ev.type === 'schedule.updated') {
+          const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
+          body = {
+            ...b,
+            ...(b.schedule ? { schedule: stripSchedulePreconditionMaterial(b.schedule) } : {}),
+            ...(b.patch ? {
+              patch: stripSchedulePreconditionMaterial(b.patch, { preserveClearMarkers: true }),
+            } : {}),
+          } as typeof ev.body;
+        }
         // Schedules stay on the MANAGEMENT gate, mirroring the GET
         // /api/schedules carve-out: schedule events carry the full task object
         // (prompt = business instructions, workingDir = repo/customer path) and
@@ -7071,8 +7585,8 @@ const server = createServer(async (req, res) => {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
             ...b,
-            ...(b.schedule ? { schedule: { ...b.schedule, prompt: undefined, workingDir: undefined } } : {}),
-            ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
+            ...(b.schedule ? { schedule: redactSchedulesForPublic([b.schedule])[0] } : {}),
+            ...(b.patch ? { patch: redactSchedulesForPublic([b.patch])[0] } : {}),
           } as typeof ev.body;
         }
         stream.write(ev.type, { larkAppId: ev.larkAppId, body });

@@ -9,6 +9,7 @@ import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
+import { requestGrantForAskClicker } from './ask-grant-request.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -33,6 +34,11 @@ export interface AskCardDispatcherDeps {
   sendMessage?: typeof sendMessage;
   replyMessage?: typeof replyMessage;
   updateMessage?: typeof updateMessage;
+}
+
+/** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
+export interface AskCardActionDeps {
+  requestGrant?: typeof requestGrantForAskClicker;
 }
 
 export function createLarkAskCardDispatcher(
@@ -178,6 +184,7 @@ export function isAskCardAction(action?: string): boolean {
 
 export async function handleAskCardAction(
   data: AskCardActionData,
+  deps: AskCardActionDeps = {},
 ): Promise<{ toast: { type: string; content: string } } | Record<string, unknown> | undefined> {
   const value = data.action?.value;
   const action = asString(value?.action);
@@ -193,6 +200,13 @@ export async function handleAskCardAction(
     return staleToast(locale);
   }
 
+  /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
+   *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
+  const outcomeResponse = (outcome: AskClickOutcome) =>
+    outcome === 'unauthorized'
+      ? escalateUnauthorized(askId, nonce, by, locale, deps)
+      : toastForOutcome(outcome, locale);
+
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
   // accepted 时直接返回终态卡片，让飞书在回调响应里同步替换——不依赖 onSettle 异步 PATCH
   // （异步 PATCH 在飞书侧常因回调已返回而被忽略，导致卡片停在未作答态）。
@@ -200,7 +214,7 @@ export async function handleAskCardAction(
     const selected = asString(value?.key);
     if (!selected) return staleToast(locale);
     const outcome = tryResolveAsk({ askId, nonce, selected, by });
-    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    if (outcome !== 'accepted') return outcomeResponse(outcome);
     return settledCardResponse(askId, {
       kind: 'answered',
       answers: [[selected]],
@@ -215,7 +229,7 @@ export async function handleAskCardAction(
     const key = asString(value?.key);
     if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
     const outcome = toggleAsk({ askId, nonce, questionIndex, key, by });
-    if (outcome !== 'toggled') return toastForOutcome(outcome, locale);
+    if (outcome !== 'toggled') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     if (!updated) return staleToast(locale);
     return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
@@ -235,7 +249,7 @@ export async function handleAskCardAction(
       const selections = parseFormSelections(formValue, questionCount);
       const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
       if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
-      if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+      if (outcome !== 'accepted') return outcomeResponse(outcome);
       return settledCardResponse(askId, {
         kind: 'answered',
         answers: selections,
@@ -249,7 +263,7 @@ export async function handleAskCardAction(
     // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
     const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
     if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
-    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    if (outcome !== 'accepted') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
     return settledCardResponse(askId, {
@@ -489,6 +503,52 @@ export function parseFormSelections(
     result.push(keys);
   }
   return result;
+}
+
+/**
+ * 点击者没有答复权限时，向 owner 弹一张授权卡（复用对话路径那套 grant 卡 + pending 表），
+ * 并把 toast 从死胡同「你没有权限」换成「已申请授权，通过后再点一次」。
+ *
+ * **授权通过后仍需再点一次**：ask 的答案取决于点的是哪个按钮，daemon 无从代替用户决定，
+ * 所以不像对话路径那样重放触发消息（ask-grant-request 故意不挂 messageData）。这里
+ * 也不动 broker 状态——unauthorized 本来就不改 ask，ask 保持 pending 等着被再点。
+ *
+ * ask 已失效 / 已 settle / nonce 不匹配时不发卡：授权也救不回一个已结束或不存在的 ask。
+ * 这几条正常由 broker 先判（它的门序是 stale → already_settled → unauthorized），这里
+ * 再自查一遍是纵深防御——把「不为已决的 ask 骚扰 owner」从对 broker 内部顺序的隐式依赖
+ * 变成本函数自己的显式前置条件（pi review F2）。
+ */
+function escalateUnauthorized(
+  askId: string,
+  nonce: string,
+  clickerOpenId: string,
+  locale: Locale | undefined,
+  deps: AskCardActionDeps,
+): { toast: { type: string; content: string } } {
+  const ask = getAskSnapshot(askId);
+  if (!ask || ask.settled || ask.nonce !== nonce) return staleToast(locale);
+  const requestGrant = deps.requestGrant ?? requestGrantForAskClicker;
+  const outcome = requestGrant(
+    {
+      larkAppId: ask.larkAppId,
+      chatId: ask.chatId,
+      cardMessageId: ask.cardMessageId,
+      rootMessageId: ask.rootMessageId,
+    },
+    clickerOpenId,
+  );
+  switch (outcome) {
+    case 'sent':
+      return { toast: { type: 'info', content: t('card.ask.toast.grant_requested', undefined, locale) } };
+    case 'pending':
+      return { toast: { type: 'info', content: t('card.ask.toast.grant_pending', undefined, locale) } };
+    case 'denied':
+      // owner 已明确拒绝，还在冷却期 —— 说实话，别谎报「等 owner 处理」。
+      return { toast: { type: 'warning', content: t('card.ask.toast.grant_denied', undefined, locale) } };
+    case 'unavailable':
+      // 发不出授权卡（开放模式无 owner / owner 关了自动发卡）→ 回落原文案。
+      return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
+  }
 }
 
 function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { type: string; content: string } } | undefined {

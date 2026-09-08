@@ -106,7 +106,7 @@ describe('dashboard grant defaults', () => {
 
     expect(requests.map(request => request.body)).toEqual([{ messageQuotaDefaultLimit: 5 }]);
     expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join(''))
-      .toContain('当前自定义：1 小时 · 每人 5 条（授权卡与 Oncall）');
+      .toContain('当前自定义：1 小时 · 授权卡每人 5 条；Oncall 不限额');
   });
 
   it('submits quota through Enter by blurring exactly once', async () => {
@@ -134,7 +134,7 @@ describe('dashboard grant defaults', () => {
     const { root } = renderGrantSection({ messageQuotaDefaultLimit: 10 });
     const quotaTip = root.findAll(node => String(node.props['aria-label'] ?? '').includes('当前使用自定义额度'))[0];
     expect(quotaTip.props['aria-label']).toContain('清空输入框并离开后');
-    expect(quotaTip.props['aria-label']).toContain('授权卡恢复每人 3 条');
+    expect(quotaTip.props['aria-label']).toContain('清空输入框并离开后恢复每人 3 条');
 
     act(() => root.findByProps({ 'data-input': 'quotaLimit' }).props.onChange({ currentTarget: { value: '' } }));
     expect(requests).toHaveLength(0);
@@ -145,7 +145,7 @@ describe('dashboard grant defaults', () => {
       .toContain('当前内置默认：1 小时 · 授权卡每人 3 条；Oncall 不限');
   });
 
-  it('keeps an edited three-message quota explicit so oncall remains limited', async () => {
+  it('keeps an edited three-message quota explicit rather than falling back to the built-in', async () => {
     const requests = installServer({ quota: 5 });
     const { root } = renderGrantSection({ messageQuotaDefaultLimit: 5 });
     act(() => root.findByProps({ 'data-input': 'quotaLimit' }).props.onChange({ currentTarget: { value: '3' } }));
@@ -153,7 +153,7 @@ describe('dashboard grant defaults', () => {
 
     expect(requests.map(request => request.body)).toEqual([{ messageQuotaDefaultLimit: 3 }]);
     expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join(''))
-      .toContain('当前自定义：1 小时 · 每人 3 条（授权卡与 Oncall）');
+      .toContain('当前自定义：1 小时 · 授权卡每人 3 条；Oncall 不限额');
   });
 
   it('rolls a failed duration selection back so the same choice can be retried', async () => {
@@ -246,13 +246,13 @@ describe('dashboard grant defaults', () => {
     await flushAction(() => root.findByProps({ 'data-input': 'quotaLimit' }).props.onBlur());
     expect(root.findByProps({ 'data-input': 'quotaLimit' }).props.value).toBe('9');
     expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join(''))
-      .toContain('当前自定义：1 小时 · 每人 10 条');
+      .toContain('当前自定义：1 小时 · 授权卡每人 10 条');
     expect(root.findByProps({ 'data-grant-status': '' }).children.join('')).toContain('quota_failed');
 
     fail = false;
     await flushAction(() => root.findByProps({ 'data-input': 'quotaLimit' }).props.onBlur());
     expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join(''))
-      .toContain('当前自定义：1 小时 · 每人 9 条');
+      .toContain('当前自定义：1 小时 · 授权卡每人 9 条');
     expect((globalThis.fetch as any).mock.calls).toHaveLength(2);
   });
 
@@ -295,10 +295,12 @@ describe('dashboard grant defaults', () => {
 
     expect(requests.map(request => request.body)).toEqual([{ grantDefaultDurationMs: 8 * HOUR }]);
     expect(root.findByProps({ 'data-input': 'quotaLimit' }).props.value).toBe('5000');
-    expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join('')).toContain('授权卡 1000 条；Oncall 5000 条');
-    const quotaTip = root.findAll(node => String(node.props['aria-label'] ?? '').includes('当前使用兼容旧配置'))[0];
-    expect(quotaTip.props['aria-label']).toContain('授权卡每人 1000 条');
-    expect(quotaTip.props['aria-label']).toContain('Oncall 每人 5000 条');
+    expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join('')).toContain('当前配置值 5000 超上限：8 小时 · 授权卡按 1000 条执行；Oncall 不限额');
+    const quotaTip = root.findAll(node => String(node.props['aria-label'] ?? '').includes('当前配置值 5000 超过上限'))[0];
+    expect(quotaTip.props['aria-label']).toContain('授权卡按每人 1000 条执行');
+    // 超限值不再被 oncall 原样使用：oncall 恒不限额、不读 defaultLimit。
+    expect(quotaTip.props['aria-label']).toContain('Oncall 群恒不限额（不读此值）');
+    expect(quotaTip.props['aria-label']).not.toContain('Oncall 每人 5000 条');
   });
 
   it('saves the DM-open toggle through the grant-prefs endpoint', async () => {

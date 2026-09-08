@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { parseNpmPackJson } from './parse-npm-pack-json.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageArg = process.argv[2];
@@ -45,7 +46,7 @@ try {
     scratch,
     '--json',
   ]);
-  const packed = parsePackJson(pack.stdout)[0];
+  const packed = parseNpmPackJson(pack.stdout)[0];
   if (
     !packed
     || typeof packed.filename !== 'string'
@@ -105,12 +106,6 @@ function runNpm(args, allowFailure = false) {
     throw new Error(`npm ${args.join(' ')} failed with exit ${String(result.status)}`);
   }
   return result;
-}
-
-function parsePackJson(stdout) {
-  const jsonStart = stdout.search(/^\[\s*$/m);
-  if (jsonStart < 0) throw new Error(`npm pack returned no JSON:\n${stdout}`);
-  return JSON.parse(stdout.slice(jsonStart));
 }
 
 function parseJsonValue(stdout, label) {

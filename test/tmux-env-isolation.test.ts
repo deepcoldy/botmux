@@ -129,6 +129,19 @@ describe('tmuxEnv()', () => {
     }
   });
 
+  it('strips SSL_CERT_FILE from the tmux CLIENT env but never from the server global env', () => {
+    // Client-side strip: a daemon-side CA bundle must not be seeded into the
+    // shared server's global table. Server-global scrub: must NOT include it,
+    // or daemon startup would delete a CA bundle the user set on their own tmux
+    // server — for every CLI, on every platform (same rule as the proxy keys).
+    expect(isBotmuxManagedTmuxEnvKey('SSL_CERT_FILE')).toBe(true);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('SSL_CERT_FILE')).toBe(false);
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(false);
+    }
+  });
+
   it('does not classify GitHub tokens as botmux-owned tmux server-global keys', () => {
     expect(isBotmuxManagedTmuxServerGlobalEnvKey('GITHUB_TOKEN')).toBe(false);
     expect(isBotmuxManagedTmuxServerGlobalEnvKey('GH_TOKEN')).toBe(false);

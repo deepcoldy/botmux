@@ -143,12 +143,14 @@ describe('worker structured-turn status wiring', () => {
     expect(schedule).toContain('backend === backendAtSchedule');
     expect(schedule).toContain('dispatchAttempt: turnIdentity?.dispatchAttempt');
     expect(schedule).toContain('structuredTarget,');
-    expect(schedule).toContain('isCurrent: deferredAttemptIsCurrent');
+    expect(schedule).toContain(
+      'isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent)',
+    );
     const staleGuard = schedule.indexOf('if (settlement.stale)');
     expect(staleGuard).toBeGreaterThanOrEqual(0);
     expect(schedule.indexOf('persistCliSessionId(cliSessionId)', staleGuard)).toBeGreaterThan(staleGuard);
     expect(schedule.indexOf('redriveRejectedStructuredReady()', staleGuard)).toBeGreaterThan(staleGuard);
-    expect(schedule.indexOf('scheduleSubmitFailureNotify(', staleGuard)).toBeGreaterThan(staleGuard);
+    expect(schedule.indexOf('armDeferredRecheck()', staleGuard)).toBeGreaterThan(staleGuard);
     expect(schedule.indexOf('emitDurableTerminal(', staleGuard)).toBeGreaterThan(staleGuard);
 
     const restart = functionSlice('restartCliProcess', 'startWebServer');
@@ -640,7 +642,7 @@ describe('worker structured-turn status wiring', () => {
     expect(handler).toContain('msg.dispatchAttempt');
     expect(adopt).toContain('adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt)');
     expect(adopt).toContain('scheduleSubmitFailureNotify(');
-    expect(adopt).toContain("'submit history'");
+    expect(adopt).toContain("t('worker.transcriptLabel')");
     expect(adopt).toContain('dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt)');
   });
 });

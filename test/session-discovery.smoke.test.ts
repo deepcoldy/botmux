@@ -57,7 +57,9 @@ describe('readComm', () => {
     // Linux /proc/<pid>/comm 给短名 "node"；BSD ps 给完整路径，readComm
     // 已统一 basename，所以这里都不应包含 "/"。
     expect(comm).not.toContain('/');
-    expect(comm).toMatch(/^node/i);
+    // The child is `process.execPath`: Node on vitest, bun on `bun test`.
+    // Linux `/proc/<pid>/comm` is the short name of whichever runtime we spawned.
+    expect(comm).toMatch(/^(node|bun)/i);
   });
 
   it('对不存在的 PID 返回 undefined', () => {

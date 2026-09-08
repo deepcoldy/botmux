@@ -6,6 +6,7 @@ import {
   maskAppSecret,
   parseSetupCommand,
   SETUP_CLI_USAGE,
+  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -212,6 +213,19 @@ describe('buildBotFromAddFlags', () => {
     const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'aiden-x-claude' });
     expect(bot.cliId).toBe('claude-code');
     expect(bot.wrapperCli).toBe('aiden x claude');
+  });
+
+  it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
+    expect(cliSelectionKeys()).toContain('traecli');
+    expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
+    expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
+      cliId: 'traex',
+    });
+    expect(editInputFromFlags({ cli: 'traecli' })).toEqual({
+      cliChoice: 'traex',
+      wrapperCli: null,
+      cliRuntime: null,
+    });
   });
 
   it('builds a Codex-compatible runtime from --cli-runtime JSON', () => {

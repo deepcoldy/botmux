@@ -3,7 +3,7 @@ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -58,6 +58,52 @@ async function waitForScreenUpdates(
   }
   throw new Error(
     `timed out waiting for ${count} ${description}: ${JSON.stringify(messages)}\n${logs.join('')}`,
+  );
+}
+
+/** Wait until the screen_update stream has SETTLED on idle: the newest update is
+ *  idle and stays idle across a quiet window.
+ *
+ *  Why this exists instead of `waitForScreenUpdates(..., u => u.status === 'idle')`:
+ *  on an argv-baked first turn the worker legitimately publishes
+ *  `working -> idle -> working -> idle`. The middle idle is the startup-window
+ *  false idle that the worker itself rejects and re-arms (see `src/worker.ts`,
+ *  "re-arming idle detector"), so "an idle has been seen" and "the turn ended
+ *  idle" are different statements. Waiting for the first idle while asserting on
+ *  the LAST update only agrees while every trailing update happens to arrive in
+ *  one IPC batch: locally all three land in the same millisecond, so the poll
+ *  always observes the settled tail and the test passes. Under CI contention that
+ *  batch splits, the poll can wake between the re-armed `working` and the final
+ *  `idle`, and the tail assertion reads `working` -- a CI-only failure with no
+ *  product-side cause. Settling on the tail removes the dependency on delivery
+ *  batching and is strictly stronger: a transient idle is followed by the re-armed
+ *  `working` well inside the quiet window, so it can no longer end the wait. */
+async function waitForSettledIdle(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  logs: string[],
+  quietMs = 500,
+): Promise<Array<Extract<WorkerToDaemon, { type: 'screen_update' }>>> {
+  const deadline = Date.now() + 10_000;
+  let idleSince: number | undefined;
+  while (Date.now() < deadline) {
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    if (updates.at(-1)?.status === 'idle') {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= quietMs) return updates;
+    } else {
+      idleSince = undefined;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before the screen settled idle\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(
+    `timed out waiting for the screen to settle idle: ${JSON.stringify(messages)}\n${logs.join('')}`,
   );
 }
 
@@ -123,6 +169,57 @@ function ompTranscriptRecord(
 }
 
 describe('worker argv reaction status', () => {
+  it('forwards the frozen TraeX backend variant into the actual spawn argv', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-traex-variant-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeTraex = join(root, 'fake-traex');
+    writeFileSync(fakeTraex, `#!/usr/bin/env node
+process.stdout.write('❯ Ready\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeTraex, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-traex-variant',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-traex-variant',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'traex',
+      cliPathOverride: fakeTraex,
+      modelBackendVariant: 'max',
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'model_backend_variant="max"');
+    expect(logs.join('')).toContain('Spawning fresh CLI:');
+  }, 15_000);
+
   it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
     tempDirs.add(root);
@@ -147,7 +244,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -241,7 +338,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -350,7 +447,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -394,18 +491,7 @@ setInterval(() => {}, 1_000);
 
     appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
 
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
   }, 20_000);
@@ -438,7 +524,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -547,7 +633,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -658,7 +744,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -714,19 +800,9 @@ setInterval(() => {}, 1_000);
     await waitForPromptReady(child, messages, logs);
 
     // prompt_ready is sent before the seed's working→idle pair; wait for the
-    // seed's idle to land instead of counting raw updates.
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    // screen to settle idle instead of counting raw updates — the seed's idle is
+    // not necessarily the last update (see waitForSettledIdle).
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 30_000);
@@ -764,7 +840,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -851,7 +927,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -942,7 +1018,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1037,7 +1113,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1110,7 +1186,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1174,7 +1250,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

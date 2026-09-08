@@ -21,7 +21,7 @@
 // port each incarnation) — reattaching the prior pane would leave it pointed at
 // the now-dead prior app-server (that lifecycle bug, not any non-broadcast, is
 // what froze the Web terminal). See codex-rpc-lifecycle + worker engageCodexRpc.
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
@@ -65,12 +65,15 @@ export interface CodexRpcEngineOpts {
    *  new incarnation of this session can reap a prior app-server (P0 teardown). */
   sessionId?: string;
   log?: LogFn;
-  /** Optional model + reasoning effort forwarded to thread config (P1). */
+  /** Optional model, backend variant, and reasoning effort forwarded to fresh thread config (P1). */
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
+  /** Generic process-scoped app-server config overrides. */
+  appServerConfig?: string[];
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
@@ -86,6 +89,16 @@ export interface CodexRpcEngineOpts {
    *  matching rpcActive bridge entry. */
   onTurnTerminal?: (terminal: CodexRpcTurnTerminal) => void;
 }
+
+export interface CodexRpcEngineDependencies {
+  /** Process boundary kept injectable so launch argv/env can be verified without
+   * relying on platform-specific process introspection such as Linux /proc. */
+  spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+}
+
+const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
+  spawnProcess: (command, args, options) => spawn(command, args, options),
+};
 
 export interface CodexRpcTurnIdentity {
   turnId: string;
@@ -163,7 +176,10 @@ export class CodexRpcEngine {
   private lastStderr = '';
   private readonly log: LogFn;
 
-  constructor(private readonly opts: CodexRpcEngineOpts) {
+  constructor(
+    private readonly opts: CodexRpcEngineOpts,
+    private readonly dependencies: CodexRpcEngineDependencies = DEFAULT_DEPENDENCIES,
+  ) {
     this.log = opts.log ?? (() => {});
   }
 
@@ -267,7 +283,8 @@ export class CodexRpcEngine {
     this.reapStaleAppServer();
     this.port = await findFreePort();
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
-    this.child = spawn(this.opts.cliBin, ['app-server', ...featureArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    const configArgs = (this.opts.appServerConfig ?? []).flatMap(value => ['-c', value]);
+    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -336,6 +353,7 @@ export class CodexRpcEngine {
     // either here would trip the app-server's model-resume-override short-circuit.
     if (!forResume) {
       if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.modelBackendVariant) config.model_backend_variant = this.opts.modelBackendVariant;
       if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
     }
     return {

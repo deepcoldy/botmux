@@ -5,8 +5,9 @@
  * The scanner's CONTRACT, and what each group below pins down:
  *   - enumeration    the three signals (pgid / env nonce / ppid chain) and the
  *                    exclude guard
- *   - fail-closed    only ENOENT is "raced away"; every other read/parse error
- *                    fails the WHOLE scan rather than shrinking the result
+ *   - fail-closed    only a vanished pid (ENOENT / ESRCH) is "raced away";
+ *                    every other read/parse error fails the WHOLE scan rather
+ *                    than shrinking the result
  *   - evidence       a clean scan is a diagnostic signal, never boundary proof
  *   - identity       pid + boot id + starttime, so a recycled pid is detected
  *   - signalling     kill(-pid) happens ONLY after the identity re-verifies
@@ -20,6 +21,7 @@ import {
   DEFAULT_PROC_ROOT,
   MOJO_TREE_NONCE_ENV,
   isProcRootOverridden,
+  isVanishedProcError,
   mojoTreeScanSupported,
   quiescenceFromScan,
   readProcessIdentity,
@@ -215,10 +217,10 @@ describe('scanMojoTree is fail-closed', () => {
     expect(scan.failure.kind).toBe('proc-entry-unparsable');
   });
 
-  it('fails the whole scan when a stat file is unreadable for a reason other than ENOENT', () => {
+  it('fails the whole scan when a stat file is unreadable for a reason other than a vanished pid', () => {
     proc(100, { ppid: 1, pgid: 100 });
     proc(200, { ppid: 100, pgid: 200 });
-    // EACCES, not ENOENT: the pid still exists, we just cannot account for it.
+    // EACCES, not ENOENT/ESRCH: the pid still exists, we just cannot account for it.
     chmodSync(join(procRoot, '200', 'stat'), 0o000);
     // Running as root defeats the permission bit; only assert when it took effect.
     let readable = true;
@@ -231,8 +233,9 @@ describe('scanMojoTree is fail-closed', () => {
   });
 
   it('treats a pid that vanished between readdir and read as a non-member, not a failure', () => {
-    // ENOENT is the ONE tolerated error: the process really is gone, so it is
-    // genuinely not a member and the scan must still succeed.
+    // ENOENT (and ESRCH — see isVanishedProcError) is the tolerated race: the
+    // process really is gone, so it is genuinely not a member and the scan
+    // must still succeed.
     proc(100, { ppid: 1, pgid: 100 });
     const ghost = join(procRoot, '200');
     mkdirSync(ghost, { recursive: true });   // directory with no stat/environ at all
@@ -240,6 +243,13 @@ describe('scanMojoTree is fail-closed', () => {
     expect(scan.ok).toBe(true);
     if (!scan.ok) return;
     expect(scan.members.map(m => m.pid)).toEqual([100]);
+  });
+
+  it('classifies Bun ESRCH on a vanished /proc pid the same as Node ENOENT', () => {
+    expect(isVanishedProcError(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))).toBe(true);
+    expect(isVanishedProcError(Object.assign(new Error('ESRCH: no such process, read'), { code: 'ESRCH' }))).toBe(true);
+    expect(isVanishedProcError(Object.assign(new Error('EACCES'), { code: 'EACCES' }))).toBe(false);
+    expect(isVanishedProcError(Object.assign(new Error('EIO'), { code: 'EIO' }))).toBe(false);
   });
 });
 

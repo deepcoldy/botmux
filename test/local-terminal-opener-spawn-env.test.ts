@@ -5,15 +5,37 @@ import type { DaemonSession } from '../src/core/types.js';
 // spawnSync (onPath) and (b) capture the detached spawn's env. Isolated in its
 // own file so the real-spawnSync tests in local-terminal-opener.test.ts stay
 // untouched.
-const cp = vi.hoisted(() => ({
+// Plain const, deliberately NOT `vi.hoisted`: that helper is a vitest TRANSFORM
+// (it physically lifts the call above the imports) and `bun test` has no
+// equivalent, so the file died there. A plain const is safe under BOTH runners
+// because the factory below only READS it when the mocked module is first
+// resolved, which is after this statement has run. (Verified on each runner.)
+const cp = {
   spawn: vi.fn(() => ({ unref: () => {} })),
   spawnSync: vi.fn(),
-}));
+};
 
-vi.mock('node:child_process', () => ({
-  spawn: cp.spawn,
-  spawnSync: cp.spawnSync,
-}));
+// ⚠️ The real module is spread in via a LAZY `require` inside the factory. Two
+// separate reasons, both measured:
+//   · bun performs real ESM named-export linking, so a factory that returns only
+//     `{spawn, spawnSync}` fails the whole file with "Export named 'fork' not
+//     found in module 'node:child_process'" — `src/core/self-spawn.ts` imports
+//     `fork` on this module's transitive graph. vitest never checks that.
+//   · `require` rather than the factory's `importOriginal` argument: that argument
+//     is vitest-only (bun passes nothing, so awaiting it throws). A top-level
+//     `import * as actual` fails too, because vitest hoists `vi.mock` above the
+//     imports and the factory would read it before initialisation.
+// Spreading widens nothing that matters: the two functions under test are still
+// fully replaced, and the real ones are only reachable via names this file's code
+// path never calls.
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    spawn: cp.spawn,
+    spawnSync: cp.spawnSync,
+  };
+});
 
 function session(overrides: Partial<DaemonSession['session']> = {}): DaemonSession {
   return {

@@ -45,10 +45,45 @@ export interface VcMeetingImTurnOrigin {
   replyTargetSenderOpenId?: string;
 }
 
+export interface SessionTokenUsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+  model: string;
+  turns: number;
+  in: number;
+  out: number;
+}
+
 export interface TrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
+  /** Where this identity came from. Absent = the ordinary IM path (the sender of
+   *  the inbound message that opened this turn). `'schedule_creator'` = a
+   *  daemon-fired scheduled turn running as the task's creator; `taskId` names
+   *  the task. Consumers that must distinguish "a human asked just now" from
+   *  "someone's scheduled task is running" (audit trails, approval gates) read
+   *  this instead of inferring it. */
+  source?: 'schedule_creator';
+  /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
+  taskId?: string;
+  /** Type of the sender whose message opened this turn. Absent when no inbound
+   *  message opened it (a daemon-fired scheduled turn — `source` says what that
+   *  is instead), when the host cannot tell what opened it (platform
+   *  `sender_type` missing or an unrecognised value AND the sender is not a
+   *  known peer), and for turns minted before this field existed. Absent is
+   *  therefore "unknown", never "human" — treat only `'user'` as a person.
+   *
+   *  A consumer cannot infer this from the identity itself: a bot's turn carries
+   *  a perfectly valid `requestUserUnionId` (its own), so "someone asked" and
+   *  "a bot triggered itself" are indistinguishable without it. Anything that
+   *  maps the caller onto a real person's access — database accounts, approval
+   *  gates, audit attribution — needs to tell those apart, otherwise a bot that
+   *  happens to hold such a mapping becomes a way for anyone who can make it
+   *  speak to borrow that access, with the audit trail pointing at the bot. */
+  senderType?: 'user' | 'bot';
 }
 
 export interface VcMeetingConsumerProfileFilter {
@@ -354,7 +389,16 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Last input from a HUMAN sender (senderType 'user', not a peer bot)
+   *  routed into this session. Unlike `lastMessageAt` it ignores bot turns
+   *  and scheduled fires, so `schedule add --follow-active` can pick the
+   *  topic where a person most recently spoke without being dragged along by
+   *  a bot's own output. */
+  lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Last cumulative token usage persisted at close time. Dashboard list
+   *  reads this durable snapshot without rescanning historical transcripts. */
+  tokenUsage?: SessionTokenUsageSnapshot | null;
   /**
    * Restore/runtime ownership quarantine. Set when botmux cannot prove that an
    * existing external/persistent target is safe to attach or tear down, and
@@ -558,6 +602,10 @@ export interface Session {
   currentImageKey?: string;
   currentTurnTitle?: string;
   usageLimit?: CliUsageLimitState;
+  /** Model fallback in effect. Persisted alongside usageLimit because the
+   *  worker's baseline cursors to EOF after a restart — the switch record is
+   *  already history by then and would never be drained again. */
+  modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -649,6 +697,9 @@ export interface Session {
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Optional TraeX backend variant frozen when this session first launches.
+   * Missing preserves the historical inherit-from-TraeX-global behavior. */
+  modelBackendVariant?: 'standard' | 'max';
   /**
    * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
@@ -793,6 +844,8 @@ export interface SessionCliLaunchSnapshotV1 {
   wrapperCli: string | null;
   model: string | null;
   reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null;
+  /** Omitted by historical snapshots; null means this /cli choice inherits. */
+  modelBackendVariant?: 'standard' | 'max' | null;
   launchShell: string | null;
   startupCommands: string[];
 }
@@ -889,6 +942,10 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
+   *  never stored in this sandbox-writable task row. Absence does not prove
+   *  that no condition exists: runtime always checks the sidecar by task id. */
+  preconditionRef?: string;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;
@@ -896,7 +953,12 @@ export interface ScheduledTask {
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
+  /** Primary execution chat retained for backward compatibility. For a
+   *  multi-chat task this is always the first entry of `chatIds`. */
   chatId: string;
+  /** All execution chats in deterministic dispatch order. Persisted only
+   *  when more than one chat is configured; absent means `[chatId]`. */
+  chatIds?: string[];
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
@@ -932,11 +994,20 @@ export interface ScheduledTask {
    *  creator — those keep the historical behavior (scheduled turns cannot
    *  run Saved Workflows). */
   ownerOpenId?: string;
+  /** Creator's Lark `union_id`, captured next to `ownerOpenId`. Stable across
+   *  apps within a tenant (unlike `ownerOpenId`, which is app-scoped), so it is
+   *  the identity a scheduled turn presents to per-user backends. Stamped only
+   *  when the creating message came from a human sender; absent for legacy
+   *  tasks, CLI-created tasks and bot-created tasks — a scheduled turn without
+   *  it carries no user identity at all (see `trustedCallerForScheduledTask`),
+   *  which is what keeps identity-bound tools fail-closed instead of silently
+   *  running as the bot. */
+  ownerUnionId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
@@ -955,6 +1026,21 @@ export interface ScheduledTask {
    *  and fresh-topic schedules; a silent fresh topic is created lazily by the
    *  first successful `botmux send`. */
   silent?: boolean;
+  /** `--follow-active`: resolve the target topic at fire time instead of
+   *  pinning one at creation. `rootMessageId` records the last landing point
+   *  (the creation topic until the first fire). Each fire: (1) that topic is
+   *  still open (an active session exists under its root, any bot) AND a
+   *  human has spoken in it → fire there; (2) otherwise → the thread-scope
+   *  session in `chatId` whose `lastHumanMessageAt` is newest, looked up
+   *  across every bot's session store because "where the person is" is a
+   *  property of the person, not of the bot that owns the task (this lands
+   *  inside the person's live session, so the task's own workingDir does not
+   *  apply there); (3) no human-active topic anywhere but the landing point
+   *  is still open (bot-only, e.g. the fresh topic this task opened) → stay;
+   *  (4) nothing open → this fire opens a fresh top-level topic, which then
+   *  becomes the landing point. Only meaningful with executionPosition
+   *  'topic'. */
+  followActive?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -1083,6 +1169,8 @@ export interface CodexAppGenerationCommit {
 export interface CliTurnPayload {
   content: string;
   codexAppInput?: CodexAppTurnInput;
+  nativeSessionTitle?: string;
+  nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
   /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
    * ONCE by the daemon at admission (real human interactive turn only) and COPIED
@@ -1123,7 +1211,7 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1230,6 +1318,37 @@ export type CotEntry =
   | { kind: 'tool_call'; id: string; name: string; args: string }
   | { kind: 'tool_result'; id: string; result: string };
 
+/** A Claude model switch that is still in effect: Claude Code fell back off the
+ *  configured model and every later reply is served by `fallbackModel` until the
+ *  user runs `/model` to switch back. Observed by the worker from the session
+ *  transcript, persisted on the Session, and rendered as one notice line on the
+ *  live card. */
+export interface ModelFallbackState {
+  /** uuid of the transcript record that caused the switch — the stable key for
+   *  dedupe and for "is this still the same switch". */
+  uuid: string;
+  /** 'refusal' = safety guardrails, 'unavailable' = model not usable,
+   *  'consent' = quota/billing confirmation. */
+  kind: 'refusal' | 'unavailable' | 'consent';
+  /** Configured model, as written in the transcript (e.g. `claude-fable-5-1[1m]`). */
+  originalModel: string;
+  /** Model now serving the session (e.g. `claude-opus-4-8[1m]`). */
+  fallbackModel: string;
+  /** Raw reason for a non-refusal switch: `overloaded`, `model_not_found`, … */
+  trigger?: string;
+  /** Refusal category (`cyber`, `bio`, …). */
+  apiRefusalCategory?: string;
+  observedAt?: string;
+  /** Claude session (transcript jsonl basename) this switch happened in. The
+   *  notice is per Claude conversation, not per botmux session: `/repo`,
+   *  `/adopt` and a resume onto another native session all replace it, and a
+   *  record carried across that boundary is either a warning about a
+   *  conversation the user is no longer having or one nothing can ever clear.
+   *  Absent on state persisted by builds that predate the binding; the next
+   *  worker's mandatory seed re-establishes it. */
+  claudeSessionId?: string;
+}
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | {
@@ -1285,6 +1404,25 @@ export type WorkerToDaemon =
       type: 'active_runtime';
       model: string | null;
       reasoningEffort: string | null;
+    }
+  /** OBSERVED FACTS about Claude Code's automatic model switching — never a
+   * decision. `claudeSessionId` (always present) says WHICH Claude conversation
+   * they are about; `fallback` is a `scope:"session"` switch record this worker
+   * had not reported yet, or `null` when the newest such record is positive
+   * evidence that no notice applies (a non-Fable original, or one a fork
+   * neutralised); `servingModel` is the model serving the MAIN thread, sent
+   * whenever it changed since the worker's last report — it also drives the
+   * card's usage line, because Claude never emits `active_runtime`. The daemon
+   * holds the state and merges: a message from a different Claude session drops
+   * what it held first, a new record replaces, `fallback: null` clears, and a
+   * serving model different from the held `fallbackModel` clears. An ABSENT
+   * field means "nothing new observed" — a worker restart or a too-short
+   * transcript window must never read as "cleared". */
+  | {
+      type: 'model_fallback';
+      claudeSessionId: string;
+      fallback?: ModelFallbackState | null;
+      servingModel?: string;
     }
   | { type: 'native_session_title_generated'; title: string }
   | {
@@ -1353,12 +1491,12 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
    * has already published a fresh token. */
-  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   | {
       type: 'codex_app_dispatch_transition';
       sessionId: string;

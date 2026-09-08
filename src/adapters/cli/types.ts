@@ -138,6 +138,9 @@ export interface CliAdapter {
      *  and a resumeSessionId; adapters whose CLI lacks the primitive ignore it. */
     forkSession?: boolean;
     initialPrompt?: string;
+    /** CLI-native display/session title prepared by botmux. Adapters with a
+     *  launch-time title flag may consume it; others should ignore it. */
+    nativeSessionTitle?: string;
     botName?: string;
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
@@ -154,6 +157,20 @@ export interface CliAdapter {
      *  session-manager's buildBotmuxShellHints. Adapters without a routing block
      *  ignore it. */
     noTransport?: boolean;
+    /** Trigger-user CLI auth is enabled for this bot. injectsSessionContext
+     *  adapters forward it so the credential-boundary block is added to the
+     *  system prompt: the session acts with ONE person's credentials while the
+     *  on-disk store holds everyone else's, and nothing in the OS currently
+     *  stops an agent from reading those files. Off → no extra prompt text. */
+    triggerUserAuth?: boolean;
+    /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
+     *  itself. Codex does not pass its own environment to shell subprocesses,
+     *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /
+     *  BASH_ENV / GIT_ASKPASS …) are stripped before `lark-cli` ever runs and
+     *  the tool resolves the machine's own login instead. Adapters whose CLI
+     *  has such a knob declare these keys; the rest ignore the field, since for
+     *  them a plain child inherits the environment anyway. */
+    shellSubprocessEnv?: Record<string, string>;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
@@ -164,10 +181,18 @@ export interface CliAdapter {
      *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
+    /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
+     *  dsh runner; adapters without a dsh runner ignore the field. */
+    dshProfile?: string;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
-     *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
-     *  with an explicit reasoning control honor it; others ignore. */
+     *  traex `model_reasoning_effort`, grok `--reasoning-effort`, claude-code
+     *  `--effort`). Only adapters with an explicit reasoning control honor it;
+     *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
+     *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Optional TraeX process-scoped backend variant. Missing means inherit
+     * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
+    modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Codex App only: restricted local browser extension bridge. */
@@ -193,6 +218,9 @@ export interface CliAdapter {
      *  instead of a drop-prone tmux paste. Both are set together or neither. */
     remoteWsUrl?: string;
     remoteThreadId?: string;
+    /** TraeCode only: process-scoped PreToolUse command for native spawn_agent.
+     *  The worker supplies this for every managed model-owning Trae process. */
+    nativeSubagentRuntimeHookCommand?: string;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees

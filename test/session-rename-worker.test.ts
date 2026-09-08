@@ -35,6 +35,21 @@ describe('worker native session rename queue', () => {
     expect(flushRegion).toContain('syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
   });
 
+  it('keeps Codex native title sync codex-only', () => {
+    const syncStart = workerSource.indexOf('async function syncFreshCodexNativeSessionTitle(');
+    const syncEnd = workerSource.indexOf('/** 在 resume 首条输入前记录', syncStart);
+    const syncRegion = workerSource.slice(syncStart, syncEnd);
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flushRegion = workerSource.slice(flushStart, flushEnd);
+
+    expect(workerSource).not.toContain('function supportsCodexAppNativeSessionTitle(');
+    expect(syncRegion).toContain("cfg.cliId !== 'codex'");
+    expect(syncRegion).toContain("createCliAdapterSync('codex'");
+    expect(syncRegion).toContain('generateCodexAppThreadTitle({');
+    expect(flushRegion).toContain("lastInitConfig?.cliId === 'codex'");
+  });
+
   it('captures the resume metadata baseline without applying the title before the first append', () => {
     const region = caseRegion('init');
     expect(region).toContain('await prepareCodexNativeTitleGeneration(msg, codexRpcEngine)');
@@ -97,6 +112,34 @@ describe('worker native session rename queue', () => {
     expect(region).toContain('lastInitConfig.nativeSessionTitlePrompt = msg.nativeSessionTitlePrompt');
     expect(region).toContain('stopNativeSessionTitleSync()');
     expect(region).toContain('void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
+  });
+
+  it('queues TraeX automatic titles only after the tagged user input submits', () => {
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flushRegion = workerSource.slice(flushStart, flushEnd);
+    const helperStart = workerSource.indexOf('function queuePostSubmitNativeSessionTitle(');
+    const helperEnd = workerSource.indexOf('\n/** 在 resume 首条输入前记录', helperStart);
+    const helperRegion = workerSource.slice(helperStart, helperEnd);
+
+    expect(helperRegion).toContain("supportsPostSubmitRenameSessionTitle(cfg.cliId)");
+    expect(helperRegion).toContain('pendingSessionRename = trimmed');
+    expect(flushRegion.indexOf('() => writeAdapter.writeInput('))
+      .toBeLessThan(flushRegion.indexOf('maybeQueuePostSubmitNativeSessionTitle(item)'));
+    expect(flushRegion).toContain('if (queuedPostSubmitNativeTitle) break');
+  });
+
+  it('keeps deferred submit recheck able to queue a TraeX automatic title', () => {
+    const helperStart = workerSource.indexOf('function scheduleSubmitFailureNotify(');
+    const helperEnd = workerSource.indexOf('\nfunction dropExactReceiptHandle', helperStart);
+    const helperRegion = workerSource.slice(helperStart, helperEnd);
+    const suppressIdx = helperRegion.indexOf("case 'suppress-confirmed':");
+    const queueIdx = helperRegion.indexOf('queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle)', suppressIdx);
+    const persistIdx = helperRegion.indexOf('persistCliSessionId(cliSessionId)', suppressIdx);
+
+    expect(suppressIdx).toBeGreaterThanOrEqual(0);
+    expect(queueIdx).toBeGreaterThan(suppressIdx);
+    expect(queueIdx).toBeLessThan(persistIdx);
   });
 
   it('queues rename IPC without opening a renderer or usage turn', () => {

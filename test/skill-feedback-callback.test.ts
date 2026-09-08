@@ -142,3 +142,110 @@ describe('feedback callback state machine', () => {
     store.close();
   });
 });
+
+describe('feedback callback reviewers audience', () => {
+  async function reviewersSetup(reviewers: string[]) {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers });
+    const response = store.createResponse({ interactionId: 'int-reviewers', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    // Bot-triggered auto-analysis has no human requester, so the delivery is
+    // ownerless — the allowlist is the only identity gate.
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+    return { store, delivery };
+  }
+
+  it('lets a listed reviewer (by open_id) click even with no requester on the delivery', async () => {
+    const { store, delivery } = await reviewersSetup(['ou_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_reviewer'), 'app', { store });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_reviewer')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('lets a listed reviewer (by cross-app union_id) click regardless of open_id', async () => {
+    const { store, delivery } = await reviewersSetup(['on_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_whoever', undefined, 'on_reviewer'), 'app', { store });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'on_reviewer')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('rejects a non-listed operator with the reviewers toast and mutates nothing', async () => {
+    const { store, delivery } = await reviewersSetup(['ou_reviewer']);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_intruder'), 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '仅指定的反馈人可反馈' });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_intruder')).toHaveLength(0);
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_reviewer')).toHaveLength(0);
+    store.close();
+  });
+});
+
+describe('feedback callback everyone audience', () => {
+  async function everyoneSetup() {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
+    const response = store.createResponse({ interactionId: 'int-everyone', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+    return { store, delivery };
+  }
+
+  it('lets any platform-identified operator click without a requester', async () => {
+    const { store, delivery } = await everyoneSetup();
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_anyone')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('prefers the verified union_id as the feedback subject', async () => {
+    const { store, delivery } = await everyoneSetup();
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone', undefined, 'on_anyone'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'on_anyone')).toMatchObject({ result: 'conclusive_usable' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_anyone')).toBeUndefined();
+    store.close();
+  });
+
+  it('lets a non-requester click a delivery that DOES carry a requester', async () => {
+    // The other everyone cases use ownerless deliveries, where the `requester`
+    // branch's fallback happens to admit any verified operator too — so they
+    // stay green even with the everyone branch deleted. Pin the one behaviour
+    // only `everyone` produces: a delivery addressed to someone specific is
+    // still clickable by a different member of the chat.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
+    const response = store.createResponse({ interactionId: 'int-everyone-owned', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_asker' });
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_someone_else'),
+      'app',
+      { store },
+    );
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_someone_else')).toMatchObject({ result: 'conclusive_usable' });
+    store.close();
+  });
+
+  it('still rejects a callback with no platform-verified operator identity', async () => {
+    const { store } = await everyoneSetup();
+    const input = event({ action: 'feedback_submit', result: 'conclusive_usable' });
+    delete input.operator;
+    const result = await handleSkillFeedbackCardAction(input, 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '无法验证反馈来源，请重试' });
+    store.close();
+  });
+});

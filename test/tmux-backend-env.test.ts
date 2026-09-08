@@ -29,6 +29,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as tmuxBackend from '../src/adapters/backend/tmux-backend.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -73,6 +74,20 @@ function firstExistingPath(paths: readonly string[]): string | undefined {
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
+
+describe('buildBotmuxEnvAssignments() — CA bundle', () => {
+  it('forwards SSL_CERT_FILE per pane (it is deliberately not on the injected allowlist)', () => {
+    // The value reaches the pane through this per-pane injection, NOT through
+    // BOTMUX_INJECTED_ENV_KEYS — listing it there would also make every pane
+    // `unset` it and let daemon startup delete a user's own tmux server value.
+    const out = buildBotmuxEnvAssignments({ SSL_CERT_FILE: '/private/etc/ssl/cert.pem' });
+    expect(out).toContain('SSL_CERT_FILE=/private/etc/ssl/cert.pem');
+  });
+
+  it('omits SSL_CERT_FILE when the worker resolved none and the operator set none', () => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(a => a.startsWith('SSL_CERT_FILE='))).toBe(false);
+  });
+});
 
 describe('buildBotmuxEnvAssignments()', () => {
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
@@ -125,9 +140,11 @@ describe('buildBotmuxEnvAssignments()', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_USAGE_DISPLAY: 'footer',
+      BOTMUX_REPLY_STYLE: JSON.stringify({ layout: false, theme: 'minimal' }),
       PATH: '/usr/bin',
     });
     expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
+    expect(out).toContain('BOTMUX_REPLY_STYLE={"layout":false,"theme":"minimal"}');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
@@ -500,22 +517,29 @@ describe('shellLaunchArgv()', () => {
 });
 
 describe('PtyBackend launchShell boundary', () => {
-  it('passes the requested CLI directly and ignores launchShell wrapping', async () => {
+  // bun 进程内 node-pty 对短命 `sh -c printf` 经常不回调 onData、立刻 onExit，
+  // buffer 为空（CI bun-test：Expected "DIRECT:cli-zero:arg-one", Received ""）。
+  // 同一断言的 bun 覆盖在 pty-backend-launch-shell.test.ts（mock spawn 参数）。
+  it.runIf(!isBunRuntime())('passes the requested CLI directly and ignores launchShell wrapping', async () => {
     const backend = new PtyBackend();
-    const output = await new Promise<string>((resolve) => {
-      let buffer = '';
-      backend.spawn('/bin/sh', ['-c', 'printf "DIRECT:%s:%s\\n" "$0" "$1"', 'cli-zero', 'arg-one'], {
-        cwd: tmpdir(),
-        cols: 80,
-        rows: 24,
-        env: { PATH: '/usr/bin:/bin' },
-        injectEnv: { BOTMUX: '1' },
-        launchShell: '/bin/fish',
+    try {
+      const output = await new Promise<string>((resolve) => {
+        let buffer = '';
+        backend.spawn('/bin/sh', ['-c', 'printf "DIRECT:%s:%s\\n" "$0" "$1"', 'cli-zero', 'arg-one'], {
+          cwd: tmpdir(),
+          cols: 80,
+          rows: 24,
+          env: { PATH: '/usr/bin:/bin' },
+          injectEnv: { BOTMUX: '1' },
+          launchShell: '/bin/fish',
+        });
+        backend.onData((data) => { buffer += data; });
+        backend.onExit(() => resolve(buffer));
       });
-      backend.onData((data) => { buffer += data; });
-      backend.onExit(() => resolve(buffer));
-    });
-    expect(output).toContain('DIRECT:cli-zero:arg-one');
+      expect(output).toContain('DIRECT:cli-zero:arg-one');
+    } finally {
+      backend.kill();
+    }
   });
 });
 

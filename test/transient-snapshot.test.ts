@@ -11,14 +11,24 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(),
-  execFileSync: vi.fn(),
-  spawnSync: vi.fn(),
-}));
+// Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
+// shim has no `importActual`, and a fill that resolved without loading the module would
+// silently un-mock. The real module is SPREAD IN because bun links named exports for
+// real — a factory returning only the overridden keys fails the whole file with
+// "Export named 'X' not found in module '…'" (measured: `fork`, pulled in by
+// src/core/self-spawn.ts on the transitive graph). vitest performs no such check.
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execSync: vi.fn(),
+    execFileSync: vi.fn(),
+    spawnSync: vi.fn(),
+  };
+});
 
-vi.mock('node:fs', async () => {
-  const actual: any = await vi.importActual('node:fs');
+vi.mock('node:fs', () => {
+  const actual: any = require('node:fs');
   return {
     ...actual,
     openSync: vi.fn(() => 7),
@@ -46,6 +56,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { snapshotToPng, snapshotToText, tryCapturePipeSnapshot } from '../src/utils/transient-snapshot.js';
 import { captureToPng } from '../src/utils/screenshot-renderer.js';
+import { bufferSpawnResult } from './helpers/spawn-result.js';
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
@@ -60,7 +71,7 @@ function spawnedBackend() {
 beforeEach(() => {
   mockedExecSync.mockReset();
   mockedSpawnSync.mockReset();
-  mockedSpawnSync.mockReturnValue({ status: 0 } as any);
+  mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedCaptureToPng.mockClear();
 });

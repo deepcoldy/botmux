@@ -142,6 +142,14 @@ export class PreviewInteractionManager {
     return count;
   }
 
+  /** 当前持有交互租约的全部认证会话。解绑吊销要按前缀筛平台身份。
+   *  ⚠️ 新增持有 authSessionId 状态的注册表必须同时接进
+   *  `dashboard.ts#syncPlatformBindingRevocation` 的并集 —— 见
+   *  `TerminalControlManager.authSessionIds` 的完整说明与当前的四个成员。 */
+  authSessionIds(): string[] {
+    return [...new Set([...this.leases.values()].map(lease => lease.authSessionId))];
+  }
+
   relockAuthSession(authSessionId: string): number {
     let count = 0;
     for (const [key, lease] of [...this.leases]) {

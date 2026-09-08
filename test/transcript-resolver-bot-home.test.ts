@@ -20,12 +20,29 @@ import { tmpdir } from 'node:os';
 // back to the BOT_HOME dir when the query carries the owning bot's app id.
 
 // Point homedir at a controllable fake so the "global" ~/.claude is test-owned.
-// vi.hoisted: the mock factory runs at import time, before module-level lets.
-const fake = vi.hoisted(() => ({ home: '/nonexistent-home' }));
-vi.mock('node:os', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('node:os')>()),
-  homedir: () => fake.home,
-}));
+//
+// The mutable home lives on the MOCK ITSELF (a `vi.fn` whose return value the tests
+// reset), and is reached below via the mocked `homedir`. Three constraints force this:
+//   · `vi.hoisted` (the original) is a vitest-only TRANSFORM — no `bun test` equivalent.
+//   · A module-level `const fake = {…}` read from the arrow is NOT enough either: the
+//     module under test calls `homedir()` while it is being imported, i.e. still inside
+//     vitest's hoisted phase → "Cannot access 'fake' before initialization" (measured).
+//     So the state has to be created by the factory, not merely read by it.
+//   · `require`, not the factory's `importOriginal` argument: that argument is vitest-only
+//     (bun passes nothing, so awaiting it throws). The real module is spread in because
+//     bun links named exports for real.
+vi.mock('node:os', () => {
+  const actual = require('node:os') as typeof import('node:os');
+  return { ...actual, homedir: vi.fn(() => '/nonexistent-home') };
+});
+
+import { homedir } from 'node:os';
+
+/** The controllable fake home, backed by the mocked `homedir`. */
+const fake = {
+  get home(): string { return homedir(); },
+  set home(value: string) { vi.mocked(homedir).mockReturnValue(value); },
+};
 
 import {
   __resetTranscriptResolverCacheForTest,

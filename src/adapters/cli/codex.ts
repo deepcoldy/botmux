@@ -177,7 +177,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -235,6 +235,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           '-c', 'shell_environment_policy.inherit="all"',
           '-c', 'shell_environment_policy.ignore_default_excludes=true',
         );
+      }
+      // Trigger-user CLI identity: the wrapper only intercepts `lark-cli` if the
+      // shell codex spawns can see these. Same mechanism as the block above and
+      // the same failure if omitted — measured: without them `lark-cli whoami`
+      // inside a session reports the machine owner, not the acting identity.
+      //
+      // Enumerated with `.set` rather than `inherit="all"`: this needs exactly
+      // these keys, while inherit would hand every shell command the whole
+      // worker environment, which is a much wider surface for a narrower need.
+      for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。

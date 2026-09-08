@@ -37,7 +37,12 @@ import {
   ASK_SKILL, ASK_SKILL_NAME,
   WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME,
 } from './definitions.js';
-import { effectiveBuiltinSkills, effectiveBuiltinSkillContent } from './effective-builtins.js';
+import {
+  effectiveBuiltinSkills,
+  effectiveBuiltinSkillContent,
+  isBuiltinSkillBodyOverridden,
+} from './effective-builtins.js';
+import { renderBotmuxSendSkill } from './reply-style-guide.js';
 
 /** The unconditional built-ins with the v3 Workflow family spliced back in at
  *  their historical position (right after `botmux-handoff`) when the machine-wide
@@ -192,7 +197,10 @@ export function builtinSkillEntries(opts: {
  *  family resolves only while the feature is enabled, so a disabled host can't
  *  pull a skill it never advertised. Honors a user override body; returns
  *  undefined for a user-disabled skill. */
-export function builtinSkillContent(name: string): string | undefined {
+export function builtinSkillContent(
+  name: string,
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
   const all = [
     ...baseBuiltinSkills(isWorkflowFeatureEnabled()),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
@@ -200,7 +208,14 @@ export function builtinSkillContent(name: string): string | undefined {
   ];
   const shipped = all.find((d) => d.name === name)?.content;
   if (shipped === undefined) return undefined;
-  return effectiveBuiltinSkillContent(name, shipped);
+  const effective = effectiveBuiltinSkillContent(name, shipped);
+  if (effective === undefined) return undefined;
+  // Explicit user bodies are authoritative. Only the shipped botmux-send guide
+  // is session-rendered from BOTMUX_REPLY_STYLE.
+  if (name === 'botmux-send' && !isBuiltinSkillBodyOverridden(name)) {
+    return renderBotmuxSendSkill(env);
+  }
+  return effective;
 }
 
 /**

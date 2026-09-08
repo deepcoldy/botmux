@@ -38,6 +38,35 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('--content-file > 位置参数 > stdin');
     expect(skill!.content).toContain('多行正文推荐只放在 heredoc/stdin 中');
   });
+
+  it('teaches complexity-adaptive layout that matches the schema-v2 renderer', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('普通回复统一用飞书卡片（schema 2.0）');
+    expect(skill!.content).toContain('单句确认 / 简短状态');
+    expect(skill!.content).toContain('复杂结果 / 方案 / 风险');
+    expect(skill!.content).toContain('独立标题组件（最多提升前 6 个');
+    expect(skill!.content).toContain('下一步 / 需要你确认');
+    expect(skill!.content).toContain('可选排版配方（参考，不是强制模板）');
+    expect(skill!.content).toContain('结果摘要');
+    expect(skill!.content).toContain('进度更新');
+    expect(skill!.content).toContain('方案对比');
+    expect(skill!.content).toContain('风险 / 待确认');
+    expect(skill!.content).toContain('交接说明');
+    expect(skill!.content).toContain('默认使用自由 Markdown');
+    expect(skill!.content).toContain('语义信号');
+    expect(skill!.content).toContain('两个以上方案需要比较');
+    expect(skill!.content).toContain('任务失败或被硬阻塞（需要人介入）');
+    expect(skill!.content).toContain('发送时加 `--attention`');
+    expect(skill!.content).toContain('对不上这五类时继续用自由 Markdown');
+    expect(skill!.content).toContain('仅有可靠数据时附 N%');
+    expect(skill!.content).toContain('可以改名、删减、重排或组合');
+    expect(skill!.content).toContain('不要输出没有内容的占位区块');
+    expect(skill!.content).toContain('配方只影响 Markdown 写法');
+    expect(skill!.content).toContain('使用 `botmux ask`');
+    expect(skill!.content).toContain('不要在普通回复里画不能点击的按钮');
+    expect(skill!.content).not.toContain('纯文本走普通消息');
+  });
 });
 
 describe('built-in botmux-history skill', () => {

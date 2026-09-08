@@ -10,7 +10,7 @@ export type SessionTitleUpdateResult =
   | { ok: false; error: 'bad_title' };
 
 const BOTMUX_LARK_TITLE_PREFIX = '[BotMux·Lark]';
-const BOTMUX_LARK_TITLE_MAX = 100;
+const BOTMUX_LARK_TITLE_MAX = 200;
 const BOTMUX_LARK_TITLE_PROMPT_MAX = 2_000;
 
 function stripLeadingKnownMentions(

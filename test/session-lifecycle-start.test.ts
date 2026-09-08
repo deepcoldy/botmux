@@ -2,10 +2,11 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
-const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
+const { emitHookEventMock, forkMock, execSyncMock, checkWorkerAdmissionMock } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
+  checkWorkerAdmissionMock: vi.fn(),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -19,6 +20,11 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+}));
+
+vi.mock('../src/core/worker-budget.js', () => ({
+  checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
+  formatMemoryBytes: (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`,
 }));
 
 vi.mock('../src/im/lark/client.js', () => {
@@ -159,11 +165,17 @@ import {
   detachWorkerForTransfer,
   forkAdoptWorker,
   forkWorker,
+  getDaemonBootId,
   initWorkerPool,
   promoteQueuedActivationTail,
+  restartCounts,
   sendWorkerInput,
   suspendWorker,
 } from '../src/core/worker-pool.js';
+import {
+  managedOriginCapabilityDirectory,
+  readManagedOriginCapability,
+} from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
@@ -237,12 +249,67 @@ beforeEach(() => {
   __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
+  restartCounts.clear();
   forkMock.mockImplementation(() => makeFakeWorker());
+  checkWorkerAdmissionMock.mockReturnValue({
+    allowed: true,
+    reasons: [],
+    pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
+    policy: {
+      minAvailableMemoryBytes: 8 * 1024 ** 3,
+      maxMemoryFullAvg10: 20,
+      minAvailableMemorySource: 'default',
+      maxMemoryFullAvg10Source: 'default',
+    },
+  });
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+  });
+});
+
+describe('host memory pressure worker admission', () => {
+  it('blocks a fresh/resumed fork before child creation and posts retry guidance', async () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue({
+      allowed: false,
+      reasons: ['MemAvailable 1.0 GiB is below the reserved 8.0 GiB'],
+      pressure: {
+        totalMemoryBytes: 32 * 1024 ** 3,
+        availableMemoryBytes: 1024 ** 3,
+        memoryFullAvg10: 25,
+        warnings: [],
+      },
+      policy: {
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    });
+    const ds = makeDs({ hasHistory: true });
+
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' })).toBe(true);
+    await Promise.resolve();
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_retry',
+      undefined,
+    );
   });
 });
 
@@ -3229,6 +3296,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',
     }));
+    expect(init).not.toHaveProperty('replyStyle');
   });
 
   it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {
@@ -3265,6 +3333,17 @@ describe('session.start lifecycle integration', () => {
     const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
     expect(forkOpts?.env?.GITHUB_TOKEN).toBeUndefined();
     expect(forkOpts?.env?.GH_TOKEN).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
+  it('preserves the host-scoped Go build policy in the daemon→worker fork env', () => {
+    vi.stubEnv('GOFLAGS', '-p=4');
+
+    forkWorker(makeDs(), 'hello', false);
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.GOFLAGS).toBe('-p=4');
 
     vi.unstubAllEnvs();
   });
@@ -3507,18 +3586,24 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
-  it('passes the persisted Lark topic title to a fresh Codex worker before its first prompt', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('derives a fresh %s native title from the untruncated first prompt', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
+    const titlePrompt = '帮我看下https://example.com/product/alpha/content/videoTag 这个页面的接口你能打开吗？我这访问一直报错，看起来访问到sample.api.service这，像是权限服务报错。';
     const ds = makeDs({
       session: {
         ...makeDs().session,
-        title: '@TestBot 排查这个 TTP logid',
-        nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+        cliId,
+        title: '@TestBot 帮我看下https://example.com/product/alp',
+        nativeSessionTitle: '[BotMux·Lark] @TestBot 帮我看下https://example.com/product/alp',
       },
     });
     forkWorker(ds, `
 <botmux_routing>routing instructions</botmux_routing>
 <user_message>
-@TestBot 排查这个 TTP logid 的失败原因
+@TestBot ${titlePrompt}
 </user_message>
 `, false);
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3526,15 +3611,21 @@ describe('session.start lifecycle integration', () => {
 
     expect(init).toEqual(expect.objectContaining({
       type: 'init',
-      nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
-      nativeSessionTitlePrompt: '排查这个 TTP logid 的失败原因',
+      nativeSessionTitle: `[BotMux·Lark] ${titlePrompt}`,
+      nativeSessionTitlePrompt: titlePrompt,
     }));
+    expect(init.nativeSessionTitle).toContain('/product/alpha/content/videoTag');
   });
 
-  it('waits when a fresh Codex topic only contains the bot mention', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('waits when a fresh %s topic only contains the bot mention', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         title: '@@TestBot',
         nativeSessionTitle: '[BotMux·Lark] @@TestBot',
         chatDisplayName: 'BotMux 标题优化群',
@@ -3555,10 +3646,15 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
   });
 
-  it('reapplies the group fallback when a pending Codex worker restarts before any content', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('reapplies the group fallback when a pending %s worker restarts before any content', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
         nativeSessionTitleAwaitingContent: true,
         chatDisplayName: 'BotMux 标题优化群',
@@ -3576,13 +3672,17 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
   });
 
-  it('consumes only the first meaningful follow-up for a pending Codex title', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('consumes only the first meaningful follow-up for a pending %s title', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const worker = makeFakeWorker();
     const ds = makeDs({
       worker,
       session: {
         ...makeDs().session,
-        cliId: 'codex',
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
       },
@@ -3615,10 +3715,15 @@ describe('session.start lifecycle integration', () => {
     });
   });
 
-  it('consumes a pending Codex title when a stopped worker resumes', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('consumes a pending %s title when a stopped worker resumes', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         cliSessionId: 'codex-native-pending',
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
@@ -3636,10 +3741,15 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
   });
 
-  it('passes the pending fallback when a stopped Codex worker has no native session id yet', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('passes the pending fallback when a stopped %s worker has no native session id yet', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
       },
@@ -3809,6 +3919,187 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 });
 
 describe('managed turn authority worker generations', () => {
+  it('keeps policy authority but invalidates live authority across claude_exit auto-restart', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-before-crash',
+      policyCapability: 'policy-worker-generation',
+      turnId: 'turn-before-crash',
+    });
+
+    worker.emit('message', { type: 'claude_exit', code: 17, signal: null });
+
+    await vi.waitFor(() => expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    })));
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: expect.any(String),
+      policyCapability: 'policy-worker-generation',
+    });
+    expect(ds.managedTurnOrigin?.capability).not.toBe('live-before-crash');
+  });
+
+  it('clears policy authority when a remote backend exits without restart', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    // Freeze this already-running generation as remote after the generic test
+    // helper has populated its local default init snapshot.
+    ds.initConfig = { ...(ds.initConfig ?? {}), backendType: 'riff' } as any;
+    ds.session.backendType = 'riff';
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'remote-live-capability',
+      policyCapability: 'remote-policy-capability',
+      turnId: 'remote-turn',
+    });
+
+    worker.emit('message', { type: 'claude_exit', code: 17, signal: null });
+
+    await vi.waitFor(() => expect(ds.managedTurnOrigin).toBeUndefined());
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    }));
+  });
+
+  it('clears policy authority when crash-loop protection parks the worker', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'crash-loop-live-capability',
+      policyCapability: 'crash-loop-policy-capability',
+      turnId: 'crash-loop-turn',
+    });
+    restartCounts.set(ds.session.sessionId, { count: 3, lastAt: Date.now() });
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 17,
+      signal: null,
+      canParkDiagnostic: true,
+    });
+
+    await vi.waitFor(() => expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' }));
+    expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    }));
+  });
+
+  it('clears retained policy authority when exit reconciliation kills the same worker', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      // onCliExit is async in production. A reconciliation step can kill the
+      // worker while the handler awaits it, leaving ds.worker still pointing at
+      // this generation. The post-await no-live-worker branch must revoke the
+      // policy-only placeholder instead of leaving it daemon-readable.
+      onCliExit: async activeDs => {
+        (activeDs.worker as any).killed = true;
+      },
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'reconciled-live-capability',
+      policyCapability: 'reconciled-policy-capability',
+      turnId: 'reconciled-turn',
+    });
+
+    worker.emit('message', { type: 'claude_exit', code: 17, signal: null });
+
+    await vi.waitFor(() => expect(ds.managedTurnOrigin).toBeUndefined());
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    }));
+  });
+
+  it('ignores claude_exit authority changes from a stale worker generation', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const staleWorker = forkMock.mock.results.at(-1)!.value;
+    forkWorker(ds, 'replacement', false);
+    const currentWorker = forkMock.mock.results.at(-1)!.value;
+    currentWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'current-live-capability',
+      policyCapability: 'current-policy-capability',
+      turnId: 'current-turn',
+    });
+
+    staleWorker.emit('message', { type: 'claude_exit', code: 17, signal: null });
+    await Promise.resolve();
+
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'current-live-capability',
+      policyCapability: 'current-policy-capability',
+      turnId: 'current-turn',
+    });
+    expect(currentWorker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    }));
+  });
+
+  it('keeps daemon routing identity when publishing a protected origin claim', () => {
+    const ds = makeDs();
+    const channelId = 'd1'.repeat(32);
+    const capability = 'a1'.repeat(32);
+    const claimDir = managedOriginCapabilityDirectory(
+      '/tmp/test-sessions',
+      ds.session.sessionId,
+      channelId,
+    );
+    rmSync(claimDir, { recursive: true, force: true });
+    try {
+      forkWorker(ds, 'first', false);
+      const worker = forkMock.mock.results.at(-1)!.value;
+      worker.emit('message', {
+        type: 'managed_turn_origin',
+        sessionId: ds.session.sessionId,
+        capability,
+        originChannelId: channelId,
+        turnId: 'turn-protected-claim',
+        dispatchAttempt: 2,
+      });
+
+      expect(readManagedOriginCapability(
+        '/tmp/test-sessions',
+        ds.session.sessionId,
+        undefined,
+        channelId,
+      )).toMatchObject({
+        sessionId: ds.session.sessionId,
+        channelId,
+        capability,
+        larkAppId: ds.larkAppId,
+        bootInstanceId: getDaemonBootId(),
+        turnId: 'turn-protected-claim',
+        dispatchAttempt: 2,
+      });
+    } finally {
+      rmSync(claimDir, { recursive: true, force: true });
+    }
+  });
+
   it('revokes the old capability immediately when a normal double-fork replacement fails', () => {
     const oldWorker = makeFakeWorker();
     const ds = makeDs({
@@ -3896,11 +4187,13 @@ describe('managed turn authority worker generations', () => {
       type: 'managed_turn_origin',
       sessionId: ds.session.sessionId,
       capability: 'before-restart',
+      policyCapability: 'policy-before-restart',
       turnId: 'turn-before-restart',
       dispatchAttempt: 4,
     });
     expect(ds.managedTurnOrigin).toEqual({
       capability: 'before-restart',
+      policyCapability: 'policy-before-restart',
       turnId: 'turn-before-restart',
       dispatchAttempt: 4,
     });
@@ -3914,18 +4207,23 @@ describe('managed turn authority worker generations', () => {
       turnId: 'turn-before-restart',
       dispatchAttempt: 4,
     });
-    expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(ds.managedTurnOrigin).toMatchObject({
+      policyCapability: 'policy-before-restart',
+    });
+    expect(ds.managedTurnOrigin?.capability).not.toBe('before-restart');
 
     // The first real turn on the replacement CLI rotates/re-publishes.
     worker.emit('message', {
       type: 'managed_turn_origin',
       sessionId: ds.session.sessionId,
       capability: 'after-restart',
+      policyCapability: 'policy-after-restart',
       turnId: 'turn-after-restart',
       dispatchAttempt: 5,
     });
     expect(ds.managedTurnOrigin).toEqual({
       capability: 'after-restart',
+      policyCapability: 'policy-after-restart',
       turnId: 'turn-after-restart',
       dispatchAttempt: 5,
     });
@@ -3940,8 +4238,103 @@ describe('managed turn authority worker generations', () => {
     });
     expect(ds.managedTurnOrigin).toEqual({
       capability: 'after-restart',
+      policyCapability: 'policy-after-restart',
       turnId: 'turn-after-restart',
       dispatchAttempt: 5,
+    });
+  });
+
+  it('keeps session-lifetime policy authority when turn terminal clears the live send capability', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'turn-capability',
+      policyCapability: 'policy-capability',
+      turnId: 'turn-terminal',
+      dispatchAttempt: 9,
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'turn-capability',
+      policyCapability: 'policy-capability',
+      turnId: 'turn-terminal',
+      dispatchAttempt: 9,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-terminal',
+      dispatchAttempt: 9,
+      status: 'completed',
+    });
+    await vi.waitFor(() => expect(ds.managedTurnOrigin).toMatchObject({
+      policyCapability: 'policy-capability',
+    }));
+    expect(ds.managedTurnOrigin?.capability).not.toBe('turn-capability');
+  });
+
+  it('revokes policy authority only when the explicit policy token matches', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-capability',
+      policyCapability: 'current-policy-capability',
+      turnId: 'turn-current',
+    });
+
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      policyCapability: 'stale-policy-capability',
+    });
+    expect(ds.managedTurnOrigin).toMatchObject({
+      capability: 'live-capability',
+      policyCapability: 'current-policy-capability',
+    });
+
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      policyCapability: 'current-policy-capability',
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'live-capability',
+      turnId: 'turn-current',
+    });
+  });
+
+  it('ignores a stale policy revoke after both capabilities rotate', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'new-live-capability',
+      policyCapability: 'new-policy-capability',
+      turnId: 'turn-new',
+    });
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'old-live-capability',
+      policyCapability: 'old-policy-capability',
+      turnId: 'turn-old',
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      capability: 'new-live-capability',
+      policyCapability: 'new-policy-capability',
+      turnId: 'turn-new',
     });
   });
 

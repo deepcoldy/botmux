@@ -39,7 +39,10 @@ function textMatches(actual: string, expected: string): boolean {
   // 宽容前缀匹配：多行内容在 TUI 里可能被嵌入换行提前提交（只提交了第一段），
   // 或 DB 侧截断。宁可认作已提交，也不误报"未确认"（与旧盲发行为对齐，不回退）。
   if (na.length > 0 && (ne.startsWith(na) || na.startsWith(ne.slice(0, na.length)))) return true;
-  return false;
+  // OpenCode 只会在原始输入前加 Directory Context；BotMux 信封本身必须作为
+  // 完整、不变的后缀落库。把 user_message 内容视为不透明文本，不解析其中可能
+  // 出现的 XML-looking 字符串。
+  return ne.length > 0 && na.endsWith(ne);
 }
 
 // -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
@@ -158,6 +161,14 @@ export async function detectOpenCodeSubmit(
         : { submitted: true };
     }
     await delayFn(800);
+    // 等待期间记录可能已落库：发送重试 Enter 前先复查，命中就不再补发 Enter
+    // （避免对已提交的内容多按一次回车，把输入框里本已提交的行再触发一次）。
+    const afterWait = detectNewSubmit(baseline, content, kind);
+    if (afterWait.found) {
+      return afterWait.cliSessionId
+        ? { submitted: true, cliSessionId: afterWait.cliSessionId }
+        : { submitted: true };
+    }
     if (!trySendEnter()) return { submitted: false };
   }
   const finalMatch = detectNewSubmit(baseline, content, kind);
@@ -340,6 +351,16 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
+    // bakes the full first-round prompt into `--prompt <content>`, so a long
+    // routing/role/user prompt blows the tmux limit before OpenCode starts.
+    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
+    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
+    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
+    // below the measured tmux ceiling.  Over-limit prompts defer to the
+    // normal post-start input queue.
+    maxInitialPromptArgBytes: 8192,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
@@ -377,11 +398,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline();
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -389,7 +411,10 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long/deferred or multiline prompts are parsed as individual
+          // key events and can be dropped instead of submitted as one message.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }

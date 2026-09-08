@@ -3,7 +3,43 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { resolveNodeExecutable } from './helpers/ts-runner.js';
 import { detectGlobalInstallManager } from '../src/utils/global-install.js';
+import { parseNpmPackJson } from '../scripts/parse-npm-pack-json.mjs';
+
+const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
+
+/**
+ * `npm pack --dry-run --json` changed its top-level shape across npm majors:
+ * older npm (bundled with Node 22, what CI runs) prints a single-element
+ * ARRAY — `[{ name, files, ... }]`; npm 12+ prints an OBJECT keyed by package
+ * name — `{ "botmux": { files, ... } }` — MEASURED on npm 12.0.1. A probe that
+ * only reads `[0]` silently gets `undefined` on the newer shape instead of a
+ * loud parse error, which is exactly backwards for a test whose job is
+ * asserting an absence (see the tarball test below). Support both so this
+ * probe means the same thing on every npm major that ships it.
+ */
+function parseNpmPackReport(stdout: string, packageName: string): { files: Array<{ path: string }> } {
+  const rows = parseNpmPackJson(stdout) as Array<{ name?: string; files: Array<{ path: string }> }>;
+  const named = rows.find(row => row?.name === packageName);
+  return named ?? rows[0];
+}
+
+function runNodeScript(script: string, env: NodeJS.ProcessEnv) {
+  const r = spawnSync(NODE_BIN, [script], { encoding: 'utf-8', env });
+  const decode = (v: unknown): string => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (Buffer.isBuffer(v)) return v.toString('utf-8');
+    return String(v);
+  };
+  return {
+    ...r,
+    status: r.status ?? (r.error ? 1 : 0),
+    stdout: decode(r.stdout),
+    stderr: `${decode(r.stderr)}${r.error ? `\n${String(r.error)}` : ''}`,
+  };
+}
 
 /**
  * Pins the npm single-version binary distribution (PR #873).
@@ -87,7 +123,7 @@ describe('package.json — lockfile safety and packaging', () => {
     // vacuous-green direction for a test whose whole job is an absence claim.
     expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
     expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
-    const paths: string[] = JSON.parse(packed.stdout)[0].files.map((f: { path: string }) => f.path);
+    const paths: string[] = parseNpmPackReport(packed.stdout, manifest.name).files.map((f: { path: string }) => f.path);
     // Proof the probe saw a real file list, so the absence assertions below have
     // something to be absent FROM.
     expect(paths).toContain('package.json');
@@ -103,6 +139,23 @@ describe('package.json — lockfile safety and packaging', () => {
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.
     expect(paths).not.toContain('ecosystem.config.cjs');
+  });
+
+  it('parseNpmPackReport() reads both npm-major shapes of `npm pack --json`', () => {
+    const files = [{ path: 'package.json', size: 1, mode: 420 }];
+    // Array shape: older npm (Node 22's bundled npm, what CI runs).
+    expect(parseNpmPackReport(JSON.stringify([{ name: 'botmux', files }]), 'botmux').files).toEqual(files);
+    // Object-keyed-by-name shape: npm 12+ — MEASURED on npm 12.0.1.
+    expect(parseNpmPackReport(JSON.stringify({ botmux: { name: 'botmux', files } }), 'botmux').files).toEqual(files);
+    // Banner before the object (workflow-core scripts used to scan only for `^[`).
+    expect(parseNpmPackReport('notice\n{ "botmux": { "name": "botmux", "files": [] } }\n', 'botmux').files).toEqual([]);
+    // CI leftover: `prepare` reprints `[workflow-core] built …` into pack stdout.
+    // The opener `[` must NOT be taken as the JSON array (this is what broke the
+    // build job after the first dual-shape helper).
+    expect(parseNpmPackReport(
+      '[workflow-core] built 9 exports in /tmp/dist\n[\n  {"name":"botmux","filename":"x.tgz","files":[]}\n]\n',
+      'botmux',
+    )).toEqual({ name: 'botmux', filename: 'x.tgz', files: [] });
   });
 
   it('declares no entry point that the tarball does not contain', () => {
@@ -155,7 +208,7 @@ describe('inject-optional-binaries — release-time version wiring', () => {
       join(dir, 'package.json'),
       `${JSON.stringify({ name: 'botmux', version: manifestVersion }, null, 2)}\n`,
     );
-    const r = spawnSync(process.execPath, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
+    const r = spawnSync(NODE_BIN, [join(dir, 'scripts', 'inject-optional-binaries.mjs'), argVersion], {
       encoding: 'utf-8',
     });
     const after = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
@@ -206,9 +259,9 @@ describe('inject-optional-binaries — release-time version wiring', () => {
     writeFileSync(join(dir, 'scripts', 'inject-optional-binaries.mjs'), readFileSync(INJECT));
     writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ name: 'botmux', version: '3.20.0' }, null, 2)}\n`);
     const script = join(dir, 'scripts', 'inject-optional-binaries.mjs');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE_BIN, [script, '3.20.0'], { encoding: 'utf-8' });
     const first = readFileSync(join(dir, 'package.json'), 'utf-8');
-    spawnSync(process.execPath, [script, '3.20.0'], { encoding: 'utf-8' });
+    spawnSync(NODE_BIN, [script, '3.20.0'], { encoding: 'utf-8' });
     expect(readFileSync(join(dir, 'package.json'), 'utf-8')).toBe(first);
   });
 });
@@ -311,10 +364,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     if (opts.binDirOnPath) env.PATH = `${join(home, '.botmux', 'bin')}:${process.env.PATH}`;
     if (opts.shell) env.SHELL = opts.shell;
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
-      encoding: 'utf-8',
-      env,
-    });
+    const r = runNodeScript(join(pkg, 'scripts', 'postinstall-bin.mjs'), env);
     return { ...r, launcher, binary, home, wrote: existsSync(launcher) };
   }
 
@@ -604,9 +654,10 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), src);
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'botmux', version: '3.20.0' }));
 
-    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
-      encoding: 'utf-8',
-      env: { PATH: process.env.PATH, HOME: home, npm_config_global: 'true' },
+    const r = runNodeScript(join(pkg, 'scripts', 'postinstall-bin.mjs'), {
+      PATH: process.env.PATH,
+      HOME: home,
+      npm_config_global: 'true',
     });
     return { ...r, wrote: existsSync(join(home, '.botmux', 'bin', 'botmux')) };
   }

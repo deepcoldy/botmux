@@ -57,6 +57,10 @@
     "cliId": "traex",
     "model": "DeepSeek-V4-Pro",
     "reasoningEffort": "medium",
+    "nativeSubagentRuntime": {
+      "model": { "mode": "custom", "value": "DeepSeek-V4-Pro" },
+      "reasoningEffort": { "mode": "custom", "value": "high" }
+    },
     "allowedUsers": ["grace@company.com"],
     "workingDir": "~/projects"
   }

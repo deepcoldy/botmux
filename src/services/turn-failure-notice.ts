@@ -149,12 +149,27 @@ export function shouldNotifyTurnFailure(turn: TurnFailureNoticeInput): boolean {
 
 /**
  * How a retry may be offered:
- * - `safe`     — input provably never executed, or the CLI's own classifier
- *                said retryable. No duplicate-side-effect risk to warn about.
+ * - `safe`     — the input provably never executed. No duplicate-side-effect
+ *                risk to warn about.
  * - `caveated` — the turn may have executed before dying. Offer the button, but
  *                the card MUST warn that redoing it can repeat side effects.
  * - `none`     — do not offer retry (not a notifiable failure, or the CLI
  *                explicitly refused: re-sending cannot help).
+ *
+ * ⚠️ `retryable === true` DOES NOT MEAN `safe`. It used to, and that was a lie
+ * the card told users: the CLI's `retryable` answers "would retrying possibly
+ * help?", not "did anything run?". `provider_server_error` is the proof — it is
+ * raised for HTTP 5xx AND for `closed mid-response` / `connection reset`
+ * signatures (see claude-transcript.ts), i.e. the connection dying AFTER the
+ * model has already been running and calling tools. MEASURED in the wild: a turn
+ * that had already read state and sent several Lark messages died with
+ * `provider_server_error`, and the card announced「这一轮的输入没有送达 CLI，
+ * 没有任何已执行的操作」— every clause false, and it steered the user toward a
+ * verbatim replay that would redo those side effects.
+ *
+ * Only WHERE the failure happened can prove nothing ran, which is exactly what
+ * `PRE_EXECUTION_ERROR_CODES` enumerates. So that set is now the ONLY route to
+ * `safe`; `retryable` decides only whether a retry is worth offering at all.
  */
 export type TurnRetryOffer = 'safe' | 'caveated' | 'none';
 
@@ -164,8 +179,14 @@ export function turnRetryOffer(
   if (!shouldNotifyTurnFailure(turn)) return 'none';
   // An explicit refusal (auth failure, invalid request) outranks every
   // heuristic below: re-sending the same input provably cannot succeed.
+  // ⚠️ Checked BEFORE the pre-execution set on purpose: those codes are emitted
+  // without a `retryable` flag (worker.ts passes none), so this cannot swallow
+  // them — but a future call site that pairs a refusal with such a code means
+  // "do not re-send", and honouring the refusal is the conservative reading.
   if (turn.retryable === false) return 'none';
-  if (turn.retryable === true) return 'safe';
+  // Location, not retryability, is what proves nothing executed. See the note on
+  // TurnRetryOffer: `retryable === true` used to short-circuit to `safe` here and
+  // made the card claim "nothing was executed" for mid-response failures.
   if (turn.errorCode !== undefined && PRE_EXECUTION_ERROR_CODES.has(turn.errorCode)) return 'safe';
   return 'caveated';
 }

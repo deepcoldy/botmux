@@ -12,7 +12,7 @@
  * terminal info comes from the `nodeSessionReady` event (written mid-run, kept
  * even if the node later fails); edges/goal come from the persisted dag.json.
  */
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, type Dirent } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { readJournal } from './journal.js';
@@ -312,6 +312,54 @@ export function projectRunById(runsDir: string, runId: string): RunView | undefi
   if (runDir !== root && !runDir.startsWith(root + sep)) return undefined;
   if (!existsSync(runDir)) return undefined;
   return projectRun(runId, runDir);
+}
+
+/**
+ * Resolve a live ephemeral v3 worker for the central `/s/<sessionId>` proxy.
+ * Journal + materialized state are the authority: only the current running
+ * attempt with a persisted per-boot read capability can register a port.
+ */
+export function liveV3TerminalPortForSession(runsDir: string, sessionId: string): number | undefined {
+  if (!sessionId || !existsSync(runsDir)) return undefined;
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(runsDir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
+    const journalPath = join(runsDir, entry.name, 'journal.ndjson');
+    if (!existsSync(journalPath)) continue;
+    let events: ReturnType<typeof readJournal>;
+    try {
+      events = readJournal(journalPath);
+    } catch {
+      continue;
+    }
+    const snapshot = materialize(events);
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (
+        event.type !== 'nodeSessionReady' ||
+        event.sessionInfo.sessionId !== sessionId ||
+        !event.sessionInfo.viewToken
+      ) continue;
+      const port = event.sessionInfo.webPort;
+      if (!Number.isInteger(port) || (port ?? 0) <= 0 || (port ?? 0) > 65_535) continue;
+      const nodeState = snapshot.nodes.get(event.nodeId);
+      const effectiveInstanceMatches = event.instanceId
+        ? nodeState?.effectiveInstanceId === event.instanceId
+        : nodeState?.effectiveInstanceId === undefined;
+      if (
+        nodeState?.status === 'running' &&
+        effectiveInstanceMatches &&
+        snapshot.attempts.get(event.instanceId ?? event.nodeId) === event.attemptId
+      ) return port;
+    }
+  }
+  return undefined;
 }
 
 /**

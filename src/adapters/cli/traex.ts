@@ -227,7 +227,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, nativeSubagentRuntimeHookCommand }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -256,6 +256,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       ];
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+      if (modelBackendVariant) baseArgs.push('-c', `model_backend_variant=${JSON.stringify(modelBackendVariant)}`);
+      if (nativeSubagentRuntimeHookCommand) {
+        baseArgs.push('-c', traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand));
+      }
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
@@ -417,6 +421,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
     deferFirstPromptTimeoutUntilReady: true,
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`
@@ -460,6 +465,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // reach the card bridge.
     asksViaHook: false,
   };
+}
+
+/** Render one process-layer hook entry. Trae merges this launch layer with
+ * global/project hooks; this does not read or mutate either config source. */
+export function traexNativeSubagentHookConfig(command: string): string {
+  return `hooks.PreToolUse=[{matcher="spawn_agent",hooks=[{type="command",command=${JSON.stringify(command)}}]}]`;
 }
 
 export const create = createTraexAdapter;

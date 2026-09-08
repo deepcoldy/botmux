@@ -3,10 +3,23 @@
  * release notes accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
+ * The `latest` lookup MUST go through the registry npm is actually configured
+ * to use (`npm config get registry`): the update button installs with the
+ * owning package manager, which resolves through that same .npmrc family.
+ * Checking the public registry while installing through a lagging mirror made
+ * the card advertise upgrades that could never install. The public registry is
+ * only a fallback for when the npm config can't be read (npm missing/unusual
+ * PATH). The ROLLBACK packument lookup, by contrast, deliberately stays
+ * public: the rollback install pins the registry to public too
+ * (`withGlobalInstallRegistry` in global-install.ts, rollback-only opt-in),
+ * and the allow-list validated against this packument must match the source
+ * that pin installs from.
+ *
  * Every network call is best-effort: timeout-bounded and returns null / [] on
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
+import { spawn, type ChildProcess } from 'node:child_process';
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
 
@@ -102,24 +115,161 @@ function vtag(v: string): string {
   return v.startsWith('v') ? v : `v${v}`;
 }
 
-const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
-const REGISTRY_PACKUMENT_URL = 'https://registry.npmjs.org/botmux';
+/** Fallback registry when the npm config can't be read (npm missing, odd PATH). */
+const PUBLIC_REGISTRY = 'https://registry.npmjs.org/';
+
+/**
+ * Normalize a raw registry value (`npm config get registry` output or a
+ * caller-supplied string) to a base URL with a trailing slash. npm prints the
+ * value as the last stdout line, but wrapper shims (nvm, corp-managed npm) may
+ * print banners first — so scan from the end and take the first line that
+ * parses as an http(s) URL. null when nothing does — garbage is never
+ * interpolated into a fetch target.
+ */
+export function normalizeRegistryBase(raw: string): string | null {
+  const lines = raw.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const v = lines[i].trim().replace(/^["']|["']$/g, '');
+    if (/^https?:\/\/\S+$/.test(v)) return v.endsWith('/') ? v : `${v}/`;
+  }
+  return null;
+}
+
+/** `GET {registry}botmux/latest` — the dist-tag manifest `@latest` installs. */
+export function registryLatestUrl(base: string): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}botmux/latest`;
+}
+
+/** `GET {registry}botmux` — the packument behind the rollback picker. */
+export function registryPackumentUrl(base: string): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}botmux`;
+}
+
+/**
+ * Read `npm config get registry` (honors user/global/project .npmrc and
+ * NPM_CONFIG_REGISTRY). Async spawn — the dashboard must not block on npm CLI
+ * startup (~0.5-1s). Exported for tests only.
+ *
+ * Hang-hardened for wrapper shims (nvm, corp-managed npm): a shim may spawn a
+ * long-lived grandchild that inherits the stdout pipe. Killing only the shim
+ * then leaves the grandchild holding the pipe, 'close' never fires, and the
+ * promise would hang forever — pinning the module's in-flight guard and
+ * killing every later version check in the process. Two bounds instead:
+ * (1) shim exited but the pipe is still held → the output is already ours,
+ *     settle after a grace period WITHOUT killing the grandchild (it may be a
+ *     legitimate resident process the shim started for unrelated reasons);
+ * (2) npm itself hung → kill the whole process group (taskkill /T on Windows).
+ */
+export function spawnNpmConfigRegistry(): Promise<string> {
+  return new Promise(resolve => {
+    // Explicit type: settle() below references `child` from a closure created
+    // before the assignment, so `let child;`'s evolving-any can't be inferred.
+    let child: ChildProcess;
+    let killTimer: NodeJS.Timeout | undefined;
+    let graceTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = (value: string): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      // Release our read end and drop the data listener: a pipe-holding
+      // grandchild would otherwise keep the fd open AND keep `out` growing
+      // (unbounded memory) for as long as it writes to the dead pipe.
+      try { child.stdout?.destroy(); } catch { /* already closed */ }
+      resolve(value);
+    };
+    try {
+      child = spawn('npm', ['config', 'get', 'registry'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        shell: process.platform === 'win32', // resolve npm.cmd on Windows
+        // Own process group (POSIX): a timeout kill then reaches the shim's
+        // descendants too, not just the shim itself.
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+      });
+    } catch {
+      resolve('');
+      return;
+    }
+    let out = '';
+    child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    child.on('error', () => settle(''));
+    // (2) The child itself is hung. Kill the group; 'exit' follows, and (1)
+    // below settles even if a setsid-style escapee still holds the pipe.
+    killTimer = setTimeout(() => {
+      try {
+        if (child.pid === undefined) return;
+        if (process.platform === 'win32') {
+          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        } else {
+          process.kill(-child.pid, 'SIGKILL');
+        }
+      } catch { /* already gone */ }
+    }, 5_000).unref();
+    // (1) npm exited but 'close' hasn't fired → a grandchild holds the pipe.
+    // We already have the output; stop waiting instead of hanging forever.
+    child.on('exit', () => {
+      graceTimer = setTimeout(() => settle(out), 1_000).unref();
+    });
+    // Normal path: all stdio closed right after exit — settle immediately.
+    child.on('close', () => settle(out));
+  });
+}
+
+let npmRegistryBase: string | null = null;   // successful reads only
+let npmRegistryInFlight: Promise<string> | null = null;
+
+/**
+ * The registry base package-manager installs resolve through. A successful
+ * read is cached for the process lifetime (registry config rarely changes,
+ * and the update flow restarts the process anyway when it matters). A failed
+ * read is NOT cached — a transient spawn failure at startup would otherwise
+ * pin the fallback (public registry) forever, re-introducing the very
+ * check/install mismatch this module exists to prevent. Retrying is naturally
+ * rate-limited by the caller's version cache. The reader is injectable so
+ * tests can cover the cache policy itself (exported for tests only).
+ */
+export function resolveNpmRegistryBase(read: () => Promise<string> = spawnNpmConfigRegistry): Promise<string> {
+  if (npmRegistryBase) return Promise.resolve(npmRegistryBase);
+  npmRegistryInFlight ??= read()
+    .then(raw => {
+      const base = normalizeRegistryBase(raw);
+      if (base) npmRegistryBase = base;
+      return base ?? PUBLIC_REGISTRY;
+    })
+    .finally(() => { npmRegistryInFlight = null; });
+  return npmRegistryInFlight;
+}
+
+/** Resolve the fetch base for a registry lookup: the opts override (tests)
+ *  when given, else the npm-configured registry with public fallback. */
+async function effectiveRegistryBase(registry?: string): Promise<string> {
+  return registry !== undefined
+    ? (normalizeRegistryBase(registry) ?? PUBLIC_REGISTRY)
+    : resolveNpmRegistryBase();
+}
 
 export interface FetchOpts {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   auth?: GithubAuthResolveOptions;
+  /** Registry base override (tests / callers that already know it). Invalid
+   *  values fall back to the public registry, mirroring runtime behavior. */
+  registry?: string;
 }
 
 /**
- * The npm registry's `latest` dist-tag version — the authoritative target for
- * both npm and pnpm updates. null on any failure (offline, non-200,
- * malformed body, or a version string we can't parse).
+ * The `latest` dist-tag version on the registry npm is configured to use —
+ * the authoritative target of a `@latest` update. null on any failure
+ * (offline, non-200, malformed body, or a version string we can't parse).
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(REGISTRY_LATEST_URL, {
+    const res = await fetchImpl(registryLatestUrl(await effectiveRegistryBase(opts?.registry)), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
@@ -164,14 +314,23 @@ export function selectRollbackVersions(raw: unknown, current: string, max = 3): 
     }));
 }
 
-/** Fetch the npm packument used to offer an allow-listed rollback target. */
+/**
+ * Fetch the packument used to offer an allow-listed rollback target.
+ * Deliberately PUBLIC, not the npm-configured registry: the rollback install
+ * pins its registry to public too (`withGlobalInstallRegistry`, rollback-only
+ * opt-in in global-install.ts), and the allow-list validated against this
+ * packument must match the source that pin installs from. Following the
+ * configured registry here would break rollback for whitelists that don't
+ * proxy botmux (lookup 503 → versions_unavailable) even though the pinned
+ * public install would have worked. (`opts.registry` does not apply here.)
+ */
 export async function fetchRollbackVersions(
   current: string,
   opts?: FetchOpts & { max?: number },
 ): Promise<RollbackVersionsResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetchImpl(REGISTRY_PACKUMENT_URL, {
+    const res = await fetchImpl(registryPackumentUrl(PUBLIC_REGISTRY), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });

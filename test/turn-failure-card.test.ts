@@ -142,10 +142,38 @@ describe('turnRetryOffer', () => {
     }
   });
 
-  it('offers a plain retry when the CLI explicitly authorised it', () => {
-    // provider_server_error / unexpected_eof — Claude's classifier said retryable.
-    expect(turnRetryOffer({ status: 'failed', errorCode: 'provider_server_error', retryable: true }))
-      .toBe('safe');
+  it('THE LIE: `retryable: true` must NOT be read as "nothing executed"', () => {
+    // REGRESSION for a card that told users a falsehood. `turnRetryOffer` used to
+    // short-circuit `retryable === true` to `safe`, and `safe` renders
+    //「这一轮的输入没有送达 CLI，没有任何已执行的操作，可以安全重试」.
+    //
+    // But the CLI's `retryable` answers "would retrying possibly help?", NOT "did
+    // anything run?". `provider_server_error` is raised for HTTP 5xx AND for
+    // `closed mid-response` / `connection reset` signatures (claude-transcript.ts),
+    // i.e. the connection dying AFTER the model has been running and calling
+    // tools. OBSERVED in production: a turn that had already read state and sent
+    // several Lark messages died with `provider_server_error`, and the card
+    // claimed nothing had executed — then offered a verbatim replay that would
+    // redo those side effects.
+    //
+    // Only WHERE the failure happened proves nothing ran, so these must caveat.
+    for (const errorCode of ['provider_server_error', 'provider_unexpected_eof']) {
+      expect(turnRetryOffer({ status: 'failed', errorCode, retryable: true }), errorCode)
+        .toBe('caveated');
+    }
+  });
+
+  it('a pre-execution code still yields `safe` — the fix must not caveat everything', () => {
+    // The counterweight: over-caveating would be its own regression (users get a
+    // scary side-effect warning, and the button degrades from replay to
+    // continue, for turns whose input demonstrably never reached the CLI).
+    // These codes are emitted WITHOUT a `retryable` flag (see worker.ts), which
+    // is why the refusal check above them cannot swallow them.
+    for (const errorCode of ['write_input_threw', 'adopt_write_input_threw',
+      'raw_input_write_failed', 'zmx_recovery_blocked_before_write',
+      'terminal_bridge_unavailable']) {
+      expect(turnRetryOffer({ status: 'failed', errorCode }), errorCode).toBe('safe');
+    }
   });
 
   it('refuses retry when the CLI explicitly said it cannot help', () => {

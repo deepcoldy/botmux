@@ -1,6 +1,8 @@
 import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
+import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
+import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 
 export type CliOption = {
   id: string;
@@ -23,6 +25,12 @@ export type CliOptionsState = {
 /** Keep the browser payload contract tied to the daemon's canonical schema. */
 export type CliRuntimeConfig = SharedCliRuntimeConfig;
 export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
+
+/** Browser contract: configured dimensions are custom; absence means pass-through. */
+export type NativeSubagentRuntimePolicy = {
+  model?: { mode: 'custom'; value: string };
+  reasoningEffort?: { mode: 'custom'; value: CodexReasoningEffort };
+};
 
 export type BotSubstituteTarget = {
   openId?: string;
@@ -60,11 +68,15 @@ export type BotDefaultsRow = {
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
   turnTimeoutMs?: number;
   /** dsh runtime variant: 'official' (JSON-RPC runner) or 'tui' (dsh-tui PTY). */
   dshRuntime?: 'official' | 'tui' | null;
+  /** dsh profile name; rendered as a dsh-only field. */
+  dshProfile?: string | null;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
@@ -73,8 +85,17 @@ export type BotDefaultsRow = {
   defaultWorkingDirAutoWorktree?: boolean;
   autoboundChatCount?: number;
   brandLabel?: string | null;
+  /** Sparse per-bot reply-card style override; null means all built-in defaults. */
+  replyStyle?: ReplyStyleConfig | null;
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
+   *  CLI calls use whatever identity is logged in on the machine). */
+  triggerUserAuth?: {
+    enabled: boolean;
+    tools: Array<'lark-cli' | 'bytedcli'>;
+    fallback: 'bot-identity' | 'none';
+  } | null;
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
@@ -86,6 +107,7 @@ export type BotDefaultsRow = {
   usageDisplay?: 'streaming' | 'footer' | 'off';
   usageSupported?: boolean;
   disableStreamingCard?: boolean;
+  pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
@@ -154,7 +176,7 @@ export type LoadBotsResult = {
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
-  { id: 'traex', label: 'traex' },
+  { id: 'traex', label: 'TRAE CLI 2.0' },
 ];
 
 export const fallbackCliOptionsState: CliOptionsState = {
@@ -232,6 +254,40 @@ export async function fetchDetectedModels(
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
     const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
     return { models, source };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the list of available DSH profiles from the daemon.
+ * Returns an empty array on any error.
+ */
+export async function fetchDshProfiles(): Promise<string[]> {
+  try {
+    const r = await fetch('/api/dsh/profiles');
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !Array.isArray(body.profiles)) return [];
+    return body.profiles.filter((p: unknown): p is string => typeof p === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Create a new DSH profile with the botmux default base plugins.
+ * Returns the created profile name, or null on error.
+ */
+export async function createDshProfile(name: string): Promise<string | null> {
+  try {
+    const r = await fetch('/api/dsh/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || typeof body.name !== 'string') return null;
+    return body.name;
   } catch {
     return null;
   }

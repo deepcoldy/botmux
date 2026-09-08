@@ -75,6 +75,32 @@ describe('runHook', () => {
     });
   });
 
+  describe('(a1) DSH user-questions + answered stub → stdout 为 AskUserQuestionAnswer', () => {
+    it('formatAnswer 结果可直接返回给 DSH userQuestions', async () => {
+      const payload = {
+        hook_event_name: 'user-questions/request',
+        tool_input: {
+          questions: [{
+            id: 'confirm',
+            question: '继续吗？',
+            options: [{ label: '继续' }, { label: '取消' }],
+          }],
+        },
+        sessionId: 'spoofed-session',
+        chatId: 'spoofed-chat',
+      };
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_user1', comment: null, timedOut: false };
+      };
+      const result = await runHook(payload, FULL_ENV, stub, 'dsh');
+      expect(posted?.sessionId).toBe(FULL_ENV.BOTMUX_SESSION_ID);
+      expect(posted?.chatId).toBe(FULL_ENV.BOTMUX_CHAT_ID);
+      expect(JSON.parse(result.stdout)).toEqual({ answers: [{ id: 'confirm', selected: ['继续'] }] });
+    });
+  });
+
   describe('(a2) 自定义回复（comment）→ stdout 含自定义文字', () => {
     it('answered 含 comment + 空 answers → directive 用 comment 作答', async () => {
       const customStub = async (): Promise<AskResult> => ({

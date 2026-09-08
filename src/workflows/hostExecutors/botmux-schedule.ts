@@ -37,6 +37,9 @@ export type ScheduleInput = {
   /** Silent fires: no "task started" banner; the spawned turn suppresses
    *  daemon-initiated group output and the model decides whether to send. */
   silent?: boolean;
+  /** `--follow-active`: re-resolve the landing topic at every fire (see
+   *  ScheduledTask.followActive). Requires executionPosition 'topic'. */
+  followActive?: boolean;
 };
 
 export type ScheduleOutput = {
@@ -69,6 +72,7 @@ const ScheduleInputSchema = z.object({
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
   silent: z.boolean().optional(),
+  followActive: z.boolean().optional(),
 });
 
 export function parseScheduleInput(input: unknown): ScheduleInput {
@@ -142,6 +146,13 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'topic execution requires rootMessageId',
       };
     }
+    if (input.followActive === true && input.executionPosition !== 'topic') {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_FOLLOW_ACTIVE_REQUIRES_TOPIC',
+        message: 'followActive requires executionPosition topic',
+      };
+    }
     if (input.parsed.kind !== 'once') return { ok: true };
     const runAtMs = input.parsed.runAt ? Date.parse(input.parsed.runAt) : Number.NaN;
     // Keep exactly the scheduler's two-minute one-shot catch-up window. Once
@@ -175,6 +186,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
       silent: input.silent,
+      followActive: input.followActive === true ? true : undefined,
     });
     return {
       output: { taskId: task.id },

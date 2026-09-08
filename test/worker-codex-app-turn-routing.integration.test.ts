@@ -11,7 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -89,7 +89,7 @@ function spawnWorker(
   messages: WorkerToDaemon[],
   onMessage?: (message: WorkerToDaemon, child: ChildProcess) => void,
 ): ChildProcess {
-  const child = spawnTsScript(resolve('src/worker.ts'), [], {
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,
@@ -194,7 +194,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -324,7 +324,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -403,7 +403,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -480,7 +480,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

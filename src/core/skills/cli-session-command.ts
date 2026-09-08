@@ -32,7 +32,18 @@ export function runSkillSessionCommand(
   if (sub === 'show') {
     const name = args[1];
     if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill show <name>\n' };
-    const builtin = builtinSkillContent(name);
+    // An observe-only adopt pane is an already-running external process: it
+    // deliberately receives neither BotMux session env nor skill injection.
+    // Only trust a reply-style snapshot when all three worker-owned markers are
+    // present; otherwise a global/native loader must render the stable default
+    // guide instead of inheriting an unrelated ambient BOTMUX_REPLY_STYLE.
+    const hasSessionReplyStyleSnapshot = !!env.BOTMUX_SESSION_ID
+      && !!env.BOTMUX_LARK_APP_ID
+      && Object.prototype.hasOwnProperty.call(env, 'BOTMUX_REPLY_STYLE');
+    const builtinEnv = name === 'botmux-send' && !hasSessionReplyStyleSnapshot
+      ? { ...env, BOTMUX_REPLY_STYLE: undefined }
+      : env;
+    const builtin = builtinSkillContent(name, builtinEnv);
     if (builtin) return { code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '' };
   }
   const sessionId = sessionIdFromEnv(env);

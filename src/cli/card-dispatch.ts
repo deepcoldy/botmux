@@ -52,7 +52,11 @@ export const CARD_COMMAND_USAGE = `botmux card — 卡片相关命令
   botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]
       原地更新之前用 send --card-file/--card-json 发出的自定义卡片
       （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
-      卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话`;
+      卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
+
+  botmux card stream open|write|snapshot|reanchor|finish ...
+      使用 CardKit 原生文本流式更新（打字机效果）；运行
+      botmux card stream --help 查看完整流程`;
 
 /** True when `botmux card patch` argv asks for help. Help wins over the
  *  missing-arg validation (cli.ts checks this before parseCardPatchArgs). */

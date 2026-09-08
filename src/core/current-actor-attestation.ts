@@ -195,10 +195,13 @@ export async function resolveDaemonCurrentActor(input: {
     return { ok: false, error: 'current_actor_unverified' };
   }
   const senderOpenId = ds.managedTurnOrigin?.callerOpenId;
-  if (!senderOpenId?.startsWith('ou_')) return { ok: false, error: 'current_actor_unverified' };
+  const liveCapability = ds.managedTurnOrigin?.capability;
+  if (!senderOpenId?.startsWith('ou_') || !liveCapability) {
+    return { ok: false, error: 'current_actor_unverified' };
+  }
 
   const frozen = {
-    ds, turnId, generation, senderOpenId, capability: ds.managedTurnOrigin!.capability,
+    ds, turnId, generation, senderOpenId, capability: liveCapability,
     workerPid, workerProcStart, processIdentities: [...processIdentities],
   };
   const identity = await (input.resolveIdentity ?? resolveVerifiedUserIdentity)(ds.larkAppId, senderOpenId);

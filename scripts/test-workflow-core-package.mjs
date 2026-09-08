@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { parseNpmPackJson } from './parse-npm-pack-json.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageDir = join(repoRoot, 'packages', 'workflow-core');
@@ -164,16 +165,10 @@ function packInto(destination) {
     '--ignore-scripts',
     '--json',
   ], repoRoot, true, npmSmokeEnv);
-  const parsed = parsePackJson(result.stdout);
+  const parsed = parseNpmPackJson(result.stdout);
   const filename = parsed[0]?.filename;
   if (!filename) throw new Error(`npm pack returned no filename: ${result.stdout}`);
   return join(destination, filename);
-}
-
-function parsePackJson(stdout) {
-  const jsonStart = stdout.search(/^\[\s*$/m);
-  if (jsonStart < 0) throw new Error(`npm pack returned no JSON:\n${stdout}`);
-  return JSON.parse(stdout.slice(jsonStart));
 }
 
 function run(command, args, cwd, capture = false, env = process.env) {

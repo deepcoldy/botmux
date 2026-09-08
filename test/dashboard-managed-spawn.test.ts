@@ -17,8 +17,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  *
  * These assert the env object each child actually receives.
  */
-const childProcess = vi.hoisted(() => ({ spawn: vi.fn() }));
-vi.mock('node:child_process', () => ({ spawn: childProcess.spawn }));
+// The spy is created INSIDE the factory and imported back below. `vi.hoisted` is a
+// vitest-only TRANSFORM (no `bun test` equivalent), and a plain const fails too because
+// the factory dereferences it in its IMMEDIATE body — vitest runs that during the
+// hoisted import phase → "Cannot access … before initialization".
+// The real module is SPREAD IN because bun links named exports for real: returning only
+// `{spawn}` fails the whole file with "Export named 'fork' not found in module
+// 'node:child_process'" (src/core/self-spawn.ts imports `fork` on the transitive graph).
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return { ...actual, spawn: vi.fn() };
+});
+
+import { spawn } from 'node:child_process';
+
+const spawnMock = vi.mocked(spawn);
 
 function fakeChild(exit: { code?: number; stdout?: string } = {}) {
   const child: any = new EventEmitter();
@@ -42,7 +55,7 @@ const SECRETS = {
 };
 
 function spawnedEnv(callIndex = 0): NodeJS.ProcessEnv {
-  const opts = childProcess.spawn.mock.calls[callIndex]?.[2] as { env: NodeJS.ProcessEnv };
+  const opts = spawnMock.mock.calls[callIndex]?.[2] as { env: NodeJS.ProcessEnv };
   return opts.env;
 }
 
@@ -56,8 +69,8 @@ function expectNoSecrets(env: NodeJS.ProcessEnv): void {
 
 describe('dashboard host children run on a redacted env', () => {
   beforeEach(() => {
-    childProcess.spawn.mockReset();
-    childProcess.spawn.mockImplementation(() => fakeChild());
+    spawnMock.mockReset();
+    spawnMock.mockImplementation(() => fakeChild());
     for (const [k, v] of Object.entries(SECRETS)) vi.stubEnv(k, v);
     vi.stubEnv('BOTMUX_DASHBOARD_PORT', '7891');
   });
@@ -69,8 +82,8 @@ describe('dashboard host children run on a redacted env', () => {
     const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
     const result = await spawnStartBotLive('cli_target');
 
-    expect(childProcess.spawn).toHaveBeenCalledOnce();
-    const [, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+    expect(spawnMock).toHaveBeenCalledOnce();
+    const [, args] = spawnMock.mock.calls[0] as [string, string[], unknown];
     expect(args.slice(1)).toEqual(['start-bot', 'cli_target', '--json']);
     expectNoSecrets(spawnedEnv());
     // Ordinary settings and the process environment still ride along — the new
@@ -84,7 +97,7 @@ describe('dashboard host children run on a redacted env', () => {
     const { spawnStopBotLive } = await import('../src/dashboard/managed-spawn.js');
     await spawnStopBotLive('cli_target');
 
-    const [, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+    const [, args] = spawnMock.mock.calls[0] as [string, string[], unknown];
     expect(args.slice(1)).toEqual(['stop-bot', 'cli_target', '--json']);
     expectNoSecrets(spawnedEnv());
   });
@@ -108,7 +121,7 @@ describe('dashboard host children run on a redacted env', () => {
     const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
     await spawnStartBotLive('cli_target');
 
-    const [command, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+    const [command, args] = spawnMock.mock.calls[0] as [string, string[], unknown];
     expect(command).toBe(process.execPath);
     expect(args[0]).toMatch(/cli\.js$/);
     expect(args.slice(1)).toEqual(['start-bot', 'cli_target', '--json']);
@@ -126,7 +139,7 @@ describe('dashboard host children run on a redacted env', () => {
       const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
       await spawnStartBotLive('cli_target');
 
-      const [command, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+      const [command, args] = spawnMock.mock.calls[0] as [string, string[], unknown];
       expect(command).toBe(process.execPath);
       expect(args).toEqual(['start-bot', 'cli_target', '--json']);
       // The specific poison: a path where the subcommand belongs.
@@ -153,11 +166,11 @@ describe('dashboard host children run on a redacted env', () => {
   });
 
   it('reports the child result unchanged (redaction is not a behavior change)', async () => {
-    childProcess.spawn.mockImplementation(() => fakeChild({ code: 0, stdout: '{"processName":"botmux-3"}' }));
+    spawnMock.mockImplementation(() => fakeChild({ code: 0, stdout: '{"processName":"botmux-3"}' }));
     const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
     expect(await spawnStartBotLive('cli_target')).toEqual({ ok: true, message: 'botmux-3 已上线' });
 
-    childProcess.spawn.mockImplementation(() => fakeChild({ code: 1, stdout: '{"message":"启动失败"}' }));
+    spawnMock.mockImplementation(() => fakeChild({ code: 1, stdout: '{"message":"启动失败"}' }));
     expect(await spawnStartBotLive('cli_target')).toEqual({ ok: false, message: '启动失败' });
   });
 
