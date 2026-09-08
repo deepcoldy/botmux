@@ -169,6 +169,56 @@ describe('PUT /api/doc-watches/:fileToken', () => {
     expect(after?.pollCursorReplyId).toBeUndefined();
   });
 
+  /**
+   * ⭐顺序：清游标必须在改 mode **之前**。这两步不是一次原子写。
+   *
+   * 复审挖出来的边角：若先改 mode 后清游标、而清游标失败（ENOSPC / EIO / 磁盘
+   * 故障），就会留下「mode=all + 陈旧游标 + baselineReady=true」—— poller 下一轮
+   * 直接从远古游标重放**全部历史评论**，正是这段代码本来要防的那件事。
+   *
+   * 🔴 造这条覆盖踩过两个坑，写下来免得后人重演：
+   *  ① **只换代码位置、不造失败，其余 20 条用例全绿**（实测）—— 顺序本身零覆盖，
+   *     所以这条用例不可省。
+   *  ② 让**第 1 次**写失败是打不响的哑弹：那样第一步就抛、第二步根本没执行，
+   *     两种顺序落盘状态**逐字相同**（实测 `mention-only` + 陈旧游标 + ready=true）。
+   *     必须让**第 2 次**写失败，才复现出「前一步已生效、后一步没跟上」的裂口。
+   *     实测两序此时确实分叉：旧序 all/1/true（灾难），正序 mention-only/清空/false。
+   */
+  it('⭐清游标失败时 mode 不得翻成 all（否则 poller 会重放全部历史评论）', async () => {
+    const base = await server();
+    putDocSubscription(dir, APP, sub({
+      commentTriggerMode: 'mention-only',
+      pollCursorAt: 1,
+      pollCursorReplyId: 'ancient',
+      pollBaselineReady: true,
+    }));
+    // 第 1 次写成功、第 2 次写失败 —— 复现「两步之间的裂口」。
+    const atomic = await import('../src/utils/atomic-write.js');
+    const real = atomic.atomicWriteFileSync;
+    let writes = 0;
+    const spy = vi.spyOn(atomic, 'atomicWriteFileSync').mockImplementation((...args: Parameters<typeof real>) => {
+      writes += 1;
+      if (writes === 2) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+      return real(...args);
+    });
+    try {
+      await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ commentTriggerMode: 'all' }),
+      }).catch(() => undefined);
+    } finally {
+      spy.mockRestore();
+    }
+    // 分母自检：确实发生了 2 次写尝试，否则这条用例又变成打不响的哑弹。
+    expect(writes, '没有发生两次写 ⟹ 探针没打到裂口上').toBeGreaterThanOrEqual(2);
+    const after = getDocSubscription(dir, APP, TOKEN)!;
+    const disastrous = after.commentTriggerMode === 'all'
+      && after.pollBaselineReady === true
+      && after.pollCursorAt === 1;
+    expect(disastrous, 'all + 陈旧游标 + baseline=true ⟹ poller 会重放全部历史').toBe(false);
+  });
+
   it('已经是 all 时不动游标（避免每次保存都白重建基线）', async () => {
     const base = await server();
     putDocSubscription(dir, APP, sub({

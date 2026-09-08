@@ -4797,11 +4797,7 @@ ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
   }
   const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
   if (!existing) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
-  if (!setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)) {
-    // 读到了但改不上 = 两次读之间被别处删了（退订 / auto-sub 回滚）。当 404 报，
-    // 不要当 500：不是故障，是竞态，界面刷新一下就对了。
-    return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
-  }
+
   // 切到 'all' 时必须重建轮询基线，否则 poller 会把该文档的**全部历史评论**
   // 当成「游标之后的新评论」一次性重放进会话。mention-only 从不进轮询，所以
   // 它的记录里可能压根没有游标 —— 这正是切换方向决定成败的那一步。
@@ -4811,8 +4807,21 @@ ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
   // 分支（`if (!current.pollBaselineReady …) { setDocCommentPollCursor(latest…); }`），
   // 且那条路径只建基线、不触发历史评论。复用它比在这里再写一份取 latest 的逻辑
   // 更稳：取失败时也绝不会退化成「重放全部历史」。
+  //
+  // ⚠️ 顺序：**清游标必须在改 mode 之前**。这两步不是一次原子写，中间有窗口。
+  // 若先改 mode 后清游标而清游标失败（磁盘故障 / JSON 损坏），就会留下
+  // 「mode=all + 陈旧游标 + baselineReady=true」—— poller 下一轮直接从远古游标
+  // 重放全部历史评论，正是这段代码要防的那件事。反过来则安全：清游标失败时
+  // mode 还是 mention-only（不进轮询），下次重试即可；而在 mention-only 上把
+  // 游标清掉本身无害，因为那个模式根本不读游标。
   if (mode === 'all' && existing.commentTriggerMode !== 'all') {
     setDocCommentPollCursor(config.session.dataDir, cachedLarkAppId, p.fileToken, undefined, false);
+  }
+
+  if (!setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)) {
+    // 读到了但改不上 = 两次读之间被别处删了（退订 / auto-sub 回滚）。当 404 报，
+    // 不要当 500：不是故障，是竞态，界面刷新一下就对了。
+    return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
   }
   const updated = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
   if (!updated) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });

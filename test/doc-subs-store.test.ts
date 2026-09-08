@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   putDocSubscription,
@@ -133,6 +133,47 @@ describe('recordDocWatchActivity（运行态诊断）', () => {
     expect(recordDocWatchActivity(dataDir, APP_A, 'ghost', { outcome: 'dispatched' })).toBe(false);
     expect(getDocSubscription(dataDir, APP_A, 'ghost')).toBeNull();
     expect(listAllDocSubscriptions(dataDir, APP_A)).toEqual([]);
+  });
+
+  /**
+   * ⭐「绝不抛」是这个函数的核心契约，却一度**零覆盖**：把它的 try/catch 整个剥掉，
+   * 全部 66 条用例照样全绿。而这个契约承的东西很重 —— `processCommentEvent` 的
+   * 7 个出口都裸调它，一旦它能抛，一次磁盘故障就会把「记不下诊断日志」升级成
+   * 「这条真实评论投递失败」，即可观测特性自己变成新的故障源。
+   *
+   * 🔴 造这条覆盖时踩过两个坑，记下来免得后人重演：
+   *  ① 「把 dataDir 指向一个同名文件」**打不到 catch**：那样订阅文件不存在 →
+   *     `readFile` 返回 {} → 行不存在 → 在写之前就 `return false` 了。读必须成功、
+   *     写才会被执行到，所以坏点得放在**写**上而不是路径上。
+   *  ② `chattr +i` 能在 root 下造出 EPERM，但依赖 ext4 且容器/CI 里可能直接失败 ——
+   *     用它就把这条用例变成环境相关的间歇红。
+   *
+   * 最终手法：mock 掉 `atomicWriteFileSync` 让它抛。这确实是「mock 抛了被抓住」，
+   * 但这里恰好是对的口径 —— 要证的命题就是「**写入抛异常时**本函数不外抛」，
+   * 而异常来源（ENOSPC / EPERM / EIO）对这条契约无差别。真实 I/O 故障没法在
+   * 单测里可移植地造出来。
+   */
+  it('⭐写入抛异常时返回 false 而不外抛（processCommentEvent 全靠这条契约）', async () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    const atomic = await import('../src/utils/atomic-write.js');
+    const spy = vi.spyOn(atomic, 'atomicWriteFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    });
+    try {
+      expect(() => recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched' })).not.toThrow();
+      expect(recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched' })).toBe(false);
+      // setDocTitle 同样不能外抛（它也在 best-effort 路径上被裸调）
+      expect(() => setDocTitle(dataDir, APP_A, 'doccnFILE1', '新标题')).not.toThrow();
+      expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', '新标题')).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('store 内容损坏时按空表处理，不外抛', () => {
+    writeFileSync(join(dataDir, `doc-subscriptions-${APP_A}.json`), '{ this is not json');
+    expect(() => recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed' })).not.toThrow();
+    expect(recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed' })).toBe(false);
   });
 
   it('⭐读后写：不会用调用方的旧快照覆盖别处刚改的字段', () => {
