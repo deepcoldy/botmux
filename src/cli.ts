@@ -6170,6 +6170,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
+       --model <id>                    本任务用指定模型跑（如 gpt-5.6-sol），不改 bot 配置
+       --reasoning-effort <level>      low|medium|high|xhigh|max|ultra（模型支持才生效）
+                                       两者都只在本任务新建会话那次执行生效；配 --new-topic 则每次生效
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
@@ -6720,7 +6723,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   if (sub === 'add') {
     const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -6763,6 +6766,28 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     // --silent: fires post no "执行中" banner; the spawned turn stays quiet and
     // the model only `botmux send`s when the alert condition in the prompt is met.
     const silent = rest.includes('--silent');
+    // Per-task model / effort. Only shape is checked here: whether the bot's CLI
+    // takes an override, and whether the model offers that effort level, depends
+    // on bot config this process may not be able to read (a sandboxed session
+    // has no bots.json). Fire time resolves it against the live bot and degrades
+    // with a warning rather than skipping the run.
+    const model = argValue(rest, '--model')?.trim();
+    if (rest.includes('--model') && !model) {
+      console.error('--model 需要一个模型 id，例如 --model gpt-5.6-sol。');
+      process.exit(1);
+    }
+    const reasoningEffortArg = argValue(rest, '--reasoning-effort')?.trim();
+    if (rest.includes('--reasoning-effort') && !reasoningEffortArg) {
+      console.error('--reasoning-effort 需要一个等级：low|medium|high|xhigh|max|ultra。');
+      process.exit(1);
+    }
+    if (reasoningEffortArg && !scheduleStore.isScheduleReasoningEffort(reasoningEffortArg)) {
+      console.error(`--reasoning-effort 只接受 low|medium|high|xhigh|max|ultra，收到 "${reasoningEffortArg}"。`);
+      process.exit(1);
+    }
+    const reasoningEffort = reasoningEffortArg && scheduleStore.isScheduleReasoningEffort(reasoningEffortArg)
+      ? reasoningEffortArg
+      : undefined;
     if (!chatId) {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
@@ -6831,6 +6856,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         deliver,
         silent,
         followActive: wantsFollowActive ? true : undefined,
+        model,
+        reasoningEffort,
       });
     } catch (err) {
       // Sandboxed sessions can only write their OWN bot's store — a cross-bot
@@ -6851,6 +6878,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
+    if (model || reasoningEffort) {
+      console.log(`   模型: ${[model ?? '（bot 默认）', reasoningEffort ? `思考强度 ${reasoningEffort}` : ''].filter(Boolean).join(' / ')}`);
+      // Model and effort are CLI process launch arguments, so only a fire that
+      // starts a process can apply them. Saying this at creation is the whole
+      // difference between a documented limit and a silent surprise weeks later.
+      console.log(executionPosition === 'new-topic'
+        ? '   ⓘ 每次新话题都会新起会话，模型每次生效。'
+        : '   ⚠️ 仅在本任务新建会话的那次执行生效；之后复用该会话时沿用它启动时的模型。需每次生效请用 --new-topic。');
+    }
     return;
   }
 

@@ -23,6 +23,20 @@ import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+/** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
+ *  here because this module is the storage layer and must not depend on the CLI
+ *  adapter services. */
+export type ScheduleReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+const SCHEDULE_REASONING_EFFORTS: readonly ScheduleReasoningEffort[] = [
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isScheduleReasoningEffort(value: unknown): value is ScheduleReasoningEffort {
+  return typeof value === 'string'
+    && SCHEDULE_REASONING_EFFORTS.includes(value as ScheduleReasoningEffort);
+}
+
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
 /**
@@ -90,6 +104,8 @@ export function canonicalScheduleInput(t: {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
@@ -129,6 +145,11 @@ export function canonicalScheduleInput(t: {
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
     followActive: t.followActive === true ? true : undefined,
+    // Which model this task's runs ask for is caller input, not runtime state.
+    // Absent on every pre-existing task, so `computeInputHash` drops both slots
+    // and their canonical JSON stays byte-for-byte what it was.
+    model: t.model?.trim() || undefined,
+    reasoningEffort: t.reasoningEffort,
   };
 }
 
@@ -349,6 +370,13 @@ function migrate(raw: any): ScheduledTask | null {
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
     followActive: raw.followActive === true ? true : undefined,
+    // Rebuilt explicitly like every other field here: omitting them would let
+    // `createTask` persist a per-task model and then have the next reload drop
+    // it, so the task silently degrades back to the bot's model (the exact way
+    // `ownerOpenId` broke once). A hand-edited junk value is dropped rather
+    // than carried to fire time, where it could only produce a CLI error.
+    model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
+    reasoningEffort: isScheduleReasoningEffort(raw.reasoningEffort) ? raw.reasoningEffort : undefined,
   };
 }
 
@@ -560,6 +588,8 @@ export function createTask(params: {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
   // Route to the OWNING bot's file: a task explicitly created for another bot
@@ -623,6 +653,8 @@ export function createTask(params: {
       deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
       followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+      reasoningEffort: params.reasoningEffort,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -646,7 +678,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {

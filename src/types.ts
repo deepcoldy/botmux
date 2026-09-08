@@ -1041,6 +1041,35 @@ export interface ScheduledTask {
    *  becomes the landing point. Only meaningful with executionPosition
    *  'topic'. */
   followActive?: boolean;
+  /** Per-task CLI model, overriding the bot's configured one for this task's
+   *  own runs (e.g. a cheap model for a 30m sentinel next to a strong one for
+   *  the nightly review, on ONE bot).
+   *
+   *  Same fresh-spawn-only semantics as the trigger API's `options.model`, and
+   *  for the same physical reason: the model is a CLI **process launch**
+   *  argument, so only a fire that spawns a worker can apply it. A fire that
+   *  injects into the task's existing session keeps whatever that process
+   *  started with. In practice: `new-topic` tasks apply it on every run;
+   *  `topic` / `top-level` tasks apply it on the run that creates their
+   *  session and then keep it. Creation surfaces say so out loud rather than
+   *  letting the difference be discovered at fire time.
+   *
+   *  Gated at fire time on the bot's CLI actually supporting the override
+   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
+   *  warning, never a skipped run.
+   *
+   *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
+   *  session record, so a daemon restart drops it: a `topic` / `top-level` task
+   *  whose session survives the restart re-forks on the bot's model. Persisting
+   *  it is not the fix — a stored session model outranks the bot's configured one
+   *  forever, which is the bug `resolveSessionLaunchModel` exists to undo. Same
+   *  behavior as the trigger API's per-turn model. */
+  model?: string;
+  /** Per-task reasoning effort, same override + fresh-spawn-only semantics as
+   *  `model`. Dropped at fire time when the resolved model does not offer the
+   *  level (`cliModelSupportsReasoningEffort`), mirroring what sessionAgentConfig
+   *  already does to a session-level effort. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }

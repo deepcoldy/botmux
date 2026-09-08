@@ -4654,6 +4654,110 @@ describe('GET /api/schedules', () => {
   });
 });
 
+describe('POST/PATCH /api/schedules — per-task model & effort', () => {
+  // The dashboard is a human editing a form, so an unusable model/effort pairing
+  // is rejected on save. (Fire time does the opposite — it degrades to the bot's
+  // configuration so a stale pin can never skip a run.)
+  const APP = 'cli_schedule_model_test';
+
+  async function withServer<T>(cliId: string, model: string | undefined, run: (base: string) => Promise<T>): Promise<T> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-model-'));
+    const previousDataDir = config.session.dataDir;
+    let local: IpcServerHandle | null = null;
+    try {
+      config.session.dataDir = join(dir, 'data');
+      scheduleStore.setScheduleScope(APP);
+      setLarkAppId(APP);
+      registerBot({ larkAppId: APP, larkAppSecret: '', cliId: cliId as any, apiOnly: true, ...(model ? { model } : {}) });
+      local = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      return await run(`http://127.0.0.1:${local.port}`);
+    } finally {
+      if (local) await local.close();
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const create = (base: string, body: Record<string, unknown>) => fetch(`${base}/api/schedules`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: '巡检', schedule: 'every 1h', prompt: '看看',
+      chatId: 'oc_target', ...body,
+    }),
+  });
+
+  it('persists a valid model + effort and projects them on the row', async () => {
+    await withServer('codex', 'gpt-5.5', async base => {
+      const res = await create(base, { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' });
+      expect(res.status).toBe(200);
+      const task = (await res.json()).task;
+      expect(task).toMatchObject({ model: 'gpt-5.6-sol', reasoningEffort: 'ultra' });
+      expect(scheduleStore.getTask(task.id, APP)).toMatchObject({
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      });
+    });
+  });
+
+  it('control: a create without them stores neither', async () => {
+    await withServer('codex', 'gpt-5.5', async base => {
+      const task = (await (await create(base, {})).json()).task;
+      expect(task.model).toBeUndefined();
+      expect(task.reasoningEffort).toBeUndefined();
+    });
+  });
+
+  it('400s an effort the resolved model does not offer', async () => {
+    await withServer('codex', 'gpt-5.5', async base => {
+      // ultra exists on gpt-5.6-sol, not on the bot's gpt-5.5.
+      const res = await create(base, { reasoningEffort: 'ultra' });
+      expect(res.status).toBe(400);
+      expect((await res.json()).field).toBe('reasoningEffort');
+    });
+  });
+
+  it('400s a bogus effort value and a non-string model', async () => {
+    await withServer('codex', 'gpt-5.5', async base => {
+      expect((await create(base, { reasoningEffort: 'turbo' })).status).toBe(400);
+      expect((await create(base, { model: 42 })).status).toBe(400);
+    });
+  });
+
+  it('400s any override on a CLI without the per-turn model contract', async () => {
+    await withServer('gemini', undefined, async base => {
+      const res = await create(base, { model: 'gpt-5.6-sol' });
+      expect(res.status).toBe(400);
+      expect((await res.json()).field).toBe('model');
+    });
+  });
+
+  it('PATCH validates the SETTLED pairing, not just the supplied half', async () => {
+    await withServer('codex', 'gpt-5.5', async base => {
+      const task = (await (await create(base, { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' })).json()).task;
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      // Downgrading the model alone must not leave the stored ultra orphaned on
+      // a model that does not offer it.
+      const bad = await patch({ model: 'gpt-5.5' });
+      expect(bad.status).toBe(400);
+      expect((await bad.json()).field).toBe('reasoningEffort');
+
+      // Clearing both together is fine, and '' is the clear marker.
+      const cleared = await patch({ model: '', reasoningEffort: '' });
+      expect(cleared.status).toBe(200);
+      const after = scheduleStore.getTask(task.id, APP)!;
+      expect(after.model).toBeUndefined();
+      expect(after.reasoningEffort).toBeUndefined();
+    });
+  });
+});
+
 describe('GET /api/schedules/:id/logs', () => {
   it('is trusted-host only and returns a bounded, sensitive-free page for an owned task', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-run-logs-'));

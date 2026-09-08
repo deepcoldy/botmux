@@ -29,6 +29,7 @@ import {
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import {
   resolveSchedulePrecondition,
@@ -3345,6 +3346,9 @@ export interface ScheduleRow {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  /** Per-task CLI model / effort; absent means "the bot's configuration". */
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   hasPrecondition: boolean;
   preconditionEnabled?: boolean;
   /** Authenticated management projection of the protected source. Internal
@@ -3362,6 +3366,80 @@ type ScheduleChatTargetsParseResult =
 /** Accept the legacy singular target and the Dashboard's multi-target array.
  * The array is authoritative when supplied; requiring an agreeing legacy field
  * avoids two different "primary" targets in one request. */
+type ScheduleModelWriteResult =
+  | { ok: true; model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null }
+  | { ok: false; field: string; error: string };
+
+/**
+ * Parse and validate a write to a task's per-task model / reasoning effort.
+ *
+ * Unlike fire time — which degrades a stale pairing to the bot's configuration
+ * so a run is never skipped — a dashboard write is a human sitting in front of
+ * the form, so an unusable pairing is rejected outright and they can fix it.
+ * The gate mirrors the trigger API: only CLIs implementing the per-turn model
+ * contract may be steered, and the effort must exist on the model the run will
+ * actually use.
+ *
+ * `''` / `null` clears the override (`update` only); absent leaves it alone.
+ */
+function parseScheduleModelWrite(
+  body: Record<string, unknown>,
+  larkAppId: string,
+  mode: 'create' | 'update',
+  current?: { model?: string; reasoningEffort?: ScheduleReasoningEffort },
+): ScheduleModelWriteResult {
+  const out: { model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null } = {};
+  if (body.model !== undefined) {
+    if (body.model !== null && typeof body.model !== 'string') {
+      return { ok: false, field: 'model', error: 'invalid_field' };
+    }
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!model && mode === 'create') {
+      // A create with an empty model simply pins nothing.
+    } else {
+      out.model = model || null;
+    }
+  }
+  if (body.reasoningEffort !== undefined) {
+    if (body.reasoningEffort === null || body.reasoningEffort === '') {
+      if (mode === 'update') out.reasoningEffort = null;
+    } else if (!scheduleStore.isScheduleReasoningEffort(body.reasoningEffort)) {
+      return { ok: false, field: 'reasoningEffort', error: 'invalid_field' };
+    } else {
+      out.reasoningEffort = body.reasoningEffort;
+    }
+  }
+  if (out.model === undefined && out.reasoningEffort === undefined) return { ok: true };
+
+  // Validate the SETTLED task, not just this request: an update supplying only
+  // an effort must be checked against the model the task already pinned.
+  const model = out.model === undefined ? current?.model : (out.model ?? undefined);
+  const reasoningEffort = out.reasoningEffort === undefined
+    ? current?.reasoningEffort
+    : (out.reasoningEffort ?? undefined);
+  if (!model && !reasoningEffort) return { ok: true, ...out };
+
+  let botCfg: BotConfig | undefined;
+  try { botCfg = getBot(larkAppId).config; } catch { botCfg = undefined; }
+  if (!isConfigurableReasoningCliId(botCfg?.cliId)) {
+    return {
+      ok: false,
+      field: 'model',
+      error: `CLI ${botCfg?.cliId ?? '(unset)'} 不支持任务级模型/思考强度`,
+    };
+  }
+  const effectiveModel = model ?? botCfg?.model;
+  if (reasoningEffort
+      && !cliModelSupportsReasoningEffort(botCfg?.cliId, effectiveModel, reasoningEffort)) {
+    return {
+      ok: false,
+      field: 'reasoningEffort',
+      error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${reasoningEffort}`,
+    };
+  }
+  return { ok: true, ...out };
+}
+
 function parseScheduleChatTargets(
   body: Record<string, unknown>,
   required: boolean,
@@ -3462,6 +3540,8 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
+    model: t.model,
+    reasoningEffort: t.reasoningEffort,
     ...schedulePreconditionProjection(t),
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
@@ -3663,6 +3743,10 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     followActive = b.followActive;
   }
+  const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'create');
+  if (!modelWrite.ok) {
+    return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+  }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
     if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
@@ -3736,6 +3820,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       deliver,
       silent,
       followActive: followActive || undefined,
+      model: modelWrite.model ?? undefined,
+      reasoningEffort: modelWrite.reasoningEffort ?? undefined,
     }, cachedLarkAppId, precondition.create);
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
@@ -3759,6 +3845,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
     chatId?: string; chatIds?: readonly string[] | null;
+    model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
   } = {};
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
@@ -3827,6 +3914,17 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     updates.silent = b.silent;
   }
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (b.model !== undefined || b.reasoningEffort !== undefined) {
+    // The pairing is judged on the task as it will END UP, so an edit touching
+    // only one half is still checked against the other half already stored.
+    const existing = scheduleStore.getTask(p.id, cachedLarkAppId);
+    const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'update', existing);
+    if (!modelWrite.ok) {
+      return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+    }
+    if (modelWrite.model !== undefined) updates.model = modelWrite.model;
+    if (modelWrite.reasoningEffort !== undefined) updates.reasoningEffort = modelWrite.reasoningEffort;
+  }
   let result;
   try {
     result = updateTaskWithOptionalPrecondition(

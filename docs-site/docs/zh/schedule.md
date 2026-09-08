@@ -123,6 +123,33 @@ botmux schedule add "每日9:00" "晨会提醒" --follow-active --root-msg-id om
 
 `--follow-active` 只对「话题下执行」有意义，不能和 `--top-level` / `--new-topic` 同时用。`schedule list` 里带 `↷跟随活跃话题` 标记的就是这类任务。
 
+## 按任务指定模型
+
+同一个 Bot 下，不同任务往往值得用不同等级的模型：每 30 分钟一次的哨兵用便宜模型就够，每天一次的代码审查才需要最强的。`--model` / `--reasoning-effort` 让任务带上自己的模型，不动 Bot 配置、不影响别的任务。
+
+```bash
+# 高频哨兵：便宜模型 + 低思考强度
+botmux schedule add "every 30m" "检查服务状态，异常才报警" \
+  --silent --model gpt-5.2 --reasoning-effort low
+
+# 每天一次的深度任务：换最强的模型和最高强度
+botmux schedule add "每日9:00" "审查昨天合入 master 的所有 PR" \
+  --new-topic --model gpt-5.6-sol --reasoning-effort ultra
+```
+
+Dashboard 的「定时任务」页也有这两个字段，留空即跟随 Bot 配置。
+
+**只有新建会话的那次执行能应用模型。** 模型和思考强度是 CLI 的**进程启动参数**（`codex --model X -c model_reasoning_effort=Y`），进程起来之后改不了。所以：
+
+| 执行位置 | 效果 |
+| --- | --- |
+| `--new-topic` | 每次触发都新起会话，模型**每次生效** |
+| `--topic` / `--top-level` | 只有创建该会话的那次触发生效；之后复用同一会话时，沿用它启动时的模型 |
+
+需要每次都生效就用 `--new-topic`。CLI 和 Dashboard 在保存时都会按执行位置提示这一点。
+
+支持的 CLI 是 Codex、Claude Code、Grok、TraeX（与 Trigger API `options.model` 同一套门禁）；其它 CLI 的任务会在触发时忽略这两个字段并记一条 warn。思考强度的可选等级取决于模型（如 `gpt-5.6-sol` 六档到 `ultra`，`gpt-5.5` 只到 `xhigh`），Dashboard 保存时会直接拒绝不支持的组合；如果任务存好之后 Bot 换了 CLI、或模型不再支持该等级，触发时会**丢掉这一项照常执行**并记 warn——不会因为配置过期就跳过一次执行。
+
 ## 管理
 
 ```bash
