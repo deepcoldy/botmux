@@ -44,7 +44,11 @@ export function isDescendantOf(pid: number, ancestorPid: number): boolean {
     return false;
   }
   try {
-    const raw = execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8' });
+    // 全进程表扫描：显式抬高 maxBuffer，防输出超过 Node 默认 1MiB 时 ENOBUFS。
+    const raw = execFileSync('ps', ['-axo', 'pid=,ppid='], {
+      encoding: 'utf-8',
+      maxBuffer: 32 * 1024 * 1024,
+    });
     const ppidOf = new Map<number, number>();
     for (const line of raw.split('\n')) {
       const m = line.trim().match(/^(\d+)\s+(\d+)$/);

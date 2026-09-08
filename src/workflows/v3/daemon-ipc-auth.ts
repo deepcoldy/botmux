@@ -23,6 +23,7 @@ import type { IncomingMessage } from 'node:http';
 
 import { dashboardSecretPath } from '../../core/dashboard-secret.js';
 import { loadDashboardSecret } from '../../dashboard/auth.js';
+import { isLoopbackPeer } from '../../utils/loopback-peers.js';
 
 export const WORKFLOW_DAEMON_IPC_DOMAIN = 'botmux-workflow-daemon-ipc/v1';
 export const WORKFLOW_DAEMON_IPC_RESPONSE_DOMAIN = 'botmux-workflow-daemon-ipc/v1/response';
@@ -216,7 +217,7 @@ function headerString(req: IncomingMessage, name: string): string | undefined {
 }
 
 function isLoopback(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || Boolean(address?.endsWith('::ffff:127.0.0.1'));
+  return isLoopbackPeer(address);
 }
 
 async function readBoundedBody(

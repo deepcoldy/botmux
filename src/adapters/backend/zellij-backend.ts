@@ -496,6 +496,8 @@ export function findServerPid(sessionName: string): number | null {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
+      // 全进程表扫描：显式抬高 maxBuffer，防输出超过 Node 默认 1MiB 时 ENOBUFS。
+      maxBuffer: 32 * 1024 * 1024,
       env: zellijEnv(),
     });
     servers = parseZellijServerProcs(out);
@@ -553,6 +555,8 @@ export function findPaneCliPid(sessionName: string, _binBasename: string): numbe
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
+      // 全进程表扫描：显式抬高 maxBuffer，防输出超过 Node 默认 1MiB 时 ENOBUFS。
+      maxBuffer: 32 * 1024 * 1024,
       env: zellijEnv(),
     });
     const children: number[] = [];
