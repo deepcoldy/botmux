@@ -16465,10 +16465,10 @@ async function spawnCli(
         // Race-safe with transcript final / submit-failure: the worker-local
         // terminal deduper lets exactly one status win for this attempt.
         emitTurnTerminal(
-          exitedTurnId,
+          currentBotmuxTurnId!,
           'ambiguous',
-          'cli_exit',
-          exitedDispatchAttempt,
+        'cli_exit',
+          currentBotmuxDispatchAttempt,
         );
       }
     }
