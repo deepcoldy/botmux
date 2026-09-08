@@ -671,6 +671,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.badge': '[分身]',
   'cmd.fork.seed_parent_line': '来自主话题「{title}」·',
   'cmd.fork.seed_back_link': '返回主话题',
+  'cmd.fork.seed_topic_reply': '正在创建分身会话并继承上下文…',
   'cmd.fork.child_intro': '【分身会话】本会话由主会话「{parentTitle}」fork 而来，已继承 fork 时刻之前的完整上下文（父 botmux sessionId：{parentSessionId}；父话题根消息 id：{parentRootId}）。fork 后主话题的新进展不会自动同步到这里。本次任务：',
   'card.fork_panel.title': '[分身任务]',
   'card.fork_panel.running': '🟢 运行中',

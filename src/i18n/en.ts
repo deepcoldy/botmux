@@ -673,6 +673,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.badge': '[Fork]',
   'cmd.fork.seed_parent_line': 'From parent topic "{title}" ·',
   'cmd.fork.seed_back_link': 'back to parent topic',
+  'cmd.fork.seed_topic_reply': 'Creating the forked session and inheriting context…',
   'cmd.fork.child_intro': '[Forked session] This session was forked from the parent session "{parentTitle}" and inherits its complete context up to the fork point (parent botmux sessionId: {parentSessionId}; parent topic root message id: {parentRootId}). Progress made in the parent after the fork is not synced here. Your task:',
   'card.fork_panel.title': '[Forked Tasks]',
   'card.fork_panel.running': '🟢 running',

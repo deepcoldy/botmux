@@ -5356,6 +5356,7 @@ export async function startForkSubtopicSession(
     ...(message.senderName ? { name: message.senderName } : {}),
   };
   let anchorId: string | undefined;
+  let topicCreated = false;
 
   const recallAnchor = async (): Promise<boolean> => {
     if (!anchorId) return true;
@@ -5398,7 +5399,23 @@ export async function startForkSubtopicSession(
       },
     });
     anchorId = await sendMessage(appId, chatId, seedPost, 'post');
-    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+    // A top-level post becomes a topic automatically only in topic-mode chats.
+    // In a regular group, explicitly replying in-thread materializes a native
+    // topic under the seed. Resolve the thread from that reply because the root
+    // message may not expose its new thread_id immediately.
+    const topicReplyId = await replyMessage(
+      appId,
+      anchorId,
+      t('cmd.fork.seed_topic_reply', undefined, loc),
+      'text',
+      true,
+    );
+    const childThreadId = (await getMessageThreadId(appId, topicReplyId)) ?? undefined;
+    if (!childThreadId?.startsWith('omt_')) {
+      const orphanTopic = !await recallAnchor();
+      return { ok: false, error: 'topic_creation_failed', orphanTopic };
+    }
+    topicCreated = true;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
@@ -5470,7 +5487,7 @@ export async function startForkSubtopicSession(
       ok: true,
       childSessionId: forkResult.childSessionId,
       anchorId,
-      link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+      link: threadAppLink(chatId, childThreadId, brand),
     };
   } catch (err) {
     logger.error(
@@ -5479,7 +5496,7 @@ export async function startForkSubtopicSession(
     );
     return {
       ok: false,
-      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      error: topicCreated ? 'fork_subtopic_failed' : 'topic_creation_failed',
       orphanTopic: anchorId ? !await recallAnchor() : false,
     };
   }
