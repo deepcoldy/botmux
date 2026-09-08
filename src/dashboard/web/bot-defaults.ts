@@ -90,11 +90,15 @@ export type BotDefaultsRow = {
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
-   *  CLI calls use whatever identity is logged in on the machine). */
+   *  CLI calls use whatever identity is logged in on the machine).
+   *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip
+   *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
     tools: Array<'lark-cli' | 'bytedcli'>;
     fallback: 'bot-identity' | 'none';
+    gitHost?: string;
+    gitTokenExchangeUrl?: string;
   } | null;
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */

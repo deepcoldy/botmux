@@ -2480,6 +2480,195 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
   });
 });
 
+describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
+  it('turning it on echoes the normalized policy back through GET /api/bot-default-oncall', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'must-not-leak',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Unset → null. The dashboard toggle renders that as off; an omitted key
+      // would be indistinguishable from "the daemon forgot", which is the bug.
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toHaveProperty('triggerUserAuth');
+      expect(initial.triggerUserAuth).toBeNull();
+
+      const on = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+        }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({
+        ok: true,
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+      });
+      // Persisted as a real OBJECT, not a JSON string. A string here is silently
+      // catastrophic: `config.triggerUserAuth?.enabled` is undefined so the
+      // credential boundary never actually engages, and the next daemon restart
+      // refuses to load bots.json at all ("must be an object").
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth;
+      expect(typeof persisted).toBe('object');
+      expect(persisted).toMatchObject({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+      // The in-memory hot update has to be an object too — this is what every
+      // spawn path reads via `getBot(...).config.triggerUserAuth?.enabled`.
+      expect(getBot(appId).config.triggerUserAuth).toMatchObject({ enabled: true, fallback: 'none' });
+      // And the written file must still load: a config a restart cannot parse
+      // would take the whole daemon down, not just this one bot's toggle.
+      expect(() => loadBotConfigs()).not.toThrow();
+
+      // The regression: a page refresh reloads from this aggregate, so the whole
+      // policy (not just `enabled`) has to survive the round trip.
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth)
+        .toMatchObject({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+
+      // Omitted `tools` normalizes to every tool — the echo must show the
+      // effective value, not the sparse body the dashboard sent.
+      const allTools = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: { enabled: true } }),
+      });
+      expect(allTools.status).toBe(200);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth)
+        .toMatchObject({ enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' });
+
+      // null clears → key dropped from disk, GET back to null (off).
+      const off = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: null }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, triggerUserAuth: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth).toBeUndefined();
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth).toBeNull();
+
+      // The secret must never ride along in the aggregate the browser reads.
+      const payload = await (await fetch(`${base}/api/bot-default-oncall`)).text();
+      expect(payload).not.toContain('must-not-leak');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the UI-less gitHost / gitTokenExchangeUrl across a tools-only save', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-git-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-git-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        triggerUserAuth: {
+          enabled: true,
+          tools: ['lark-cli', 'bytedcli'],
+          fallback: 'bot-identity',
+          gitHost: 'code.example.com',
+          gitTokenExchangeUrl: 'https://exchange.example.com/token',
+        },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // The dashboard has no editor for the two git fields, so it PUTs only the
+      // three it renders. Dropping the rest would silently disable per-turn git
+      // auth for someone who merely unchecked a tool.
+      const put = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+        }),
+      });
+      expect(put.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth).toMatchObject({
+        enabled: true,
+        tools: ['lark-cli'],
+        fallback: 'bot-identity',
+        gitHost: 'code.example.com',
+        gitTokenExchangeUrl: 'https://exchange.example.com/token',
+      });
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth)
+        .toMatchObject({ tools: ['lark-cli'], gitHost: 'code.example.com' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a fallback that asks for another person\'s login, leaving config untouched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-bad-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-bad-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // The dashboard door must validate exactly like `/botconfig set` does.
+      // Accepting these would persist a policy the registry parser later refuses,
+      // i.e. a toggle that bricks the daemon on its next restart.
+      for (const bad of [
+        { enabled: true, fallback: 'device' },          // deliberately-forbidden fallback
+        { enabled: true, tools: ['lark-cli', 'nope'] }, // typo'd tool name
+        { enabled: 'yes' },                             // wrong type
+        { enabled: true, gitHost: 'https://x/y' },      // not a bare hostname
+        'enabled',                                      // not an object at all
+      ]) {
+        const res = await fetch(`${base}/api/bot-trigger-user-auth`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ triggerUserAuth: bad }),
+        });
+        expect(res.status, `should reject ${JSON.stringify(bad)}`).toBe(400);
+        expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth).toBeUndefined();
+      }
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth).toBeNull();
+      expect(() => loadBotConfigs()).not.toThrow();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-reply-style — sparse reply-card appearance', () => {
   it('persists normalized overrides, hot-updates GET, and clears the default block', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-style-'));

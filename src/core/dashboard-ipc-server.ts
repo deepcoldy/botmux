@@ -268,7 +268,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { tokenStoreProtection } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -4892,6 +4892,16 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   let codexAuthSync: 'shared' | 'isolated' = 'shared';
   try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
+  // Trigger-user CLI auth policy. Absent → null ("feature off"), which is what
+  // the dashboard toggle renders as unchecked. It has to be echoed here or the
+  // Bot Defaults page loses the setting on every refresh: the PUT persists it,
+  // but this aggregate is the only thing the page reloads from.
+  //
+  // Already-normalized by the registry parser (enabled/tools/fallback always
+  // present), and the policy carries no secret — just which tools it covers and
+  // what to do for an unauthorized sender.
+  let triggerUserAuth: TriggerUserAuthConfig | null = null;
+  try { triggerUserAuth = getBot(cachedLarkAppId).config.triggerUserAuth ?? null; } catch { /* default off */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -5089,6 +5099,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
     envelopeInjection,
+    triggerUserAuth,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
@@ -6350,9 +6361,20 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
 });
 
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
-// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
-// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
-// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+// `{ triggerUserAuth: object | null }`：null → 清除（关闭）。
+//
+// 走 coerceConfigValue + applyConfigField，与 /botconfig set 的 json 分支同一口径：
+// ① 校验一致，拒绝原因（比如「fallback 不能是 device」）原样透出，不在这里另写一套
+// 判断；② 落盘的是 **parser 归一化后的对象**。之前这里把 JSON.stringify 的结果直接
+// 交给 applyConfigField，而 json kind 的 applyConfigField 不解析、原样写入，于是
+// bots.json 里存的是一个 JSON **字符串**——三个后果都是静默的：
+//   • getBot().config.triggerUserAuth 是 string，`?.enabled` 恒为 undefined，
+//     功能实际从未生效（开关看着开了，凭证边界并没有建立）；
+//   • parser 从未被调用，`fallback:'device'` 这类被刻意禁止的值也会 200 落盘；
+//   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
+//     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
+const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback']);
+
 ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { triggerUserAuth?: unknown };
@@ -6360,15 +6382,37 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
-  // '' is the store's "clear" sentinel; anything else goes through the shared
-  // JSON coercion so a malformed policy is rejected the same way here as it is
-  // from chat.
-  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
-    ? ''
-    : JSON.stringify(body.triggerUserAuth);
-  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+
+  // null → 清除整份配置（关闭）。applyConfigField 的 null 分支 delete key。
+  let value: TriggerUserAuthConfig | null = null;
+  if (body.triggerUserAuth !== null && body.triggerUserAuth !== undefined) {
+    const incoming = body.triggerUserAuth;
+    // 合并保存：dashboard 只回写 UI 展示的三个字段；接口支持但 UI 没有编辑器的
+    // gitHost / gitTokenExchangeUrl 必须原样保留，否则用户只勾一个 tool 就会静默
+    // 删掉「按当轮身份鉴权 git push」的配置。清除（body=null）仍是整份删除。
+    let merged: unknown = incoming;
+    if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+      let preserved: Record<string, unknown> = {};
+      try {
+        const prev = getBot(cachedLarkAppId).config.triggerUserAuth as
+          Record<string, unknown> | undefined;
+        if (prev && typeof prev === 'object' && !Array.isArray(prev)) {
+          preserved = Object.fromEntries(
+            Object.entries(prev).filter(([k]) => !TRIGGER_USER_AUTH_UI_EDITABLE_KEYS.has(k)),
+          );
+        }
+      } catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
+      merged = { ...preserved, ...(incoming as Record<string, unknown>) };
+    }
+    // coerceConfigValue 吃 JSON 文本（与 IM 入口一致），返回 parser 归一化后的对象。
+    const coerced = coerceConfigValue(spec, JSON.stringify(merged));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason, reason: coerced.reason });
+    value = coerced.value as TriggerUserAuthConfig;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, r);
-  jsonRes(res, 200, { ok: true });
+  // 回响规范化后的实际生效值，前端保存后无需再拉一次聚合接口就能对齐。
+  jsonRes(res, 200, { ok: true, triggerUserAuth: value });
 });
 
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
