@@ -69,6 +69,10 @@ export interface CodexPendingTurn {
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
   markTimeMs?: number;
+  /** Timestamp of the transcript user record that actually started this
+   *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
+   *  semantics intentionally serve the outbound-send suppression window. */
+  transcriptStartTimeMs?: number;
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
@@ -148,6 +152,28 @@ export class CodexBridgeQueue {
         0, this.closedNativeTurns.length - CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX,
       );
     }
+  }
+
+  private sourceSessionsCompatible(left: string | undefined, right: string | undefined): boolean {
+    return !left || !right || left === right;
+  }
+
+  private targetForNativeEvent(ev: CodexBridgeEvent): CodexPendingTurn | null {
+    if (!ev.sourceTurnId) return this.collecting;
+    const exact = this.queue.find(turn => turn.started && turn.finalText === undefined
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
+    if (exact) return exact;
+    const fallback = this.collecting;
+    if (!fallback
+      || fallback.sourceTurnId
+      || !this.sourceSessionsCompatible(fallback.sourceSessionId, ev.sourceSessionId)
+      // Native records for a legacy turn cannot precede that turn's user
+      // record in the append-only transcript. This remains a replay guard
+      // after an old closed-turn tombstone ages out of the bounded cache.
+      || (fallback.transcriptStartTimeMs !== undefined
+        && ev.timestampMs < fallback.transcriptStartTimeMs)) return null;
+    return fallback;
   }
 
   /** Register events as historical without producing pending-turn side
@@ -463,10 +489,13 @@ export class CodexBridgeQueue {
       // record after an id-less legacy record already started the turn. Bind
       // that id without treating the mirror as another user/steer boundary.
       const target = this.queue.find(turn => turn.started && turn.finalText === undefined
-        && turn.sourceTurnId === ev.sourceTurnId)
+        && turn.sourceTurnId === ev.sourceTurnId
+        && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId))
         ?? this.queue.find(turn => turn.started && turn.finalText === undefined
           && !turn.sourceTurnId
-          && (!turn.sourceSessionId || !ev.sourceSessionId || turn.sourceSessionId === ev.sourceSessionId));
+          && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)
+          && (turn.transcriptStartTimeMs === undefined
+            || ev.timestampMs >= turn.transcriptStartTimeMs));
       if (!target || !ev.sourceTurnId) return;
       if (target.sourceSessionId && ev.sourceSessionId
         && target.sourceSessionId !== ev.sourceSessionId) return;
@@ -477,13 +506,7 @@ export class CodexBridgeQueue {
       // Cosmetic thinking-timeline record. Only meaningful while a turn is
       // collecting; history replay / unmatched events are dropped (never
       // buffered — a late replay into the wrong turn is worse than a gap).
-      const target = ev.sourceTurnId
-        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
-          && turn.sourceTurnId === ev.sourceTurnId)
-          // Backward-compatible bridge dialects can expose a native id only
-          // on mid-turn/terminal records, after an id-less user record.
-          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
-        : this.collecting;
+      const target = this.targetForNativeEvent(ev);
       if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
@@ -542,6 +565,7 @@ export class CodexBridgeQueue {
         next!.unconfirmedAttributionStartedAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
         next!.sourceTurnId = ev.sourceTurnId;
+        next!.transcriptStartTimeMs = ev.timestampMs;
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the
@@ -588,6 +612,7 @@ export class CodexBridgeQueue {
           isLocal: true,
           userText: ev.text,
           markTimeMs: ev.timestampMs,
+          transcriptStartTimeMs: ev.timestampMs,
           sourceSessionId: ev.sourceSessionId,
           sourceTurnId: ev.sourceTurnId,
         };
@@ -602,11 +627,7 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'assistant_final') {
-      const target = ev.sourceTurnId
-        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
-          && turn.sourceTurnId === ev.sourceTurnId)
-          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
-        : this.collecting;
+      const target = this.targetForNativeEvent(ev);
       if (target) {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
@@ -627,11 +648,7 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'turn_aborted') {
-      const target = ev.sourceTurnId
-        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
-          && turn.sourceTurnId === ev.sourceTurnId)
-          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
-        : this.collecting;
+      const target = this.targetForNativeEvent(ev);
       if (!target) {
         if (bufferUnmatched && !this.localTurnsEnabled) this.rememberUnmatched(ev);
         return;
