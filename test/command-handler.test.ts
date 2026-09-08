@@ -336,7 +336,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatName: vi.fn(async () => null),
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
   getChatModeStrict: vi.fn(async () => 'topic' as const),
-  getMessageThreadId: vi.fn(async () => 'omt_child'),
+  getMessageThreadId: vi.fn(async () => null),
   getMessageDetail: vi.fn(),
   // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
   // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
@@ -1864,7 +1864,7 @@ describe('handleCommand', () => {
     vi.mocked(sendMessage).mockResolvedValue('card-msg-id');
     vi.mocked(replyMessage).mockResolvedValue('picker-card-msg-id');
     vi.mocked(getChatModeStrict).mockResolvedValue('topic');
-    vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
+    vi.mocked(getMessageThreadId).mockResolvedValue(null);
     vi.mocked(forkSession).mockResolvedValue({ ok: true, childSessionId: 'child-sess-1' });
     vi.mocked(isForkCapableSession).mockReturnValue(true);
     vi.mocked(sessionStore.getSession).mockReturnValue(undefined);
@@ -2021,6 +2021,15 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    beforeEach(() => {
+      vi.mocked(replyMessage).mockResolvedValue('topic-reply-msg-id');
+      vi.mocked(getMessageThreadId).mockImplementation(async (_appId, messageId) => {
+        if (messageId === ROOT_ID) return 'omt_parent';
+        if (messageId === 'topic-reply-msg-id') return 'omt_child';
+        return null;
+      });
+    });
+
     it.each(['codex', 'claude-code'] as const)('passes post images into the %s first turn and renders them in the root', async cliId => {
       const { downloadResources } = await import('../src/core/session-manager.js');
       const attachments = [{ type: 'image' as const, path: '/tmp/fork-image.jpg', name: 'img_source.jpg' }];
@@ -2048,8 +2057,7 @@ describe('handleCommand', () => {
       expect(options.forkTaskText).toBe(task);
     });
 
-    it('creates a child topic in a regular group and forwards the multiline task as the first fork turn', async () => {
-      vi.mocked(getChatModeStrict).mockResolvedValue('group');
+    it('materializes a child topic from the top-level seed and forwards the multiline task as the first fork turn', async () => {
       const ds = makeDaemonSession({
         scope: 'thread',
         lastScreenStatus: 'idle',
@@ -2065,20 +2073,26 @@ describe('handleCommand', () => {
       await handleCommand(
         '/fork',
         ROOT_ID,
-        makeLarkMessage(`/fork ${task}`, { threadId: 'omt_parent' }),
+        makeLarkMessage(`/fork ${task}`),
         deps,
         LARK_APP_ID,
       );
 
-      // A thread-scoped source is sufficient. The containing chat does not
-      // need to be a topic group; regular groups can host native topics too.
-      expect(getChatModeStrict).not.toHaveBeenCalled();
       expect(sendMessage).toHaveBeenCalledWith(
         LARK_APP_ID,
         CHAT_ID,
         expect.stringContaining('调研这个问题'),
         'post',
       );
+      expect(replyMessage).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        'card-msg-id',
+        expect.stringContaining('继承上下文'),
+        'text',
+        true,
+      );
+      expect(getMessageThreadId).toHaveBeenNthCalledWith(1, LARK_APP_ID, ROOT_ID);
+      expect(getMessageThreadId).toHaveBeenNthCalledWith(2, LARK_APP_ID, 'topic-reply-msg-id');
       expect(forkSession).toHaveBeenCalledWith(
         'sess-001',
         CHAT_ID,
@@ -2116,7 +2130,6 @@ describe('handleCommand', () => {
     });
 
     it('keeps a regular-group top-level chat session out of the topic fork path', async () => {
-      vi.mocked(getChatModeStrict).mockResolvedValue('group');
       const ds = makeDaemonSession({
         scope: 'chat',
         lastScreenStatus: 'idle',
@@ -2140,6 +2153,29 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
+    });
+
+    it('fails closed and recalls the seed when the child reply has no real thread id', async () => {
+      vi.mocked(getMessageThreadId).mockImplementation(async (_appId, messageId) => {
+        if (messageId === ROOT_ID) return 'omt_parent';
+        if (messageId === 'topic-reply-msg-id') return 'om_not_a_thread';
+        return null;
+      });
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '继续排查',
+        ds,
+        makeLarkMessage('/fork 继续排查'),
+        LARK_APP_ID,
+      );
+
+      expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+      expect(forkSession).not.toHaveBeenCalled();
     });
 
     it('reports an orphan topic when fork creation and message recall both fail', async () => {

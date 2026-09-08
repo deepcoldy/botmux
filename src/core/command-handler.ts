@@ -6800,6 +6800,7 @@ export async function startForkSubtopicSession(
         content: [[{ tag: 'text', text: t('cmd.fork.seed_anchor_line', undefined, loc) }]],
       },
     });
+    let groupChildThreadId: string | undefined;
     if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
       // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
       // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
@@ -6818,10 +6819,22 @@ export async function startForkSubtopicSession(
         ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
         : await replyMessage(appId, anchorId, seedPost, 'post', true);
     } else {
-      // 群聊：顶层 post 本身就是话题锚点，无单独 seed。
       anchorId = sourceOptions
         ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
         : await sendMessage(appId, chatId, seedPost, 'post');
+      // A top-level post becomes a topic automatically only in topic-mode chats.
+      // In a regular group, explicitly replying in-thread materializes a native
+      // topic under the seed. Resolve the thread from that reply because the root
+      // message may not expose its new thread_id immediately.
+      const topicReplyText = t('cmd.fork.seed_topic_reply', undefined, loc);
+      const topicReplyId = sourceOptions
+        ? await replyMessage(appId, anchorId, topicReplyText, 'text', true, undefined, undefined, sourceOptions)
+        : await replyMessage(appId, anchorId, topicReplyText, 'text', true);
+      groupChildThreadId = (await getMessageThreadId(appId, topicReplyId)) ?? undefined;
+      if (!groupChildThreadId?.startsWith('omt_')) {
+        const orphanTopic = !await recallAnchor();
+        return { ok: false, error: 'topic_creation_failed', orphanTopic };
+      }
     }
     // 私聊锚点必须登记 /t 同款溯源：扁平 DM 路由默认把 root_id+thread_id
     // 回复折进 chat-scope 会话，只有命中 marker 才会 promote 到锚点的分身
@@ -6832,7 +6845,9 @@ export async function startForkSubtopicSession(
       const { recordP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
       recordP2pForceTopicRoot(appId, anchorId, chatId);
     }
-    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+    const childThreadId = forkInPlaceIsP2p
+      ? (await getMessageThreadId(appId, anchorId)) ?? undefined
+      : groupChildThreadId;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
