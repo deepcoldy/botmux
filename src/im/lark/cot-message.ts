@@ -35,11 +35,15 @@
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
  *
- * Opt-in per bot via `thinkingCard: true`.
+ * Per-bot master switch `thinkingCard` (default ON — only an explicit false
+ * disables; per-chat opt-out via `/cot off`). `thinkingCardToolResult: false`
+ * additionally drops the TOOL_CALL_RESULT code blocks, see
+ * {@link cotToolResultEnabled}.
  */
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
+import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
@@ -79,6 +83,51 @@ interface CotState {
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
+/** 最近几轮的 state，按 turnId 索引：一个 turn 的 thinking 已经把 `states` 换成
+ *  新 turn 之后，旧 turn 的 turn_terminal 才姗姗来迟时，仍能找到并收尾它自己的气泡，
+ *  而不是因 turnId 不匹配被忽略、让旧气泡永远转圈。有界（RECENT_COT_STATES_MAX）。 */
+const recentStates = new WeakMap<DaemonSession, Map<string, CotState>>();
+const RECENT_COT_STATES_MAX = 8;
+
+function rememberRecentState(ds: DaemonSession, state: CotState): void {
+  let m = recentStates.get(ds);
+  if (!m) { m = new Map(); recentStates.set(ds, m); }
+  m.delete(state.turnId);
+  m.set(state.turnId, state);
+  while (m.size > RECENT_COT_STATES_MAX) {
+    const oldest = m.keys().next().value;
+    if (oldest === undefined) break;
+    m.delete(oldest);
+  }
+}
+
+/**
+ * 新 turn 的 thinking 到来时，上一轮的气泡若还活着（已创建、未收尾），必须在这里
+ * 主动收尾，而不是把 state 一丢了之：丢掉之后没有任何路径会再给它 RUN_FINISHED——
+ * 它自己的 turn_terminal 已经（或将要）因 state 被替换而找不到对象，气泡就永远停在
+ * 「执行中」。实测触发场景：上一轮跑得久，用户 type-ahead 发了下一条，Claude 无缝
+ * 接着跑，两轮之间没有 idle 边沿。
+ *
+ * 下一轮的 thinking 已经出现，本身就证明上一轮结束了，所以按 done 收尾；若上一轮
+ * 曾经推送失败（disabled），走显式 complete 让它停止转圈。
+ */
+function settleSupersededState(ds: DaemonSession, state: CotState): void {
+  if (state.settled) return;
+  if (state.disabled) {
+    if (state.cotId) {
+      state.settled = true;
+      apiComplete(ds, state, 'error')
+        .catch(() => { /* best-effort */ })
+        .finally(() => clearCotOrphanMarker(state));
+    }
+    return;
+  }
+  if (!state.finishStatus) {
+    state.finishStatus = 'done';
+    logger.info(`[cot] superseded by a newer turn, finishing cot=${state.cotId ?? '(creating)'} turn=${state.turnId.substring(0, 24)} as done`);
+    void pump(ds, state);
+  }
+}
 
 // ─── Orphan closure across daemon restarts ─────────────────────────────────
 //
@@ -195,6 +244,17 @@ export function cotEnabled(ds: DaemonSession): boolean {
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));
   } catch {
     return false;
+  }
+}
+
+/** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）：bot 级
+ *  `thinkingCardToolResult`，默认 ON，只有显式 false 关闭。每个 entry 现场读
+ *  注册表，改配置下一批推送即生效；读不到 bot 按开处理，保持既有渲染。 */
+export function cotToolResultEnabled(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.thinkingCardToolResult !== false;
+  } catch {
+    return true;
   }
 }
 
@@ -325,12 +385,6 @@ function reasoningId(state: CotState, index: number): string {
   return `reasoning-${state.turnId}-${index + 1}`;
 }
 
-/** Longest tool subject rendered after the category label. The title is a
- *  single unwrapped line in the bubble, so this is a layout bound, not a
- *  data bound — much tighter than COT_TOOL_ARGS_MAX_CHARS (600), which sizes
- *  a payload that turned out never to be rendered at all. */
-const COT_TOOL_TITLE_SUBJECT_MAX_CHARS = 80;
-
 /** Built-in Feishu CoT icon + i18n label key for a CLI tool name. The label
  *  becomes the node's `title` (the bubble shows a readable category like
  *  「执行命令」 instead of `Bash ({"command":…})`; the concrete subject —
@@ -365,78 +419,15 @@ function toolMeta(name: string): { icon: string; labelKey: string } {
  * dropped too, so the title is the only surviving carrier. The args event is
  * still sent — it costs nothing and a future client may render it.
  *
- * `args` is whatever the CLI produced: a JSON object string for Claude
- * (`{"command":…}` / `{"file_path":…}`), but Codex's dominant
- * `custom_tool_call` ships a raw non-JSON script string, which is used as-is.
- * Text that LOOKS like JSON but will not parse is treated as truncated: the
- * priority fields are recovered by regex where possible (the transcript layer
- * hard-cuts args at 600 chars, which mangles Write/Edit payloads whose
- * `content` dwarfs the path, yet leaves the leading `"file_path":"…"` intact),
- * and only a total miss yields ''. Every "no usable subject" path returns ''
- * so the caller keeps the bare category label — exactly the pre-change
- * rendering.
+ * `subject` 由转写层在 args 截断**之前**从完整 input 上提取（cot-subject.ts，
+ * 与本模块共用同一份字段优先级），是首选载体——长命令 / heredoc / 大 content
+ * 的 Write 都不会再丢主题。缺省时回退解析 `args`，兼容只发 args 的旧世代
+ * worker：Claude 的 `{"command":…}` JSON、Codex custom_tool_call 的裸脚本、
+ * 以及被 600 字符截断后靠正则回捞前导字段的 JSON。所有「拿不到主题」的路径
+ * 都返回 ''，调用方保留裸类别标签——即改动前的渲染。
  */
-interface ToolSubject { display: string; full: string }
-
-/** Fields ordered by how well each identifies the call to a human reader.
- *  `command` covers Claude's Bash and Codex's local_shell_call action;
- *  `description`/`prompt` catch sub-agent and task-style calls that carry no
- *  path or command of their own. */
-const COT_SUBJECT_FIELDS = [
-  'command', 'cmd', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'subject',
-  'description', 'prompt',
-] as const;
-
-function toolTitleSubject(args: string): ToolSubject {
-  const none: ToolSubject = { display: '', full: '' };
-  const raw = args.trim();
-  if (raw.length === 0) return none;
-  let subject = raw;
-  if (raw.startsWith('{')) {
-    let parsed: unknown;
-    try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
-    if (parsed && typeof parsed === 'object') {
-      const o = parsed as Record<string, unknown>;
-      const pick = COT_SUBJECT_FIELDS
-        .map(k => o[k])
-        .find(v => (typeof v === 'string' && v.trim().length > 0) || Array.isArray(v));
-      if (pick === undefined) return none;
-      // local_shell_call renders `command` as ["bash","-lc","…"] — the last
-      // element is the script; joining the argv would bury it in boilerplate.
-      subject = Array.isArray(pick)
-        ? String(pick[pick.length - 1] ?? '').trim()
-        : String(pick).trim();
-      if (subject.length === 0) return none;
-    } else {
-      // Truncated JSON: rendering the raw `{"command":` fragment is worse than
-      // rendering nothing, but the leading fields usually survive the cut, so
-      // recover one by regex before giving up.
-      const recovered = recoverSubjectFromTruncatedJson(raw);
-      if (recovered === undefined) return none;
-      subject = recovered;
-    }
-  }
-  // Multi-line scripts must collapse: the title is one unwrapped line.
-  const full = subject.replace(/\s+/g, ' ').trim();
-  if (full.length === 0) return none;
-  const display = full.length > COT_TOOL_TITLE_SUBJECT_MAX_CHARS
-    ? `${full.slice(0, COT_TOOL_TITLE_SUBJECT_MAX_CHARS)}…`
-    : full;
-  return { display, full };
-}
-
-/** Pull the first priority field out of JSON that was cut mid-payload. Only
- *  complete `"key":"value"` pairs match, so a value truncated mid-string is
- *  skipped rather than shown half-rendered. */
-function recoverSubjectFromTruncatedJson(raw: string): string | undefined {
-  for (const key of COT_SUBJECT_FIELDS) {
-    const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
-    if (!m) continue;
-    let value: string;
-    try { value = JSON.parse(`"${m[1]}"`); } catch { continue; } // bad escape → skip
-    if (value.trim().length > 0) return value.trim();
-  }
-  return undefined;
+function toolTitleSubject(entry: { args: string; subject?: string }): ToolSubject {
+  return boundSubjectForTitle(entry.subject || subjectFromArgsString(entry.args));
 }
 
 /** Category label plus the concrete subject when one can be extracted. */
@@ -497,14 +488,15 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
   }
   if (entry.kind === 'tool_call') {
     const meta = toolMeta(entry.name);
-    const subject = toolTitleSubject(entry.args);
+    const subject = toolTitleSubject(entry);
     // A tool_result entry carries only {id, result} — no tool name — so the
     // language has to be resolved here, while the call's name and subject are
     // in hand, and remembered for the matching result. Detection uses the
     // UNTRUNCATED subject: a path longer than the title cap still ends in its
     // extension, which the display string has already lost to the ellipsis.
+    // 工具输出关闭时结果不会发出，语言也无需记。
     const lang = resultLanguage(entry.name, subject.full);
-    if (lang) {
+    if (lang && cotToolResultEnabled(ds)) {
       if (!state.resultLanguages) state.resultLanguages = new Map();
       state.resultLanguages.set(entry.id, lang);
     }
@@ -520,14 +512,21 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       ev('TOOL_CALL_END', { toolCallId: entry.id }),
     ];
   }
-  if (entry.result.length === 0) return [];
-  const language = state.resultLanguages?.get(entry.id);
+  // 工具节点在 TOOL_CALL_END 之后处于「执行中」状态（官方 COT 事件文档对 22 的定义），
+  // 只有 TOOL_CALL_RESULT 才让它落定。所以「关掉工具输出」不能简单地不发 RESULT——
+  // 那会让每个工具节点永远转圈；结果串本身为空时同理。两种情况都改发一条极简 text
+  // 结果收尾：气泡里只留「工具名 · 命令/路径」加一个完成标记，与 Claude Code 自身
+  // 界面一致，又不会留下未落定的节点。
+  const omitResult = !cotToolResultEnabled(ds) || entry.result.length === 0;
+  const language = omitResult ? undefined : state.resultLanguages?.get(entry.id);
   return [
     ev('TOOL_CALL_RESULT', {
       messageId: `tr-${entry.id}`,
       toolCallId: entry.id,
       role: 'tool',
-      content: JSON.stringify({ type: 'code', ...(language ? { language } : {}), code: entry.result }),
+      content: JSON.stringify(omitResult
+        ? { type: 'text', text: t('cot.tool.result_done', undefined, localeForBot(ds.larkAppId)) }
+        : { type: 'code', ...(language ? { language } : {}), code: entry.result }),
     }),
   ];
 }
@@ -555,7 +554,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
         ]);
-        logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 12)}`);
+        logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 24)}`);
       }
       const pending = state.pendingEntries;
       state.pendingEntries = undefined;
@@ -577,7 +576,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         ]);
         state.settled = true;
         clearCotOrphanMarker(state);
-        logger.info(`[cot] finished cot=${state.cotId} status=${state.finishStatus}`);
+        logger.info(`[cot] finished cot=${state.cotId} turn=${state.turnId.substring(0, 24)} status=${state.finishStatus}`);
       }
       break;
     }
@@ -613,7 +612,11 @@ export function handleCotThinkingUpdate(
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);
-  if (state && state.turnKey !== key) state = undefined; // superseded turn
+  if (state && state.turnKey !== key) {
+    // superseded turn：先把旧气泡收尾（见 settleSupersededState），再换新 state。
+    settleSupersededState(ds, state);
+    state = undefined;
+  }
   if (state?.disabled) return false;
   if (state?.settled) return true; // late updates after terminal: swallow
   if (!state) {
@@ -626,6 +629,7 @@ export function handleCotThinkingUpdate(
       pumping: false,
     };
     states.set(ds, state);
+    rememberRecentState(ds, state);
   }
   state.pendingEntries = msg.entries;
   void pump(ds, state);
@@ -708,7 +712,11 @@ export function finalizeCotMessage(
   turnId: string,
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous',
 ): boolean {
-  const state = states.get(ds);
+  let state = states.get(ds);
+  // 当前 state 不是这一轮（已被新 turn 替换）时，按 turnId 找最近几轮的 state：
+  // 迟到的 terminal 仍要收尾它自己的气泡（通常 settleSupersededState 已先按 done
+  // 收过，这里靠 finishStatus / settled 幂等）。
+  if (!state || state.turnId !== turnId) state = recentStates.get(ds)?.get(turnId);
   if (!state || state.turnId !== turnId) return false;
   if (state.disabled) {
     // A mid-turn push failure left the bubble unfinished (disabled before

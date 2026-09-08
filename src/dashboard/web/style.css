@@ -4623,8 +4623,8 @@ td code,
   margin: 0;
 }
 
-#g-drawer .form-row :where(input, select),
-#g-drawer .g-modal-field :where(input, select) {
+#g-drawer .form-row :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select),
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select) {
   box-sizing: border-box;
   display: block;
   width: 100%;
@@ -4636,11 +4636,11 @@ td code,
   background-color: var(--surface);
 }
 
-#g-drawer .g-modal-field :where(input, select):hover:not(:disabled) {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
 }
 
-#g-drawer .g-modal-field :where(input, select):focus {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):focus {
   border-color: var(--accent);
   box-shadow: none;
   outline: none;
@@ -18461,6 +18461,78 @@ form.dashboard-toolbar > input[type="text"]:focus {
   white-space: nowrap;
 }
 
+.connector-bot-picker-chips {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  overflow: visible !important;
+}
+
+.connector-bot-picker-chip {
+  position: relative;
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  max-width: 140px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  color: var(--accent-strong);
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-remove {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -3px;
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.connector-bot-picker-chip-remove:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent-strong);
+}
+
+.connector-bot-picker-chip[data-full]:hover::after {
+  content: attr(data-full);
+  position: absolute;
+  z-index: 1700;
+  top: calc(100% + 7px);
+  left: 0;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 48px));
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  pointer-events: none;
+}
+
 .connector-group-picker-trigger:hover,
 .connector-group-picker.open .connector-group-picker-trigger {
   border-color: var(--accent);
@@ -18503,7 +18575,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: block;
 }
 
-.connectors-page .cn-form .connector-group-search > input[type="search"] {
+.connector-group-search > input[type="search"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   height: 34px;
   min-height: 34px;
   padding: 0 12px 0 34px;
@@ -18527,8 +18599,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .connector-group-search-icon::after {
   content: '';
   position: absolute;
-  right: -4px;
-  bottom: -3px;
+  right: -5px;
+  bottom: -1px;
   width: 5px;
   border-bottom: 1.5px solid var(--muted);
   transform: rotate(45deg);

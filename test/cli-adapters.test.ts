@@ -996,12 +996,12 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.readyPattern?.test('❯ ')).toBe(true);
   });
 
-  it('defers the first prompt until the TUI composer is ready', () => {
+  it('defers the first prompt until the TUI composer is ready (three-stage boot)', () => {
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
   });
 
-  it('does not type ahead', () => {
-    expect(adapter.supportsTypeAhead).not.toBe(true);
+  it('supports type-ahead so queued messages are written while the TUI is busy', () => {
+    expect(adapter.supportsTypeAhead).toBe(true);
   });
 
   it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
@@ -2296,6 +2296,63 @@ describe('busyPattern', () => {
     expect(busy!.test('› Ask anything                                      97% left')).toBe(false);
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('claude-code matches the working footer structure and self-heals a false idle, but not prose or the idle composer', () => {
+    // Regression: claude-code only had a readyPattern (❯ is resident while
+    // Claude works), so a single ≥2s PTY stall flipped a busy session to idle
+    // with no path back. The working footer carries an extra
+    // 「· esc to interrupt ·」 segment the idle composer lacks.
+    const claude = createCliAdapterSync('claude-code');
+    const busy = claude.busyPattern;
+    expect(busy).toBeDefined();
+    expect(claude.idleToBusyPattern).toBeDefined();
+    expect(claude.idleToBusyPattern!.source).toBe(busy!.source);
+    // Real footer lines (5 permission modes — mode names are runtime-assembled,
+    // do NOT enumerate them in the anchor — plus the ctrl+t variant and the
+    // retry footer), extracted from live panes.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  manual mode on · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  plan mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to hide tasks · ← for agents')).toBe(true);
+    expect(busy!.test(' · next try in 3s · attempt 2 · esc to interrupt')).toBe(true);
+    // Idle composer: no interrupt segment.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents')).toBe(false);
+    expect(busy!.test('❯')).toBe(false);
+    // Prose quoting the hint must not flip an idle card back to busy. The
+    // transcript shares the screen with the footer and busyProbeRegion scans
+    // the bottom third, so the BARE phrase in prose (prompt echo, assistant
+    // reply, mid-dot decoration, "on" + hint shape, prompt-then-help form)
+    // must all stay inert — a loose /esc to interrupt/ anchor pinned idle
+    // sessions busy forever (probe retries have no deadline).
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+    expect(busy!.test('❯ Reply with exactly this one line and nothing else: docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('● docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('· esc to interrupt ·')).toBe(false);
+    expect(busy!.test('the mode is on · esc to interrupt is documented in the docs')).toBe(false);
+    expect(busy!.test('next try: please esc to interrupt yourself')).toBe(false);
+    // Multi-line probe region: prose above must not rescue a busy verdict,
+    // and a busy footer must be found mid-region.
+    const region = [
+      '❯ docs say esc to interrupt works',
+      '● docs say esc to interrupt works',
+      '✻ Cogitated for 19s · done 10:36 PM',
+      '────────────────────────────────',
+      '❯',
+      '────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(busy!.test(region)).toBe(false);
+    const busyRegion = region.replace(
+      '· ← for agents',
+      '· esc to interrupt · ← for agents',
+    );
+    expect(busy!.test(busyRegion)).toBe(true);
+    // Shared def: seed/relay render the same Claude Code footer.
+    expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy!.source);
+    expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
   });
 
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {

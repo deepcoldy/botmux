@@ -704,7 +704,7 @@ describe('drainCodexRollout', () => {
     const r = drainCodexRollout(path, 0);
     expect(r.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'cot', 'assistant_final']);
     expect(r.events[1].cotEntries).toEqual([{ kind: 'thinking', text: '**Plan** first I look around' }]);
-    expect(r.events[2].cotEntries).toEqual([{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["bash","-lc","ls"]}' }]);
+    expect(r.events[2].cotEntries).toEqual([{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["bash","-lc","ls"]}', subject: 'ls' }]);
     // Wrapped shell output is unwrapped to the inner text.
     expect(r.events[3].cotEntries).toEqual([{ kind: 'tool_result', id: 'call_1', result: 'total 24' }]);
   });
@@ -1095,10 +1095,44 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
   it('maps local_shell_call and web_search_call to named tool calls', () => {
     expect(codexCotEntriesFromResponseItem({
       type: 'local_shell_call', call_id: 'c2', status: 'completed', action: { type: 'exec', command: ['ls'] },
-    })).toEqual([{ kind: 'tool_call', id: 'c2', name: 'shell', args: '{"type":"exec","command":["ls"]}' }]);
+    })).toEqual([{ kind: 'tool_call', id: 'c2', name: 'shell', args: '{"type":"exec","command":["ls"]}', subject: 'ls' }]);
     expect(codexCotEntriesFromResponseItem({
       type: 'web_search_call', id: 'ws1', action: { query: 'feishu cot' },
-    })).toEqual([{ kind: 'tool_call', id: 'ws1', name: 'web_search', args: '{"query":"feishu cot"}' }]);
+    })).toEqual([{ kind: 'tool_call', id: 'ws1', name: 'web_search', args: '{"query":"feishu cot"}', subject: 'feishu cot' }]);
+  });
+
+  /**
+   * `subject` 在截断之前从原始 arguments / input / action 上取：四种 tool_call
+   * 形态各验一条，其中 function_call 的脚本超过 600 字符、args 被截而 subject 完整。
+   */
+  it('carries the subject taken BEFORE truncation across all four tool_call shapes', () => {
+    const script = `echo ${'x'.repeat(695)}`; // 700 chars
+    const [fc] = codexCotEntriesFromResponseItem({
+      type: 'function_call', name: 'shell', call_id: 'f1',
+      arguments: JSON.stringify({ command: ['bash', '-lc', script] }),
+    }) as any[];
+    expect(fc.args.length).toBe(601);
+    expect(fc.subject).toBe(script);
+
+    // custom_tool_call: raw non-JSON string, multi-line collapsed to one line.
+    const [ct] = codexCotEntriesFromResponseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'c1',
+      input: 'await tools.exec_command({\n  cmd: "free -h"\n})',
+    }) as any[];
+    expect(ct.subject).toBe('await tools.exec_command({ cmd: "free -h" })');
+
+    // local_shell_call: argv last element, not the joined boilerplate.
+    const [ls] = codexCotEntriesFromResponseItem({
+      type: 'local_shell_call', call_id: 'l1', action: { type: 'exec', command: ['bash', '-lc', 'pnpm run build'] },
+    }) as any[];
+    expect(ls.subject).toBe('pnpm run build');
+
+    // apply_patch: first file path in the patch.
+    const [ap] = codexCotEntriesFromResponseItem({
+      type: 'custom_tool_call', name: 'apply_patch', call_id: 'p1',
+      input: '*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+y\n*** End Patch',
+    }) as any[];
+    expect(ap.subject).toBe('src/a.ts');
   });
 
   it('keeps a raw (non-wrapped) function_call_output string and maps custom tool calls', () => {

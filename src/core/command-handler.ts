@@ -1505,11 +1505,17 @@ export async function handleCotCommand(
     const chatOff = (() => {
       try { return !!getBot(larkAppId).config.noCotChats?.includes(chatId); } catch { return false; }
     })();
-    await reply(!masterOn
+    // 工具输出子开关是 bot 级（/botconfig set thinkingCardToolResult），这里只读
+    // 展示、不提供 /cot 子命令——避免和群级 on/off 混淆。默认开时不加行。
+    const toolResultOff = (() => {
+      try { return getBot(larkAppId).config.thinkingCardToolResult === false; } catch { return false; }
+    })();
+    const status = !masterOn
       ? t('cmd.cot.status_master_off', undefined, loc)
       : chatOff
         ? t('cmd.cot.status_chat_off', undefined, loc)
-        : t('cmd.cot.status_on', undefined, loc));
+        : t('cmd.cot.status_on', undefined, loc);
+    await reply(toolResultOff ? `${status}\n${t('cmd.cot.status_result_off', undefined, loc)}` : status);
     return;
   }
 

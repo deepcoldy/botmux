@@ -117,6 +117,9 @@ export type BotDefaultsRow = {
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   thinkingCard?: boolean;
+  /** 思考气泡是否附带工具输出代码块。默认 ON —— 只有显式 false 表示关闭；
+   *  thinkingCard 关闭时无意义。 */
+  thinkingCardToolResult?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;

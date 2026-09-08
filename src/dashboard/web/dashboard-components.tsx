@@ -396,14 +396,49 @@ type DropdownMenuProps<T extends string> = {
 };
 
 /**
+ * The band a popup has to stay inside, in viewport coordinates.
+ *
+ * The screen edge is not the only thing that crops a popup: every ancestor with
+ * a non-`visible` overflow crops it too, and such a box is often far smaller
+ * than the viewport. `.roles-profile-apply` (角色管理 → Profiles → 应用到群组)
+ * is one — `max-height: 34%; overflow: auto` — so a popup budgeted against
+ * `window.innerHeight` believed it had ~635px above the trigger when the panel
+ * only showed ~290px, flipped up, and left a single group row reachable.
+ *
+ * Overshooting the TOP edge of such a box is unrecoverable: an overflow
+ * container scrolls towards its content, never above it, so those options can
+ * be neither seen nor clicked. Intersecting the ancestors' boxes with the
+ * viewport gives the placement maths a frame that reflects what is really on
+ * screen.
+ *
+ * Pure function of the geometry so it can be unit-tested without a DOM.
+ */
+export function popupClipFrame(input: {
+  viewportHeight: number;
+  /** Border boxes of the clipping ancestors; order does not matter. */
+  clippers: { top: number; bottom: number }[];
+}): { top: number; bottom: number } {
+  let top = 0;
+  let bottom = input.viewportHeight;
+  for (const box of input.clippers) {
+    top = Math.max(top, box.top);
+    bottom = Math.min(bottom, box.bottom);
+  }
+  // An ancestor scrolled entirely off screen inverts the band; collapse it
+  // instead of handing negative geometry to the caller (the height floor in
+  // dropdownPlacement then keeps the popup usable).
+  return { top, bottom: Math.max(top, bottom) };
+}
+
+/**
  * Where a dropdown popup should go, and how tall it may be.
  *
  * A dropdown's ancestors are mostly `overflow: hidden` (main / .chrome-body /
- * .app-shell), so a popup hanging past the viewport edge is clipped away: those
- * options cannot be seen, and pointer/wheel events never reach them either
- * (the popup is not under the cursor down there). Plain CSS cannot know how
- * much room is left below the trigger, so the component measures it and hands
- * the budget to style.css as a custom property.
+ * .app-shell), so a popup hanging past the edge of the frame is clipped away:
+ * those options cannot be seen, and pointer/wheel events never reach them
+ * either (the popup is not under the cursor down there). Plain CSS cannot know
+ * how much room is left below the trigger, so the component measures it and
+ * hands the budget to style.css as a custom property.
  *
  * Pure function of the geometry so it can be unit-tested without a DOM.
  */
@@ -415,6 +450,13 @@ export function dropdownPlacement(input: {
   naturalHeight: number;
   viewportHeight: number;
   /**
+   * Visible band from popupClipFrame. Defaults to the whole viewport, which is
+   * the right frame only when nothing between the trigger and the screen edge
+   * clips — pass the measured band whenever a DOM is available.
+   */
+  frameTop?: number;
+  frameBottom?: number;
+  /**
    * Size for this direction instead of deciding one. Used when a per-page rule
    * pins the direction with higher specificity than the `.is-drop-up` class, so
    * the budget must match what actually rendered rather than what we asked for.
@@ -423,8 +465,10 @@ export function dropdownPlacement(input: {
 }): { dropUp: boolean; maxHeight: number } {
   const margin = 12;
   const gap = 8;
-  const roomBelow = input.viewportHeight - input.triggerBottom - gap - margin;
-  const roomAbove = input.triggerTop - gap - margin;
+  const frameTop = input.frameTop ?? 0;
+  const frameBottom = input.frameBottom ?? input.viewportHeight;
+  const roomBelow = frameBottom - input.triggerBottom - gap - margin;
+  const roomAbove = input.triggerTop - frameTop - gap - margin;
   // Flip up only when below genuinely cannot fit AND above is roomier;
   // otherwise stay below (predictable) and just cap the height.
   const dropUp = input.forceDropUp ?? (input.naturalHeight > roomBelow && roomAbove > roomBelow);
@@ -432,6 +476,56 @@ export function dropdownPlacement(input: {
   // worse than a popup that slightly overhangs but is still scrollable.
   const maxHeight = Math.max(140, Math.floor(dropUp ? roomAbove : roomBelow));
   return { dropUp, maxHeight };
+}
+
+/**
+ * Border boxes of the ancestors that crop `el`, nearest first.
+ *
+ * An `overflow` box does not clip an absolutely positioned descendant whose
+ * containing block sits *above* that box — which is how a popup sometimes
+ * escapes one. Here it never does: the popup's containing block is its own
+ * `.sect-sort-menu` (`position: relative`, style.css), so every non-`visible`
+ * overflow box further up encloses that containing block and genuinely crops
+ * the popup. Should a popup ever be re-parented out of the menu, or the menu
+ * be made `position: static`, this walk would need the containing block
+ * checked per ancestor rather than assumed.
+ *
+ * Two distinct things happen at a `position: fixed` ancestor, and conflating
+ * them drops a real clipper: boxes *above* it stop applying, but the fixed box
+ * *itself* still crops its own descendants — a `<dialog>` opened with
+ * `showModal()` is exactly that (the UA stylesheet makes it fixed, and the
+ * dashboard's modals add their own `overflow`). So record it, then stop.
+ */
+function clippingAncestorBoxes(el: HTMLElement): { top: number; bottom: number }[] {
+  const boxes: { top: number; bottom: number }[] = [];
+  for (let node = el.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+    const style = window.getComputedStyle(node);
+    // `clip`/`hidden`/`auto`/`scroll` all crop; only `visible` lets the popup out.
+    // A single axis is enough: `overflow-x: hidden` forces the other axis to a
+    // scrolling value too, so reading both keeps mixed pairs from slipping past.
+    const crops = !(style.overflowY === 'visible' && style.overflowX === 'visible');
+    if (crops) {
+      const box = node.getBoundingClientRect();
+      boxes.push({ top: box.top, bottom: box.bottom });
+    }
+    // A `fixed` box is positioned against the viewport, so overflow boxes above
+    // it in the tree do not crop it (verified in Chromium: a popup inside a
+    // `position: fixed` panel stays visible and hit-testable well outside an
+    // `overflow: hidden` grandparent). Stop, or a modal would be budgeted
+    // against a container it visibly escapes.
+    //
+    // Its own box is already recorded above. On today's four modal dropdowns
+    // that changes the frame by at most a few pixels — but only because each of
+    // them also has an inner scroll container, clamped to roughly the same
+    // height, that was recorded before we got here. The viewport does not
+    // supply that bound: a fixed box centred in a taller viewport sits strictly
+    // inside it (measured: a 219-380 dialog against a 0-599 viewport), so the
+    // clamp contributes nothing. Drop the inner container from such a modal and
+    // skipping this box would over-budget the popup by ~200px, straight back to
+    // the overshoot this whole walk exists to prevent.
+    if (style.position === 'fixed') break;
+  }
+  return boxes;
 }
 
 export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
@@ -470,12 +564,22 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       const pop = popRef.current;
       if (!details || !pop) return;
       const trigger = details.getBoundingClientRect();
-      const { dropUp, maxHeight } = dropdownPlacement({
+      // Walk from the popup, so the <details> that wraps it is itself checked:
+      // nothing sets overflow on `.sect-sort-menu` today, but a page-level rule
+      // that did would clip the popup, and starting at the trigger would miss it.
+      const frame = popupClipFrame({
+        viewportHeight: window.innerHeight,
+        clippers: clippingAncestorBoxes(pop),
+      });
+      const geometry = {
         triggerTop: trigger.top,
         triggerBottom: trigger.bottom,
         naturalHeight: pop.scrollHeight,
         viewportHeight: window.innerHeight,
-      });
+        frameTop: frame.top,
+        frameBottom: frame.bottom,
+      };
+      const { dropUp, maxHeight } = dropdownPlacement(geometry);
       details.classList.toggle('is-drop-up', dropUp);
       // A per-page rule may pin the direction regardless of the class — e.g.
       // `.connector-create-modal #cn-verify .sect-sort-pop` sets `bottom` with
@@ -490,13 +594,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       const renderedUp = popBox.height > 0 && popBox.bottom <= trigger.top + 1;
       const effective = renderedUp === dropUp
         ? maxHeight
-        : dropdownPlacement({
-          triggerTop: trigger.top,
-          triggerBottom: trigger.bottom,
-          naturalHeight: pop.scrollHeight,
-          viewportHeight: window.innerHeight,
-          forceDropUp: renderedUp,
-        }).maxHeight;
+        : dropdownPlacement({ ...geometry, forceDropUp: renderedUp }).maxHeight;
       pop.style.setProperty('--dropdown-popover-space', `${effective}px`);
     };
     const frame = window.requestAnimationFrame(place);

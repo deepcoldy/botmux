@@ -1,6 +1,7 @@
 import { Cron } from 'croner';
 import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
 import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
@@ -681,6 +682,10 @@ export function addTask(params: {
   silent?: boolean;
   /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
   followActive?: boolean;
+  /** See ScheduledTask.model — per-task CLI model for this task's own runs. */
+  model?: string;
+  /** See ScheduledTask.reasoningEffort. */
+  reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
@@ -738,6 +743,8 @@ export function addTask(params: {
     deliver: params.deliver === 'local' ? 'local' : 'origin',
     silent: params.silent,
     followActive: params.followActive === true ? true : undefined,
+    model: params.model?.trim() || undefined,
+    reasoningEffort: params.reasoningEffort,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
@@ -931,6 +938,9 @@ export function updateTask(
     followActive?: boolean;
     chatId?: string;
     chatIds?: readonly string[] | null;
+    /** `''` / `null` clears the per-task model and falls back to the bot's. */
+    model?: string | null;
+    reasoningEffort?: ScheduleReasoningEffort | null;
   },
   options: { deferEvent?: boolean } = {},
 ): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
@@ -944,6 +954,18 @@ export function updateTask(
   if (updates.silent !== undefined) {
     patch.silent = updates.silent === true ? true : undefined;
     eventPatch.silent = updates.silent === true;
+  }
+  // `null` (and an all-whitespace model) is the documented way to clear the
+  // per-task override; `undefined` leaves whatever the task already has.
+  if (updates.model !== undefined) {
+    patch.model = updates.model?.trim() || undefined;
+    // JSON/SSE omit undefined, so clearing must travel as null or a cached
+    // dashboard row keeps showing the model the user just removed.
+    eventPatch.model = patch.model ?? null;
+  }
+  if (updates.reasoningEffort !== undefined) {
+    patch.reasoningEffort = updates.reasoningEffort ?? undefined;
+    eventPatch.reasoningEffort = patch.reasoningEffort ?? null;
   }
 
   const legacyPosition = updates.deliver === 'new-topic'

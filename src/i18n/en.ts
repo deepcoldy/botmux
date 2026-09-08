@@ -1532,6 +1532,7 @@ export const messages: Record<string, string> = {
   'cmd.cot.show_now': '🧠 Summoned this turn\'s thinking bubble (with everything accumulated so far; reverts when the turn ends).',
   'cmd.cot.show_armed': '🧠 No thinking in flight — the next turn will show the bubble once, then revert.',
   'cmd.cot.usage': 'Usage: /cot (status) | /cot off (mute this chat) | /cot on (restore) | /cot show (one-shot peek)',
+  'cmd.cot.status_result_off': '📄 Tool output: off (the bubble keeps only thinking paragraphs and tool node titles). /botconfig set thinkingCardToolResult on to restore.',
   'help.cot': '/cot        - Thinking-process message switch (this chat): /cot off to mute, /cot on to restore, /cot show for a one-shot peek, /cot for status (bot-level master switch: /botconfig thinkingCard)',
   'cot.tool.bash': 'Run command',
   'cot.tool.write': 'Edit file',
@@ -1539,5 +1540,6 @@ export const messages: Record<string, string> = {
   'cot.tool.search': 'Search',
   'cot.tool.task': 'Manage tasks',
   'cot.tool.default': 'Call {name}',
+  'cot.tool.result_done': '✓ Done',
   'cot.interrupted': '⚠️ Interrupted by a service restart — this turn\'s thinking never finished',
 };

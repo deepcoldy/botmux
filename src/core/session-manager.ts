@@ -72,6 +72,7 @@ import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
+import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -3656,6 +3657,13 @@ export async function executeScheduledTask(
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
     : effectivePrompt;
+  // Per-task model / effort, resolved against the bot that is about to run it.
+  // Stale intent is dropped with a warning rather than failing the run.
+  const modelOverride = resolveScheduleModelOverride(task, bot.config);
+  for (const warning of modelOverride.warnings) {
+    logger.warn(`[scheduler] Task "${task.name}" (${task.id}): ${warning}`);
+  }
+
   const key = sessionKey(anchor, larkAppId);
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
@@ -3702,6 +3710,18 @@ export async function executeScheduledTask(
       const resumableOwner = isRelayableRealSession(existing)
         || !!existing.session.suspendedColdResume;
       if (isContinuation && resumableOwner) {
+        // Model and effort are CLI process launch arguments, so a fire that
+        // reuses this task's existing session runs on whatever that process
+        // started with. Documented as fresh-spawn-only (ScheduledTask.model) and
+        // announced at creation; logged here so a surprising run is explainable
+        // from the daemon log alone.
+        if (modelOverride.model || modelOverride.reasoningEffort) {
+          logger.info(
+            `[scheduler] Task "${task.name}" reuses session ${existing.session.sessionId}; `
+            + `its per-task model/effort applies only to a fresh session `
+            + `(running on ${existing.session.model ?? 'the CLI default'})`,
+          );
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (sharedTopicRootId) {
@@ -3793,6 +3813,10 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
+    // Effort is persisted with the session (mirroring trigger-session): unlike
+    // the model it is not re-resolved from the bot on every spawn, so a later
+    // resume of this scheduled session must find it here.
+    if (modelOverride.reasoningEffort) session.reasoningEffort = modelOverride.reasoningEffort;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -3812,6 +3836,10 @@ export async function executeScheduledTask(
       workingDir: task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
+      // In-memory only, exactly like the trigger API's per-turn model: persisting
+      // it would let it outrank the bot's configured model for every later
+      // resume of this session (see resolveSessionLaunchModel).
+      ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);

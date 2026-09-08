@@ -19,7 +19,7 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -992,5 +992,100 @@ describe('executeScheduledTask — explicit position wins over a retained root',
     expect(ds.scope).toBe('chat');
     expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
     expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+  });
+});
+
+describe('executeScheduledTask — per-task model / reasoning effort', () => {
+  // ScheduledTask.model is fresh-spawn only: it can only be applied by a fire
+  // that starts a CLI process, because that is when the flag is passed.
+  const cliOf = (id: string) => { (BOT.config as { cliId: string }).cliId = id; };
+
+  beforeEach(() => { cliOf('codex'); });
+  afterEach(() => { cliOf('claude-code'); });
+
+  it('a fresh session carries the task model as an in-memory spawn override', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBe('gpt-5.6-sol');
+    // Never persisted: a stored model would outrank the bot's configured one on
+    // every later resume of this session (resolveSessionLaunchModel rule 1).
+    expect(ds.session.model).toBeUndefined();
+    // Effort is not re-resolved per spawn, so it does ride on the record.
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(store.get(ds.session.sessionId)?.reasoningEffort).toBe('ultra');
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('control: a task without an override leaves the bot configuration alone', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+  });
+
+  it('drops an effort the pinned model does not offer, still spawns with the model', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.5', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBe('gpt-5.5');
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    // Degraded, never skipped.
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops both when the bot now runs a CLI without the override contract', async () => {
+    cliOf('gemini');
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'high' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a fire that reuses this task’s session still injects, without touching its model', async () => {
+    const session: Session = {
+      sessionId: 'sess-live-model', chatId: CHAT, rootMessageId: ROOT, title: 'live',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      model: 'gpt-5.2',
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+    };
+    const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    // The turn is delivered, not refused — the running process just keeps the
+    // model it started with.
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(existing.spawnModelOverride).toBeUndefined();
+    expect(existing.session.model).toBe('gpt-5.2');
+    expect(existing.session.reasoningEffort).toBeUndefined();
   });
 });

@@ -1884,6 +1884,11 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
    */
   thinkingCard?: boolean;
+  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 ON（缺省 =
+   *  开；只有显式 false 持久化）。off 时气泡只保留思考段落与工具节点标题
+   *  （工具名 · 命令/路径），与 Claude Code 自身界面一致。子开关：
+   *  {@link thinkingCard} 关闭时无意义。 */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -3571,6 +3576,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
+      // 同 thinkingCard 约定：缺省 = 开，只有显式 false 有意义。
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,

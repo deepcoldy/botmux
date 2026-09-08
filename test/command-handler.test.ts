@@ -7312,6 +7312,19 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
+  it('/cot status appends the tool-output line only when thinkingCardToolResult is off', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('工具输出');
+
+    botWith({ thinkingCard: true, thinkingCardToolResult: false });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
+    expect(reply).toContain('开启中');
+    expect(reply).toContain('工具输出：已关闭');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
   it('unknown subcommand shows usage', async () => {
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot bogus', deps);

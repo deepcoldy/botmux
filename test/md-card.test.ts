@@ -1361,6 +1361,45 @@ describe('buildCardBodyElements image rows', () => {
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
+  it.each([
+    ['medium', 2], ['small', 3], ['tiny', 4],
+  ])('fits the whole image in a proportional column: %s', (mode, columnCount) => {
+    for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
+      const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
+      const row = out.find(e => e.tag === 'column_set');
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+      expect(row.columns).toHaveLength(columnCount as number);
+      for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+      for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
+      const img = row.columns[0].elements[0];
+      expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
+      expect(img).not.toHaveProperty('mode');
+      expect(img).not.toHaveProperty('size');
+      expect(img).not.toHaveProperty('custom_width');
+    }
+  });
+
+  it('keeps the default output identical, including explicit fit_horizontal', () => {
+    const legacy = buildCardBodyElements('截图\n\n![](img_v2_a)');
+    expect(buildImageCardElements('截图', [K[0]])).toEqual(legacy);
+    expect(buildImageCardElements('截图', [K[0]], undefined, undefined, 'fit_horizontal')).toEqual(legacy);
+  });
+
+  it('sizes standalone placeholders and trailing images without resizing a grid', () => {
+    const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows[0].columns[0].elements[0]).toMatchObject({ img_key: K[0], scale_type: 'fit_horizontal', alt: { content: '预览' } });
+    expect(rows[2].columns[0].elements[0]).toMatchObject({ img_key: K[3], scale_type: 'fit_horizontal' });
+    expect(rows[1]).toEqual(buildImageCardElements('![](img:0,1)', [K[1], K[2]])[0]);
+  });
+
+  it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
+    for (const markdown of ['```\n![](img_v2_a)\n```', '    ![](img_v2_a)', 'see ![](img_v2_a) here', '![](https://example.com/a.png)']) {
+      expect(buildCardBodyElements(markdown, undefined, undefined, 'small')).toEqual(buildCardBodyElements(markdown));
+    }
+  });
+
+
   it('no images → identical to buildCardBodyElements', () => {
     expect(buildImageCardElements('hello **world**', [])).toEqual(
       buildCardBodyElements('hello **world**'),

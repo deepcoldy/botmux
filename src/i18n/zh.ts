@@ -1534,6 +1534,7 @@ export const messages: Record<string, string> = {
   'cmd.cot.show_now': '🧠 已召唤本 turn 的思考气泡（含目前已累积的思考过程；本 turn 结束后自动恢复原设置）。',
   'cmd.cot.show_armed': '🧠 当前没有进行中的思考——下个 turn 将展示一次思考气泡，结束后自动恢复原设置。',
   'cmd.cot.usage': '用法：/cot（查看状态）| /cot off（本群关思考消息）| /cot on（恢复）| /cot show（临时看一次）',
+  'cmd.cot.status_result_off': '📄 工具输出：已关闭（气泡只保留思考段落与工具节点标题）。/botconfig set thinkingCardToolResult on 恢复。',
   'help.cot': '/cot        - 思考过程消息开关（当前群）：/cot off 关闭、/cot on 恢复、/cot show 临时看一次、/cot 查状态（bot 总开关见 /botconfig thinkingCard）',
   'cot.tool.bash': '执行命令',
   'cot.tool.write': '编辑文件',
@@ -1541,5 +1542,6 @@ export const messages: Record<string, string> = {
   'cot.tool.search': '搜索',
   'cot.tool.task': '任务管理',
   'cot.tool.default': '调用 {name}',
+  'cot.tool.result_done': '✓ 已完成',
   'cot.interrupted': '⚠️ 服务重启，本轮思考已中断',
 };
