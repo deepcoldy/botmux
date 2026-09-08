@@ -207,6 +207,8 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('data-startup-blocked');
     expect(page).toContain("setActiveTab('advanced')");
     expect(page).toContain('res.body.restartRequired');
+    expect(i18n).toContain("'botDefaults.startupBlockedBadge': '未启动'");
+    expect(i18n).toContain("'botDefaults.startupBlockedBadge': 'Not started'");
     for (const key of [
       'quotaFallbackTitle', 'quotaFallbackTarget', 'quotaFallbackCycle', 'quotaFallbackSave',
       'startupBlockedBadge', 'startupBlockedTitle', 'startupBlockedHelp', 'metaOffline',
