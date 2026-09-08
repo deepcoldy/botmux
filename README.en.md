@@ -48,6 +48,8 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 >
 > Nothing native is compiled during install (no Python / node-gyp / compiler): the PTY is already inside the binary. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2** — the daemon needs PTY / tmux / Unix signals and does not run on native Windows; WSL2 reports as linux and is a fully supported first-class environment. An unsupported platform, or a binary that cannot run on this host, **fails with an explicit error and leaves your existing install untouched** rather than leaving you with a command that won't start.
 >
+> Stable macOS CLI releases use a consistent Apple Developer ID signature. Replacing the binary during an upgrade therefore preserves the code identity used by macOS file and App Data permissions instead of appearing as a new program for every version. Canary, beta, and RC builds remain ad-hoc signed.
+>
 > To upgrade: `botmux upgrade` (replaces the binary in place), or just **re-run the curl command** — also an in-place upgrade, and it won't append a second PATH line.
 
 <details>

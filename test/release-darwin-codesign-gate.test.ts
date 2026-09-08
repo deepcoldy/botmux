@@ -10,13 +10,15 @@ import { resolve } from 'node:path';
  * runner tolerated the bad signature and ran the binary anyway; macOS 27 SIGKILLs
  * it before main(), which is all `botmux upgrade` saw (exit 137).
  *
- * Two gates now exist, and this suite is what keeps them from quietly vanishing —
+ * These release guarantees are what this suite keeps from quietly vanishing —
  * the repo has no workflow lint, so a deleted step is first noticed after a tag
  * has already published (see ci-musl-gate.test.ts for the same reasoning):
  *   • release.yml verifies EVERY darwin binary with `codesign --verify --strict`
  *     (the smoke step only executes the host arch; the cross-built one is not run)
  *   • scripts/smoke-bun-binary.mjs checks the signature before anything else on
  *     darwin, so the PR gate and the release gate agree
+ *   • stable releases replace the preliminary ad-hoc signature with one Developer
+ *     ID designated requirement before npm or GitHub publishes the CLI
  *   • the build Bun is pinned to a version that carries the fix, and every pin in
  *     the repo agrees with package.json's `packageManager`
  *
@@ -42,6 +44,7 @@ const CI = stripHashComments(read('.github/workflows/ci.yml'));
 const GLIBC_SH = stripHashComments(read('scripts/build-linux-glibc-baseline.sh'));
 const SMOKE = stripJsComments(read('scripts/smoke-bun-binary.mjs'));
 const BUILD = stripJsComments(read('scripts/build-bun-binary.mjs'));
+const STABLE_SIGN = stripHashComments(read('scripts/sign-macos-cli-binaries.sh'));
 const PKG = JSON.parse(read('package.json')) as { packageManager?: string };
 
 /** The step body from its `- name:` line up to the next step. */
@@ -191,6 +194,62 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
   it('re-signs both darwin arches rather than special-casing x64', () => {
     // Idempotent, and keeps working if the arch-conditional upstream bug moves.
     expect(BUILD).not.toMatch(/=== 'x64'[\s\S]{0,80}codesign/);
+  });
+});
+
+describe('stable releases — Developer ID identity survives CLI binary replacement', () => {
+  const signJobStart = RELEASE.indexOf('\n  sign-darwin-binaries:');
+  const subpackagesStart = RELEASE.indexOf('\n  binary-subpackages:');
+  const signJob = signJobStart < 0 || subpackagesStart < 0
+    ? ''
+    : RELEASE.slice(signJobStart, subpackagesStart);
+  const subpackages = subpackagesStart < 0
+    ? ''
+    : RELEASE.slice(subpackagesStart, RELEASE.indexOf('\n  attach-bun-binaries:'));
+
+  it('uses the protected macos-signing environment only for stable tags', () => {
+    expect(signJob).not.toBe('');
+    expect(signJob).toMatch(/environment:\s*macos-signing/);
+    expect(signJob).toContain("needs.preflight.outputs.tag == 'latest'");
+    expect(signJob).toContain('MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}');
+    expect(signJob).toContain('MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}');
+  });
+
+  it('replaces the darwin artifact only after both binaries are signed and smoked', () => {
+    expect(signJob).toContain('scripts/sign-macos-cli-binaries.sh dist-bin');
+    expect(signJob).toContain('node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64');
+    expect(signJob).toContain('name: bun-binaries-darwin');
+    expect(signJob).toMatch(/overwrite:\s*true/);
+    expect(signJob.indexOf('scripts/sign-macos-cli-binaries.sh'))
+      .toBeLessThan(signJob.indexOf('overwrite: true'));
+  });
+
+  it('fails stable npm publication closed when signing was skipped or failed', () => {
+    expect(subpackages).toContain('sign-darwin-binaries');
+    expect(subpackages).toContain("needs.preflight.outputs.tag != 'latest'");
+    expect(subpackages).toContain("needs.sign-darwin-binaries.result == 'success'");
+    for (const prerequisite of ['preflight', 'bun-binaries', 'bun-binaries-musl']) {
+      expect(subpackages).toContain(`needs.${prerequisite}.result == 'success'`);
+    }
+  });
+
+  it('signs x64 and arm64 with one explicit non-ad-hoc identity', () => {
+    expect(STABLE_SIGN).toMatch(/for arch in x64 arm64/);
+    expect(STABLE_SIGN).toContain('--sign "$IDENTITY"');
+    expect(STABLE_SIGN).toContain('--identifier "$IDENTIFIER"');
+    expect(STABLE_SIGN).toContain('--options runtime');
+    expect(STABLE_SIGN).toContain('--timestamp');
+    expect(STABLE_SIGN).toContain('--entitlements "$ENTITLEMENTS"');
+    expect(STABLE_SIGN).not.toMatch(/--sign\s+['"]?-['"]?/);
+  });
+
+  it('rejects an unstable identity and pins one designated requirement across arches', () => {
+    expect(STABLE_SIGN).toContain('Developer ID Application:');
+    expect(STABLE_SIGN).toContain('TeamIdentifier');
+    expect(STABLE_SIGN).toContain('*cdhash*');
+    expect(STABLE_SIGN).toContain('darwin x64 and arm64 designated requirements differ');
+    expect(STABLE_SIGN).toContain('cd "$DIST_DIR"');
+    expect(STABLE_SIGN).toContain('shasum -a 256 "$binary_name" > "$binary_name.sha256"');
   });
 });
 

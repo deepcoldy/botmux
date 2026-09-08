@@ -1,15 +1,17 @@
 name: Cancel stale release approvals
 
-# 背景:Release workflow 的 `desktop` job（macOS 签名+公证）挂在 `environment:
-# macos-signing` 的人工审批 gate 上。GitHub 对「等待审批」的 pending 没有原生自动
-# 超时——job 的 timeout 不涵盖排队等审批的时间,environment 的 wait-timer 是「等 N
-# 分钟后自动放行」(反而会去发版),都不是我们要的「超期自动取消」。结果不想发
-# 桌面包时,run 会无限期停在 waiting(最长 30 天),在 deployments 页堆成一排。
+# 背景:Release workflow 的 `desktop` 与 `sign-darwin-binaries` job 都挂在
+# `environment: macos-signing` 的人工审批 gate 上。GitHub 对「等待审批」的 pending
+# 没有原生自动超时——job 的 timeout 不涵盖排队等审批的时间,environment 的
+# wait-timer 是「等 N 分钟后自动放行」(反而会去发版),都不是我们要的「超期自动
+# 取消」。结果一个无人批准的正式发布会一直停在 waiting(最长 30 天),在
+# deployments 页堆成一排。
 #
 # 本 workflow 每天跑一次,把 Release workflow 里 status=waiting 且创建超过阈值
-# (默认 24h)的 run 直接 cancel 掉。npm/GitHub Release 早在 release job 里发完了
-# (它不 needs desktop),所以 cancel 只终止那个干等的 macOS 签名,零副作用。
-# 想真出桌面包就在阈值时间内去点批准,或事后 workflow_dispatch 重跑 Release。
+# (默认 24h)的 run 直接 cancel 掉。正式版的 npm/GitHub Release 现在会等待 CLI
+# Developer ID 签名，所以超时取消发生在任何包发布之前；预览版不走签名 gate。
+# 想正式发布就在阈值时间内批准。workflow_dispatch 仍只用于补签/刷新 Desktop
+# 附件，不能补发一个被取消的正式版本。
 
 on:
   schedule:
