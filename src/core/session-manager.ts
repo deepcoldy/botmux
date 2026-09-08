@@ -16,7 +16,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -72,6 +72,7 @@ import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
+import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -626,7 +627,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -648,7 +649,10 @@ export async function downloadResources(larkAppId: string, messageId: string, re
     const savePath = join(dir, res.name);
     try {
       const resMessageId = res.messageId ?? messageId;
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
+      // Whose token backs the user-token fallback: the person who sent the
+      // attachment. They can see what they just posted, and the download is
+      // attributed to them rather than to whoever happens to be logged in.
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.
@@ -1092,6 +1096,15 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
+/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
+ *  Absent bot / unreadable config → false: an uncertain answer must not add a
+ *  block claiming a boundary that is not configured. */
+function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
  *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
@@ -1106,7 +1119,7 @@ type NewTopicOpts = {
   sessionBackendType?: BackendType;
 };
 
-type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'sessionId' | 'role'
+type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
@@ -1227,6 +1240,25 @@ function buildNewTopicBlocks(
     if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
     if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+    // Trigger-user auth: the same credential boundary the claude-family adapters
+    // get via --append-system-prompt. Without it the inline-prompt CLIs
+    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // this release's only protection, a missing block there is a silent hole.
+    //
+    // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:
+    // hook mode requires `supportsInvisiblePromptHook`, which only claude-code
+    // has, and claude-code has `injectsSessionContext` — so this whole branch is
+    // skipped for it and a `credentials` block is never produced in hook mode
+    // (verified: claude-code's opening prompt carries no <botmux_credentials>;
+    // it gets the block via --append-system-prompt instead).
+    //
+    // Kept out of the envelope anyway, because the day another CLI becomes
+    // hook-capable this is the difference between the agent seeing the boundary
+    // and not. An envelope the CLI cannot read drops the block silently —
+    // nothing errors when a constraint is merely absent.
+    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
+      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
+    }
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
@@ -3625,6 +3657,13 @@ export async function executeScheduledTask(
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
     : effectivePrompt;
+  // Per-task model / effort, resolved against the bot that is about to run it.
+  // Stale intent is dropped with a warning rather than failing the run.
+  const modelOverride = resolveScheduleModelOverride(task, bot.config);
+  for (const warning of modelOverride.warnings) {
+    logger.warn(`[scheduler] Task "${task.name}" (${task.id}): ${warning}`);
+  }
+
   const key = sessionKey(anchor, larkAppId);
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
@@ -3671,6 +3710,18 @@ export async function executeScheduledTask(
       const resumableOwner = isRelayableRealSession(existing)
         || !!existing.session.suspendedColdResume;
       if (isContinuation && resumableOwner) {
+        // Model and effort are CLI process launch arguments, so a fire that
+        // reuses this task's existing session runs on whatever that process
+        // started with. Documented as fresh-spawn-only (ScheduledTask.model) and
+        // announced at creation; logged here so a surprising run is explainable
+        // from the daemon log alone.
+        if (modelOverride.model || modelOverride.reasoningEffort) {
+          logger.info(
+            `[scheduler] Task "${task.name}" reuses session ${existing.session.sessionId}; `
+            + `its per-task model/effort applies only to a fresh session `
+            + `(running on ${existing.session.model ?? 'the CLI default'})`,
+          );
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (sharedTopicRootId) {
@@ -3762,6 +3813,10 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
+    // Effort is persisted with the session (mirroring trigger-session): unlike
+    // the model it is not re-resolved from the bot on every spawn, so a later
+    // resume of this scheduled session must find it here.
+    if (modelOverride.reasoningEffort) session.reasoningEffort = modelOverride.reasoningEffort;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -3781,6 +3836,10 @@ export async function executeScheduledTask(
       workingDir: task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
+      // In-memory only, exactly like the trigger API's per-turn model: persisting
+      // it would let it outrank the bot's configured model for every later
+      // resume of this session (see resolveSessionLaunchModel).
+      ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);

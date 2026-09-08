@@ -134,6 +134,7 @@ describe('sandbox relay watcher host handoff', () => {
         preparedPath,
         localLinkMode: process.env.BOTMUX_CARD_LOCAL_LINK_MODE,
         relayEnv: process.env.BOTMUX_SEND_RELAY ?? null,
+        originChannel: process.env.BOTMUX_ORIGIN_CHANNEL_ID ?? null,
         sessionId: value('--session-id'),
       }));
     `);
@@ -153,6 +154,7 @@ describe('sandbox relay watcher host handoff', () => {
     const stop = startOutboxWatcher(outbox, {
       ...process.env,
       BOTMUX_SEND_RELAY: outbox,
+      BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32),
       BOTMUX_CARD_PREPARED_CONTENT_FILE: '/untrusted/stale-prepared.md',
     }, 'forced-session', { cliPath: fixture });
 
@@ -176,6 +178,7 @@ describe('sandbox relay watcher host handoff', () => {
         preparedPath: string;
         localLinkMode: string;
         relayEnv: string | null;
+        originChannel: string | null;
         sessionId: string;
       };
 
@@ -186,6 +189,7 @@ describe('sandbox relay watcher host handoff', () => {
         selected: 'PREPARED',
         localLinkMode: 'disabled',
         relayEnv: null,
+        originChannel: null,
         sessionId: 'forced-session',
       });
       expect(dirname(child.rawPath)).toBe(join(root, 'relay-staging'));

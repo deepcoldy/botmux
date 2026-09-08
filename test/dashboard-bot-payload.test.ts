@@ -22,9 +22,9 @@ describe('dashboard bot payload helpers', () => {
       'autoboundChatCount', 'brandLabel',
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
-      'disableStreamingCard', 'pinStreamingCard', 'silentTurnReactions',
+      'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
-      'thinkingCard', 'senderTag', 'overloadAlert', 'botToBotSameDir',
+      'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'autoStartOnNewTopic',
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
@@ -65,6 +65,15 @@ describe('dashboard bot payload helpers', () => {
     const feedback = { enabled: true, audience: 'requester' };
     expect(botDefaultsPayload({ larkAppId: 'app' }, { feedback })).toMatchObject({ feedback });
     expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('feedback');
+  });
+
+  it('normalizes quota fallback only in the private Bot Defaults payload', () => {
+    const quotaFallbackBot = { enabled: true, targetAppId: 'cli_backup', kinds: ['rate'], message: ' Take over. ' };
+    expect(botDefaultsPayload({ larkAppId: 'cli_source' }, { quotaFallbackBot }))
+      .toMatchObject({ quotaFallbackBot: { ...quotaFallbackBot, message: 'Take over.' } });
+    expect(botDefaultsPayload({ larkAppId: 'cli_source' }, { quotaFallbackBot: { ...quotaFallbackBot, targetAppId: 'ou_wrong' } }))
+      .toMatchObject({ quotaFallbackBot: null });
+    expect(botSummaryPayload({ larkAppId: 'cli_source' })).not.toHaveProperty('quotaFallbackBot');
   });
 
   it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {

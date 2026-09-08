@@ -137,6 +137,7 @@ describe('bot-config store', () => {
     const { store } = await freshModules();
     expect(store.findConfigField('MODEL')?.configKey).toBe('model');
     expect(store.findConfigField('disablestreamingcard')?.configKey).toBe('disableStreamingCard');
+    expect(store.findConfigField('hiddenstreamingcardbuttons')?.configKey).toBe('hiddenStreamingCardButtons');
     expect(store.findConfigField('PINSTREAMINGCARD')?.configKey).toBe('pinStreamingCard');
     expect(store.findConfigField('nope')).toBeUndefined();
   });
@@ -428,6 +429,26 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('hiddenStreamingCardButtons')!;
+    const parsed = store.coerceConfigValue(spec, 'close terminal close');
+    expect(parsed).toEqual({ ok: true, value: ['terminal', 'close'] });
+    expect(store.coerceConfigValue(spec, 'terminal unknown')).toEqual({ ok: false, reason: 'empty' });
+    if (!parsed.ok) return;
+
+    const set = await store.applyConfigField('app_default', spec, parsed.value);
+    expect(set.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toEqual(['terminal', 'close']);
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons)
+      .toEqual(['terminal', 'close']);
+
+    const unset = await store.applyConfigField('app_default', spec, null);
+    expect(unset.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toBeUndefined();
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
+  });
+
   it('defaultOn boolean (thinkingCard): inverted persistence — only explicit false is written', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('thinkingCard')!;
@@ -454,6 +475,31 @@ describe('bot-config store', () => {
     expect(r3.ok).toBe(true);
     if (r3.ok) expect(r3.newText).toBe('on');
     expect(readConfig().thinkingCard).toBeUndefined();
+  });
+
+  it('defaultOn boolean (thinkingCardToolResult): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('thinkingCardToolResult')!;
+    expect(spec.defaultOn).toBe(true);
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().thinkingCardToolResult).toBe(false);
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
+    expect(registry.getBot('app_default').config.thinkingCardToolResult).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().thinkingCardToolResult).toBeUndefined();
   });
 
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {

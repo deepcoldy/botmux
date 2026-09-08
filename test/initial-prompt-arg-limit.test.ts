@@ -12,6 +12,7 @@ import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import {
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
+  shouldDeferArgsBakedDurablePrompt,
   shouldTrackArgvBakedFirstPrompt,
   shouldDeferInitialPromptForArgLimit,
 } from '../src/utils/pending-input-queue.js';
@@ -367,6 +368,32 @@ describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)'
       sessionId: 'sess-integration-1',
       resume: false,
       initialPrompt: defer ? undefined : envelope,
+    });
+    expect(args).toContain('--prompt');
+    expect(args).toContain(envelope);
+  });
+
+  it.each([
+    ['dispatch attempt', { dispatchAttempt: 1 }],
+    ['queued activation', { queuedActivationToken: 'activation-token' }],
+  ])('keeps a short fresh durable %s envelope on OpenCode --prompt', (_label, durable) => {
+    const envelope = buildNewTopicPrompt(
+      '帮我看看这个 bug',
+      'sess-durable-opencode',
+      'opencode',
+    );
+    expect(Buffer.byteLength(envelope, 'utf8')).toBeLessThan(budget);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      durableInitialPromptViaArgs: adapter.durableInitialPromptViaArgs === true,
+      adoptMode: false,
+      ...durable,
+    })).toBe(false);
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-durable-opencode',
+      resume: false,
+      initialPrompt: envelope,
     });
     expect(args).toContain('--prompt');
     expect(args).toContain(envelope);

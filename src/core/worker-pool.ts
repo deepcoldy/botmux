@@ -30,7 +30,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -102,6 +102,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -488,6 +489,10 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
+import {
+  claimQuotaFallbackEvent,
+  resolveQuotaFallbackTarget,
+} from '../services/quota-fallback.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -526,6 +531,7 @@ import {
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
@@ -565,6 +571,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { clearAllSessionIdentities } from './cli-identity.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   MAX_STARTUP_AUTO_RETRIES,
@@ -971,6 +978,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1026,6 +1034,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1141,6 +1150,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1221,6 +1231,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1305,6 +1316,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1987,6 +1999,40 @@ function failureNoticeFallbackMentionOpenId(ds: DaemonSession): string | undefin
   return admin;
 }
 
+function isConfiguredLarkBot(appId: string): boolean {
+  try {
+    return loadBotConfigs().some(bot => bot.larkAppId === appId && bot.apiOnly !== true);
+  } catch {
+    return getAllBots().some(bot => bot.config.larkAppId === appId && bot.config.apiOnly !== true);
+  }
+}
+
+/** Resolve the configured stable target App ID into one live mention handle.
+ * The strict local-peer path proves app identity + current membership. Remote
+ * peers fail closed until an equivalent identity proof exists. */
+async function resolveQuotaFallbackForSession(
+  ds: DaemonSession,
+  targetAppId: string,
+) {
+  return resolveQuotaFallbackTarget(ds.larkAppId, ds.chatId, targetAppId, {
+    isLocalConfigured: isConfiguredLarkBot,
+    resolveLocal: async (receiverAppId, chatId, subjectAppId) => {
+      const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(
+        receiverAppId,
+        chatId,
+        [subjectAppId],
+      );
+      if (!resolved.ok) {
+        return { ok: false as const, detail: `${resolved.error}: ${resolved.message}` };
+      }
+      const mapping = resolved.mappings.find(row => row.larkAppId === subjectAppId);
+      return mapping
+        ? { ok: true as const, openId: mapping.subjectOpenId }
+        : { ok: false as const, detail: 'strict resolver returned no target mapping' };
+    },
+  });
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
@@ -1996,6 +2042,9 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
   ds.rateLimitNotifiedKey = undefined;
+  // Only the async ownership token is session-local. Cross-session duplicate
+  // handoffs are suppressed by the source-bot five-minute event window.
+  ds.quotaFallbackAttemptToken = undefined;
   persistStreamCardState(ds);
 }
 
@@ -2033,6 +2082,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -3117,6 +3167,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -3183,6 +3234,7 @@ export async function postTurnStartingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
 
   ds.streamCardNonce = nonce;
@@ -3323,6 +3375,7 @@ export async function postFreshStreamingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -6477,6 +6530,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
 }
 
@@ -6843,6 +6897,13 @@ export async function closeSession(
   // All authoritative map/status/store/event state above transitions
   // synchronously, before the first await. Lark reaction/unsubscribe cleanup is
   // best-effort and can be slow; it must not leave a resurrection window.
+
+  // Trigger-user credentials die with the session. These files hold a live user
+  // token, so a closed session must not leave one on disk for a future session
+  // (or an operator inspecting the data dir) to pick up.
+  try { clearAllSessionIdentities(config.session.dataDir, sessionId); }
+  catch { /* best-effort; absence is the desired state */ }
+
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
   if (cleanupAppId) {
     for (const target of docReactionTargets) {
@@ -9163,71 +9224,6 @@ function reparkUnsubmittedQueuedActivation(ds: DaemonSession, reason: string): b
   return true;
 }
 
-/** The opening activation was ACKed, but one of the turns held behind its
- * runtime reservation was not accepted before that worker exited. Promote the
- * exact FIFO head into a new durable queued activation so the next inbound or
- * Dashboard activation reforks it before every remaining tail item. */
-function reparkQueuedActivationFollowUpTail(ds: DaemonSession, reason: string): boolean {
-  if (!ds.initialStartPending || ds.session.queuedActivationPending) return false;
-  const next = ds.pendingQueuedActivationFollowUps?.[0];
-  if (!next) return false;
-  const matchingCodexEntries = ds.session.cliId === 'codex-app'
-    ? (ds.session.codexAppDispatchLedger ?? []).filter(entry =>
-      (entry.state === 'accepted' || entry.state === 'prepared')
-      && entry.turnId === next.turnId
-      && entry.dispatchAttempt === next.dispatchAttempt)
-    : [];
-  if (matchingCodexEntries.length > 1) {
-    logger.error(
-      `[${tag(ds)}] Cannot re-park queued follow-up after ${reason}: `
-      + `${matchingCodexEntries.length} Codex entries match turn ${next.turnId}`,
-    );
-    return false;
-  }
-  const retainedCodexEntry = matchingCodexEntries[0];
-  const retainedCodexToken = retainedCodexEntry
-    ? (retainedCodexEntry.queuedActivationToken ?? randomUUID())
-    : undefined;
-  // A failed daemon→worker IPC normally rolls its newly accepted Codex entry
-  // back. If that rollback persistence itself failed, the durable FIFO remains
-  // authoritative: recover it through a tokened ACK journal instead of
-  // creating an invalid queued+unsettled hybrid.
-  ds.session.queued = !retainedCodexEntry;
-  ds.session.queuedPrompt = next.cliInput.content;
-  ds.session.queuedCodexAppText = next.cliInput.codexAppInput?.text;
-  ds.session.queuedCodexAppMessageContext = undefined;
-  ds.session.queuedActivationInput = next.cliInput;
-  ds.session.queuedActivationTurnId = next.turnId;
-  ds.session.queuedActivationDispatchAttempt = next.dispatchAttempt;
-  ds.session.queuedActivationPending = retainedCodexEntry ? true : undefined;
-  ds.session.queuedActivationToken = retainedCodexToken;
-  if (retainedCodexEntry && retainedCodexToken) {
-    retainedCodexEntry.queuedActivationToken = retainedCodexToken;
-  }
-  ds.pendingQueuedActivationFollowUps!.shift();
-  if (ds.pendingQueuedActivationFollowUps!.length === 0) {
-    ds.pendingQueuedActivationFollowUps = undefined;
-  }
-  ds.pendingPrompt = next.cliInput.content;
-  ds.initialStartPending = false;
-  ds.initialStartClaimToken = undefined;
-  try {
-    sessionStore.updateSession(ds.session);
-  } catch (err) {
-    // Keep the exact head parked in memory. The caller has already fenced the
-    // dead worker, so a later inbound can safely retry this owner even if the
-    // durable projection is temporarily unavailable.
-    logger.error(
-      `[${tag(ds)}] Failed to persist queued follow-up re-park after ${reason}: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  logger.warn(`[${tag(ds)}] Re-parked unaccepted queued activation follow-up after ${reason}`);
-  return true;
-}
-
-export const __testOnly_reparkQueuedActivationFollowUpTail = reparkQueuedActivationFollowUpTail;
-
 type AcceptedWorkerForkDispatch = {
   dispatchId: string;
   turnId: string;
@@ -9953,12 +9949,13 @@ export function admitQueuedActivationTail(
 
 /** True while a live worker's opening activation still owns submission order.
  * Every ingress that sees this state must use admitQueuedActivationTail rather
- * than ordinary worker IPC. */
+ * than ordinary worker IPC. A command still queued for the session (a follower
+ * whose prompt is being built, the opening's own release) holds the gate too:
+ * an ordinary turn arriving now must land behind it, not overtake it. */
 export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
-    || ds.queuedActivationTailReleasePending !== undefined
+    || hasPendingSessionTurns(ds.session.sessionId)
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
 }
@@ -10723,8 +10720,6 @@ export function forkWorker(
         // claim so the next generation can replay that exact head.
         ds.initialStartPending = false;
         ds.initialStartClaimToken = undefined;
-      } else {
-        reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
       const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
         || ds.remoteCloseState !== undefined;
@@ -10836,6 +10831,9 @@ export function forkWorker(
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     codexAuthSync: botCfg.codexAuthSync ?? 'shared',
+    // Trigger-user CLI auth: the worker needs the policy to know which tools to
+    // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
+    ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -11856,6 +11854,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -11965,6 +11964,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -12445,6 +12445,83 @@ function setupWorkerHandlers(
           });
         }
 
+        // Optional daemon-side backup-Bot handoff. This deliberately sits next
+        // to (but does not share) the owner-notification latch: the daemon sends
+        // one fixed message with one real <at>, without asking the exhausted CLI
+        // to generate or replay anything. Claim the source-bot/kind five-minute
+        // window BEFORE asynchronous identity resolution/send, so repeated
+        // screen ticks and concurrent limited sessions cannot produce a storm.
+        const quotaFallback = botCfg.quotaFallbackBot;
+        if (
+          ds.lastScreenStatus === 'limited'
+          && prevStatus !== 'limited'
+          && ds.usageLimit
+          && !ds.suppressRecoveryCard
+          && quotaFallback?.enabled === true
+          && quotaFallback.kinds.includes(ds.usageLimit.kind)
+        ) {
+          const limitKey = usageLimitStateKey(ds.usageLimit);
+          const fallbackTurn = fallbackTurnId(ds, msg.turnId);
+          if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
+            logger.info(
+              `[${t}] Quota fallback deduplicated within five minutes `
+              + `(kind=${ds.usageLimit.kind}, target=${quotaFallback.targetAppId})`,
+            );
+          } else {
+            const attemptToken = randomUUID();
+            ds.quotaFallbackAttemptToken = attemptToken;
+            const ownsFallbackAttempt = (): boolean =>
+              ownsLifecycleMutation()
+              && ds.quotaFallbackAttemptToken === attemptToken
+              && ds.lastScreenStatus === 'limited'
+              && !!ds.usageLimit
+              && usageLimitStateKey(ds.usageLimit) === limitKey;
+            void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+              .then(async resolved => {
+                // Identity resolution is asynchronous. Never let a lookup from
+                // a cleared/replaced worker episode post into a later turn —
+                // even when that later episode happens to have the same limit
+                // key (the token distinguishes the two claims).
+                if (!ownsFallbackAttempt()) {
+                  logger.info(
+                    `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+                  );
+                  return;
+                }
+                if (!resolved.ok) {
+                  logger.warn(
+                    `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+                    + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+                  );
+                  return;
+                }
+                const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+                try {
+                  if (!ownsFallbackAttempt()) return;
+                  await scopedReply(handoff, 'text', fallbackTurn);
+                  logger.info(
+                    `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+                    + `(${resolved.source}) for episode=${limitKey}`,
+                  );
+                } catch (err: any) {
+                  // Keep the daemon-wide five-minute claim. A later frame/session
+                  // must not retry and spam the same peer; owner notice and manual
+                  // retry controls remain available.
+                  logger.warn(
+                    `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+                    + `${err?.message ?? err}`,
+                  );
+                }
+              })
+              .catch((err: any) => {
+                logger.warn(
+                  `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+                  + `${err?.message ?? err}`,
+                );
+              });
+          }
+        }
+
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
         // substitute turn's screen updates stay card-less even after a queued
@@ -12494,6 +12571,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -12608,6 +12686,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -12684,6 +12763,7 @@ function setupWorkerHandlers(
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           silentIdleCardFlag(ds),
           dshRuntimeForSession(ds),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -13113,6 +13193,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -13187,6 +13268,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -14298,8 +14380,6 @@ function setupWorkerHandlers(
         // this exact head with queuedActivationResume before durable tail N+1.
         ds.initialStartPending = false;
         ds.initialStartClaimToken = undefined;
-      } else {
-        reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
       }
       ds.worker = null;
       ds.workerReady = false;

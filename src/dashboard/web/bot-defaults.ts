@@ -3,6 +3,7 @@ import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
 import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
 import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
 export type CliOption = {
   id: string;
@@ -89,6 +90,13 @@ export type BotDefaultsRow = {
   replyStyle?: ReplyStyleConfig | null;
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
+   *  CLI calls use whatever identity is logged in on the machine). */
+  triggerUserAuth?: {
+    enabled: boolean;
+    tools: Array<'lark-cli' | 'bytedcli'>;
+    fallback: 'bot-identity' | 'none';
+  } | null;
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
@@ -100,6 +108,7 @@ export type BotDefaultsRow = {
   usageDisplay?: 'streaming' | 'footer' | 'off';
   usageSupported?: boolean;
   disableStreamingCard?: boolean;
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
@@ -108,11 +117,25 @@ export type BotDefaultsRow = {
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   thinkingCard?: boolean;
+  /** 思考气泡是否附带工具输出代码块。默认 ON —— 只有显式 false 表示关闭；
+   *  thinkingCard 关闭时无意义。 */
+  thinkingCardToolResult?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
+  quotaFallbackBot?: {
+    enabled: true;
+    targetAppId: string;
+    kinds: Array<'usage' | 'rate'>;
+    message: string;
+  } | null;
+  online?: boolean;
+  startupBlocked?: {
+    reason: 'quota_fallback_cycle';
+    cycle: string[];
+  };
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;
   summaryMemoryPath?: string;

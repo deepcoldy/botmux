@@ -4623,8 +4623,8 @@ td code,
   margin: 0;
 }
 
-#g-drawer .form-row :where(input, select),
-#g-drawer .g-modal-field :where(input, select) {
+#g-drawer .form-row :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select),
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select) {
   box-sizing: border-box;
   display: block;
   width: 100%;
@@ -4636,11 +4636,11 @@ td code,
   background-color: var(--surface);
 }
 
-#g-drawer .g-modal-field :where(input, select):hover:not(:disabled) {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
 }
 
-#g-drawer .g-modal-field :where(input, select):focus {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):focus {
   border-color: var(--accent);
   box-shadow: none;
   outline: none;
@@ -6740,6 +6740,22 @@ dialog.onboarding-dialog::backdrop {
   color: var(--muted);
   background: color-mix(in srgb, var(--muted) 6%, transparent);
   border: 1px solid var(--border-soft);
+}
+
+/* Trigger-user auth: tool checkboxes sit inline with their label, and the two
+   boundary advisories read as warnings rather than as ordinary help text — an
+   operator must not skim past "the agent can read other people's tokens". */
+.bd-inline-check { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; font-size: 12px; }
+.bd-inline-check input { margin: 0; }
+.bd-section-note[data-trigger-user-auth-token-advisory],
+.bd-section-note[data-trigger-user-auth-mcp-advisory] {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
 }
 
 /* ── Sandbox directory whitelist tree ── */
@@ -10726,6 +10742,10 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   border-radius: var(--radius-sm);
   padding: 1px 7px;
 }
+.bd-roster-flag-blocked {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+}
 
 /* 右：档案 */
 .bd-profile { max-width: none; padding: 0; background: transparent; border: 0; box-shadow: none; }
@@ -11194,6 +11214,24 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   background: color-mix(in srgb, var(--success) 10%, var(--surface));
   color: var(--success);
 }
+.bd-profile-meta .bd-meta-blocked {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  color: var(--danger);
+}
+.bd-startup-blocked {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 18px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  color: var(--danger);
+  font-size: 12px;
+}
+.bd-startup-blocked span { color: var(--muted); }
 
 .bd-tile {
   border-radius: var(--radius-xl);
@@ -18445,6 +18483,78 @@ form.dashboard-toolbar > input[type="text"]:focus {
   white-space: nowrap;
 }
 
+.connector-bot-picker-chips {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  overflow: visible !important;
+}
+
+.connector-bot-picker-chip {
+  position: relative;
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  max-width: 140px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  color: var(--accent-strong);
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-bot-picker-chip-remove {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -3px;
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.connector-bot-picker-chip-remove:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent-strong);
+}
+
+.connector-bot-picker-chip[data-full]:hover::after {
+  content: attr(data-full);
+  position: absolute;
+  z-index: 1700;
+  top: calc(100% + 7px);
+  left: 0;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 48px));
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  pointer-events: none;
+}
+
 .connector-group-picker-trigger:hover,
 .connector-group-picker.open .connector-group-picker-trigger {
   border-color: var(--accent);
@@ -18487,7 +18597,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: block;
 }
 
-.connectors-page .cn-form .connector-group-search > input[type="search"] {
+.connector-group-search > input[type="search"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   height: 34px;
   min-height: 34px;
   padding: 0 12px 0 34px;
@@ -18511,8 +18621,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .connector-group-search-icon::after {
   content: '';
   position: absolute;
-  right: -4px;
-  bottom: -3px;
+  right: -5px;
+  bottom: -1px;
   width: 5px;
   border-bottom: 1.5px solid var(--muted);
   transform: rotate(45deg);
@@ -24324,6 +24434,41 @@ dialog select[multiple]:hover:not(:disabled) {
   display: grid;
   gap: 10px;
   margin-top: 10px;
+}
+
+.bot-defaults-page .bd-card-button-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 24px;
+  margin-top: 2px;
+}
+
+.bot-defaults-page .bd-card-button-toggle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  min-height: 40px;
+  margin: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 64%, transparent);
+}
+
+.bot-defaults-page .bd-card-button-toggle .toggle-tx {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.bot-defaults-page .bd-card-button-toggle .switch {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+@media (max-width: 620px) {
+  .bot-defaults-page .bd-card-button-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

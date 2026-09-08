@@ -431,6 +431,97 @@ describe('handleCotThinkingUpdate', () => {
     expect(args.content.delta).toContain('x'.repeat(500));
   });
 
+  /**
+   * 转写层在 args 截断前从完整 input 提取 `subject`，渲染层优先用它；解析
+   * args 只是给尚未升级、只发 args 的旧世代 worker 的回退。
+   */
+  it('prefers the transcript-provided subject over parsing args', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // args 已被截成解析不出的残片，但 subject 完整。
+      { kind: 'tool_call', id: 'S1', name: 'Bash', args: '{"command":', subject: 'git log --oneline' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title).toContain('git log --oneline');
+    expect(title).not.toContain('{');
+  });
+
+  it('bounds a long subject for the title but resolves the language from its full form', async () => {
+    const ds = makeDs();
+    const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
+    expect(longPath.length).toBeGreaterThan(80);
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'S2', name: 'Read', args: '', subject: longPath },
+      { kind: 'tool_result', id: 'S2', result: 'export const x = 1;' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).not.toContain('.ts');
+    const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(body.language).toBe('typescript');
+  });
+
+  it('thinkingCardToolResult=false swaps the result body for a minimal marker (never drops it)', async () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, thinkingCardToolResult: false } } as any);
+    handleCotThinkingUpdate(ds, upd([
+      think('check'),
+      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'R1', result: 'file-a' },
+    ]));
+    await flush();
+    const types = pushedEvents().map(e => e.type);
+    expect(types).toContain('TOOL_CALL_START');
+    expect(types).toContain('TOOL_CALL_ARGS');
+    expect(types).toContain('TOOL_CALL_END');
+    // RESULT 必须仍在：TOOL_CALL_END 之后节点处于「执行中」，只有 RESULT 让它落定。
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('R1');
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+    // 但真实输出不再出现在气泡里。
+    expect(JSON.stringify(pushedEvents())).not.toContain('file-a');
+  });
+
+  it('an empty tool result is also closed with the marker rather than left pending', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'E1', name: 'Bash', args: '{"command":"true"}' },
+      { kind: 'tool_result', id: 'E1', result: '' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('E1');
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+  });
+
+  it('absent thinkingCardToolResult means ON; turning it off mid-turn affects the next batch', async () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: {} } as any);
+    const first = [
+      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'R1', result: 'file-a' },
+    ];
+    handleCotThinkingUpdate(ds, upd(first));
+    await flush();
+    const results = () => pushedEvents().filter(e => e.type === 'TOOL_CALL_RESULT')
+      .map(e => [e.content.toolCallId, JSON.parse(e.content.content).type]);
+    expect(results()).toEqual([['R1', 'code']]);
+    // 配置改为关闭：累积列表追加的第二批仍带 RESULT（否则节点停在「执行中」），
+    // 但内容退化成完成标记而不是输出代码块。
+    vi.mocked(getBot).mockReturnValue({ config: { thinkingCardToolResult: false } } as any);
+    handleCotThinkingUpdate(ds, upd([
+      ...first,
+      { kind: 'tool_call', id: 'R2', name: 'Bash', args: '{"command":"pwd"}' },
+      { kind: 'tool_result', id: 'R2', result: '/root' },
+    ]));
+    await flush();
+    expect(results()).toEqual([['R1', 'code'], ['R2', 'text']]);
+    expect(JSON.stringify(pushedEvents())).not.toContain('/root');
+    expect(pushedEvents().filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.toolCallId)).toEqual(['R1', 'R2']);
+  });
+
   it('coalesces bursts to the latest entry list (single in-flight pump)', async () => {
     const ds = makeDs();
     let release: () => void = () => {};
@@ -738,5 +829,47 @@ describe('abortCotMessage (worker died without turn_terminal)', () => {
   it('is a no-op when the session has no live CoT state', () => {
     abortCotMessage(makeDs());
     expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('superseded turn (type-ahead: next turn starts before the previous one is finalized)', () => {
+  it('finishes the previous live bubble as done when a newer turn\'s thinking arrives', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'))).toBe(true);
+    await flush();
+    const evs = pushedEvents();
+    const finished = evs.filter(e => e.type === 'RUN_FINISHED');
+    // 旧气泡先被按 done 收尾……
+    expect(finished.map(e => e.content)).toEqual([{ threadId: 's1', runId: 'om_t1', status: 'done' }]);
+    // ……且收尾批次在新 turn 的 RUN_STARTED 之前落地。
+    const idxFinishT1 = evs.findIndex(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1');
+    const idxStartT2 = evs.findIndex(e => e.type === 'RUN_STARTED' && e.content.runId === 'om_t2');
+    expect(idxFinishT1).toBeGreaterThan(-1);
+    expect(idxStartT2).toBeGreaterThan(idxFinishT1);
+    // 迟到的 t1 terminal：仍能按 turnId 找到它（返回 true），但不会再发第二个 RUN_FINISHED。
+    expect(finalizeCotMessage(ds, 'om_t1', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1')).toHaveLength(1);
+    // 当前 turn 照常收尾。
+    expect(finalizeCotMessage(ds, 'om_t2', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED').map(e => e.content.runId)).toEqual(['om_t1', 'om_t2']);
+  });
+
+  it('a superseded bubble whose pushes had failed is closed via the explicit complete endpoint', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    // 第二次推送失败 → 该轮 disabled，但气泡已存在。
+    request.mockImplementationOnce(async () => { throw new Error('boom'); });
+    handleCotThinkingUpdate(ds, upd([think('turn one'), think('more')], 'om_t1'));
+    await flush();
+    handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'));
+    await flush();
+    const complete = request.mock.calls.find(([req]) => typeof req.url === 'string' && req.url.includes('/message_cot/complete/'));
+    expect(complete).toBeDefined();
+    expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
   });
 });

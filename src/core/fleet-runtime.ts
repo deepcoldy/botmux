@@ -23,6 +23,7 @@ import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
 import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
+import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -189,6 +190,14 @@ export function resolveFleetBots(): FleetBotSpec[] {
   try { bots = JSON.parse(readFileSync(botsJson, 'utf-8')); } catch { return []; }
   const list = Array.isArray(bots) ? bots : (bots as { bots?: unknown[] })?.bots;
   if (!Array.isArray(list)) return [];
+  return resolveFleetBotsFromEntries(list);
+}
+
+/** Pure projection used by startup and regression tests. Cyclic handoff members
+ * are intentionally absent; the dashboard is appended separately by
+ * resolveFleetMembers(), so operators retain a recovery surface. */
+export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotSpec[] {
+  const cyclicAppIds = new Set(findQuotaFallbackCycles(list as any[]).flat());
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
     return {
@@ -199,7 +208,7 @@ export function resolveFleetBots(): FleetBotSpec[] {
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
-  });
+  }).filter(spec => !cyclicAppIds.has(spec.appId));
 }
 
 const LOG_DIR = join(CONFIG_DIR, 'logs');
@@ -555,4 +564,3 @@ export function stopBotViaSupervisor(
     sleepSyncMs(150);
   }
 }
-

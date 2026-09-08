@@ -9,6 +9,7 @@
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
+import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -41,6 +42,7 @@ import {
   MAX_CARD_ACTION_ACK_TIMEOUT_MS,
   MIN_CARD_ACTION_ACK_TIMEOUT_MS,
 } from '../core/card-action-ack.js';
+import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
 
 /**
  * 生效时机：
@@ -101,8 +103,10 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
+  { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
+  { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -125,6 +129,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"],"fallback":"bot-identity"}；tools 省略=全部，fallback 只能是 bot-identity（未授权时降级到 bot 自己的身份）或 none（直接失败），绝不会退回到另一个人的登录态。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
@@ -474,7 +479,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -553,6 +558,21 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
             return { ok: false, reason: `invalid_mojo_config: ${normalized.errors.join('; ')}` };
           }
           return { ok: true, value: normalized.value };
+        }
+        if (spec.configKey === 'triggerUserAuth') {
+          // Same SHARED parser as the bots.json door, so the two cannot drift.
+          // A rejected value is surfaced verbatim: an operator reaching for a
+          // "use the machine login" fallback must be told it is refused on
+          // purpose, and a typo'd tool name must not quietly leave the boundary
+          // unenforced while the config looks accepted.
+          try {
+            const config = parseTriggerUserAuthConfig(parsed);
+            return config
+              ? { ok: true, value: config }
+              : { ok: false, reason: 'invalid_json' };
+          } catch (e) {
+            return { ok: false, reason: `invalid_trigger_user_auth: ${(e as Error).message}` };
+          }
         }
         return { ok: true, value: parsed };
       } catch {

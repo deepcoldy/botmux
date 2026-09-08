@@ -53,6 +53,8 @@ import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
+// cot-subject 只用语言内建，等价于内联，不违反本模块 dependency-free 口径。
+import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
 
 const IS_LINUX = platform() === 'linux';
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
@@ -235,7 +237,12 @@ export interface CodexBridgeEvent {
  *  keep this module dependency-free. */
 export type CodexCotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从原始 arguments / input / action 提取的单行主题（≤1000）；
+     *  无可用字段时不带此键。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
 
 /** Per-entry truncation caps for the CoT tool timeline (same rationale and
@@ -246,6 +253,16 @@ const COT_TOOL_RESULT_MAX_CHARS = 800;
 
 function truncateForCot(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** 组装 tool_call 节点：args 截断、subject 传输层截断，主题为空时不带键。 */
+function toolCallEntry(id: string, name: string, args: string, rawSubject: string): CodexCotEntry {
+  const subject = boundSubjectForTransport(rawSubject);
+  return {
+    kind: 'tool_call', id, name,
+    args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+    ...(subject ? { subject } : {}),
+  };
 }
 
 /** Codex shell outputs are usually a JSON string `{"output":"…","metadata":…}`;
@@ -292,29 +309,33 @@ export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
     }
     return texts.length > 0 ? [{ kind: 'thinking', text: texts.join('\n\n') }] : [];
   }
+  // 四种 tool_call 形态的主题都在截断**之前**从原始字符串 / 对象上取：
+  // function_call 的 arguments 是 JSON 字符串，custom_tool_call 的 input 是裸
+  // 字符串（apply_patch / 脚本），local_shell_call / web_search_call 的 action
+  // 是对象——截断后的 JSON 解析不出主题。
   if (p.type === 'function_call' && typeof p.name === 'string') {
     const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
     if (!id) return [];
     const args = typeof p.arguments === 'string' ? p.arguments : '';
-    return [{ kind: 'tool_call', id, name: p.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+    return [toolCallEntry(id, p.name, args, subjectFromArgsString(args))];
   }
   if (p.type === 'custom_tool_call' && typeof p.name === 'string' && typeof p.call_id === 'string' && p.call_id) {
     const args = typeof p.input === 'string' ? p.input : '';
-    return [{ kind: 'tool_call', id: p.call_id, name: p.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+    return [toolCallEntry(p.call_id, p.name, args, subjectFromArgsString(args))];
   }
   if (p.type === 'local_shell_call') {
     const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
     if (!id) return [];
     let args = '';
     try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
-    return [{ kind: 'tool_call', id, name: 'shell', args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+    return [toolCallEntry(id, 'shell', args, subjectFromInputObject(p.action))];
   }
   if (p.type === 'web_search_call') {
     const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
     if (!id) return [];
     let args = '';
     try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
-    return [{ kind: 'tool_call', id, name: 'web_search', args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+    return [toolCallEntry(id, 'web_search', args, subjectFromInputObject(p.action))];
   }
   if ((p.type === 'function_call_output' || p.type === 'custom_tool_call_output') && typeof p.call_id === 'string' && p.call_id) {
     const result = stringifyCodexToolOutput(p.output);

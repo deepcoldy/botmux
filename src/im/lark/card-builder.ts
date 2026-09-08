@@ -21,6 +21,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -309,6 +310,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
+  'minimax': 'MiniMax',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -969,6 +971,7 @@ export function buildStreamingCard(
    *  never showed the button either), so a call site that forgets to pass it
    *  degrades to the status quo rather than to a broken button. */
   dshRuntime?: 'official' | 'tui',
+  hiddenButtons: readonly StreamingCardButtonId[] = [],
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -990,30 +993,33 @@ export function buildStreamingCard(
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
+  const hidden = new Set(hiddenButtons);
 
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
-    type: 'default' as const,
-    value: { action: 'toggle_display', ...actionBase },
-  });
-  if (displayMode !== 'hidden') {
+  if (!hidden.has('output')) {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+      text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
       type: 'default' as const,
-      value: { action: 'export_text', ...actionBase },
+      value: { action: 'toggle_display', ...actionBase },
     });
+    if (displayMode !== 'hidden') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'export_text', ...actionBase },
+      });
+    }
+    if (displayMode === 'screenshot') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'refresh_screenshot', ...actionBase },
+      });
+    }
   }
-  if (displayMode === 'screenshot') {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'refresh_screenshot', ...actionBase },
-    });
-  }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('terminal')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -1031,7 +1037,7 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('writeLink')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -1055,7 +1061,7 @@ export function buildStreamingCard(
   //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
@@ -1068,7 +1074,7 @@ export function buildStreamingCard(
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
   // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
     headerActions.push({
       tag: 'button',
@@ -1086,13 +1092,15 @@ export function buildStreamingCard(
         value: { action: 'takeover', ...actionBase },
       });
     }
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-      type: 'danger' as const,
-      value: { action: 'disconnect', ...actionBase },
-    });
-  } else {
+    if (!hidden.has('close')) {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
+        type: 'danger' as const,
+        value: { action: 'disconnect', ...actionBase },
+      });
+    }
+  } else if (!hidden.has('close')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
@@ -1100,7 +1108,7 @@ export function buildStreamingCard(
       value: { action: 'close', ...actionBase },
     });
   }
-  elements.push({ tag: 'action', actions: headerActions });
+  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing

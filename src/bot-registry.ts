@@ -16,6 +16,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -52,6 +53,11 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import {
+  findQuotaFallbackCycles,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from './services/quota-fallback.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -60,6 +66,10 @@ import type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from './im/lark/streaming-card-buttons.js';
 
 /**
  * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
@@ -1542,6 +1552,14 @@ export interface BotConfig {
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
   /**
+   * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
+   * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
+   * `bytedcli` run as the person who sent the current message, and a sender who
+   * has not authorized gets the bot's own tenant identity (or a failure, per
+   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   */
+  triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
+  /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
    * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
@@ -1611,6 +1629,13 @@ export interface BotConfig {
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
+  /**
+   * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
+   * rate-limit state. The stable target App ID is resolved to a live,
+   * receiver-scoped mention handle at send time; no open_id is persisted here.
+   * Missing/invalid/disabled means no automatic handoff.
+   */
+  quotaFallbackBot?: QuotaFallbackBotConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -1851,6 +1876,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Main controls omitted from live streaming cards. Missing means show all. */
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -1869,6 +1896,11 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
    */
   thinkingCard?: boolean;
+  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 ON（缺省 =
+   *  开；只有显式 false 持久化）。off 时气泡只保留思考段落与工具节点标题
+   *  （工具名 · 命令/路径），与 Claude Code 自身界面一致。子开关：
+   *  {@link thinkingCard} 关闭时无意义。 */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -2878,10 +2910,30 @@ function resolveBotConfigPath(): string {
   );
 }
 
+/** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
+function warnAndCollectCyclicQuotaFallbackIds(
+  entries: any[],
+  selectedAppId?: string,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(entries);
+  const affected = new Set<string>();
+  for (const cycle of cycles) {
+    for (const appId of cycle) affected.add(appId);
+    // Indexed daemon loading should not make every unrelated daemon repeat the
+    // same warning. The all-bot parser has no selectedAppId and logs each cycle.
+    if (selectedAppId && !cycle.includes(selectedAppId)) continue;
+    logger.warn(
+      `[bot-registry] quotaFallbackBot cycle disabled for affected bots: ${cycle.join(' -> ')}; `
+      + 'unrelated bots remain available',
+    );
+  }
+  return affected;
+}
+
 /**
  * Resolve one daemon's exact raw bots.json slot without compacting earlier
- * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
- * array index; filtering the array first would make a later ready bot load a
+ * activation-pending entries. The supervisor assigns BOTMUX_BOT_INDEX from the
+ * durable array index; filtering first would make a later ready bot load a
  * different App whenever concurrent onboarding left an earlier slot pending.
  */
 export function loadBotConfigAtIndex(index: number): BotConfig {
@@ -2902,6 +2954,8 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
   }
+  const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -2937,6 +2991,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
     }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  if (cyclicQuotaFallbackIds.has(String(entryForDaemon.larkAppId))) {
+    delete entryForDaemon.quotaFallbackBot;
+  }
   delete entryForDaemon.activationStarting;
   delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
@@ -3033,6 +3090,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
@@ -3104,6 +3162,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    // Malformed input throws instead of degrading to off: an operator who typo'd
+    // a tool name would otherwise believe a credential boundary is enforced
+    // when it is not — worse than not having the feature.
+    let triggerUserAuth;
+    try {
+      triggerUserAuth = parseTriggerUserAuthConfig(entry.triggerUserAuth) ?? undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -3354,6 +3421,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
+      ? {}
+      : normalizeQuotaFallbackBotConfig(entry.quotaFallbackBot, entry.larkAppId);
+    if (normalizedQuotaFallback.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackBot ignored: ${normalizedQuotaFallback.error}`,
+      );
+    }
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
       entry.nativeSubagentRuntime,
     );
@@ -3462,6 +3537,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -3484,6 +3560,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.maxLiveWorkers
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -3542,9 +3619,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
+      // 同 thinkingCard 约定：缺省 = 开，只有显式 false 有意义。
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,

@@ -1041,6 +1041,35 @@ export interface ScheduledTask {
    *  becomes the landing point. Only meaningful with executionPosition
    *  'topic'. */
   followActive?: boolean;
+  /** Per-task CLI model, overriding the bot's configured one for this task's
+   *  own runs (e.g. a cheap model for a 30m sentinel next to a strong one for
+   *  the nightly review, on ONE bot).
+   *
+   *  Same fresh-spawn-only semantics as the trigger API's `options.model`, and
+   *  for the same physical reason: the model is a CLI **process launch**
+   *  argument, so only a fire that spawns a worker can apply it. A fire that
+   *  injects into the task's existing session keeps whatever that process
+   *  started with. In practice: `new-topic` tasks apply it on every run;
+   *  `topic` / `top-level` tasks apply it on the run that creates their
+   *  session and then keep it. Creation surfaces say so out loud rather than
+   *  letting the difference be discovered at fire time.
+   *
+   *  Gated at fire time on the bot's CLI actually supporting the override
+   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
+   *  warning, never a skipped run.
+   *
+   *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
+   *  session record, so a daemon restart drops it: a `topic` / `top-level` task
+   *  whose session survives the restart re-forks on the bot's model. Persisting
+   *  it is not the fix — a stored session model outranks the bot's configured one
+   *  forever, which is the bug `resolveSessionLaunchModel` exists to undo. Same
+   *  behavior as the trigger API's per-turn model. */
+  model?: string;
+  /** Per-task reasoning effort, same override + fresh-spawn-only semantics as
+   *  `model`. Dropped at fire time when the resolved model does not offer the
+   *  level (`cliModelSupportsReasoningEffort`), mirroring what sessionAgentConfig
+   *  already does to a session-level effort. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -1211,7 +1240,7 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1315,7 +1344,14 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
  *  worker truncates args/results before shipping. */
 export type CotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 转写层从**未截断**的完整 input 提取的单行主题（command / file_path /
+     *  …），气泡工具节点标题的首选载体：args 会被截到 600 字符，长命令 /
+     *  大 content 的 Write 一截就解析不出主题。缺省时（旧世代 worker）渲染层
+     *  回退解析 args。已折叠为单行、≤1000 字符（超长带 `…`）。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
 
 /** A Claude model switch that is still in effect: Claude Code fell back off the

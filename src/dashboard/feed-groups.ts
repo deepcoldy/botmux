@@ -1,6 +1,7 @@
 import type { BotConfig } from '../bot-registry.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
-import { resolveUserToken } from '../utils/user-token.js';
+import { resolveOwnerUserToken } from '../utils/user-token.js';
+import { getOwnerOpenId } from '../bot-registry.js';
 
 export const FEED_GROUP_SCOPES = ['im:feed_group_v1:read', 'im:feed_group_v1:write'] as const;
 
@@ -27,13 +28,20 @@ type ApiEnvelope = {
 };
 
 async function userApi(
-  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>,
+  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand' | 'ownerOpenId'>,
   path: string,
   init: RequestInit,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, unknown>> {
   const brand = normalizeBrand(bot.brand);
-  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, brand);
+  // 「消息分组」只存在于某个人的收件箱里 —— 始终用 owner 本人的 token。
+  //
+  // owner 优先从注册表派生（resolvedAllowedUsers 的首个 ou_），`ownerOpenId`
+  // 只作兜底：那是 bots.json 里的原始字段，实际部署里几乎没人填。token 现在按人
+  // 存，owner 解析不出来就等于用一个空 key 去查——查不到，界面显示「未授权」，
+  // 而那个人明明刚授权过。
+  const ownerOpenId = getOwnerOpenId(bot.larkAppId) ?? bot.ownerOpenId;
+  const token = await resolveOwnerUserToken(bot.larkAppId, bot.larkAppSecret, brand, ownerOpenId);
   if (!token) throw new FeedGroupApiError('尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。', 'user_login_required', 401);
   const response = await fetchImpl(`${larkHosts(brand).openApi}${path}`, {
     ...init,

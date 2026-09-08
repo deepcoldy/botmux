@@ -34,6 +34,8 @@ type ScheduleRow = Record<string, any> & {
   preconditionSource?: 'inline' | 'file';
   preconditionScript?: string;
   preconditionFilePath?: string;
+  model?: string;
+  reasoningEffort?: string;
 };
 type ScheduleBotOption = {
   larkAppId: string;
@@ -77,6 +79,10 @@ type ScheduleRunLogPage = {
 export type PreconditionEditMode = 'keep' | 'inline' | 'file';
 type PreconditionHelpSource = 'inline' | 'file';
 const RUN_ACTION_MIN_PENDING_MS = 1000;
+/** Kept in sync with CODEX_REASONING_EFFORTS; which levels a given model
+ *  actually offers is decided server-side, which 400s an unusable pairing. */
+const SCHEDULE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
@@ -1209,6 +1215,11 @@ function ScheduleRowCard(props: {
           ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
+          {s.model || s.reasoningEffort ? (
+            <span title={tr('schedules.modelChipHelp')}>
+              🧠 {[s.model, s.reasoningEffort].filter(Boolean).join(' · ')}
+            </span>
+          ) : null}
           {s.hasPrecondition ? (
             <span className={`schedule-precondition-chip${s.preconditionEnabled === false ? ' is-paused' : ''}`}>
               <i className="schedule-precondition-chip-icon" aria-hidden="true">⌘</i>
@@ -1404,6 +1415,7 @@ function SchedulesPage() {
     topicTitle: string;
     updateExecutionPosition: boolean;
     chatIds: string[]; larkAppId: string;
+    model: string; reasoningEffort: string;
   }): Promise<void> {
     setFormError(null);
     try {
@@ -1433,6 +1445,10 @@ function SchedulesPage() {
               topicTitle: data.topicTitle,
               chatIds: data.chatIds,
             } : {}),
+            // Always submitted, including empty: on the update path an empty
+            // string is how the form clears an override back to the bot's.
+            model: data.model,
+            reasoningEffort: data.reasoningEffort,
           }
         : {
             name: data.name,
@@ -1453,6 +1469,8 @@ function SchedulesPage() {
             topicTitle: data.topicTitle,
             chatIds: data.chatIds,
             larkAppId: data.larkAppId,
+            model: data.model,
+            reasoningEffort: data.reasoningEffort,
           };
       const r = await fetch(url, {
         method,
@@ -1653,6 +1671,9 @@ interface ScheduleFormData {
   updateExecutionPosition: boolean;
   chatIds: string[];
   larkAppId: string;
+  /** Per-task model / effort. `''` means "use the bot's configuration". */
+  model: string;
+  reasoningEffort: string;
 }
 
 export function ScheduleFormModal(props: {
@@ -1692,6 +1713,8 @@ export function ScheduleFormModal(props: {
   const preconditionTestRunningRef = useRef(false);
   const preconditionTestRevisionRef = useRef(0);
   const [silent, setSilent] = useState(editing?.silent === true);
+  const [model, setModel] = useState(editing?.model ?? '');
+  const [reasoningEffort, setReasoningEffort] = useState<string>(editing?.reasoningEffort ?? '');
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
     editing && scheduleExecutionPlacement(editing) === 'thread'
       ? 'topic'
@@ -2053,6 +2076,8 @@ export function ScheduleFormModal(props: {
       updateExecutionPosition: !localDelivery,
       chatIds,
       larkAppId,
+      model: model.trim(),
+      reasoningEffort,
     });
   }
 
@@ -2625,6 +2650,41 @@ export function ScheduleFormModal(props: {
         </label>
         {executionPosition === 'new-topic' && silent ? (
           <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        ) : null}
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.model')}</span>
+          <input
+            type="text"
+            value={model}
+            onChange={e => setModel(e.target.value)}
+            placeholder={tr('schedules.form.modelPlaceholder')}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+          />
+          <small className="schedule-form-help">{tr('schedules.form.modelHelp')}</small>
+        </label>
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.reasoningEffort')}</span>
+          <select
+            value={reasoningEffort}
+            onChange={e => setReasoningEffort(e.target.value)}
+          >
+            <option value="">{tr('schedules.form.reasoningEffortDefault')}</option>
+            {SCHEDULE_REASONING_EFFORTS.map(level => (
+              <option value={level} key={level}>{level}</option>
+            ))}
+          </select>
+          <small className="schedule-form-help">{tr('schedules.form.reasoningEffortHelp')}</small>
+        </label>
+        {(model.trim() || reasoningEffort) ? (
+          // Model / effort are CLI process launch arguments: only a fire that
+          // starts a process can apply them.
+          <p className="schedule-form-help">
+            {tr(executionPosition === 'new-topic'
+              ? 'schedules.form.modelFreshEveryRun'
+              : 'schedules.form.modelFirstRunOnly')}
+          </p>
         ) : null}
         {props.error ? (
           <p className="schedule-form-error">{props.error}</p>

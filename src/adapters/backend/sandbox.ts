@@ -681,7 +681,8 @@ export function prepareDirectSandbox(opts: {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
 
-  const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
+  const dataDir = canonical(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -836,6 +837,10 @@ export function prepareDirectSandbox(opts: {
   pushExecDir(opts.cliBin);      // the CLI binary
   const env: Record<string, string> = {
     HOME: opts.home,
+    // The worker mounts canonical paths. A symlinked host HOME/data root is
+    // not recreated in bwrap's fresh root, so inherited lexical paths cannot
+    // locate the owning session store or its per-bot schedule directory.
+    SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
     PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
   };
@@ -1220,6 +1225,11 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  // This channel locates the pane's read-isolation proof, not the host
+  // watcher's origin. Carrying it across re-exec misclassifies the host child
+  // as isolated. Durable origin still comes from authorize below; do not add
+  // a cmdSend exemption based on child-mutable env or namespace-local PIDs.
+  delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
   if (preparedContentFile) {

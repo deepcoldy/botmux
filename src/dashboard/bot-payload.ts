@@ -1,10 +1,12 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
+import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -119,15 +121,18 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true,
+    hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     thinkingCard: j?.thinkingCard !== false,
+    thinkingCardToolResult: j?.thinkingCardToolResult !== false,
     senderTag: j?.senderTag !== false,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
+    quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',
@@ -158,6 +163,11 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Trigger-user CLI auth policy, verbatim (no secrets in it — just which
+    // tools and what to do when the sender has not authorized).
+    triggerUserAuth: (j?.triggerUserAuth && typeof j.triggerUserAuth === 'object')
+      ? j.triggerUserAuth
+      : null,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',

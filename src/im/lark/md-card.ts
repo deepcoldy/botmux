@@ -881,6 +881,7 @@ export function buildCardBodyElements(
   input: string,
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode = 'fit_horizontal',
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
@@ -892,8 +893,9 @@ export function buildCardBodyElements(
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
   const layoutBudget = { promotedHeadings: 0 };
-  for (const seg of splitImageRowSegments(input)) {
+  for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
+    else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
     else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
@@ -1003,9 +1005,30 @@ function buildMarkdownElements(
   return elements;
 }
 
-/** A single uploaded image rendered full-width (legacy single-image look). */
+// Existing multi-image rows retain their legacy payload for compatibility.
 function singleImgElement(imgKey: string): any {
   return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/** Botmux width presets, not Feishu's square/cropping `size` presets. */
+function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const img = {
+    tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
+    scale_type: 'fit_horizontal', preview: true,
+  };
+  const columnCounts: Record<string, number> = { medium: 2, small: 3, tiny: 4 };
+  const count = columnCounts[mode];
+  if (!count) return img;
+  // Feishu normalizes unequal weights to 1. Use N equal columns instead:
+  // one image and N-1 empty columns. `none` preserves the fraction on narrow
+  // screens; fit_horizontal keeps the entire image without a fixed height.
+  return {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
+    columns: Array.from({ length: count }, (_, index) => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: index === 0 ? [img] : [],
+    })),
+  };
 }
 
 /**
@@ -1050,14 +1073,14 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
-type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
+type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**
  * Split a markdown body into segments, pulling out lines that consist solely of
  * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
  * inside ``` / ~~~ code blocks are never treated as image rows.
  */
-function splitImageRowSegments(input: string): BodySegment[] {
+function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): BodySegment[] {
   const segs: BodySegment[] = [];
   let buf: string[] = [];
   const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
@@ -1081,6 +1104,16 @@ function splitImageRowSegments(input: string): BodySegment[] {
       }
       buf.push(line);
       continue;
+    }
+    // Only promote standalone images for an explicit size override. Keep the
+    // legacy Markdown output, inline prose, code blocks, and image grids intact.
+    if (!fenceChar && imageMode !== 'fit_horizontal') {
+      const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
+      if (single && FEISHU_IMG_KEY.test(single[2])) {
+        flush();
+        segs.push({ type: 'img', key: single[2], alt: single[1] });
+        continue;
+      }
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
@@ -1112,14 +1145,17 @@ function splitImageRowSegments(input: string): BodySegment[] {
  * pre-pass turns multi-image lines into the actual `column_set` rows. This keeps
  * one rendering path: a caller that embeds `![](img_key)` directly and puts two
  * on a line (e.g. the menu poster) gets the same grid without using `--images`.
+ * `imageMode` overrides standalone single images only; inline Markdown images
+ * and side-by-side rows retain their existing layout.
  */
 export function buildImageCardElements(
   md: string,
   imageKeys: string[],
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode?: string,
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1150,7 +1186,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
 }
 
 /**

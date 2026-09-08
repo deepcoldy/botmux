@@ -2,16 +2,17 @@
 title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-09-06（Stage 2 单一 apply 落地：close / prune / 白板绑定只有一份行级变换，宿主离线写改为命令）
+updated: 2026-09-07（Stage 3 per-session turn 落地：开场激活窗口内的命令走按 sessionId 的队列，分散的计数 / 延迟交接 / 回放删除；Stage 4 降为低优先级；Stage 0 / Stage 1 收尾按升级窗口已关闭排期）
 topic: session-virtual-actor
 status: active
-baseline: origin/master@8d2986c71（含已合入的 #852、#1073、#1093、#1051、#1202）
+baseline: origin/master@61dadb04c（含已合入的 #852、#1073、#1093、#1051、#1202、#1280）
 references:
   - PR #846（会话行唯一写入入口）
   - PR #852（per-bot SQLite + JSON 导入 + 混合窗口；已合入 master）
   - PR #1051（删除 daemon 侧 JSON 写路径 + 行级持久化；已合入 master）
   - PR #1202（Stage 1 occupancy：库内 `occupancy` 租约；已合入 master）
-  - Stage 2 单一 apply（`services/session-commands.ts`；本轮落地）
+  - PR #1280（Stage 2 单一 apply：`services/session-commands.ts`；已合入 master）
+  - Stage 3 per-session turn（`core/session-turn-queue.ts`；本轮落地）
   - #831 / feat/virtual_actor_stage2（不合入；SessionRuntime 只覆盖部分写点的失败记录）
 ---
 
@@ -93,8 +94,8 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 - **occupancy 已在同库 `occupancy` 表。** 租约在 `BEGIN IMMEDIATE` 内判定，有效租约一票否决离线写；`findOnlineDaemon` 不再是唯一所有权来源。没有有效租约（缺行 / 过期 / 不可读）时心跳仍参与判定——这是升级窗口（只写会话行、不写 occupancy 的 daemon，含回滚后的旧构建）。删除该回落的条件与 Stage 0 JSON 读路径相同。
 - **apply 已收成一份**（Stage 2）。行级变换只在 `services/session-commands.ts`：daemon 的 `closeSession` / `/whiteboard` 路由与宿主的 `services/session-command-host.ts`（`applySessionCommandAsHost` / `readSessionRowAsHost`）都调用它。仍分开的是**运行时拆除**（daemon 的 killWorker / remote cancel prepare vs 宿主 CLI 的 SIGTERM + backing 销毁）与 close 后的旁路清理（宿主只做 dashboard 图片目录清理；turn-sends / prompt-ctx / frozen-card 仍由 daemon 清）。
-- **没有 per-session turn。** 进程内仍依赖多处独立的 fence。
-- **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。删除这些分支的条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。磁盘上的冻结 JSON 文件可以保留。
+- **per-session turn 已有（Stage 3）。** `core/session-turn-queue.ts#runSessionTurn` 是按 `sessionId` 的 Promise 链；开场激活窗口内的命令（后到消息的 prompt 构造 + durable tail 落盘、开场 ACK 对路由的释放）都走它。仍在队列外的是 fork 边界的所有权 `initialStartClaimToken`（跨越整段资源准备，见 Stage 3「有意保留」）与 pendingRepo 等待期的缓冲（等人，不是等 `await`）。
+- **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。升级窗口已按关闭处理（见 Stage 0 的状态记录），这些分支在收尾 PR 里删除。磁盘上的冻结 JSON 文件可以保留。
 
 #831 / `SessionRuntime` **不合入**。失败原因是只把约 32% 的写点迁入新层、旧 API 完整保留、约 17k 行适配层按设计要整段删除，并在 build 上挂审计脚本。这不能证明会话桥不该用 virtual actor。写点地图和 receipts/lane 只作线索，立项前在现行代码上复核。
 
@@ -123,6 +124,8 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 2. 兜底复核点 **2026-11-26**（本文 2026-08-28 定稿起 90 天）。届时若 fleet 自动重启仍未落地，就按当时 latest 与「`sessions.db` 首次进入 latest 的版本」之间的跨度，决定直接删除还是再延一期，并把结论写回本节。
 
 第 2 条是必需的：fleet 自动重启不在本文范围，也没有承诺时间点。只写第 1 条，等于把跨进程 JSON 读做成 §不做 明令禁止的「长期不变量」。
+
+**状态（2026-09-07）**：SQLite 引擎首次进入 latest 是 v3.18.0（2026-08-28），daemon 不再写 JSON 的版本是 v3.18.12（2026-09-02），occupancy 租约的版本是 v3.19.0（2026-09-06）。维护者已决定不再等 fleet 自动重启，按升级窗口已关闭处理；收尾 PR（本节的 JSON 读路径删除 + Stage 1 的心跳回落删除）排在 Stage 3 之后统一做，范围见 §5。
 
 条件满足后，再开一个仍属 Stage 0 的 PR，从代码中删除 JSON 读路径（不必等 occupancy）：
 
@@ -165,21 +168,32 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 未纳入本 stage：daemon 与宿主各自的运行时拆除（worker / backing 的杀法）本来就分属两种进程形态，不是行级 apply；IPC 传输层（`postSessionCliIpc` 的 capability 鉴权 vs `fetchDaemonIpc` 的 host HMAC）承载不同的鉴权语义，不合并。
 
-### Stage 3 — Per-session turn
+### Stage 3 — Per-session turn【已落地：开场激活窗口】
 
 **目标**：同一 `sessionId` 上的命令在跨 `await` 后仍串行。按 session 排队，不引入 `SessionRuntime`。
 
-- 按 `sessionId` 将命令闭包入队（或等价的 Promise 链）。host 仍是 bot 进程。
-- 用队列替换已有测试或线上证据的分散 fence（async tail-admission、worker generation / exit 路径上无保护的 `updateSession`、队首激活 FIFO 等）。没有复现的路径不要为了「更像 actor」而改。
-- stage2 的 receipts / lane 只作线索，立项前在现行代码复核。
+已落地：
 
-daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外部入口都走同一 apply，否则队列覆盖不到 CLI / dashboard。
+1. `core/session-turn-queue.ts#runSessionTurn(sessionId, command)`：按 `sessionId` 的 Promise 链，命令按入队顺序执行、跨自身 `await` 不交错，前一条失败不阻塞后一条；链空即回收。没有 mailbox 类型、没有 actor 对象。`hasPendingSessionTurns(sessionId)` 供入口判定「这条 session 上还有命令没跑完」。
+2. 收进队列的命令，全部在**开场激活窗口**——到达 → 构造 prompt（`await` 发送者查询）→ 落 durable tail：
+   - 同 anchor 后到消息的两处入口（`initialStartPending` 下的 follower；worker 已死、带 retained journal 的 refork 前置 staging）统一走 `admitFollowerBehindOpening`：到达时同步取 FIFO 序号，构造 + 落盘作为一条命令入队。若开场的释放在它之前跑完（tail 为空、路由已放开），同一条命令内联 promote，不再排队。pendingRepo 分支从到达到落盘没有 `await`，不需入队。
+   - 开场的路由释放 `releaseQueuedActivationReservation`（worker `queued_activation_submitted` ACK、普通冷 fork 后的交接、失败重试）入队，因此必然在先到的 follower 落盘之后执行。
+   - `hasQueuedActivationAdmissionGate` 用 `hasPendingSessionTurns` 代替计数：队列上有命令时，live worker 的普通 turn 也进 durable tail，不得插队。
+3. 删除的分散 fence：`queuedActivationTailAdmissionsOutstanding` 计数、`queuedActivationTailReleasePending` 延迟交接、`reserveAsync… / settleAsync…` 回放；`forkReservedInitialSession` 与原始命令冷启动对计数的判定改为查队列。保留的 100ms 重试定时器只负责「promote 落盘 / IPC 失败后重试」，不再承担排序。
+4. 顺手删除的死代码：`pendingQueuedActivationFollowUps` 与 `reparkQueuedActivationFollowUpTail`——#597 的 durable tail 落地后没有任何写入方，repark 恒返回 false。
 
-`admitQueuedActivationTail` 一类在 store 外做字段备份再回滚的逻辑：在「按命令更新且不替换 `ds.session` 引用」的 apply 入口出现后删除。不要为少写几行回滚代码单独增加一个公共 patch API。
+有意保留、不入队的：
 
-### Stage 4 — （可选）按 session 隔离激活
+- `initialStartClaimToken` / `initialStartPending`：fork 边界的所有权，跨越 `handleNewTopic` 从资源准备到 fork 的整段异步（秒级）。期间到达的 follower 必须**立刻**落 durable tail 才扛得住 daemon 崩溃；把整段准备做成队列命令会让 follower 在内存里等待、失去这层持久化。它是状态，不是 `await` 间隙。
+- `pendingRepo` 等待期的 `pendingFollowUps*` 缓冲：等人点卡片，队列不能被人拿着。
+- `admitQueuedActivationTail` / `promoteQueuedActivationTail` 里「store 外备份再回滚」的写法：删除条件不变——daemon 侧出现「按命令更新且不替换 `ds.session` 引用」的 apply 入口（`closeSession` 已是该形态）。让 admit 走它需要新的 store 导出，并改动多个 stub 了 `updateSession` 的测试夹具；本轮未做，与 promote 的四份备份一起处理。
+- worker generation / exit 路径上的 `updateSession`：没有复现证据（相关回归测试覆盖的是重启协调器）。按本节「没有复现的路径不改」不动。
 
-仅当「同一 bot 进程内容纳全部会话」导致事件循环或崩溃域不可接受时立项。Stage 1–3 不依赖本 stage。调度仍在本机，不引入跨机器放置。
+后续再有证据的交错路径，用 `runSessionTurn` 包住那一段即可，不再新增计数或标志。
+
+### Stage 4 — （低优先级）按 session 隔离激活
+
+**暂不立项。** 触发条件是「同一 bot 进程容纳全部会话导致事件循环或崩溃域不可接受」，目前没有证据：2026-08-23 的恢复风暴发生在共享 tmux server 层（见 `test/tmux-startup-storm-recovery.test.ts`），按 session 拆进程解决不了它。Stage 0–3 不依赖本 stage；调度仍在本机，不引入跨机器放置。只有出现上述证据时再评估。
 
 ### 不做
 
@@ -222,11 +236,18 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
 
 - **#1051**：删除 daemon JSON 写路径；含白板解绑的 compare-and-set、离线写打开前拒绝缺文件、离线写与 daemon 发现各收敛成一份实现。
 - **Stage 1**：occupancy 写入 SQLite；有效租约一票否决，`findOnlineDaemon` 降为无有效租约时的回落。回落的删除条件见上。
-- **删除 JSON 读路径**：条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。fleet 实现不在本文范围。
+- **删除 JSON 读路径**：升级窗口已按关闭处理（见 Stage 0 的状态记录），与 Stage 1 心跳回落一起进下面的收尾 PR。
 - **Stage 2（已落地）**：daemon 未运行时宿主在同一事务内执行同一 apply，删除第二套对外写协议（任意闭包改行）。这一阶段减少的概念最多。
-- **下一个架构主 PR：Stage 3**：按已有证据把分散 fence 收进 per-session 队列。不设「迁完全部写点」的完成门。
+- **Stage 3（已落地）**：开场激活窗口内的命令收进按 `sessionId` 的队列；计数 / 延迟交接 / 回放删除。不设「迁完全部写点」的完成门。
+- **下一个 PR：Stage 0 / Stage 1 收尾（净删除）**，升级窗口已按关闭处理（见 Stage 0 状态）：
+  - `session-store`：删 db-else-json 分流（`StoreFileRef.kind`、`resolveStoreFile` / `listStoreRefs` 的 JSON 分支、`readStoreEntries` / `readStoreRowByKey` / `readStoreActiveRows` / `countActiveSessionsOnDisk` 的 JSON 分支）、`getSessionFresh` 的 JSON 文件锁读、非 owner 进程无库时的 `loadFromFrozenJson`、宿主命令的 JSON 文件锁写路径。无 `.db` 且尚未导入时非 owner 进程明确报「会话库尚未迁移，请重启 daemon」。
+  - 删 `abortIf` 心跳回落：`session-command-host` 的 `legacyHeartbeatHeld` / `hostOptions`，`isOccupancyHeld` 只看租约；`sqliteOccupancyBlocksWrite` 去掉 `abortIf`。
+  - 沙盒 `fs-policy`：不再授权 `sessions-<self>.json` 只读（两处）。
+  - `core/mojo-containment-command.ts#defaultIsSessionActive` 仍直接扫 `sessions*.json`：SQLite 后它对所有会话都答「不活跃」，revoke 的安全闸静默失效。改为读 store（严格跨 store 点读，保留「有库读不了 → 未知」的三态）。
+  - 保留：owner daemon 首次 load 的一次性导入及其文件锁、中毒库恢复。它不是跨进程协议；删掉会让从 3.17.x 直接升到新版的用户静默丢会话。其删除条件是「升级来源不可能低于 3.18.0」，晚于本次。
+  - 测试：`session-store` / `session-store-sqlite` / `session-occupancy` / `session-delete-cli` / `whiteboard-unbind-session` / `fs-policy` / `mojo-containment` 里的 JSON 窗口与心跳回落用例改为 fail-closed 断言。
 
-`closeSession` 的字段级回滚已在 #1051 替换。`admitQueuedActivationTail`、async tail-admission、generation / exit 上无保护的写入归 Stage 3。`initial-user-turn` 在落盘失败时仅更新内存：有复现再进入 Stage 2 或 3，不单独开事务修复轨道。
+`closeSession` 的字段级回滚已在 #1051 替换；async tail-admission 已在 Stage 3 收进队列。`admitQueuedActivationTail` / `promoteQueuedActivationTail` 的回滚写法与 generation / exit 上无保护的写入仍归 Stage 3 的后续（见其「有意保留」）。`initial-user-turn` 在落盘失败时仅更新内存：有复现再进入 Stage 2 或 3，不单独开事务修复轨道。
 
 ## 6. 历史
 

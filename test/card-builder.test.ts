@@ -1301,6 +1301,44 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
+    it('hides selected streaming-card controls without affecting the others', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['terminal', 'writeLink', 'close'],
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+    });
+
+    it('treats output as one control group and omits empty action containers', () => {
+      const screenshot = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'screenshot',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output'],
+      ));
+      const screenshotActions = findActions(screenshot);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+
+      const allHidden = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
+      ));
+      expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
+    });
+
     it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);

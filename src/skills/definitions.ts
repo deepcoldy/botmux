@@ -48,12 +48,13 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
 执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
 
 ### 查看
 

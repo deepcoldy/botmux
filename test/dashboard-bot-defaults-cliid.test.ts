@@ -1950,6 +1950,50 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
   });
 
+  it('persists live-card button visibility as a canonical hidden list', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_buttons', hiddenStreamingCardButtons: ['close'] },
+        putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-close' }).props.checked).toBe(false);
+    const terminal = renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-terminal' });
+    expect(terminal.props.checked).toBe(true);
+    await act(async () => {
+      terminal.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({
+      hiddenStreamingCardButtons: ['terminal', 'close'],
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-terminal' }).props.checked).toBe(false);
+  });
+
+  it('renders live-card controls in the compact button grid', () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_button_grid' },
+        putCardPref,
+      }));
+    });
+
+    const grid = renderer.root.findByProps({ 'data-card-button-grid': true });
+    const toggles = grid.findAllByProps({ className: 'toggle-row bd-card-button-toggle' });
+    expect(toggles).toHaveLength(6);
+    expect(toggles.every(toggle => toggle.findAllByType('small').length === 0)).toBe(true);
+  });
+
   it('toggling pin streaming on persists pinStreamingCard=true', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
       ok: true,
@@ -2037,7 +2081,19 @@ describe('card behavior defaults', () => {
       }));
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of [
+      'toggle-disable-streaming',
+      'toggle-silent-reactions',
+      'toggle-pin-streaming-card',
+      'toggle-writable-link',
+      'toggle-private-card',
+      'toggle-streaming-button-output',
+      'toggle-streaming-button-terminal',
+      'toggle-streaming-button-writeLink',
+      'toggle-streaming-button-compact',
+      'toggle-streaming-button-stop',
+      'toggle-streaming-button-close',
+    ]) {
       const before = renderer.root.findByProps({ 'data-action': action }).props.checked;
       await act(async () => {
         renderer.root.findByProps({ 'data-action': action }).props.onChange({ currentTarget: { checked: !before } });

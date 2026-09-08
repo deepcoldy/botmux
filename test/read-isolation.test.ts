@@ -912,6 +912,16 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(12);
   });
 
+  it('cold-spawns panes predating the canonical session-data root contract', () => {
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(13);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 13,
+      bootId: 'lexical-data-root',
+      state: 'committed',
+      capabilities: ['credential', 'read', 'write'],
+    }), ['credential', 'read', 'write'])).toBe(false);
+  });
+
   it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
     // A pane spawned before this change keeps its ORIGINAL process environment, so
     // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep
@@ -958,6 +968,16 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
 describe('worker capability carve-out ordering', () => {
   const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
   const strippedSource = stripComments(source);
+
+  it('aligns Linux managed-origin grants with the canonical sandbox data root', () => {
+    const linuxAt = strippedSource.indexOf("if (process.platform === 'linux' && readIsolationOriginChannelId)");
+    expect(linuxAt).toBeGreaterThanOrEqual(0);
+    const grants = strippedSource.slice(linuxAt, strippedSource.indexOf('if (mcpRuntimeManifest)', linuxAt));
+    // The real-bwrap tests feed a compile-ready policy; guard the worker's
+    // production call site too, so lexical grants cannot silently return.
+    expect(grants).toMatch(/managedOriginCapabilityDirectory\(\s*canonical\(isolationRuntimeDataDir\)/);
+    expect(grants).toMatch(/managedOriginAttestationDirectory\(\s*canonical\(isolationRuntimeDataDir\)/);
+  });
 
   it('publishes each child-visible capability before the sandbox starts', () => {
     const macPathAt = strippedSource.indexOf("readIsolationOriginCapabilityFile = process.platform === 'darwin'");

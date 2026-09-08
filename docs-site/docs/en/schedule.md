@@ -123,6 +123,33 @@ Cross-topic notice: a plain topic-pinned task that fires somewhere other than it
 
 `--follow-active` only makes sense for topic execution and cannot be combined with `--top-level` / `--new-topic`. Tasks of this kind show a `↷跟随活跃话题` marker in `schedule list`.
 
+## A Model Per Task
+
+Under one bot, different tasks usually deserve different model tiers: a sentinel firing every 30 minutes runs fine on a cheap model, while the nightly code review is the one that needs the strongest. `--model` / `--reasoning-effort` give a task its own model without touching the bot config or any other task.
+
+```bash
+# Frequent sentinel: cheap model, low effort
+botmux schedule add "every 30m" "check service health, alert only on failure" \
+  --silent --model gpt-5.2 --reasoning-effort low
+
+# Once-a-day deep task: strongest model, highest effort
+botmux schedule add "0 9 * * *" "review every PR merged to master yesterday" \
+  --new-topic --model gpt-5.6-sol --reasoning-effort ultra
+```
+
+The Dashboard "Schedules" page has both fields too; empty means "follow the bot config".
+
+**Only a run that creates a session can apply the model.** Model and reasoning effort are CLI **process launch** arguments (`codex --model X -c model_reasoning_effort=Y`) and cannot be changed once the process is up. So:
+
+| Execution position | Effect |
+| --- | --- |
+| `--new-topic` | Every run starts a new session, so the model applies **every time** |
+| `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
+
+Use `--new-topic` when it must apply on every run. Both the CLI and the Dashboard say which case you are in when you save.
+
+Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trigger API's `options.model`); a task on any other CLI ignores both fields at fire time and logs a warning. Which effort levels exist depends on the model (`gpt-5.6-sol` goes up to `ultra`, `gpt-5.5` stops at `xhigh`), and the Dashboard rejects an unsupported pairing on save. If the bot later switches CLI, or the model stops offering the level, the fire **drops that field and runs anyway** with a warning — stale configuration never skips a run.
+
 ## Management
 
 ```bash

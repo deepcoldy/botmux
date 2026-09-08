@@ -10,6 +10,7 @@
  *                                  body, 'footer' = ordinary reply-card footer,
  *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
+ *   • hiddenStreamingCardButtons — omit selected controls from live cards
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
  *                                  message (only meaningful while the card is off)
@@ -22,6 +23,8 @@
  *                                  native Feishu CoT message during turns
  *                                  (bot-level master switch; per-chat opt-out
  *                                  via /cot off)
+ *   • thinkingCardToolResult    — 思考气泡是否附带工具输出代码块（默认 on；
+ *                                  off 时只保留思考段落与工具节点标题）
  *   • senderTag                 — inject the per-turn `<sender>` tag naming who
  *                                  spoke (default on; off drops per-message
  *                                  identity from the prompt)
@@ -42,6 +45,10 @@ import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from '../im/lark/streaming-card-buttons.js';
 
 export interface BotCardPrefs {
   /** Where to show native Context / Token usage:
@@ -49,6 +56,7 @@ export interface BotCardPrefs {
    *  reply-card footer, 'off' = nowhere. */
   usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
+  hiddenStreamingCardButtons: StreamingCardButtonId[];
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -61,6 +69,9 @@ export interface BotCardPrefs {
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   thinkingCard: boolean;
+  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 TRUE（缺省 =
+   *  开；只有显式 false 持久化），同 thinkingCard 约定；thinkingCard 关闭时无意义。 */
+  thinkingCardToolResult: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as thinkingCard. Off also drops the cursor anti-echo note (it is
@@ -102,12 +113,14 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       thinkingCard: c.thinkingCard !== false,
+      thinkingCardToolResult: c.thinkingCardToolResult !== false,
       senderTag: c.senderTag !== false,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
@@ -126,12 +139,14 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
+      hiddenStreamingCardButtons: [],
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       thinkingCard: true,
+      thinkingCardToolResult: true,
       senderTag: true,
       overloadAlert: false,
       botToBotSameDir: true,
@@ -220,16 +235,24 @@ async function updateBotCardPrefsInternal(
     if (val === 'footer' || val === 'off') entry[key] = val;
     else delete entry[key];
   };
+  const applyHiddenButtons = (entry: any, val: StreamingCardButtonId[] | undefined) => {
+    if (val === undefined) return;
+    const normalized = normalizeHiddenStreamingCardButtons(val);
+    if (normalized) entry.hiddenStreamingCardButtons = normalized;
+    else delete entry.hiddenStreamingCardButtons;
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     applyDefaultTrue(entry, 'thinkingCard', patch.thinkingCard);
+    applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
@@ -247,12 +270,14 @@ async function updateBotCardPrefsInternal(
       result: {
         usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
+        hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         thinkingCard: entry.thinkingCard !== false,
+        thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
@@ -284,6 +309,9 @@ async function updateBotCardPrefsInternal(
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
   }
+  if (patch.hiddenStreamingCardButtons !== undefined) {
+    bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
+  }
   if (patch.pinStreamingCard !== undefined) {
     bot.config.pinStreamingCard = patch.pinStreamingCard || undefined;
   }
@@ -302,6 +330,10 @@ async function updateBotCardPrefsInternal(
   if (patch.thinkingCard !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.thinkingCard = patch.thinkingCard === false ? false : undefined;
+  }
+  if (patch.thinkingCardToolResult !== undefined) {
+    // 默认 true：只存显式 false，true 时清掉键（回到默认开）。
+    bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
   }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -352,11 +384,12 @@ async function updateBotCardPrefsInternal(
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `hiddenStreamingCardButtons=${r.result.hiddenStreamingCardButtons.join(',') || '-'} ` +
     `pinStreamingCard=${r.result.pinStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
-    `thinkingCard=${r.result.thinkingCard} ` +
+    `thinkingCard=${r.result.thinkingCard} thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +

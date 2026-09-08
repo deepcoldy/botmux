@@ -56,10 +56,39 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+| `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
 | `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Set to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
 
 `nativeSubagentRuntime` rewrites only new subagents created through Trae's native `spawn_agent`; it does not alter the parent agent itself. An absent dimension passes through the subagent request, while `custom` replaces it with a fixed value. When both a custom model and custom effort are configured, BotMux validates that Trae supports the combination. Switching the bot to another CLI removes this field automatically. In the Dashboard, “Pass through request” corresponds to an absent dimension. This policy is behavior configuration and is copied when cloning a bot, but it is intentionally excluded from portable Agent presets. Legacy `mode: "inherit"` values are invalid and are not applied.
+
+### Automatic CLI quota handoff
+
+`quotaFallbackBot` lets the daemon post one fixed, real `@` to a backup Bot at the original session landing point once the current CLI is confirmed quota-limited. It does not call the exhausted primary model, and the existing limit card and owner notification remain unchanged.
+
+![Quota-limit handoff under Dashboard Bot Configuration → Advanced](/img/quota-fallback-dashboard.png)
+
+```json
+{
+  "quotaFallbackBot": {
+    "enabled": true,
+    "targetAppId": "cli_xxx_backup",
+    "kinds": ["usage", "rate"],
+    "message": "The primary Bot has exhausted its quota. Please take over this conversation and continue from its context."
+  }
+}
+```
+
+- `targetAppId` is the backup Bot's stable Lark App ID. Never configure or copy an `ou_xxx`: open IDs are scoped to the sending application. At send time, the daemon resolves a receiver-scoped mention handle from the current chat's live membership.
+- `kinds` accepts `usage` and/or `rate`; omitting it enables both. Omitting `message` uses the built-in Chinese handoff text. The message is limited to 1000 characters and must be non-blank without a native `<at>` tag.
+- The target must be a locally configured Bot that is currently in the chat. Cross-deployment/team-directory targets are not supported yet because the daemon cannot safely prove which live `open_id` belongs to a remote App ID. Non-local, self, absent, and live-resolution failures all fail closed.
+- Save and Bot clone validate the complete impending handoff graph and reject self-reference or cycles such as `A → B → C → A`; an acyclic chain may continue cascading. If a manual edit introduces a cycle, `botmux start/restart` skips Bots in that cycle while still starting the Dashboard and unrelated Bots. Bot Config marks the skipped Bots and lets an operator repair the edge under Advanced → Quota-limit handoff; restart after saving to bring them online. A supervisor-driven daemon reload still disables cyclic handoff at load time and logs a warning so malformed configuration cannot spread its impact.
+
+![Dashboard marks Bots skipped because of a handoff cycle and opens the Advanced recovery controls](/img/quota-fallback-cycle-recovery-dashboard.png)
+
+- Within a daemon, the source Bot and limit kind are deduplicated across all sessions for five minutes. A failed identity lookup or delivery still occupies that window to prevent a short retry storm.
+- Chat-scoped sessions land in the original chat and thread-scoped sessions land in the original thread. The backup Bot reads context from the existing history. Restoring a daemon with an already-limited session does not backfill an old handoff.
+- The whole feature is inert when the block is absent or `enabled` is not exactly `true`, preserving previous behavior. Configure it under Dashboard "Bot Configuration → Advanced → Quota-limit handoff," or edit `bots.json` manually.
 
 ### Codex-compatible distributions
 
@@ -196,6 +225,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
+| `hiddenStreamingCardButtons` | Hides selected main controls on live streaming cards. Values: `output` (also hides text export and screenshot refresh), `terminal`, `writeLink`, `compact`, `stop`, and `close` (`Disconnect` on adopted sessions). Missing or empty shows every control, for example `["terminal", "writeLink", "close"]`. Hot-update with `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close`; `unset` restores all controls |
 | `pinStreamingCard` | When `true`, the bot **pins the current public live-status card**. It is opt-in and default-off: only an explicit `true` enables it. Only the current public live-status real `streamCardId` participates; repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay out of scope. The switch is hot-updated: once dashboard or `/botconfig set pinStreamingCard on/off` successfully writes local config and changes the effective value, Botmux runs a best-effort reconciliation across this bot's **existing active sessions**, and after a daemon restart it also schedules one fire-and-forget recovery pass for the current bot after `restoreActiveSessions`. The configuration response and daemon readiness do **not wait** for Feishu Pin/Unpin calls. Failures never interrupt publication, transfer, resume, close, startup, or configuration itself; during exceptional periods there may temporarily be zero or multiple Pins. This feature adds **no durable retry journal and no broad remote cleanup**: restart recovery only trusts Feishu Pins whose operator provenance is `app_id === current larkAppId`, then narrows cleanup to the strict intersection with the enqueue-time local candidate IDs. A colliding current Pin with human, other-app, mixed, or malformed provenance is neither claimed nor re-pinned; an absent current Pin is claimed only when create returns the exact message ID and same-app provenance. Explicit off cleans process-owned IDs plus freshly proven local candidates, while ordinary disable, close, and transfer remain process-ownership-only |
 | `noPinStreamingCardChats` | Array of `chatId`s where Botmux must **not pin** streaming cards even when `pinStreamingCard` is enabled for the bot. This is the negative set behind `/card pin off|on`. The live streaming cards themselves still post normally; only the Pin side effect is suppressed for those chats. Empty / absent means no per-chat opt-out |
 | `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |
@@ -209,6 +239,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | Field | Description |
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
+| `thinkingCardToolResult` | Boolean, default `true` (on). Whether tool nodes in the native thinking bubble (bot-level master switch `thinkingCard`, default on) carry the command output / file content code block. `false` keeps only thinking paragraphs and tool node titles (tool · command / path) and degrades the result to a single `✓ Done` line (a tool node only leaves the “running” state once a result event arrives, so the event cannot simply be dropped), matching Claude Code's own UI; toggle via `/botconfig set thinkingCardToolResult off` or the dashboard card sub-switch, effective immediately |
 
 With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
 

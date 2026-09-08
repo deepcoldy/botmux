@@ -81,7 +81,7 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) · `minimax` (MiniMax `mmx text repl`; region set by `mmx auth login --region cn|global`, isolate multiple regions on one host via per-bot `env` `MMX_CONFIG_DIR`) …
 
 The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
 

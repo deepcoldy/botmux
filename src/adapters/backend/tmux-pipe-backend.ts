@@ -935,7 +935,10 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private stopLifecycleWatcher(): void {
     if (this.lifecycleTimer) {
-      clearInterval(this.lifecycleTimer);
+      // Watcher is a chained setTimeout (backoff), not setInterval. Node
+      // aliases the two clears; still call the matching one so a future
+      // runtime that does not cannot leave a probe timer on the loop.
+      clearTimeout(this.lifecycleTimer);
       this.lifecycleTimer = null;
     }
   }
@@ -986,13 +989,15 @@ export class TmuxPipeBackend implements SessionBackend {
     liveFifoReaders.delete(this);
     this.fifoTornDown = true;
     if (this.readStream) {
-      try { this.readStream.destroy(); } catch { /* already closed */ }
-      // After destroy the stream must not keep the event loop alive. Bun's test
-      // runner waits for open handles between cases; a destroyed-but-still-ref'd
-      // fifo reader is what wedged test/tmux-startup-storm-recovery.test.ts
-      // after its first case passed (CI FILE_WALL, 720s).
-      try { (this.readStream as { unref?: () => void }).unref?.(); } catch { /* not a handle anymore */ }
+      const stream = this.readStream as fs.ReadStream & { close?: () => void; unref?: () => void };
       this.readStream = null;
+      // Bun's ReadStream has close() and no unref() (verified bun 1.4.0).
+      // bun test waits for open handles after the last case; destroy()+unref
+      // is a no-op there and left test/tmux-startup-storm-recovery.test.ts
+      // wedged until the 720s FILE_WALL after both cases had already passed.
+      try { stream.close?.(); } catch { /* already closed */ }
+      try { stream.destroy(); } catch { /* already closed */ }
+      try { stream.unref?.(); } catch { /* not a handle anymore */ }
     }
     if (this.fifoWakeFd !== null) {
       // EAGAIN (pipe full) is fine: a full pipe means the read already has data

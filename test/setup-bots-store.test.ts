@@ -66,6 +66,16 @@ describe('writeBotsJsonAtomic', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t' }]);
     expect(existsSync(join(tmpDir, 'bots.json'))).toBe(true);
   });
+
+  it('rejects a cloned next generation that would create a fallback cycle', () => {
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe' }]);
+    const before = readFileSync(botsPath, 'utf8');
+    expect(() => writeBotsJsonAtomic(botsPath, [
+      { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
+      { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
+    ])).toThrow('cli_a -> cli_b -> cli_a');
+    expect(readFileSync(botsPath, 'utf8')).toBe(before);
+  });
 });
 
 describe('readBotsJsonOrEmpty', () => {

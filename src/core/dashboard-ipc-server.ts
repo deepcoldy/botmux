@@ -30,6 +30,7 @@ import {
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import {
   resolveSchedulePrecondition,
@@ -59,6 +60,11 @@ import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import {
+  isStreamingCardButtonId,
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -111,6 +117,11 @@ import { config } from '../config.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
+import {
+  findQuotaFallbackCycle,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -261,7 +272,9 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { tokenStoreProtection } from '../services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
@@ -3331,6 +3344,9 @@ export interface ScheduleRow {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  /** Per-task CLI model / effort; absent means "the bot's configuration". */
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   hasPrecondition: boolean;
   preconditionEnabled?: boolean;
   /** Authenticated management projection of the protected source. Internal
@@ -3348,6 +3364,80 @@ type ScheduleChatTargetsParseResult =
 /** Accept the legacy singular target and the Dashboard's multi-target array.
  * The array is authoritative when supplied; requiring an agreeing legacy field
  * avoids two different "primary" targets in one request. */
+type ScheduleModelWriteResult =
+  | { ok: true; model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null }
+  | { ok: false; field: string; error: string };
+
+/**
+ * Parse and validate a write to a task's per-task model / reasoning effort.
+ *
+ * Unlike fire time — which degrades a stale pairing to the bot's configuration
+ * so a run is never skipped — a dashboard write is a human sitting in front of
+ * the form, so an unusable pairing is rejected outright and they can fix it.
+ * The gate mirrors the trigger API: only CLIs implementing the per-turn model
+ * contract may be steered, and the effort must exist on the model the run will
+ * actually use.
+ *
+ * `''` / `null` clears the override (`update` only); absent leaves it alone.
+ */
+function parseScheduleModelWrite(
+  body: Record<string, unknown>,
+  larkAppId: string,
+  mode: 'create' | 'update',
+  current?: { model?: string; reasoningEffort?: ScheduleReasoningEffort },
+): ScheduleModelWriteResult {
+  const out: { model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null } = {};
+  if (body.model !== undefined) {
+    if (body.model !== null && typeof body.model !== 'string') {
+      return { ok: false, field: 'model', error: 'invalid_field' };
+    }
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!model && mode === 'create') {
+      // A create with an empty model simply pins nothing.
+    } else {
+      out.model = model || null;
+    }
+  }
+  if (body.reasoningEffort !== undefined) {
+    if (body.reasoningEffort === null || body.reasoningEffort === '') {
+      if (mode === 'update') out.reasoningEffort = null;
+    } else if (!scheduleStore.isScheduleReasoningEffort(body.reasoningEffort)) {
+      return { ok: false, field: 'reasoningEffort', error: 'invalid_field' };
+    } else {
+      out.reasoningEffort = body.reasoningEffort;
+    }
+  }
+  if (out.model === undefined && out.reasoningEffort === undefined) return { ok: true };
+
+  // Validate the SETTLED task, not just this request: an update supplying only
+  // an effort must be checked against the model the task already pinned.
+  const model = out.model === undefined ? current?.model : (out.model ?? undefined);
+  const reasoningEffort = out.reasoningEffort === undefined
+    ? current?.reasoningEffort
+    : (out.reasoningEffort ?? undefined);
+  if (!model && !reasoningEffort) return { ok: true, ...out };
+
+  let botCfg: BotConfig | undefined;
+  try { botCfg = getBot(larkAppId).config; } catch { botCfg = undefined; }
+  if (!isConfigurableReasoningCliId(botCfg?.cliId)) {
+    return {
+      ok: false,
+      field: 'model',
+      error: `CLI ${botCfg?.cliId ?? '(unset)'} 不支持任务级模型/思考强度`,
+    };
+  }
+  const effectiveModel = model ?? botCfg?.model;
+  if (reasoningEffort
+      && !cliModelSupportsReasoningEffort(botCfg?.cliId, effectiveModel, reasoningEffort)) {
+    return {
+      ok: false,
+      field: 'reasoningEffort',
+      error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${reasoningEffort}`,
+    };
+  }
+  return { ok: true, ...out };
+}
+
 function parseScheduleChatTargets(
   body: Record<string, unknown>,
   required: boolean,
@@ -3448,6 +3538,8 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
+    model: t.model,
+    reasoningEffort: t.reasoningEffort,
     ...schedulePreconditionProjection(t),
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
@@ -3649,6 +3741,14 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     followActive = b.followActive;
   }
+  // 用 `cachedLarkAppId` 校验，与下面落盘的 `larkAppId: cachedLarkAppId` 是同一个
+  // 值：任务归哪个 bot，就必须用那个 bot 的 CLI 判定模型/强度是否可用。表单虽然能
+  // 选 bot，但 POST 目前不接受 body 里的 larkAppId，所以两者恒等。若将来放开，这两
+  // 处必须一起改，否则会变成「用 A bot 的 CLI 去校验 B bot 的任务」。
+  const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'create');
+  if (!modelWrite.ok) {
+    return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+  }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
     if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
@@ -3722,6 +3822,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       deliver,
       silent,
       followActive: followActive || undefined,
+      model: modelWrite.model ?? undefined,
+      reasoningEffort: modelWrite.reasoningEffort ?? undefined,
     }, cachedLarkAppId, precondition.create);
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
@@ -3745,6 +3847,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
     chatId?: string; chatIds?: readonly string[] | null;
+    model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
   } = {};
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
@@ -3813,6 +3916,17 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     updates.silent = b.silent;
   }
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (b.model !== undefined || b.reasoningEffort !== undefined) {
+    // The pairing is judged on the task as it will END UP, so an edit touching
+    // only one half is still checked against the other half already stored.
+    const existing = scheduleStore.getTask(p.id, cachedLarkAppId);
+    const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'update', existing);
+    if (!modelWrite.ok) {
+      return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+    }
+    if (modelWrite.model !== undefined) updates.model = modelWrite.model;
+    if (modelWrite.reasoningEffort !== undefined) updates.reasoningEffort = modelWrite.reasoningEffort;
+  }
   let result;
   try {
     result = updateTaskWithOptionalPrecondition(
@@ -4946,12 +5060,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // that is always empty — the CLI has no resolvable transcript).
     usageSupported: cliSupportsNativeUsage(cliId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
+    hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
     thinkingCard: cardPrefs.thinkingCard,
+    thinkingCardToolResult: cardPrefs.thinkingCardToolResult,
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
@@ -4963,6 +5079,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    quotaFallbackBot: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
+      catch { return null; }
+    })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
@@ -4996,13 +5116,82 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   });
 });
 
+type QuotaFallbackDashboardUpdate =
+  | { ok: true; config: QuotaFallbackBotConfig | null }
+  | { ok: false; error: string; reason?: string; cycle?: string[] };
+
+// Per-bot quota fallback topology. The complete next bots.json generation is
+// checked while the cross-process config lock is held, so two concurrent saves
+// cannot each validate against stale state and jointly create A→B→A.
+ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+
+  try {
+    const result = await rmwBotEntry<QuotaFallbackDashboardUpdate>(cachedLarkAppId, (entry, all) => {
+      if (body.enabled !== true) {
+        delete entry.quotaFallbackBot;
+        const cycle = findQuotaFallbackCycle(all);
+        return cycle
+          ? { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } }
+          : { write: true, result: { ok: true, config: null } };
+      }
+
+      const normalized = normalizeQuotaFallbackBotConfig(body, cachedLarkAppId);
+      if (!normalized.config) {
+        return {
+          write: false,
+          result: { ok: false, error: 'invalid_quota_fallback', reason: normalized.error },
+        };
+      }
+      const target = all.find(candidate =>
+        candidate?.larkAppId === normalized.config!.targetAppId
+        && candidate?.apiOnly !== true
+        && candidate?.activationPending !== true
+        && candidate?.activationDeactivating === undefined
+        && candidate?.activationStarting === undefined
+        && candidate?.activationCommitted === undefined,
+      );
+      if (!target) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_target_not_local' } };
+      }
+
+      entry.quotaFallbackBot = normalized.config;
+      const cycle = findQuotaFallbackCycle(all);
+      if (cycle) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } };
+      }
+      return { write: true, result: { ok: true, config: normalized.config } };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    if (!result.result.ok) {
+      const status = result.result.error === 'quota_fallback_cycle' ? 409 : 400;
+      return jsonRes(res, status, result.result);
+    }
+    getBot(cachedLarkAppId).config.quotaFallbackBot = result.result.config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackBot: result.result.config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_save_failed', reason: error?.message ?? String(error) });
+  }
+});
+
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
-    disableStreamingCard?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
+    thinkingCardToolResult?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
@@ -5014,7 +5203,8 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
-    disableStreamingCard?: boolean; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
+    thinkingCardToolResult?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -5024,6 +5214,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (Array.isArray(body.hiddenStreamingCardButtons)
+      && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {
+    patch.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(body.hiddenStreamingCardButtons) ?? [];
+  }
   if (typeof body.pinStreamingCard === 'boolean') patch.pinStreamingCard = body.pinStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
@@ -5031,6 +5225,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
+  if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
@@ -5819,6 +6014,11 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 标签是 owner 自己的收件箱侧边栏，这次授权只可能是他本人的。
+      // 从注册表派生 owner，`ownerOpenId` 只作兜底：那个原始字段实际部署里几乎
+      // 没人填，缺了它 pending 记录就没有归属，回调时也就没法校验「链接是不是
+      // 被转给别人点了」——命令路径有这道校验，Dashboard 这条不该没有。
+      getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
     );
     jsonRes(res, 200, { ok: true, authUrl });
   } catch (e: any) {
@@ -5833,7 +6033,11 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
-    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    // 同上：token 按人存，owner 解析不出来就是拿空 key 去查，徽标会对一个刚
+    // 授权完的人显示「未授权」。
+    const status = getFeedGroupAuthStatus(
+      cfg.larkAppId, normalizeBrand(cfg.brand), getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
+    );
     jsonRes(res, 200, {
       ok: true,
       ...status,
@@ -6153,6 +6357,54 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, body.codexAuthSync);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
+});
+
+// PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
+// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
+// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
+// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { triggerUserAuth?: unknown };
+  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  const spec = findConfigField('triggerUserAuth');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  // '' is the store's "clear" sentinel; anything else goes through the shared
+  // JSON coercion so a malformed policy is rejected the same way here as it is
+  // from chat.
+  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
+    ? ''
+    : JSON.stringify(body.triggerUserAuth);
+  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true });
+});
+
+// GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
+// 边界提示（token 存储保护程度、自带凭证的 MCP server）。
+// 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const policy = cfg.triggerUserAuth ?? null;
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
+    // as the same OS user as botmux and can read other people's token files.
+    const protection = tokenStoreProtection(cfg.sandbox === true);
+    const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    jsonRes(res, 200, {
+      ok: true,
+      policy,
+      authorizedCount,
+      tokenStoreEnforced: protection.enforced,
+      ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
+      ...(mcpAdvisory ? { mcpAdvisory } : {}),
+    });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如

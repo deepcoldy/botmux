@@ -56,10 +56,39 @@
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
+| `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
 
 `nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
+
+### CLI 限额自动交接
+
+`quotaFallbackBot` 让 daemon 在当前 CLI 确认进入额度限制状态时，用固定文案在原会话落点真实 `@` 一个备用 Bot。它不调用已耗尽额度的主模型，也不会改变原有的限额卡片或 owner 通知。
+
+![Dashboard「Bot 配置 → 高级」中的额度耗尽交接配置](/img/quota-fallback-dashboard.png)
+
+```json
+{
+  "quotaFallbackBot": {
+    "enabled": true,
+    "targetAppId": "cli_xxx_backup",
+    "kinds": ["usage", "rate"],
+    "message": "主 Bot 当前额度已耗尽，请接手本会话并结合上下文继续处理。"
+  }
+}
+```
+
+- `targetAppId` 必须是备用 Bot 的稳定飞书 App ID；不要配置或复制 `ou_xxx`，因为 `open_id` 按发送应用隔离。daemon 会在发送时从当前群的实时成员解析接收方视角下的 mention handle。
+- `kinds` 可选 `usage`（用量上限）和 / 或 `rate`（速率限制）；省略时两类都处理。`message` 省略时使用示例中的默认文案，最多 1000 字符，不能为空或包含原生 `<at>` 标签。
+- 目标必须是本机已配置且当前确实在群内的 Bot；跨部署 / 团队目录目标暂不支持，因为 daemon 目前无法安全证明远端 App ID 对应哪个实时 `open_id`。非本机目标、self、不在群或实时解析失败都会安全跳过。
+- 保存和复制 Bot 时会用「即将落盘」的完整配置检查交接图，拒绝 self 和 `A → B → C → A` 这类环路；无环链可以继续级联。若手工修改配置引入环路，`botmux start/restart` 会跳过环路中的 Bot，但仍启动 Dashboard 和无关 Bot；Dashboard 的 Bot 配置列表会标记这些未启动 Bot，并允许在「高级 → 额度耗尽交接」直接修复，保存后重启即可恢复。supervisor 重拉 daemon 时仍会在加载层禁用环路交接并记录 warning，避免异常配置扩大影响。
+
+![Dashboard 标记因交接环路而未启动的 Bot，并直接打开高级修复入口](/img/quota-fallback-cycle-recovery-dashboard.png)
+
+- daemon 内按「源 Bot + 限额类型」在所有会话间做 5 分钟去重；身份解析或发送失败也会占用这个去重窗口，避免短时重试风暴。
+- chat-scope 会落回原群，thread-scope 会落回原话题；上下文由备用 Bot 自己读取当前历史。daemon 重启恢复旧限额状态时不会补发历史交接。
+- 整个配置块缺省或 `enabled` 不为 `true` 时完全关闭，保持旧行为。可在 Dashboard「Bot 配置 → 高级 → 额度耗尽交接」配置，也可手工编辑 `bots.json`。
 
 ### Codex 兼容发行版
 
@@ -195,6 +224,7 @@
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
+| `hiddenStreamingCardButtons` | 隐藏实时流式卡片中的指定主按钮。可选值：`output`（同时隐藏导出文字、截图刷新）、`terminal`、`writeLink`、`compact`、`stop`、`close`（接管会话中对应“断开”）。缺省或空数组显示全部，例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close` 热更新，`unset` 恢复全部 |
 | `pinStreamingCard` | `true` 时为该 bot **置顶当前公开的实时状态卡片**；默认关闭，只有显式 `true` 才开启。只认当前公开 live-status 的真实 `streamCardId`，repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡、以及其它交互卡都不参与。开关支持热更新：通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 成功写盘且有效值发生变化后，会对这个 bot 的**现有活跃会话**做 best-effort 热重算；daemon 重启后还会在 `restoreActiveSessions` 完成后，为当前 bot 额外安排一次 fire-and-forget 恢复。配置响应和 daemon readiness **都不会等待**飞书 Pin/Unpin 完成。失败不会中断发卡、转移、恢复、关闭、启动或配置本身；异常期间可能暂时出现 0 个或多个 Pin。该功能**不维护持久重试日志，也不会做宽泛的远端清理**：重启恢复只信任飞书返回里 `app_id === 当前 larkAppId` 的操作来源，然后再与本进程入队瞬间已知的本地候选 ID 做严格交集。人工、其它应用、混合或来源字段不完整的同 ID 当前 Pin 既不会被认领，也不会被重复 Pin；只有列表中不存在当前卡时才创建，且 create 返回必须精确匹配消息 ID 与同应用来源。显式关闭只清理进程内已拥有的 ID 与远端刚证明属于同应用的本地候选；普通 disable、关闭会话和转移只清理进程内已拥有的 ID |
 | `noPinStreamingCardChats` | 一个 `chatId` 数组，表示即使 bot 已开启 `pinStreamingCard`，这些群里也**不要自动置顶**流式卡片。它就是 `/card pin off|on` 背后的 negative set。实时流式卡片本身仍照常发送，只是当前群不再触发 Pin 副作用；为空或缺省表示没有按群关闭 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
@@ -203,11 +233,16 @@
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
 
+Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同一配置的可视化开关：
+
+![实时卡片按钮配置](/img/streaming-card-button-settings.png)
+
 ## Prompt 注入
 
 | 字段 | 说明 |
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+| `thinkingCardToolResult` | 布尔，默认 `true`（开）。思考气泡（bot 级总开关 `thinkingCard`，默认开）的工具节点是否附带命令输出 / 文件内容代码块。设为 `false` 后气泡只保留思考段落与工具节点标题（工具名 · 命令 / 路径），结果退化成一行 `✓ 已完成`（工具节点在飞书端要收到结果事件才会从「执行中」落定，所以不能干脆不发），与 Claude Code 自身界面一致；`/botconfig set thinkingCardToolResult off` 或 dashboard「卡片」子开关切换，立即生效 |
 
 关掉后模型看不到发言人身份：多人会话里无法区分谁说的、也无法按人称呼。适合模型会把标签内容抄进回复正文的 CLI（如 cursor，见 `<sender_note>` 反抄写提示——标签关掉后该提示也一并消失），或不希望把每条消息的身份写进 CLI 记录的场景。
 

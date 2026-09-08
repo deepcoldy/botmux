@@ -82,6 +82,7 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
+import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -205,6 +206,7 @@ import {
   larkTransportEnabled,
 } from './core/types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/pending-repo-journal.js';
+import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -326,6 +328,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
+import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -341,7 +344,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3510,6 +3513,21 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
+  // turn. This is the per-message acceptance point — every inbound turn passes
+  // through here before reaching the worker — so it is the one place that can
+  // guarantee no turn runs with the previous sender's credentials still on disk.
+  // It precedes the reaction bookkeeping and its early returns: a card-on session
+  // returns below, but its turns need the identity refreshed just the same.
+  //
+  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
+  // here would yield a microtask before the bookkeeping below on every turn of
+  // every bot, reordering concurrent turns that the single-flight paths depend
+  // on. A feature that is off must not perturb timing at all, so the await only
+  // happens once a bot has actually opted in.
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3554,6 +3572,65 @@ export async function noteTurnReceived(
     return;
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+/**
+ * Publish the acting CLI identity for one turn, and tell the sender when they
+ * need to authorize.
+ *
+ * The sender comes from the daemon's own per-turn record (`replyTargets`, via
+ * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
+ * are daemon-owned: a worker contributes only a turn id and can never choose
+ * which human that id denotes.
+ *
+ * The "please authorize" notice is sent at most once per session per tool. A
+ * repeat on every turn would be noise, and the sender already has the link.
+ */
+/** Whether this session's bot opted into trigger-user CLI auth. Synchronous so a
+ *  bot that has not opted in adds no await boundary to the turn path at all. */
+function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
+async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  let botConfig;
+  try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
+  if (!botConfig.triggerUserAuth?.enabled) return;
+
+  // Strictly this turn's sender. NOT `lastCallerOpenId`: that is the last human
+  // who happened to talk to the session, and a turn with no sender of its own
+  // (scheduled run, hook, meeting event, bot-to-bot handoff) is exactly the case
+  // where borrowing them would run someone else's automation under their name,
+  // silently and with their permissions.
+  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+
+  await publishTurnCliIdentity({
+    botConfig,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId,
+    locale: localeForBot(ds.larkAppId),
+    // Stamped so the wrapper can tell these credentials apart from a later
+    // message's: acceptance here is not the same instant as the CLI starting
+    // this turn, and B's message can be accepted while A's turn still runs.
+    turnId,
+  });
+
+  // NO chat notice here.
+  //
+  // This ran at message-acceptance, before the agent had decided which tool it
+  // would use, so it announced every governed tool that lacked credentials.
+  // Ask for lark-cli and you were told to authorize bytedcli as well — advice
+  // for something you were not doing. It was also once-per-session, so the one
+  // time it WOULD have been useful (you finally do call bytedcli and it is
+  // refused) it stayed silent.
+  //
+  // The refusal already carries this. The wrapper prints, on stderr, which tool
+  // was refused and which command authorizes it — at the moment of the refusal,
+  // for that tool only, every time it happens. That is strictly better
+  // information than a guess made a second earlier, so the guess is gone rather
+  // than being made narrower.
 }
 
 async function sessionReply(
@@ -4912,6 +4989,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
       silentIdleCardFlag(ds),
       dshRuntimeForSession(ds),
+      resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -4943,6 +5021,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // while the previous turn is still running) and must not relabel this card.
   ds.currentTurnId = turnId;
   ds.usageLimit = undefined;
+  ds.quotaFallbackAttemptToken = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
   ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
@@ -17077,80 +17156,92 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
   if (token !== undefined && ds.initialStartClaimToken !== token) return false;
   ds.initialStartClaimToken = undefined;
   ds.initialStartPending = false;
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) === 0) {
-    ds.queuedActivationTailReleasePending = undefined;
-    if (ds.queuedActivationTailReleaseRetryTimer) {
-      clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
-      ds.queuedActivationTailReleaseRetryTimer = undefined;
-    }
+  if (ds.queuedActivationTailReleaseRetryTimer) {
+    clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
+    ds.queuedActivationTailReleaseRetryTimer = undefined;
   }
   return true;
 }
 
-/** Fence an arrival before any sender/prompt await. Besides reserving durable
- * FIFO order, keep the opening route owned until this reservation either lands
- * in the durable tail or fails. */
-function reserveAsyncQueuedActivationTailAdmission(
-  ds: DaemonSession,
-): QueuedActivationTailReservation {
-  const reservation = reserveQueuedActivationTailAdmission(ds);
-  ds.queuedActivationTailAdmissionsOutstanding =
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) + 1;
-  return reservation;
+/** True while a failed release still has work: the route is held, or a
+ * durable tail entry is waiting for promotion. Do not key this only on
+ * `initialStartPending` — inline promote can fail after the opening already
+ * cleared that flag, and `promoteQueuedActivationTail` setting it again
+ * before a store throw is not a contract. */
+function queuedActivationReleaseDue(ds: DaemonSession): boolean {
+  return ds.initialStartPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0;
 }
 
+/** Retry a route release whose durable promotion failed (a store write or the
+ * worker IPC) while the route is still held. The retry is one more command on
+ * the session's turn queue, so it cannot overtake an admission that arrived in
+ * the meantime. */
 function scheduleQueuedActivationTailReleaseRetry(
   ds: DaemonSession,
   acknowledgedToken?: string,
 ): void {
-  if (!ds.initialStartPending || ds.queuedActivationTailReleaseRetryTimer) return;
+  if (!queuedActivationReleaseDue(ds) || ds.queuedActivationTailReleaseRetryTimer) return;
   const timer = setTimeout(() => {
     if (ds.queuedActivationTailReleaseRetryTimer !== timer) return;
     ds.queuedActivationTailReleaseRetryTimer = undefined;
-    if (!ds.initialStartPending) return;
-    if (!releaseQueuedActivationReservation(ds, acknowledgedToken)) {
-      scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
-    }
+    if (!queuedActivationReleaseDue(ds)) return;
+    void releaseQueuedActivationReservation(ds, acknowledgedToken).then(released => {
+      if (!released) scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
+    }, err => {
+      logger.error(
+        `[${ds.session.sessionId.slice(0, 8)}] Queued activation release retry failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }, 100);
   timer.unref?.();
   ds.queuedActivationTailReleaseRetryTimer = timer;
 }
 
-/** Complete one async reservation. If the predecessor ACK arrived during its
- * await, the final settler performs the deferred handoff immediately. */
-function settleAsyncQueuedActivationTailAdmission(ds: DaemonSession): void {
-  const outstanding = Math.max(
-    0,
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) - 1,
-  );
-  ds.queuedActivationTailAdmissionsOutstanding = outstanding || undefined;
-  if (outstanding > 0 || !ds.queuedActivationTailReleasePending) return;
-  const pending = ds.queuedActivationTailReleasePending;
-  ds.queuedActivationTailReleasePending = undefined;
-  if (!releaseQueuedActivationReservation(ds, pending.acknowledgedToken)) {
-    scheduleQueuedActivationTailReleaseRetry(ds, pending.acknowledgedToken);
-  }
+/** Admit one same-anchor follower behind the opening it arrived after.
+ *
+ * Its FIFO order was stamped at arrival (`reservation`); the prompt build
+ * awaits (sender lookup), so build + durable admission run as ONE command on
+ * the session's turn queue — neither a later arrival nor the opening's ACK can
+ * act on the session in between. If the opening released its route while this
+ * follower was still queued (its ACK or ordinary fork ran ahead on the same
+ * queue and found an empty tail), nothing else will promote the entry, so the
+ * same command promotes it inline — never through the queue again. */
+async function admitFollowerBehindOpening(
+  ds: DaemonSession,
+  reservation: QueuedActivationTailReservation,
+  follower: { userPrompt: string; turnId: string; build: () => Promise<CliTurnPayload> },
+): Promise<void> {
+  await runSessionTurn(ds.session.sessionId, async () => {
+    const cliInput = await follower.build();
+    admitQueuedActivationTail(ds, {
+      userPrompt: follower.userPrompt,
+      cliInput,
+      turnId: follower.turnId,
+    }, reservation);
+    if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
+      scheduleQueuedActivationTailReleaseRetry(ds);
+    }
+  });
 }
-
-export const __testOnly_reserveAsyncQueuedActivationTailAdmission =
-  reserveAsyncQueuedActivationTailAdmission;
-export const __testOnly_settleAsyncQueuedActivationTailAdmission =
-  settleAsyncQueuedActivationTailAdmission;
 
 /** Release a queued activation's runtime route reservation only after the
  * worker ACKs actual adapter submission. Turns that arrived meanwhile are sent
- * as one ordered follow-up, never allowed to overtake the opening item. */
-function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken?: string): boolean {
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0) {
-    // The worker may ACK while N+1 is still awaiting sender/resource prompt
-    // construction. Keep the route gate and replay this release when the last
-    // reserved arrival either persists or fails.
-    ds.queuedActivationTailReleasePending = acknowledgedToken === undefined
-      ? {}
-      : { acknowledgedToken };
-    return false;
-  }
-  ds.queuedActivationTailReleasePending = undefined;
+ * as one ordered follow-up, never allowed to overtake the opening item.
+ *
+ * One command on the session's turn queue: a follower whose build + admission
+ * is still in flight was enqueued before this release, so the release runs
+ * after its durable tail entry exists — no outstanding counter, no deferred
+ * replay. */
+function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken?: string): Promise<boolean> {
+  return runSessionTurn(ds.session.sessionId, () => releaseQueuedActivationReservationNow(ds, acknowledgedToken));
+}
+
+/** The release itself. Only for a caller already running on the session's turn
+ * queue (a follower admission that found the route released); every other
+ * caller goes through {@link releaseQueuedActivationReservation}. */
+function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedToken?: string): boolean {
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
@@ -17225,27 +17316,6 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     ds.pendingCodexAppApplicationContext = undefined;
   }
 
-  // Migrate pre-durable runtime tails (and tests/rolling-upgrade state) before
-  // advancing. Persistence happens before the volatile cursor is cleared.
-  for (const staged of ds.pendingQueuedActivationFollowUps ?? []) {
-    const reservation = reserveQueuedActivationTailAdmission(ds);
-    try {
-      admitQueuedActivationTail(ds, {
-        userPrompt: staged.userPrompt,
-        cliInput: staged.cliInput,
-        turnId: staged.turnId,
-        dispatchAttempt: staged.dispatchAttempt,
-      }, reservation, { codexAppInputGateFrozen: true });
-    } catch (err) {
-      logger.error(
-        `[${ds.session.sessionId.slice(0, 8)}] Failed to migrate activation successor: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
-    }
-  }
-  ds.pendingQueuedActivationFollowUps = undefined;
-
   if ((ds.session.queuedActivationTail?.length ?? 0) === 0) {
     clearInitialStartBuffers(ds);
     clearInitialStartClaim(ds);
@@ -17277,11 +17347,12 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
 }
 
 export const __testOnly_releaseQueuedActivationReservation = releaseQueuedActivationReservation;
+export const __testOnly_admitFollowerBehindOpening = admitFollowerBehindOpening;
 
 /** Exact production callback passed to initWorkerPool. Keep the boolean return:
  * false means the worker did not accept the staged FIFO head and the pool must
  * retry instead of silently dropping the activation reservation. */
-function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string): boolean {
+function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string): Promise<boolean> {
   return releaseQueuedActivationReservation(ds, activationToken);
 }
 
@@ -17306,12 +17377,19 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   const waitsForQueuedAck = ds.session.queuedActivationPending === true;
   ds.initialStartPending = waitsForQueuedAck
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0;
+    || hasPendingSessionTurns(ds.session.sessionId);
   clearInitialStartBuffers(ds);
   if (!waitsForQueuedAck && ds.initialStartPending) {
-    // A follower may have reserved FIFO order while the opening prompt was
-    // still being built. Hand off now, or defer until its reservation settles.
-    void releaseQueuedActivationReservation(ds);
+    // A follower may still be building its prompt behind this opening. The
+    // release is queued behind it, so the handoff sees every admitted entry.
+    void releaseQueuedActivationReservation(ds).then(released => {
+      if (!released) scheduleQueuedActivationTailReleaseRetry(ds);
+    }, err => {
+      logger.error(
+        `[${ds.session.sessionId.slice(0, 8)}] Failed to release the opening route after fork: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 }
 
@@ -17353,7 +17431,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
   // both the raw text and Enter have crossed the adapter boundary.
   const armRawActivationAck = !ds.session.queuedActivationPending
     && ((ds.session.queuedActivationTail?.length ?? 0) > 0
-      || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0);
+      || hasPendingSessionTurns(ds.session.sessionId));
   if (armRawActivationAck) ds.session.queued = true;
   try {
     forkWorker(ds, '', false);
@@ -18047,6 +18125,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -18498,7 +18577,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources, senderOpenId);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -19551,6 +19630,7 @@ async function handleThreadReplyAdmitted(
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, anchor, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -20142,11 +20222,14 @@ async function handleThreadReplyAdmitted(
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  // Same value the turn record below is built from; read here because the
+  // user-token fallback for a download should use the SENDER's own credentials.
+  const inboundSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   let attachments: LarkAttachment[];
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
     if (attachments.length > 0) {
       parsed.attachments = attachments;
@@ -20159,7 +20242,7 @@ async function handleThreadReplyAdmitted(
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
-  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const callerOpenId = inboundSenderOpenId;
   if (ds) {
     markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
@@ -20248,39 +20331,41 @@ async function handleThreadReplyAdmitted(
     && !ownsInitialStartClaim()
     && !liveTakeoverReady;
   if (ds && initialStartPending && !ds.pendingRepo) {
-    const tailReservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    try {
-      const botCfg = getBot(ds.larkAppId).config;
-      const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-        attachments,
-        mentions: parsed.mentions,
-        isAdoptMode: false,
-        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
-        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
-        sender: await getThreadSender(),
-        larkAppId,
-        chatId: ds.session.chatId,
-        whiteboardId: ds.session.whiteboardId,
-        substituteTrigger,
-        codexAppText: parsed.content,
-        codexAppApplicationContext,
-        codexAppMessageContext,
-      sessionBackendType: ds.session.backendType,
+    // FIFO order is stamped now, at arrival; the prompt build (sender lookup)
+    // and the durable admission then run as one command on the session's turn
+    // queue, so neither a later arrival nor the opening's ACK can act on the
+    // session in between.
+    const tailReservation = reserveQueuedActivationTailAdmission(ds);
+    await admitFollowerBehindOpening(ds, tailReservation, {
+      userPrompt: promptContent,
       turnId: parsed.messageId,
-      });
-      // R5-B1-1: freeze the admission-time steer authorization onto this earliest
-      // (initialStartPending follower) tail entry — the strip-proof admit rebuild
-      // then preserves it through promote/repark. Only a plain-human turn is true.
-      if (codexAppSteerable) followUp.codexAppSteerable = true;
-      admitQueuedActivationTail(ds, {
-        userPrompt: promptContent,
-        cliInput: followUp,
-        turnId: parsed.messageId,
-      }, tailReservation);
-      markIngressAdmitted(ctx);
-    } finally {
-      settleAsyncQueuedActivationTailAdmission(ds);
-    }
+      build: async () => {
+        const botCfg = getBot(ds.larkAppId).config;
+        const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          attachments,
+          mentions: parsed.mentions,
+          isAdoptMode: false,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+          sender: await getThreadSender(),
+          larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
+          codexAppText: parsed.content,
+          codexAppApplicationContext,
+          codexAppMessageContext,
+          sessionBackendType: ds.session.backendType,
+          turnId: parsed.messageId,
+        });
+        // R5-B1-1: freeze the admission-time steer authorization onto this earliest
+        // (initialStartPending follower) tail entry — the strip-proof admit rebuild
+        // then preserves it through promote/repark. Only a plain-human turn is true.
+        if (codexAppSteerable) followUp.codexAppSteerable = true;
+        return followUp;
+      },
+    });
+    markIngressAdmitted(ctx);
     logger.info(
       `[${tag(ds)}] buffered same-anchor turn ${parsed.messageId.substring(0, 12)} `
       + 'behind queued activation submission ACK',
@@ -20309,13 +20394,9 @@ async function handleThreadReplyAdmitted(
     return;
   }
   if (ds?.pendingRepo || initialStartPending) {
-    const durableTailReservation = ds.pendingRepo
-      ? reserveAsyncQueuedActivationTailAdmission(ds)
-      : undefined;
     const bufferedCodexAppInputAccepted = initialStartPending && !ds.pendingRepo
       ? codexAppCleanInputAcceptedForSession(ds)
       : undefined;
-    try {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
@@ -20413,11 +20494,13 @@ async function handleThreadReplyAdmitted(
         ds.session.queuedCodexAppMessageContext ??= ds.pendingCodexAppMessageContext;
         // R5-B1-1: freeze steer authorization onto the pending-repo follower tail.
         if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
+        // No await separates this arrival from its admission, so the FIFO
+        // order is stamped by the admit itself.
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: exactFollowUp,
           turnId: parsed.messageId,
-        }, durableTailReservation!);
+        });
       }
       // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
       // 失败也不得诱导重发（PR #846 review）。
@@ -20493,9 +20576,6 @@ async function handleThreadReplyAdmitted(
       : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
-    } finally {
-      if (durableTailReservation) settleAsyncQueuedActivationTailAdmission(ds);
-    }
   }
 
   if (!ds) {
@@ -20867,6 +20947,7 @@ async function handleThreadReplyAdmitted(
       ds.usageLimitRetryTimer = undefined;
     }
     ds.usageLimit = undefined;
+    ds.quotaFallbackAttemptToken = undefined;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     // The cosmetic freeze step (above) is gated on a live worker. With no
     // worker we just park the current card in frozenCards — the upcoming
@@ -20908,42 +20989,40 @@ async function handleThreadReplyAdmitted(
     // <whiteboard> block in its refork prompt) that its live turns never had.
     if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
     const stageCurrentBehindQueuedActivation = async (): Promise<void> => {
-      const tailReservation = reserveAsyncQueuedActivationTailAdmission(ds);
-      try {
-        const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          attachments,
-          mentions: parsed.mentions,
-          isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
-          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-          sender: await getThreadSender(),
-          larkAppId,
-          chatId: ds.session.chatId,
-          whiteboardId: ds.session.whiteboardId,
-          substituteTrigger,
-          codexAppText: parsed.content,
-          codexAppApplicationContext,
-          codexAppMessageContext,
-        sessionBackendType: ds.session.backendType,
+      const tailReservation = reserveQueuedActivationTailAdmission(ds);
+      await admitFollowerBehindOpening(ds, tailReservation, {
+        userPrompt: promptContent,
         turnId: parsed.messageId,
-        });
-        // R4-B1: freeze the admission-time steer authorization onto the queued
-        // opening payload so the worker-null re-fork path carries it exactly like
-        // the live-worker path (admission computed once at line ~18431; COPIED
-        // here, never re-inferred). System/recovery openings keep it absent.
-        if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
-        if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
-        admitQueuedActivationTail(ds, {
-          userPrompt: promptContent,
-          cliInput: currentFollowUp,
-          turnId: parsed.messageId,
-        }, tailReservation);
-        // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
-        // 不得再诱导重发。
-        markIngressAdmitted(ctx);
-      } finally {
-        settleAsyncQueuedActivationTailAdmission(ds);
-      }
+        build: async () => {
+          const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+            attachments,
+            mentions: parsed.mentions,
+            isAdoptMode: false,
+            cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+            cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+            sender: await getThreadSender(),
+            larkAppId,
+            chatId: ds.session.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger,
+            codexAppText: parsed.content,
+            codexAppApplicationContext,
+            codexAppMessageContext,
+            sessionBackendType: ds.session.backendType,
+            turnId: parsed.messageId,
+          });
+          // R4-B1: freeze the admission-time steer authorization onto the queued
+          // opening payload so the worker-null re-fork path carries it exactly like
+          // the live-worker path (admission computed once at line ~18431; COPIED
+          // here, never re-inferred). System/recovery openings keep it absent.
+          if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
+          if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
+          return currentFollowUp;
+        },
+      });
+      // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
+      // 不得再诱导重发。
+      markIngressAdmitted(ctx);
       ds.initialStartPending = true;
       await noteTurnReceived(
         ds,
@@ -21167,7 +21246,7 @@ async function handleThreadReplyAdmitted(
         // Ordinary cold reforks have no adapter-submission ACK. The child owns
         // the opening init after forkWorker returns, so hand any concurrently
         // buffered followers to its IPC queue now in exact arrival order.
-        retainInitialStartClaim = !releaseQueuedActivationReservation(ds);
+        retainInitialStartClaim = !(await releaseQueuedActivationReservation(ds));
       }
     }
   }
@@ -21524,6 +21603,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
       if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
       ds.usageLimit = undefined;
+      ds.quotaFallbackAttemptToken = undefined;
       ds.currentTurnTitle = text.substring(0, 50);
       parkStreamCard(ds);
       ds.streamCardId = undefined;

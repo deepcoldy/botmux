@@ -281,6 +281,11 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import {
+  findQuotaFallbackCycles,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
@@ -2705,6 +2710,64 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
     }]));
   } catch {
     return new Map();
+  }
+}
+
+type QuotaFallbackStartupBlock = { reason: 'quota_fallback_cycle'; cycle: string[] };
+
+/** File-backed Bot Defaults rows keep recovery possible when a daemon was
+ * deliberately skipped during startup. The dashboard itself is online, so it
+ * can expose the raw cyclic handoff edge and persist the repair without asking
+ * the unavailable daemon to proxy its own configuration. */
+async function configuredBotDefaultsRecoveryRows(
+  onlineAppIds: ReadonlySet<string>,
+): Promise<any[]> {
+  try {
+    const configs = loadBotConfigs();
+    const raw = await readRawConfig(requireConfigPath());
+    const rawByAppId = new Map(raw.map(entry => [String(entry?.larkAppId ?? ''), entry]));
+    const cycles = findQuotaFallbackCycles(raw);
+    const blockByAppId = new Map<string, QuotaFallbackStartupBlock>();
+    for (const cycle of cycles) {
+      for (const appId of cycle.slice(0, -1)) {
+        blockByAppId.set(appId, { reason: 'quota_fallback_cycle', cycle });
+      }
+    }
+    const persistedNames = readPersistedBotNames();
+    return configs
+      .map((bot, botIndex) => ({ bot, botIndex }))
+      .filter(({ bot }) => !onlineAppIds.has(bot.larkAppId))
+      .map(({ bot, botIndex }) => {
+        const rawEntry = rawByAppId.get(bot.larkAppId);
+        const payload = botDefaultsPayload({
+          larkAppId: bot.larkAppId,
+          botName: bot.displayName ?? bot.name ?? persistedNames.get(bot.larkAppId) ?? null,
+          cliId: bot.cliId,
+          brand: bot.brand,
+          cliRuntime: bot.cliRuntime,
+          cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
+          wrapperCli: bot.wrapperCli,
+          model: bot.model,
+          modelBackendVariant: bot.modelBackendVariant,
+          reasoningEffort: bot.reasoningEffort,
+          nativeSubagentRuntime: bot.nativeSubagentRuntime,
+          turnTimeoutMs: bot.turnTimeoutMs,
+          dshRuntime: bot.dshRuntime,
+          dshProfile: bot.dshProfile,
+        }, {
+          displayName: bot.displayName ?? null,
+          larkBotName: persistedNames.get(bot.larkAppId) ?? null,
+          quotaFallbackBot: rawEntry?.quotaFallbackBot,
+        });
+        return {
+          ...payload,
+          botIndex,
+          online: false,
+          ...(blockByAppId.has(bot.larkAppId) ? { startupBlocked: blockByAppId.get(bot.larkAppId) } : {}),
+        };
+      });
+  } catch {
+    return [];
   }
 }
 
@@ -6432,14 +6495,14 @@ const server = createServer(async (req, res) => {
         .map(b => withConfiguredCliId(b, agentFields))
         .map(b => ({ ...b, brand: brandByAppId.get(b.larkAppId) }))
         .sort((a, b) => a.botIndex - b.botIndex);
-      const out = await Promise.all(onlineBots.map(async d => {
+      const onlineOut = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');
           if (!r.ok) {
-            return botDefaultsPayload(d, undefined, `http_${r.status}`);
+            return { ...botDefaultsPayload(d, undefined, `http_${r.status}`), botIndex: d.botIndex };
           }
           const j = await r.json() as any;
-          return botDefaultsPayload({
+          return { ...botDefaultsPayload({
             ...d,
             botName: d.botName ?? j.botName,
             cliId: j.cliId || d.cliId,
@@ -6463,11 +6526,16 @@ const server = createServer(async (req, res) => {
               : d.nativeSubagentRuntime,
             turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
             dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
-          }, j);
+          }, j), botIndex: d.botIndex };
         } catch (e: any) {
-          return botDefaultsPayload(d, undefined, e?.message ?? String(e));
+          return { ...botDefaultsPayload(d, undefined, e?.message ?? String(e)), botIndex: d.botIndex };
         }
       }));
+      const recoveryRows = await configuredBotDefaultsRecoveryRows(
+        new Set(onlineBots.map(bot => bot.larkAppId)),
+      );
+      const out = [...onlineOut, ...recoveryRows]
+        .sort((a, b) => Number(a.botIndex ?? Number.MAX_SAFE_INTEGER) - Number(b.botIndex ?? Number.MAX_SAFE_INTEGER));
       return jsonRes(res, 200, { bots: out });
     }
 
@@ -6485,6 +6553,84 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    let mBotQuotaFallback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotQuotaFallback = url.pathname.match(/^\/api\/bots\/([^/]+)\/quota-fallback$/))) {
+      const appId = decodeURIComponent(mBotQuotaFallback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      if (registry.getByAppId(appId)) {
+        const upstream = await proxyToDaemon(appId, `/api/bot-quota-fallback`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+
+      let body: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid');
+        body = parsed;
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      try {
+        // Establish the authoritative bots.json path even if a caller reaches
+        // this recovery endpoint before the Bot Config page's GET /api/bots.
+        loadBotConfigs();
+        const result = await rmwBotEntry<
+          | { ok: true; config: QuotaFallbackBotConfig | null }
+          | { ok: false; error: string; reason?: string; cycle?: string[] }
+        >(appId, (entry, all) => {
+          if (body.enabled !== true) {
+            delete entry.quotaFallbackBot;
+            const cycle = findQuotaFallbackCycles(all)[0];
+            return cycle
+              ? { write: false, result: { ok: false as const, error: 'quota_fallback_cycle', cycle } }
+              : { write: true, result: { ok: true as const, config: null } };
+          }
+          const normalized = normalizeQuotaFallbackBotConfig(body, appId);
+          if (!normalized.config) {
+            return {
+              write: false,
+              result: { ok: false as const, error: 'invalid_quota_fallback', reason: normalized.error },
+            };
+          }
+          const target = all.find(candidate =>
+            candidate?.larkAppId === normalized.config!.targetAppId
+            && candidate?.apiOnly !== true
+            && candidate?.activationPending !== true
+            && candidate?.activationDeactivating === undefined
+            && candidate?.activationStarting === undefined
+            && candidate?.activationCommitted === undefined,
+          );
+          if (!target) {
+            return { write: false, result: { ok: false as const, error: 'quota_fallback_target_not_local' } };
+          }
+          entry.quotaFallbackBot = normalized.config;
+          const cycle = findQuotaFallbackCycles(all)[0];
+          return cycle
+            ? { write: false, result: { ok: false as const, error: 'quota_fallback_cycle', cycle } }
+            : { write: true, result: { ok: true as const, config: normalized.config } };
+        });
+        if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+        if (!result.result.ok) {
+          return jsonRes(res, result.result.error === 'quota_fallback_cycle' ? 409 : 400, result.result);
+        }
+        return jsonRes(res, 200, {
+          ok: true,
+          quotaFallbackBot: result.result.config,
+          restartRequired: true,
+        });
+      } catch (error: any) {
+        return jsonRes(res, 500, { ok: false, error: 'quota_fallback_save_failed', reason: error?.message ?? String(error) });
+      }
     }
 
     // PUT /api/bots/:appId/working-dir-mode — proxy to that bot's daemon. Body
@@ -6712,6 +6858,32 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Trigger-user CLI auth: per-bot switch + status. Proxied to that bot's
+    // daemon, which owns the shared validation path (/botconfig uses the same).
+    let mBotTriggerUserAuth: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTriggerUserAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuth[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    let mBotTriggerUserAuthStatus: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBotTriggerUserAuthStatus = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth-status$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuthStatus[1]);
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth-status`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -7160,7 +7332,14 @@ const server = createServer(async (req, res) => {
       try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
       catch { /* handled below */ }
       if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
-      const { authUrl } = generateAuthUrl(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), [...FEED_GROUP_SCOPES]);
+      const { authUrl } = generateAuthUrl(
+        bot.larkAppId,
+        bot.larkAppSecret,
+        normalizeBrand(bot.brand),
+        [...FEED_GROUP_SCOPES],
+        // 标签属于 owner 个人的收件箱，授权归属写明本人。
+        bot.ownerOpenId,
+      );
       return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, authUrl });
     }
 

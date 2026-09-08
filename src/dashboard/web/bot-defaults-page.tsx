@@ -41,6 +41,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -63,6 +64,10 @@ import {
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
+import {
+  STREAMING_CARD_BUTTON_IDS,
+  type StreamingCardButtonId,
+} from '../../im/lark/streaming-card-buttons.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
@@ -111,7 +116,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string>;
+type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -746,12 +751,14 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
+    hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     thinkingCard: body.thinkingCard,
+    thinkingCardToolResult: body.thinkingCardToolResult,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
@@ -837,7 +844,9 @@ export function BotDefaultsPage() {
       return;
     }
     if (!selectedAppId || !filtered.some(bot => bot.larkAppId === selectedAppId)) {
-      setSelectedAppId(filtered[0].larkAppId);
+      const firstBot = filtered[0];
+      setSelectedAppId(firstBot.larkAppId);
+      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
     }
   }, [filtered, loadError, loading, selectedAppId]);
 
@@ -876,6 +885,7 @@ export function BotDefaultsPage() {
       <BotDefaultsCard
         key={`${selectedBot.larkAppId}:${profileRoleVersion}`}
         bot={selectedBot}
+        bots={bots}
         cliState={cliState}
         patchBot={patchBot}
         activeTab={activeTab}
@@ -955,7 +965,10 @@ export function BotDefaultsPage() {
                 key={bot.larkAppId}
                 bot={bot}
                 selected={bot.larkAppId === selectedAppId}
-                onSelect={() => setSelectedAppId(bot.larkAppId)}
+                onSelect={() => {
+                  setSelectedAppId(bot.larkAppId);
+                  if (bot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
+                }}
               />
             ))}
           </div>
@@ -967,6 +980,7 @@ export function BotDefaultsPage() {
 }
 
 function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect(): void }) {
+  const tr = useT();
   const { bot } = props;
   const name = bot.botName ?? bot.larkAppId;
   const cli = displayCliId(bot, cliIdOf(bot.larkAppId));
@@ -989,13 +1003,17 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
         <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
-      {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+        ? <span className="bd-roster-flag bd-roster-flag-blocked">{tr('botDefaults.startupBlockedBadge')}</span>
+        : bot.online === false ? <span className="bd-roster-flag">{tr('botDefaults.offlineBadge')}</span>
+        : bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
     </div>
   );
 }
 
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
+  bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
   activeTab: BotDefaultsTab;
@@ -1043,7 +1061,10 @@ function BotDefaultsCard(props: {
               patchBot={patchBot}
               meta={(
                 <>
-                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+                    ? <small className="bd-meta-blocked">● {tr('botDefaults.metaStartupBlocked')}</small>
+                    : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
+                    : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
                   {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
                 </>
@@ -1054,6 +1075,12 @@ function BotDefaultsCard(props: {
         </header>
         <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
       </div>
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle' ? (
+        <div className="bd-startup-blocked" role="alert" data-startup-blocked>
+          <strong>{tr('botDefaults.startupBlockedTitle')}</strong>
+          <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
+        </div>
+      ) : null}
       <div className="bd-body bd-tab-panels">
         <div
           id="bd-panel-common"
@@ -1109,6 +1136,7 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1154,6 +1182,7 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1264,6 +1293,145 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
           </div>
         </details>
       ) : null}
+    </section>
+  );
+}
+
+type QuotaFallbackKind = 'usage' | 'rate';
+
+function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow[]; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackBot ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [targetAppId, setTargetAppId] = useState(initial?.targetAppId ?? '');
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [message, setMessage] = useState(initial?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackBot ?? null;
+    setEnabled(next?.enabled === true);
+    setTargetAppId(next?.targetAppId ?? '');
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setMessage(next?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  }, [props.bot.quotaFallbackBot, tr]);
+
+  const targetOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackTargetPlaceholder') },
+    ...props.bots
+      .filter(candidate => candidate.larkAppId !== props.bot.larkAppId && !candidate.error)
+      .map(candidate => ({
+        value: candidate.larkAppId,
+        label: `${candidate.botName ?? candidate.larkAppId} · ${candidate.larkAppId}`,
+      })),
+  ], [props.bot.larkAppId, props.bots, tr]);
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    const cleanMessage = message.trim();
+    if (enabled && !targetAppId) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackTargetRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    if (enabled && (!cleanMessage || Array.from(cleanMessage).length > 1000 || /<\s*at\b/i.test(cleanMessage))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackMessageInvalid')}` });
+      return;
+    }
+
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback`,
+        { enabled, targetAppId, kinds, message: cleanMessage },
+      );
+      if (res.ok && res.body.ok) {
+        const config = res.body.quotaFallbackBot ?? null;
+        props.patchBot(props.bot.larkAppId, {
+          quotaFallbackBot: config,
+          ...(res.body.restartRequired ? { startupBlocked: undefined } : {}),
+        });
+        setStatus({
+          text: `✓ ${res.body.restartRequired ? tr('botDefaults.quotaFallbackSavedRestart') : tr('botDefaults.cardPrefSaved')}`,
+          ok: true,
+        });
+      } else if (res.body?.error === 'quota_fallback_cycle') {
+        const cycle = Array.isArray(res.body?.cycle) ? res.body.cycle.join(' → ') : '';
+        const text = tr('botDefaults.quotaFallbackCycle', { cycle });
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error', duration: 8_000 });
+      } else if (res.body?.error === 'quota_fallback_target_not_local') {
+        const text = tr('botDefaults.quotaFallbackTargetNotLocal');
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error' });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback" data-quota-fallback>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackHelp')}>{tr('botDefaults.quotaFallbackTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback"
+        title={tr('botDefaults.quotaFallbackEnabled')}
+        help={tr('botDefaults.quotaFallbackEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.quotaFallbackTargetHelp')}>{tr('botDefaults.quotaFallbackTarget')}</FieldTitle>
+          <DropdownField<string>
+            dataInput="quotaFallbackTarget"
+            ariaLabel={tr('botDefaults.quotaFallbackTarget')}
+            value={targetAppId}
+            disabled={busy || !enabled}
+            options={targetOptions}
+            searchable
+            onChange={setTargetAppId}
+          />
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.quotaFallbackMessageHelp')}>{tr('botDefaults.quotaFallbackMessage')}</FieldTitle></span>
+          <textarea rows={3} maxLength={1000} data-input="quotaFallbackMessage" value={message} disabled={busy || !enabled} onChange={event => setMessage(event.currentTarget.value)} />
+        </label>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackCycleNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
     </section>
   );
 }
@@ -3297,6 +3465,154 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   );
 }
 
+/**
+ * Trigger-user CLI auth.
+ *
+ * Sits in the security tab beside sandbox / Codex credentials / grants — this is
+ * the same class of setting: who a session acts as.
+ *
+ * The shape mirrors SandboxSection: a main toggle, with the detail controls
+ * appearing only once it is on. Tools are checkboxes rather than separate toggles
+ * because they are one feature's scope, not two independent capabilities.
+ *
+ * The two advisories are shown, not hidden. Without the file sandbox the agent
+ * can read other people's token files directly, and a self-credentialed MCP
+ * server bypasses the wrapper entirely — an operator who is not told either of
+ * those would believe the boundary is complete.
+ */
+function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const policy = bot.triggerUserAuth ?? null;
+  const enabled = policy?.enabled === true;
+  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
+  const fallback = policy?.fallback ?? 'bot-identity';
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [info, setInfo] = useState<{
+    authorizedCount?: number;
+    tokenStoreAdvisory?: string;
+    mcpAdvisory?: string;
+  } | null>(null);
+
+  // Only fetch the advisories when the feature is on: they describe THIS
+  // policy's limits, and showing them for a bot that never enabled it would be
+  // noise about a boundary nobody asked for.
+  useEffect(() => {
+    if (!enabled) { setInfo(null); return; }
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth-status`, undefined);
+        if (alive && res.ok && res.body.ok) setInfo(res.body as any);
+      } catch { /* advisory only — never block the panel on it */ }
+    })();
+    return () => { alive = false; };
+  }, [bot.larkAppId, enabled]);
+
+  async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
+    const previous = policy;
+    setStatus(null);
+    setBusy(true);
+    patchBot(bot.larkAppId, { triggerUserAuth: next });
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+        triggerUserAuth: next,
+      });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.triggerUserAuthSaved')}`, ok: true });
+      } else {
+        patchBot(bot.larkAppId, { triggerUserAuth: previous });
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      patchBot(bot.larkAppId, { triggerUserAuth: previous });
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
+    void save({ enabled: true, tools: next, fallback });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-trigger-user-auth"
+        title={tr('botDefaults.triggerUserAuthToggle')}
+        help={tr('botDefaults.triggerUserAuthHelp')}
+        onChange={checked => void save(
+          checked ? { enabled: true, tools, fallback } : null,
+        )}
+      />
+      {enabled ? (
+        <>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthTools')}</span>
+            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+              <label key={tool} className="bd-inline-check">
+                <input
+                  type="checkbox"
+                  data-action={`trigger-user-auth-tool-${tool}`}
+                  checked={tools.includes(tool)}
+                  disabled={busy}
+                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                />
+                <span>{tool}</span>
+              </label>
+            ))}
+          </div>
+          <div className="bd-row">
+            <label>
+              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
+              <select
+                data-input="triggerUserAuthFallback"
+                value={fallback}
+                disabled={busy}
+                onChange={event => void save({
+                  enabled: true,
+                  tools,
+                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
+                })}
+              >
+                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
+                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
+              </select>
+            </label>
+          </div>
+          {tools.includes('bytedcli') ? (
+            <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
+          ) : null}
+          {typeof info?.authorizedCount === 'number' ? (
+            <p className="bd-section-note" data-trigger-user-auth-authorized="">
+              {tr('botDefaults.triggerUserAuthAuthorized', { count: String(info.authorizedCount) })}
+            </p>
+          ) : null}
+          {info?.tokenStoreAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-token-advisory="">
+              ⚠️ {info.tokenStoreAdvisory}
+            </p>
+          ) : null}
+          {info?.mcpAdvisory ? (
+            <p className="bd-section-note" data-trigger-user-auth-mcp-advisory="">
+              ⚠️ {info.mcpAdvisory}
+            </p>
+          ) : null}
+        </>
+      ) : null}
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-trigger-user-auth-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
 function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
@@ -3947,23 +4263,27 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const { bot, putCardPref } = props;
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
+  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
+    setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
-  }, [bot.disableStreamingCard, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
+  }, [bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -3989,6 +4309,12 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
     { value: 'off', label: tr('botDefaults.usageDisplayOff') },
   ];
+  const buttonOptions: Array<{ id: StreamingCardButtonId; title: string; description: string }> =
+    STREAMING_CARD_BUTTON_IDS.map(id => ({
+      id,
+      title: tr(`botDefaults.streamingButton.${id}`),
+      description: tr(`botDefaults.streamingButton.${id}Description`),
+    }));
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
@@ -4040,6 +4366,21 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
             }}
           />
+          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
+            <ToggleRow
+              checked={thinkingCardToolResult}
+              disabled={busy !== null}
+              dataAction="toggle-thinking-card-tool-result"
+              title={tr('botDefaults.thinkingCardToolResult')}
+              description={tr('botDefaults.thinkingCardToolResultDescription')}
+              help={tr('botDefaults.thinkingCardToolResultHelp')}
+              onChange={checked => {
+                const previous = thinkingCardToolResult;
+                setThinkingCardToolResult(checked);
+                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
+              }}
+            />
+          </div>
           <StreamingCardPinToggle
             scope="bot-defaults"
             checked={pinStreamingCard}
@@ -4058,6 +4399,39 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               );
             }}
           />
+        </section>
+
+        <section className="bd-card-setting-group" data-card-buttons-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.streamingButtons')}</h4>
+          <div className="bd-card-button-grid" data-card-button-grid>
+            {buttonOptions.map(option => {
+              const visible = !hiddenButtons.includes(option.id);
+              return (
+                <ToggleRow
+                  key={option.id}
+                  className="bd-card-button-toggle"
+                  checked={visible}
+                  disabled={busy !== null}
+                  dataAction={`toggle-streaming-button-${option.id}`}
+                  title={option.title}
+                  help={option.description}
+                  onChange={checked => {
+                    const previous = hiddenButtons;
+                    const hidden = new Set(hiddenButtons);
+                    if (checked) hidden.delete(option.id);
+                    else hidden.add(option.id);
+                    const next = STREAMING_CARD_BUTTON_IDS.filter(id => hidden.has(id));
+                    setHiddenButtons(next);
+                    void savePatch(
+                      { hiddenStreamingCardButtons: next },
+                      `streaming-button-${option.id}`,
+                      () => setHiddenButtons(previous),
+                    );
+                  }}
+                />
+              );
+            })}
+          </div>
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>

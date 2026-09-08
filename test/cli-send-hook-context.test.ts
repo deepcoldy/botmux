@@ -5,8 +5,9 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
-import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
+import { buildRelayHostEnv, startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {
+  ensureManagedOriginAttestationDirectory,
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
@@ -482,6 +483,12 @@ describe('cmdSend hook context wiring', () => {
 
   it('rejects a trusted host re-exec when its authorized Codex App ledger was already settled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-ledger-gone-'));
+    const channelId = 'ef'.repeat(32);
+    ensureManagedOriginAttestationDirectory(dataDir, 'session', channelId);
+    replaceManagedOriginCapabilityFile(
+      managedOriginCapabilityPath(dataDir, 'session', channelId),
+      JSON.stringify({ sessionId: 'session', channelId, capability: 'cd'.repeat(32) }),
+    );
     seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -493,21 +500,62 @@ describe('cmdSend hook context wiring', () => {
       const result = await runCli(
         ['send', 'must not downgrade', '--session-id', 'session', '--no-mention'],
         {
-          ...process.env,
-          SESSION_DATA_DIR: dataDir,
-          BOTMUX_SESSION_ID: 'session',
-          BOTMUX_TURN_ID: 'turn-settled',
-          BOTMUX_DISPATCH_ATTEMPT: '4',
-          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          ...buildRelayHostEnv({
+            ...process.env,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'session',
+            BOTMUX_TURN_ID: 'turn-settled',
+            BOTMUX_ORIGIN_CHANNEL_ID: channelId,
+            BOTMUX_DISPATCH_ATTEMPT: '4',
+            BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+            BOTMUX_SEND_RELAY: '',
+            BOTMUX_WORKFLOW: '',
+            BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+          }),
+          // startOutboxWatcher applies this only after authorize succeeds.
           BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER: '1',
-          BOTMUX_SEND_RELAY: '',
-          BOTMUX_WORKFLOW: '',
-          BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
         },
       );
       expect(result.code).toBe(2);
       expect(result.stderr).toContain('authorized Codex App origin session/turn-settled is no longer unsettled');
       expect(result.stderr).not.toContain('must not downgrade');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'a matching numeric parent with a pane origin channel', workerPid: process.pid, readIsolated: '' },
+    { name: 'a different worker parent', workerPid: process.pid + 1, readIsolated: '' },
+    { name: 'an explicitly isolated child', workerPid: process.pid, readIsolated: '1' },
+  ])('does not accept a host relay flag from $name', async ({ workerPid, readIsolated }) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-parent-'));
+    try {
+      const channelId = 'fe'.repeat(32);
+      ensureManagedOriginAttestationDirectory(dataDir, 'session', channelId);
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'isolated', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'codex', pid: workerPid,
+        },
+      });
+      const result = await runCli(
+        ['send', 'must not send', '--session-id', 'session', '--no-mention'],
+        {
+          ...process.env,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_ORIGIN_CHANNEL_ID: channelId,
+          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_READ_ISOLATED: readIsolated,
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+        },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('read-isolated owning data-root locator is missing or ambiguous');
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

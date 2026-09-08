@@ -81,7 +81,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `minimax`(MiniMax `mmx text repl`；区域由 `mmx auth login --region cn|global` 决定，同机多区用 per-bot `env` 的 `MMX_CONFIG_DIR` 隔离) …
 
 `ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
 

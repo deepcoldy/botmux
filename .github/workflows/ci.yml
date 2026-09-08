@@ -34,13 +34,13 @@ jobs:
         with:
           node-version: 22
 
-      # Bun is the package manager (packageManager: bun@1.4.1). node-pty's native
+      # Bun is the package manager (packageManager: bun@1.4.2). node-pty's native
       # build runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
       # need a real build/Release/pty.node.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
@@ -84,7 +84,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run build
       # Wrapper retries once only when every file already passed and vitest's
@@ -146,7 +146,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
@@ -240,7 +240,7 @@ jobs:
               # prebuild and must compile here. binutils supplies readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.1 --loglevel=error
+              npm i -g bun@1.4.2 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
@@ -363,7 +363,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
 
       # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
       # plus the spawn-helper sidecar), which is why ONE macOS runner can emit

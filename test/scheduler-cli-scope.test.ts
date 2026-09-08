@@ -29,4 +29,18 @@ describe('schedule CLI session scope propagation', () => {
     // Forwarded after topicTitle so the addTask arg order asserted above still holds.
     expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?\btopicTitle,[\s\S]*?followActive: wantsFollowActive \? true : undefined,[\s\S]*?\}\);/);
   });
+
+  it('forwards --model / --reasoning-effort and rejects a bad level before writing', () => {
+    // Both take a value, so `positionals` skips it automatically — asserting the
+    // flags are NOT in the boolean list is what keeps "gpt-5.6-sol" out of the prompt.
+    expect(cliSource).not.toMatch(/positionals\(rest, \[[^\]]*'--model'[^\]]*\]\)/);
+    expect(cliSource).not.toMatch(/positionals\(rest, \[[^\]]*'--reasoning-effort'[^\]]*\]\)/);
+    // Shape is validated in-process; the CLI/model pairing is not, because a
+    // sandboxed session cannot read bots.json (fire time degrades instead).
+    expect(cliSource).toMatch(/isScheduleReasoningEffort\(reasoningEffortArg\)/);
+    expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?followActive: wantsFollowActive \? true : undefined,[\s\S]*?\bmodel,[\s\S]*?\breasoningEffort,[\s\S]*?\}\);/);
+    // The receipt must state the fresh-spawn-only limit rather than let it be
+    // discovered weeks later at fire time.
+    expect(cliSource).toMatch(/executionPosition === 'new-topic'[\s\S]*?模型每次生效[\s\S]*?仅在本任务新建会话的那次执行生效/);
+  });
 });

@@ -37,7 +37,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { getBot, getBotClient, effectiveBotDisplayName, type BotState } from '../bot-registry.js';
 import { config } from '../config.js';
-import { resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveOwnerUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
@@ -484,6 +484,9 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 飞书「消息分组」是 owner 自己的收件箱侧边栏，所以这个授权本就只能是他本人
+      // 的；归属写明 owner，别让它落到 per-app 文件里跟别人的 token 混在一起。
+      ownerOpenId,
     );
     const loc = localeForBot(larkAppId);
     await sendUserMessage(
@@ -686,7 +689,9 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   const brand = normalizeBrand(cfg.brand);
   const host = larkHosts(brand).openApi;
 
-  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
+  // Owner 个人功能：飞书「消息分组」是 owner 自己的收件箱侧边栏，bot 没有收件箱，
+  // 所以这里始终用 owner 本人的 token，跟本轮消息是谁发的无关。
+  const userToken = await resolveOwnerUserToken(cfg.larkAppId, cfg.larkAppSecret, brand, ownerOpenId);
   if (!userToken) {
     logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
     void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
