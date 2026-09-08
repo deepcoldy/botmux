@@ -2,7 +2,7 @@
 title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单）
+updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单。同日二次修订：三项待定项落定——放弃扁平 legacy 行、只读库 fail-fast、导入删除条件；补阅读指引、决策记录与验收标准）
 topic: session-virtual-actor
 status: active
 baseline: origin/master@0aba0fdd（含已合入的 #852、#1073、#1093、#1051、#1202、#1280、#1308）
@@ -19,6 +19,51 @@ references:
 # Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 
 本文是会话态后续实施的唯一口径。#852 已把会话行持久化换到 SQLite，Stage 1–3 已把 occupancy、单一 apply、开场窗口的 per-session 串行落地。本次更新做三件事：把基线切到含 #1308 的 master；把升级窗口的处理方式从「等 fleet 自动重启」改成「用户手动重启，新代码遇到旧 daemon 时 fail closed 并提示重启」，并据此把所有跨进程兼容路径列为可删；按终态重新度量现状差距，给出收尾 PR 的拆分和可以收缩的测试面。
+
+## 阅读指引（给实施者，含 agent）
+
+本文既是设计口径也是施工清单。按要做的事读对应的节，不必通读：
+
+| 要做的事 | 先读 | 再读 |
+|---|---|---|
+| 理解终态与不变量 | §0、§1 | §2.2 差距表 |
+| 开收尾 PR（删跨进程 JSON 读写、心跳改语义、unmigrated 文案、mojo 修复） | §5 A、§3.3、§3.4、§3.6 | §6 测试面、下方验收标准 |
+| 开前置 PR（descriptor 能力位、supervisor killTimeout、宿主侧租约规则） | §5 B、§3.5、§3.7 | 验收标准 |
+| daemon 侧租约不变量 / owner 侧命令化 / Stage 3 残留 | §5 C、§4 对应 stage | §7 |
+| 判断某条兼容分支能不能删 | §0 原则 7、8；§3.1、§3.2 | 决策记录 |
+
+**决策记录**（已拍板，不要在 PR 里重新讨论；改变需要更新本表）：
+
+| 日期 | 决策 | 依据 |
+|---|---|---|
+| 2026-09-07 | 会话库升级窗口按已关闭处理，不再等 fleet 自动重启 | v3.18.0 于 08-28 进 latest |
+| 2026-09-08 | 升级后由用户手动 `botmux restart`；新代码遇旧 daemon 时 fail closed 并提示；不为窗口保留读旧格式分支；不设复核日期 | §3.1 |
+| 2026-09-08 | 心跳探针保留，语义改为「只拒绝、带原因」，不删除 | §3.4：删它会开与版本无关的丢更新窗口 |
+| 2026-09-08 | descriptor 加 presence-based 能力位与仅用于文案的版本号；任何地方不做版本大小比较 | §3.5 |
+| 2026-09-08 | 无 `larkAppId` 的扁平 legacy 行直接放弃；扁平 store 的全部支持点随收尾 PR 删除 | 扁平 store 只存在于 2026-03-11 至 03-22（首次发布到 per-bot 拆分），早于第一个发布 tag v2.16.1（2026-05-07），没有任何发布版本写过它 |
+| 2026-09-08 | 只读库 / `loadFailure` 的 daemon 从「降级运行」改为「有界重试后 fail-fast」 | §3.7：写不了会话库的 daemon 不能服务，降级运行只会让宿主与它竞争 |
+| 2026-09-08 | 一次性导入 + 中毒库恢复的删除条件：latest ≥ v3.19 满 90 天（2026-12-06 之后）且线上 `session-stores/` 的 `*.tmp*` 孤儿核查为零 | §5 C-16 |
+
+**验收标准**（收尾 PR 与前置 PR 合并前必须全部成立）：
+
+```bash
+# A：跨进程 JSON 读写与心跳回落已删
+grep -nE "kind: 'json'|loadFromFrozenJson|abortIf|legacyHeartbeatHeld" src/services/session-store.ts src/services/session-command-host.ts   # 期望 0 行
+grep -nF 'sessions-${ctx.currentAppId}.json' src/adapters/cli/fs-policy.ts                                                           # 期望 0 行
+grep -nF 'sessions(-[^.]+)?' src/core/mojo-containment-command.ts                                                                    # 期望 0 行
+grep -nE "withFileLockSync" src/services/session-store.ts                                                                             # 期望只剩导入与中毒恢复两处
+grep -rnE "sessionStore\.init\(\s*\)" test | wc -l                                                                                    # 期望 0（扁平 store 支持已删；init(appId) 必填后 tsc 也会报）
+# B：descriptor 能力位与关停预算
+grep -nE "sessionStoreProtocol|botmuxVersion" src/daemon.ts src/utils/daemon-discovery.ts src/dashboard/registry.ts                   # 三个文件都应命中
+grep -nE "PM2_DAEMON_KILL_TIMEOUT_MS" src/core/shutdown-budgets.ts                                                                    # 断言对象应换成 fleet supervisor 的 killTimeoutMs
+# 构建与测试（与 master 基线 diff，见 memory「botmux 测试基线 diff」）
+bun run build
+bun run test -- test/session-store.test.ts test/session-store-sqlite.test.ts test/session-occupancy.test.ts test/session-delete-cli.test.ts test/whiteboard-unbind-session.test.ts test/fs-policy.test.ts test/mojo-containment.test.ts test/session-turn-queue.test.ts
+```
+
+行为层面的验收：① 用只有 `sessions-<appId>.json`、无 `.db` 的数据目录跑 `botmux list` / `botmux delete <id>` / 会话内 `botmux send`，三者都必须给出 unmigrated 文案而不是「没有活跃会话」或裸栈；② 在库里写一条有效租约、不写 descriptor，`botmux delete` 必须报「daemon 在线」而不是离线关闭；③ 写一个新鲜但无能力位的 descriptor、库里无租约，`botmux delete` 必须报「旧版本 daemon，请先 botmux restart」且行未变、worker 未被 SIGTERM；④ 同③但 descriptor 带能力位，文案必须是「未持有租约」而不是「旧版本」；⑤ 在带 `BOTMUX_SESSION_ID` 的子进程里触发③，输出不得含 `botmux restart`、pid、端口或版本号。
+
+**施工约束**：`/Users/fancy/Code/botmux` 是 live daemon 的运行 checkout，收尾 PR 在 worktree 做，验证止于 build + 单测，不 `switch:here`、不重启；PR 描述用直白中文、写清动了哪些共用路径与各会话类型的验证，不写群内人名与机器人协作花名；行号以本文基线 master@0aba0fdd 为准，动手前先 `git grep` 复核。
 
 ## 0. 原则
 
@@ -98,7 +143,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 | 部分 | 已落地 | 相对终态仍缺 |
 |---|---|---|
-| **身份** | `sessionId` 寻址；跨 store 只读发现（`getSession` → `findInOtherFiles`） | 扁平 legacy store（appId 为空）仍有 8 处支持点（`session-store.ts:440-442/446-448/469-470/725-733/1219-1228/2465/2493-2495`，`init` 的 `appId?`）；生产自 2026-03-22 起再也产生不出这种 store。**真 bug**：扁平 `sessions.json` 里的行被按 larkAppId 导入 per-bot `.db` 后源文件不删，`readSessionRowCopiesAcrossStores` 把两者算成两个 store，身份扫描答「重复」（实测复现）。 |
+| **身份** | `sessionId` 寻址；跨 store 只读发现（`getSession` → `findInOtherFiles`） | 扁平 legacy store（appId 为空）仍有 8 处支持点（`session-store.ts:440-442/446-448/469-470/725-733/1219-1228/2465/2493-2495`，`init` 的 `appId?`）。这种 store 只存在于项目最初 11 天（2026-03-11 首次发布到 2026-03-22 per-bot 拆分，e5aa28e6），早于第一个发布 tag v2.16.1（2026-05-07）：没有任何发布版本写过它，生产上 `init` 只有 daemon 与 worker 两处调用且 appId 必填。**真 bug**：扁平 `sessions.json` 里的行被按 larkAppId 导入 per-bot `.db` 后源文件不删，`readSessionRowCopiesAcrossStores` 把两者算成两个 store，身份扫描答「重复」（实测复现）。 |
 | **occupancy** | 同库 `occupancy` 表；首次 `load()` 的 `BEGIN IMMEDIATE` 内领取；有效租约一票否决宿主写；接管规则看过期与 `ownerPid` 存活 | ① daemon 侧没有任何消费者：`occupancyState` 只用于日志去重（`daemon.ts:22673-22692`），`restoreActiveSessions` 不看 claim 结果，`persistRow` 不查租约——被判 `displaced` 的 daemon 照常 restore / fork / 写行。设计 §1「至多一个激活」在运行时层面没有实现点，今天的租约只是给宿主看的互斥锁。② claim 失败 / displaced 只 warn 并随 30s 心跳重试；`'unavailable'` 连日志都没有。③ 关停期 `claimOccupancy()` 返回值被丢弃（`daemon.ts:23683`）。④ 宿主侧 `occupancyLeaseIsActive` 只看 `leaseUntil`，不看 `ownerPid` 是否存活。⑤ supervisor 默认 `killTimeoutMs` 8s（`fleet-supervisor.ts:138`，`index-supervisor.ts` 未传）小于 daemon 关停预算 28s（`shutdown-budgets.ts:39`），超 8s 的关停被 SIGKILL、租约不释放，留下最长 90s 的「未过期但进程已死」的行；`shutdown-budgets.ts:53-55` 仍在对着 PM2 常量做断言。⑥ 心跳仍作为 `abortIf` 参与判定（§3.4）。 |
 | **apply** | `applySessionRowCommand` 是 close / prune / whiteboard / worker-exited 的唯一变换；宿主与 daemon 的 `closeSession` 都走它；`HostSessionCommand` 用 `never` 把 daemon 专属字段挡在 tsc 边界外 | ① owner 侧没有命令层：`sessionStore.updateSession(session)` 全仓 138 处 / 14 个模块，形态是「就地改对象 + 整行 upsert」，只有 `closeSession` 走命令。这是 Stage 2 从非 owner 侧删掉的 `mutateSessionRowOffline` 在 owner 侧的等价物，也是 Stage 3 只能包住开场窗口的根因——没有命令边界就没有可入队的单位。② `persistActiveRemoteLineage*` 三个函数（`session-store.ts:1435/1498/2203`，约 240 行）是第二套手写行级事务，`SessionRowCommand` 没有 lineage 命令；`'postrename_ambiguity'` 是 JSON 时代的命名。③ `whiteboard-store.ts:466-486`：daemon 应答了非 2xx 非 409（如 400/500）也落到宿主 apply，与 `cli.ts:3856` 的「已应答即权威」不同构。 |
 | **turn** | `runSessionTurn` 按 `sessionId` 的 Promise 链；开场激活窗口内的 follower 落盘、开场释放都走它；`hasPendingSessionTurns` 替代计数 | ① `admitQueuedActivationTail` / `promoteQueuedActivationTail` 仍在 store 外备份再回滚（promote 4 份快照），且 promote 的回滚漏还原 `ds.session.queued`（`worker-pool.ts:9742` vs `9784-9787`；对照同文件 `10294` 有还原）。② `initialStartClaimToken` 在 worker-pool 有 4 处绕过 token fence 的裸清除（`9159/10670/11585/14246`）。③ `utils/anchor-serializer.ts#serializeByAnchor` 仍是第二套按会话串行（键是 anchor 不是 sessionId），5s 后主动放弃排序，4 个消费点在 `event-dispatcher.ts`。④ `session-store.ts:1660` 的 `bridgeMarkerCleanupFences` 是第三个 per-session Promise fence，给旁路文件排序却住在会话库模块里。⑤ `hasQueuedActivationAdmissionGate` 有 5 个消费点、4 类后果：两处改路由进 durable tail，一处抑制 live takeover，`daemon.ts:19886` 直接拒绝 passthrough 命令，`trigger-session.ts:1191` 对带幂等 key 的 HTTP trigger 回 `trigger_failed`——Stage 3 之后队列上一条几毫秒的 release 命令就能让后两处在正常时序下拒绝用户。⑥ `hasPendingSessionTurns` 把正在运行的命令自己也算 pending，「命令内不得对同 session 再入队」只靠注释维护。 |
@@ -170,7 +215,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - `UnownedRowOptions.abortIf: () => boolean` 换成 `probeHolder: () => HolderReason | undefined`，`UnownedRowBlocked` 的 `owned` 带 `heldBy`。这是把已有的 boolean 换成有信息量的枚举，不新增协议。
 - 探针仍在事务内、只判一次。`session-store.ts:2625` 发布前的第二次判定随之删除：租约在 `2617` 只读一次、两次判定复用同一个快照，事务内其它连接改不了 occupancy 行，第二次判定的唯一活项就是 `abortIf`。
 - 宿主侧租约有效性从「只看 `leaseUntil`」改为「未过期 或 `ownerPid` 存活」。方向是 fail closed：进程卡住 / 休眠导致两个信号同时过期时仍拒绝。PID 复用会导致误拒（表现为宿主暂时不能离线 close），要彻底解决需在 occupancy 行里存 `processStartIdentity`（schema 是 `CREATE TABLE IF NOT EXISTS`，加列要显式 ALTER），留到 §5 C 项。daemon 侧 `claimOccupancyInTxn` 的接管规则（未过期且进程存活才让路）方向不同，不改。
-- `isOccupancyHeld` 只剩 `cli.ts:3696` 一个调用方，改为返回同一个枚举；`hostOptions` 里「无 `larkAppId` 的行不探测」与扁平 store 一起处理（§5 C-16）。
+- `isOccupancyHeld` 只剩 `cli.ts:3696` 一个调用方，改为返回同一个枚举；`hostOptions` 里「无 `larkAppId` 的行不探测」随扁平 store 一起删除（§5 A-8）。
 - 宿主的 `openDbForOwnStore` 在判定之前就对目标库执行 `CREATE TABLE IF NOT EXISTS occupancy`：在 v3.18.x 的库上这是一次真实的 schema 变更，也抹掉了「有没有 occupancy 表」这个版本判据。收尾时先用 `openDbForRead` 读租约与 descriptor，确认无人持有再升级为 own-store open。
 
 ### 3.5 descriptor 能力位与版本号
@@ -199,7 +244,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 5. supervisor `killTimeoutMs` 与 daemon 关停预算对齐（≥ 28s + 余量），`shutdown-budgets.ts:53-55` 的断言改成对 fleet supervisor 生效。
 6. `restoreActiveSessions` 与 tmux adopt 以 `held` 为前置：被 displaced 的 boot 不得 re-attach 同一批 tmux 会话（今天两个 daemon 会同时向同一个 pane 写）。
 
-**行为变更需要单独确认**：只读库 / `loadFailure` 的 daemon 从「降级运行（`claimOccupancyOnLoad` 注释明写有意容忍）」变成「有界重试后 fail-fast」。本文建议 fail-fast：写不了会话库的 daemon 本来就不能服务。
+**已决定的行为变更**：只读库 / `loadFailure` 的 daemon 从「降级运行（`claimOccupancyOnLoad` 注释明写有意容忍，收尾时改掉这段注释）」变成「有界重试后 fail-fast」。写不了会话库的 daemon 本来就不能服务，降级运行只会让它与宿主竞争同一批行；退出时的错误信息要带上 `loadFailure.message`，让 `botmux status` 与 supervisor 日志能直接看到原因。
 
 不变量落地后，宿主侧仍然不能只看租约：它管不了 ≤ v3.18.14 的存量 daemon，也管不了进程卡死 > 90s。两者互补：不变量把 displaced 窗口压到 1s 量级并让 daemon 自杀，心跳探针把旧 daemon 与卡死的 daemon 挡在门外。
 
@@ -218,7 +263,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 **删除条件已满足**（按 §3 的策略，不再等 fleet 自动重启，也不设复核日期）。收尾范围见 §5 A-1。
 
-删除后保留的 JSON 认知只有两处：owner daemon 首次 `load()` 的一次性导入（含文件锁、中毒库恢复），以及 §3.3 的 `unmigrated` 判别（只看文件是否存在）。导入的删除条件是「升级来源不可能低于 v3.18.0」，见 §5 C-17。
+删除后保留的 JSON 认知只有两处：owner daemon 首次 `load()` 的一次性导入（含文件锁、中毒库恢复），以及 §3.3 的 `unmigrated` 判别（只看文件是否存在）。导入的删除条件见 §5 C-16。
 
 ### Stage 1 — Occupancy 写入 SQLite【已落地；收尾：daemon 侧不变量 + 心跳定性】
 
@@ -277,6 +322,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 5. **S** 隔离判定前移（§3.6）；`whiteboard-store` 的「已应答即终态」。
 6. **S** 死代码与过时注释：`__testOnly_setAfterRemoteBatchRename`、`test/session-store.test.ts:25` 的 fs mock 注入、`daemon.ts:4212-4214`、`dashboard-ipc-server.ts:2247`。
 7. **S** 测试改造，按 §6。
+8. **S** 删扁平 legacy store：`init(appId: string)` 必填，删 8 处支持点与 `hostOptions` 的无 `larkAppId` 分支、`cli.ts:3877-3882` 的离线路径特例，约 30 处测试夹具的无参 `init()` 改为传 appId。无 `larkAppId` 的行已决定放弃（见阅读指引的决策记录），PR 描述里写明。这一项与 A-1 之后的代码没有耦合，若让 PR 过大可拆成紧随其后的独立 PR，但不设任何前置条件。
 
 ### B. 必须同 PR 或紧邻的前置 PR（否则 A-2 是回归）
 
@@ -286,17 +332,16 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 ### C. 单独排期
 
-11. **M** daemon 侧租约状态机 + `persistRow` 断言 + 关停期续租检查（§3.7-1/2/3/4）。含只读库 fail-fast 的行为变更，需单独确认。
+11. **M** daemon 侧租约状态机 + `persistRow` 断言 + 关停期续租检查（§3.7-1/2/3/4），含只读库 fail-fast（已决定）。
 12. **L** occupancy 接进 daemon runtime：restore / fork / tmux adopt 的 boot gate（§3.7-6）。这是 §1「至多一个激活」第一次真正成立。
 13. **L** `occupancy` 加 `owner_start_identity` 列 + 宿主侧改用它（Stage 1-3）。
 14. **M** `persistActiveRemoteLineage*` 收进命令；`bridgeMarkerCleanupFences` 移出（Stage 2-1、Stage 3-5）。
 15. **L** owner 侧 `updateSession` 命令化，先三类（Stage 2-2）。
-16. **S** 扁平 legacy store 拍板：`init(appId: string)` 必填，删 8 处支持点与 `hostOptions` 的无 appId 分支，约 30 处测试夹具的无参 `init()` 要改。无 `larkAppId` 的行在 A-1 之后已不可见也不可 close（它们只存在于 2026-03-22 之前的扁平 `sessions.json`），**建议直接声明放弃**，在 PR 描述里写明，不留「代码里删了没人知道」。
-17. **M** 删除一次性导入、其文件锁与中毒库恢复（约 400 行）以及 `frozenJsonRows` 一族测试夹具。删除条件：latest 已 ≥ v3.19 满 90 天（2026-12-06 之后），且对线上 `session-stores/` 做一次 `*.tmp*` 孤儿核查为零。届时 `utils/file-lock.ts` 对会话库的依赖整体解除。
-18. **M** 6 个跨 store 枚举入口（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
-19. **M** Stage 3 残留 1–3（admit / promote 命令化、claim token 清除、gate 的两处用户可见拒绝）。
-20. **L** Stage 3 残留 4（`serializeByAnchor` 并入 `runSessionTurn`）。
-21. **S** 常态可见性（§3.8）。
+16. **M** 删除一次性导入、其文件锁与中毒库恢复（约 400 行）以及 `frozenJsonRows` 一族测试夹具；届时 `storeJsonFileName` 只剩 §3.3 的 `unmigrated` 判别一个用途，`utils/file-lock.ts` 对会话库的依赖整体解除。**条件（已决定）**：latest ≥ v3.19 满 90 天（2026-12-06 之后），且对线上 `session-stores/` 做一次 `find … -name '*.tmp*'` 孤儿核查为零。
+17. **M** 6 个跨 store 枚举入口（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
+18. **M** Stage 3 残留 1–3（admit / promote 命令化、claim token 清除、gate 的两处用户可见拒绝）。
+19. **L** Stage 3 残留 4（`serializeByAnchor` 并入 `runSessionTurn`）。
+20. **S** 常态可见性（§3.8）。
 
 ## 6. 测试面收缩
 
@@ -341,7 +386,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 ### 6.4 保留（含删除条件）
 
-- 导入与中毒库恢复用例（`session-store.test.ts:172/195/227/415/425/438/445/526/1322/1423/1453/1479`、`session-store-sqlite.test.ts:94-181`、`session-store-sqlite-poisoned-recovery.test.ts` 全部 18 条）随 §5 C-17 一起删除。`frozenJsonRows` 夹具在 poisoned-recovery 里有 10 处引用（`60/333/363/388/405/426/464/481/499/584`）。
+- 导入与中毒库恢复用例（`session-store.test.ts:172/195/227/415/425/438/445/526/1322/1423/1453/1479`、`session-store-sqlite.test.ts:94-181`、`session-store-sqlite-poisoned-recovery.test.ts` 全部 18 条）随 §5 C-16 一起删除。`frozenJsonRows` 夹具在 poisoned-recovery 里有 10 处引用（`60/333/363/388/405/426/464/481/499/584`）。
 - `session-store-sqlite.test.ts:225`（冻结 JSON 不是 store）、`:323`（改新鲜行）、`:337`（SQLITE_BUSY → contended）是终态保证，保留。
 - `session-delete-cli.test.ts:312`（daemon 拒绝不因过期租约翻成离线写许可）、`:352`（无 descriptor 但有租约必须让位）、`:438` / `:462`（沙盒与 origin-channel 闸）是终态核心。
 - `initial-user-turn-opening.test.ts`（28 条，运行时 38）与 `session-turn-queue.test.ts`（5 条）没有一条在钉 Stage 3 之前的排序机制，全部保留。
@@ -367,4 +412,4 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 2026-08-28 至 09-08：#1051 删除 daemon 侧 JSON 写路径并把落盘改成行级 upsert，同时把删板解绑、离线写与 daemon 发现各收敛成一份实现；#1202 落地库内租约；#1280 落地单一 apply 并删除「任意闭包改行」的离线写入口；#1308 把开场激活窗口的串行化收进 `runSessionTurn`。期间跨进程读写按「升级窗口无上界」保留了 db-else-json 与心跳回落，删除条件曾定为「fleet 自动重启落地或 2026-11-26 复核」。
 
-2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。
+2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。同日二次修订把三项待定项落定为决策（阅读指引的决策记录）：扁平 legacy 行放弃并随收尾 PR 删除支持点；只读库 daemon fail-fast；导入与中毒恢复按日期 + 磁盘核查删除。
