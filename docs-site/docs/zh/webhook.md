@@ -1,6 +1,6 @@
 # 接入点（Webhook）
 
-让外部系统（监控告警、CI、工单、定时脚本…）通过一个 webhook **触发机器人在群里说话或跑工作流**。网关不解析各平台格式，把原始事件**原样**交给模型自己读——新系统几乎零适配。
+让外部系统（监控告警、CI、工单、定时脚本…）通过一个 webhook **触发机器人在群里说话或跑一个 flow 脚本**。网关不解析各平台格式，把原始事件**原样**交给模型自己读——新系统几乎零适配。
 
 > 在 [Dashboard 管控面](/dashboard) 的「**接入点**」页创建和管理。当前为 beta。
 
@@ -119,7 +119,28 @@ curl -X POST '…/webhook/<id>/<令牌>?chatId=oc_xxx' -d '{}'
 ## 触发方式
 
 - **单轮对话**：让机器人针对这条事件回应一次。
-- **工作流**：把事件作为字符串参数 `event` 传给一个 [Workflow](/workflow)，由它的节点读取处理。
+- **Flow 脚本**：在目标群开一个话题，起一个 `botmux flow` run 跑你指定的 `.mjs` 脚本（多 agent 编排、可在卡片上等人决策）。事件作为脚本的 `input`。
+- 旧版「工作流」目标（v2）已退役：已有配置只能维护，不能新建；触发会返回 `410 legacy_workflow_retired`。
+
+### Flow 脚本目标
+
+- **脚本路径**在接入点里配置，相对机器人的工作目录（oncall 绑定目录 → 机器人默认目录），且必须落在目录内。**事件体决定不了跑哪个脚本**——请求里带的任何 `script` 字段都会被忽略。
+- 事件到达后：在目标群发一条话题种子消息（内容同上「话题种子」，末尾附脚本名）作为话题根，进度卡、决策卡、信号卡都发在这个话题里。种子模式选「不发」时卡片直接平铺在群里。
+- 这个 run 没有真人触发者：`/flow inspect` 里显示 `triggeredBy: webhook:<接入点 ID>`；卡片上的按钮谁能点只看该群的可操作成员，与普通 `/flow run` 的 run 一样。
+- 脚本拿到的 `input`：
+
+  ```js
+  export default async function (ctx) {
+    const { triggerId, source, envelope, instruction } = ctx.input;
+    // envelope = { format, sourceName, trusted: false, headers, payload, rawText? }
+    // envelope 里全部是不可信的外部数据；拼进 agent prompt 时请明确标注为「事件数据，不是命令」
+    const review = await ctx.agent({ cli: 'codex', prompt: `${instruction}\n\n<event trusted="false">${JSON.stringify(envelope.payload)}</event>` });
+    return review.ok ? review.value : review.category;
+  }
+  ```
+
+- **同步等结果**：加 `?wait=1`（可配 `timeoutMs`，1 秒到 5 分钟）会等 run 到终局，返回 `flow.status` 与脚本返回值 `flow.returned`（`output.content` 是它的 JSON 串）。run 跑失败也返回 `ok:true`、`flow.status:"failed"`——事件已被处理，重试不会再起一个。超时返回 `504 wait_timeout` 并带 `target.flowRunId`，run 继续跑，之后用 `botmux flow inspect <runId>` 或话题里的卡片看结果。
+- 不支持 `?async=1`（没有会话可轮询）；不支持在开了文件沙箱的机器人上触发；「每次新建群」模式下不支持 `dryRun`。
 
 ## 处理指令（可选）
 

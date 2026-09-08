@@ -31,13 +31,15 @@ export interface TriggerLogRequest {
 }
 
 export interface TriggerLogTarget {
-  kind?: 'turn' | 'workflow';
+  kind?: 'turn' | 'workflow' | 'flow';
   mode?: 'dynamic' | 'fixed' | 'new-group';
   botId?: string;
   chatId?: string;
   sessionId?: string;
   rootMessageId?: string;
   workflowId?: string;
+  /** `kind: 'flow'`：connector 配置的脚本路径。 */
+  script?: string;
 }
 
 export interface TriggerLogResponse {
@@ -45,6 +47,8 @@ export interface TriggerLogResponse {
   durationMs: number;
   sessionId?: string;
   workflowRunId?: string;
+  /** `kind: 'flow'`：起的 run id。 */
+  flowRunId?: string;
   chatId?: string;
 }
 

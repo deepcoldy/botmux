@@ -77,6 +77,7 @@ import {
   type V3RunSaveCardHandlerDeps,
 } from './v3-run-save-card-handler.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
+import { isFlowCardAction } from './flow-card.js';
 import {
   handleV3DistillationAction,
   isV3DistillationAction,
@@ -141,6 +142,13 @@ export interface CardHandlerDeps {
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
   v3DistillationDeps?: V3DistillationCardHandlerDeps;
+  /** flow（JS as runtime 编排）卡片：进度 / 决策 / 信号 / 中断卡的动作。daemon 接线到
+   *  FlowRunManager；前置门在 flow-card-handler.ts，裁决在 runner（设计文档 §7.2）。 */
+  flowCardAction?: (
+    value: Record<string, unknown> | undefined,
+    operatorOpenId: string | undefined,
+    formValue: Record<string, unknown> | undefined,
+  ) => Promise<unknown>;
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
@@ -1974,6 +1982,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       larkAppId,
       cardMessageId,
       deps.v3DistillationDeps,
+    );
+  }
+  // flow 卡（进度 / 决策 / 信号 / 中断）：同 v3，value 里没有 root_id/session_id，
+  // 权限门用 run binding 的 chatId 走 canOperate（flow-card-handler.ts）。
+  if (isFlowCardAction(value?.action)) {
+    if (!deps.flowCardAction) return;
+    return await deps.flowCardAction(
+      value as Record<string, unknown> | undefined,
+      operatorOpenId,
+      action?.form_value,
     );
   }
 

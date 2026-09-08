@@ -11,15 +11,18 @@ import {
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
+  scrubFlowChildEnv,
   scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
   scrubSessionTurnMarkerEnv,
   scrubWorkflowWorkerEnv,
+  FLOW_WORKER_ENV_KEYS as FLOW_WORKER_ENV_KEYS_LOCAL,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
+import { FLOW_WORKER_ENV_KEYS as FLOW_WORKER_ENV_KEYS_CANONICAL } from '../src/flow/types.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -266,6 +269,39 @@ describe('stripDashboardH5Env()', () => {
   });
 });
 
+describe('scrubFlowChildEnv()', () => {
+  it('drops the launching topic\'s routing identity, injected family (incl. per-bot CLI homes), IM creds and stale markers; keeps flow knobs, proxy and plain env', () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: '/usr/bin', HOME: '/root', HTTPS_PROXY: 'http://p:1', no_proxy: 'localhost',
+      CLAUDE_CONFIG_DIR: '/root/.claude-alt', CODEX_HOME: '/root/.codex-alt',
+      // 触发 shell 是某个话题的 CLI：会话路由身份 + owner + MCP gateway + daemon 内部变量
+      BOTMUX_SESSION_ID: 'topic-1', BOTMUX_CHAT_ID: 'oc_1', BOTMUX_LARK_APP_ID: 'cli_x', BOTMUX_CHAT_TYPE: 'thread',
+      BOTMUX_OWNER_OPEN_ID: 'ou_1', __OWNER_OPEN_ID: 'ou_1', BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/gw.sock', BOTMUX_MCP_GATEWAY_REQUIRED: '1',
+      BOTMUX_BOT_INDEX: '0', BOTMUX_TURN_ID: 't1', BOTS_CONFIG: '/root/.botmux/bots.json', SESSION_DATA_DIR: '/root/.botmux/data', IS_SANDBOX: '1', BOTMUX: '1',
+      LARK_APP_ID: 'cli_x', LARK_APP_SECRET: 's', GITHUB_TOKEN: 'ghp', TMUX: '/tmp/tmux-0/default,1,0', TMUX_PANE: '%1',
+      CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'sess', BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'x',
+      // v3 / 外层 flow 的 attempt 标记：嵌套 run 不得继承（逃逸扫描按它识别归属）
+      BOTMUX_WORKFLOW_RUN_ID: 'w', BOTMUX_FLOW_ATTEMPT: 'outer/#0/1-1', BOTMUX_FLOW_RUN_ID: 'outer', BOTMUX_FLOW_RUN_DIR: '/x',
+      // runner 自己的注入旋钮要留着（测试用假 agent、崩溃点、源码 loader）
+      BOTMUX_FLOW_FAKE_AGENT: 'echo', BOTMUX_FLOW_TS_SRC_DIR: '/src', BOTMUX_FLOW_CRASH_AT: 'after_send_intent',
+    };
+    scrubFlowChildEnv(env);
+    expect(Object.keys(env).sort()).toEqual([
+      'BOTMUX_FLOW_CRASH_AT', 'BOTMUX_FLOW_FAKE_AGENT', 'BOTMUX_FLOW_TS_SRC_DIR',
+      'HOME', 'HTTPS_PROXY', 'PATH', 'no_proxy',
+    ]);
+    // 删除是真删，不是 present-with-undefined（node-pty 会把 undefined 拼成字符串）
+    expect('BOTMUX_SESSION_ID' in env).toBe(false);
+    expect('BOTMUX_FLOW_ATTEMPT' in env).toBe(false);
+  });
+
+  it('every botmux-injected and redacted key is covered (drift guard against new session-scoped keys)', () => {
+    const env: NodeJS.ProcessEnv = Object.fromEntries([...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS].map((k) => [k, 'v']));
+    scrubFlowChildEnv(env);
+    expect(Object.keys(env)).toEqual([]);
+  });
+});
+
 describe('scrubSessionCliHomeEnv()', () => {
   it('deletes inherited session-level CLI home pointers in place, keys absent not undefined', () => {
     const env: NodeJS.ProcessEnv = {
@@ -347,6 +383,14 @@ describe('scrubWorkflowWorkerEnv()', () => {
     for (const key of Object.values(GOAL_ENV)) {
       expect(WORKFLOW_WORKER_ENV_KEYS).toContain(key);
     }
+  });
+
+  it('also drops the flow attempt markers, pinned to src/flow/types.ts FLOW_WORKER_ENV_KEYS', () => {
+    expect([...FLOW_WORKER_ENV_KEYS_LOCAL]).toEqual([...FLOW_WORKER_ENV_KEYS_CANONICAL]);
+    const env: NodeJS.ProcessEnv = { ...Object.fromEntries(FLOW_WORKER_ENV_KEYS_CANONICAL.map((key) => [key, 'leaked'])), KEEP: 'v' };
+    scrubWorkflowWorkerEnv(env);
+    for (const key of FLOW_WORKER_ENV_KEYS_CANONICAL) expect(key in env, key).toBe(false);
+    expect(env.KEEP).toBe('v');
   });
 });
 

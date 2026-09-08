@@ -180,7 +180,9 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
+/** 外部触发（无会话）在某个群里落地时的工作目录：oncall 绑定 → bot 默认目录 → bot 配置目录 → `~`。
+ *  turn 与 flow 触发共用同一条解析，保证同一个群里两种触发看到同一个目录。 */
+export function resolveTriggerWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
   const bot = getBot(larkAppId);
   const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
   const botDefault = effectiveDefaultWorkingDir(bot.config);
@@ -1552,7 +1554,7 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
+  const wd = resolveTriggerWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }

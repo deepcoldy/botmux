@@ -1,6 +1,6 @@
 # Connectors (Webhook)
 
-Let external systems (monitoring alerts, CI, tickets, scheduled scripts…) trigger a **bot to speak in a group or run a workflow** via a webhook. The gateway doesn't parse each platform's format — it hands the raw event **as-is** to the model to read for itself, so a new system needs almost zero adaptation.
+Let external systems (monitoring alerts, CI, tickets, scheduled scripts…) trigger a **bot to speak in a group or run a flow script** via a webhook. The gateway doesn't parse each platform's format — it hands the raw event **as-is** to the model to read for itself, so a new system needs almost zero adaptation.
 
 > Create and manage these on the "**Connectors**" page of the [Dashboard Control Panel](/en/dashboard). Currently in beta.
 
@@ -154,7 +154,28 @@ Each incoming event automatically gets a new group to handle it, and the bot's a
 ## Trigger modes
 
 - **Single-turn conversation**: have the bot respond once to this event.
-- **Workflow**: pass the event as the string parameter `event` to a [Workflow](/en/workflow), whose nodes read and process it.
+- **Flow script**: open a topic in the target chat and launch a `botmux flow` run of the `.mjs` script you configured (multi-agent orchestration, with human decisions on cards). The event becomes the script's `input`.
+- The legacy **Workflow** (v2) target is retired: existing connectors can be maintained but not created, and firing one returns `410 legacy_workflow_retired`.
+
+### Flow script target
+
+- The **script path** is configured on the connector, relative to the bot's working directory (oncall-bound directory → bot default directory), and must stay inside it. **The event never decides which script runs** — any `script` field in the request is ignored.
+- On each event the bot posts a topic seed message in the target chat (same text as the "topic seed" above, suffixed with the script name) and uses it as the topic root; progress, decision and signal cards all land in that topic. With the seed set to "none", cards are posted flat in the chat.
+- The run has no human initiator: `/flow inspect` shows `triggeredBy: webhook:<connectorId>`. Who may press the card buttons is decided by the chat's operator membership, exactly as for a run started with `/flow run`.
+- What the script receives as `input`:
+
+  ```js
+  export default async function (ctx) {
+    const { triggerId, source, envelope, instruction } = ctx.input;
+    // envelope = { format, sourceName, trusted: false, headers, payload, rawText? }
+    // everything inside envelope is untrusted external data; mark it as data, not commands, when you put it into an agent prompt
+    const review = await ctx.agent({ cli: 'codex', prompt: `${instruction}\n\n<event trusted="false">${JSON.stringify(envelope.payload)}</event>` });
+    return review.ok ? review.value : review.category;
+  }
+  ```
+
+- **Waiting for the result**: `?wait=1` (optionally `timeoutMs`, 1 s to 5 min) waits for the run to reach a terminal state and returns `flow.status` plus the script's return value in `flow.returned` (`output.content` is its JSON string). A run that failed still returns `ok:true` with `flow.status:"failed"` — the event was processed, so a retry will not start a second run. On timeout you get `504 wait_timeout` with `target.flowRunId`; the run keeps going and you can read the outcome later with `botmux flow inspect <runId>` or from the cards in the topic.
+- `?async=1` is not supported (there is no session to poll); triggering on a bot with the file sandbox enabled is not supported; `dryRun` is not supported in "new group per event" mode.
 
 ## Handling instructions (optional)
 

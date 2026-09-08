@@ -24,7 +24,7 @@ import {
   type TriggerLogListOptions,
   type TriggerLogStats,
 } from '../services/trigger-log-store.js';
-import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
+import { FLOW_TRIGGER_SCRIPT_MAX_LENGTH, type TriggerAction, type TriggerErrorCode } from '../services/trigger-types.js';
 import { jsonRes } from './http.js';
 
 const DEFAULT_VERIFY_HEADERS = {
@@ -215,6 +215,7 @@ function sameConnectorTarget(
     && left.botId === right.botId
     && left.chatId === right.chatId
     && left.workflowId === right.workflowId
+    && left.script === right.script
     && sameStringSet(left.botIds, right.botIds)
     && sameStringSet(left.allowChats, right.allowChats);
 }
@@ -240,7 +241,7 @@ function normalizeConnectorInput(
   const targetMode = typeof target.mode === 'string' ? target.mode : prior?.target.mode ?? 'dynamic';
   if (!['dynamic', 'fixed', 'new-group'].includes(targetMode)) return { ok: false, error: 'bad_target_mode' };
   const targetKind = typeof target.kind === 'string' ? target.kind : prior?.target.kind ?? 'turn';
-  if (!['turn', 'workflow'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
+  if (!['turn', 'workflow', 'flow'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
   const botId = typeof target.botId === 'string' && target.botId.trim() ? target.botId.trim() : prior?.target.botId;
   if (!botId) return { ok: false, error: 'target_bot_required' };
   const botIds = hasOwn(target, 'botIds')
@@ -254,6 +255,15 @@ function normalizeConnectorInput(
     ? (typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId)
     : undefined;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
+  // flow：脚本路径由 connector 拥有者在这里固定；webhook 请求体永远决定不了跑哪个脚本。
+  // 是否真的落在 bot 工作目录内由 daemon 起 run 时核对（FlowRunManager.launch）。
+  const script = targetKind === 'flow'
+    ? (typeof target.script === 'string' && target.script.trim() ? target.script.trim() : prior?.target.script)
+    : undefined;
+  if (targetKind === 'flow') {
+    if (!script) return { ok: false, error: 'flow_script_required' };
+    if (script.length > FLOW_TRIGGER_SCRIPT_MAX_LENGTH || script.includes('\0')) return { ok: false, error: 'bad_flow_script' };
+  }
   // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
   const lifecycleExtractors = targetMode === 'new-group'
     ? (c.lifecycleExtractors === undefined
@@ -303,6 +313,7 @@ function normalizeConnectorInput(
         ? { allowChats: hasOwn(target, 'allowChats') ? stringList(target.allowChats) : (prior?.target.allowChats ?? []) }
         : {}),
       ...(workflowId ? { workflowId } : {}),
+      ...(script ? { script } : {}),
     },
     promptEnvelope: {
       sourceName: typeof promptEnvelope.sourceName === 'string' && promptEnvelope.sourceName.trim()
@@ -351,7 +362,7 @@ function normalizeConnectorInput(
   if (!prior && next.target.kind === 'workflow') {
     return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
   }
-  if (prior?.target.kind === 'turn' && next.target.kind === 'workflow') {
+  if (prior && prior.target.kind !== 'workflow' && next.target.kind === 'workflow') {
     return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
   }
   if (prior?.target.kind === 'workflow' && !sameConnectorTarget(next.target, prior.target)) {

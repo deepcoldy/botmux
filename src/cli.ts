@@ -12292,6 +12292,11 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
+  // flow 的三个角色进程（src/flow/*）。runner 由 `botmux flow run/resume` 或 daemon 起，
+  // script host 与 agent worker 由 runner 起；三者都必须在编译态可达。
+  else if (__entrySubcommand === 'flow-runner') await import('./flow-runner.js');
+  else if (__entrySubcommand === 'flow-script') await import('./flow-script.js');
+  else if (__entrySubcommand === 'flow-agent') await import('./flow-agent.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
@@ -13457,6 +13462,13 @@ switch (command) {
     // real ephemeral worker pool, daemon-independent (dogfood path).
     const { cmdV3 } = await import('./workflows/v3/cli-run.js');
     await cmdV3(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'flow': {
+    // `botmux flow run <script.mjs>` — JS-as-runtime 编排（src/flow/，设计文档
+    // docs/design/2026-09-06-js-as-runtime-orchestration.md）。
+    const { cmdFlow } = await import('./cli/flow.js');
+    process.exitCode = await cmdFlow(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'goal': {

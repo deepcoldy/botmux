@@ -533,3 +533,78 @@ describe('connector-api write routes', () => {
     expect(remaining.logs.map((x: any) => x.triggerId)).toEqual(['sig']);
   });
 });
+
+describe('connector-api flow targets', () => {
+  it('creates a flow connector only with a script, stores it, and keeps the script on non-target edits', async () => {
+    const missing = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'CI flow', target: { mode: 'fixed', kind: 'flow', botId: 'app1', chatId: 'oc_1' } }),
+    });
+    expect(missing.status).toBe(400);
+    expect(await json(missing)).toMatchObject({ ok: false, error: 'flow_script_required' });
+    expect((await json(await fetch(`${baseUrl}/api/connectors`))).connectors).toEqual([]);
+
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'CI flow',
+        target: { mode: 'fixed', kind: 'flow', botId: 'app1', chatId: 'oc_1', script: '  flows/on-push.mjs ' },
+        promptEnvelope: { sourceName: 'ci', instruction: 'Review the push.' },
+      }),
+    }));
+    expect(created.ok).toBe(true);
+    expect(created.connector.target).toEqual({ mode: 'fixed', kind: 'flow', botId: 'app1', chatId: 'oc_1', script: 'flows/on-push.mjs' });
+
+    const edited = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'CI flow (renamed)', promptEnvelope: { sourceName: 'ci', instruction: 'Review carefully.' } }),
+    }));
+    expect(edited.ok).toBe(true);
+    expect(edited.connector.target.script).toBe('flows/on-push.mjs');
+    expect(edited.connector.promptEnvelope.instruction).toBe('Review carefully.');
+  });
+
+  it('converts between turn and flow freely but never into the retired workflow kind', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Turn first', target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' } }),
+    }));
+    const toFlow = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { mode: 'fixed', kind: 'flow', botId: 'app1', chatId: 'oc_1', script: 'flows/a.mjs' } }),
+    }));
+    expect(toFlow.ok).toBe(true);
+    expect(toFlow.connector.target).toMatchObject({ kind: 'flow', script: 'flows/a.mjs' });
+
+    const toWorkflow = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { mode: 'fixed', kind: 'workflow', botId: 'app1', chatId: 'oc_1', workflowId: 'weekly-report' } }),
+    });
+    expect(toWorkflow.status).toBe(400);
+    expect(await json(toWorkflow)).toMatchObject({ ok: false, error: 'legacy_workflow_connector_creation_disabled' });
+
+    const backToTurn = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' } }),
+    }));
+    expect(backToTurn.ok).toBe(true);
+    expect(backToTurn.connector.target).toEqual({ mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' });
+  });
+
+  it('rejects an over-long flow script path', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Long', target: { mode: 'fixed', kind: 'flow', botId: 'app1', chatId: 'oc_1', script: 'a'.repeat(600) } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({ ok: false, error: 'bad_flow_script' });
+  });
+});

@@ -165,6 +165,7 @@ export async function dispatchTriggerRequest(
           durationMs: Math.max(0, Date.now() - logContext.startedAtMs),
           ...(parsed.target?.sessionId ? { sessionId: parsed.target.sessionId } : {}),
           ...(parsed.target?.workflowRunId ? { workflowRunId: parsed.target.workflowRunId } : {}),
+          ...(parsed.target?.flowRunId ? { flowRunId: parsed.target.flowRunId } : {}),
           ...(parsed.target?.chatId ? { chatId: parsed.target.chatId } : {}),
         },
       } : {}),

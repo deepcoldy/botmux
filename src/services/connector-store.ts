@@ -5,7 +5,8 @@ import { config } from '../config.js';
 
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
-export type ConnectorTargetKind = 'turn' | 'workflow';
+/** `turn`：单轮对话；`workflow`：v2 工作流墓碑（不可新建）；`flow`：起一个 `botmux flow` run。 */
+export type ConnectorTargetKind = 'turn' | 'workflow' | 'flow';
 export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
 
 export interface ConnectorTopicMessageExtractor {
@@ -41,6 +42,9 @@ export interface ConnectorDefinition {
     chatId?: string;
     allowChats?: string[];
     workflowId?: string;
+    /** `kind: 'flow'`：脚本路径，相对目标 bot 的工作目录（必须落在其内；由 connector 拥有者
+     *  配置，事件体决定不了跑什么脚本）。 */
+    script?: string;
   };
   promptEnvelope: {
     sourceName: string;

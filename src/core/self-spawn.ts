@@ -33,7 +33,10 @@ export type BotmuxEntry =
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
-  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner';
+  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
+  // flow（JS-as-runtime 编排）的三个角色：runner（持 lease 的特权进程）、script host
+  // （受限 vm 里跑脚本）、agent worker（一个 attempt 一个 PTY）。设计文档 §6.1。
+  | 'flow-runner' | 'flow-script' | 'flow-agent';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -46,6 +49,9 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
   'mir-runner': '__mir-runner',
+  'flow-runner': '__flow-runner',
+  'flow-script': '__flow-script',
+  'flow-agent': '__flow-agent',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -59,6 +65,9 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',
   'mir-runner': 'mir-runner.js',
+  'flow-runner': 'flow-runner.js',
+  'flow-script': 'flow-script.js',
+  'flow-agent': 'flow-agent.js',
 };
 
 /**

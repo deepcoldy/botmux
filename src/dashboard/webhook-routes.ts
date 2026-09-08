@@ -803,20 +803,33 @@ async function handleWebhookRouteImpl(
     parsed.payload,
     deps.resolveMentionIdentities,
   );
-  if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn') {
+  // flow 只有「等 run 结束」一种应答模式：没有 session 可供 asyncReturnSessionId 轮询，
+  // 结果要么同步等回来，要么事后用 `botmux flow inspect <runId>` 看。
+  const isFlow = connector.target.kind === 'flow';
+  const flowTarget = isFlow ? { script: connector.target.script ?? '' } : {};
+  if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn' && !isFlow) {
     fail(400, 'bad_request', 'wait mode is only supported for turn connectors');
+    return true;
+  }
+  if (isFlow && responseOptions.asyncReturnSessionId) {
+    fail(400, 'bad_request', 'asyncReturnSessionId is not supported for flow connectors; use waitForFinalOutput or poll with botmux flow inspect');
     return true;
   }
   if (responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) {
     const chatId = connector.target.mode === 'fixed'
       ? connector.target.chatId
       : dynamicChatId(req, url, parsed.payload);
-    const sessionId = dynamicSessionId(req, url, parsed.payload);
+    const sessionId = isFlow ? undefined : dynamicSessionId(req, url, parsed.payload);
     const rootMessageId = dynamicRootMessageId(req, url, parsed.payload);
     auditTarget = { ...auditTarget, ...(chatId ? { chatId } : {}), ...(sessionId ? { sessionId } : {}), ...(rootMessageId ? { rootMessageId } : {}) };
     const allowChats = connector.target.allowChats ?? [];
     if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
       fail(403, 'chat_not_allowed', 'chatId is not allowed for this connector');
+      return true;
+    }
+    if (isFlow && !chatId) {
+      // flow 的卡片必须落在真实话题里，没有 http_wait_* 这种虚拟会话可退
+      fail(400, 'target_required', 'flow connector requires a target chatId');
       return true;
     }
     const trigger: TriggerRequest = {
@@ -832,6 +845,7 @@ async function handleWebhookRouteImpl(
         ...(chatId ? { chatId } : {}),
         ...(sessionId ? { sessionId } : {}),
         ...(rootMessageId ? { rootMessageId } : {}),
+        ...flowTarget,
       },
       envelope: {
         format: 'botmux.webhook.v1',
@@ -854,13 +868,13 @@ async function handleWebhookRouteImpl(
     // A turn-targeted dry-run cannot be truthfully preflighted before a chat
     // exists. Never satisfy a read-only request by creating lifecycle state or
     // a Feishu group; reject it explicitly instead.
-    if (responseOptions.dryRun && connector.target.kind === 'turn') {
+    if (responseOptions.dryRun && (connector.target.kind === 'turn' || isFlow)) {
       webhookError(
         res,
         400,
         connectorId,
         'bad_request',
-        'dryRun is not supported for new-group turn connectors because no target chat exists yet',
+        `dryRun is not supported for new-group ${connector.target.kind} connectors because no target chat exists yet`,
       );
       return true;
     }
@@ -958,6 +972,7 @@ async function handleWebhookRouteImpl(
         botId: connector.target.botId,
         chatId,
         workflowId: connector.target.workflowId,
+        ...flowTarget,
       },
       envelope: {
         format: 'botmux.webhook.v1',
@@ -1013,6 +1028,7 @@ async function handleWebhookRouteImpl(
       chatId,
       ...(rootMessageId ? { rootMessageId } : {}),
       workflowId: connector.target.workflowId,
+      ...flowTarget,
     },
     envelope: {
       format: 'botmux.webhook.v1',

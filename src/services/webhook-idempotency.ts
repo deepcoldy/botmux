@@ -334,6 +334,9 @@ export function dispatchDidRun(body: { ok?: boolean; errorCode?: string; trigger
   // Proven dispatched: the wait timed out, not the dispatch. The triggerId is the
   // turn that is running, so a retry must fold onto it.
   if (body.errorCode === 'wait_timeout' && body.triggerId) return true;
+  // Same for a flow run whose runner died mid-way: the run exists on disk and is
+  // resumable (`/flow resume`), so a retried delivery must NOT start a second one.
+  if (body.errorCode === 'flow_interrupted' && body.triggerId) return true;
   // Everything else (daemon_offline, bad_request, target_required, bot_not_found,
   // trigger_failed, no_output …) is either provably pre-dispatch or genuinely
   // commit-unknown. For those we keep the fail-open stance the rest of this module

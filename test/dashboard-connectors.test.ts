@@ -8,10 +8,11 @@ import {
 } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
-  it('keeps the legacy workflow kind visible but disabled in the create surface', () => {
+  it('offers turn and flow kinds, keeping the legacy workflow kind visible but disabled', () => {
     const options = buildConnectorKindOptions((key) => key);
     expect(options).toEqual([
       { value: 'turn', label: 'connectors.kindTurn' },
+      { value: 'flow', label: 'connectors.kindFlow' },
       {
         value: 'workflow',
         label: 'connectors.kindWorkflowRetiring',

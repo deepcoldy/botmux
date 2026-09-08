@@ -116,6 +116,7 @@ export function webhookAuditTarget(
     botId: connector.target.botId,
     ...(connector.target.chatId ? { chatId: connector.target.chatId } : {}),
     ...(connector.target.workflowId ? { workflowId: connector.target.workflowId } : {}),
+    ...(connector.target.script ? { script: connector.target.script } : {}),
     ...overrides,
   };
 }

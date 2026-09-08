@@ -1,5 +1,8 @@
 export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting';
-export type TriggerTargetKind = 'turn' | 'workflow';
+/** `turn`：单轮对话；`workflow`：v2 工作流（已退役，只剩墓碑）；`flow`：起一个 `botmux flow` run。 */
+export type TriggerTargetKind = 'turn' | 'workflow' | 'flow';
+/** `target.script` 的最大长度（相对 bot 工作目录的路径）。 */
+export const FLOW_TRIGGER_SCRIPT_MAX_LENGTH = 512;
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
 export type LegacyWorkflowRetirementReason =
@@ -22,6 +25,9 @@ export interface TriggerRequest {
     sessionId?: string;
     rootMessageId?: string;
     workflowId?: string;
+    /** `kind: 'flow'`：脚本路径，相对目标 bot 的工作目录（必须落在其内）。由 connector 配置
+     *  提供，绝不取自请求体——事件只能决定 `input`，不能决定跑什么。 */
+    script?: string;
   };
   envelope: {
     format: string;
@@ -97,7 +103,11 @@ export type TriggerErrorCode =
   | 'trigger_failed'
   | 'wait_timeout'
   | 'no_output'
-  | 'workflow_trigger_not_implemented';
+  | 'workflow_trigger_not_implemented'
+  /** flow run 已起但 runner 中途退出（可 `/flow resume`）；重试投递不应再起一个。 */
+  | 'flow_interrupted'
+  /** 目标 bot 没有启用 flow（core-only bot，或 daemon 版本过旧）。 */
+  | 'flow_not_enabled';
 
 /** Four-state async lifecycle for `GET /api/sessions/:id/trigger-result`.
  *  Programmatic callers (task runners) branch on this instead of ok/action:
@@ -122,6 +132,18 @@ export interface TriggerResponse {
     sessionId?: string;
     workflowRunId?: string;
     chatId?: string;
+    /** `kind: 'flow'`：起的 run id（`botmux flow inspect <runId>` / `/flow inspect`）。 */
+    flowRunId?: string;
+    /** `kind: 'flow'`：卡片所在话题的根消息 id。 */
+    rootMessageId?: string;
+  };
+  /** `kind: 'flow'` + `waitForFinalOutput`：run 的终态。`returned` 是脚本返回值。 */
+  flow?: {
+    runId: string;
+    status: string;
+    health?: string;
+    returned?: unknown;
+    error?: { code: string; message: string } | null;
   };
   message?: string;
   errorCode?: TriggerErrorCode;
@@ -193,8 +215,8 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (!isRecord(source) || !isRecord(target) || !isRecord(envelope)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'source, target, and envelope are required objects' } };
   }
-  if (target.kind !== 'turn' && target.kind !== 'workflow') {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
+  if (target.kind !== 'turn' && target.kind !== 'workflow' && target.kind !== 'flow') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn, workflow, or flow' } };
   }
   const options = isRecord(raw.options) ? raw.options : {};
   // Strict boolean typing for the mode/gate flags. The validator derives these
@@ -225,6 +247,22 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (target.kind === 'workflow' && typeof target.workflowId !== 'string') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'workflow target requires workflowId' } };
   }
+  if (target.kind === 'flow') {
+    // flow run 的卡片必须落在真实飞书话题里：没有虚拟会话，也不复用已有 session。
+    const script = typeof target.script === 'string' ? target.script.trim() : '';
+    if (!script || script.length > FLOW_TRIGGER_SCRIPT_MAX_LENGTH || script.includes('\0')) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: `flow target requires script (1 to ${FLOW_TRIGGER_SCRIPT_MAX_LENGTH} chars)` } };
+    }
+    if (!hasChatId) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'flow target requires chatId (rootMessageId is optional and must belong to it)' } };
+    }
+    if (hasSessionId) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'flow target does not accept sessionId' } };
+    }
+    if (asyncReturnSessionId) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'asyncReturnSessionId is not supported for flow targets; use waitForFinalOutput or poll with botmux flow inspect' } };
+    }
+  }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
   }
@@ -240,8 +278,8 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
     }
   }
-  if (waitForFinalOutput && target.kind !== 'turn') {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput is only supported for turn targets' } };
+  if (waitForFinalOutput && target.kind !== 'turn' && target.kind !== 'flow') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput is only supported for turn and flow targets' } };
   }
   if (waitForFinalOutput && asyncReturnSessionId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };

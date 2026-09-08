@@ -129,7 +129,7 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
-import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -206,6 +206,14 @@ export type BotDescriptionManager = {
 let botDescriptionManager: BotDescriptionManager | null = null;
 export function setBotDescriptionManager(manager: BotDescriptionManager | null): void {
   botDescriptionManager = manager;
+}
+
+// `POST /api/trigger` 的 `target.kind: 'flow'` 分支：由 daemon 启动时注册（它持有本 bot 的
+// FlowRunManager 与飞书客户端）。未注册（core-only bot / 测试环境）→ 明确 501，不降级成 turn。
+export type FlowTriggerHandler = (req: TriggerRequest) => Promise<TriggerResponse>;
+let flowTriggerHandler: FlowTriggerHandler | null = null;
+export function setFlowTriggerHandler(handler: FlowTriggerHandler | null): void {
+  flowTriggerHandler = handler;
 }
 
 type SupervisorShutdownRegistration = SupervisorShutdownIdentity & {
@@ -3137,7 +3145,19 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
         error: 'active session registry unavailable',
       });
     }
-    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    let result: TriggerResponse;
+    if (valid.request.target.kind === 'flow') {
+      if (!flowTriggerHandler) {
+        return jsonRes(res, 501, {
+          ok: false,
+          errorCode: 'flow_not_enabled',
+          error: 'flow is not enabled on this bot (core-only bot, or daemon too old)',
+        });
+      }
+      result = await flowTriggerHandler(valid.request);
+    } else {
+      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    }
     const status = result.ok
       ? 200
       // An idempotent retry that resolves to a durable `failed` async state is a
@@ -3153,6 +3173,8 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
           ? 404
         : result.errorCode === 'wait_timeout'
           ? 504
+        : result.errorCode === 'flow_interrupted'
+          ? 502
         : result.errorCode === 'target_required' || result.errorCode === 'bad_request'
           ? 400
           : 500;

@@ -878,3 +878,119 @@ describe('legacy workflow connector tombstone', () => {
     expect(captured).toHaveLength(0);
   });
 });
+
+describe('flow connector target', () => {
+  async function seedFlowConnector(input: { mode: 'fixed' | 'dynamic' | 'new-group'; id?: string }): Promise<ConnectorDefinition> {
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    return upsertConnector({
+      id: input.id ?? `conn_flow_${input.mode.replace('-', '_')}`,
+      name: 'CI flow',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: {
+        mode: input.mode,
+        kind: 'flow',
+        botId: 'app1',
+        ...(input.mode === 'fixed' ? { chatId: 'oc_fixed' } : {}),
+        script: 'flows/on-push.mjs',
+      },
+      promptEnvelope: { sourceName: 'ci', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024, instruction: 'Review the push.' },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-09-08T00:00:00.000Z',
+      updatedAt: '2026-09-08T00:00:00.000Z',
+    });
+  }
+
+  it('dispatches a fixed-chat flow connector with the connector-owned script, never one from the request', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, path: string, init: RequestInit) => {
+      captured.push({ path, body: JSON.parse(String(init.body)) });
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: 'trg_flow', action: 'queued', target: { kind: 'flow', chatId: 'oc_fixed', flowRunId: 'run_1', rootMessageId: 'om_seed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedFlowConnector({ mode: 'fixed' });
+    const res = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ref: 'refs/heads/main', target: { script: '../../evil.mjs' }, script: 'evil.mjs' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'queued', target: { kind: 'flow', flowRunId: 'run_1' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].path).toBe('/api/trigger');
+    expect(captured[0].body.target).toEqual({ kind: 'flow', botId: 'app1', chatId: 'oc_fixed', script: 'flows/on-push.mjs' });
+    expect(captured[0].body.instruction).toBe('Review the push.');
+    expect(captured[0].body.envelope).toMatchObject({ trusted: false, sourceName: 'ci', payload: { ref: 'refs/heads/main' } });
+    expect(captured[0].body.options).toEqual({});
+  });
+
+  it('wait mode forwards waitForFinalOutput for a flow connector and rejects async mode', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: 'trg_flow_wait', action: 'completed', output: { content: '{"verdict":"ship"}' }, flow: { runId: 'run_1', status: 'completed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedFlowConnector({ mode: 'dynamic' });
+    const res = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value?wait=1&timeoutMs=60000&chatId=oc_dyn`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ref: 'refs/heads/main' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'completed', flow: { status: 'completed' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toEqual({ kind: 'flow', botId: 'app1', chatId: 'oc_dyn', script: 'flows/on-push.mjs' });
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true, timeoutMs: 60000 });
+
+    const noChat = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value?wait=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(noChat.status).toBe(400);
+    expect(await noChat.json()).toMatchObject({ ok: false, errorCode: 'target_required' });
+
+    const asyncMode = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value?async=1&chatId=oc_dyn`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(asyncMode.status).toBe(400);
+    expect(await asyncMode.json()).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(captured).toHaveLength(1);
+  });
+
+  it('new-group flow connectors create the group first and refuse dry runs', async () => {
+    const captured: any[] = [];
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new_flow', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: 'trg_flow_group', action: 'queued', target: { kind: 'flow', chatId: 'oc_new_flow', flowRunId: 'run_2' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon, createLifecycleGroup });
+    const connector = await seedFlowConnector({ mode: 'new-group' });
+
+    const dry = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value?dryRun=true`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(dry.status).toBe(400);
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+
+    const res = await fetch(`${baseUrl}/webhook/${connector.id}/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ alert: { id: 'a1' } }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, lifecycle: { action: 'create', chatId: 'oc_new_flow' } });
+    expect(createLifecycleGroup).toHaveBeenCalledTimes(1);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toMatchObject({ kind: 'flow', chatId: 'oc_new_flow', script: 'flows/on-push.mjs' });
+  });
+});

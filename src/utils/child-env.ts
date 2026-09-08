@@ -53,9 +53,51 @@ export const WORKFLOW_WORKER_ENV_KEYS = [
   'BOTMUX_V3_GOAL',
 ] as const;
 
-/** Remove workflow-only identity from a non-workflow process boundary. */
+/**
+ * Runtime markers that belong only to a `botmux flow` agent worker / script host
+ * (src/flow/types.ts FLOW_WORKER_ENV_KEYS — string literals here because this
+ * module is deliberately dependency-free; a drift-guard test pins the two lists
+ * together). Same failure shape as the workflow keys: a CLI running inside a
+ * flow attempt may invoke `botmux restart`, and the attempt marker must not be
+ * persisted into the long-lived daemons and inherited by every ordinary worker.
+ */
+export const FLOW_WORKER_ENV_KEYS = ['BOTMUX_FLOW_ATTEMPT', 'BOTMUX_FLOW_RUN_ID', 'BOTMUX_FLOW_RUN_DIR'] as const;
+
+/** Remove workflow-only (and flow-only) identity from a non-workflow process boundary. */
 export function scrubWorkflowWorkerEnv(env: NodeJS.ProcessEnv): void {
   for (const key of WORKFLOW_WORKER_ENV_KEYS) delete env[key];
+  for (const key of FLOW_WORKER_ENV_KEYS) delete env[key];
+}
+
+/**
+ * Env baseline for everything a `botmux flow` runner spawns (script host, agent
+ * workers and through them the sub-agent CLIs). A flow run is launched from an
+ * arbitrary shell — including the shell of a CLI that is itself a botmux topic
+ * session — so `process.env` may carry that topic's routing identity
+ * (BOTMUX_SESSION_ID / BOTMUX_CHAT_ID / BOTMUX_LARK_APP_ID / owner / MCP gateway
+ * socket …). A sub-agent inheriting those believes it IS the topic session: its
+ * botmux hooks report Stop/AskUserQuestion into the parent thread and its
+ * `botmux send` posts as the parent. Flow sub-agents are not DaemonSessions
+ * (design §3), so the whole botmux-injected family, IM-app credentials and
+ * stale claude session markers are dropped here. Kept deliberately:
+ *  - `BOTMUX_FLOW_*`: the runner's own test/injection knobs (fake agent, crash
+ *    points, source-dir loader); the per-run/per-attempt markers are re-set by
+ *    the runner and worker AFTER this scrub (nested runs must not inherit the
+ *    outer run's marker — the escape scan keys on it).
+ *  - proxy vars: sub-agent CLIs need the network.
+ * CLAUDE_CONFIG_DIR / CODEX_HOME go with the injected family: inherited from a
+ * topic they are that bot's isolated CLI home (a sibling's data root, see
+ * SESSION_CLI_HOME_ENV_KEYS); from a terminal the default HOME applies. The M2
+ * daemon-side launcher pins them per run instead.
+ */
+export function scrubFlowChildEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('BOTMUX') && !key.startsWith('BOTMUX_FLOW_')) delete env[key];
+  }
+  for (const key of BOTMUX_INJECTED_ENV_KEYS) delete env[key];
+  for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  stripDashboardH5Env(env);
+  scrubWorkflowWorkerEnv(env);
 }
 
 /** Boundary-only companion to the markers. A CLAUDE_EFFORT inherited THROUGH

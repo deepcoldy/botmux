@@ -15,11 +15,12 @@ interface Connector {
   verify?: { type: 'token' | 'hmac-sha256' };
   target: {
     mode: 'dynamic' | 'fixed' | 'new-group';
-    kind: 'turn' | 'workflow';
+    kind: 'turn' | 'workflow' | 'flow';
     botId: string;
     chatId?: string;
     allowChats?: string[];
     workflowId?: string;
+    script?: string;
   };
   promptEnvelope: { sourceName: string; instruction?: string };
   topicMessage?: {
@@ -53,8 +54,9 @@ interface GroupOpt {
 interface CreateForm {
   name: string;
   botId: string;
-  kind: 'turn' | 'workflow';
+  kind: 'turn' | 'workflow' | 'flow';
   workflowId: string;
+  script: string;
   mode: 'dynamic' | 'fixed' | 'new-group';
   chatId: string;
   manualChat: boolean;
@@ -95,6 +97,7 @@ const emptyForm: CreateForm = {
   botId: '',
   kind: 'turn',
   workflowId: '',
+  script: '',
   mode: 'dynamic',
   chatId: '',
   manualChat: false,
@@ -153,9 +156,10 @@ export function buildConnectorTopicMessageConfig(
 
 export function buildConnectorKindOptions(
   tr: (key: string) => string,
-): Array<{ value: 'turn' | 'workflow'; label: string; disabled?: boolean }> {
+): Array<{ value: 'turn' | 'workflow' | 'flow'; label: string; disabled?: boolean }> {
   return [
     { value: 'turn', label: tr('connectors.kindTurn') },
+    { value: 'flow', label: tr('connectors.kindFlow') },
     {
       value: 'workflow',
       label: tr('connectors.kindWorkflowRetiring'),
@@ -317,6 +321,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     botId: connector.target.botId,
     kind: connector.target.kind,
     workflowId: connector.target.workflowId || '',
+    script: connector.target.script || '',
     mode: connector.target.mode,
     chatId: knownChat ? chatId : '',
     manualChat: Boolean(chatId && !knownChat),
@@ -476,7 +481,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   }
 
   function kindLabel(k: string): string {
-    return k === 'workflow' ? tr('connectors.kindLabelWorkflow') : tr('connectors.kindLabelTurn');
+    return k === 'workflow'
+      ? tr('connectors.kindLabelWorkflow')
+      : k === 'flow'
+        ? tr('connectors.kindLabelFlow')
+        : tr('connectors.kindLabelTurn');
   }
 
   function patchForm(patch: Partial<CreateForm>): void {
@@ -526,6 +535,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       setCreateMsg({ text: tr('connectors.errLegacyWorkflowRetired'), error: true });
       return;
     }
+    const script = form.script.trim();
+    if (form.kind === 'flow' && !script) {
+      setCreateMsg({ text: tr('connectors.errScript'), error: true });
+      return;
+    }
     const topicMessageText = form.topicMessageText.trim();
     if ((form.topicMessageMode === 'custom' || form.topicMessageMode === 'template') && !topicMessageText) {
       setCreateMsg({ text: tr('connectors.errTopicMessage'), error: true });
@@ -544,7 +558,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     const body: any = {
       name,
       enabled: editingConnector?.enabled ?? true,
-      target: { kind: form.kind, mode: form.mode, botId },
+      target: { kind: form.kind, mode: form.mode, botId, ...(form.kind === 'flow' ? { script } : {}) },
       promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
       topicMessage: topicMessage.value,
       suppressFinalOutput: form.suppressFinalOutput,
@@ -635,6 +649,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           ...cur,
           name: '',
           workflowId: '',
+          script: '',
           manualChatId: '',
           dedup: '',
           secret: '',
@@ -797,6 +812,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             <label className="cn-field" htmlFor="cn-wf">
               <FieldTitle>{tr('connectors.fWf')}</FieldTitle>
               <input id="cn-wf" value={form.workflowId} onChange={e => patchForm({ workflowId: e.currentTarget.value })} placeholder="workflowId" />
+            </label>
+          ) : null}
+
+          {form.kind === 'flow' ? (
+            <label className="cn-field cn-field-wide" htmlFor="cn-script">
+              <FieldTitle>{tr('connectors.fScript')}</FieldTitle>
+              <input id="cn-script" value={form.script} onChange={e => patchForm({ script: e.currentTarget.value })} placeholder="flows/on-alert.mjs" />
+              <span className="muted">{tr('connectors.fScriptHint')}</span>
             </label>
           ) : null}
 
@@ -1177,6 +1200,7 @@ function ConnectorList(props: {
             </div>
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
             {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
+            {c.target.kind === 'flow' ? <div className="muted connector-item-note">{tr('connectors.flowScriptPrefix')}<code>{c.target.script}</code></div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             <div className="muted connector-item-note">

@@ -44,6 +44,13 @@ import { sweepOrphanCotMessages } from './im/lark/cot-message.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { startFlowSlotSweeper } from './flow/sweeper.js';
+import { flowSlotsFile } from './flow/paths.js';
+import { FlowRunManager } from './flow/daemon-manager.js';
+import { triggerFlowRun } from './flow/trigger.js';
+import type { RunBinding } from './flow/types.js';
+import { handleFlowCardAction } from './im/lark/flow-card-handler.js';
+import { FLOW_USAGE, parseFlowSlashCommand } from './im/lark/flow-slash-command.js';
 import {
   selectCodexRuntimeUpdateTargets,
   startCliRuntimeUpdateMonitor,
@@ -211,7 +218,8 @@ import {
   recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setFlowTriggerHandler } from './core/dashboard-ipc-server.js';
+import { getBotSandbox } from './services/sandbox-store.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
@@ -268,7 +276,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic, buildExternalEventTopicMessage, resolveTriggerWorkingDir } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
   runWithdrawAutoClose,
@@ -4467,6 +4475,196 @@ async function recoverV3DistillationProposalsForBot(larkAppId: string): Promise<
   }
 }
 
+// ---------------------------------------------------------------------------
+// flow（JS as runtime 编排，设计文档 docs/design/2026-09-06-js-as-runtime-orchestration.md）
+// M2：话题里 `/flow …` 触发绑定；进度 / 决策 / 信号 / 中断卡都发在触发话题。
+// 一个 daemon 一个 bot，manager 在 startup 拿到 cfg.larkAppId 后构造。
+// ---------------------------------------------------------------------------
+let flowRunManager: FlowRunManager | null = null;
+
+interface FlowImInvocation {
+  content: string;
+  anchor: string;
+  chatId: string | undefined;
+  larkAppId: string;
+  initiatorOpenId: string | undefined;
+  teamTrustUnionId: string | undefined;
+  botSender: boolean;
+}
+
+/**
+ * `/flow` 话题命令。真人成员 + `canOperate` 才能用；`run` 需要在已有会话的话题里（脚本路径
+ * 相对该话题工作目录），沙箱会话在 M2 先拒绝（脚本宿主进沙箱是 M3）。
+ * 返回 true 表示已处理（含错误提示），调用方直接 return。
+ */
+async function handleFlowCommandIfAny(inv: FlowImInvocation): Promise<boolean> {
+  const command = parseFlowSlashCommand(inv.content);
+  if (!command) return false;
+  const reply = async (text: string): Promise<void> => {
+    try {
+      await sessionReply(inv.anchor, text, 'text', inv.larkAppId);
+    } catch (err) {
+      logger.warn(`[flow] notification failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  if (command.kind === 'help') {
+    await reply(FLOW_USAGE);
+    return true;
+  }
+  if (command.kind === 'invalid') {
+    await reply(`❌ ${command.error}\n\n${FLOW_USAGE}`);
+    return true;
+  }
+  const manager = flowRunManager;
+  if (!manager) {
+    await reply('❌ flow 尚未在本机器人启用。');
+    return true;
+  }
+  if (inv.botSender || !inv.initiatorOpenId) {
+    await reply('❌ /flow 只接受真人成员的命令。');
+    return true;
+  }
+  if (!inv.chatId || !canOperate(inv.larkAppId, inv.chatId, inv.initiatorOpenId, inv.teamTrustUnionId)) {
+    await reply('❌ 只有本群可操作成员才能使用 /flow。');
+    return true;
+  }
+  const by = inv.initiatorOpenId;
+  // run 级命令：还要对 run 自己绑定的群做 canOperate（与卡片前置门同一条权限线），
+  // 否则同一 bot 的另一个群里的可操作成员也能取消 / 提交别人的 run。
+  const boundRun = async (runId: string): Promise<RunBinding | null> => {
+    const binding = manager.readBinding(runId);
+    if (!binding) {
+      await reply(`❌ run ${runId} 不存在或不属于本机器人。`);
+      return null;
+    }
+    if (binding.chatId !== inv.chatId && !canOperate(inv.larkAppId, binding.chatId, by, inv.teamTrustUnionId)) {
+      await reply(`❌ 你没有权限操作 run ${runId}（它绑定在别的群）。`);
+      return null;
+    }
+    return binding;
+  };
+  switch (command.kind) {
+    case 'ls': {
+      const runs = manager.listRuns();
+      if (runs.length === 0) {
+        await reply('本机器人还没有 flow run。');
+        return true;
+      }
+      const lines = runs.slice(0, 20).map((r) => `${r.runId}  ${r.status}  gen ${r.gen}  ${r.script}`);
+      await reply(lines.join('\n'));
+      return true;
+    }
+    case 'inspect': {
+      if (!(await boundRun(command.runId))) return true;
+      const status = await manager.control(command.runId, { t: 'status' });
+      if (!status) {
+        const info = manager.interruptedInfo(command.runId);
+        await reply(info
+          ? `run ${command.runId} 已中断（${info.reason}）；在途：${info.inflight.join(', ') || '无'}。用 /flow resume ${command.runId} 恢复。`
+          : `run ${command.runId} 已结束或 runner 由终端持有；详情用 \`botmux flow inspect ${command.runId}\`。`);
+        return true;
+      }
+      if (!status.ok) {
+        await reply(`❌ ${status.error}`);
+        return true;
+      }
+      const lines = [`run ${command.runId}：${status.status}`];
+      for (const p of status.pending) lines.push(`待决策：${p.identity}#${p.attempt}（${p.reason}）`);
+      for (const w of status.waits) lines.push(`待信号：${w.identity} v${w.version}（投递 ${w.delivery}${w.deliveryError ? `：${w.deliveryError}` : ''}）`);
+      await reply(lines.join('\n'));
+      return true;
+    }
+    case 'run': {
+      const ds = activeSessions.get(sessionKey(inv.anchor, inv.larkAppId));
+      if (!ds) {
+        await reply('❌ /flow run 需要在已有会话的话题里使用（脚本路径相对该话题的工作目录）。');
+        return true;
+      }
+      if (ds.session.sandbox) {
+        await reply('❌ 沙箱会话暂不支持 /flow run。');
+        return true;
+      }
+      const binding: RunBinding = {
+        larkAppId: inv.larkAppId,
+        chatId: inv.chatId,
+        rootId: inv.anchor,
+        sessionId: ds.session.sessionId,
+        // 话题 owner 是 daemon 认证的 session 身份；无 owner 的会话由触发者兜底
+        ownerOpenId: ds.session.ownerOpenId ?? by,
+        triggeredBy: by,
+        workingDir: getSessionWorkingDir(ds),
+      };
+      const result = await manager.launch({
+        script: command.script,
+        input: command.input,
+        binding,
+        limits: {
+          ...(command.concurrency !== undefined ? { maxConcurrency: command.concurrency } : {}),
+          ...(command.maxDurationMin !== undefined ? { maxDurationMs: Math.round(command.maxDurationMin * 60_000) } : {}),
+        },
+      });
+      if (!result.ok) await reply(`❌ ${result.error}`);
+      else logger.info(`[flow] run ${result.runId} launched from ${inv.anchor.substring(0, 12)} by ${by.substring(0, 12)}`);
+      return true;
+    }
+    case 'cancel': {
+      if (!(await boundRun(command.runId))) return true;
+      const res = await manager.control(command.runId, { t: 'cancel', by });
+      if (res) {
+        await reply(res.ok ? `已请求取消 run ${command.runId}。` : `❌ ${res.error}`);
+        return true;
+      }
+      if (!manager.interruptedInfo(command.runId)) {
+        await reply(`run ${command.runId} 已结束，或 runner 由终端持有（用 \`botmux flow cancel\`）。`);
+        return true;
+      }
+      const error = await manager.resume(command.runId, by, 'cancel');
+      await reply(error ? `❌ ${error}` : `run ${command.runId} 正在恢复并取消。`);
+      return true;
+    }
+    case 'resume': {
+      if (!(await boundRun(command.runId))) return true;
+      if (!manager.interruptedInfo(command.runId)) {
+        await reply(`run ${command.runId} 不在中断态。`);
+        return true;
+      }
+      const error = await manager.resume(command.runId, by, 'resume');
+      await reply(error ? `❌ ${error}` : `run ${command.runId} 正在恢复。`);
+      return true;
+    }
+    case 'signal': {
+      if (!(await boundRun(command.runId))) return true;
+      const status = await manager.control(command.runId, { t: 'status' });
+      if (!status) {
+        await reply(`❌ run ${command.runId} 的 runner 不在（已中断或已结束）；中断的先 /flow resume。`);
+        return true;
+      }
+      if (!status.ok) {
+        await reply(`❌ ${status.error}`);
+        return true;
+      }
+      const wait = status.waits.find((w) => w.identity === command.identity);
+      if (!wait) {
+        await reply(`❌ run ${command.runId} 没有等待中的信号 ${command.identity}。`);
+        return true;
+      }
+      const res = await manager.control(command.runId, {
+        t: 'signal',
+        identity: wait.identity,
+        version: wait.version,
+        content: wait.content,
+        by,
+        value: command.value,
+      });
+      if (!res) await reply('❌ runner 已退出。');
+      else await reply(res.ok ? `已提交信号 ${wait.identity} v${wait.version}。` : `❌ ${res.error}`);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 async function handleV3SavedWorkflowCommandIfAny(
   invocation: V3SavedWorkflowImInvocation,
 ): Promise<boolean> {
@@ -5450,6 +5648,22 @@ const cardDeps: CardHandlerDeps = {
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
+  // flow 卡片：前置门（白名单 / nonce / run 登记 / canOperate）在 flow-card-handler，
+  // 「已消费 / 旧 version / content 变化」由 runner 裁决（设计 §7.2）。
+  flowCardAction: async (value, operatorOpenId, formValue) => {
+    const manager = flowRunManager;
+    if (!manager) return { toast: { type: 'warning', content: 'flow 尚未在本机器人启用' } };
+    return handleFlowCardAction(value, operatorOpenId, formValue, {
+      readBinding: (runId) => manager.readBinding(runId),
+      canOperate: (binding, openId) => canOperate(binding.larkAppId, binding.chatId, openId),
+      control: (runId, req) => manager.control(runId, req),
+      resumeInterrupted: (runId, by, choice) => manager.resume(runId, by, choice),
+      interruptedGenIsCurrent: (runId, gen) => manager.interruptedGenIsCurrent(runId, gen),
+      scriptName: (runId) => manager.scriptName(runId),
+      interruptedInfo: (runId) => manager.interruptedInfo(runId),
+      lastRunPause: (runId) => manager.lastRunPause(runId),
+    });
+  },
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -17870,6 +18084,18 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   })) {
     return;
   }
+  // `/flow …`（JS as runtime 编排）同样由 host 直接处理，不进 CLI。
+  if (await handleFlowCommandIfAny({
+    content: cmdContent,
+    anchor,
+    chatId,
+    larkAppId,
+    initiatorOpenId: senderOpenId,
+    teamTrustUnionId,
+    botSender: isBotSenderType || isForeignBotSender,
+  })) {
+    return;
+  }
 
   // v3 即兴 grill：`/workflow [new] <目标>`。daemon 不拷问——把目标包成触发
   // botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
@@ -19336,6 +19562,18 @@ async function handleThreadReplyAdmitted(
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
+    botSender: isBotSenderType || isForeignBot,
+  })) {
+    return;
+  }
+  // `/flow …`（JS as runtime 编排）在 thread 内同样由 host 处理。
+  if (await handleFlowCommandIfAny({
+    content: cmdContent,
+    anchor,
+    chatId: threadChatId,
+    larkAppId,
+    initiatorOpenId: threadSenderOpenId,
+    teamTrustUnionId: threadTeamTrustUnionId,
     botSender: isBotSenderType || isForeignBot,
   })) {
     return;
@@ -22741,6 +22979,48 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  // flow（JS as runtime 编排）M2：本 bot 的 run 管理器。绑定话题的 runner 由 daemon 起（IPC 子进程，
+  // 不 detached：daemon 死 → runner 自己写 run.interrupted 并退出），卡片走 sessionReply /
+  // updateMessage。cold-attach：本 app 绑定、未结束且 runner 不在的 run → 补发中断卡（§6.4）。
+  // core-only（apiOnly）bot 没有飞书 chat，sessionReply 会返回 ''；这里直接不启用。
+  if (!coreOnly) {
+    flowRunManager = new FlowRunManager({
+      larkAppId: cfg.larkAppId,
+      dataDir: config.session.dataDir,
+      distDir: __dirname,
+      transport: {
+        reply: async (rootId, cardJson) => {
+          const messageId = await sessionReply(rootId, cardJson, 'interactive', cfg.larkAppId);
+          if (!messageId) throw new Error('lark transport suppressed the reply');
+          return messageId;
+        },
+        patch: (messageId, cardJson) => updateMessage(cfg.larkAppId, messageId, cardJson).then(() => undefined),
+      },
+      log: {
+        info: (m) => logger.info(m),
+        warn: (m) => logger.warn(m),
+      },
+    });
+    await flowRunManager.coldAttach().catch((err) => {
+      logger.warn(`[flow] cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    // webhook 接入点 / `POST /api/trigger` 的 `target.kind: 'flow'`：在目标群开话题、起绑定的 run。
+    // 前置链路（connector 校验、限流、幂等、目标群）与 turn 触发共用；这里只做 daemon 内落地。
+    const manager = flowRunManager;
+    setFlowTriggerHandler((req) => triggerFlowRun(req, {
+      larkAppId: cfg.larkAppId,
+      manager,
+      apiOnly: () => getBot(cfg.larkAppId).config.apiOnly === true,
+      sandboxed: () => getBotSandbox(cfg.larkAppId),
+      isInChat: (chatId) => isInChat(cfg.larkAppId, chatId),
+      messageChatId: (messageId) => getMessageChatId(cfg.larkAppId, messageId),
+      sendTopicSeed: (chatId, text) => sendMessage(cfg.larkAppId, chatId, text),
+      notify: async (anchor, text) => { await sessionReply(anchor, text, 'text', cfg.larkAppId); },
+      resolveWorkingDir: (chatId) => resolveTriggerWorkingDir(cfg.larkAppId, chatId),
+      topicMessage: (req) => buildExternalEventTopicMessage(req, cfg.larkAppId),
+    }));
+  }
+
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
@@ -22774,8 +23054,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
   // global botmux install and a detached `botmux restart` would tear down the
   // real fleet. Core-only manages only its own single process.
+  let stopFlowSlotSweeper: (() => void) | undefined;
   if (idx === 0 && !coreOnly) {
     startMaintenance();
+    // `botmux flow` 宿主槽位清扫器（设计 §9）：宿主级单文件，只在主 daemon 跑；只回收 holder 已死的
+    // 槽位并在容器确认为空后释放，不碰活着的 runner，也不写任何 run 的 journal。
+    stopFlowSlotSweeper = startFlowSlotSweeper({
+      slotsFile: flowSlotsFile(config.session.dataDir),
+      log: (m) => logger.info(`[flow-slots] ${m}`),
+    });
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
       primaryLarkAppId: cfg.larkAppId,
@@ -23059,6 +23346,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     deferredScheduleSettleTimers.clear();
     vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
+    stopFlowSlotSweeper?.();
+    // 断开绑定 runner 的 IPC：runner 自己写 run.interrupted 退出，下次启动 cold-attach 补中断卡。
+    setFlowTriggerHandler(null);
+    flowRunManager?.close();
+    flowRunManager = null;
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);
