@@ -1362,26 +1362,21 @@ describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
   it.each([
-    ['large', 3, 1], ['medium', 1, 1], ['small', 1, 2], ['tiny', 1, 3],
-  ])('fits the whole image in a proportional column: %s', (mode, imageWeight, spacerWeight) => {
+    ['medium', 2], ['small', 3], ['tiny', 4],
+  ])('fits the whole image in a proportional column: %s', (mode, columnCount) => {
     for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
       const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
       const row = out.find(e => e.tag === 'column_set');
-      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px', columns: [
-        { width: 'weighted', weight: imageWeight }, { width: 'weighted', weight: spacerWeight, elements: [] },
-      ] });
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+      expect(row.columns).toHaveLength(columnCount as number);
+      for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+      for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
       const img = row.columns[0].elements[0];
       expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
       expect(img).not.toHaveProperty('mode');
       expect(img).not.toHaveProperty('size');
       expect(img).not.toHaveProperty('custom_width');
     }
-  });
-
-  it('keeps explicit cropping separate from proportional width presets', () => {
-    expect(buildImageCardElements('', [K[0]], undefined, undefined, 'crop_center')).toEqual([
-      { tag: 'img', img_key: K[0], alt: { tag: 'plain_text', content: '' }, scale_type: 'crop_center', size: 'stretch', preview: true },
-    ]);
   });
 
   it('keeps the default output identical, including explicit fit_horizontal', () => {

@@ -1014,24 +1014,20 @@ function singleImgElement(imgKey: string): any {
 function singleImageLayout(imgKey: string, mode: string, alt: string): any {
   const img = {
     tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
-    scale_type: mode === 'crop_center' ? 'crop_center' : 'fit_horizontal',
-    ...(mode === 'crop_center' ? { size: 'stretch' } : {}),
-    preview: true,
+    scale_type: 'fit_horizontal', preview: true,
   };
-  const weights: Record<string, [number, number]> = {
-    large: [3, 1], medium: [1, 1], small: [1, 2], tiny: [1, 3],
-  };
-  const ratio = weights[mode];
-  if (!ratio) return img;
-  // `none` preserves the ratio on narrow screens too. The second column is
-  // intentionally empty; the image fits its column without cropping or a
-  // fixed height. `size` only applies to crop modes in card schema 2.0.
+  const columnCounts: Record<string, number> = { medium: 2, small: 3, tiny: 4 };
+  const count = columnCounts[mode];
+  if (!count) return img;
+  // Feishu normalizes unequal weights to 1. Use N equal columns instead:
+  // one image and N-1 empty columns. `none` preserves the fraction on narrow
+  // screens; fit_horizontal keeps the entire image without a fixed height.
   return {
     tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
-    columns: [
-      { tag: 'column', width: 'weighted', weight: ratio[0], elements: [img] },
-      { tag: 'column', width: 'weighted', weight: ratio[1], elements: [] },
-    ],
+    columns: Array.from({ length: count }, (_, index) => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: index === 0 ? [img] : [],
+    })),
   };
 }
 

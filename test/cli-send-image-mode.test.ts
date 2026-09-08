@@ -21,14 +21,14 @@ function run(args: string[]) {
 describe('send --image-mode', () => {
   it.each([
     ['--image-mode', 'invalid'], ['--image-mode=SMALL'], ['--image-mode'],
-    ['--image-mode='], ['--image-mode', '--images', '/tmp/screenshot.png'],
+    ['--image-mode='], ['--image-mode', 'large'], ['--image-mode=crop_center'], ['--image-mode', '--images', '/tmp/screenshot.png'],
   ])('rejects invalid or missing mode: %j', (...args) => {
     const result = run(['send', ...args]);
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('--image-mode 仅支持');
   });
 
-  it.each(['fit_horizontal', 'crop_center', 'large', 'medium', 'small', 'tiny'])('accepts %s before attachment validation', mode => {
+  it.each(['fit_horizontal', 'medium', 'small', 'tiny'])('accepts %s before attachment validation', mode => {
     // Reject stdin-as-attachment after parsing, without uploading or sending.
     const result = run(['send', `--image-mode=${mode}`, '--images', '-']);
     expect(result.status).toBe(1);
@@ -39,16 +39,16 @@ describe('send --image-mode', () => {
     const result = run(['--help']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--image-mode <mode>');
-    expect(result.stdout).toContain('fit_horizontal（默认）|crop_center|large|medium|small|tiny');
-    expect(result.stdout).toContain('large/medium/small/tiny 等比占宽 3/4、1/2、1/3、1/4');
+    expect(result.stdout).toContain('fit_horizontal（默认）|medium|small|tiny');
+    expect(result.stdout).toContain('medium/small/tiny 等比占宽 1/2、1/3、1/4');
   });
 });
 
 
 describe('cmdSend outbound card JSON', () => {
   it.each([
-    ['small', 2], ['tiny', 3], ['fit_horizontal', 0],
-  ])('delivers the width preset through the real CLI: %s', (mode, spacerWeight) => {
+    ['medium', 2], ['small', 3], ['tiny', 4], ['fit_horizontal', 0],
+  ])('delivers the width preset through the real CLI: %s', (mode, columnCount) => {
     for (const upload of [false, true]) {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-image-card-'));
       try {
@@ -71,11 +71,12 @@ describe('cmdSend outbound card JSON', () => {
         const card = JSON.parse(captured!.slice('CAPTURE_CARD='.length));
         expect(card.schema).toBe('2.0');
         const row = card.body.elements.find((e: any) => e.tag === 'column_set');
-        if (spacerWeight) {
-          expect(row).toMatchObject({ flex_mode: 'none', columns: [
-            { width: 'weighted', weight: 1, elements: [{ tag: 'img', img_key: 'img_v3_test_upload', scale_type: 'fit_horizontal', preview: true }] },
-            { width: 'weighted', weight: spacerWeight, elements: [] },
-          ] });
+        if (columnCount) {
+          expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+          expect(row.columns).toHaveLength(columnCount as number);
+          for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+          for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
+          expect(row.columns[0].elements).toEqual([{ tag: 'img', img_key: 'img_v3_test_upload', alt: { tag: 'plain_text', content: upload ? '' : '截图' }, scale_type: 'fit_horizontal', preview: true }]);
           expect(row.columns[0].elements[0]).not.toHaveProperty('mode');
           expect(row.columns[0].elements[0]).not.toHaveProperty('size');
         } else {

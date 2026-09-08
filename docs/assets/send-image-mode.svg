@@ -15,14 +15,16 @@
       <text x="18" y="33" font-size="18">small</text>
       <rect x="18" y="55" width="88" height="58.667" rx="5" fill="#e8efff"/>
       <path d="M25 64h57m-57 7h73m-73 7h48m-48 7h62" stroke="#688aca" stroke-width="2.33"/>
-      <text x="18" y="262" font-size="14">Column width: 1/3; fit_horizontal</text>
+      <path d="M106 50v175m88-175v175" stroke="#d9e1ee" stroke-dasharray="4 4"/>
+      <text x="18" y="262" font-size="14">3 equal columns; image in column 1</text>
     </g>
     <g transform="translate(690 95)">
       <rect width="300" height="285" rx="12" fill="white" stroke="#d9e1ee"/>
       <text x="18" y="33" font-size="18">tiny</text>
       <rect x="18" y="55" width="66" height="44" rx="4" fill="#e8efff"/>
       <path d="M23 62h42m-42 5.5h55m-55 5.5h36m-36 5.5h46" stroke="#688aca" stroke-width="2"/>
-      <text x="18" y="262" font-size="14">Column width: 1/4; fit_horizontal</text>
+      <path d="M84 50v175m66-175v175m66-175v175" stroke="#d9e1ee" stroke-dasharray="4 4"/>
+      <text x="18" y="262" font-size="14">4 equal columns; image in column 1</text>
     </g>
     <text x="30" y="412" font-size="14" fill="#526070">Standalone images only. Inline Markdown images and multi-image rows keep their existing layout.</text>
   </g>
