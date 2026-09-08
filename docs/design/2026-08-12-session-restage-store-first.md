@@ -5,7 +5,7 @@ date: 2026-08-12
 updated: 2026-09-07（Stage 3 per-session turn 落地：开场激活窗口内的命令走按 sessionId 的队列，分散的计数 / 延迟交接 / 回放删除；Stage 4 降为低优先级；Stage 0 / Stage 1 收尾按升级窗口已关闭排期）
 topic: session-virtual-actor
 status: active
-baseline: origin/master@cfc425a00（含已合入的 #852、#1073、#1093、#1051、#1202、#1280）
+baseline: origin/master@61dadb04c（含已合入的 #852、#1073、#1093、#1051、#1202、#1280）
 references:
   - PR #846（会话行唯一写入入口）
   - PR #852（per-bot SQLite + JSON 导入 + 混合窗口；已合入 master）
