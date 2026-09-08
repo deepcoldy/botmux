@@ -184,10 +184,17 @@ const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
  * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
  * identical prompts in distinct turns must remain distinct local turns. */
 const traexSeenUserTurns = new Map<string, Set<string>>();
-/** Newer TraeX writes item_completed(UserMessage) first, then a legacy
- * user_message mirror without turn_id. Remember exactly the next expected
- * mirror across incremental drains so it cannot start the next queued turn. */
-const traexPendingLegacyUserMirror = new Map<string, { text: string; timestampMs: number }>();
+/** TraeX can write the legacy and item_completed user records in either order.
+ * Remember the one missing counterpart across incremental drains. The state
+ * belongs only to the currently open native turn and is cleared at its
+ * terminal edge, so a same-text prompt in the next turn remains real input. */
+interface TraexPendingUserMirror {
+  text: string;
+  timestampMs: number;
+  expected: 'legacy' | 'item';
+  sourceTurnId?: string;
+}
+const traexPendingUserMirror = new Map<string, TraexPendingUserMirror>();
 const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
 const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
 const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
@@ -212,11 +219,34 @@ function claimTraexUserTurn(path: string, turnId: unknown): boolean {
   return true;
 }
 
-function rememberTraexLegacyUserMirror(path: string, text: string, timestampMs: number): void {
-  traexPendingLegacyUserMirror.set(path, { text, timestampMs });
-  if (traexPendingLegacyUserMirror.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
-    const oldestPath = traexPendingLegacyUserMirror.keys().next().value;
-    if (oldestPath) traexPendingLegacyUserMirror.delete(oldestPath);
+function rememberTraexUserMirror(path: string, pending: TraexPendingUserMirror): void {
+  traexPendingUserMirror.set(path, pending);
+  if (traexPendingUserMirror.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+    const oldestPath = traexPendingUserMirror.keys().next().value;
+    if (oldestPath) traexPendingUserMirror.delete(oldestPath);
+  }
+}
+
+function isExpectedTraexUserMirror(
+  pending: TraexPendingUserMirror | undefined,
+  expected: TraexPendingUserMirror['expected'],
+  text: string,
+  timestampMs: number,
+): boolean {
+  return pending?.expected === expected
+    && pending.text === text
+    && timestampMs >= pending.timestampMs
+    && timestampMs - pending.timestampMs <= TRAEX_LEGACY_USER_MIRROR_WINDOW_MS;
+}
+
+function clearTraexUserMirrorAtTerminal(path: string, sourceTurnId: string, probe: boolean): void {
+  if (probe) return;
+  const pending = traexPendingUserMirror.get(path);
+  // Legacy-first state has no native id until its item mirror arrives. An
+  // item-first state does, so a delayed terminal from another turn must not
+  // invalidate the currently-open turn's mirror expectation.
+  if (!pending?.sourceTurnId || pending.sourceTurnId === sourceTurnId) {
+    traexPendingUserMirror.delete(path);
   }
 }
 
@@ -448,7 +478,7 @@ export function drainTraexRollout(
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
   const legacyUserIndexesWithoutTurnId = new Map<string, number>();
-  let probePendingLegacyUserMirror: { text: string; timestampMs: number } | undefined;
+  let probePendingUserMirror: TraexPendingUserMirror | undefined;
   const claimUserTurn = (turnId: unknown): boolean => {
     if (typeof turnId !== 'string' || turnId.length === 0) return true;
     if (seenUserTurns.has(turnId)) return false;
@@ -499,19 +529,19 @@ export function drainTraexRollout(
       const userText = payload.message;
       if (!sourceTurnId) {
         const expectedMirror = probe
-          ? probePendingLegacyUserMirror
-          : traexPendingLegacyUserMirror.get(path);
-        if (probe) probePendingLegacyUserMirror = undefined;
-        else traexPendingLegacyUserMirror.delete(path);
-        if (expectedMirror
-          && expectedMirror.text === userText
-          && base.timestampMs >= expectedMirror.timestampMs
-          && base.timestampMs - expectedMirror.timestampMs <= TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) continue;
+          ? probePendingUserMirror
+          : traexPendingUserMirror.get(path);
+        if (probe) probePendingUserMirror = undefined;
+        else traexPendingUserMirror.delete(path);
+        if (isExpectedTraexUserMirror(expectedMirror, 'legacy', userText, base.timestampMs)) continue;
       }
       if (userText && claimUserTurn(payload.turn_id)) {
         events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
         if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
           legacyUserIndexesWithoutTurnId.set(userText, events.length - 1);
+          const pending = { text: userText, timestampMs: base.timestampMs, expected: 'item' as const };
+          if (probe) probePendingUserMirror = pending;
+          else rememberTraexUserMirror(path, pending);
         }
         // New turn: drop any agent_message state an unterminated predecessor
         // left behind so it can't be attributed to this turn.
@@ -536,10 +566,25 @@ export function drainTraexRollout(
               if (index > legacyIndex) legacyUserIndexesWithoutTurnId.set(text, index - 1);
             }
           }
-          events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
-          if (sourceTurnId) {
-            if (probe) probePendingLegacyUserMirror = { text: userText, timestampMs: base.timestampMs };
-            else rememberTraexLegacyUserMirror(path, userText, base.timestampMs);
+          const expectedMirror = probe
+            ? probePendingUserMirror
+            : traexPendingUserMirror.get(path);
+          if (probe) probePendingUserMirror = undefined;
+          else traexPendingUserMirror.delete(path);
+          const mirrorsEarlierLegacy = legacyIndex !== undefined
+            || isExpectedTraexUserMirror(expectedMirror, 'item', userText, base.timestampMs);
+          if (!mirrorsEarlierLegacy || legacyIndex !== undefined) {
+            events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
+          }
+          if (!mirrorsEarlierLegacy && sourceTurnId) {
+            const pending = {
+              text: userText,
+              timestampMs: base.timestampMs,
+              expected: 'legacy' as const,
+              sourceTurnId,
+            };
+            if (probe) probePendingUserMirror = pending;
+            else rememberTraexUserMirror(path, pending);
           }
           // New turn: drop any agent_message state an unterminated predecessor
           // left behind so it can't be attributed to this turn.
@@ -609,6 +654,8 @@ export function drainTraexRollout(
         text = recoverTraexEmptyFinal(pending, adoptMode);
       }
       if (!probe) traexPendingAgentCache.delete(path);
+      if (probe) probePendingUserMirror = undefined;
+      else clearTraexUserMirrorAtTerminal(path, payload.turn_id, false);
       legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,
@@ -636,6 +683,8 @@ export function drainTraexRollout(
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
       if (!probe) traexPendingAgentCache.delete(path);
+      if (probe) probePendingUserMirror = undefined;
+      else clearTraexUserMirrorAtTerminal(path, payload.turn_id, false);
       legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,

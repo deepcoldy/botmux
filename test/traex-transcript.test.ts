@@ -619,6 +619,90 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
+  it('does not let a legacy-first item mirror cross a drain and steal the next pending turn', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000120';
+    writeFileSync(path, line(user('same prompt', '2000-01-01T00:00:01.000Z')));
+
+    const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
+    queue.mark('d1', 'same prompt', 0);
+    queue.mark('d2', 'same prompt', 0);
+
+    const first = drainTraexRollout(path, 0);
+    expect(first.events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'same prompt' }),
+    ]);
+    expect(first.events[0]).not.toHaveProperty('sourceTurnId');
+    queue.ingest(first.events);
+    appendFileSync(path, [
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'same prompt' }],
+      }, firstTurnId, '2000-01-01T00:00:01.100Z')),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs_first', summary: [{ type: 'summary_text', text: 'cot-1' }], content: [],
+        }], '2000-01-01T00:00:02.000Z'),
+        payload: {
+          ...historyAppend([]).payload,
+          turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs_first', summary: [{ type: 'summary_text', text: 'cot-1' }], content: [] }],
+        },
+      }),
+      line({ ...taskComplete('answer-1'), payload: { ...taskComplete('answer-1').payload, turn_id: firstTurnId } }),
+    ].join(''));
+
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events.filter(event => event.kind === 'user')).toEqual([]);
+    queue.ingest(second.events);
+    expect(observed).toEqual([{ turnId: 'd1', text: 'cot-1' }]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', finalText: 'answer-1', sourceTurnId: firstTurnId }),
+    ]);
+    expect(queue.peek()).toEqual([expect.objectContaining({ turnId: 'd2', started: false })]);
+  });
+
+  it('expires an item-first mirror expectation at terminal before a same-text next turn', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000121';
+    writeFileSync(path, line(itemCompleted({
+      type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'repeat' }],
+    }, firstTurnId, '2000-01-01T00:00:01.000Z')));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('d1', 'repeat', 0);
+    queue.mark('d2', 'repeat', 0);
+
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+    appendFileSync(path, line({
+      ...taskComplete('answer-1'),
+      payload: { ...taskComplete('answer-1').payload, turn_id: firstTurnId },
+      timestamp: '2000-01-01T00:00:02.000Z',
+    }));
+    const terminal = drainTraexRollout(path, first.newOffset);
+    queue.ingest(terminal.events);
+    appendFileSync(path, line(user('repeat', '2000-01-01T00:00:03.000Z')));
+    const next = drainTraexRollout(path, terminal.newOffset);
+    queue.ingest(next.events);
+
+    expect(first.events).toEqual([expect.objectContaining({
+      kind: 'user', text: 'repeat', sourceTurnId: firstTurnId,
+    })]);
+    expect(terminal.events).toEqual([expect.objectContaining({
+      kind: 'assistant_final', text: 'answer-1', sourceTurnId: firstTurnId,
+    })]);
+    expect(next.events).toEqual([expect.objectContaining({ kind: 'user', text: 'repeat' })]);
+    expect(next.events[0]).not.toHaveProperty('sourceTurnId');
+    expect(queue.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'd1', finalText: 'answer-1', sourceTurnId: firstTurnId,
+    })]);
+    expect(queue.peek()).toEqual([expect.objectContaining({ turnId: 'd2', started: true })]);
+  });
+
   it('does not suppress a later identical prompt when the expected legacy mirror never arrives', () => {
     const firstTurnId = '00000000-0000-7000-8000-000000000119';
     writeFileSync(path, line(itemCompleted({
