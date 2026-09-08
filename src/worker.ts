@@ -19395,9 +19395,16 @@ process.on('message', async (raw: unknown) => {
             const argvGeneration = cliSpawnGeneration;
             const argvBackend = backend;
             const finalizeArgvSubmission = (cliSessionId?: string) => {
+              if (!cliSessionId) return;
+              if (msg.queuedActivationToken) {
+                send({
+                  type: 'queued_activation_submitted',
+                  sessionId,
+                  activationToken: msg.queuedActivationToken,
+                });
+              }
               if (!submission
                 || submission.baseline === null
-                || !cliSessionId
                 || !msg.turnId
                 || msg.dispatchAttempt === undefined
                 || !cliAdapter?.isInitialPromptComplete
@@ -19416,13 +19423,6 @@ process.on('message', async (raw: unknown) => {
                 backend: argvBackend,
                 generation: argvGeneration,
               });
-              if (msg.queuedActivationToken) {
-                send({
-                  type: 'queued_activation_submitted',
-                  sessionId,
-                  activationToken: msg.queuedActivationToken,
-                });
-              }
             };
             if (submission && confirm && argvBackend) {
               try {

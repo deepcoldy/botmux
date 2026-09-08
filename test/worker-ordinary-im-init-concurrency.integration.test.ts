@@ -2,6 +2,7 @@ import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -191,6 +192,96 @@ if (process.argv.includes('app-server')) {
       turnId: 'om_followup_order',
     }));
   }, 20_000);
+
+  it('acknowledges an OpenCode argv activation token without a dispatch attempt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-opencode-argv-activation-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const xdgDataDir = join(root, 'xdg');
+    const dbDir = join(xdgDataDir, 'opencode');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dbDir, { recursive: true });
+    const prompt = '<session_id>sid-opencode-activation</session_id>\n<user_message>OPEN_CODE_TOKEN_ONLY</user_message>';
+    const db = new DatabaseSync(join(dbDir, 'opencode.db'));
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+    `);
+    db.prepare('INSERT INTO session VALUES (?,?,?,?,?,?,?)')
+      .run('ses_activation', null, dataDir, '', 1, 1, null);
+    const initialBaseline = Date.now();
+    db.prepare('INSERT INTO message VALUES (?,?,?,?)')
+      .run('msg_before', 'ses_activation', initialBaseline, JSON.stringify({ role: 'user' }));
+    db.prepare('INSERT INTO part VALUES (?,?,?,?,?)')
+      .run('part_before', 'msg_before', 'ses_activation', initialBaseline, JSON.stringify({ type: 'text', text: 'before' }));
+    db.close();
+
+    const fakeOpenCode = join(root, 'fake-opencode');
+    writeFileSync(fakeOpenCode, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { DatabaseSync } = require('node:sqlite');
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf('--prompt') + 1];
+const db = new DatabaseSync(process.env.OPENCODE_DB_PATH);
+const now = Date.now();
+db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_user', 'ses_activation', now, JSON.stringify({ role: 'user' }));
+db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part_user', 'msg_user', 'ses_activation', now, JSON.stringify({ type: 'text', text: prompt }));
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeOpenCode, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        XDG_DATA_HOME: xdgDataDir,
+        OPENCODE_DB_PATH: join(dbDir, 'opencode.db'),
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-opencode-activation',
+        BOTMUX_TIME_SCALE: '0.05',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-opencode-activation',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'opencode',
+      cliPathOverride: fakeOpenCode,
+      backendType: 'pty',
+      prompt,
+      queuedActivationToken: 'opencode-token-only',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_opencode_initial',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message =>
+      message.type === 'queued_activation_submitted'
+      && message.activationToken === 'opencode-token-only'), logs, 8_000);
+
+    expect(messages).toContainEqual({
+      type: 'queued_activation_submitted',
+      sessionId: 'sid-opencode-activation',
+      activationToken: 'opencode-token-only',
+    });
+  }, 12_000);
 
   it('renames a TraeX native session only after the first Lark prompt is submitted', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-native-title-'));
