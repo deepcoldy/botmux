@@ -37,7 +37,7 @@ vi.mock('../src/im/lark/client.js', async (original) => ({
   getUserProfile: async () => null,
 }));
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { startLarkEventDispatcher, rawMessageIngressAnchor } from '../src/im/lark/event-dispatcher.js';
 import { serializeByAnchor } from '../src/utils/anchor-serializer.js';
@@ -109,6 +109,17 @@ describe('/manager through the registered Lark event handler', () => {
     expect(await isChatManager(APP, CHAT)).toBe(false);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit administrator even on an otherwise open bot', async () => {
+    const bot = getBot(APP);
+    bot.config.allowedUsers = [];
+    bot.resolvedAllowedUsers = [];
+    bot.config.chatGrants = undefined;
+    await deliver('/manager set', { sender: 'ou_stranger' });
+    expect(transport.writes).toBe(0);
+    expect(await isChatManager(APP, CHAT)).toBe(false);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
   it('lets a talk-authorized guest read status without granting management', async () => {

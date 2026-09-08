@@ -57,7 +57,7 @@ Mention exactly one target bot in a top-level message in a regular group:
 | `/manager set` | Select this bot as manager and append ` · bot name` to the group name |
 | `/manager clear` | Clear this manager; restore the original name unless someone manually renamed the group |
 
-Only the target bot's owner/allowedUsers may set or clear it. Talk-authorized users may inspect status. Commands do not create CLI sessions and are not supported in DMs, independent topics, or automatically managed session groups.
+Only the target bot's owner/allowedUsers may set or clear it; an otherwise open bot still requires an explicit administrator allowlist. Talk-authorized users may inspect status. Commands do not create CLI sessions and are not supported in DMs, independent topics, or automatically managed session groups.
 
 The manager answers unmentioned, top-level regular-group messages from talk-authorized humans, but yields when only another member is mentioned. `@all` is not a redirect. Explicit mentions keep their existing behavior. This grants neither additional talk access nor operational permissions to humans or bots.
 

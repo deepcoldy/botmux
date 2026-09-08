@@ -35,7 +35,10 @@ export async function tryHandleManagerCommand(
     return true;
   }
   if (action !== 'status') {
-    if (!canOperate(app, chat, senderOpenId)) {
+    // canOperate alone allows everyone on an unconfigured/open bot. Selecting
+    // a group's default responder must always require an explicit administrator.
+    if (!senderOpenId || !getBot(app).resolvedAllowedUsers.includes(senderOpenId)
+      || !canOperate(app, chat, senderOpenId)) {
       await reply(t('cmd.manager.owner_only', undefined, loc));
       return true;
     }
