@@ -96,6 +96,8 @@ export interface CodexPendingTurn {
    *  assistant reply so the Lark thread sees both sides of the exchange. */
   userText?: string;
   sourceSessionId?: string;
+  /** Native provider turn id learned from the transcript user event. */
+  sourceTurnId?: string;
   /** True when the turn was delivered via Codex RPC (turn/start) and the
    *  app-server has acknowledged it. RPC turns have no local transcript to
    *  ingest, so they can never reach the started state; this flag keeps the
@@ -433,13 +435,25 @@ export class CodexBridgeQueue {
       // Cosmetic thinking-timeline record. Only meaningful while a turn is
       // collecting; history replay / unmatched events are dropped (never
       // buffered — a late replay into the wrong turn is worse than a gap).
-      if (this.collecting && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
-        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
-        try { this.cotObserver(ev.cotEntries, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+      const target = ev.sourceTurnId
+        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
+          && turn.sourceTurnId === ev.sourceTurnId)
+          // Backward-compatible bridge dialects can expose a native id only
+          // on mid-turn/terminal records, after an id-less user record.
+          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
+        : this.collecting;
+      if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+        if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
+        try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
       }
       return;
     }
     if (ev.kind === 'user') {
+      // Some providers mirror one native user turn in more than one record.
+      // Once its stable id has started a pending turn, ignore any duplicate
+      // before considering HOL-drop or matching the next queued prompt.
+      if (ev.sourceTurnId && this.queue.some(turn => turn.started && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
       // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
@@ -478,6 +492,7 @@ export class CodexBridgeQueue {
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
+        next!.sourceTurnId = ev.sourceTurnId;
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the
@@ -525,6 +540,7 @@ export class CodexBridgeQueue {
           userText: ev.text,
           markTimeMs: ev.timestampMs,
           sourceSessionId: ev.sourceSessionId,
+          sourceTurnId: ev.sourceTurnId,
         };
         const insertAt = this.queue.findIndex(t => !t.started);
         if (insertAt === -1) this.queue.push(localTurn);
@@ -537,14 +553,20 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'assistant_final') {
-      if (this.collecting) {
-        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
-        this.collecting.finalText = ev.text;
-        this.collecting.terminalStatus = ev.terminalStatus;
-        this.collecting.terminalErrorCode = ev.terminalErrorCode;
-        this.collecting.terminalErrorSummary = ev.terminalErrorSummary;
+      const target = ev.sourceTurnId
+        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
+          && turn.sourceTurnId === ev.sourceTurnId)
+          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
+        : this.collecting;
+      if (target) {
+        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+        if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
+        target.finalText = ev.text;
+        target.terminalStatus = ev.terminalStatus;
+        target.terminalErrorCode = ev.terminalErrorCode;
+        target.terminalErrorSummary = ev.terminalErrorSummary;
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
-        this.collecting = null;
+        if (this.collecting === target) this.collecting = null;
         // CoCo-style type-ahead writes the next user event only after this
         // final dequeues it. Refresh the next turn's pre-start lease at that
         // hand-off boundary instead of letting either its confirmed lease or
@@ -555,20 +577,26 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'turn_aborted') {
-      if (!this.collecting) {
+      const target = ev.sourceTurnId
+        ? (this.queue.find(turn => turn.started && turn.finalText === undefined
+          && turn.sourceTurnId === ev.sourceTurnId)
+          ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null))
+        : this.collecting;
+      if (!target) {
         if (bufferUnmatched && !this.localTurnsEnabled) this.rememberUnmatched(ev);
         return;
       }
-      if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+      if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+      if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
       // Interrupted Codex turns have no assistant_final. Close with empty text
       // so the worker skips final_output but still publishes the authoritative
       // exact-attempt turn_terminal required by reliable durable delivery.
       // Side effects may already have happened, so mirror TRAE-X and classify
       // an otherwise-untyped abort as ambiguous rather than completed/failed.
-      this.collecting.finalText = '';
-      this.collecting.terminalStatus = ev.terminalStatus ?? 'ambiguous';
-      this.collecting.terminalErrorCode = ev.terminalErrorCode ?? 'structured_turn_aborted';
-      this.collecting = null;
+      target.finalText = '';
+      target.terminalStatus = ev.terminalStatus ?? 'ambiguous';
+      target.terminalErrorCode = ev.terminalErrorCode ?? 'structured_turn_aborted';
+      if (this.collecting === target) this.collecting = null;
       this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
       this.refreshNextPreStartLease();
     }

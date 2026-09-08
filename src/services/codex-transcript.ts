@@ -226,6 +226,10 @@ export interface CodexBridgeEvent {
    *  Raw provider payloads stay in the rollout/Web terminal. */
   terminalErrorSummary?: string;
   sourceSessionId?: string;
+  /** Native provider turn id when the transcript format exposes one. Bridges
+   *  can use it to bind cosmetic/terminal events to the exact started turn
+   *  instead of relying solely on whichever turn is currently collecting. */
+  sourceTurnId?: string;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */

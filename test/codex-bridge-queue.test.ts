@@ -56,6 +56,17 @@ function emitDecisions(
 }
 
 describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
+  it('rejects CoT from a different native provider turn', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'prompt', 100);
+    q.ingest([{ ...userEv('prompt', 'u-native', 200), sourceTurnId: 'native-1' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'wrong' }], 'c-wrong', 300), sourceTurnId: 'native-2' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'right' }], 'c-right', 301), sourceTurnId: 'native-1' }]);
+    expect(seen).toEqual(['t1']);
+  });
+
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
     const q = new CodexBridgeQueue();
     const seen: { turnId: string; entries: readonly unknown[] }[] = [];

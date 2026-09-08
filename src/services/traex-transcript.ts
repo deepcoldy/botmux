@@ -184,8 +184,13 @@ const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
  * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
  * identical prompts in distinct turns must remain distinct local turns. */
 const traexSeenUserTurns = new Map<string, Set<string>>();
+/** Newer TraeX writes item_completed(UserMessage) first, then a legacy
+ * user_message mirror without turn_id. Remember exactly the next expected
+ * mirror across incremental drains so it cannot start the next queued turn. */
+const traexPendingLegacyUserMirror = new Map<string, { text: string; timestampMs: number }>();
 const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
 const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
+const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
 
 function claimTraexUserTurn(path: string, turnId: unknown): boolean {
   if (typeof turnId !== 'string' || turnId.length === 0) return true;
@@ -205,6 +210,14 @@ function claimTraexUserTurn(path: string, turnId: unknown): boolean {
     if (oldestTurnId) seen.delete(oldestTurnId);
   }
   return true;
+}
+
+function rememberTraexLegacyUserMirror(path: string, text: string, timestampMs: number): void {
+  traexPendingLegacyUserMirror.set(path, { text, timestampMs });
+  if (traexPendingLegacyUserMirror.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+    const oldestPath = traexPendingLegacyUserMirror.keys().next().value;
+    if (oldestPath) traexPendingLegacyUserMirror.delete(oldestPath);
+  }
 }
 
 function itemCompletedUserText(item: unknown): string {
@@ -271,7 +284,17 @@ function traexHistoryCotEntries(payload: any): CodexBridgeEvent['cotEntries'] {
         .join('');
       item = { ...rawItem, output: text };
     }
-    entries.push(...codexCotEntriesFromResponseItem(item));
+    const itemEntries = codexCotEntriesFromResponseItem(item);
+    entries.push(...itemEntries);
+    // The shared renderer deliberately accepts an empty tool result and turns
+    // it into its localized completion marker. Preserve that terminal edge
+    // for image-only, unknown-block, and empty-array outputs without exposing
+    // opaque/non-text payloads in the CoT message.
+    if (itemEntries.length === 0
+      && (rawItem.type === 'function_call_output' || rawItem.type === 'custom_tool_call_output')
+      && typeof rawItem.call_id === 'string' && rawItem.call_id) {
+      entries.push({ kind: 'tool_result', id: rawItem.call_id, result: '' });
+    }
   }
   return entries;
 }
@@ -425,6 +448,7 @@ export function drainTraexRollout(
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
   const legacyUserIndexesWithoutTurnId = new Map<string, number>();
+  let probePendingLegacyUserMirror: { text: string; timestampMs: number } | undefined;
   const claimUserTurn = (turnId: unknown): boolean => {
     if (typeof turnId !== 'string' || turnId.length === 0) return true;
     if (seenUserTurns.has(turnId)) return false;
@@ -455,6 +479,9 @@ export function drainTraexRollout(
       timestampMs: eventTimestampMs(obj.timestamp),
       ...(sourceSessionId ? { sourceSessionId } : {}),
     };
+    const sourceTurnId = typeof payload.turn_id === 'string' && payload.turn_id.length > 0
+      ? payload.turn_id
+      : undefined;
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
@@ -462,7 +489,7 @@ export function drainTraexRollout(
     if (!probe && obj.type === 'history_mutation') {
       const cotEntries = traexHistoryCotEntries(payload);
       if (cotEntries && cotEntries.length > 0) {
-        events.push({ ...base, kind: 'cot', text: '', cotEntries });
+        events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
       }
       continue;
     }
@@ -470,8 +497,19 @@ export function drainTraexRollout(
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
+      if (!sourceTurnId) {
+        const expectedMirror = probe
+          ? probePendingLegacyUserMirror
+          : traexPendingLegacyUserMirror.get(path);
+        if (probe) probePendingLegacyUserMirror = undefined;
+        else traexPendingLegacyUserMirror.delete(path);
+        if (expectedMirror
+          && expectedMirror.text === userText
+          && base.timestampMs >= expectedMirror.timestampMs
+          && base.timestampMs - expectedMirror.timestampMs <= TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) continue;
+      }
       if (userText && claimUserTurn(payload.turn_id)) {
-        events.push({ ...base, kind: 'user', text: userText });
+        events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
         if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
           legacyUserIndexesWithoutTurnId.set(userText, events.length - 1);
         }
@@ -498,7 +536,11 @@ export function drainTraexRollout(
               if (index > legacyIndex) legacyUserIndexesWithoutTurnId.set(text, index - 1);
             }
           }
-          events.push({ ...base, kind: 'user', text: userText });
+          events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
+          if (sourceTurnId) {
+            if (probe) probePendingLegacyUserMirror = { text: userText, timestampMs: base.timestampMs };
+            else rememberTraexLegacyUserMirror(path, userText, base.timestampMs);
+          }
           // New turn: drop any agent_message state an unterminated predecessor
           // left behind so it can't be attributed to this turn.
           if (!probe) traexPendingAgentCache.delete(path);
@@ -572,6 +614,7 @@ export function drainTraexRollout(
         ...base,
         kind: 'assistant_final',
         text,
+        ...(sourceTurnId ? { sourceTurnId } : {}),
         // A non-null error means the turn FAILED (e.g. the model endpoint
         // connection failed before any response). Mirror the Codex drainer:
         // classify as failed with a safe code/summary so the worker surfaces
@@ -600,6 +643,7 @@ export function drainTraexRollout(
         text: '',
         terminalStatus: 'ambiguous',
         terminalErrorCode: abortErrorCode(payload.reason),
+        ...(sourceTurnId ? { sourceTurnId } : {}),
       });
     }
   }

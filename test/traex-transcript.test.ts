@@ -258,6 +258,22 @@ describe('drainTraexRollout', () => {
     });
   });
 
+  it('closes tool calls whose output has no displayable text', () => {
+    writeFileSync(path, line(historyAppend([
+      { type: 'function_call_output', call_id: 'image', output: [{ type: 'input_image', image_url: 'data:image/png;base64,hidden' }] },
+      { type: 'function_call_output', call_id: 'unknown', output: [{ type: 'future_block', value: 'hidden' }] },
+      { type: 'function_call_output', call_id: 'empty-array', output: [] },
+      { type: 'function_call_output', call_id: 'scalar', output: 'plain text' },
+    ])));
+
+    expect(drainTraexRollout(path, 0).events[0].cotEntries).toEqual([
+      { kind: 'tool_result', id: 'image', result: '' },
+      { kind: 'tool_result', id: 'unknown', result: '' },
+      { kind: 'tool_result', id: 'empty-array', result: '' },
+      { kind: 'tool_result', id: 'scalar', result: 'plain text' },
+    ]);
+  });
+
   it('ignores replacement history and diagnostic mirrors to avoid replaying or duplicating CoT', () => {
     const reasoning = {
       type: 'reasoning',
@@ -555,6 +571,65 @@ describe('drainTraexRollout', () => {
     ].join(''));
 
     expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(1);
+  });
+
+  it('does not let an item-first legacy mirror cross a drain and steal the next pending turn', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000117';
+    const secondTurnId = '00000000-0000-7000-8000-000000000118';
+    writeFileSync(path, line(itemCompleted({
+      type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'same queued prompt' }],
+    }, firstTurnId)));
+
+    const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
+    queue.mark('d1', 'same queued prompt', 0);
+    queue.mark('d2', 'same queued prompt', 0);
+
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+    appendFileSync(path, [
+      line(user('same queued prompt', '2000-01-01T00:00:01.001Z')),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs_first', summary: [{ type: 'summary_text', text: 'cot-1' }], content: [],
+        }], '2000-01-01T00:00:02.000Z'),
+        payload: {
+          ...historyAppend([]).payload,
+          turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs_first', summary: [{ type: 'summary_text', text: 'cot-1' }], content: [] }],
+        },
+      }),
+      line({ ...taskComplete('answer-1'), payload: { ...taskComplete('answer-1').payload, turn_id: firstTurnId } }),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-second', content: [{ type: 'text', text: 'same queued prompt' }],
+      }, secondTurnId, '2000-01-01T00:00:04.000Z')),
+      line({ ...taskComplete('answer-2'), payload: { ...taskComplete('answer-2').payload, turn_id: secondTurnId }, timestamp: '2000-01-01T00:00:05.000Z' }),
+    ].join(''));
+
+    queue.ingest(drainTraexRollout(path, first.newOffset).events);
+    expect(observed).toEqual([{ turnId: 'd1', text: 'cot-1' }]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', finalText: 'answer-1', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ turnId: 'd2', finalText: 'answer-2', sourceTurnId: secondTurnId }),
+    ]);
+  });
+
+  it('does not suppress a later identical prompt when the expected legacy mirror never arrives', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000119';
+    writeFileSync(path, line(itemCompleted({
+      type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'repeat later' }],
+    }, firstTurnId)));
+    const first = drainTraexRollout(path, 0);
+
+    appendFileSync(path, line(user('repeat later', '2000-01-01T00:00:10.000Z')));
+    expect(drainTraexRollout(path, first.newOffset).events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'repeat later' }),
+    ]);
   });
 
   it('keeps identical item_completed prompts from separate turns', () => {
