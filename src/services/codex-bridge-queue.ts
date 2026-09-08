@@ -437,7 +437,9 @@ export class CodexBridgeQueue {
       // that id without treating the mirror as another user/steer boundary.
       const target = this.queue.find(turn => turn.started && turn.finalText === undefined
         && turn.sourceTurnId === ev.sourceTurnId)
-        ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null);
+        ?? this.queue.find(turn => turn.started && turn.finalText === undefined
+          && !turn.sourceTurnId
+          && (!turn.sourceSessionId || !ev.sourceSessionId || turn.sourceSessionId === ev.sourceSessionId));
       if (!target || !ev.sourceTurnId) return;
       if (target.sourceSessionId && ev.sourceSessionId
         && target.sourceSessionId !== ev.sourceSessionId) return;
@@ -500,7 +502,8 @@ export class CodexBridgeQueue {
       if ((willStartNext || willSynthLocal)
         && this.collecting
         && this.collecting.finalText === undefined
-        && !isDistinctNativeTurn) {
+        && !isDistinctNativeTurn
+        && ev.preserveCollecting !== true) {
         const idx = this.queue.indexOf(this.collecting);
         if (idx >= 0) this.queue.splice(idx, 1);
         this.collecting = null;

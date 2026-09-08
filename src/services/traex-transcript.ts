@@ -589,7 +589,16 @@ export function drainTraexRollout(
           } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
             events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
           } else if (!expectedMirror) {
-            events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
+            const hasUnboundLegacyPredecessor = pendingUserMirrors.some(
+              candidate => candidate.expected === 'item' && !candidate.sourceTurnId,
+            );
+            events.push({
+              ...base,
+              kind: 'user',
+              text: userText,
+              ...(sourceTurnId ? { sourceTurnId } : {}),
+              ...(hasUnboundLegacyPredecessor ? { preserveCollecting: true } : {}),
+            });
           }
           if (expectedMirror?.expected === 'item' && sourceTurnId) {
             pendingUserMirrors.push({

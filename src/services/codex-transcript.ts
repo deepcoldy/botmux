@@ -232,6 +232,9 @@ export interface CodexBridgeEvent {
    *  can use it to bind cosmetic/terminal events to the exact started turn
    *  instead of relying solely on whichever turn is currently collecting. */
   sourceTurnId?: string;
+  /** The transcript parser has positive evidence that this user record starts
+   * a distinct native turn while an older id-less turn remains open. */
+  preserveCollecting?: boolean;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
