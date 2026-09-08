@@ -67,6 +67,23 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     expect(seen).toEqual(['t1']);
   });
 
+  it('keeps distinct native turns instead of treating them as a steer merge', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'same', 100);
+    q.mark('t2', 'same', 101);
+    q.ingest([
+      { ...userEv('same', 'u1', 200), sourceTurnId: 'native-1' },
+      { ...userEv('same', 'u2', 201), sourceTurnId: 'native-2' },
+      { ...asstEv('answer-1', 'a1', 300), sourceTurnId: 'native-1' },
+      { ...asstEv('answer-2', 'a2', 301), sourceTurnId: 'native-2' },
+    ]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-1', sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', finalText: 'answer-2', sourceTurnId: 'native-2' }),
+    ]);
+  });
+
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
     const q = new CodexBridgeQueue();
     const seen: { turnId: string; entries: readonly unknown[] }[] = [];

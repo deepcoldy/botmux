@@ -703,6 +703,85 @@ describe('drainTraexRollout', () => {
     expect(queue.peek()).toEqual([expect.objectContaining({ turnId: 'd2', started: true })]);
   });
 
+  it('pairs repeated legacy-first mirrors FIFO within one drain', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000122';
+    const secondTurnId = '00000000-0000-7000-8000-000000000123';
+    writeFileSync(path, [
+      line(user('same', '2000-01-01T00:00:01.000Z')),
+      line(user('same', '2000-01-01T00:00:02.000Z')),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'same' }],
+      }, firstTurnId, '2000-01-01T00:00:01.100Z')),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-second', content: [{ type: 'text', text: 'same' }],
+      }, secondTurnId, '2000-01-01T00:00:02.100Z')),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [],
+        }], '2000-01-01T00:00:03.000Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [] }],
+        },
+      }),
+      line({ ...taskComplete('answer-a'), payload: { ...taskComplete('answer-a').payload, turn_id: firstTurnId } }),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [],
+        }], '2000-01-01T00:00:05.000Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: secondTurnId,
+          items: [{ type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [] }],
+        },
+      }),
+      line({
+        ...taskComplete('answer-b'),
+        payload: { ...taskComplete('answer-b').payload, turn_id: secondTurnId },
+        timestamp: '2000-01-01T00:00:06.000Z',
+      }),
+    ].join(''));
+
+    const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
+    queue.mark('d1', 'same', 0);
+    queue.mark('d2', 'same', 0);
+    const result = drainTraexRollout(path, 0);
+
+    expect(result.events.filter(event => event.kind === 'user')).toEqual([
+      expect.objectContaining({ text: 'same', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ text: 'same', sourceTurnId: secondTurnId }),
+    ]);
+    queue.ingest(result.events);
+    expect(observed).toEqual([
+      { turnId: 'd1', text: 'cot-a' },
+      { turnId: 'd2', text: 'cot-b' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', finalText: 'answer-a', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ turnId: 'd2', finalText: 'answer-b', sourceTurnId: secondTurnId }),
+    ]);
+  });
+
+  it('keeps a same-text item as a new turn when the legacy mirror window elapsed', () => {
+    const turnId = '00000000-0000-7000-8000-000000000124';
+    writeFileSync(path, [
+      line(user('repeat after window', '2000-01-01T00:00:01.000Z')),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-later', content: [{ type: 'text', text: 'repeat after window' }],
+      }, turnId, '2000-01-01T00:00:07.000Z')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toEqual([
+      expect.objectContaining({ text: 'repeat after window' }),
+      expect.objectContaining({ text: 'repeat after window', sourceTurnId: turnId }),
+    ]);
+  });
+
   it('does not suppress a later identical prompt when the expected legacy mirror never arrives', () => {
     const firstTurnId = '00000000-0000-7000-8000-000000000119';
     writeFileSync(path, line(itemCompleted({

@@ -481,7 +481,13 @@ export class CodexBridgeQueue {
       // is ignored rather than treated as a turn boundary. Mirrors Claude's
       // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
       // text yet" — the streaming-transcript equivalent of "no finalText").
-      if ((willStartNext || willSynthLocal) && this.collecting && this.collecting.finalText === undefined) {
+      const isDistinctNativeTurn = !!ev.sourceTurnId
+        && !!this.collecting?.sourceTurnId
+        && ev.sourceTurnId !== this.collecting.sourceTurnId;
+      if ((willStartNext || willSynthLocal)
+        && this.collecting
+        && this.collecting.finalText === undefined
+        && !isDistinctNativeTurn) {
         const idx = this.queue.indexOf(this.collecting);
         if (idx >= 0) this.queue.splice(idx, 1);
         this.collecting = null;

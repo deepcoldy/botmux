@@ -191,12 +191,18 @@ const traexSeenUserTurns = new Map<string, Set<string>>();
 interface TraexPendingUserMirror {
   text: string;
   timestampMs: number;
-  expected: 'legacy' | 'item';
+  expected: 'legacy' | 'item' | 'terminal';
   sourceTurnId?: string;
 }
-const traexPendingUserMirror = new Map<string, TraexPendingUserMirror>();
+interface TraexDrainUserMirror extends TraexPendingUserMirror {
+  /** Set only for a legacy event emitted by this drain, so its item mirror can
+   * upgrade that event in place without changing chronological turn order. */
+  eventIndex?: number;
+}
+const traexPendingUserMirrors = new Map<string, TraexPendingUserMirror[]>();
 const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
 const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
+const TRAEX_PENDING_USER_MIRRORS_PER_PATH_MAX = 64;
 const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
 
 function claimTraexUserTurn(path: string, turnId: unknown): boolean {
@@ -219,35 +225,50 @@ function claimTraexUserTurn(path: string, turnId: unknown): boolean {
   return true;
 }
 
-function rememberTraexUserMirror(path: string, pending: TraexPendingUserMirror): void {
-  traexPendingUserMirror.set(path, pending);
-  if (traexPendingUserMirror.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
-    const oldestPath = traexPendingUserMirror.keys().next().value;
-    if (oldestPath) traexPendingUserMirror.delete(oldestPath);
+function rememberTraexUserMirrors(path: string, pending: readonly TraexPendingUserMirror[]): void {
+  if (pending.length === 0) {
+    traexPendingUserMirrors.delete(path);
+    return;
+  }
+  traexPendingUserMirrors.set(path, pending.slice(-TRAEX_PENDING_USER_MIRRORS_PER_PATH_MAX));
+  if (traexPendingUserMirrors.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+    const oldestPath = traexPendingUserMirrors.keys().next().value;
+    if (oldestPath) traexPendingUserMirrors.delete(oldestPath);
   }
 }
 
-function isExpectedTraexUserMirror(
-  pending: TraexPendingUserMirror | undefined,
+function takeExpectedTraexUserMirror(
+  pending: TraexDrainUserMirror[],
   expected: TraexPendingUserMirror['expected'],
   text: string,
   timestampMs: number,
-): boolean {
-  return pending?.expected === expected
-    && pending.text === text
-    && timestampMs >= pending.timestampMs
-    && timestampMs - pending.timestampMs <= TRAEX_LEGACY_USER_MIRROR_WINDOW_MS;
+): TraexDrainUserMirror | undefined {
+  // Transcript timestamps are chronological. Expired candidates cannot be a
+  // later mirror and retaining them could consume a genuine repeated prompt.
+  for (let index = pending.length - 1; index >= 0; index--) {
+    const ageMs = timestampMs - pending[index].timestampMs;
+    if (ageMs > TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) pending.splice(index, 1);
+  }
+  const index = pending.findIndex(candidate => candidate.expected === expected
+    && candidate.text === text
+    && timestampMs >= candidate.timestampMs);
+  if (index < 0) return undefined;
+  return pending.splice(index, 1)[0];
 }
 
-function clearTraexUserMirrorAtTerminal(path: string, sourceTurnId: string, probe: boolean): void {
-  if (probe) return;
-  const pending = traexPendingUserMirror.get(path);
-  // Legacy-first state has no native id until its item mirror arrives. An
-  // item-first state does, so a delayed terminal from another turn must not
-  // invalidate the currently-open turn's mirror expectation.
-  if (!pending?.sourceTurnId || pending.sourceTurnId === sourceTurnId) {
-    traexPendingUserMirror.delete(path);
+function clearTraexUserMirrorsAtTerminal(pending: TraexDrainUserMirror[], sourceTurnId: string): void {
+  // A paired legacy-first turn leaves a terminal marker, while item-first
+  // state carries its id directly. Prefer either exact match so a terminal
+  // cannot consume a source-less candidate belonging to a typed-ahead turn.
+  const exactIndex = pending.findIndex(candidate => candidate.sourceTurnId === sourceTurnId);
+  if (exactIndex >= 0) {
+    pending.splice(exactIndex, 1);
+    return;
   }
+  // A legacy-only dialect never reveals the id until terminal. In that case
+  // retire only the oldest unmatched legacy turn, preserving queued inputs.
+  const legacyIndex = pending.findIndex(candidate => candidate.expected === 'item');
+  if (legacyIndex >= 0) pending.splice(legacyIndex, 1);
 }
 
 function itemCompletedUserText(item: unknown): string {
@@ -477,8 +498,9 @@ export function drainTraexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
-  const legacyUserIndexesWithoutTurnId = new Map<string, number>();
-  let probePendingUserMirror: TraexPendingUserMirror | undefined;
+  const pendingUserMirrors: TraexDrainUserMirror[] = probe
+    ? []
+    : (traexPendingUserMirrors.get(path) ?? []).map(candidate => ({ ...candidate }));
   const claimUserTurn = (turnId: unknown): boolean => {
     if (typeof turnId !== 'string' || turnId.length === 0) return true;
     if (seenUserTurns.has(turnId)) return false;
@@ -528,20 +550,17 @@ export function drainTraexRollout(
       && typeof payload.message === 'string') {
       const userText = payload.message;
       if (!sourceTurnId) {
-        const expectedMirror = probe
-          ? probePendingUserMirror
-          : traexPendingUserMirror.get(path);
-        if (probe) probePendingUserMirror = undefined;
-        else traexPendingUserMirror.delete(path);
-        if (isExpectedTraexUserMirror(expectedMirror, 'legacy', userText, base.timestampMs)) continue;
+        if (takeExpectedTraexUserMirror(pendingUserMirrors, 'legacy', userText, base.timestampMs)) continue;
       }
       if (userText && claimUserTurn(payload.turn_id)) {
         events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
         if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
-          legacyUserIndexesWithoutTurnId.set(userText, events.length - 1);
-          const pending = { text: userText, timestampMs: base.timestampMs, expected: 'item' as const };
-          if (probe) probePendingUserMirror = pending;
-          else rememberTraexUserMirror(path, pending);
+          pendingUserMirrors.push({
+            text: userText,
+            timestampMs: base.timestampMs,
+            expected: 'item',
+            eventIndex: events.length - 1,
+          });
         }
         // New turn: drop any agent_message state an unterminated predecessor
         // left behind so it can't be attributed to this turn.
@@ -558,33 +577,33 @@ export function drainTraexRollout(
           // the same drain also contains their 0.201.4 UserMessage mirror,
           // replace the uncorrelatable legacy event with the turn-addressable
           // item_completed event instead of starting two local turns.
-          const legacyIndex = legacyUserIndexesWithoutTurnId.get(userText);
+          const expectedMirror = takeExpectedTraexUserMirror(
+            pendingUserMirrors, 'item', userText, base.timestampMs,
+          );
+          const legacyIndex = expectedMirror?.eventIndex;
           if (legacyIndex !== undefined) {
-            events.splice(legacyIndex, 1);
-            legacyUserIndexesWithoutTurnId.delete(userText);
-            for (const [text, index] of legacyUserIndexesWithoutTurnId) {
-              if (index > legacyIndex) legacyUserIndexesWithoutTurnId.set(text, index - 1);
-            }
-          }
-          const expectedMirror = probe
-            ? probePendingUserMirror
-            : traexPendingUserMirror.get(path);
-          if (probe) probePendingUserMirror = undefined;
-          else traexPendingUserMirror.delete(path);
-          const mirrorsEarlierLegacy = legacyIndex !== undefined
-            || isExpectedTraexUserMirror(expectedMirror, 'item', userText, base.timestampMs);
-          if (!mirrorsEarlierLegacy || legacyIndex !== undefined) {
+            events[legacyIndex] = {
+              ...events[legacyIndex],
+              ...(sourceTurnId ? { sourceTurnId } : {}),
+            };
+          } else if (!expectedMirror) {
             events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
           }
-          if (!mirrorsEarlierLegacy && sourceTurnId) {
-            const pending = {
+          if (expectedMirror?.expected === 'item' && sourceTurnId) {
+            pendingUserMirrors.push({
               text: userText,
               timestampMs: base.timestampMs,
-              expected: 'legacy' as const,
+              expected: 'terminal',
               sourceTurnId,
-            };
-            if (probe) probePendingUserMirror = pending;
-            else rememberTraexUserMirror(path, pending);
+            });
+          }
+          if (!expectedMirror && sourceTurnId) {
+            pendingUserMirrors.push({
+              text: userText,
+              timestampMs: base.timestampMs,
+              expected: 'legacy',
+              sourceTurnId,
+            });
           }
           // New turn: drop any agent_message state an unterminated predecessor
           // left behind so it can't be attributed to this turn.
@@ -654,9 +673,7 @@ export function drainTraexRollout(
         text = recoverTraexEmptyFinal(pending, adoptMode);
       }
       if (!probe) traexPendingAgentCache.delete(path);
-      if (probe) probePendingUserMirror = undefined;
-      else clearTraexUserMirrorAtTerminal(path, payload.turn_id, false);
-      legacyUserIndexesWithoutTurnId.clear();
+      clearTraexUserMirrorsAtTerminal(pendingUserMirrors, payload.turn_id);
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -683,9 +700,7 @@ export function drainTraexRollout(
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
       if (!probe) traexPendingAgentCache.delete(path);
-      if (probe) probePendingUserMirror = undefined;
-      else clearTraexUserMirrorAtTerminal(path, payload.turn_id, false);
-      legacyUserIndexesWithoutTurnId.clear();
+      clearTraexUserMirrorsAtTerminal(pendingUserMirrors, payload.turn_id);
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -696,6 +711,7 @@ export function drainTraexRollout(
       });
     }
   }
+  if (!probe) rememberTraexUserMirrors(path, pendingUserMirrors.map(({ eventIndex: _eventIndex, ...candidate }) => candidate));
   return {
     events,
     newOffset,
