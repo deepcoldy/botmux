@@ -2,7 +2,7 @@
 title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单。同日二次修订：三项待定项落定——放弃扁平 legacy 行、只读库 fail-fast、导入删除条件；补阅读指引、决策记录与验收标准）
+updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单。同日二次修订：三项待定项落定——放弃扁平 legacy 行、只读库 fail-fast、导入删除条件；补阅读指引、决策记录与验收标准。三次修订：会话内定位改为 daemon 优先、库兜底（A-9），常态可见性提前进前置 PR（B-11））
 topic: session-virtual-actor
 status: active
 baseline: origin/master@0aba0fdd（含已合入的 #852、#1073、#1093、#1051、#1202、#1280、#1308）
@@ -27,7 +27,8 @@ references:
 | 要做的事 | 先读 | 再读 |
 |---|---|---|
 | 理解终态与不变量 | §0、§1 | §2.2 差距表 |
-| 开收尾 PR（删跨进程 JSON 读写、心跳改语义、unmigrated 文案、mojo 修复） | §5 A、§3.3、§3.4、§3.6 | §6 测试面、下方验收标准 |
+| 开收尾 PR（删跨进程 JSON 读写、心跳改语义、unmigrated 文案、mojo 修复、会话内定位 daemon 优先） | §5 A、§3.3、§3.4、§3.6、§3.9 | §6 测试面、下方验收标准 |
+| 开前置 PR 里的常态可见性（status 版本列、dashboard 提示、安装提示） | §3.8、§5 B-11 | — |
 | 开前置 PR（descriptor 能力位、supervisor killTimeout、宿主侧租约规则） | §5 B、§3.5、§3.7 | 验收标准 |
 | daemon 侧租约不变量 / owner 侧命令化 / Stage 3 残留 | §5 C、§4 对应 stage | §7 |
 | 判断某条兼容分支能不能删 | §0 原则 7、8；§3.1、§3.2 | 决策记录 |
@@ -43,6 +44,8 @@ references:
 | 2026-09-08 | 无 `larkAppId` 的扁平 legacy 行直接放弃；扁平 store 的全部支持点随收尾 PR 删除 | 扁平 store 只存在于 2026-03-11 至 03-22（首次发布到 per-bot 拆分），早于第一个发布 tag v2.16.1（2026-05-07），没有任何发布版本写过它 |
 | 2026-09-08 | 只读库 / `loadFailure` 的 daemon 从「降级运行」改为「有界重试后 fail-fast」 | §3.7：写不了会话库的 daemon 不能服务，降级运行只会让宿主与它竞争 |
 | 2026-09-08 | 一次性导入 + 中毒库恢复的删除条件：latest ≥ v3.19 满 90 天（2026-12-06 之后）且线上 `session-stores/` 的 `*.tmp*` 孤儿核查为零 | §5 C-16 |
+| 2026-09-08 | 会话内定位（`botmux send` 与 detectCurrentSession / resolveSessionAppId）改为「先问活着的 daemon，问不到再读库」；daemon 侧路由补全路由字段 | §3.9：daemon 在时内存行才是权威（原则 4）；顺带让旧 daemon 窗口里的 send 降级可达 |
+| 2026-09-08 | 常态可见性（status 版本列、dashboard 提示、安装后提示）从单独排期提前进前置 PR | §3.8：会话里 agent 背后的人看不到事后报错，只能靠事前提醒 |
 
 **验收标准**（收尾 PR 与前置 PR 合并前必须全部成立）：
 
@@ -52,6 +55,7 @@ grep -nE "kind: 'json'|loadFromFrozenJson|abortIf|legacyHeartbeatHeld" src/servi
 grep -nF 'sessions-${ctx.currentAppId}.json' src/adapters/cli/fs-policy.ts                                                           # 期望 0 行
 grep -nF 'sessions(-[^.]+)?' src/core/mojo-containment-command.ts                                                                    # 期望 0 行
 grep -nE "withFileLockSync" src/services/session-store.ts                                                                             # 期望只剩导入与中毒恢复两处
+grep -nE "sessions\.get\(sid\)" src/cli.ts                                                                                           # 期望 0（cmdSend 与会话内定位底座已改走 resolveSessionById）
 grep -rnE "sessionStore\.init\(\s*\)" test | wc -l                                                                                    # 期望 0（扁平 store 支持已删；init(appId) 必填后 tsc 也会报）
 # B：descriptor 能力位与关停预算
 grep -nE "sessionStoreProtocol|botmuxVersion" src/daemon.ts src/utils/daemon-discovery.ts src/dashboard/registry.ts                   # 三个文件都应命中
@@ -61,7 +65,7 @@ bun run build
 bun run test -- test/session-store.test.ts test/session-store-sqlite.test.ts test/session-occupancy.test.ts test/session-delete-cli.test.ts test/whiteboard-unbind-session.test.ts test/fs-policy.test.ts test/mojo-containment.test.ts test/session-turn-queue.test.ts
 ```
 
-行为层面的验收：① 用只有 `sessions-<appId>.json`、无 `.db` 的数据目录跑 `botmux list` / `botmux delete <id>` / 会话内 `botmux send`，三者都必须给出 unmigrated 文案而不是「没有活跃会话」或裸栈；② 在库里写一条有效租约、不写 descriptor，`botmux delete` 必须报「daemon 在线」而不是离线关闭；③ 写一个新鲜但无能力位的 descriptor、库里无租约，`botmux delete` 必须报「旧版本 daemon，请先 botmux restart」且行未变、worker 未被 SIGTERM；④ 同③但 descriptor 带能力位，文案必须是「未持有租约」而不是「旧版本」；⑤ 在带 `BOTMUX_SESSION_ID` 的子进程里触发③，输出不得含 `botmux restart`、pid、端口或版本号。
+行为层面的验收：① 用只有 `sessions-<appId>.json`、无 `.db` 的数据目录跑 `botmux list` / `botmux delete <id>` / 会话内 `botmux send`，三者都必须给出 unmigrated 文案而不是「没有活跃会话」或裸栈；② 在库里写一条有效租约、不写 descriptor，`botmux delete` 必须报「daemon 在线」而不是离线关闭；③ 写一个新鲜但无能力位的 descriptor、库里无租约，`botmux delete` 必须报「旧版本 daemon，请先 botmux restart」且行未变、worker 未被 SIGTERM；④ 同③但 descriptor 带能力位，文案必须是「未持有租约」而不是「旧版本」；⑤ 在带 `BOTMUX_SESSION_ID` 的子进程里触发③，输出不得含 `botmux restart`、pid、端口或版本号；⑥ 数据目录只有 `sessions-<appId>.json`、无 `.db`，但有一个新鲜 descriptor 指向一个会回答 `GET /api/sessions/:id` 的 daemon（可用测试桩）时，`botmux send` 必须发出（降级到话题根），且返回行的 `larkAppId` 与 env 不一致时必须拒绝；同样场景 daemon 不回答时才落到 unmigrated 提示。
 
 **施工约束**：`/Users/fancy/Code/botmux` 是 live daemon 的运行 checkout，收尾 PR 在 worktree 做，验证止于 build + 单测，不 `switch:here`、不重启；PR 描述用直白中文、写清动了哪些共用路径与各会话类型的验证，不写群内人名与机器人协作花名；行号以本文基线 master@0aba0fdd 为准，动手前先 `git grep` 复核。
 
@@ -175,11 +179,11 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 | 仍在运行的 daemon | 新 CLI / dashboard / worker 的表现 |
 |---|---|
-| < v3.18.0（无 `.db`，有 `sessions-<appId>.json`） | 所有跨进程读（`botmux list/send/delete/whiteboard`、dashboard 删板、worker `owner:false` 的 `load()`）遇到该 bot 时得到 `unmigrated`：读侧不把该 bot 计入结果并在 stderr 打一行提示；写侧返回独立判别值并提示。IPC 路径不受影响。 |
+| < v3.18.0（无 `.db`，有 `sessions-<appId>.json`） | 会话内定位走 daemon 优先（§3.9）：`botmux send` 与会话内的 history / whiteboard / schedule 等从活着的旧 daemon 拿到路由，降级但可达。其余跨进程读（`botmux list`、`delete` 的离线路径、dashboard 删板、worker `owner:false` 的 `load()`）遇到该 bot 时得到 `unmigrated`：读侧不把该 bot 计入结果并在 stderr 打一行提示；写侧返回独立判别值并提示。IPC 路径不受影响。 |
 | v3.18.0 – v3.18.14（有 `.db`，无租约） | IPC 能应答的走 IPC，daemon 权威。IPC 不可达而落到宿主写时：无有效租约 + descriptor 新鲜 → 拒绝，提示「后台 daemon 是升级前的旧进程，请先运行 `botmux restart`」。 |
 | ≥ v3.19.0 | 租约是权威；descriptor 新鲜但无租约时同样拒绝，但文案是「daemon 在线但暂未持有会话库租约」（见 §3.5）。 |
 
-会话内 agent 的 `botmux send` 确实读会话库取 `chatId` / `larkAppId`（`cli.ts:8571-8613`；Linux bwrap 下由宿主 re-exec 读，riff 沙盒例外用 env）。在 < v3.18.0 的 daemon 下它会失败，agent 只能在 stderr 看到提示。这是本策略明确接受的代价：升级到用户重启之间，正在跑的会话内 agent 回不了消息。
+会话内 agent 的 `botmux send` 今天读会话库取 `chatId` / `larkAppId`（`cli.ts:8571-8613`；Linux bwrap 下由宿主 re-exec 读，riff 沙盒例外用 env）。按 §3.9 改为先问活着的 daemon 之后，它在 < v3.18.0 的 daemon 下**降级但可达**：消息落在正确的话题里，但旧 daemon 返回的行没有每轮的精确回复锚点与 codex 派发台账，回复可能落到话题根、@回发送者不精确。仍然发不出的只剩两个角落：macOS 凭证隔离的会话 CLI 读不到 IPC secret、只能读库；v2.x（2026-07-16 之前）的 daemon 不认宿主 HMAC。两者都退回 unmigrated 提示。
 
 ### 3.3 「无 `.db`」的判别与文案落点
 
@@ -250,12 +254,26 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 ### 3.8 常态可见性
 
-升级窗口从「自动关闭」改成「用户手动关闭」后长度没有上界，只在失败时提示等于把发现时机推给一次失败操作：
+升级窗口从「自动关闭」改成「用户手动关闭」后长度没有上界，只在失败时提示等于把发现时机推给一次失败操作；而会话里 agent 背后的人根本看不到事后报错。所以这一节随前置 PR 一起做（§5 B-11）：
 
 - `botmux status` 增加 VERSION 列（`listOnlineDaemons` 按 appId join fleet 行），表尾提示「N 个 daemon 仍在跑 vX（磁盘 vY），运行 `botmux restart` 应用」。
 - dashboard「版本与更新」卡增加「运行中的 daemon：n 个 v3.20.0 / m 个 v3.19.3 ⇒ 需要重启」，数据源 `registry.list()`，对照量是 `currentInstalledVersion()`。版本不进 `botsRosterSignature`，靠轮询刷新。
 - `postinstall-bin.mjs` 与 `install.sh` 在升级成功后无条件打一行「若 daemon 正在运行，请执行 `botmux restart` 应用新版本」（它们读不到、也不该读 `~/.botmux/data`）。
 - dashboard i18n `sessions.history.staleHint` 是猜测式提示，有版本字段后改成真判定或删掉。
+
+### 3.9 会话内定位：先问活着的 daemon，问不到再读库
+
+`botmux send`、`detectCurrentSession`、`currentWhiteboardContext`、`resolveSessionAppId` 今天都用 `loadSessions().get(sid)` 从磁盘上的会话库定位自己，即使 daemon 正活着。这是「文件即权威」时代的遗留：daemon 在时，它内存里的行才是权威（§0 原则 4），跨进程读库只该发生在 daemon 不在时。改法：
+
+1. 新增一个解析器 `resolveSessionById(sid)`，替换上述入口里的 `loadSessions().get(sid)`：
+   - 先定位 bot：env `BOTMUX_LARK_APP_ID`（worker 注入，`worker.ts:1249`）；没有时按在线 descriptor 逐个询问。
+   - 向该 bot 的 daemon 发 `GET /api/sessions/:id`（`dashboard-ipc-server.ts:1189`，2026-04-30 起存在，早于第一个发布 tag；宿主 HMAC 鉴权，2026-07-16 起所有 v3.x daemon 都认）。200 → 用它返回的行；**404 来自已应答的 daemon，是权威的「不存在」**，不再回落读库；连接失败 / 无 descriptor / 本进程读不到 secret（隔离 CLI）→ 读库（含 §3.3 的 unmigrated 判别）。
+   - 返回行的 `larkAppId` 必须与 env 一致、`sessionId` 必须等于请求的 id，否则拒绝。descriptor 只用于寻址（§0 原则 7）：伪造 descriptor 至多让请求打到一个假端口，返回的行过不了这两条核对。
+2. daemon 侧把路由返回补全为 send 需要的字段：当前轮的 `replyTargets` 条目、`currentReplyTarget`、`quoteTargetId` / `quoteTargetSenderOpenId`、`codexAppDispatchLedger`。旧 daemon 只返回基础行（`sessionId` / `larkAppId` / `chatId` / `chatType` / `rootMessageId` / `scope` / `status`），send 据此降级：无每轮锚点时回到话题根，`--mention-back` 退回会话级发送者。
+3. `botmux list` 仍是快照，但组装方式改成 dashboard 已经在用的那种：在线 daemon 走 `GET /api/sessions`，只对离线 bot 读库。这一步不在收尾 PR 里（§5 C-17 的枚举器收敛时一起做）。
+4. 沙盒：Linux bwrap 的 send 由宿主侧 re-exec 完成，能读 secret，走 daemon 优先；macOS 凭证隔离的 CLI 读不到 secret，保持读库。不为它新开一条免鉴权的读路由——那等于把会话路由暴露给任何本机进程。
+
+效果：正常状态下 send 不再依赖跨进程读库，会话库的跨进程读只剩「daemon 不在」这一种情形；旧 daemon 窗口里的 send 从「未找到 session」变成降级可达。这不是兼容分支：它不读任何旧格式，走的是首发就有的正式通道，窗口关闭后仍是主路径。
 
 ## 4. 后续 stage
 
@@ -323,12 +341,14 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 6. **S** 死代码与过时注释：`__testOnly_setAfterRemoteBatchRename`、`test/session-store.test.ts:25` 的 fs mock 注入、`daemon.ts:4212-4214`、`dashboard-ipc-server.ts:2247`。
 7. **S** 测试改造，按 §6。
 8. **S** 删扁平 legacy store：`init(appId: string)` 必填，删 8 处支持点与 `hostOptions` 的无 `larkAppId` 分支、`cli.ts:3877-3882` 的离线路径特例，约 30 处测试夹具的无参 `init()` 改为传 appId。无 `larkAppId` 的行已决定放弃（见阅读指引的决策记录），PR 描述里写明。这一项与 A-1 之后的代码没有耦合，若让 PR 过大可拆成紧随其后的独立 PR，但不设任何前置条件。
+9. **M** 会话内定位改为 daemon 优先（§3.9）：`resolveSessionById` 替换 `cmdSend` / `detectCurrentSession` / `currentWhiteboardContext` / `resolveSessionAppId` 里的 `loadSessions().get(sid)`；daemon 侧 `GET /api/sessions/:id` 补全路由字段；返回行与 env 的一致性核对；测试补「daemon 应答 200 / 404 / 连接失败」三种分支与 larkAppId 不一致拒绝。
 
 ### B. 必须同 PR 或紧邻的前置 PR（否则 A-2 是回归）
 
 8. **M** descriptor 加 `sessionStoreProtocol` 与 `botmuxVersion`，读侧两处同步（§3.5）；`supervisorShutdownProtocol` 与前端 `bootstrapRequired` 死路径、`RestartLifecycleFlags` 一起处置。
 9. **M** supervisor `killTimeoutMs` 对齐关停预算；`shutdown-budgets.ts:53-55` 断言改对象（§3.7-5）。
 10. **M** 宿主侧租约有效性两段规则（§3.4）。
+11. **S** 常态可见性（§3.8，依赖 B-8 的 `botmuxVersion`）：`botmux status` 的 VERSION 列与表尾提示、dashboard「版本与更新」卡的「运行中的 daemon 需要重启」、`postinstall-bin.mjs` 与 `install.sh` 升级后的一行提示。
 
 ### C. 单独排期
 
@@ -338,10 +358,9 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 14. **M** `persistActiveRemoteLineage*` 收进命令；`bridgeMarkerCleanupFences` 移出（Stage 2-1、Stage 3-5）。
 15. **L** owner 侧 `updateSession` 命令化，先三类（Stage 2-2）。
 16. **M** 删除一次性导入、其文件锁与中毒库恢复（约 400 行）以及 `frozenJsonRows` 一族测试夹具；届时 `storeJsonFileName` 只剩 §3.3 的 `unmigrated` 判别一个用途，`utils/file-lock.ts` 对会话库的依赖整体解除。**条件（已决定）**：latest ≥ v3.19 满 90 天（2026-12-06 之后），且对线上 `session-stores/` 做一次 `find … -name '*.tmp*'` 孤儿核查为零。
-17. **M** 6 个跨 store 枚举入口（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
+17. **M** 6 个跨 store 枚举入口（顺带把 `botmux list` 改成「在线 daemon 走 IPC、离线 bot 读库」，§3.9-3）（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
 18. **M** Stage 3 残留 1–3（admit / promote 命令化、claim token 清除、gate 的两处用户可见拒绝）。
 19. **L** Stage 3 残留 4（`serializeByAnchor` 并入 `runSessionTurn`）。
-20. **S** 常态可见性（§3.8）。
 
 ## 6. 测试面收缩
 
@@ -412,4 +431,4 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 2026-08-28 至 09-08：#1051 删除 daemon 侧 JSON 写路径并把落盘改成行级 upsert，同时把删板解绑、离线写与 daemon 发现各收敛成一份实现；#1202 落地库内租约；#1280 落地单一 apply 并删除「任意闭包改行」的离线写入口；#1308 把开场激活窗口的串行化收进 `runSessionTurn`。期间跨进程读写按「升级窗口无上界」保留了 db-else-json 与心跳回落，删除条件曾定为「fleet 自动重启落地或 2026-11-26 复核」。
 
-2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。同日二次修订把三项待定项落定为决策（阅读指引的决策记录）：扁平 legacy 行放弃并随收尾 PR 删除支持点；只读库 daemon fail-fast；导入与中毒恢复按日期 + 磁盘核查删除。
+2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。同日二次修订把三项待定项落定为决策（阅读指引的决策记录）：扁平 legacy 行放弃并随收尾 PR 删除支持点；只读库 daemon fail-fast；导入与中毒恢复按日期 + 磁盘核查删除。三次修订：会话内定位改为 daemon 优先、库兜底（§3.9、A-9），§3.2 中「会话内 agent 回不了消息」的代价改为「降级但可达」；常态可见性从单独排期提前进前置 PR（B-11）。
