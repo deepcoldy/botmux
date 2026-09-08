@@ -183,8 +183,7 @@ export function buildConnectorTargetBody(form: Pick<CreateForm,
   if (form.mode === 'dynamic') target.allowChats = form.allowChats;
   if (form.kind === 'workflow' && form.workflowId) target.workflowId = form.workflowId;
   if (form.mode === 'new-group') {
-    const botIds = normalizeConnectorBotIds(form.botId, form.additionalBotIds);
-    if (botIds.length > 1) target.botIds = botIds;
+    target.botIds = normalizeConnectorBotIds(form.botId, form.additionalBotIds);
   } else {
     target.botIds = [];
   }

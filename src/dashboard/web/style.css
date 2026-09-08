@@ -1729,10 +1729,6 @@ textarea {
   transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
 }
 
-input[type=search]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
-  padding-left: 32px;
-}
-
 textarea {
   min-height: 84px;
   resize: vertical;
@@ -4627,8 +4623,8 @@ td code,
   margin: 0;
 }
 
-#g-drawer .form-row :where(input, select),
-#g-drawer .g-modal-field :where(input, select) {
+#g-drawer .form-row :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select),
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select) {
   box-sizing: border-box;
   display: block;
   width: 100%;
@@ -4640,11 +4636,11 @@ td code,
   background-color: var(--surface);
 }
 
-#g-drawer .g-modal-field :where(input, select):hover:not(:disabled) {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
 }
 
-#g-drawer .g-modal-field :where(input, select):focus {
+#g-drawer .g-modal-field :where(input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]), select):focus {
   border-color: var(--accent);
   box-shadow: none;
   outline: none;
@@ -18563,7 +18559,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: block;
 }
 
-.connectors-page .cn-form .connector-group-search > input[type="search"] {
+.connector-group-search > input[type="search"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   height: 34px;
   min-height: 34px;
   padding: 0 12px 0 34px;

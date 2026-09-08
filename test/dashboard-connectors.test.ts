@@ -68,6 +68,16 @@ describe('dashboard connector new-group bot selection', () => {
 
     expect(buildConnectorTargetBody({
       kind: 'turn',
+      mode: 'new-group',
+      botId: 'app1',
+      additionalBotIds: [],
+      chatId: '',
+      allowChats: [],
+      workflowId: '',
+    })).toEqual({ kind: 'turn', mode: 'new-group', botId: 'app1', botIds: ['app1'] });
+
+    expect(buildConnectorTargetBody({
+      kind: 'turn',
       mode: 'fixed',
       botId: 'app1',
       additionalBotIds: ['app2'],
