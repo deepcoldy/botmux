@@ -6039,6 +6039,59 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ─── 文档评论监听 doc-watches (proxy to daemon) ─────────────────────────
+    // GET    /api/doc-watches/:larkAppId
+    // POST   /api/doc-watches/:larkAppId              body { docRef, commentTriggerMode?, workingDir? }
+    // PUT    /api/doc-watches/:larkAppId/:fileToken   body { commentTriggerMode }
+    // DELETE /api/doc-watches/:larkAppId/:fileToken
+    //
+    // 这些路径都**不在** PUBLIC_READ_PATHS 里 ⟹ 未认证访客在 decideDashboardAuth
+    // 已被 401；写操作还要 `authed`（= canManageHost）。与 message-listeners
+    // 逐字同款形状：dashboard 只做转发，所有写盘都发生在 daemon 进程内（订阅表是
+    // 单写者模型，见 doc-subs-store.ts 顶注）。
+    let mDocWatch: RegExpMatchArray | null;
+    if ((mDocWatch = url.pathname.match(/^\/api\/doc-watches\/([^/]+)\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mDocWatch[1]);
+      const fileToken = decodeURIComponent(mDocWatch[2]);
+      if (req.method === 'PUT' || req.method === 'DELETE') {
+        if (!authed) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'forbidden' })); return; }
+        const init: RequestInit = { method: req.method };
+        if (req.method === 'PUT') {
+          const chunks: Buffer[] = [];
+          for await (const c of req) chunks.push(c as Buffer);
+          init.headers = { 'content-type': 'application/json' };
+          init.body = Buffer.concat(chunks).toString('utf8') || '{}';
+        }
+        const upstream = await proxyToDaemon(larkAppId, `/api/doc-watches/${encodeURIComponent(fileToken)}`, init);
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mDocWatch = url.pathname.match(/^\/api\/doc-watches\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mDocWatch[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, '/api/doc-watches', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'POST') {
+        if (!authed) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'forbidden' })); return; }
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, '/api/doc-watches', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
     // ─── 免@ 斜杠命令 commandTriggers (proxy to daemon) ─────────────────────
     // GET /api/command-triggers/:larkAppId
     // PUT /api/command-triggers/:larkAppId

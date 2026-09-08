@@ -306,4 +306,69 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
   it('removeDocSubscription 只在那一个闭包里被调用，没有旁路', () => {
     expect(region.match(/removeDocSubscription\(/g) ?? []).toHaveLength(1);
   });
+
+  /**
+   * 运行态诊断（dashboard「最近一次结局」看板的数据来源）的接线。
+   *
+   * 为什么也用源码形状而不是行为测试：与本文件既有那批断言同一个理由 ——
+   * `processCommentEvent` 没导出，跑通它要 mock 订阅表 / open_id 探针 / 审计通知
+   * 整条链路。而这里要钉的恰恰是「**每个出口**都记了」这种覆盖性事实，源码计数
+   * 正好表达得动它；换成行为测试反而要为每个出口各搭一套 mock，更容易漏。
+   *
+   * 真正的行为语义（计数、清 error、行不存在不写）在
+   * test/doc-subs-store.test.ts 里逐条测过，两边合起来才完整。
+   */
+  it('processCommentEvent 的每个出口都记了运行态结局（7 个：6 个丢弃 + 1 个成功）', () => {
+    expect(region.match(/noteOutcome\(/g) ?? []).toHaveLength(7);
+  });
+
+  it('七种结局各记一次，没有把两个不同出口记成同一种（否则看板分不出为什么没回复）', () => {
+    for (const outcome of [
+      'no-comment', 'trigger-missing', 'self-authored',
+      'not-mentioned', 'empty-text', 'audit-rejected', 'dispatched',
+    ]) {
+      expect(region.match(new RegExp(`noteOutcome\\('${outcome}'`, 'g')) ?? [], outcome).toHaveLength(1);
+    }
+  });
+
+  /**
+   * ⚠️ 诊断记录绝不能改变控制流。`noteOutcome` 内部已经 try/catch 咽掉一切，
+   * 但如果调用点写成 `await`／或把它塞进 `if` 的判据里，一次写盘失败就能挡住
+   * 一条真实评论的投递 —— 那这个「可观测」特性就成了新的故障源，比没有更糟。
+   */
+  it('noteOutcome 全部是裸语句调用：不 await、不参与任何判据', () => {
+    // 逐行看（而不是用正则往前回看固定字符数——那样缩进一深就把 `await ` 挪出窗口）：
+    // 每个调用行去掉缩进后必须**以 noteOutcome( 开头**。`await noteOutcome(`、
+    // `if (noteOutcome(`、`const x = noteOutcome(` 都会在这里被抓住。
+    // ⚠️ 只筛 `noteOutcome(`：声明行是 `const noteOutcome = (outcome: …`，箭头
+    // 函数的形参表让它**不含** `noteOutcome(` 这个字面量，所以它天然不在这个集合
+    // 里 —— 别再加一道 `!includes('const noteOutcome')` 的过滤，那是照着「声明行
+    // 也会被筛进来」的错误预设写的（我第一版就是，分母对不上才发现）。
+    const calls = region.split('\n').filter(line => line.includes('noteOutcome('));
+    // 分母自检：7 个出口各一次。数不对说明切片或实现变了，先修这条再谈其它。
+    expect(calls).toHaveLength(7);
+    for (const line of calls) {
+      expect(line.trimStart(), `noteOutcome 必须是裸语句: ${JSON.stringify(line)}`).toMatch(/^noteOutcome\(/);
+    }
+  });
+
+  /**
+   * 标题补齐在评论事件的**热路径**上（用户正等 bot 回复），必须 fire-and-forget。
+   * 写成 await 就是给每条评论插一次同步的飞书往返 —— 一次超时就让用户干等。
+   */
+  it('热路径里的标题补齐不 await（fire-and-forget）', () => {
+    expect(region).toContain('void fetchDocTitle(');
+    expect(region).not.toMatch(/await fetchDocTitle\(/);
+  });
+
+  /**
+   * auto-sub 溯源三字段：owner 事后能查「这条监听是谁 @ 出来的」。
+   * 在此之前 owner 只在当时收到一条私信，事后没有任何界面可复查。
+   */
+  it('auto-sub 记下溯源（谁 @ 出来的、什么时候）', () => {
+    const autoSub = regionBetween('const autoSub: DocSubscription = {', 'putDocSubscription(config.session.dataDir');
+    expect(autoSub).toContain('autoCreated: true');
+    expect(autoSub).toContain('autoCreatedBy: operatorOpenId');
+    expect(autoSub).toContain('autoCreatedAt:');
+  });
 });

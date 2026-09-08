@@ -10,6 +10,10 @@ import {
   listDocSubscriptionsForSession,
   listAllDocSubscriptions,
   setCommentTriggerMode,
+  recordDocWatchActivity,
+  setDocTitle,
+  asDocWatchOutcome,
+  DOC_WATCH_LAST_ERROR_MAX,
   type DocSubscription,
 } from '../src/services/doc-subs-store.js';
 
@@ -81,5 +85,87 @@ describe('doc-subs-store', () => {
     putDocSubscription(dataDir, APP_A, sub());
     expect(getDocSubscription(dataDir, APP_B, 'doccnFILE1')).toBeNull();
     expect(listAllDocSubscriptions(dataDir, APP_B)).toEqual([]);
+  });
+});
+
+describe('recordDocWatchActivity（运行态诊断）', () => {
+  it('记下结局与时刻；dispatched 额外累加计数并推进 lastDispatchAt', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    expect(recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 5_000 })).toBe(true);
+    let row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.lastOutcome).toBe('dispatched');
+    expect(row.lastActivityAt).toBe(5_000);
+    expect(row.lastDispatchAt).toBe(5_000);
+    expect(row.dispatchCount).toBe(1);
+
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 6_000 });
+    row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.dispatchCount).toBe(2);
+    expect(row.lastDispatchAt).toBe(6_000);
+  });
+
+  it('非 dispatched 结局推进 lastActivityAt 但不动投递计数/时刻', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 1_000 });
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'not-mentioned', at: 2_000 });
+    const row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.lastActivityAt).toBe(2_000);
+    expect(row.lastDispatchAt).toBe(1_000);   // 没被后来的正常丢弃冲掉
+    expect(row.dispatchCount).toBe(1);
+    expect(row.lastOutcome).toBe('not-mentioned');
+  });
+
+  it('⭐成功后清掉上一次的 lastError（否则修好的旧报错会永远挂在界面上）', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed', error: 'boom' });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toBe('boom');
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched' });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toBeUndefined();
+  });
+
+  it('lastError 超长被截断（订阅表不该被一条报错撑大）', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed', error: 'x'.repeat(5_000) });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toHaveLength(DOC_WATCH_LAST_ERROR_MAX);
+  });
+
+  it('⭐订阅不存在时不写（绝不能把已被回滚/退订的订阅复活）', () => {
+    expect(recordDocWatchActivity(dataDir, APP_A, 'ghost', { outcome: 'dispatched' })).toBe(false);
+    expect(getDocSubscription(dataDir, APP_A, 'ghost')).toBeNull();
+    expect(listAllDocSubscriptions(dataDir, APP_A)).toEqual([]);
+  });
+
+  it('⭐读后写：不会用调用方的旧快照覆盖别处刚改的字段', () => {
+    putDocSubscription(dataDir, APP_A, sub({ commentTriggerMode: 'mention-only' }));
+    // 模拟：调用方手里还是 mention-only 的旧快照，期间 dashboard 改成了 all
+    setCommentTriggerMode(dataDir, APP_A, 'doccnFILE1', 'all');
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched' });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.commentTriggerMode).toBe('all');
+  });
+});
+
+describe('setDocTitle', () => {
+  it('写入标题；标题未变时不重复写（返回 false）', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', ' 需求文档 ')).toBe(true);
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.docTitle).toBe('需求文档');
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', '需求文档')).toBe(false);
+  });
+
+  it('空标题与未知 token 都不写', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', '   ')).toBe(false);
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.docTitle).toBeUndefined();
+    expect(setDocTitle(dataDir, APP_A, 'ghost', 'x')).toBe(false);
+  });
+});
+
+describe('asDocWatchOutcome', () => {
+  it('收窄已知值，拒绝未知/非字符串（跨版本读旧文件）', () => {
+    expect(asDocWatchOutcome('dispatched')).toBe('dispatched');
+    expect(asDocWatchOutcome('poll-failed')).toBe('poll-failed');
+    expect(asDocWatchOutcome('from-a-future-version')).toBeUndefined();
+    expect(asDocWatchOutcome(undefined)).toBeUndefined();
+    expect(asDocWatchOutcome(42)).toBeUndefined();
   });
 });

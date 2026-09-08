@@ -148,6 +148,17 @@ import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } fr
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
+import {
+  getDocSubscription,
+  listAllDocSubscriptions,
+  putDocSubscription,
+  removeDocSubscription,
+  setCommentTriggerMode,
+  setDocCommentPollCursor,
+  type CommentTriggerMode,
+  type DocSubscription,
+} from '../services/doc-subs-store.js';
+import { fetchDocTitle, resolveDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, type RoleInjectMode } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
@@ -4696,6 +4707,214 @@ ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
   if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true });
+});
+
+// ─── 文档评论监听（doc-watches） ─────────────────────────────────────────────
+//
+// 与飞书侧 `/watch-comment` **同一份存储、同一套语义**，只是换了操作面。
+//
+// ⚠️ 授权边界（改这段前必读）：`/watch-comment` 是 **owner-only**（见
+// command-handler.ts 的 `cmd.watch.owner_only`）。这里没有再查一次「你是不是
+// owner」，不是漏了，而是**判据在上游且更严**：本 IPC 面整体挂在 HMAC 之后
+// （`ipcHmacAuthorized`），而唯一持有该密钥的调用方是 dashboard 进程；dashboard
+// 侧这些路由不在 `PUBLIC_READ_PATHS` 白名单里，所以未认证访客在
+// `decideDashboardAuth` 就已被 401，写操作还要过 `canManageHost`。
+//
+// 也就是说：能走到这里的只有「本机管理 cookie」或「平台授予 dashboard:manage 的
+// 协管者」。**协管者能改文档监听而飞书侧非 owner 不能** —— 这是刻意的口径统一，
+// 与 settings / schedules / groups 的既有边界逐字一致（那三个同样是 canManageHost
+// 而非飞书 owner）。要收紧成「只有 owner 本人」的话，得在 dashboard 侧用
+// `legacyAuthed` 而不是在这里加判断（见 request-identity.ts 顶注对两者的区分）。
+//
+// 另一条不变量：dashboard 是**独立进程**，而 doc-subs-store 的注释明写「写者只有
+// daemon 进程本身，单写者，原子写即可，无需跨进程锁」。所以所有写入必须像这样
+// 经 IPC 回到 daemon 执行，dashboard 侧**绝不能**直接 import 那个 store 去写盘。
+
+/** 文档 token 形状闸。飞书 file_token 是 20+ 位字母数字（同 parseDocRef 的
+ *  RAW_TOKEN_RE），这里额外收上限防路径注入 / 超长键把订阅表撑大。 */
+const DOC_WATCH_FILE_TOKEN_RE = /^[A-Za-z0-9]{20,64}$/;
+
+function isValidDocFileToken(token: string): boolean {
+  return DOC_WATCH_FILE_TOKEN_RE.test(token);
+}
+
+/** 一行订阅投影给 dashboard。刻意**不回吐**轮询游标之外的内部字段，也不回吐
+ *  `sessionAnchor`/`sessionId` 之外的会话内部结构 —— 界面要的是「哪篇文档、什么
+ *  模式、跑得怎么样」。 */
+function composeDocWatchRow(sub: DocSubscription): Record<string, unknown> {
+  return {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    docTitle: sub.docTitle,
+    commentTriggerMode: sub.commentTriggerMode,
+    managedBy: sub.managedBy ?? 'subscribe-lark-doc',
+    workingDir: sub.workingDir,
+    chatId: sub.chatId,
+    scope: sub.scope,
+    sessionId: sub.sessionId,
+    ownerOpenId: sub.ownerOpenId,
+    createdAt: sub.createdAt,
+    // 运行态（C 档的核心）：全部 optional，旧记录读到 undefined 是正常态。
+    lastActivityAt: sub.lastActivityAt,
+    lastOutcome: sub.lastOutcome,
+    lastError: sub.lastError,
+    lastDispatchAt: sub.lastDispatchAt,
+    dispatchCount: sub.dispatchCount ?? 0,
+    pollBaselineReady: sub.pollBaselineReady,
+    pollCursorAt: sub.pollCursorAt,
+    // auto-sub 溯源：让 owner 事后能查「这条是谁 @ 出来的」，不再只能凭当时那条 DM。
+    autoCreated: sub.autoCreated === true,
+    autoCreatedBy: sub.autoCreatedBy,
+    autoCreatedAt: sub.autoCreatedAt,
+    larkAppId: cachedLarkAppId,
+  };
+}
+
+ipcRoute('GET', '/api/doc-watches', (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let subs: DocSubscription[];
+  try {
+    subs = listAllDocSubscriptions(config.session.dataDir, cachedLarkAppId);
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  // 新的在前。createdAt 缺失的（理论上不该有）排最后而不是当 0 排最前。
+  const rows = subs
+    .slice()
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+    .map(composeDocWatchRow);
+  jsonRes(res, 200, { watches: rows });
+});
+
+ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidDocFileToken(p.fileToken)) return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body?.commentTriggerMode;
+  if (mode !== 'all' && mode !== 'mention-only') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!existing) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  if (!setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)) {
+    // 读到了但改不上 = 两次读之间被别处删了（退订 / auto-sub 回滚）。当 404 报，
+    // 不要当 500：不是故障，是竞态，界面刷新一下就对了。
+    return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  }
+  // 切到 'all' 时必须重建轮询基线，否则 poller 会把该文档的**全部历史评论**
+  // 当成「游标之后的新评论」一次性重放进会话。mention-only 从不进轮询，所以
+  // 它的记录里可能压根没有游标 —— 这正是切换方向决定成败的那一步。
+  //
+  // 这里刻意**不去打飞书拿真实 latest 游标**（那是异步 + 可能失败的），而是把
+  // `pollBaselineReady` 置 false 交给 poller 下一轮自己建基线 —— 它本来就有这条
+  // 分支（`if (!current.pollBaselineReady …) { setDocCommentPollCursor(latest…); }`），
+  // 且那条路径只建基线、不触发历史评论。复用它比在这里再写一份取 latest 的逻辑
+  // 更稳：取失败时也绝不会退化成「重放全部历史」。
+  if (mode === 'all' && existing.commentTriggerMode !== 'all') {
+    setDocCommentPollCursor(config.session.dataDir, cachedLarkAppId, p.fileToken, undefined, false);
+  }
+  const updated = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!updated) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  logger.info(`[doc-comment] dashboard set mode=${mode} file=${p.fileToken.slice(0, 12)}${mode === 'all' && existing.commentTriggerMode !== 'all' ? ' (poll baseline reset)' : ''}`);
+  jsonRes(res, 200, { ok: true, watch: composeDocWatchRow(updated) });
+});
+
+ipcRoute('DELETE', '/api/doc-watches/:fileToken', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidDocFileToken(p.fileToken)) return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  const removed = removeDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!removed) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  // 旧 `/subscribe-lark-doc` 族在飞书侧有逐文件订阅要退，`watch-comment` 族只依赖
+  // 应用级评论事件、没有远端订阅可退（与 restoreDocSubscriptions 的分流逐字一致）。
+  // best-effort：远端退订失败不该让本地记录留着 —— 留着才是真正的「幽灵监听」。
+  if (removed.managedBy !== 'watch-comment') {
+    try {
+      await unsubscribeDocFile(cachedLarkAppId, { fileToken: removed.fileToken, fileType: removed.fileType });
+    } catch (err) {
+      logger.warn(`[doc-comment] dashboard unwatch: remote unsubscribe failed for ${p.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  logger.info(`[doc-comment] dashboard unwatched file=${p.fileToken.slice(0, 12)} (managedBy=${removed.managedBy ?? 'subscribe-lark-doc'})`);
+  jsonRes(res, 200, { ok: true, removed: composeDocWatchRow(removed) });
+});
+
+ipcRoute('POST', '/api/doc-watches', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const docRef = typeof body?.docRef === 'string' ? body.docRef.trim() : '';
+  if (!docRef) return jsonRes(res, 400, { ok: false, error: 'doc_ref_required' });
+  const mode: CommentTriggerMode = body?.commentTriggerMode === 'all'
+    ? 'all'
+    : body?.commentTriggerMode === 'mention-only'
+      ? 'mention-only'
+      : (getBot(cachedLarkAppId).config.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
+
+  // workingDir 走与 `/cd`、`/watch-comment --dir` 同一个校验器（存在 + 是目录）。
+  // 刻意**不开** autoCreate：这是一条「贴过来的路径」，静默 mkdir 会把打错的路径
+  // 变成一个空目录，掩盖问题而不是暴露它（见 working-dir.ts 顶注）。
+  let workingDir: string | undefined;
+  if (typeof body?.workingDir === 'string' && body.workingDir.trim()) {
+    const v = validateWorkingDir(body.workingDir.trim());
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_working_dir', message: v.error });
+    workingDir = v.resolvedPath;
+  }
+
+  let file: { fileToken: string; fileType: string };
+  try {
+    file = await resolveDocFile(cachedLarkAppId, docRef);
+  } catch (err) {
+    return jsonRes(res, 400, { ok: false, error: 'unresolvable_doc', message: err instanceof Error ? err.message : String(err) });
+  }
+  if (!isValidDocFileToken(file.fileToken)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  }
+
+  const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, file.fileToken);
+  // 'all' 需要轮询基线。这里同样不自己取 latest 游标（会失败、会重放历史），而是
+  // 沿用「已有且同为 all 就继承，否则置 pollBaselineReady=false 让 poller 建」的
+  // 策略 —— 与上面 PUT 的理由逐字相同。
+  const reuseBaseline = mode === 'all'
+    && existing?.managedBy === 'watch-comment'
+    && existing.commentTriggerMode === 'all'
+    && existing.pollBaselineReady === true;
+
+  const subscription: DocSubscription = {
+    fileToken: file.fileToken,
+    fileType: file.fileType,
+    // dashboard 登记的是「文档原生」监听：没有 IM 会话可挂，用虚拟 anchor，
+    // 与飞书侧无 session 时的 `doc:<token>` 逐字一致（daemon.ts:autoCreateDocSession
+    // 按这个 key 竞争 routing ownership）。
+    sessionAnchor: `doc:${file.fileToken}`,
+    sessionId: undefined,
+    scope: 'chat',
+    chatId: `doc:${file.fileToken}`,
+    commentTriggerMode: mode,
+    managedBy: 'watch-comment',
+    // 归属记 bot owner 而不是「当前 dashboard 操作者」：dashboard 身份可能是平台
+    // 协管者，而 ownerOpenId 会被 auto-create session 当作 session owner 用
+    // （daemon.ts:autoCreateDocSession）—— 那里要的是本 app 视角下的真人 owner。
+    // ⚠️ open_id 是 app-scoped 的，绝不能把别处的 ou_ 搬进来（见 CLAUDE.md 身份边界）。
+    ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+    workingDir: workingDir ?? existing?.workingDir ?? getBot(cachedLarkAppId).config.docRepoMap?.[file.fileToken],
+    pollCursorAt: reuseBaseline ? existing?.pollCursorAt : undefined,
+    pollCursorReplyId: reuseBaseline ? existing?.pollCursorReplyId : undefined,
+    pollBaselineReady: mode === 'all' ? (reuseBaseline ? true : false) : undefined,
+    createdAt: existing?.createdAt ?? Date.now(),
+  };
+  // 标题快照：best-effort，失败留空（列表回退显示 token）。
+  const title = await fetchDocTitle(cachedLarkAppId, file);
+  if (title) subscription.docTitle = title;
+  else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
+
+  const { previous } = putDocSubscription(config.session.dataDir, cachedLarkAppId, subscription);
+  logger.info(`[doc-comment] dashboard watch → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${subscription.workingDir ? ` wd=${subscription.workingDir}` : ''}${previous ? ' (rebound)' : ''}`);
+  jsonRes(res, 200, {
+    ok: true,
+    watch: composeDocWatchRow(subscription),
+    rebound: previous ? previous.sessionAnchor !== subscription.sessionAnchor : false,
+  });
 });
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────

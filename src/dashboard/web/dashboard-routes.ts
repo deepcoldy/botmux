@@ -65,6 +65,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('roles-profile', '#/roles/profile', () => import('./roles-page.js'), 'renderRoleProfilesPage'),
   pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
   pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
+  pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),

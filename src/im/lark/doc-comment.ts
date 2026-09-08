@@ -541,6 +541,43 @@ function ensureOk(res: any, what: string): any {
   return res.data;
 }
 
+/**
+ * 取文档标题（best-effort，给列表/看板显示用）。
+ *
+ * 为什么需要：订阅表的主键是 `file_token`，人眼完全认不出那是哪篇文档 ——
+ * `/watch-comment list` 一直显示的就是 token 前 12 位。`docTitle` 字段早就在
+ * store 里声明了，但**全仓没有任何写入方**，所以那个 `docTitle || fileToken`
+ * 回退恒走后者。这个函数就是补上缺的那一半。
+ *
+ * 拿不到就返回 undefined，**绝不抛**：标题只是显示用，不能让取标题失败挡住
+ * 一条订阅的登记或一条评论的投递。
+ *
+ * ⚠️ `doc_type` 用订阅记录里存的 `fileType`。飞书对 token/type 不匹配返回的是
+ * `failed_list` 里的 970005 而不是顶层错误，所以这里只认 `metas[0].title`，
+ * 任何取不到的形态都一律降级成 undefined，不去区分具体原因（区分了也没有别的
+ * 处置方式）。
+ */
+export async function fetchDocTitle(
+  larkAppId: string,
+  file: ResolvedDocFile,
+): Promise<string | undefined> {
+  try {
+    const res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: '/open-apis/drive/v1/metas/batch_query',
+      data: {
+        request_docs: [{ doc_token: file.fileToken, doc_type: file.fileType }],
+      },
+    });
+    if (res?.code !== 0) return undefined;
+    const title = res?.data?.metas?.[0]?.title;
+    return typeof title === 'string' && title.trim() ? title.trim() : undefined;
+  } catch (err) {
+    logger.debug(`[doc-comment] fetchDocTitle failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
+}
+
 // ─── 订阅 / 退订 ────────────────────────────────────────────────────────────────
 
 /** 订阅文档事件（评论新增等靠此推送）。幂等：重复订阅飞书返回成功。 */

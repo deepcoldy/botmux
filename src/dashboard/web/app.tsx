@@ -99,6 +99,7 @@ const MANAGE_ROUTES = [
   'insights',
   'feedback',
   'whiteboards',
+  'doc-watches',
 ];
 
 const NAV_ITEMS: NavItem[] = [
@@ -165,6 +166,9 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
   { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
+  // 文档评论监听：一篇飞书文档 + 一支监听的「笔」。归到「员工/工作面」组里，
+  // 与 roles / skills 同层 —— 它配置的是 bot 在文档里怎么被触发。
+  { id: 'doc-watches', href: '#/doc-watches', labelKey: 'nav.docWatches', manage: true, icon: <><path d="M3.2 2.2h6.2l3.4 3.4v8.2H3.2z" /><path d="M9.2 2.4v3.4h3.4" /><path d="M5.4 9h4M5.4 11.2h2.6" /></> },
   { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
@@ -184,7 +188,7 @@ const NAV_ITEMS: NavItem[] = [
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
-  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
+  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'doc-watches', 'customization', 'bot-defaults'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];

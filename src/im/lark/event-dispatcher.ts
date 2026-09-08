@@ -24,9 +24,9 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, recordDocWatchActivity, setDocTitle, type DocSubscription, type DocWatchOutcome } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, fetchDocTitle, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
@@ -3253,6 +3253,11 @@ async function processCommentEvent(
       ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
       workingDir: mappedDir,
       createdAt: Date.now(),
+      // 溯源：这条订阅是「文档里有人 @bot」自动建出来的，不是 owner 主动登记的。
+      // owner 只在当时收到一条 DM，事后要能在 dashboard 上复查「谁 @ 出来的」。
+      autoCreated: true,
+      autoCreatedBy: operatorOpenId,
+      autoCreatedAt: Date.now(),
     };
     putDocSubscription(config.session.dataDir, larkAppId, autoSub);
     sub = autoSub;
@@ -3268,6 +3273,25 @@ async function processCommentEvent(
   // 历史脏记录（旧版本留下的未审计订阅）和并发窗口（事件 A 刚 put、事件 B 就读到）
   // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
   const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+
+  /**
+   * 记一条运行态诊断（给 dashboard 的「最近一次结局」看板用）。
+   *
+   * 语义 = 「记到**活下来的那一行**上」：既有订阅照记；本次 auto-sub 被回滚掉的
+   * 那种情况无行可记，也不该记 —— 那条订阅本就不该存在。
+   *
+   * 关于与 `rollbackAutoSub` 的先后：本文件里统一写成**先回滚、后记录**，但这
+   * 一点**当前并不承重** —— `recordDocWatchActivity` 是读后写、行不存在就直接
+   * 返回 false（实测两种顺序的落盘结果逐字相同）。之所以仍固定成这个顺序，是为了
+   * 防住一种**未来**的改动：万一哪天有人把那个函数改成 upsert（缺行就建），
+   * 「先记录后回滚」就会真的把一条刚被判为未授权的订阅复活，而「先回滚后记录」
+   * 在那种改动下依然安全。别把这条顺序当成现有的安全保证来引用。
+   *
+   * 绝不 throw、绝不影响控制流：这些字段只是给人看的，记不下也不能挡住投递。
+   */
+  const noteOutcome = (outcome: DocWatchOutcome, error?: string): void => {
+    recordDocWatchActivity(config.session.dataDir, larkAppId, fileToken, { outcome, error });
+  };
 
   // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
   // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
@@ -3316,6 +3340,7 @@ async function processCommentEvent(
       // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
       rollbackAutoSub();
     }
+    noteOutcome('no-comment');
     return;
   }
   const trigger = parsed.replyId
@@ -3344,6 +3369,7 @@ async function processCommentEvent(
       // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
       rollbackAutoSub();
     }
+    noteOutcome('trigger-missing');
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
@@ -3355,6 +3381,7 @@ async function processCommentEvent(
   if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) {
     // 这条事件不会走到审计门，本次 auto-sub 占位必须回滚（同下面 mention gate）。
     rollbackAutoSub();
+    noteOutcome('self-authored');
     return;
   }
 
@@ -3365,6 +3392,7 @@ async function processCommentEvent(
   if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
     rollbackAutoSub();
+    noteOutcome('not-mentioned');
     return;
   }
 
@@ -3396,6 +3424,7 @@ async function processCommentEvent(
     } else {
       rollbackAutoSub();
     }
+    noteOutcome('empty-text');
     return;
   }
 
@@ -3404,9 +3433,25 @@ async function processCommentEvent(
   // （owner 自己触发的不通知，直接放行。）
   // 走同一个 helper —— 「回复」和「失败标记」共用一套规则，规则分叉迟早会让
   // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
-  if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) return;
+  if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) {
+    noteOutcome('audit-rejected');
+    return;
+  }
 
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  // 记在 handleDocComment **之前**：这里已经过了全部闸口，「已派发」是本函数能
+  // 负责的最后一个事实。handleDocComment 内部的成败属于会话层，不在本记录的口径里
+  // （硬要等它返回反而会把「派发了但会话侧慢」记成没派发）。
+  noteOutcome('dispatched');
+
+  // 标题快照补齐（只在缺时补，且**故意不 await**）：这条路径是评论事件的热路径，
+  // 用户正在等 bot 回复，绝不能为了一个显示字段插一次同步的飞书往返。失败/超时
+  // 都无所谓 —— 下一条评论还会再试，而列表在此期间回退显示 token。
+  if (!sub.docTitle) {
+    void fetchDocTitle(larkAppId, { fileToken, fileType: sub.fileType })
+      .then(title => { if (title) setDocTitle(config.session.dataDir, larkAppId, fileToken, title); })
+      .catch(() => { /* 显示字段，best-effort */ });
+  }
   await handlers.handleDocComment({
     larkAppId,
     sub,
