@@ -62,6 +62,25 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     return env;
   };
 
+  // bun's execFileSync timeout defaults to SIGTERM. A wedged `tmux kill-server`
+  // (or kill-session) that ignores TERM is the same shape as the storm itself
+  // and held this file until the 720s per-file wall after both cases passed.
+  const forceKillTmux = (args: string[], env: NodeJS.ProcessEnv, timeout = 2_000): void => {
+    try {
+      execFileSync(REAL_TMUX!, args, {
+        stdio: 'ignore',
+        env,
+        timeout,
+        killSignal: 'SIGKILL',
+      });
+    } catch { /* already gone or deadline */ }
+  };
+
+  const disposeBackend = (backend: TmuxPipeBackend, sessionName: string): void => {
+    try { backend.destroySession(); } catch { try { backend.kill(); } catch { /* already torn down */ } }
+    forceKillTmux(['kill-session', '-t', sessionName], realTmuxEnv());
+  };
+
   beforeAll(() => {
     workDir = mkdtempSync(join(tmpdir(), 'bmx-storm-'));
     shimDir = join(workDir, 'shim');
@@ -112,13 +131,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     // is being torn down and PATH is already restored) — strip before killing.
     delete killEnv.TMUX;
     delete killEnv.TMUX_PANE;
-    try {
-      execFileSync(REAL_TMUX!, ['kill-server'], {
-        stdio: 'ignore',
-        env: killEnv,
-        timeout: 5000,
-      });
-    } catch { /* server already gone */ }
+    forceKillTmux(['kill-server'], killEnv);
     rmSync(workDir, { recursive: true, force: true });
   });
 
@@ -155,14 +168,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       // otherwise keep the private server busy. destroySession also drops the
       // session. Under bun test a leftover fifo handle after the first case
       // wedged the whole file until the 720s per-file wall.
-      try { backend.destroySession(); } catch { backend.kill(); }
-      try {
-        execFileSync(REAL_TMUX!, ['kill-session', '-t', SESSION_NAME], {
-          stdio: 'ignore',
-          env: realTmuxEnv(),
-          timeout: 5000,
-        });
-      } catch { /* already gone */ }
+      disposeBackend(backend, SESSION_NAME);
     }
   }, 25_000);
 
@@ -178,12 +184,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     try {
       expect(Date.now() - startedAt).toBeLessThan(4000);
     } finally {
-      backend.kill();
-      try {
-        execFileSync(REAL_TMUX!, ['kill-session', '-t', 'bmx-stormrep2'], {
-          stdio: 'ignore', env: realTmuxEnv(), timeout: 5000,
-        });
-      } catch { /* already gone */ }
+      disposeBackend(backend, 'bmx-stormrep2');
     }
   }, 15_000);
 });

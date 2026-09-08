@@ -37,6 +37,8 @@
  *              BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL drives the injection.
  *   nowake   — reproduces the pre-fix teardown (destroy + unlink, no wake-up
  *              byte) and MUST hang, proving the harness has teeth
+ *   drain    — kill() then return, no process.exit(). bun test waits for the
+ *              event loop to empty; process.exit() would hide a leftover handle
  */
 import fs from 'node:fs';
 import { TmuxPipeBackend, __testOnly_liveFifoReaderCount as readerRegistrySize } from '../../src/adapters/backend/tmux-pipe-backend.js';
@@ -184,7 +186,9 @@ setTimeout(() => {
   process.stdout.write(
     `LEAKED_READERS=${readerRegistrySize()} FIFO_LEFT=${fs.existsSync(fifoPath)}\n`,
   );
-  process.exit(0);
+  // bun test does not force-exit: a leftover fifo handle keeps the process
+  // alive after every assertion has passed. process.exit() would hide that.
+  if (mode !== 'drain') process.exit(0);
 }, 250);
 
 }
