@@ -886,6 +886,76 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
+  it.each([
+    {
+      terminalName: 'task_complete',
+      firstTerminal: (turnId: string) => ({
+        ...taskComplete('answer-a'),
+        payload: { ...taskComplete('answer-a').payload, turn_id: turnId },
+      }),
+      expectedStatus: 'completed',
+      expectedText: 'answer-a',
+    },
+    {
+      terminalName: 'turn_aborted',
+      firstTerminal: (turnId: string) => ({
+        ...turnAborted('interrupted'),
+        payload: { ...turnAborted('interrupted').payload, turn_id: turnId },
+      }),
+      expectedStatus: 'ambiguous',
+      expectedText: '',
+    },
+  ])('binds an id-less legacy predecessor from $terminalName when its item mirror never arrives', ({
+    firstTerminal, expectedStatus, expectedText,
+  }) => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000131';
+    const secondTurnId = '00000000-0000-7000-8000-000000000132';
+    writeFileSync(path, line(user('first', '2000-01-01T00:00:01.000Z')));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+
+    appendFileSync(path, line(user(
+      'second', '2000-01-01T00:00:02.000Z', secondTurnId,
+    )));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([expect.objectContaining({
+      kind: 'user', text: 'second', sourceTurnId: secondTurnId, preserveCollecting: true,
+    })]);
+    queue.ingest(second.events);
+
+    appendFileSync(path, [
+      line(firstTerminal(firstTurnId)),
+      line({
+        ...taskComplete('answer-b'),
+        payload: { ...taskComplete('answer-b').payload, turn_id: secondTurnId },
+        timestamp: '2000-01-01T00:00:04.000Z',
+      }),
+    ].join(''));
+    const terminal = drainTraexRollout(path, second.newOffset);
+    expect(terminal.events.slice(0, 2)).toEqual([
+      expect.objectContaining({ kind: 'turn_bind', sourceTurnId: firstTurnId }),
+      expect.objectContaining({
+        kind: 'assistant_final', sourceTurnId: firstTurnId,
+        ...(expectedStatus === 'completed' ? {} : { terminalStatus: expectedStatus }),
+      }),
+    ]);
+    queue.ingest(terminal.events);
+
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'd1', finalText: expectedText, sourceTurnId: firstTurnId,
+        ...(expectedStatus === 'completed' ? {} : { terminalStatus: expectedStatus }),
+      }),
+      expect.objectContaining({
+        turnId: 'd2', finalText: 'answer-b', sourceTurnId: secondTurnId,
+      }),
+    ]);
+  });
+
   it('expires an item-first mirror expectation at terminal before a same-text next turn', () => {
     const firstTurnId = '00000000-0000-7000-8000-000000000121';
     writeFileSync(path, line(itemCompleted({

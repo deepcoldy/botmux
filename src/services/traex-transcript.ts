@@ -193,6 +193,10 @@ interface TraexPendingUserMirror {
   timestampMs: number;
   expected: 'legacy' | 'item' | 'terminal';
   sourceTurnId?: string;
+  /** A native successor was allowed to start while this id-less legacy turn
+   * stayed queued, so a terminal may need to bind it if its item mirror never
+   * arrives. */
+  preservedBeforeSuccessor?: boolean;
 }
 interface TraexDrainUserMirror extends TraexPendingUserMirror {
   /** Set only for a legacy event emitted by this drain, so its item mirror can
@@ -263,9 +267,13 @@ function shouldPreserveUnboundLegacyPredecessor(
   // Keep that id-less predecessor alive until the delayed mirror/terminal can
   // identify it. Apply this to every supported native user dialect.
   expireTraexUserMirrors(pending, timestampMs);
-  return sourceTurnId !== undefined && pending.some(
+  if (sourceTurnId === undefined) return false;
+  const predecessor = pending.find(
     candidate => candidate.expected === 'item' && !candidate.sourceTurnId,
   );
+  if (!predecessor) return false;
+  predecessor.preservedBeforeSuccessor = true;
+  return true;
 }
 
 function expireTraexUserMirrors(pending: TraexDrainUserMirror[], timestampMs: number): void {
@@ -275,19 +283,28 @@ function expireTraexUserMirrors(pending: TraexDrainUserMirror[], timestampMs: nu
   }
 }
 
-function clearTraexUserMirrorsAtTerminal(pending: TraexDrainUserMirror[], sourceTurnId: string): void {
+function takeTraexUserMirrorAtTerminal(
+  pending: TraexDrainUserMirror[],
+  sourceTurnId: string,
+  nativeUserWasSeen: boolean,
+): TraexDrainUserMirror | undefined {
   // A paired legacy-first turn leaves a terminal marker, while item-first
   // state carries its id directly. Prefer either exact match so a terminal
   // cannot consume a source-less candidate belonging to a typed-ahead turn.
   const exactIndex = pending.findIndex(candidate => candidate.sourceTurnId === sourceTurnId);
   if (exactIndex >= 0) {
-    pending.splice(exactIndex, 1);
-    return;
+    return pending.splice(exactIndex, 1)[0];
   }
+  // A terminal for a turn whose native user record was already observed must
+  // not consume an earlier id-less legacy turn. That predecessor can only be
+  // identified by the first unseen native id that reaches its mirror or
+  // terminal edge.
+  if (nativeUserWasSeen) return undefined;
   // A legacy-only dialect never reveals the id until terminal. In that case
   // retire only the oldest unmatched legacy turn, preserving queued inputs.
   const legacyIndex = pending.findIndex(candidate => candidate.expected === 'item');
-  if (legacyIndex >= 0) pending.splice(legacyIndex, 1);
+  if (legacyIndex < 0) return undefined;
+  return pending.splice(legacyIndex, 1)[0];
 }
 
 function itemCompletedUserText(item: unknown): string {
@@ -712,7 +729,18 @@ export function drainTraexRollout(
         text = recoverTraexEmptyFinal(pending, adoptMode);
       }
       if (!probe) traexPendingAgentCache.delete(path);
-      clearTraexUserMirrorsAtTerminal(pendingUserMirrors, payload.turn_id);
+      const terminalMirror = takeTraexUserMirrorAtTerminal(
+        pendingUserMirrors,
+        payload.turn_id,
+        seenUserTurns.has(payload.turn_id) || traexSeenUserTurns.get(path)?.has(payload.turn_id) === true,
+      );
+      if (terminalMirror?.expected === 'item'
+        && !terminalMirror.sourceTurnId
+        && terminalMirror.preservedBeforeSuccessor) {
+        events.push({
+          ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: payload.turn_id,
+        });
+      }
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -739,7 +767,18 @@ export function drainTraexRollout(
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
       if (!probe) traexPendingAgentCache.delete(path);
-      clearTraexUserMirrorsAtTerminal(pendingUserMirrors, payload.turn_id);
+      const terminalMirror = takeTraexUserMirrorAtTerminal(
+        pendingUserMirrors,
+        payload.turn_id,
+        seenUserTurns.has(payload.turn_id) || traexSeenUserTurns.get(path)?.has(payload.turn_id) === true,
+      );
+      if (terminalMirror?.expected === 'item'
+        && !terminalMirror.sourceTurnId
+        && terminalMirror.preservedBeforeSuccessor) {
+        events.push({
+          ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: payload.turn_id,
+        });
+      }
       events.push({
         ...base,
         kind: 'assistant_final',
