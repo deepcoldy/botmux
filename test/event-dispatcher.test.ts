@@ -8959,6 +8959,35 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  // 段落只是排版：节点序必须在整篇文档内**连续累加**，不能每段从 0 重来。
+  // 这条形态（命令在首段、@ 在次段）是能区分两种实现的那条：连续累加 → cmd(0) 在
+  // at(1) 之前 ⇒ 触发（正确）；段落内重置 → 两者段内序同为 0 ⇒ 误判成「@ 在命令
+  // 之前」而让路。上面 [[at],[text]] 那条在两种写法下同为让路，钉不住这一点。
+  it('post 形态：节点序跨段落连续累加（命令在首段、@ 在次段 → 触发）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [
+        [{ tag: 'text', text: '/solve 看看这个' }],
+        [{ tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' }],
+      ] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
   // 命令前有 @ 就仍然让路，哪怕命令后面也 @ 了人：开头那个 @ 已经把活儿指出去了。
   it('yields when a mention leads the message even if another follows the command', async () => {
     setup({ enabled: true, commands: [{ cmd: '/solve' }] });
