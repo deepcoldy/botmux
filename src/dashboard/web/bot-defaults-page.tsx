@@ -4224,17 +4224,17 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 
         <section className="bd-card-setting-group" data-card-buttons-group>
           <h4 className="bd-card-setting-heading">{tr('botDefaults.streamingButtons')}</h4>
-          <div className="bd-card-control-list">
+          <div className="bd-card-button-grid" data-card-button-grid>
             {buttonOptions.map(option => {
               const visible = !hiddenButtons.includes(option.id);
               return (
                 <ToggleRow
                   key={option.id}
+                  className="bd-card-button-toggle"
                   checked={visible}
                   disabled={busy !== null}
                   dataAction={`toggle-streaming-button-${option.id}`}
                   title={option.title}
-                  description={option.description}
                   help={option.description}
                   onChange={checked => {
                     const previous = hiddenButtons;

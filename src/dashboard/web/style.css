@@ -24342,6 +24342,41 @@ dialog select[multiple]:hover:not(:disabled) {
   margin-top: 10px;
 }
 
+.bot-defaults-page .bd-card-button-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 24px;
+  margin-top: 2px;
+}
+
+.bot-defaults-page .bd-card-button-toggle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  min-height: 40px;
+  margin: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 64%, transparent);
+}
+
+.bot-defaults-page .bd-card-button-toggle .toggle-tx {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.bot-defaults-page .bd-card-button-toggle .switch {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+@media (max-width: 620px) {
+  .bot-defaults-page .bd-card-button-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .bot-defaults-page .toggle-row .switch {
     transition: none;

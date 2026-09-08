@@ -143,6 +143,16 @@ describe('bot defaults focused layout', () => {
     }
   });
 
+  it('keeps live-card button controls compact and responsive', () => {
+    expect(page).toContain('className="bd-card-button-grid" data-card-button-grid');
+    expect(page).toContain('className="bd-card-button-toggle"');
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-card-button-grid'))
+      .toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-card-button-toggle'))
+      .toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\) 36px;/);
+    expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.bot-defaults-page \.bd-card-button-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr;/);
+  });
+
   it('places the Feishu description editor inside the profile header main column', () => {
     const profileStart = page.indexOf('<BotProfileIdentity');
     const tabsStart = page.indexOf('<BotDefaultsTabs', profileStart);

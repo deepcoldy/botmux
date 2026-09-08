@@ -1978,6 +1978,22 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-terminal' }).props.checked).toBe(false);
   });
 
+  it('renders live-card controls in the compact button grid', () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_button_grid' },
+        putCardPref,
+      }));
+    });
+
+    const grid = renderer.root.findByProps({ 'data-card-button-grid': true });
+    const toggles = grid.findAllByProps({ className: 'toggle-row bd-card-button-toggle' });
+    expect(toggles).toHaveLength(6);
+    expect(toggles.every(toggle => toggle.findAllByType('small').length === 0)).toBe(true);
+  });
+
   it('toggling pin streaming on persists pinStreamingCard=true', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
       ok: true,
