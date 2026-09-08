@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
+import { logger } from '../src/utils/logger.js';
 import {
   DEFAULT_QUOTA_FALLBACK_MESSAGE,
   MAX_QUOTA_FALLBACK_MESSAGE_LENGTH,
@@ -8,6 +9,7 @@ import {
   assertQuotaFallbackGraphAcyclic,
   claimQuotaFallbackEvent,
   findQuotaFallbackCycle,
+  findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
   resolveQuotaFallbackTarget,
   type QuotaFallbackTargetDeps,
@@ -116,6 +118,20 @@ describe('quota fallback graph validation', () => {
     ])).toBeNull();
   });
 
+  it('finds every independent cycle so loading can disable only its members', () => {
+    expect(findQuotaFallbackCycles([
+      bot('cli_a', 'cli_b'),
+      bot('cli_b', 'cli_a'),
+      bot('cli_c', 'cli_d'),
+      bot('cli_d', 'cli_e'),
+      bot('cli_e', 'cli_c'),
+      bot('cli_safe'),
+    ])).toEqual([
+      ['cli_a', 'cli_b', 'cli_a'],
+      ['cli_c', 'cli_d', 'cli_e', 'cli_c'],
+    ]);
+  });
+
   it('rejects self cycles and ignores non-executable onboarding/api-only rows', () => {
     expect(() => assertQuotaFallbackGraphAcyclic([bot('cli_a', 'cli_a')]))
       .toThrow('cli_a -> cli_a');
@@ -128,11 +144,30 @@ describe('quota fallback graph validation', () => {
     ])).toBeNull();
   });
 
-  it('makes startup parsing fail with an actionable cycle path', () => {
-    expect(() => parseBotConfigsFromText(JSON.stringify([
+  it('degrades only cycle members while loading and keeps unrelated bots available', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const unrelated = Array.from({ length: 48 }, (_, index) => bot(
+      `cli_safe${String(index).padStart(2, '0')}`,
+      index === 0 ? 'cli_safe01' : undefined,
+    ));
+    const configs = parseBotConfigsFromText(JSON.stringify([
       bot('cli_a', 'cli_b'),
       bot('cli_b', 'cli_a'),
-    ]))).toThrow(/cli_a -> cli_b -> cli_a/);
+      ...unrelated,
+    ]));
+    expect(configs).toHaveLength(50);
+    expect(configs.map(config => config.larkAppId)).toEqual([
+      'cli_a',
+      'cli_b',
+      ...unrelated.map(entry => entry.larkAppId),
+    ]);
+    expect(configs[0].quotaFallbackBot).toBeUndefined();
+    expect(configs[1].quotaFallbackBot).toBeUndefined();
+    expect(configs[2].quotaFallbackBot?.targetAppId).toBe('cli_safe01');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(
+      'cli_a -> cli_b -> cli_a; unrelated bots remain available',
+    ));
+    warn.mockRestore();
   });
 });
 

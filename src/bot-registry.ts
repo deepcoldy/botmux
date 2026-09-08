@@ -54,7 +54,7 @@ import {
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
 import {
-  assertQuotaFallbackGraphAcyclic,
+  findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
@@ -2904,10 +2904,30 @@ function resolveBotConfigPath(): string {
   );
 }
 
+/** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
+function warnAndCollectCyclicQuotaFallbackIds(
+  entries: any[],
+  selectedAppId?: string,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(entries);
+  const affected = new Set<string>();
+  for (const cycle of cycles) {
+    for (const appId of cycle) affected.add(appId);
+    // Indexed daemon loading should not make every unrelated daemon repeat the
+    // same warning. The all-bot parser has no selectedAppId and logs each cycle.
+    if (selectedAppId && !cycle.includes(selectedAppId)) continue;
+    logger.warn(
+      `[bot-registry] quotaFallbackBot cycle disabled for affected bots: ${cycle.join(' -> ')}; `
+      + 'unrelated bots remain available',
+    );
+  }
+  return affected;
+}
+
 /**
  * Resolve one daemon's exact raw bots.json slot without compacting earlier
- * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
- * array index; filtering the array first would make a later ready bot load a
+ * activation-pending entries. The supervisor assigns BOTMUX_BOT_INDEX from the
+ * durable array index; filtering first would make a later ready bot load a
  * different App whenever concurrent onboarding left an earlier slot pending.
  */
 export function loadBotConfigAtIndex(index: number): BotConfig {
@@ -2924,13 +2944,12 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
   }
-  // A daemon selected by durable array index still validates the complete
-  // impending topology. Parsing only its singleton row would miss A→B→A.
-  assertQuotaFallbackGraphAcyclic(parsed);
   const entry = parsed[index];
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
   }
+  const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -2966,6 +2985,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
     }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  if (cyclicQuotaFallbackIds.has(String(entryForDaemon.larkAppId))) {
+    delete entryForDaemon.quotaFallbackBot;
+  }
   delete entryForDaemon.activationStarting;
   delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
@@ -3062,7 +3084,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
-  assertQuotaFallbackGraphAcyclic(parsed);
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
@@ -3393,10 +3415,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
-    const normalizedQuotaFallback = normalizeQuotaFallbackBotConfig(
-      entry.quotaFallbackBot,
-      entry.larkAppId,
-    );
+    const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
+      ? {}
+      : normalizeQuotaFallbackBotConfig(entry.quotaFallbackBot, entry.larkAppId);
     if (normalizedQuotaFallback.error) {
       logger.warn(
         `[bot-registry:${entry.larkAppId}] quotaFallbackBot ignored: ${normalizedQuotaFallback.error}`,

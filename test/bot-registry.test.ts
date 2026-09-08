@@ -2059,7 +2059,7 @@ describe('loadBotConfigs', () => {
     expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
   });
 
-  it('validates the full fallback graph before starting one indexed daemon', () => {
+  it('disables a cyclic fallback while still loading one indexed daemon', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
     fsMock.readFileSync.mockReturnValue(JSON.stringify([
@@ -2073,9 +2073,24 @@ describe('loadBotConfigs', () => {
         larkAppSecret: 'b-secret',
         quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' },
       },
+      {
+        larkAppId: 'cli_unrelated',
+        larkAppSecret: 'unrelated-secret',
+      },
     ]));
 
-    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('cli_a -> cli_b -> cli_a');
+    expect(mod.loadBotConfigAtIndex(0)).toMatchObject({
+      larkAppId: 'cli_a',
+      quotaFallbackBot: undefined,
+    });
+    expect(mod.loadBotConfigAtIndex(1)).toMatchObject({
+      larkAppId: 'cli_b',
+      quotaFallbackBot: undefined,
+    });
+    expect(mod.loadBotConfigAtIndex(2)).toMatchObject({
+      larkAppId: 'cli_unrelated',
+      quotaFallbackBot: undefined,
+    });
   });
 
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {

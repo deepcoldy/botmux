@@ -139,7 +139,7 @@ export function normalizeQuotaFallbackBotConfig(
 }
 
 /**
- * Return the first executable cycle in the local quota-fallback graph.
+ * Return every executable cycle in the local quota-fallback graph.
  *
  * The input is intentionally the raw, impending bots.json array: save/clone
  * paths can validate the exact generation they are about to commit while they
@@ -148,9 +148,9 @@ export function normalizeQuotaFallbackBotConfig(
  * blocks remain inert exactly as the runtime parser treats them, except direct
  * self-reference which is itself a cycle and is reported explicitly.
  */
-export function findQuotaFallbackCycle(
+export function findQuotaFallbackCycles(
   entries: readonly QuotaFallbackGraphEntry[],
-): string[] | null {
+): string[][] {
   const active = entries.filter(entry =>
     entry
     && typeof entry === 'object'
@@ -181,6 +181,7 @@ export function findQuotaFallbackCycle(
     }
   }
 
+  const cycles: string[][] = [];
   const done = new Set<string>();
   for (const start of activeIds) {
     if (done.has(start)) continue;
@@ -189,14 +190,23 @@ export function findQuotaFallbackCycle(
     let current: string | undefined = start;
     while (current && !done.has(current)) {
       const index = pathIndex.get(current);
-      if (index !== undefined) return [...path.slice(index), current];
+      if (index !== undefined) {
+        cycles.push([...path.slice(index), current]);
+        break;
+      }
       pathIndex.set(current, path.length);
       path.push(current);
       current = edges.get(current);
     }
     for (const appId of path) done.add(appId);
   }
-  return null;
+  return cycles;
+}
+
+export function findQuotaFallbackCycle(
+  entries: readonly QuotaFallbackGraphEntry[],
+): string[] | null {
+  return findQuotaFallbackCycles(entries)[0] ?? null;
 }
 
 export function assertQuotaFallbackGraphAcyclic(
