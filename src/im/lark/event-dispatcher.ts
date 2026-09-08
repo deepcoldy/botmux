@@ -44,6 +44,8 @@ import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
+import { tryHandleManagerCommand } from './manager-command.js';
+import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
@@ -2221,6 +2223,13 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
+  // An owner-selected manager adds top-level addressing only, not permissions
+  // or ownership of independent topics. Explicit mentions keep their usual path.
+  if (isAllowed && message.chat_type === 'group' && !message.root_id && !message.thread_id
+    && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId)) {
+    return 'allowed';
+  }
+
   // No @mention — only allow if sender is the sole human in the group
   // AND this is the only bot in the chat. With multiple bots, require @mention
   // to disambiguate.
@@ -3889,6 +3898,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleManagerCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
