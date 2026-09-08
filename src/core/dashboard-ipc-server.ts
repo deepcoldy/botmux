@@ -4751,6 +4751,9 @@ function composeDocWatchRow(sub: DocSubscription): Record<string, unknown> {
     workingDir: sub.workingDir,
     chatId: sub.chatId,
     scope: sub.scope,
+    // 落点锚：界面据此区分「绑在真实飞书话题/群」与「独立文档会话」（虚拟
+    // `doc:<token>`）。这决定 bot 的回复出现在哪里，是用户最需要看见的一件事。
+    sessionAnchor: sub.sessionAnchor,
     sessionId: sub.sessionId,
     ownerOpenId: sub.ownerOpenId,
     createdAt: sub.createdAt,
@@ -4889,40 +4892,66 @@ ipcRoute('POST', '/api/doc-watches', async (req, res) => {
     && existing.commentTriggerMode === 'all'
     && existing.pollBaselineReady === true;
 
+  // ⚠️ 已有绑定必须保住（F3）。dashboard 只能登记「文档原生」监听（虚拟 anchor），
+  // 但这篇文档可能是在飞书**话题里**用 `/watch-comment` 绑的，那条记录挂着真实
+  // `om_` anchor / `scope:'thread'` / `oc_` chatId / sessionId —— 评论会回到那个
+  // 群话题里。若无条件写成虚拟 anchor，用户以为自己只是「改一下工作目录」，实际
+  // 把投递落点从群话题搬到了独立文档会话，界面上毫无提示。
+  //
+  // 所以：只有「本来就没有真实会话绑定」时才用虚拟 anchor；已绑真实会话的一律
+  // 沿用原绑定，本次登记只更新 mode / workingDir / 游标这些**可配置**的部分。
+  const keepsExistingBinding = !!existing && existing.sessionAnchor !== `doc:${file.fileToken}`;
   const subscription: DocSubscription = {
     fileToken: file.fileToken,
     fileType: file.fileType,
     // dashboard 登记的是「文档原生」监听：没有 IM 会话可挂，用虚拟 anchor，
     // 与飞书侧无 session 时的 `doc:<token>` 逐字一致（daemon.ts:autoCreateDocSession
-    // 按这个 key 竞争 routing ownership）。
-    sessionAnchor: `doc:${file.fileToken}`,
-    sessionId: undefined,
-    scope: 'chat',
-    chatId: `doc:${file.fileToken}`,
+    // 按这个 key 竞争 routing ownership）。已绑真实会话时沿用原绑定，见上。
+    sessionAnchor: keepsExistingBinding ? existing!.sessionAnchor : `doc:${file.fileToken}`,
+    sessionId: keepsExistingBinding ? existing!.sessionId : undefined,
+    scope: keepsExistingBinding ? existing!.scope : 'chat',
+    chatId: keepsExistingBinding ? existing!.chatId : `doc:${file.fileToken}`,
     commentTriggerMode: mode,
     managedBy: 'watch-comment',
     // 归属记 bot owner 而不是「当前 dashboard 操作者」：dashboard 身份可能是平台
     // 协管者，而 ownerOpenId 会被 auto-create session 当作 session owner 用
     // （daemon.ts:autoCreateDocSession）—— 那里要的是本 app 视角下的真人 owner。
     // ⚠️ open_id 是 app-scoped 的，绝不能把别处的 ou_ 搬进来（见 CLAUDE.md 身份边界）。
-    ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+    // 沿用原绑定时也沿用原 ownerOpenId：那是当初在飞书里登记这条监听的真人，
+    // 会被 autoCreateDocSession 当作 session owner 用；换成 bot owner 会把
+    // 已存在会话的归属改掉。新建时才记本 app 的 owner。
+    ownerOpenId: keepsExistingBinding ? existing!.ownerOpenId : getOwnerOpenId(cachedLarkAppId),
     workingDir: workingDir ?? existing?.workingDir ?? getBot(cachedLarkAppId).config.docRepoMap?.[file.fileToken],
     pollCursorAt: reuseBaseline ? existing?.pollCursorAt : undefined,
     pollCursorReplyId: reuseBaseline ? existing?.pollCursorReplyId : undefined,
     pollBaselineReady: mode === 'all' ? (reuseBaseline ? true : false) : undefined,
     createdAt: existing?.createdAt ?? Date.now(),
+    // 溯源显式透传（F2）：dashboard 这条路径**不改变行的来源** —— 它只是改绑定/
+    // 模式/目录，一条陌生人 @ 出来的 auto-sub 经此保存后**仍然是** auto-sub。
+    // 所以这里必须显式带上，否则整行覆盖会把审计凭据抹掉，而「事后能查这条是谁
+    // @ 出来的」正是本特性要解决的问题。
+    // （对比 `/watch-comment`：那是 owner 主动接管，刻意**不**带，让溯源自然清掉。）
+    autoCreated: existing?.autoCreated,
+    autoCreatedBy: existing?.autoCreatedBy,
+    autoCreatedAt: existing?.autoCreatedAt,
   };
   // 标题快照：best-effort，失败留空（列表回退显示 token）。
   const title = await fetchDocTitle(cachedLarkAppId, file);
   if (title) subscription.docTitle = title;
   else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
 
-  const { previous } = putDocSubscription(config.session.dataDir, cachedLarkAppId, subscription);
-  logger.info(`[doc-comment] dashboard watch → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${subscription.workingDir ? ` wd=${subscription.workingDir}` : ''}${previous ? ' (rebound)' : ''}`);
+  // inheritRuntime：重新登记不该把投递计数/最近结局清零（换绑定不代表历史归零）。
+  const { previous } = putDocSubscription(config.session.dataDir, cachedLarkAppId, subscription, { inheritRuntime: true });
+  // 日志里的 'rebound' 要说的是「投递落点变了」，不是「覆盖了一行」—— 后者在
+  // 保住原绑定的路径上恒真，写成 rebound 会让人误以为落点被搬走了。
+  const reboundBinding = !!previous && previous.sessionAnchor !== subscription.sessionAnchor;
+  logger.info(`[doc-comment] dashboard watch → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${subscription.workingDir ? ` wd=${subscription.workingDir}` : ''}${reboundBinding ? ' (rebound)' : previous ? ' (updated)' : ''}${keepsExistingBinding ? ` keep-binding=${existing!.scope}:${existing!.sessionAnchor.slice(0, 12)}` : ''}`);
   jsonRes(res, 200, {
     ok: true,
     watch: composeDocWatchRow(subscription),
-    rebound: previous ? previous.sessionAnchor !== subscription.sessionAnchor : false,
+    rebound: reboundBinding,
+    // 界面据此告诉用户「这条监听仍绑在原来的群话题里，本次只改了模式/目录」。
+    keptBinding: keepsExistingBinding,
   });
 });
 

@@ -73,6 +73,14 @@ function WatchCard(props: {
         {row.managedBy !== 'watch-comment' ? (
           <span className="dw-pill" title="旧 /subscribe-lark-doc 族：飞书侧有逐文件订阅">旧式订阅</span>
         ) : null}
+        {/* 绑在真实飞书会话上（不是虚拟 doc: 落点）时标出来 —— 否则用户看不出
+            「这篇文档的评论会回到某个群话题」，而那恰恰决定了回复出现在哪里。 */}
+        {row.sessionAnchor && row.sessionAnchor !== `doc:${row.fileToken}` ? (
+          <span
+            className="dw-pill"
+            title={`绑定在飞书${row.scope === 'thread' ? '话题' : '群会话'}上：评论会回到那里，而不是独立的文档会话。在这里保存只会改触发范围/工作目录，不会改绑。`}
+          >{row.scope === 'thread' ? '绑定话题' : '绑定群'}</span>
+        ) : null}
       </div>
 
       <div className="dw-meta">
@@ -316,7 +324,9 @@ function DocWatchesPage() {
       toast(`登记失败：${r.message || r.error}`, { kind: 'error' });
       return;
     }
-    toast('已开始监听');
+    toast(r.keptBinding
+      ? '已保存。这篇文档原本绑在某个飞书话题上，本次只更新了触发范围/工作目录，评论仍回到原话题'
+      : '已开始监听');
     await reload(bots);
   }
 

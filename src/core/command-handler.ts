@@ -3264,7 +3264,11 @@ export async function handleCommand(
           const fetchedTitle = await fetchDocTitle(larkAppId, file);
           if (fetchedTitle) subscription.docTitle = fetchedTitle;
           else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
-          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          // inheritRuntime：重新登记同一篇文档时延续投递计数/最近结局，否则每次
+          // 重登记都把运行态清零，界面上看起来像从没触发过。
+          // ⚠️ 溯源三字段刻意不传：owner 主动 /watch-comment 就意味着这条不再是
+          // 「陌生人 @ 出来的 auto-sub」，继承会让界面挂着已经不成立的审计结论。
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription, { inheritRuntime: true });
           const rebound = previous && previous.sessionAnchor !== anchor;
           let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
             title: file.fileToken.slice(0, 12),

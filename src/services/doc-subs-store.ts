@@ -152,18 +152,56 @@ function writeFile(dataDir: string, larkAppId: string, data: FileShape): void {
 }
 
 /**
+ * 运行态诊断字段（`recordDocWatchActivity` 写的那一组）。
+ *
+ * 它们描述的是**这篇文档的投递历史**，而不是「当前这一行是怎么产生的」——所以
+ * 重新登记（换绑定 / 改模式 / 改目录）时应当延续：换个绑定不代表历史归零。
+ *
+ * ⚠️ 刻意**不含** `autoCreated*` 那三个溯源字段。两组的正确策略是**相反**的，
+ * 详见 {@link putDocSubscription} 的 `inheritRuntime` 说明。
+ */
+const RUNTIME_DIAGNOSTIC_KEYS = [
+  'lastActivityAt', 'lastOutcome', 'lastError', 'lastDispatchAt', 'dispatchCount',
+] as const satisfies ReadonlyArray<keyof DocSubscription>;
+
+/**
  * 新增 / 覆盖一条订阅（fileToken 主键 → 重订阅覆盖旧绑定 = 1 文档:1 会话）。
  * 返回被覆盖掉的旧订阅（如果该文档此前绑在别的会话上），调用方据此退订旧的 /
  * 提示用户。
+ *
+ * 默认语义是**整行覆盖**，四个调用方都依赖它，别改。
+ *
+ * `inheritRuntime: true` 时额外做一件事：把上一行的**运行态诊断字段**
+ * （{@link RUNTIME_DIAGNOSTIC_KEYS}）补到新行里 —— 仅当新行没有显式给出该字段时。
+ * 用于「重新登记同一篇文档」的路径（`/watch-comment` 重登记、dashboard 新增），
+ * 否则每次重登记都会把投递计数与最近结局清零，界面上看起来像从没触发过。
+ *
+ * ⚠️⚠️ **溯源三字段（`autoCreated` / `autoCreatedBy` / `autoCreatedAt`）刻意不在
+ * 继承名单里，这不是遗漏。** 它们描述「这一行是怎么产生的」，而重新登记恰恰可能
+ * 改变这件事：一条陌生人 @ 出来的 auto-sub，被 owner 用 `/watch-comment` 主动接管
+ * 之后就**不再是** auto-sub 了。若盲目继承，界面会一直挂着「自动创建 · 触发者
+ * ou_xxx」这条**已经不成立的**审计结论 —— 比字段丢失更糟：丢失是少一条信息，
+ * 这是显示一条错的信息，与「补溯源以便审计」的初衷正好相反。
+ * 所以溯源一律由写入方自己决定：想保留就显式传（dashboard 改绑定用
+ * `existing?.autoCreated`），接管就不传（自然清掉）。
  */
 export function putDocSubscription(
   dataDir: string,
   larkAppId: string,
   sub: DocSubscription,
+  opts?: { inheritRuntime?: boolean },
 ): { previous?: DocSubscription } {
   const data = readFile(dataDir, larkAppId);
   const previous = data[sub.fileToken];
-  data[sub.fileToken] = sub;
+  const next = { ...sub };
+  if (opts?.inheritRuntime && previous) {
+    for (const key of RUNTIME_DIAGNOSTIC_KEYS) {
+      if (next[key] === undefined && previous[key] !== undefined) {
+        (next as Record<string, unknown>)[key] = previous[key];
+      }
+    }
+  }
+  data[sub.fileToken] = next;
   writeFile(dataDir, larkAppId, data);
   return { previous };
 }

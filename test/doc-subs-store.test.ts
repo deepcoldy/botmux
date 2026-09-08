@@ -201,6 +201,73 @@ describe('setDocTitle', () => {
   });
 });
 
+describe('putDocSubscription inheritRuntime', () => {
+  // 这一组钉的是「两组字段策略相反」这件事本身。它容易被后人顺手统一成「都继承」
+  // 或「都不继承」，而两种统一各自会坏掉下面一半的用例。
+  const runtimeRow = (over: Partial<DocSubscription> = {}): DocSubscription => ({
+    fileToken: 'tok', fileType: 'docx', sessionAnchor: 'doc:tok', scope: 'chat',
+    chatId: 'doc:tok', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+    createdAt: 1,
+    lastActivityAt: 900, lastOutcome: 'dispatched', lastDispatchAt: 900, dispatchCount: 3,
+    autoCreated: true, autoCreatedBy: 'ou_stranger', autoCreatedAt: 100,
+    ...over,
+  });
+
+  it('默认（不传 opts）保持整行覆盖语义 —— 四个调用方都依赖它', () => {
+    putDocSubscription(dataDir, APP_A, runtimeRow());
+    putDocSubscription(dataDir, APP_A, runtimeRow({
+      lastActivityAt: undefined, lastOutcome: undefined, lastDispatchAt: undefined,
+      dispatchCount: undefined, autoCreated: undefined, autoCreatedBy: undefined,
+      autoCreatedAt: undefined,
+    }));
+    const after = getDocSubscription(dataDir, APP_A, 'tok');
+    expect(after?.dispatchCount).toBeUndefined();
+    expect(after?.autoCreated).toBeUndefined();
+  });
+
+  it('⭐inheritRuntime 只补运行态五项，**不**碰溯源三项', () => {
+    putDocSubscription(dataDir, APP_A, runtimeRow());
+    // owner 用 /watch-comment 接管：字面量不写溯源（这条不再是 auto-sub），
+    // 也不写运行态（它不该关心，交给 inheritRuntime 延续）。
+    putDocSubscription(dataDir, APP_A, {
+      fileToken: 'tok', fileType: 'docx',
+      sessionAnchor: 'om_ownerThread', sessionId: 'sess-owner', scope: 'thread',
+      chatId: 'oc_ownerGroup', commentTriggerMode: 'all', managedBy: 'watch-comment',
+      ownerOpenId: 'ou_the_owner', createdAt: 1,
+    }, { inheritRuntime: true });
+    const after = getDocSubscription(dataDir, APP_A, 'tok');
+    // 运行态延续：换绑定不代表这篇文档的投递历史归零。
+    expect(after?.dispatchCount).toBe(3);
+    expect(after?.lastOutcome).toBe('dispatched');
+    expect(after?.lastActivityAt).toBe(900);
+    // 溯源清掉：owner 主动接管后这条**不再是**陌生人 @ 出来的。若继承，界面会
+    // 一直挂着「自动创建 · 触发者 ou_stranger」这条已经不成立的审计结论 ——
+    // 比字段丢失更糟（丢失是少一条信息，这是显示一条错的信息）。
+    expect(after?.autoCreated).toBeUndefined();
+    expect(after?.autoCreatedBy).toBeUndefined();
+    expect(after?.autoCreatedAt).toBeUndefined();
+  });
+
+  it('inheritRuntime 不覆盖调用方显式给出的运行态值', () => {
+    putDocSubscription(dataDir, APP_A, runtimeRow());
+    putDocSubscription(dataDir, APP_A, runtimeRow({ dispatchCount: 0, lastOutcome: 'poll-failed' }), { inheritRuntime: true });
+    const after = getDocSubscription(dataDir, APP_A, 'tok');
+    expect(after?.dispatchCount).toBe(0);
+    expect(after?.lastOutcome).toBe('poll-failed');
+  });
+
+  it('inheritRuntime 在没有旧行时是纯新增（不造出空字段）', () => {
+    putDocSubscription(dataDir, APP_A, {
+      fileToken: 'tok', fileType: 'docx', sessionAnchor: 'doc:tok', scope: 'chat',
+      chatId: 'doc:tok', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+      createdAt: 1,
+    }, { inheritRuntime: true });
+    const after = getDocSubscription(dataDir, APP_A, 'tok');
+    expect(after?.dispatchCount).toBeUndefined();
+    expect(after?.lastOutcome).toBeUndefined();
+  });
+});
+
 describe('asDocWatchOutcome', () => {
   it('收窄已知值，拒绝未知/非字符串（跨版本读旧文件）', () => {
     expect(asDocWatchOutcome('dispatched')).toBe('dispatched');

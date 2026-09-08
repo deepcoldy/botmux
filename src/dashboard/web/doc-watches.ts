@@ -29,6 +29,8 @@ export interface DocWatchRow {
   workingDir?: string;
   chatId?: string;
   scope?: 'thread' | 'chat';
+  /** 落点锚。真实飞书会话是 `om_*`/`oc_*`；独立文档会话是 `doc:<token>`。 */
+  sessionAnchor?: string;
   sessionId?: string;
   ownerOpenId?: string;
   createdAt: number;
@@ -109,7 +111,7 @@ export async function deleteDocWatch(
 export async function createDocWatch(
   larkAppId: string,
   input: { docRef: string; commentTriggerMode?: DocWatchMode; workingDir?: string },
-): Promise<{ ok: boolean; error?: string; message?: string }> {
+): Promise<{ ok: boolean; error?: string; message?: string; keptBinding?: boolean }> {
   try {
     const r = await fetch(`/api/doc-watches/${encodeURIComponent(larkAppId)}`, {
       method: 'POST',
@@ -120,7 +122,10 @@ export async function createDocWatch(
     if (!r.ok || body?.ok === false) {
       return { ok: false, error: body?.error ?? `HTTP ${r.status}`, message: body?.message };
     }
-    return { ok: true };
+    // keptBinding：这篇文档本来就绑在某个飞书话题上，本次登记只改了模式/目录，
+    // **没有**把投递落点搬到独立文档会话。要如实告诉用户，否则「我刚才改了什么」
+    // 全凭猜（服务端刻意保住了绑定，界面沉默反而会让人以为被改绑了）。
+    return { ok: true, keptBinding: body?.keptBinding === true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

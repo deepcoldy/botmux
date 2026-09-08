@@ -1999,6 +1999,8 @@ describe('handleCommand', () => {
           workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2046,6 +2048,8 @@ describe('handleCommand', () => {
         expect.any(String),
         LARK_APP_ID,
         expect.objectContaining({ workingDir: undefined }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2083,6 +2087,8 @@ describe('handleCommand', () => {
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,

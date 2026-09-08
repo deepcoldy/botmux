@@ -403,6 +403,76 @@ describe('POST /api/doc-watches', () => {
     expect(getDocSubscription(dir, APP, TOKEN)).toBeNull();
   });
 
+  it('⭐重复登记不清零运行态，且**保留** auto-sub 溯源（dashboard 不改变行的来源）', async () => {
+    const base = await server();
+    vi.spyOn(docComment, 'resolveDocFile').mockResolvedValue({ fileToken: TOKEN, fileType: 'docx' });
+    vi.spyOn(docComment, 'fetchDocTitle').mockResolvedValue(undefined);
+    // 一条跑了一阵的 auto-sub：陌生人 @ 出来的，已经投递过 42 次。
+    putDocSubscription(dir, APP, sub({
+      lastActivityAt: 999, lastOutcome: 'dispatched', lastDispatchAt: 999, dispatchCount: 42,
+      autoCreated: true, autoCreatedBy: 'ou_stranger', autoCreatedAt: 500,
+    }));
+    await fetch(`${base}/api/doc-watches`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ docRef: TOKEN, commentTriggerMode: 'all' }),
+    });
+    const after = getDocSubscription(dir, APP, TOKEN);
+    // 运行态：描述这篇文档的投递历史，换个模式不代表历史归零。
+    expect(after?.dispatchCount).toBe(42);
+    expect(after?.lastOutcome).toBe('dispatched');
+    expect(after?.lastActivityAt).toBe(999);
+    // 溯源：dashboard 这条路径只改配置、不改变「这一行是怎么产生的」⟹ 必须留着，
+    // 否则 owner 一保存就把「这条是陌生人 @ 出来的」这条审计凭据抹掉了。
+    expect(after?.autoCreated).toBe(true);
+    expect(after?.autoCreatedBy).toBe('ou_stranger');
+    expect(after?.autoCreatedAt).toBe(500);
+  });
+
+  it('⭐已绑飞书话题的文档：dashboard 登记只改配置，**不**把投递落点搬到虚拟会话', async () => {
+    const base = await server();
+    vi.spyOn(docComment, 'resolveDocFile').mockResolvedValue({ fileToken: TOKEN, fileType: 'docx' });
+    vi.spyOn(docComment, 'fetchDocTitle').mockResolvedValue(undefined);
+    // `/watch-comment` 在真实话题里登记的形状：评论会回到那个群话题。
+    putDocSubscription(dir, APP, sub({
+      sessionAnchor: 'om_realRootMessageId01',
+      sessionId: 'sess-abc-123',
+      scope: 'thread',
+      chatId: 'oc_realGroupChatId01',
+      ownerOpenId: 'ou_the_real_person',
+    }));
+    const r = await fetch(`${base}/api/doc-watches`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ docRef: TOKEN, commentTriggerMode: 'all' }),
+    });
+    const body = await r.json();
+    const after = getDocSubscription(dir, APP, TOKEN);
+    // 绑定四件套一个都不能动 —— 动了评论就不回原话题了。
+    expect(after?.sessionAnchor).toBe('om_realRootMessageId01');
+    expect(after?.sessionId).toBe('sess-abc-123');
+    expect(after?.scope).toBe('thread');
+    expect(after?.chatId).toBe('oc_realGroupChatId01');
+    // ownerOpenId 也沿用：它会被 autoCreateDocSession 当作 session owner 用。
+    expect(after?.ownerOpenId).toBe('ou_the_real_person');
+    // 可配置的部分照常生效。
+    expect(after?.commentTriggerMode).toBe('all');
+    // 落点没变 ⟹ 不是 rebound；界面据 keptBinding 提示「仍绑在原话题」。
+    expect(body.rebound).toBe(false);
+    expect(body.keptBinding).toBe(true);
+  });
+
+  it('没有真实会话绑定时才用虚拟 doc: anchor（新建 / 原本就是文档原生监听）', async () => {
+    const base = await server();
+    vi.spyOn(docComment, 'resolveDocFile').mockResolvedValue({ fileToken: TOKEN, fileType: 'docx' });
+    vi.spyOn(docComment, 'fetchDocTitle').mockResolvedValue(undefined);
+    const r = await fetch(`${base}/api/doc-watches`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ docRef: TOKEN }),
+    });
+    expect((await r.json()).keptBinding).toBe(false);
+    expect(getDocSubscription(dir, APP, TOKEN)?.sessionAnchor).toBe(`doc:${TOKEN}`);
+    expect(getDocSubscription(dir, APP, TOKEN)?.ownerOpenId).toBe('ou_owner_real');
+  });
+
   it('重复登记同一文档：覆盖而非新增（1 文档 : 1 会话），保留原 createdAt', async () => {
     const base = await server();
     vi.spyOn(docComment, 'resolveDocFile').mockResolvedValue({ fileToken: TOKEN, fileType: 'docx' });
