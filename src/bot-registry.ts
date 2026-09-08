@@ -61,6 +61,10 @@ import type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from './im/lark/streaming-card-buttons.js';
 
 /**
  * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
@@ -1860,6 +1864,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Main controls omitted from live streaming cards. Missing means show all. */
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -2400,6 +2406,12 @@ export function getBot(larkAppId: string): BotState {
     throw new Error(`Bot not registered: ${larkAppId}`);
   }
   return state;
+}
+
+/** Resolve the live per-bot streaming-card button policy for card re-renders. */
+export function resolveHiddenStreamingCardButtons(larkAppId: string): StreamingCardButtonId[] {
+  const state = bots.get(larkAppId);
+  return normalizeHiddenStreamingCardButtons(state?.config.hiddenStreamingCardButtons) ?? [];
 }
 
 export function getBotClient(larkAppId: string): Lark.Client {
@@ -3561,6 +3573,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,

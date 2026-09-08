@@ -59,6 +59,11 @@ import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import {
+  isStreamingCardButtonId,
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -4948,6 +4953,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // that is always empty — the CLI has no resolvable transcript).
     usageSupported: cliSupportsNativeUsage(cliId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
+    hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
@@ -5004,7 +5010,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
-    disableStreamingCard?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
@@ -5016,7 +5022,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
-    disableStreamingCard?: boolean; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -5026,6 +5032,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (Array.isArray(body.hiddenStreamingCardButtons)
+      && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {
+    patch.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(body.hiddenStreamingCardButtons) ?? [];
+  }
   if (typeof body.pinStreamingCard === 'boolean') patch.pinStreamingCard = body.pinStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;

@@ -1,6 +1,7 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
+import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
@@ -119,6 +120,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true,
+    hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,

@@ -91,6 +91,7 @@ describe('card-prefs store — 主动开工 fields', () => {
 
     const prefs = store.getBotCardPrefs('app_default');
     expect(prefs.pinStreamingCard).toBe(false);
+    expect(prefs.hiddenStreamingCardButtons).toEqual([]);
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
@@ -156,6 +157,30 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(off.ok && off.prefs.silentTurnReactions).toBe(false);
     expect(readConfig().silentTurnReactions).toBeUndefined();
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
+  });
+
+  it('normalizes and hot-updates hidden streaming-card buttons', async () => {
+    writeConfig({ hiddenStreamingCardButtons: ['close', 'bogus', 'terminal', 'close'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').hiddenStreamingCardButtons)
+      .toEqual(['terminal', 'close']);
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons)
+      .toEqual(['terminal', 'close']);
+
+    const update = await store.updateBotCardPrefs('app_default', {
+      hiddenStreamingCardButtons: ['writeLink', 'stop'],
+    });
+    expect(update.ok && update.prefs.hiddenStreamingCardButtons).toEqual(['writeLink', 'stop']);
+    expect(readConfig().hiddenStreamingCardButtons).toEqual(['writeLink', 'stop']);
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons)
+      .toEqual(['writeLink', 'stop']);
+
+    const clear = await store.updateBotCardPrefs('app_default', { hiddenStreamingCardButtons: [] });
+    expect(clear.ok && clear.prefs.hiddenStreamingCardButtons).toEqual([]);
+    expect(readConfig().hiddenStreamingCardButtons).toBeUndefined();
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
   });
 
   it('autoStartOnGroupJoinSeed round-trips; blank clears back to the built-in i18n fallback', async () => {

@@ -42,6 +42,7 @@ import {
   MAX_CARD_ACTION_ACK_TIMEOUT_MS,
   MIN_CARD_ACTION_ACK_TIMEOUT_MS,
 } from '../core/card-action-ack.js';
+import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
 
 /**
  * 生效时机：
@@ -102,6 +103,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
+  { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },

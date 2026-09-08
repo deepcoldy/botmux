@@ -1768,6 +1768,66 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
+  it('persists known button ids canonically, clears them, and rejects unknown ids', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-streaming-buttons-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-streaming-buttons-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.hiddenStreamingCardButtons).toEqual([]);
+
+      const set = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hiddenStreamingCardButtons: ['close', 'terminal', 'close'] }),
+      });
+      expect(set.status).toBe(200);
+      expect(await set.json()).toMatchObject({
+        ok: true,
+        hiddenStreamingCardButtons: ['terminal', 'close'],
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].hiddenStreamingCardButtons)
+        .toEqual(['terminal', 'close']);
+
+      const clear = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hiddenStreamingCardButtons: [] }),
+      });
+      expect(clear.status).toBe(200);
+      expect(await clear.json()).toMatchObject({ ok: true, hiddenStreamingCardButtons: [] });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].hiddenStreamingCardButtons).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hiddenStreamingCardButtons: ['terminal', 'unknown'] }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时不落盘', () => {
   // 编辑态软预填把「当前生效的内置默认」直接填进输入框，所以一次顺手的保存会把
   // bot 从「跟随动态默认」钉死成「锁定这一版文案」（升级不再跟上、切 locale 仍发

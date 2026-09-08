@@ -137,6 +137,7 @@ describe('bot-config store', () => {
     const { store } = await freshModules();
     expect(store.findConfigField('MODEL')?.configKey).toBe('model');
     expect(store.findConfigField('disablestreamingcard')?.configKey).toBe('disableStreamingCard');
+    expect(store.findConfigField('hiddenstreamingcardbuttons')?.configKey).toBe('hiddenStreamingCardButtons');
     expect(store.findConfigField('PINSTREAMINGCARD')?.configKey).toBe('pinStreamingCard');
     expect(store.findConfigField('nope')).toBeUndefined();
   });
@@ -426,6 +427,26 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('hiddenStreamingCardButtons')!;
+    const parsed = store.coerceConfigValue(spec, 'close terminal close');
+    expect(parsed).toEqual({ ok: true, value: ['terminal', 'close'] });
+    expect(store.coerceConfigValue(spec, 'terminal unknown')).toEqual({ ok: false, reason: 'empty' });
+    if (!parsed.ok) return;
+
+    const set = await store.applyConfigField('app_default', spec, parsed.value);
+    expect(set.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toEqual(['terminal', 'close']);
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons)
+      .toEqual(['terminal', 'close']);
+
+    const unset = await store.applyConfigField('app_default', spec, null);
+    expect(unset.ok).toBe(true);
+    expect(readConfig().hiddenStreamingCardButtons).toBeUndefined();
+    expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
   });
 
   it('defaultOn boolean (thinkingCard): inverted persistence — only explicit false is written', async () => {

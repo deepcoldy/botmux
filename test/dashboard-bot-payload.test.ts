@@ -22,7 +22,7 @@ describe('dashboard bot payload helpers', () => {
       'autoboundChatCount', 'brandLabel',
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
-      'disableStreamingCard', 'pinStreamingCard', 'silentTurnReactions',
+      'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
       'thinkingCard', 'senderTag', 'overloadAlert', 'botToBotSameDir',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',

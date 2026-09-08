@@ -63,6 +63,10 @@ import {
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
+import {
+  STREAMING_CARD_BUTTON_IDS,
+  type StreamingCardButtonId,
+} from '../../im/lark/streaming-card-buttons.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
@@ -111,7 +115,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string>;
+type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -746,6 +750,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
+    hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -4096,6 +4101,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const { bot, putCardPref } = props;
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -4107,12 +4113,13 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
+    setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
-  }, [bot.disableStreamingCard, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4138,6 +4145,12 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
     { value: 'off', label: tr('botDefaults.usageDisplayOff') },
   ];
+  const buttonOptions: Array<{ id: StreamingCardButtonId; title: string; description: string }> =
+    STREAMING_CARD_BUTTON_IDS.map(id => ({
+      id,
+      title: tr(`botDefaults.streamingButton.${id}`),
+      description: tr(`botDefaults.streamingButton.${id}Description`),
+    }));
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
@@ -4207,6 +4220,39 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               );
             }}
           />
+        </section>
+
+        <section className="bd-card-setting-group" data-card-buttons-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.streamingButtons')}</h4>
+          <div className="bd-card-control-list">
+            {buttonOptions.map(option => {
+              const visible = !hiddenButtons.includes(option.id);
+              return (
+                <ToggleRow
+                  key={option.id}
+                  checked={visible}
+                  disabled={busy !== null}
+                  dataAction={`toggle-streaming-button-${option.id}`}
+                  title={option.title}
+                  description={option.description}
+                  help={option.description}
+                  onChange={checked => {
+                    const previous = hiddenButtons;
+                    const hidden = new Set(hiddenButtons);
+                    if (checked) hidden.delete(option.id);
+                    else hidden.add(option.id);
+                    const next = STREAMING_CARD_BUTTON_IDS.filter(id => hidden.has(id));
+                    setHiddenButtons(next);
+                    void savePatch(
+                      { hiddenStreamingCardButtons: next },
+                      `streaming-button-${option.id}`,
+                      () => setHiddenButtons(previous),
+                    );
+                  }}
+                />
+              );
+            })}
+          </div>
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>

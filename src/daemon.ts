@@ -75,6 +75,7 @@ import {
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
   botAcceptsSlashFromBots,
+  resolveHiddenStreamingCardButtons,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -4943,6 +4944,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
       silentIdleCardFlag(ds),
       dshRuntimeForSession(ds),
+      resolveHiddenStreamingCardButtons(ds.larkAppId),
     );
     scheduleCardPatch(ds, frozenCard);
 
