@@ -545,6 +545,23 @@ export function drainTraexRollout(
     // production drainer needs when it observes this same record later.
     return probe || claimTraexUserTurn(path, turnId);
   };
+  const bindPreservedLegacyPredecessor = (turnId: string, base: {
+    uuid: string; timestampMs: number; sourceSessionId?: string;
+  }): boolean => {
+    // A source-id CoT can be the first native evidence for a preserved
+    // legacy-first turn when its item mirror is delayed or absent. Do not
+    // steal a predecessor for a successor whose native user was already seen.
+    const candidate = pendingUserMirrors.find(mirror => mirror.expected === 'item'
+      && !mirror.sourceTurnId
+      && mirror.preservedBeforeSuccessor);
+    if (!candidate || !claimUserTurn(turnId)) return false;
+    candidate.expected = 'terminal';
+    candidate.sourceTurnId = turnId;
+    events.push({
+      ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: turnId,
+    });
+    return true;
+  };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   let cursor = start;
@@ -577,6 +594,7 @@ export function drainTraexRollout(
     if (!probe && obj.type === 'history_mutation') {
       const cotEntries = traexHistoryCotEntries(payload);
       if (cotEntries && cotEntries.length > 0) {
+        if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
       }
       continue;
@@ -737,6 +755,7 @@ export function drainTraexRollout(
       if (terminalMirror?.expected === 'item'
         && !terminalMirror.sourceTurnId
         && terminalMirror.preservedBeforeSuccessor) {
+        claimUserTurn(payload.turn_id);
         events.push({
           ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: payload.turn_id,
         });
@@ -775,6 +794,7 @@ export function drainTraexRollout(
       if (terminalMirror?.expected === 'item'
         && !terminalMirror.sourceTurnId
         && terminalMirror.preservedBeforeSuccessor) {
+        claimUserTurn(payload.turn_id);
         events.push({
           ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: payload.turn_id,
         });

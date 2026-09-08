@@ -913,6 +913,12 @@ describe('drainTraexRollout', () => {
     writeFileSync(path, line(user('first', '2000-01-01T00:00:01.000Z')));
 
     const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
     queue.mark('d1', 'first', 0);
     queue.mark('d2', 'second', 0);
     const first = drainTraexRollout(path, 0);
@@ -928,7 +934,25 @@ describe('drainTraexRollout', () => {
     queue.ingest(second.events);
 
     appendFileSync(path, [
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [],
+        }], '2000-01-01T00:00:02.500Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [] }],
+        },
+      }),
       line(firstTerminal(firstTurnId)),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [],
+        }], '2000-01-01T00:00:03.500Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: secondTurnId,
+          items: [{ type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [] }],
+        },
+      }),
       line({
         ...taskComplete('answer-b'),
         payload: { ...taskComplete('answer-b').payload, turn_id: secondTurnId },
@@ -936,8 +960,9 @@ describe('drainTraexRollout', () => {
       }),
     ].join(''));
     const terminal = drainTraexRollout(path, second.newOffset);
-    expect(terminal.events.slice(0, 2)).toEqual([
+    expect(terminal.events.slice(0, 3)).toEqual([
       expect.objectContaining({ kind: 'turn_bind', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ kind: 'cot', sourceTurnId: firstTurnId }),
       expect.objectContaining({
         kind: 'assistant_final', sourceTurnId: firstTurnId,
         ...(expectedStatus === 'completed' ? {} : { terminalStatus: expectedStatus }),
@@ -945,6 +970,10 @@ describe('drainTraexRollout', () => {
     ]);
     queue.ingest(terminal.events);
 
+    expect(observed).toEqual([
+      { turnId: 'd1', text: 'cot-a' },
+      { turnId: 'd2', text: 'cot-b' },
+    ]);
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({
         turnId: 'd1', finalText: expectedText, sourceTurnId: firstTurnId,
@@ -953,6 +982,70 @@ describe('drainTraexRollout', () => {
       expect.objectContaining({
         turnId: 'd2', finalText: 'answer-b', sourceTurnId: secondTurnId,
       }),
+    ]);
+  });
+
+  it('keeps a delayed item mirror from duplicating a predecessor bound by CoT', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000133';
+    const secondTurnId = '00000000-0000-7000-8000-000000000134';
+    writeFileSync(path, line(user('first', '2000-01-01T00:00:01.000Z')));
+    const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+
+    appendFileSync(path, line(user('second', '2000-01-01T00:00:02.000Z', secondTurnId)));
+    const second = drainTraexRollout(path, first.newOffset);
+    queue.ingest(second.events);
+
+    appendFileSync(path, [
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [],
+        }], '2000-01-01T00:00:02.100Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [] }],
+        },
+      }),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'first' }],
+      }, firstTurnId, '2000-01-01T00:00:02.200Z')),
+      line({ ...taskComplete('answer-a'), payload: { ...taskComplete('answer-a').payload, turn_id: firstTurnId } }),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [],
+        }], '2000-01-01T00:00:04.000Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: secondTurnId,
+          items: [{ type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [] }],
+        },
+      }),
+      line({
+        ...taskComplete('answer-b'),
+        payload: { ...taskComplete('answer-b').payload, turn_id: secondTurnId },
+        timestamp: '2000-01-01T00:00:05.000Z',
+      }),
+    ].join(''));
+    const final = drainTraexRollout(path, second.newOffset);
+    expect(final.events.filter(event => event.kind === 'user')).toEqual([]);
+    expect(final.events.filter(event => event.kind === 'turn_bind')).toHaveLength(1);
+    queue.ingest(final.events);
+
+    expect(observed).toEqual([
+      { turnId: 'd1', text: 'cot-a' },
+      { turnId: 'd2', text: 'cot-b' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', finalText: 'answer-a', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ turnId: 'd2', finalText: 'answer-b', sourceTurnId: secondTurnId }),
     ]);
   });
 
