@@ -110,6 +110,21 @@ function agentMessage(text: string, phase: 'commentary' | 'final_answer' = 'comm
   };
 }
 
+function historyAppend(items: unknown[], timestamp = '2000-01-01T00:00:02.000Z') {
+  return {
+    timestamp,
+    type: 'history_mutation',
+    payload: {
+      version: 1,
+      commit_id: 'commit-1',
+      turn_id: '00000000-0000-7000-8000-000000000010',
+      operation: 'append',
+      items,
+    },
+  };
+}
+
+
 // Dialect that dropped the `phase` field (cf. codex >= 0.146): the record
 // carries no phase at all, so commentary and final are byte-identical.
 function agentMessageNoPhase(text: string) {
@@ -163,6 +178,132 @@ afterEach(() => {
 });
 
 describe('drainTraexRollout', () => {
+  it('emits TraeX reasoning and tool calls/results as ordered CoT events', () => {
+    const longOutput = `done\n${'x'.repeat(900)}`;
+    writeFileSync(path, [
+      line(user('inspect it')),
+      line(historyAppend([
+        {
+          type: 'reasoning',
+          id: 'rs_1',
+          summary: [{ type: 'summary_text', text: 'Inspect the repository' }],
+          content: [{ type: 'reasoning_text', text: 'private raw fallback' }],
+        },
+        {
+          type: 'function_call',
+          id: 'fc_1',
+          call_id: 'call_1',
+          name: 'exec',
+          arguments: JSON.stringify({ command: ['bash', '-lc', 'rg --files src'] }),
+        },
+        {
+          type: 'function_call_output',
+          id: 'fco_1',
+          call_id: 'call_1',
+          output: [
+            { type: 'input_text', text: 'Script completed\n' },
+            { type: 'input_text', text: longOutput },
+            { type: 'image_url', image_url: 'data:image/png;base64,ignored' },
+          ],
+        },
+        {
+          type: 'custom_tool_call',
+          id: 'fc_2',
+          call_id: 'call_2',
+          name: 'apply_patch',
+          input: '*** Begin Patch\n*** Update File: src/a.ts\n',
+        },
+        {
+          type: 'custom_tool_call_output',
+          id: 'fco_2',
+          call_id: 'call_2',
+          output: [{ type: 'output_text', text: 'Done!' }],
+        },
+      ])),
+      line(taskComplete('done')),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.events.map(event => event.kind)).toEqual([
+      'user',
+      'cot',
+      'assistant_final',
+    ]);
+    expect(result.events[1].cotEntries).toEqual([
+      { kind: 'thinking', text: 'Inspect the repository' },
+      {
+        kind: 'tool_call',
+        id: 'call_1',
+        name: 'exec',
+        args: JSON.stringify({ command: ['bash', '-lc', 'rg --files src'] }),
+        subject: 'rg --files src',
+      },
+      {
+        kind: 'tool_result',
+        id: 'call_1',
+        result: expect.stringMatching(/^Script completed\ndone\n.*…$/),
+      },
+      {
+        kind: 'tool_call',
+        id: 'call_2',
+        name: 'apply_patch',
+        args: '*** Begin Patch\n*** Update File: src/a.ts\n',
+        subject: 'src/a.ts',
+      },
+      { kind: 'tool_result', id: 'call_2', result: 'Done!' },
+    ]);
+    expect(result.events[1].cotEntries?.[2]).toMatchObject({
+      kind: 'tool_result',
+      result: expect.stringMatching(/^.{800}…$/s),
+    });
+  });
+
+  it('ignores replacement history and diagnostic mirrors to avoid replaying or duplicating CoT', () => {
+    const reasoning = {
+      type: 'reasoning',
+      id: 'rs_old',
+      summary: [],
+      content: [{ type: 'reasoning_text', text: 'historical reasoning' }],
+    };
+    writeFileSync(path, [
+      line(user('inspect it')),
+      line({
+        ...historyAppend([reasoning]),
+        payload: { ...historyAppend([reasoning]).payload, operation: 'replace' },
+      }),
+      line({
+        timestamp: '2000-01-01T00:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'agent_reasoning_raw_content', text: 'diagnostic mirror' },
+      }),
+      line({
+        timestamp: '2000-01-01T00:00:02.500Z',
+        type: 'event_msg',
+        payload: { type: 'exec_command_end', call_id: 'call_1', command: ['pwd'], status: 'completed' },
+      }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.events.map(event => event.kind)).toEqual(['user', 'assistant_final']);
+  });
+
+  it('keeps submit-confirmation probes free of cosmetic CoT events', () => {
+    writeFileSync(path, [
+      line(historyAppend([{
+        type: 'reasoning',
+        id: 'rs_1',
+        summary: [],
+        content: [{ type: 'reasoning_text', text: 'not needed by the probe' }],
+      }])),
+      line(user('confirm me')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { probe: true }).events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'confirm me' }),
+    ]);
+  });
+
   it('reports the latest complete turn_context model and reasoning effort', () => {
     writeFileSync(path, [
       line({

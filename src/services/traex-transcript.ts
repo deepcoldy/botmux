@@ -10,6 +10,10 @@
  *     user-attribution evidence;
  *   - assistant response_item messages have no `phase` and are emitted many
  *     times during tool use, so none of them is a safe turn boundary;
+ *   - append-only `history_mutation` records carry the model-visible
+ *     reasoning and tool call/result items. They are normalized into the same
+ *     cosmetic CoT event shape used by Codex, without changing turn
+ *     attribution or completion;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
  *     the final visible text in `last_agent_message` (which may be empty).
  *     When it is empty the drainer consults the turn's assistant records: a
@@ -49,6 +53,7 @@ import {
   type CodexBridgeEvent,
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
+  codexCotEntriesFromResponseItem,
   codexTaskFailureCode,
   safeFailureSummary,
 } from './codex-transcript.js';
@@ -244,6 +249,33 @@ function itemCompletedAgentText(item: unknown): string {
   return parts.join('');
 }
 
+/** TraeX persists the model-visible conversation in `history_mutation`
+ * records. Unlike its diagnostic `exec_command_end` / `patch_apply_end`
+ * events, these append records contain both the original tool call and its
+ * returned content, in model order. Normalize the array-shaped tool output to
+ * the string shape understood by the shared Codex CoT extractor. */
+function traexHistoryCotEntries(payload: any): CodexBridgeEvent['cotEntries'] {
+  if (payload?.operation !== 'append' || !Array.isArray(payload.items)) return [];
+  const entries: NonNullable<CodexBridgeEvent['cotEntries']> = [];
+  for (const rawItem of payload.items) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    let item = rawItem;
+    if ((rawItem.type === 'function_call_output' || rawItem.type === 'custom_tool_call_output')
+      && Array.isArray(rawItem.output)) {
+      const text = rawItem.output
+        .flatMap((block: any) => block && typeof block === 'object'
+          && typeof block.text === 'string'
+          && (block.type === 'input_text' || block.type === 'output_text' || block.type === 'text')
+          ? [block.text]
+          : [])
+        .join('');
+      item = { ...rawItem, output: text };
+    }
+    entries.push(...codexCotEntriesFromResponseItem(item));
+  }
+  return entries;
+}
+
 function traexPendingAgentState(path: string): TraexPendingAgentMessages {
   let state = traexPendingAgentCache.get(path);
   if (!state) {
@@ -423,6 +455,17 @@ export function drainTraexRollout(
       timestampMs: eventTimestampMs(obj.timestamp),
       ...(sourceSessionId ? { sourceSessionId } : {}),
     };
+    // The append-only history is TraeX's canonical model/tool timeline. Its
+    // event_msg records mirror reasoning and tool completion, so consuming
+    // those too would duplicate nodes. One mutation can carry parallel calls
+    // or results; preserve their item order in one cosmetic event.
+    if (!probe && obj.type === 'history_mutation') {
+      const cotEntries = traexHistoryCotEntries(payload);
+      if (cotEntries && cotEntries.length > 0) {
+        events.push({ ...base, kind: 'cot', text: '', cotEntries });
+      }
+      continue;
+    }
     if (obj.type === 'event_msg'
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
