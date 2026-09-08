@@ -25,7 +25,11 @@ function line(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
-function user(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
+function user(
+  text: string,
+  timestamp = '2000-01-01T00:00:01.000Z',
+  turnId?: string,
+) {
   return {
     timestamp,
     type: 'event_msg',
@@ -35,6 +39,7 @@ function user(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
       images: [],
       local_images: [],
       text_elements: [],
+      ...(turnId ? { turn_id: turnId } : {}),
     },
   };
 }
@@ -759,6 +764,77 @@ describe('drainTraexRollout', () => {
     appendFileSync(path, line(itemCompleted({
       type: 'UserMessage', id: 'msg-second', content: [{ type: 'text', text: 'second' }],
     }, secondTurnId, '2000-01-01T00:00:02.000Z')));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([expect.objectContaining({
+      kind: 'user', text: 'second', sourceTurnId: secondTurnId, preserveCollecting: true,
+    })]);
+    queue.ingest(second.events);
+
+    appendFileSync(path, [
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'first' }],
+      }, firstTurnId, '2000-01-01T00:00:02.100Z')),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [],
+        }], '2000-01-01T00:00:03.000Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: firstTurnId,
+          items: [{ type: 'reasoning', id: 'rs-a', summary: [{ type: 'summary_text', text: 'cot-a' }], content: [] }],
+        },
+      }),
+      line({ ...taskComplete('answer-a'), payload: { ...taskComplete('answer-a').payload, turn_id: firstTurnId } }),
+      line({
+        ...historyAppend([{
+          type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [],
+        }], '2000-01-01T00:00:05.000Z'),
+        payload: {
+          ...historyAppend([]).payload, turn_id: secondTurnId,
+          items: [{ type: 'reasoning', id: 'rs-b', summary: [{ type: 'summary_text', text: 'cot-b' }], content: [] }],
+        },
+      }),
+      line({
+        ...taskComplete('answer-b'),
+        payload: { ...taskComplete('answer-b').payload, turn_id: secondTurnId },
+        timestamp: '2000-01-01T00:00:06.000Z',
+      }),
+    ].join(''));
+    const third = drainTraexRollout(path, second.newOffset);
+    expect(third.events[0]).toEqual(expect.objectContaining({
+      kind: 'turn_bind', sourceTurnId: firstTurnId,
+    }));
+    queue.ingest(third.events);
+
+    expect(observed).toEqual([
+      { turnId: 'd1', text: 'cot-a' },
+      { turnId: 'd2', text: 'cot-b' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', finalText: 'answer-a', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ turnId: 'd2', finalText: 'answer-b', sourceTurnId: secondTurnId }),
+    ]);
+  });
+
+  it('preserves a legacy-first turn before a native-id legacy-dialect successor', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000129';
+    const secondTurnId = '00000000-0000-7000-8000-000000000130';
+    writeFileSync(path, line(user('first', '2000-01-01T00:00:01.000Z')));
+
+    const queue = new CodexBridgeQueue();
+    const observed: Array<{ turnId: string; text: string }> = [];
+    queue.setCotObserver((entries, turn) => {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') observed.push({ turnId: turn.turnId, text: entry.text });
+      }
+    });
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+
+    appendFileSync(path, line(user(
+      'second', '2000-01-01T00:00:02.000Z', secondTurnId,
+    )));
     const second = drainTraexRollout(path, first.newOffset);
     expect(second.events).toEqual([expect.objectContaining({
       kind: 'user', text: 'second', sourceTurnId: secondTurnId, preserveCollecting: true,

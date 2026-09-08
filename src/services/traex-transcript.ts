@@ -245,15 +245,34 @@ function takeExpectedTraexUserMirror(
 ): TraexDrainUserMirror | undefined {
   // Transcript timestamps are chronological. Expired candidates cannot be a
   // later mirror and retaining them could consume a genuine repeated prompt.
-  for (let index = pending.length - 1; index >= 0; index--) {
-    const ageMs = timestampMs - pending[index].timestampMs;
-    if (ageMs > TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) pending.splice(index, 1);
-  }
+  expireTraexUserMirrors(pending, timestampMs);
   const index = pending.findIndex(candidate => candidate.expected === expected
     && candidate.text === text
     && timestampMs >= candidate.timestampMs);
   if (index < 0) return undefined;
   return pending.splice(index, 1)[0];
+}
+
+function shouldPreserveUnboundLegacyPredecessor(
+  pending: TraexDrainUserMirror[],
+  sourceTurnId: string | undefined,
+  timestampMs: number,
+): boolean {
+  // A native-id user can be a typed-ahead successor whose event arrives
+  // before the item mirror that will bind an already-started legacy turn.
+  // Keep that id-less predecessor alive until the delayed mirror/terminal can
+  // identify it. Apply this to every supported native user dialect.
+  expireTraexUserMirrors(pending, timestampMs);
+  return sourceTurnId !== undefined && pending.some(
+    candidate => candidate.expected === 'item' && !candidate.sourceTurnId,
+  );
+}
+
+function expireTraexUserMirrors(pending: TraexDrainUserMirror[], timestampMs: number): void {
+  for (let index = pending.length - 1; index >= 0; index--) {
+    const ageMs = timestampMs - pending[index].timestampMs;
+    if (ageMs > TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) pending.splice(index, 1);
+  }
 }
 
 function clearTraexUserMirrorsAtTerminal(pending: TraexDrainUserMirror[], sourceTurnId: string): void {
@@ -553,7 +572,16 @@ export function drainTraexRollout(
         if (takeExpectedTraexUserMirror(pendingUserMirrors, 'legacy', userText, base.timestampMs)) continue;
       }
       if (userText && claimUserTurn(payload.turn_id)) {
-        events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
+        const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
+          pendingUserMirrors, sourceTurnId, base.timestampMs,
+        );
+        events.push({
+          ...base,
+          kind: 'user',
+          text: userText,
+          ...(sourceTurnId ? { sourceTurnId } : {}),
+          ...(preserveCollecting ? { preserveCollecting: true } : {}),
+        });
         if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
           pendingUserMirrors.push({
             text: userText,
@@ -589,15 +617,15 @@ export function drainTraexRollout(
           } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
             events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
           } else if (!expectedMirror) {
-            const hasUnboundLegacyPredecessor = pendingUserMirrors.some(
-              candidate => candidate.expected === 'item' && !candidate.sourceTurnId,
+            const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
+              pendingUserMirrors, sourceTurnId, base.timestampMs,
             );
             events.push({
               ...base,
               kind: 'user',
               text: userText,
               ...(sourceTurnId ? { sourceTurnId } : {}),
-              ...(hasUnboundLegacyPredecessor ? { preserveCollecting: true } : {}),
+              ...(preserveCollecting ? { preserveCollecting: true } : {}),
             });
           }
           if (expectedMirror?.expected === 'item' && sourceTurnId) {
