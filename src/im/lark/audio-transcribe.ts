@@ -62,6 +62,11 @@ export async function resolveInboundAudio(
   rawEventContent: string,
   parsedContent: string,
   reply: (text: string) => Promise<string>,
+  /** Who sent the voice message. Tokens are stored per person, so without it
+   *  the download falls back to a lookup that finds nothing once the sender has
+   *  re-authorized — and the failure reads as "please /login" to someone who
+   *  just did. */
+  senderOpenId?: string,
 ): Promise<AudioTurnOutcome> {
   if (msgType !== 'audio') return { kind: 'not_audio' };
 
@@ -106,7 +111,7 @@ export async function resolveInboundAudio(
   try {
     try {
       // 飞书语音是 ogg/opus；type='file' 走 im.v1.message.resource 下载。
-      await downloadMessageResource(larkAppId, messageId, meta.fileKey, 'file', audioPath);
+      await downloadMessageResource(larkAppId, messageId, meta.fileKey, 'file', audioPath, senderOpenId);
     } catch (err) {
       // UserTokenMissingError 的 message 已含 /login 提示，直接透传。
       const userMessage = `语音下载失败：${errMsg(err)}`;

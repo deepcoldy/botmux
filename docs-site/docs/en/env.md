@@ -8,6 +8,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 
 | Variable | Default | Description |
 |------|------|------|
+| `BOTMUX_CODEX_NODE_REPL_PATH` | — | Absolute path to the installed Codex `node_repl` executable when no valid MCP runtime is configured; used only by opt-in browser support. |
 | `BOTS_CONFIG` | _(unset)_ | Path to bots.json (overrides the default location) |
 | `WEB_HOST` | `0.0.0.0` | HTTP service bind address |
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP used in terminal links (for public/intranet-domain access, see [Web Terminal](/en/web-terminal)) |
@@ -34,6 +35,8 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | Each daemon's IPC port = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | Workflow run storage directory |
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | Allow tokenless access to the Dashboard's allow-listed read-only APIs / SSE. Once this switch has been saved in Dashboard Settings, the value persisted in `~/.botmux/config.json` takes precedence over this environment variable |
+| `BOTMUX_COMPANION_SECRET_FILE` | _(unset)_ | Dedicated HMAC secret-file path for the closed [Local Companion API](/en/companion-api), normally set by `start/restart --companion-secret-file`. Botmux strictly requires a canonical absolute path, current-user ownership, non-symlink regular file, `0600`, and nonempty content. It is not passed to session CLIs and never falls back to `.dashboard-secret`. |
+| `BOTMUX_COMPANION_BOT_APP_ID` | _(unset)_ | The single isolated test Bot bound to the Companion API, normally set by `start/restart --companion-bot`. Callers cannot select a Bot. |
 
 ## File locations
 

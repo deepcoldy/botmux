@@ -7,9 +7,11 @@
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
- *   botmux start          — start daemon and auto plugin services
+ *   botmux start [--companion-secret-file <path> --companion-bot <appId>]
+ *                         — start daemon and optionally its closed local companion API
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
- *   botmux restart [--with-plugin] — restart daemon, then ensure auto plugin services
+ *   botmux restart [--with-plugin] [--companion-secret-file <path> --companion-bot <appId>]
+ *                         — restart daemon, then ensure auto plugin services
  *   botmux logs [--lines] [--bot <i>] [--no-follow] — view/stream per-bot daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version (本地 checkout 则 git pull --ff-only + rebuild + restart)
@@ -109,7 +111,6 @@ import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from './utils/codex-app-dispatch-ledger.js';
-import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
@@ -217,6 +218,7 @@ import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.j
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import {
   hasManagedOriginIsolationMarker,
+  isIsolatedCliProcess,
   managedOriginDataRootProbeAccess,
   managedOriginIsolationSentinelAccess,
   managedOriginLegacyIsolationProbeAccess,
@@ -262,7 +264,10 @@ import {
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
-import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import { clearWorkerConfig, mergeDashboardConfig, mergeGlobalConfig, mergeWorkerConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
+import { evaluateWorkerAdmission, formatMemoryBytes, readHostMemoryPressure } from './core/worker-budget.js';
+import { sessionScopeCapabilities } from './core/session-scope.js';
+import { DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   createWhiteboard,
   ensureDefaultWhiteboard,
@@ -286,7 +291,9 @@ import {
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot } from './services/session-store.js';
-import { isOccupancyHeld, mutateSessionRowWhenUnowned } from './services/session-offline-write.js';
+import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
+import { bindSessionWhiteboard as persistThenRememberWhiteboard, whiteboardBindFailedMessage } from './services/session-whiteboard-bind.js';
+import type { HostSessionCommand } from './services/session-commands.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -2430,10 +2437,22 @@ function preflightNodeSanity(): void {
   }
 }
 
+function applyCompanionOptions(argv: string[]): void {
+  applyCompanionStartupOptions({
+    argv,
+    env: process.env,
+    bots: loadBotsJson(),
+    // Validate without retaining or logging the value. The Dashboard performs
+    // the same fail-closed check before exposing any companion route.
+    validateSecret: loadCompanionSecret,
+  });
+}
+
 async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
+  applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
   // via fleet-state (pid + kill-0 under the fleet mutation lock), so there is no
@@ -2512,6 +2531,9 @@ async function startConfiguredFleet(
       const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
       const result = startFleetViaSupervisor();
       if (result.action === 'already-running') {
+        if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
+          throw new Error('fleet is already running; use `botmux restart` to apply companion options');
+        }
         console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人)`);
       }
     }, { maxWaitMs: 5_000 });
@@ -2634,6 +2656,7 @@ interface RestartLifecycleFlags {
 
 
 async function cmdRestart(): Promise<void> {
+  applyCompanionOptions(process.argv.slice(3));
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
@@ -3614,21 +3637,57 @@ function loadSessions(): Map<string, SessionData> {
   }) as unknown as Map<string, SessionData>;
 }
 
-/** Offline-only narrow session mutation. Callers must prefer the owning daemon
- * while it is available; the shared helper rereads the exact row under the
- * store's write exclusion (so a stale CLI snapshot can never be written back)
- * and re-evaluates occupancy inside that exclusion. */
-function mutateSessionOffline(
-  session: SessionData,
-  mutate: (current: SessionData) => boolean,
-): SessionData | undefined {
+/** Host-side offline session commands. Callers must prefer the owning daemon
+ * while it is available; the shared host module rereads the exact row under
+ * the store's write exclusion (so a stale CLI snapshot can never be written
+ * back), re-evaluates occupancy inside that exclusion, and runs the ONE
+ * command apply the daemon also uses (services/session-commands.ts). */
+function hostTarget(session: SessionData): { sessionId: string; larkAppId?: string } {
   const larkAppId = session.larkAppId;
-  return mutateSessionRowWhenUnowned(
-    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
-    current => mutate(current as unknown as SessionData),
-    { dataDir: resolveDataDir() },
-  ) as unknown as SessionData | undefined;
+  return { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) };
 }
+
+type OfflineRowRead =
+  | { ok: true; current: SessionData }
+  | { ok: false; error: string };
+
+function offlineBlockedError(outcome: 'owned' | 'missing' | 'contended'): string {
+  switch (outcome) {
+    case 'owned': return 'owning_daemon_became_available';
+    case 'missing': return 'session_row_missing';
+    case 'contended': return 'session_store_busy';
+  }
+}
+
+/** Exclusion-ordered fresh read that yields while a daemon holds the store. */
+function readSessionOffline(session: SessionData): OfflineRowRead {
+  const read = readSessionRowAsHost(hostTarget(session), { dataDir: resolveDataDir() });
+  if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
+  return { ok: false, error: offlineBlockedError(read.outcome) };
+}
+
+function applySessionOffline(
+  session: SessionData,
+  command: HostSessionCommand,
+  options: { expectAdopted?: boolean } = {},
+): UnownedRowApply {
+  return applySessionCommandAsHost(hostTarget(session), command, { dataDir: resolveDataDir(), ...options });
+}
+
+/** True inside a sandboxed / read-isolated / credential-only pane: such a
+ * process can only send commands to the owning daemon and never becomes a
+ * store host (design §1). Classified by positive signals (sandbox outbox env,
+ * host-stamped isolation env, host-stamped origin channel, kernel denial on a
+ * probe inode) — never by a missing secret file, so a host shell on a machine
+ * whose daemon never ran keeps its offline commands. Device enrollment does
+ * not stamp the host shell; see `isIsolatedCliProcess`. */
+function isolatedCliProcess(): boolean {
+  let osUserHomeDir: string | undefined;
+  try { osUserHomeDir = userInfo().homedir; } catch { osUserHomeDir = undefined; }
+  if (!osUserHomeDir) return isIsolatedCliProcess(process.env, '');
+  return isIsolatedCliProcess(process.env, osUserHomeDir);
+}
+const ISOLATED_CLI_OFFLINE_ERROR = '隔离会话内不能离线修改会话（daemon 不可达）';
 
 /** Is this bot's store held by a live host (occupancy lease, or a fresh
  *  heartbeat while no live lease exists)? Same data dir as the store access
@@ -3645,14 +3704,15 @@ type OfflineAbandonResult =
  * the newest durable row under the shared session-file lock. Provider-specific
  * backing cleanup remains owned by the dedicated backend lifecycle changes. */
 async function abandonSessionOffline(session: SessionData): Promise<OfflineAbandonResult> {
-  let current = mutateSessionOffline(session, () => false);
-  if (!current) return { ok: false, error: 'owning_daemon_became_available' };
+  const first = readSessionOffline(session);
+  if (!first.ok) return first;
+  let current = first.current;
 
   const originalPid = adoptedCliPid(current);
   const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
   if (ownedWorkerPid) {
     // Narrow the unavoidable occupancy race: do not signal a worker after an
-    // owning daemon has claimed the row. The locked write below repeats this.
+    // owning daemon has claimed the row. The locked command below repeats this.
     if (current.larkAppId && occupancyHeld(current.larkAppId)) {
       return { ok: false, error: 'owning_daemon_became_available' };
     }
@@ -3666,24 +3726,21 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
 
     // Persist worker-less state without touching FIFO authority. If a new
     // daemon/generation changed the row while SIGTERM settled, fail closed.
-    let workerCleared = false;
-    const afterStop = mutateSessionOffline(current, latest => {
-      if (latest.pid !== ownedWorkerPid
-        || isAdoptedSession(latest) !== isAdoptedSession(current!)) return false;
-      delete latest.pid;
-      workerCleared = true;
-      return true;
-    });
-    if (!afterStop || !workerCleared) {
+    const afterStop = applySessionOffline(
+      current,
+      { type: 'worker-exited', pid: ownedWorkerPid },
+      { expectAdopted: isAdoptedSession(current) },
+    );
+    if (afterStop.outcome !== 'applied') {
       return { ok: false, error: 'session_changed_while_stopping_worker' };
     }
-    current = afterStop;
+    current = afterStop.row as unknown as SessionData;
   } else {
     // Even without a Botmux worker pid, re-read after the first authority check
     // so the cleanup inputs are the newest locked backend/task lineage.
-    const refreshed = mutateSessionOffline(current, () => false);
-    if (!refreshed) return { ok: false, error: 'owning_daemon_became_available' };
-    current = refreshed;
+    const refreshed = readSessionOffline(current);
+    if (!refreshed.ok) return refreshed;
+    current = refreshed.current;
   }
 
   // Provider-specific backing teardown (no daemon to run killWorker()). Adopted
@@ -3726,64 +3783,50 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
     }
   }
 
-  let applied = false;
-  const published = mutateSessionOffline(current, latest => {
-    if (isAdoptedSession(latest) !== isAdoptedSession(current)) return false;
-    if (latest.status === 'closed') {
-      applied = true;
-      return false;
-    }
-    latest.status = 'closed';
-    latest.closedAt = new Date().toISOString();
-    delete latest.codexAppDispatchLedger;
-    delete latest.codexAppGenerationCommits;
-    delete latest.queuedActivationPending;
-    delete latest.queuedActivationTail;
-    delete latest.pendingRepoSetup;
-    delete latest.previewTarget;
-    applied = true;
-    return true;
-  });
-  if (!published || !applied) {
+  // The same close the daemon applies (one field list, one module); an
+  // already-closed fresh row is a success that keeps its original closedAt.
+  const published = applySessionOffline(
+    current,
+    { type: 'close' },
+    { expectAdopted: isAdoptedSession(current) },
+  );
+  if (published.outcome !== 'applied' && published.outcome !== 'noop') {
     return { ok: false, error: 'session_changed_during_offline_cleanup' };
   }
 
-  return { ok: true, current: published, ...(cleanedBacking ? { cleanedBacking } : {}) };
+  return {
+    ok: true,
+    current: published.row as unknown as SessionData,
+    ...(cleanedBacking ? { cleanedBacking } : {}),
+  };
 }
 
 function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
-  let pruned = false;
-  mutateSessionOffline(session, current => {
-    if (hasProtectedSessionMutationOwnership(current)) return false;
-    current.status = 'closed';
-    current.closedAt = new Date().toISOString();
-    delete current.codexAppDispatchLedger;
-    delete current.codexAppGenerationCommits;
-    delete current.previewTarget;
-    pruned = true;
-    return true;
-  });
-  return pruned;
+  const result = applySessionOffline(session, { type: 'prune' });
+  return result.outcome === 'applied' || result.outcome === 'noop';
 }
 
 function patchSessionWhiteboardOffline(session: SessionData, whiteboardId: string): boolean {
-  return !!mutateSessionOffline(session, current => {
-    current.whiteboardId = whiteboardId;
-    return true;
-  });
+  const result = applySessionOffline(session, { type: 'whiteboard', whiteboardId });
+  return result.outcome === 'applied' || result.outcome === 'noop';
 }
 
+/** `unavailable`: no daemon answered, and this host may take the offline
+ *  path. `forbidden_isolated`: no daemon answered, and this process is a
+ *  sandboxed / read-isolated CLI that may only send — never write. */
 async function postOwningDaemonSessionMutation(
   session: SessionData,
   suffix: 'close' | 'prune' | 'whiteboard',
   body?: Record<string, unknown>,
-): Promise<'applied' | 'refused' | 'unavailable'> {
-  if (!session.larkAppId) return 'unavailable';
+): Promise<'applied' | 'refused' | 'unavailable' | 'forbidden_isolated'> {
+  const unavailable = (): 'unavailable' | 'forbidden_isolated' =>
+    (isolatedCliProcess() ? 'forbidden_isolated' : 'unavailable');
+  if (!session.larkAppId) return unavailable();
   let daemon: ReturnType<typeof findDaemon>;
-  try { daemon = findDaemon(session.larkAppId); } catch { return 'unavailable'; }
-  if (!daemon) return 'unavailable';
+  try { daemon = findDaemon(session.larkAppId); } catch { return unavailable(); }
+  if (!daemon) return unavailable();
   let secret: string;
-  try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  try { secret = loadDaemonIpcSecret(); } catch { return unavailable(); }
   let res: Awaited<ReturnType<typeof fetchDaemonIpc>>;
   try {
     res = await fetchDaemonIpc(
@@ -3807,7 +3850,7 @@ async function postOwningDaemonSessionMutation(
     if (occupancyHeld(session.larkAppId)) {
       throw new Error(`连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return 'unavailable';
+    return unavailable();
   }
   if (suffix === 'prune' && res.status === 409) return 'refused';
   // A daemon that ANSWERED is alive and authoritative whatever the lease says:
@@ -3875,6 +3918,10 @@ async function abandonSessionAuthoritatively(
       }
     }
   }
+  // A sandboxed / read-isolated CLI has no store host capability (design §1):
+  // with no daemon to send the command to it fails here, explicitly, instead
+  // of degrading into a write behind the sandbox's read-only grant.
+  if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
   const offline = await abandonSessionOffline(session);
   return offline.ok
     ? {
@@ -3889,7 +3936,7 @@ async function abandonSessionAuthoritatively(
 async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
   const result = await postOwningDaemonSessionMutation(session, 'prune');
   if (result === 'applied') return true;
-  if (result === 'refused') return false;
+  if (result === 'refused' || result === 'forbidden_isolated') return false;
   return pruneSessionOfflineIfLedgerEmpty(session);
 }
 
@@ -3899,8 +3946,23 @@ async function patchSessionWhiteboardAuthoritatively(
 ): Promise<boolean> {
   const result = await postOwningDaemonSessionMutation(session, 'whiteboard', { whiteboardId });
   if (result === 'applied') return true;
-  if (result === 'refused') return false;
+  if (result === 'refused' || result === 'forbidden_isolated') return false;
   return patchSessionWhiteboardOffline(session, whiteboardId);
+}
+
+/** Persist the binding, then mirror it on the in-memory row. A failed
+ *  authoritative patch must not pretend the session is bound. */
+async function bindSessionWhiteboard(
+  session: SessionData,
+  whiteboardId: string,
+): Promise<boolean> {
+  const bound = await persistThenRememberWhiteboard(
+    session,
+    whiteboardId,
+    patchSessionWhiteboardAuthoritatively,
+  );
+  if (!bound) console.error(whiteboardBindFailedMessage(session.sessionId));
+  return bound;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -6099,8 +6161,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   clone <机器人名> [--name <新名称>]
               创建新应用并复制该机器人的行为配置；留空名称自动使用 源名称-copy-时间戳
   start       启动 daemon，并启动 mode=auto 的插件 service
+              可用 --companion-secret-file <绝对路径> --companion-bot <appId> 开启封闭本机 Companion API
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
-  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
+  restart     重启 daemon（同样接受 --companion-secret-file / --companion-bot；--with-plugin 显式先停再启动 auto service）
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
@@ -6139,7 +6202,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-       unset             清除 worker 预算覆盖，恢复按机器 CPU/内存自动推导
+  worker-budget status 查看主机内存准入阈值与 session scope 能力
+       set             设置 --min-available-mib / --max-memory-full-avg10 / --session-memory-max-mib
+       unset           清除主机 worker 内存策略覆盖
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
        --unset         清除（global 或 --bot N 配合）
@@ -6361,6 +6426,85 @@ function argValue(args: string[], ...flags: string[]): string | undefined {
   return undefined;
 }
 
+function positiveNumber(value: string | undefined, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${label} must be a positive number`);
+  return parsed;
+}
+
+function cmdWorkerBudget(args: string[]): void {
+  const sub = (args[0] ?? 'status').toLowerCase();
+  if (sub === 'status') {
+    const pressure = readHostMemoryPressure();
+    const decision = evaluateWorkerAdmission(pressure, readGlobalConfig().worker);
+    const scope = sessionScopeCapabilities();
+    const bots = loadBotsJson();
+    console.log('Worker host protection');
+    console.log(`  resident ceiling policy: unchanged (per-bot maxLiveWorkers; default ${DEFAULT_MAX_LIVE_WORKERS})`);
+    if (bots.length === 0) {
+      console.log(`  effective resident ceiling: ${DEFAULT_MAX_LIVE_WORKERS} (default; no configured bots)`);
+    } else {
+      bots.forEach((bot, index) => {
+        const configured = typeof bot?.maxLiveWorkers === 'number'
+          && Number.isInteger(bot.maxLiveWorkers)
+          && bot.maxLiveWorkers > 0
+          ? bot.maxLiveWorkers
+          : undefined;
+        const label = typeof bot?.botName === 'string' && bot.botName.trim()
+          ? bot.botName.trim()
+          : typeof bot?.larkAppId === 'string' && bot.larkAppId
+            ? bot.larkAppId
+            : `bot-${index}`;
+        console.log(
+          `  effective resident ceiling [${label}]: ${configured ?? DEFAULT_MAX_LIVE_WORKERS} `
+          + `(${configured === undefined ? 'default' : 'config'})`,
+        );
+      });
+    }
+    console.log(`  MemAvailable: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)}`);
+    console.log(`  reserve: ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)} (${decision.policy.minAvailableMemorySource})`);
+    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`}`);
+    console.log(`  PSI limit: ${decision.policy.maxMemoryFullAvg10.toFixed(2)}% (${decision.policy.maxMemoryFullAvg10Source})`);
+    console.log(`  admission: ${decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`}`);
+    console.log(`  session scope cleanup: ${scope.cleanupSupported ? 'supported' : 'unsupported'}`);
+    console.log(`  MemoryMax enforceable: ${scope.memoryControllerSupported ? 'yes' : 'no'}`);
+    console.log(`  configured session MemoryMax: ${decision.policy.sessionMemoryMaxBytes === undefined ? 'unset' : formatMemoryBytes(decision.policy.sessionMemoryMaxBytes)}`);
+    if (scope.reason) console.log(`  scope note: ${scope.reason}`);
+    for (const warning of pressure.warnings) console.log(`  pressure note: ${warning} (fail-open)`);
+    console.log(`  Config file: ${globalConfigPath()}`);
+    return;
+  }
+  if (sub === 'set') {
+    const rest = args.slice(1);
+    const minMib = argValue(rest, '--min-available-mib');
+    const psi = argValue(rest, '--max-memory-full-avg10');
+    const memoryMaxMib = argValue(rest, '--session-memory-max-mib');
+    if (minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
+      throw new Error('worker-budget set requires at least one policy flag');
+    }
+    const patch: WorkerConfig = {};
+    if (minMib !== undefined) patch.minAvailableMemoryBytes = Math.round(positiveNumber(minMib, '--min-available-mib') * 1024 ** 2);
+    if (psi !== undefined) {
+      const value = positiveNumber(psi, '--max-memory-full-avg10');
+      if (value > 100) throw new Error('--max-memory-full-avg10 must be <= 100');
+      patch.maxMemoryFullAvg10 = value;
+    }
+    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = Math.round(positiveNumber(memoryMaxMib, '--session-memory-max-mib') * 1024 ** 2);
+    const resolved = mergeWorkerConfig(patch);
+    console.log('Updated worker host protection policy.');
+    console.log(JSON.stringify(resolved, null, 2));
+    console.log('New worker admissions use this policy without changing resident-session ceilings.');
+    return;
+  }
+  if (sub === 'unset' || sub === 'clear') {
+    clearWorkerConfig();
+    console.log('Cleared worker host protection overrides; defaults apply.');
+    return;
+  }
+  console.error('Usage: botmux worker-budget [status|set|unset]');
+  process.exitCode = 1;
+}
+
 function argFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
@@ -6534,8 +6678,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
       if (ctx.session) {
-        await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
-        ctx.session.whiteboardId = meta.id;
+        await bindSessionWhiteboard(ctx.session, meta.id);
       }
     }
     if (!meta) {
@@ -6551,8 +6694,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     const ctx = currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     if (ctx.session && !ctx.session.whiteboardId) {
-      await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
-      ctx.session.whiteboardId = meta.id;
+      await bindSessionWhiteboard(ctx.session, meta.id);
     }
     console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
     return;
@@ -6575,8 +6717,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
     if (ctx.session) {
-      await patchSessionWhiteboardAuthoritatively(ctx.session, id);
-      ctx.session.whiteboardId = id;
+      await bindSessionWhiteboard(ctx.session, id);
     }
   }
   if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
@@ -7314,6 +7455,9 @@ import {
 } from './bot-registry.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
+import { loadCompanionSecret } from './dashboard/companion-api.js';
+import { applyCompanionStartupOptions } from './cli/companion-startup-options.js';
+import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
@@ -13290,6 +13434,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
@@ -13355,12 +13500,13 @@ const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgra
 // there — its meaning on stop/restart is "also tear the plugin service down",
 // and start has no tear-down phase.
 const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
-  start: [],
+  start: ['--companion-secret-file', '--companion-bot'],
   stop: ['--with-plugin'],
-  restart: ['--with-plugin'],
+  restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
   upgrade: [],
   update: [],
 };
+const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
@@ -13378,9 +13524,12 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   // of these commands takes a positional argument either, so anything outside
   // the table above is unknown, flag-shaped or not.
   const knownFleetFlags = FLEET_KNOWN_FLAGS[command ?? ''] ?? [];
-  const unknownFleetArgs = fleetArgs.filter(arg => !knownFleetFlags.includes(arg));
-  if (unknownFleetArgs.length > 0) {
-    console.error(`未知参数: ${unknownFleetArgs.join(' ')}`);
+  const unknownArgs = unknownFleetArgs(fleetArgs, {
+    boolFlags: knownFleetFlags.filter(flag => !FLEET_VALUE_FLAGS.has(flag)),
+    valueFlags: knownFleetFlags.filter(flag => FLEET_VALUE_FLAGS.has(flag)),
+  });
+  if (unknownArgs.length > 0) {
+    console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
     process.exit(2);
@@ -13901,11 +14050,11 @@ function printPluginServiceDeleteError(err: unknown): boolean {
   if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_delete_failed') return false;
   const failures = Array.isArray((err as any).failures) ? (err as any).failures : [];
   const details = failures
-    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'PM2 删除失败')}`)
+    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'supervisor 删除失败')}`)
     .join('; ');
-  console.error('❌ 插件服务的 PM2 记录删除失败，插件未卸载。');
+  console.error('❌ 插件服务的 supervisor 记录删除失败，插件未卸载。');
   if (details) console.error(`   ${details}`);
-  console.error('   请确认 PM2 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
+  console.error('   请确认插件 supervisor 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
   return true;
 }
 
@@ -14576,13 +14725,34 @@ switch (command) {
     break;
   }
   case 'autostart': {
+    const args = process.argv.slice(3);
+    if (args.some(arg => arg === '--help' || arg === '-h')) {
+      console.log('用法: botmux autostart <enable|disable|status>');
+      break;
+    }
+    const sub = args[0] ?? 'status';
+    const extra = args.slice(1);
+    const knownSubcommands = new Set(['enable', 'install', 'disable', 'uninstall', 'status']);
+    if (!knownSubcommands.has(sub) || extra.length > 0) {
+      const unknown = [...(!knownSubcommands.has(sub) ? [sub] : []), ...extra];
+      console.error(`未知参数: ${unknown.join(' ')}`);
+      console.error('  `botmux autostart` 只接受一个子命令: enable、disable、status（兼容别名: install、uninstall）。');
+      process.exitCode = 2;
+      break;
+    }
     ensureConfigDir();
-    const sub = process.argv[3] ?? 'status';
     const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
     if (sub === 'enable' || sub === 'install') enableAutostart(opts);
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
-    else if (sub === 'status') autostartStatus(opts);
-    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    else autostartStatus(opts);
+    break;
+  }
+  case 'worker-budget': {
+    try { cmdWorkerBudget(process.argv.slice(3)); }
+    catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
     break;
   }
   default:

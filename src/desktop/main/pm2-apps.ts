@@ -5,6 +5,8 @@ import type { DesktopPaths } from '../shared/types.js';
 import { buildBundledPath } from './node-command.js';
 import type { RuntimeLaunchTarget } from './runtime-service.js';
 import { parsePm2Apps, type Pm2AppSummary } from './runtime-source.js';
+import { readFleetState } from '../../core/fleet-state-store.js';
+import { pidAlive } from '../../core/fleet-supervisor.js';
 import {
   inspectLinuxPm2ReadonlyTarget,
   type LinuxPm2GodProcess,
@@ -39,8 +41,17 @@ export function listPm2Apps(
   const existsSync = deps.existsSync ?? pathExistsSync;
   const packageRoot = runtime.root;
   const pm2Bin = join(packageRoot, 'node_modules', 'pm2', 'bin', 'pm2');
-  if (!existsSync(pm2Bin)) {
-    return Promise.reject(new Error(`PM2 binary not found: ${pm2Bin}`));
+  const statePath = join(paths.botmuxHome, 'fleet-state.json');
+  // A native fleet takes precedence over a leftover PM2 installation. Keep
+  // the optional legacy observer only for runtimes without a fleet record.
+  if (pathExistsSync(statePath) || !existsSync(pm2Bin)) {
+    const state = readFleetState(statePath);
+    if (existsSync(statePath) && !state) return Promise.reject(new Error('Invalid fleet state'));
+    return Promise.resolve((state?.procs ?? []).map(proc => ({
+      name: proc.name,
+      status: pidAlive(proc.pid) ? proc.status : 'stopped',
+      ...(state?.supervisorEntry ? { script: state.supervisorEntry } : {}),
+    })));
   }
   let expectedGod: LinuxPm2GodProcess | undefined;
   try {

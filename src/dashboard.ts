@@ -15,6 +15,15 @@ import { isStandaloneBinary } from './core/self-spawn.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
+import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
+import {
+  deleteTeamRoleFile,
+  readTeamRoleInjectMode,
+  resolveTeamRoleFile,
+  writeTeamRoleFile,
+  writeTeamRoleInjectMode,
+} from './core/role-resolver.js';
+import { readBotsJsonOrEmpty } from './setup/bots-store.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
@@ -232,6 +241,7 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  renameGroup,
   setPinStreamingCardForGroup,
   unbindOncall,
   type GroupsActionDeps,
@@ -3428,9 +3438,81 @@ function analyticsService(): FeedbackAnalyticsService {
   return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
 }
 
+const companionApi = (() => {
+  try {
+    const secretFile = config.companion.secretFile;
+  const appId = config.companion.botAppId;
+  if (!secretFile && !appId) return null;
+  if (!secretFile || !appId) throw new Error('companion_configuration_incomplete');
+  const requireBoundBot = () => {
+    const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
+    const bot = matches.length === 1 ? matches[0] : undefined;
+    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+      throw new Error('companion_bound_bot_invalid');
+    }
+    return bot;
+  };
+  requireBoundBot();
+  const readRuntime = (): CompanionRuntime => {
+    const bound = requireBoundBot();
+    return {
+      provider: bound.cliId === 'traex' ? 'traecli' : 'codex',
+      ...(typeof bound.model === 'string' && bound.model.trim() ? { model: bound.model.trim() } : {}),
+      ...(typeof bound.reasoningEffort === 'string' && bound.reasoningEffort ? { reasoning: bound.reasoningEffort } : {}),
+    };
+  };
+  return createCompanionApi({
+    secret: loadCompanionSecret(secretFile),
+    operations: {
+      readRole: () => {
+        requireBoundBot();
+        return { role: resolveTeamRoleFile(appId) ?? '', injectMode: readTeamRoleInjectMode(appId), revision: null };
+      },
+      writeRole: ({ role, injectMode }) => {
+        requireBoundBot();
+        if (role.trim()) writeTeamRoleFile(appId, role);
+        else deleteTeamRoleFile(appId);
+        writeTeamRoleInjectMode(appId, injectMode);
+        return { role: resolveTeamRoleFile(appId) ?? '', injectMode: readTeamRoleInjectMode(appId), revision: null };
+      },
+      readRuntime,
+      writeRuntime: async (runtime) => {
+        requireBoundBot();
+        const upstream = await proxyToDaemon(appId, '/api/bot-agent', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cliId: runtime.provider === 'traecli' ? 'traex' : 'codex',
+            model: runtime.model ?? '',
+            reasoningEffort: runtime.reasoning ?? '',
+          }),
+        });
+        if (!upstream.ok) throw new Error('companion_runtime_update_failed');
+        const body = await upstream.json() as Record<string, unknown>;
+        return {
+          provider: body.cliId === 'traex' ? 'traecli' : 'codex',
+          ...(typeof body.model === 'string' && body.model ? { model: body.model } : {}),
+          ...(typeof body.reasoningEffort === 'string' && body.reasoningEffort ? { reasoning: body.reasoningEffort } : {}),
+        };
+      },
+    },
+    });
+  } catch (error) {
+    logger.warn(`[companion] disabled: ${error instanceof Error ? error.message : 'configuration_invalid'}`);
+    return null;
+  }
+})();
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+    // Closed companion surface: it buffers bodies only for this exact prefix,
+    // before the ordinary Dashboard auth/router touches the request stream.
+    if (companionApi && await companionApi(req, res, url.search ? `${url.pathname}${url.search}` : url.pathname)) return;
+    if (!companionApi && url.pathname.startsWith('/__companion/')) {
+      return jsonRes(res, 404, { ok: false, error: 'companion_disabled' });
+    }
 
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
@@ -6286,6 +6368,26 @@ const server = createServer(async (req, res) => {
       return writeHandlerResult(res, result);
     }
 
+    // Host integrations can select one exact configured bot for the write;
+    // the daemon still enforces membership before calling Lark.
+    let mRename: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mRename = url.pathname.match(/^\/api\/groups\/([^/]+)\/name\/([^/]+)$/))) {
+      const chatId = decodeURIComponent(mRename[1]);
+      const appId = decodeURIComponent(mRename[2]);
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req, 4_096);
+      } catch (error) {
+        const tooLarge = error instanceof DashboardJsonBodyTooLargeError;
+        return jsonRes(res, tooLarge ? 413 : 400, {
+          ok: false,
+          error: tooLarge ? 'body_too_large' : 'bad_json',
+        });
+      }
+      const result = await renameGroup(chatId, appId, JSON.stringify(parsed) || '{}', groupsActionDeps);
+      return writeHandlerResult(res, result);
+    }
+
     // ─── Oncall bindings (per chat × bot) ────────────────────────────────────
     // External: PUT/DELETE /api/groups/:chatId/oncall/:larkAppId
     // Internal: PUT/DELETE /api/oncall/:chatId (on the named bot's daemon).
@@ -6612,6 +6714,32 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Trigger-user CLI auth: per-bot switch + status. Proxied to that bot's
+    // daemon, which owns the shared validation path (/botconfig uses the same).
+    let mBotTriggerUserAuth: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTriggerUserAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuth[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    let mBotTriggerUserAuthStatus: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBotTriggerUserAuthStatus = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth-status$/))) {
+      const appId = decodeURIComponent(mBotTriggerUserAuthStatus[1]);
+      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth-status`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -7060,7 +7188,14 @@ const server = createServer(async (req, res) => {
       try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
       catch { /* handled below */ }
       if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
-      const { authUrl } = generateAuthUrl(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), [...FEED_GROUP_SCOPES]);
+      const { authUrl } = generateAuthUrl(
+        bot.larkAppId,
+        bot.larkAppSecret,
+        normalizeBrand(bot.brand),
+        [...FEED_GROUP_SCOPES],
+        // 标签属于 owner 个人的收件箱，授权归属写明本人。
+        bot.ownerOpenId,
+      );
       return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, authUrl });
     }
 

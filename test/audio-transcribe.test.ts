@@ -125,12 +125,16 @@ describe('resolveInboundAudio', () => {
     mocks.resolveAsrConfig.mockReturnValue(cfg);
     mocks.transcribeAudioFile.mockResolvedValue('帮我看下这个函数为什么报错');
     const { fn, calls } = makeReply();
-    const r = await resolveInboundAudio(APP, MSG, 'audio', AUDIO_CONTENT, '[语音]', fn);
+    const r = await resolveInboundAudio(APP, MSG, 'audio', AUDIO_CONTENT, '[语音]', fn, 'ou_speaker');
     expect(r).toEqual({ kind: 'transcribed', text: `${AUDIO_TRANSCRIPTION_PREFIX}\n帮我看下这个函数为什么报错` });
     // 占位「正在转写」先发，成功后删除
     expect(calls[0]).toContain('正在转写');
     expect(mocks.deleteMessage).toHaveBeenCalledTimes(1);
-    expect(mocks.downloadMessageResource).toHaveBeenCalledWith(APP, MSG, 'file_vc_123', 'file', expect.stringContaining('voice.ogg'));
+    // 最后一参是说话人：token 按人存，不传就等于拿空 key 去查——本人刚授权过也
+    // 会取不到，然后报一句「请 /login」给一个刚 login 完的人。
+    expect(mocks.downloadMessageResource).toHaveBeenCalledWith(
+      APP, MSG, 'file_vc_123', 'file', expect.stringContaining('voice.ogg'), 'ou_speaker',
+    );
     expect(mocks.transcribeAudioFile).toHaveBeenCalledWith(cfg, expect.stringContaining('voice.ogg'));
   });
 

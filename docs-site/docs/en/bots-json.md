@@ -136,6 +136,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 
 ### Codex App browser bridge (experimental)
 
+Install the browser runtime bundled with the Codex desktop app. The bridge prefers `mcp_servers.node_repl`, but locates the installed runtime when the desktop removes that MCP registration; set `BOTMUX_CODEX_NODE_REPL_PATH` for a custom installation. Identity, site safety status, and feature configuration use the official authenticated request channel. The bridge does not read or store login tokens, and fails closed when the runtime or authentication is unavailable.
+
 This option addresses one narrow gap: Codex running through Botmux's app-server path does not otherwise inherit the Chrome tool built into Codex App. The bridge belongs entirely to Botmux and has no dependency on a project repository, Harness, or local-proxy setup.
 
 ```json
@@ -146,8 +148,10 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 ```
 
 - Install and enable the Codex browser extension in Chrome / Edge under the same OS user first. Botmux selects the newest complete official plugin under `CODEX_HOME` (or `~/.codex`) automatically; use an absolute `pluginRoot` only for a maintained custom location.
-- The setting registers one `botmux_browser` dynamic tool only on newly created Codex App threads. Existing threads are not rewritten; open a new Lark topic / session to verify it.
-- The tool exposes only high-level tab, accessibility-tree interaction, navigation, and screenshot operations. It does not expose arbitrary JavaScript, raw CDP, cookies, local storage, browser history, clipboard, or file transfer.
+- The setting registers the `botmux_browser` dynamic tool when starting or resuming a Codex App thread. Restart or resume an already-running runner to load the updated tool definition.
+- The bridge probes capabilities per tab. It prefers the accessibility tree, falls back automatically to visible-DOM / Playwright-DOM snapshots when AX is unavailable, and exposes typed Playwright locator, DOM, and coordinate operations. A backend without `tab.ax` no longer breaks the entire Chrome connection.
+- Browser Use safety requests for origin access, uploads, downloads, and similar actions block the operation and appear as Lark authorization cards. Only users accepted by Botmux's `canTalk` check can choose session approval, persistent approval, or denial; Botmux ask records the answer and reviewer. A plain approval is also scoped to the current runner session and is reused for the same origin, operation type, and risk context; a different origin, operation type, risk context, or new session requires confirmation again. Denial, timeout, or daemon unavailability fails closed.
+- The tool does not expose arbitrary JavaScript, raw CDP, cookies, local storage, browser history, or clipboard. Uploads/downloads run only through Browser Use's controlled file chooser and safety checks. Secure browser-auth flows involving credentials never downgrade to an ordinary Lark card and require a client with a secure credential broker.
 - Each Botmux runner owns isolated browser-session state. The feature is off by default, so unconfigured bots retain their existing launch arguments and behavior.
 - It currently cannot be combined with `existingAppServer`, `sandbox`, or `readIsolation`; conflicting configuration fails at startup instead of running with an incomplete isolation boundary.
 

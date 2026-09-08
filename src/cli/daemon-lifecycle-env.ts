@@ -34,12 +34,21 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_DASHBOARD_PORT',
   'BOTMUX_DAEMON_IPC_BASE_PORT',
   'BOTMUX_DASHBOARD_PUBLIC_READONLY',
+  // Closed local companion control surface. The values are lifecycle settings:
+  // start/restart flags override them in inherited env; ~/.botmux/.env keeps
+  // them across boot-time starts. Session CLI boundaries redact both keys.
+  'BOTMUX_COMPANION_SECRET_FILE',
+  'BOTMUX_COMPANION_BOT_APP_ID',
   // Self-hosted reverse-proxy base for terminal/dashboard links
   // (publicReverseProxyBaseUrl). Left out of this list it only survived as
   // long as every restart came from a shell that exported it — one restart
   // from a bot session (whose pane wrapper unsets BOTMUX_*) silently demoted
   // all web-terminal links back to raw ip:port.
   'BOTMUX_PUBLIC_URL',
+  // Host-scoped Go build fanout policy. This is intentionally an ordinary,
+  // non-secret environment value: the daemon inherits it, worker/session
+  // children retain it, and individual Go commands may still override -p.
+  'GOFLAGS',
   // Dashboard-only, non-secret settings: the control-audit destination
   // (dashboard/control-audit.ts defaultControlAuditPath) and the terminal
   // takeover lease TTL (dashboard/terminal-control.ts terminalControlTtlFromEnv).
@@ -78,8 +87,17 @@ export function resolveDaemonEnv(
   refreshPersistedEnv = Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim()),
 ): Record<DaemonEnvKey, string> {
   const fileEnv = envFileText === undefined ? {} : parse(envFileText);
+  const companionKeys = new Set<DaemonEnvKey>([
+    'BOTMUX_COMPANION_SECRET_FILE',
+    'BOTMUX_COMPANION_BOT_APP_ID',
+  ]);
   const resolve = (key: DaemonEnvKey): string => {
-    const value = refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
+    // start/restart flags are authoritative even when invoked from a managed
+    // session. Do not let refreshPersistedEnv discard the freshly validated
+    // companion binding before the supervisor receives it.
+    const value = companionKeys.has(key)
+      ? inheritedEnv[key] ?? fileEnv[key]
+      : refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
     return value?.trim() ?? '';
   };
 

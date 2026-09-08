@@ -10,6 +10,12 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import {
+  applySessionRowCommand,
+  type HostSessionCommand,
+  type SessionRowRefusal,
+  type SessionRowReleased,
+} from './session-commands.js';
+import {
   openDatabaseSyncOrThrow,
   sqliteEngineAvailable,
   type DatabaseSyncLike,
@@ -2059,65 +2065,52 @@ export function closeSession(
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
-    // The materialised images are cleaned up AFTER the row commits, so the list
-    // has to be read before it is dropped from the row. Not a rollback copy —
-    // the durable-first commit below has nothing to undo.
-    const priorDashboardAttachments = session.dashboardAttachments;
+    // The close-time token snapshot is sampled here, outside any store lock
+    // (the transcript scan can be large), and handed to the shared apply as an
+    // input. `null` = sampled, nothing found; the apply then writes `null`
+    // only when the row carries no snapshot yet. An already-closed row does
+    // not take a new snapshot — re-close must not pin a later `null` over a
+    // live dashboard read, and must not spend the scan when apply will ignore it.
+    let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
+    if (session.status !== 'closed') {
+      tokenUsage = null;
+      try {
+        tokenUsage = getSessionTokenUsage({
+          cliId: session.cliId ?? 'unknown',
+          sessionId: session.sessionId,
+          cliSessionId: session.cliSessionId,
+          cwd: session.workingDir,
+          larkAppId: session.larkAppId,
+          fresh: true,
+        });
+      } catch (err: any) {
+        logger.warn(`Failed to snapshot token usage for session ${sessionId}: ${err?.message ?? err}`);
+      }
+    }
     // Durable first: build the closed row, commit it, and only then merge it
     // into the live object. A failed write leaves the session exactly as it
-    // was, including any prior tokenUsage snapshot.
+    // was, including any prior tokenUsage snapshot. The transition itself is
+    // the ONE shared apply (session-commands.ts); this is the daemon's own
+    // store close, reached after its explicit prepare, so it alone names the
+    // journal wipe. Persist only on `applied` — a no-op re-close must not
+    // rewrite the row.
     const next: Session = { ...session };
-    next.status = 'closed';
-    next.closedAt = new Date().toISOString();
-    try {
-      const tokenUsage = getSessionTokenUsage({
-        cliId: session.cliId ?? 'unknown',
-        sessionId: session.sessionId,
-        cliSessionId: session.cliSessionId,
-        cwd: session.workingDir,
-        larkAppId: session.larkAppId,
-        fresh: true,
-      });
-      if (tokenUsage !== null) next.tokenUsage = tokenUsage;
-      else if (next.tokenUsage === undefined) next.tokenUsage = null;
-    } catch (err: any) {
-      logger.warn(`Failed to snapshot token usage for session ${sessionId}: ${err?.message ?? err}`);
-      if (next.tokenUsage === undefined) next.tokenUsage = null;
+    const applied = applySessionRowCommand(next, {
+      type: 'close',
+      ...(tokenUsage !== undefined ? { tokenUsage } : {}),
+      clearMojoCloseJournal: true,
+      ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
+      ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
+      ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
+    }, { now: new Date() });
+    if (applied.outcome === 'applied') {
+      persistRow(next);
+      Object.assign(session, next);
     }
-    next.dashboardAttachments = undefined;
-    next.queuedAttachments = undefined;
-    // `previewTarget` is a live loopback (host, port) the session's agent
-    // registered with `botmux preview <port>` for its CURRENT worker
-    // generation — routing state, not a durable property of the conversation.
-    // A closed session owns no port any more, and the OS is free to hand that
-    // number to an unrelated local server; the preview proxy dials a target by
-    // host/port alone, so a retained value would let a later reader (resume,
-    // an offline row copy, a dashboard snapshot) proxy the user into someone
-    // else's service. Drop it in the same atomic save as status='closed'.
-    // Cleanup only: registration and proxying are untouched, and a resumed
-    // session simply re-runs `botmux preview <port>`.
-    next.previewTarget = undefined;
-    next.mojoCloseJournal = undefined;
-    // Survives close on purpose — the containment handle is still in the durable
-    // store, so the row must keep reporting the residual until the handle clears.
-    if (opts.parkLocalResidual) next.mojoLocalResidual = opts.parkLocalResidual;
-    if (opts.parkMojoLineage) {
-      // Keep both ids when a different one was already parked: each is the only
-      // handle left for manual cleanup of its remote session.
-      const already = next.mojoQuarantinedLineage;
-      next.mojoQuarantinedLineage = already && already !== opts.parkMojoLineage
-        ? `${already},${opts.parkMojoLineage}`
-        : opts.parkMojoLineage;
-      next.mojoQuarantineNoticePending = true;
-    }
-    // Riff cancellation has already completed before this durable transition.
-    // Clear its retry handle in the same atomic save as status='closed'.
-    if (opts.clearRiffParentTaskId) next.riffParentTaskId = undefined;
-    persistRow(next);
-    Object.assign(session, next);
-    if (session.larkAppId && priorDashboardAttachments?.length) {
+    const released = applied.outcome === 'applied' ? applied.released.dashboardAttachments : undefined;
+    if (session.larkAppId && released?.length) {
       try {
-        cleanupMaterializedDashboardImages(session.larkAppId, priorDashboardAttachments);
+        cleanupMaterializedDashboardImages(session.larkAppId, released);
       } catch (error: any) {
         logger.warn(`Failed to clean Dashboard images for session ${sessionId}: ${error?.message ?? error}`);
       }
@@ -2544,37 +2537,65 @@ export function readSessionRowCopiesAcrossStores(
   return matches;
 }
 
-/**
- * Locked offline mutation of one exact row in its owning store (per-bot when
- * the caller-observed row carries `larkAppId`, the legacy store otherwise).
- * Re-reads the row under the owning store's write exclusion — the SQLite
- * store's `BEGIN IMMEDIATE` transaction, or the shared file lock for a store
- * still on JSON — and hands the FRESH copy to `mutate`, never publishing the
- * caller's possibly-stale snapshot.
- *
- * SQLite ownership is the occupancy row read in this same `BEGIN IMMEDIATE`
- * transaction. A live lease aborts the write. Without one (row absent or
- * expired) `abortIf` — the descriptor-heartbeat probe, also a test hook —
- * still decides; that is the upgrade window for daemons that write SQLite
- * but not occupancy. `abortIf` is evaluated at entry and again immediately
- * before publication (the lease row itself cannot change under this
- * transaction). JSON stores use `abortIf` only (no occupancy table).
- * SQLite's own locking does NOT replace occupancy: it orders writers, but
- * cannot detect that a daemon holding a stale in-memory cache has come alive.
- *
- * Returns the fresh row — mutated when `mutate` returned true, otherwise
- * unmodified (so `() => false` is an exclusion-ordered fresh read) — or
- * undefined when the row is absent, `abortIf` aborted, or the store's write
- * lock could not be taken (another writer holds `BEGIN IMMEDIATE` past
- * busy_timeout). Lock contention is the same clean yield as a held lease:
- * the caller must not publish, and the CLI must not throw a stack. Other
- * errors (missing engine, corrupt file) still surface.
- */
-export function mutateSessionRowOffline(
+// ─── Temporary host activation (daemon absent) ──────────────────────────────
+//
+// A process that owns no store may still act on one exact row while no daemon
+// holds it: `botmux delete` / `list` auto-prune / `whiteboard` from a host
+// shell, and the dashboard's board deletion. The activation is ONE exclusive
+// store transaction — the SQLite `BEGIN IMMEDIATE`, or the shared file lock of
+// a store still on JSON (upgrade window) — inside which ownership is judged,
+// the FRESH row is read, the shared command apply (session-commands.ts) runs,
+// and the row is published. Nothing else is expressible here: there is no
+// closure that could write an arbitrary field list.
+//
+// SQLite ownership is the occupancy row read in this same transaction. A live
+// lease yields. Without one (row absent or expired) `abortIf` — the
+// descriptor-heartbeat probe, also a test hook — still decides; that is the
+// upgrade window for daemons that write SQLite but not occupancy. `abortIf`
+// is evaluated at entry and again immediately before publication (the lease
+// row itself cannot change under this transaction). JSON stores use `abortIf`
+// only (no occupancy table). SQLite's own locking does NOT replace occupancy:
+// it orders writers, but cannot detect that a daemon holding a stale
+// in-memory cache has come alive.
+//
+// No lease row is written by the temporary host: a claim + release inside a
+// single exclusive transaction is unobservable to every other connection, and
+// holding one ACROSS the steps of a multi-step command (the offline abandon)
+// would only leave a daemon that boots meanwhile `displaced` until its next
+// heartbeat tick. Each step re-judges ownership in its own transaction.
+
+/** Why the activation yielded without touching the row. */
+export type UnownedRowBlocked =
+  /** A live lease, or a fresh heartbeat while no live lease exists, holds the store. */
+  | { outcome: 'owned' }
+  /** No such row — or no store file at all (never created here: an empty
+   *  store would disable the daemon's one-shot JSON import gate). */
+  | { outcome: 'missing' }
+  /** The store's write lock could not be taken (another writer holds it past
+   *  busy_timeout / the file-lock wait). Same "do not publish" as `owned`;
+   *  reported apart so a caller never claims a live row is gone. */
+  | { outcome: 'contended' };
+
+export type UnownedRowRead =
+  | { outcome: 'ok'; row: Session }
+  | UnownedRowBlocked;
+
+export type UnownedRowApply =
+  | { outcome: 'applied'; row: Session; released: SessionRowReleased }
+  | { outcome: 'noop'; row: Session }
+  | { outcome: 'refused'; reason: SessionRowRefusal | 'row_changed'; row: Session }
+  | UnownedRowBlocked;
+
+type UnownedRowOptions = { dataDir?: string; abortIf?: () => boolean };
+
+/** One step over the fresh row: whether to publish it, and what to report. */
+type UnownedRowStep<T> = (current: Session) => { publish: boolean; result: T };
+
+function runUnownedRowTxn<T>(
   target: { sessionId: string; larkAppId?: string },
-  mutate: (current: Session) => boolean,
-  options: { dataDir?: string; abortIf?: () => boolean } = {},
-): Session | undefined {
+  options: UnownedRowOptions,
+  step: UnownedRowStep<T>,
+): T | UnownedRowBlocked {
   const dataDir = options.dataDir ?? config.session.dataDir;
   const ref = resolveStoreFile(target.larkAppId, dataDir);
 
@@ -2583,31 +2604,32 @@ export function mutateSessionRowOffline(
     // a missing file. The window between that probe and this open must not
     // plant an empty store: that would make the daemon's import gate skip the
     // one-shot JSON import and silently drop every pre-SQLite row.
-    if (!existsSync(ref.path)) return undefined;
+    if (!existsSync(ref.path)) return { outcome: 'missing' };
     let db: SqliteDatabaseLike | undefined;
     let inTxn = false;
     try {
       // openDbForOwnStore (schema ensure) and BEGIN IMMEDIATE both take the
       // write lock. Contention here is "someone else is publishing", not a
-      // broken store — same abort as a live occupancy row.
+      // broken store — same yield as a live occupancy row.
       db = openDbForOwnStore(ref.path);
       db.exec('BEGIN IMMEDIATE');
       inTxn = true;
       const lease = readOccupancyInTxn(db);
-      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return undefined;
+      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return { outcome: 'owned' };
       const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
         .get(target.sessionId) as { row: string } | undefined;
-      if (!hit) return undefined;
+      if (!hit) return { outcome: 'missing' };
       const current = JSON.parse(hit.row) as Session;
-      if (!mutate(current)) return current;
-      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return undefined;
+      const { publish, result } = step(current);
+      if (!publish) return result;
+      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return { outcome: 'owned' };
       db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
         .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
       db.exec('COMMIT');
       inTxn = false;
-      return current;
+      return result;
     } catch (err) {
-      if (isTransientStoreContentionError(err)) return undefined;
+      if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
       throw err;
     } finally {
       if (inTxn) { try { db?.exec('ROLLBACK'); } catch { /* txn already gone */ } }
@@ -2616,31 +2638,86 @@ export function mutateSessionRowOffline(
   }
 
   // Upgrade window: this store's owning daemon still runs the pre-SQLite build
-  // and keeps writing the JSON, so an offline mutation has to land there too —
+  // and keeps writing the JSON, so an offline command has to land there too —
   // creating a .db here would fork the two representations behind that daemon's
   // back. Same file lock the old build takes.
   const fp = ref.path;
-  return withFileLockSync(fp, () => {
-    if (options.abortIf?.()) return undefined;
-    let data: Record<string, Session> = {};
-    if (existsSync(fp)) {
-      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-    }
-    const current = data[target.sessionId];
-    if (!current || !mutate(current)) return current;
-    data[target.sessionId] = current;
-    for (const [key, val] of Object.entries(data)) {
-      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
-        delete data[key];
-        continue;
+  try {
+    return withFileLockSync(fp, (): T | UnownedRowBlocked => {
+      if (options.abortIf?.()) return { outcome: 'owned' };
+      let data: Record<string, Session> = {};
+      if (existsSync(fp)) {
+        try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
       }
-      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+      const current = data[target.sessionId];
+      if (!current) return { outcome: 'missing' };
+      const { publish, result } = step(current);
+      if (!publish) return result;
+      data[target.sessionId] = current;
+      for (const [key, val] of Object.entries(data)) {
+        if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
+          delete data[key];
+          continue;
+        }
+        if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+      }
+      if (options.abortIf?.()) return { outcome: 'owned' };
+      const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+      writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+      renameSync(tmpFp, fp);
+      return result;
+    });
+  } catch (err) {
+    if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
+    throw err;
+  }
+}
+
+function sessionRowIsAdopted(row: Session): boolean {
+  return !!row.adoptedFrom && typeof row.adoptedFrom === 'object';
+}
+
+/**
+ * Exclusion-ordered fresh read of one exact row while no daemon holds its
+ * store. This is an ownership check that happens not to write, not a plain
+ * point-read: it yields `owned` under exactly the rules of the apply below,
+ * so a multi-step host command (abandon: stop the worker, destroy the
+ * backing, close) can re-judge ownership before each irreversible step.
+ */
+export function readSessionRowUnowned(
+  target: { sessionId: string; larkAppId?: string },
+  options: UnownedRowOptions = {},
+): UnownedRowRead {
+  return runUnownedRowTxn(target, options, current => ({
+    publish: false,
+    result: { outcome: 'ok' as const, row: current },
+  }));
+}
+
+/**
+ * Apply one host command to the FRESH row of its owning store (per-bot when the
+ * caller-observed row carries `larkAppId`, the legacy store otherwise) while
+ * no daemon holds it, and publish the result. The caller's snapshot is never
+ * written back.
+ *
+ * `expectAdopted` is a fail-closed precondition for multi-step host commands:
+ * the row must still be (non-)adopted exactly as the caller last read it,
+ * otherwise the step is `refused` with `row_changed`.
+ */
+export function applySessionCommandUnowned(
+  target: { sessionId: string; larkAppId?: string },
+  command: HostSessionCommand,
+  options: UnownedRowOptions & { expectAdopted?: boolean } = {},
+): UnownedRowApply {
+  return runUnownedRowTxn<UnownedRowApply>(target, options, current => {
+    if (options.expectAdopted !== undefined && sessionRowIsAdopted(current) !== options.expectAdopted) {
+      return { publish: false, result: { outcome: 'refused', reason: 'row_changed', row: current } };
     }
-    if (options.abortIf?.()) return undefined;
-    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-    renameSync(tmpFp, fp);
-    return current;
+    const applied = applySessionRowCommand(current, command, { now: new Date() });
+    if (applied.outcome === 'applied') {
+      return { publish: true, result: { outcome: 'applied', row: current, released: applied.released } };
+    }
+    return { publish: false, result: { ...applied, row: current } };
   });
 }
 

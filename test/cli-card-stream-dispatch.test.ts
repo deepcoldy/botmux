@@ -153,6 +153,30 @@ describe('parseCardRuntimeStatusArgs', () => {
     ])).toEqual({ ok: true, operation: 'unbind-runtime', streamId: STREAM_ID });
   });
 
+  it.each([
+    ['--session-id'],
+    ['--session-id='],
+    ['--session-id', '--stream-id', STREAM_ID],
+    ['--session-id', '-'],
+    ['--session-id=-'],
+  ])('rejects a missing --session-id value: %j', (...sessionArgs) => {
+    for (const args of [
+      ['unbind-runtime', '--stream-id', STREAM_ID, ...sessionArgs],
+      [
+        'bind-runtime',
+        '--stream-id', STREAM_ID,
+        '--status-element-id', 'status_badge',
+        '--image-element-id', 'loader_img',
+        '--active-image-key', 'img_active_12345678',
+        '--inactive-image-key', 'img_inactive_12345678',
+        ...sessionArgs,
+      ],
+    ]) {
+      expect(parseCardRuntimeStatusArgs(args))
+        .toEqual({ ok: false, error: '--session-id 需要会话 id 参数' });
+    }
+  });
+
   it('rejects unsafe element/image ids and malformed labels', () => {
     expect(parseCardRuntimeStatusArgs([
       'bind-runtime', '--stream-id', STREAM_ID,

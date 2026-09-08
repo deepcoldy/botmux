@@ -17,6 +17,9 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
+import { sessionIdentityBinDir, installIdentityWrapper, findRealToolBinary, ensureSessionIdentityPlaceholders, installGitAskpass, identityWrapperInstalled, gitIdentityConfigEnv, publishActiveTurn, installLoginShellPathShim, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -164,6 +167,10 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
+import {
+  stopSessionScope,
+  wrapCommandInSessionScope,
+} from './core/session-scope.js';
 import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
@@ -3302,6 +3309,19 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
 
 function writeCliPidMarker(): void {
   if (!sessionId) return;
+  // Publish the turn the CLI is actually executing, for the trigger-user
+  // identity wrapper. It rides this function because every point that changes
+  // `currentBotmuxTurnId` already calls it — including the ones that bypass the
+  // normal queue (adopt writes, passthrough, init). A separate call at each site
+  // would be one `git rebase` away from missing one, and a missed site means
+  // stale turn ⇒ refused commands.
+  //
+  // Distinct from the pid marker's own `turnId` field: that file is JSON (the
+  // wrapper is /bin/sh and must not spawn jq) and lives where the CLI could
+  // rewrite it. This one is a single line under the 0700 identity dir.
+  if (process.env.SESSION_DATA_DIR) {
+    publishActiveTurn(process.env.SESSION_DATA_DIR, sessionId, currentBotmuxTurnId);
+  }
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath) continue;
     try {
@@ -8736,6 +8756,7 @@ let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
 // Throttle for the happy-path upload log in captureAndUpload (one line/min).
 let lastUploadLogAtMs = 0;
+let screenshotCaptureInFlight = false;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -8797,64 +8818,80 @@ async function captureAndUpload(): Promise<void> {
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
   if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
+  if (screenshotCaptureInFlight)    { logScreenshotSkip('capture/upload already in flight'); return; }
 
-  let png: Buffer;
-  let usageLimitContent = '';
+  screenshotCaptureInFlight = true;
   try {
-    // Preferred path: pipe-pane backends ask tmux for a fresh viewport
-    // snapshot and render it through a transient xterm-headless. This
-    // avoids the accumulated-buffer drift that produced duplicated /
-    // staircase content under the legacy long-lived renderer.
-    const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
-    if (pipeResult) {
-      if (pipeResult.ansi === lastShotHash) return;
-      lastShotHash = pipeResult.ansi;
-      png = pipeResult.png;
-      usageLimitContent = pipeResult.content;
-    } else {
-      // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
-      // still drive the long-lived renderer.
-      if (!renderer) { logScreenshotSkip('renderer=null'); return; }
-      const term = renderer.xterm;
-      const startY = term.buffer.active.baseY;
-      const snap = renderer.rawSnapshot();
-      const hash = createHash('md5').update(snap).digest('hex');
-      if (hash === lastShotHash) return;
-      lastShotHash = hash;
-      usageLimitContent = snap;
-      const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-      png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    let png: Buffer;
+    let usageLimitContent = '';
+    const previousShotHash = lastShotHash;
+    let attemptedShotHash: string | null = null;
+    try {
+      // Preferred path: pipe-pane backends ask tmux for a fresh viewport
+      // snapshot and render it through a transient xterm-headless. This
+      // avoids the accumulated-buffer drift that produced duplicated /
+      // staircase content under the legacy long-lived renderer.
+      const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+      if (pipeResult) {
+        if (pipeResult.ansi === lastShotHash) return;
+        attemptedShotHash = pipeResult.ansi;
+        lastShotHash = attemptedShotHash;
+        png = pipeResult.png;
+        usageLimitContent = pipeResult.content;
+      } else {
+        // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
+        // still drive the long-lived renderer.
+        if (!renderer) { logScreenshotSkip('renderer=null'); return; }
+        const term = renderer.xterm;
+        const startY = term.buffer.active.baseY;
+        const snap = renderer.rawSnapshot();
+        const hash = createHash('md5').update(snap).digest('hex');
+        if (hash === lastShotHash) return;
+        attemptedShotHash = hash;
+        lastShotHash = attemptedShotHash;
+        usageLimitContent = snap;
+        const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+        const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+      }
+    } catch (err: any) {
+      logError(`Screenshot render failed: ${err?.message ?? err}`);
+      return;
     }
-  } catch (err: any) {
-    logError(`Screenshot render failed: ${err?.message ?? err}`);
-    return;
-  }
 
-  let imageKey: string;
-  try {
-    imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
-  } catch (err: any) {
-    logError(`Screenshot upload failed: ${err?.message ?? err}`);
-    return;
-  }
+    let imageKey: string;
+    try {
+      imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
+    } catch (err: any) {
+      // Do not clobber a newer reset (display-mode change/manual refresh) that
+      // happened while the request was pending. Otherwise restore the prior
+      // hash so the next regular tick retries this unchanged frame.
+      if (attemptedShotHash !== null && lastShotHash === attemptedShotHash) {
+        lastShotHash = previousShotHash;
+      }
+      logError(`Screenshot upload failed: ${err?.message ?? err}`);
+      return;
+    }
 
-  const status = projectedRuntimeScreenStatus();
-  // Success is otherwise completely silent (skips and failures log above), which
-  // made "loop alive and uploading" indistinguishable from "loop never started"
-  // in the daemon log. One throttled line keeps the happy path observable.
-  const nowMs = Date.now();
-  if (nowMs - lastUploadLogAtMs >= 60_000) {
-    lastUploadLogAtMs = nowMs;
-    log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    const status = projectedRuntimeScreenStatus();
+    // Success is otherwise completely silent (skips and failures log above), which
+    // made "loop alive and uploading" indistinguishable from "loop never started"
+    // in the daemon log. One throttled line keeps the happy path observable.
+    const nowMs = Date.now();
+    if (nowMs - lastUploadLogAtMs >= 60_000) {
+      lastUploadLogAtMs = nowMs;
+      log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    }
+    send({
+      type: 'screenshot_uploaded',
+      imageKey,
+      ...classifyScreenUsageLimit(usageLimitContent, status),
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  } finally {
+    screenshotCaptureInFlight = false;
   }
-  send({
-    type: 'screenshot_uploaded',
-    imageKey,
-    ...classifyScreenUsageLimit(usageLimitContent, status),
-    turnId: currentBotmuxTurnId,
-    dispatchAttempt: currentBotmuxDispatchAttempt,
-  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -14460,6 +14497,29 @@ async function spawnCli(
   const buildArgsWorkingDir = sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
+  // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
+  // runs. Computed here rather than in the wrapper-install block below because
+  // buildArgs runs first; these are pure path derivations, so naming them early
+  // is safe, and the block below is still what actually writes the files.
+  //
+  // Only the shim vars: the wrapper reads the identity file itself, keyed by
+  // SESSION_DATA_DIR + BOTMUX_SESSION_ID, which the pane already carries. No
+  // credential is passed through this channel.
+  const identityShellEnv: Record<string, string> = {};
+  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
+    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
+    identityShellEnv.ZDOTDIR = join(dir, 'shell');
+    identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+    // git runs as a shell subprocess too, so askpass needs the same forwarding
+    // or a push carries the machine's identity. Declared only when bytedcli is
+    // governed — that is the exact condition under which installGitAskpass
+    // writes the file, and pointing GIT_ASKPASS at a missing path would break
+    // git prompts rather than fall back.
+    if (cfg.triggerUserAuth.tools.includes('bytedcli')) {
+      identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
+    }
+  }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -14482,6 +14542,14 @@ async function spawnCli(
     // adapters (claude-code/genius/grok build it via buildBotmuxSystemPromptText).
     // Reuses the same predicate computed above for the persistent-pane guard.
     noTransport: noTransportSession,
+    // Trigger-user auth on → the system prompt gains the credential-boundary
+    // block. It is a behavioral rule, not a control: nothing in the OS stops the
+    // agent from reading another person's token file today, and the likeliest
+    // way that happens is an agent grepping the data dir to debug an auth error.
+    triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
+    // Adapters whose CLI filters the environment of the shell commands it runs
+    // (codex) re-declare these; the rest ignore them and inherit normally.
+    ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,
@@ -14613,6 +14681,131 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  // Trigger-user CLI auth: shadow the governed tools with wrappers that source
+  // the identity the daemon publishes per turn. The dir is per SESSION and
+  // prepended only for a bot that enabled the policy — a wrapper in the shared
+  // ~/.botmux/bin would shadow lark-cli for every bot on this machine, and for
+  // the operator's own shell, neither of which asked for it.
+  //
+  // The real binary is resolved from the PATH we are about to hand the child,
+  // with the wrapper dir excluded, so a wrapper can never resolve to itself.
+  const triggerUserAuthPolicy = cfg.triggerUserAuth;
+  if (triggerUserAuthPolicy?.enabled && process.env.SESSION_DATA_DIR) {
+    const wrapperDir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    // Pre-create the identity files so they survive the sandbox's
+    // existence-filter (it drops allow paths that do not exist at spawn, and a
+    // dropped path would leave the wrapper unable to read what the daemon later
+    // publishes — the session would silently run without the sender's identity).
+    // Empty is the correct initial content: no identity is published until the
+    // first turn resolves one, and the wrapper treats an empty file as "no
+    // identity", the same as absent.
+    try {
+      ensureSessionIdentityPlaceholders(
+        process.env.SESSION_DATA_DIR,
+        cfg.sessionId,
+        triggerUserAuthPolicy.tools,
+      );
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
+    }
+    let installedAny = false;
+    for (const tool of triggerUserAuthPolicy.tools) {
+      try {
+        const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
+        if (!real) {
+          log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+          continue;
+        }
+        installIdentityWrapper(wrapperDir, tool, real);
+        installedAny = true;
+        log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
+      } catch (e) {
+        // A missing wrapper means the tool keeps its previous behavior; it must
+        // not stop the session from starting.
+        log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
+      }
+    }
+    // Every governed tool failed to wrap, yet the policy is on. The session
+    // then runs completely unprotected while the operator believes otherwise —
+    // the failure mode observed in production, where the agent cheerfully
+    // reported `identity: user` (the machine account) as "normal". Absence of a
+    // wrapper is invisible by nature, so it has to be said out loud.
+    if (!installedAny) {
+      log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
+        + 'trigger-user identity; calls will use whatever credentials the machine has');
+    }
+    if (installedAny) {
+      childEnv.PATH = prependBotmuxBin(wrapperDir, childEnv.PATH);
+      // A prepend alone loses to path_helper in the login shell the agent's
+      // tool calls run through — see installLoginShellPathShim. These three
+      // vars put the wrapper dir back in front after the system startup files
+      // have run, without touching the user's dotfiles.
+      try {
+        const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+        childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+        childEnv.ZDOTDIR = zdotdir;
+        childEnv.BASH_ENV = bashEnv;
+      } catch (e) {
+        // Without the shim a login shell resolves the REAL tool, which is the
+        // silent-bypass this feature exists to prevent. Say so loudly rather
+        // than letting the session look protected while it is not.
+        log(`[trigger-user-auth] WARN login-shell PATH shim not installed (${(e as Error).message}); `
+          + `tool calls made through a login shell may bypass the identity wrapper`);
+      }
+    }
+    // Git attribution: a push over HTTPS to Codebase authenticates with a
+    // Codebase JWT, which git mints via GIT_ASKPASS and which reads none of the
+    // env vars above. Without this, work pushed on someone's behalf carries the
+    // machine's identity — and "who opened this MR" is exactly what this feature
+    // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
+    // per-turn identity with no second credential path to keep in sync.
+    if (triggerUserAuthPolicy.tools.includes('bytedcli')
+        && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
+      try {
+        const askpass = installGitAskpass(
+          wrapperDir,
+          true,
+          triggerUserAuthPolicy.gitTokenExchangeUrl,
+        );
+        if (askpass) {
+          childEnv.GIT_ASKPASS = askpass;
+          // Bind the helper to the configured code host and rewrite SSH remotes
+          // to HTTPS for it. Without the rewrite, a repo cloned over SSH keeps
+          // authenticating with the machine's key and the attribution chain
+          // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
+          // ~/.gitconfig is never touched.
+          if (triggerUserAuthPolicy.gitHost) {
+            Object.assign(childEnv, gitIdentityConfigEnv(askpass, triggerUserAuthPolicy.gitHost));
+            log(`[trigger-user-auth] git pushes to ${triggerUserAuthPolicy.gitHost} authenticate as the acting user`);
+          } else {
+            log('[trigger-user-auth] git askpass installed; set triggerUserAuth.gitHost to also force HTTPS for a code host');
+          }
+        }
+      } catch (e) {
+        log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
+      }
+    }
+    // Say plainly how protected the token store actually is. Without the file
+    // sandbox the agent runs as the same OS user as botmux and can read every
+    // person's token file directly; per-person storage fixes attribution and the
+    // overwrite bug, but only the sandbox makes the isolation OS-enforced.
+    // Logged rather than enforced: refusing to run would push operators away
+    // from a change that helps either way, and implying isolation we do not have
+    // would be worse than both.
+    const protection = tokenStoreProtection(sandboxRequested);
+    if (protection.advisory) log(`[trigger-user-auth] NOTE ${protection.advisory}`);
+    // An MCP server with its own app credentials never execs a wrapped CLI, so
+    // this policy does not reach it: the agent can still act under an identity
+    // unrelated to the current sender. Warn rather than block — a self-configured
+    // client has legitimate uses and botmux does not own it — but do not stay
+    // silent, or the operator will believe the boundary is complete.
+    try {
+      const selfCredentialed = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+      if (selfCredentialed) log(`[trigger-user-auth] NOTE ${selfCredentialed}`);
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not scan MCP configs: ${(e as Error).message}`);
+    }
+  }
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
@@ -15807,6 +16000,33 @@ async function spawnCli(
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
+    if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
+      // Wrap the command executed INSIDE the pane, not `tmux new-session`.
+      // The shared tmux server keeps its own cgroup while the owned CLI and all
+      // of its command descendants enter this per-session scope.
+      // If a prior worker crashed after its pane vanished, retire any detached
+      // descendant still held by this exact logical session's old scope before
+      // reusing the deterministic unit name.
+      stopSessionScope(cfg.sessionId);
+      const scoped = wrapCommandInSessionScope(
+        cfg.sessionId,
+        spawnBin,
+        spawnArgs,
+        readGlobalConfig().worker,
+      );
+      spawnBin = scoped.bin;
+      spawnArgs = scoped.args;
+      if (scoped.unitName) {
+        log(
+          `Launching owned CLI in ${scoped.unitName}`
+          + (scoped.capabilities.memoryControllerSupported
+            ? ' (memory controller verified)'
+            : ' (scope cleanup only; MemoryMax not enforceable)'),
+        );
+      } else if (scoped.capabilities.reason) {
+        log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
+      }
+    }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
@@ -16904,6 +17124,19 @@ function killCli(opts: {
   appRunnerControlDecoder.reset();
 }
 
+function stopOwnedSessionScope(reason: string): void {
+  const cfg = lastInitConfig;
+  if (!cfg || cfg.adoptMode || isRemoteBackendType(effectiveBackendType)) return;
+  try {
+    const stopped = stopSessionScope(cfg.sessionId);
+    log(stopped
+      ? `Stopped owned session scope (${reason})`
+      : `Owned session scope was absent or could not be stopped (${reason})`);
+  } catch (error) {
+    log(`Failed to stop owned session scope (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
@@ -16997,6 +17230,7 @@ async function restartCliProcess(
         ));
         return;
       }
+      stopOwnedSessionScope('restart');
       killCli({
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
@@ -17665,10 +17899,15 @@ body.touch.has-token #terminal .xterm{
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+/* 16px is a hard floor, not a taste call: iOS Safari / WKWebView auto-zooms the
+   page whenever a focused form control renders below 16px, and it never zooms
+   back out — the terminal is left scaled up with its right-hand columns off
+   screen. -webkit-text-size-adjust does NOT prevent that (it only stops the
+   text-inflation algorithm), so the size itself has to be 16px. */
 #mobile-input{
   flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
   padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
-  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
@@ -18741,11 +18980,11 @@ if(isTouch&&hasToken){(function(){
     mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
 
   // Buffer mode types the text into the CLI's own input box WITHOUT submitting
-  // (the payload ends in a newline, which a TUI treats as "insert", not "run"),
-  // so the button is labelled 上屏 there and the user presses the Enter key once
-  // the text looks right. Live mode's button really does submit (it appends a
-  // carriage return), so it keeps 发送 — same reason the mode button spells out
-  // the extra Enter step.
+  // (it sends the text and nothing else — no trailing newline, which a TUI would
+  // insert as a literal line break rather than run), so the button is labelled
+  // 上屏 there and the user presses the Enter key once the text looks right. Live
+  // mode's button really does submit (it appends a carriage return), so it keeps
+  // 发送 — same reason the mode button spells out the extra Enter step.
   function setMode(m){mode=m;bar.setAttribute('data-mode',m);
     modeBtn.textContent=m===LIVE?'实时':'缓冲';
     sendBtn.textContent=m===LIVE?'发送':'上屏';
@@ -18764,17 +19003,28 @@ if(isTouch&&hasToken){(function(){
     measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
-  function sendBuffered(appendEnter){
+  // 上屏 puts the text into the CLI's own input box and stops there — the user
+  // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
+  // lands inside that box as a literal line break (a TUI reads it as "insert"),
+  // so the text showed up with a stray empty line after it. Only the Enter key
+  // (or live mode's own commit) sends the \\r that actually runs the command.
+  function sendBuffered(){
     var text=ta.value;
-    var payload=appendEnter?text+'\\n':text;
-    if(!payload)return;
-    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
+    if(!text)return;
+    if(!sendInput(text.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
     if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
-  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+  // An EMPTY box in buffer mode still has to submit: after 上屏 the text is on the
+  // terminal and the box was cleared, and pressing Enter is literally step 3 of
+  // the 上屏 → 检查 → Enter flow this bar is built around. sendBuffered() bails on
+  // empty text, and the keydown handler has already called preventDefault(), so
+  // routing there would make the key vanish entirely. Send the \\r the key-row ⏎
+  // button already sends in this exact state — same reasoning as the empty-box
+  // Backspace below: an empty box has no draft, so the key belongs to the terminal.
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else if(ta.value)sendBuffered();else sendInput('\\r');}
 
   // shortcut keys row
   var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
@@ -18783,7 +19033,11 @@ if(isTouch&&hasToken){(function(){
   var REPEAT_DELAY=450,REPEAT_EVERY=60;
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
+    // Set once a repeat tick has actually fired, so the click the browser sends
+    // when the finger lifts can be swallowed instead of adding one more hit.
+    var suppressTrailingClick=false;
     btn.addEventListener('click',function(){btn.blur();
+      if(suppressTrailingClick){suppressTrailingClick=false;return;}
       var act=btn.getAttribute('data-sk');
       if(act==='paste'){
         // Commit pending live text before the async clipboard result lands.
@@ -18798,13 +19052,16 @@ if(isTouch&&hasToken){(function(){
     // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
     // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
     // repeating Enter would fire the command several times, repeating Ctrl-C
-    // would spray interrupts. The first hit still comes from the click handler
-    // above (so a plain tap keeps working, mouse included); this only adds the
-    // follow-up ticks after the finger has stayed down past REPEAT_DELAY.
+    // would spray interrupts. A plain tap is still served by the click handler
+    // above (mouse included); this adds the follow-up ticks once the finger has
+    // stayed down past REPEAT_DELAY. Note a click event fires when the finger
+    // LIFTS, so on a long press it lands AFTER the ticks — it is swallowed above
+    // so a 1.2s hold deletes exactly as many characters as it showed ticks.
     if(REPEATABLE[btn.getAttribute('data-sk')]){
       var holdT=null,holdIv=null;
       var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
       btn.addEventListener('pointerdown',function(){
+        suppressTrailingClick=false;
         stopHold();
         holdT=setTimeout(function(){
           holdIv=setInterval(function(){
@@ -18814,7 +19071,8 @@ if(isTouch&&hasToken){(function(){
             if(btn.disabled){stopHold();return;}
             var seq=sk[btn.getAttribute('data-sk')];
             var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
-            if(!ok)stopHold();
+            if(!ok){stopHold();return;}
+            suppressTrailingClick=true;
           },REPEAT_EVERY);
         },REPEAT_DELAY);
       });
@@ -18826,9 +19084,38 @@ if(isTouch&&hasToken){(function(){
     }
   })(keyBtns[i]);}
 
+  // Tapping ANY bar button must not blur the textarea. iOS retracts the
+  // software keyboard the moment the focused element loses focus, and this bar
+  // rides above the keyboard (transform: -var(--keyboard-inset)) — so the
+  // keyboard closing yanks the whole bar down by ~300px while the finger is
+  // still on the glass. The button the user aims at next has moved, which is
+  // exactly the mis-tap being reported. Cancelling pointerdown suppresses the
+  // pointer-initiated focus transfer; click, form submit, :active feedback and
+  // the key row's horizontal scroll all still work (verified in a real
+  // browser — Backspace/Ctrl-C/mode/上屏 all kept focus on #mobile-input).
+  // Buttons only: the textarea itself must keep focusing and placing its caret,
+  // and Tab focus is unaffected because only pointer-driven focus is cancelled.
+  // Static NodeList, captured once: the bar's buttons must stay in the initial
+  // markup. A button added later would miss this handler AND the disable pass
+  // over 'controls' below, so both regress together rather than silently apart.
+  var barBtns=bar.querySelectorAll('button');
+  for(var bbi=0;bbi<barBtns.length;bbi++){
+    barBtns[bbi].addEventListener('pointerdown',function(e){e.preventDefault();});
+  }
+
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
     if(mode===LIVE&&!sendLiveKey(''))return;
+    // Entering live must flush the staged buffer text too, for the same reason:
+    // live means "what the box holds is already in the terminal", and the mirror
+    // is reset to empty just below. Leaving text in the textarea breaks that
+    // invariant AND is invisible (live renders the textarea transparent), so the
+    // next keystroke would diff '' → 'hello…' and INSERT the stale text into the
+    // terminal instead of editing it. Flush it the way 上屏 does — insert without
+    // submitting — rather than silently discarding what the user typed.
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();}
     setMode(mode===LIVE?BUFFER:LIVE);
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
@@ -18846,6 +19133,22 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
       sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    // Backspace on an EMPTY textarea has to be forwarded by hand, in BOTH modes.
+    // Live mode otherwise only ever sends what the 'input' listener diffs, and
+    // buffer mode does not send keystrokes at all — but deleting from an empty
+    // box changes nothing, so the browser fires beforeinput and NO input event
+    // (verified in a real browser). Either way the keystroke evaporates.
+    // An empty box has no draft to edit, so the only thing Backspace can
+    // sensibly mean there is "delete on the terminal" — which is exactly what
+    // the bottom bar's ⌫ (aria-label 删除终端字符) already does in both modes.
+    // Leaving it mode-gated made the two disagree in the same visible state:
+    // after 上屏 the box is empty and the text is on the terminal, yet the
+    // system keyboard could not erase it while ⌫ could.
+    // Non-empty is still left alone so a pending IME draft edits locally
+    // instead of eating terminal characters.
+    if(!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+      e.preventDefault();
+      sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
   setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
@@ -20211,6 +20514,7 @@ process.on('message', async (raw: unknown) => {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
+      stopOwnedSessionScope('close');
       killCli();
       // Bridge marker + turn-journal files outlive a single CLI process (kept
       // across restarts so a mid-flight send is still credited and an
@@ -20484,6 +20788,7 @@ process.on('message', async (raw: unknown) => {
         if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      stopOwnedSessionScope('suspend');
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the

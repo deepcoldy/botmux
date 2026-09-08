@@ -208,11 +208,25 @@ export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
  *    client env can't override, so the shell wrapper `unset`s them before exec
  *    (see SHELL_WRAPPER_SCRIPT in tmux-backend.ts).
  */
+export const COMPANION_STARTUP_ENV_KEYS = [
+  'BOTMUX_COMPANION_SECRET_FILE',
+  'BOTMUX_COMPANION_BOT_APP_ID',
+] as const;
+
+/** Remove companion authority from processes that never serve its API. */
+export function stripCompanionStartupEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of COMPANION_STARTUP_ENV_KEYS) delete env[key];
+}
+
 export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Startup-only private secret-file path. A session CLI is not the local
+  // companion process and must not learn even the credential's location.
+  // Kept as a literal because this boundary module is dependency-free.
+  ...COMPANION_STARTUP_ENV_KEYS,
   // Dashboard-only Feishu H5 login config/credential family — see
   // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
   // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend
@@ -413,6 +427,27 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
+  // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
+  // NOT from childEnv, so the worker's PATH prepend never reaches it — these
+  // three are how the wrapper dir gets back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // Without them on this allowlist the whole feature is inert in a tmux pane:
+  // every governed call silently resolves the real tool and runs as the machine
+  // account.
+  'BOTMUX_IDENTITY_BIN',
+  'ZDOTDIR',
+  'BASH_ENV',
+  // Git attribution for the acting person. Same reason: askpass and the
+  // per-host credential config are set on childEnv, which a tmux pane does not
+  // inherit, so a push would carry the machine's identity instead.
+  'GIT_ASKPASS',
+  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
+  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
+  // a prefix rule here would widen what any session can push into a pane.
+  'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',

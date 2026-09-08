@@ -196,6 +196,30 @@ export async function bindOncall(
 }
 
 /**
+ * PUT /api/groups/:chatId/name/:appId — rename a group through one explicit
+ * bot identity. The selected daemon validates membership and the Lark name.
+ */
+export async function renameGroup(
+  chatId: string,
+  appId: string,
+  bodyRaw: string,
+  deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(
+    appId,
+    `/api/groups/${encodeURIComponent(chatId)}/name`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: bodyRaw || '{}',
+    },
+  );
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/**
  * DELETE /api/groups/:chatId/oncall/:appId — unbind the per-(chat × bot)
  * oncall. Internal proxy path is `/api/oncall/:chatId` DELETE.
  */

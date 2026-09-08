@@ -30,11 +30,6 @@ let prevCodexHome: string | undefined;
 let prevScale: string | undefined;
 let ownerChild: ChildProcessWithoutNullStreams;
 let rolloutB: string;
-/** Deferred timers scheduled by a test's onEnter. writeInput retries Enter, so
- *  onEnter can fire several times; track every timer and clear them in afterEach
- *  so none survives to append to an already-removed home dir (→ uncaught ENOENT
- *  that poisons later tests / fails CI). */
-let pendingTimers: ReturnType<typeof setTimeout>[] = [];
 
 /** A rollout file under `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl`. */
 function rolloutPath(root: string, sid: string): string {
@@ -87,8 +82,6 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  for (const t of pendingTimers) clearTimeout(t);
-  pendingTimers = [];
   if (ownerChild && !ownerChild.killed) ownerChild.kill('SIGKILL');
   if (home) rmSync(home, { recursive: true, force: true });
   if (prevScale === undefined) delete process.env.BOTMUX_TIME_SCALE; else process.env.BOTMUX_TIME_SCALE = prevScale;
@@ -146,22 +139,24 @@ describe('codex writeInput history ownership filter', () => {
   it('does not wedge when ONLY the foreign line exists yet — waits, then binds B once B lands', async () => {
     const historyPath = join(home, 'history.jsonl');
     const adapter = createCodexAdapter();
-    // On submit only A appears; B's line arrives shortly after (separate tick).
-    // writeInput retries Enter, so guard the deferred B-append one-shot and track
-    // the timer so afterEach can clear it (no append into a removed home dir).
-    let scheduledB = false;
+    // The first Enter only exposes A. Once writeInput has rejected that foreign
+    // match and exhausted its first bounded wait, its retry is the observable
+    // happens-before boundary that publishes B. This preserves the intended
+    // "foreign first, owned later" ordering without racing a wall-clock timer.
+    let enterCount = 0;
     const onEnter = () => {
-      appendFileSync(historyPath, historyLine(SID_A, 'ping'));
-      if (scheduledB) return;
-      scheduledB = true;
-      pendingTimers.push(setTimeout(() => {
-        try { appendFileSync(historyPath, historyLine(SID_B, 'ping')); } catch { /* home may be gone if test already resolved */ }
-      }, 20));
+      enterCount += 1;
+      if (enterCount === 1) {
+        appendFileSync(historyPath, historyLine(SID_A, 'ping'));
+      } else if (enterCount === 2) {
+        appendFileSync(historyPath, historyLine(SID_B, 'ping'));
+      }
     };
 
     const result = await adapter.writeInput!(fakePty(ownerChild.pid!, onEnter), 'ping');
     // Must NOT have taken A; must eventually bind B (not a permanent no-match).
     expect((result as any)?.cliSessionId).toBe(SID_B);
+    expect(enterCount).toBe(2);
   });
 
   it('with NO pid, preserves accept-first semantics (single-pane / pid-less callers unchanged)', async () => {

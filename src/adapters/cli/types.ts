@@ -160,6 +160,20 @@ export interface CliAdapter {
      *  session-manager's buildBotmuxShellHints. Adapters without a routing block
      *  ignore it. */
     noTransport?: boolean;
+    /** Trigger-user CLI auth is enabled for this bot. injectsSessionContext
+     *  adapters forward it so the credential-boundary block is added to the
+     *  system prompt: the session acts with ONE person's credentials while the
+     *  on-disk store holds everyone else's, and nothing in the OS currently
+     *  stops an agent from reading those files. Off → no extra prompt text. */
+    triggerUserAuth?: boolean;
+    /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
+     *  itself. Codex does not pass its own environment to shell subprocesses,
+     *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /
+     *  BASH_ENV / GIT_ASKPASS …) are stripped before `lark-cli` ever runs and
+     *  the tool resolves the machine's own login instead. Adapters whose CLI
+     *  has such a knob declare these keys; the rest ignore the field, since for
+     *  them a plain child inherits the environment anyway. */
+    shellSubprocessEnv?: Record<string, string>;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

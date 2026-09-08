@@ -663,6 +663,8 @@ describe('detachedRestartEnv', () => {
         BOTMUX_RESTART_LEASE_ID: leaseId,
         BOTMUX_RESTART_LEASE_DIR: dir,
         WEB_HOST: 'must-not-be-revived',
+        BOTMUX_COMPANION_SECRET_FILE: '/run/secrets/companion',
+        BOTMUX_COMPANION_BOT_APP_ID: 'local_test_bot',
         [DETACHED_RESTART_ENV_REFRESH]: '1',
         [DETACHED_RESTART_ENV_FALLBACK]: '{bad json',
       };
@@ -670,9 +672,17 @@ describe('detachedRestartEnv', () => {
       const context = prepareRestartDriverContext(env, process.pid, now + 1);
       expect(context).toEqual({
         refreshPersistedEnv: true,
-        readFailureFallback: { WEB_HOST: 'must-not-be-revived' },
+        readFailureFallback: {
+          WEB_HOST: 'must-not-be-revived',
+          BOTMUX_COMPANION_SECRET_FILE: '/run/secrets/companion',
+          BOTMUX_COMPANION_BOT_APP_ID: 'local_test_bot',
+        },
       });
-      expect(env).toEqual({});
+      expect(env).toMatchObject({
+        BOTMUX_COMPANION_SECRET_FILE: '/run/secrets/companion',
+        BOTMUX_COMPANION_BOT_APP_ID: 'local_test_bot',
+      });
+      expect(env.WEB_HOST).toBeUndefined();
       expect(resolveFleetDaemonEnv(env, { status: 'failed' }, context).WEB_HOST)
         .toBe('must-not-be-revived');
     } finally {

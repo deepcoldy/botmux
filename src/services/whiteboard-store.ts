@@ -9,7 +9,7 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
-import { mutateSessionRowWhenUnowned } from './session-offline-write.js';
+import { applySessionCommandAsHost } from './session-command-host.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -446,8 +446,8 @@ type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
  * Clear one session's binding to a board that is being deleted.
  *
  * Daemon up: send the command, so the row that persists is the daemon's own.
- * Daemon down: publish the row here, under the store's write exclusion and the
- * occupancy re-check in {@link mutateSessionRowWhenUnowned}.
+ * Daemon down: apply the same command here, under the store's write exclusion
+ * and the occupancy re-check in {@link applySessionCommandAsHost}.
  *
  * Both paths are compare-and-set against `boardId`. Deletion has already
  * removed the board from the index by the time this runs, so the daemon's
@@ -483,20 +483,20 @@ async function unbindSessionWhiteboard(
       }
     } catch { /* fall through: the re-probe below decides whether we may write */ }
   }
-  let changed = false;
-  const published = mutateSessionRowWhenUnowned(
+  const published = applySessionCommandAsHost(
     { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
-    (current) => {
-      const row = current as unknown as SessionWhiteboardRef;
-      if (row.whiteboardId !== boardId) return false;
-      row.whiteboardId = undefined;
-      changed = true;
-      return true;
-    },
+    { type: 'whiteboard', whiteboardId: null, expectWhiteboardId: boardId },
     { dataDir },
   );
-  if (!published) return 'unresolved';
-  return changed ? 'cleared' : 'already_changed';
+  switch (published.outcome) {
+    case 'applied': return 'cleared';
+    // The fresh row no longer points at this board (or already dropped it).
+    case 'noop':
+    case 'refused': return 'already_changed';
+    case 'owned':
+    case 'missing':
+    case 'contended': return 'unresolved';
+  }
 }
 
 /**

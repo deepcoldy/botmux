@@ -146,8 +146,11 @@
 ```
 
 - 需要先在同一 OS 用户的 Chrome / Edge 中安装并启用 Codex 浏览器扩展；Botmux 默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存中选择最新完整版本。只有维护自定义插件目录时才填写绝对路径 `pluginRoot`。
-- 开启后仅给新建的 Codex App thread 注册一个 `botmux_browser` 动态工具。旧 thread 不会被原地改写，请新开一个飞书话题 / 会话验证。
-- 工具只暴露标签页、可访问性树交互、导航和截图等高层操作，不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史、剪贴板或文件传输。
+- 需要安装 Codex 桌面端附带的浏览器运行时。桥接优先使用 `mcp_servers.node_repl` 配置；桌面端移除该 MCP 注册项时，会从已安装的桌面端定位运行时，自定义安装位置可设置 `BOTMUX_CODEX_NODE_REPL_PATH`。身份、站点安全状态和功能配置均走官方认证请求通道，不自行读取或保存登录令牌；运行时缺失或登录失败时会中止操作，不降级为匿名请求。
+- 开启后会在新建和恢复 Codex App thread 时注册 `botmux_browser` 动态工具。已运行的 runner 需重启或重新恢复会话，才能加载更新后的工具定义。
+- 工具先按标签页探测能力：优先使用可访问性树；AX 不可用时自动回退到可见 DOM / Playwright DOM，并提供受类型约束的 Playwright locator、DOM 和坐标交互。不会因为某个后端缺少 `tab.ax` 而中断整个 Chrome 连接。
+- Browser Use 发出的站点访问、上传、下载等安全确认会阻塞当前操作并投射为飞书授权卡；只有通过 Botmux `canTalk` 校验的用户可以选择“本会话允许 / 始终允许 / 拒绝”，回答和回答人由 Botmux ask 记录。普通“允许”也只授予当前 runner 会话，后续同一站点、操作类型和风险上下文自动复用；不同站点、操作类型、风险上下文或新会话仍会重新确认。拒绝、超时、daemon 不可达均 fail closed。
+- 工具不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史或剪贴板。上传/下载只通过 Browser Use 的受控文件选择器和安全确认执行；需要密码等秘密输入的 secure browser-auth 流程不会降级到普通飞书卡片，必须由支持安全凭证 broker 的客户端处理。
 - 每个 Botmux runner 独立持有浏览器会话状态；默认关闭，未配置的 bot 启动参数和行为完全不变。
 - 当前不支持与 `existingAppServer`、`sandbox` 或 `readIsolation` 组合，配置冲突会在启动时直接报错，避免以不完整隔离边界运行。
 

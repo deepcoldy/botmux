@@ -87,11 +87,13 @@ import {
   findActiveSessionsByRoot,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
-  mutateSessionRowOffline,
+  applySessionCommandUnowned,
+  readSessionRowUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
 } from '../src/services/session-store.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
+import { withFileLockSync } from '../src/utils/file-lock.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -978,9 +980,28 @@ describe('closeSession()', () => {
     closeSession(session.sessionId);
     const secondClosedAt = getSession(session.sessionId)!.closedAt;
 
-    // closedAt gets updated on second close
-    expect(secondClosedAt).toBeDefined();
+    // Re-close is a noop: original closedAt is kept.
+    expect(secondClosedAt).toBe(firstClosedAt);
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+
+  it('parks a residual on an already-closed row without refreshing closedAt', () => {
+    const session = createSession('chat1', 'root1', 'Reclose Park Residual');
+    closeSession(session.sessionId);
+    const firstClosedAt = getSession(session.sessionId)!.closedAt;
+
+    closeSession(session.sessionId, {
+      parkLocalResidual: 'local_subtree_boundary_unproven',
+      parkMojoLineage: 'mojo-late',
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      closedAt: firstClosedAt,
+      mojoLocalResidual: 'local_subtree_boundary_unproven',
+      mojoQuarantinedLineage: 'mojo-late',
+      mojoQuarantineNoticePending: true,
+    });
   });
 });
 
@@ -1623,58 +1644,82 @@ describe('readSessionRowCopiesAcrossStores()', () => {
   });
 });
 
-describe('mutateSessionRowOffline()', () => {
-  it('mutates the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
+describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
+  it('applies the command to the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
     // The row gained a newer field on disk after the caller took its snapshot.
     // The old cli.ts saveSession() would have written the stale snapshot back,
-    // erasing workerGeneration; the exclusive row mutation must preserve it.
+    // erasing workerGeneration; the exclusive row apply must preserve it.
     seedStore('appA', { s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }) });
 
-    const published = mutateSessionRowOffline(
+    const published = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      current => {
-        current.status = 'closed';
-        current.closedAt = '2026-08-13T00:00:00.000Z';
-        return true;
-      },
+      { type: 'close' },
       { dataDir: tempDir },
     );
 
-    expect(published?.status).toBe('closed');
-    expect(published?.workerGeneration).toBe(7);
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed', workerGeneration: 7 } });
     const onDisk = readPersistedSessionRows(tempDir, 'appA');
     expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.closedAt).toBeTruthy();
     expect(onDisk.s1.workerGeneration).toBe(7);
   });
 
-  it('returns the fresh row without writing when mutate declines', () => {
+  it('reads the fresh row without writing', () => {
     seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
-    const current = mutateSessionRowOffline(
+    const read = readSessionRowUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      () => false,
       { dataDir: tempDir },
     );
-    expect(current?.sessionId).toBe('s1');
+    expect(read).toMatchObject({ outcome: 'ok', row: { sessionId: 's1', status: 'active' } });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
-  it('returns undefined for a missing row', () => {
-    seedStore('appA', { s1: row('s1') });
-    expect(mutateSessionRowOffline(
-      { sessionId: 'ghost', larkAppId: 'appA' },
-      () => true,
+  it('a re-applied close is a noop that keeps the original closedAt', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA', status: 'closed', closedAt: '2026-08-13T00:00:00.000Z' }) });
+    const result = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
       { dataDir: tempDir },
-    )).toBeUndefined();
+    );
+    expect(result).toMatchObject({ outcome: 'noop', row: { status: 'closed', closedAt: '2026-08-13T00:00:00.000Z' } });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.closedAt).toBe('2026-08-13T00:00:00.000Z');
   });
 
-  it('aborts untouched when abortIf trips at entry', () => {
-    seedStore('appA', { s1: row('s1') });
-    const result = mutateSessionRowOffline(
+  it('refuses with row_changed when the adoption precondition no longer holds', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA', adoptedFrom: { source: 'tmux', tmuxTarget: 'u:1.0' } }) });
+    const result = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      current => { current.status = 'closed'; return true; },
-      { dataDir: tempDir, abortIf: () => true },
+      { type: 'close' },
+      { dataDir: tempDir, expectAdopted: false },
     );
-    expect(result).toBeUndefined();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'row_changed' });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
+  });
+
+  it('reports missing for an absent row', () => {
+    seedStore('appA', { s1: row('s1') });
+    expect(applySessionCommandUnowned(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'missing' });
+    expect(readSessionRowUnowned(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'missing' });
+  });
+
+  it('yields owned untouched when abortIf trips at entry — for the read as well as the apply', () => {
+    seedStore('appA', { s1: row('s1') });
+    expect(applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir, abortIf: () => true },
+    )).toEqual({ outcome: 'owned' });
+    expect(readSessionRowUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { dataDir: tempDir, abortIf: () => true },
+    )).toEqual({ outcome: 'owned' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
@@ -1684,24 +1729,24 @@ describe('mutateSessionRowOffline()', () => {
     // orders writers but cannot see a daemon holding a stale in-memory cache.
     seedStore('appA', { s1: row('s1') });
     let probes = 0;
-    const result = mutateSessionRowOffline(
+    const result = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      current => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir, abortIf: () => ++probes > 1 },
     );
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ outcome: 'owned' });
     expect(probes).toBe(2);
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
   it('targets the legacy store when the row carries no larkAppId', () => {
     seedStore(undefined, { s1: row('s1') });
-    const published = mutateSessionRowOffline(
+    const published = applySessionCommandUnowned(
       { sessionId: 's1' },
-      current => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir },
     );
-    expect(published?.status).toBe('closed');
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
     expect(readPersistedSessionRows(tempDir).s1.status).toBe('closed');
   });
 
@@ -1710,11 +1755,11 @@ describe('mutateSessionRowOffline()', () => {
     // empty store here, the owning daemon's `existsSync(db)` gate would skip
     // the one-shot JSON import and silently discard every pre-SQLite row.
     mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
-    expect(mutateSessionRowOffline(
+    expect(applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      () => true,
+      { type: 'close' },
       { dataDir: tempDir },
-    )).toBeUndefined();
+    )).toEqual({ outcome: 'missing' });
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 
@@ -1724,13 +1769,27 @@ describe('mutateSessionRowOffline()', () => {
     // fork the two representations behind that daemon's back — and the empty
     // store would also disable its one-shot import gate.
     seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    const published = mutateSessionRowOffline(
+    const published = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      current => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir },
     );
-    expect(published?.status).toBe('closed');
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
+
+  it('reports contended (not missing) when the JSON store file lock is held past its wait', () => {
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    const held = withFileLockSync(
+      join(tempDir, 'sessions-appA.json'),
+      () => applySessionCommandUnowned(
+        { sessionId: 's1', larkAppId: 'appA' },
+        { type: 'close' },
+        { dataDir: tempDir },
+      ),
+    );
+    expect(held).toEqual({ outcome: 'contended' });
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
+  }, 15_000);
 });

@@ -456,6 +456,40 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
   });
 
+  // Codex does NOT hand its own environment to the shell commands it runs, so
+  // the trigger-user wrapper vars have to be declared explicitly or `lark-cli`
+  // resolves the machine's login instead of the acting person's. Shipped broken
+  // exactly this way: worker set them, tmux forwarded them, codex stripped them.
+  it('forwards the trigger-user identity vars to shell subprocesses', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua',
+      resume: false,
+      shellSubprocessEnv: {
+        BOTMUX_IDENTITY_BIN: '/data/cli-identity/sess-tua.bin',
+        ZDOTDIR: '/data/cli-identity/sess-tua.bin/shell',
+      },
+    });
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/data/cli-identity/sess-tua.bin"');
+    expect(args).toContain('shell_environment_policy.set.ZDOTDIR="/data/cli-identity/sess-tua.bin/shell"');
+  });
+
+  // `.set` per key, never `inherit="all"`: that would hand every shell command
+  // the entire worker environment for a need that is exactly three variables.
+  it('does not widen the policy to inherit everything', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua', resume: false,
+      shellSubprocessEnv: { BOTMUX_IDENTITY_BIN: '/data/x.bin' },
+    });
+    expect(args).not.toContain('shell_environment_policy.inherit="all"');
+  });
+
+  it('adds nothing when trigger-user auth is off', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-plain', resume: false });
+    expect(args.filter(a => a.startsWith('shell_environment_policy.set.'))).toEqual([
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-plain"',
+    ]);
+  });
+
   it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-rpc', resume: true,

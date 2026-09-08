@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   AUTOSTART_UNIT_ENV,
+  autostartPath,
   consumeAutostartUnitMarker,
   launchProgram, launchCommand, unitContent, plistContent, windowsScriptContent,
   type AutostartOpts,
@@ -116,6 +117,17 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(unitContent(nodeOpts())).toContain(`Environment=${AUTOSTART_UNIT_ENV}=1`);
   });
 
+  it('does not persist TRAE session shims into boot-hook PATH', () => {
+    const transient = '/home/u/.trae/tmp/arg0/traecli-random';
+    const stable = '/home/u/.local/bin:/usr/bin:/bin';
+    const renderedOpts = opts({ environmentPath: `${transient}:${stable}` });
+
+    expect(unitContent(renderedOpts)).toContain(`Environment=PATH=${stable}`);
+    expect(plistContent(renderedOpts)).toContain(`<string>${stable}</string>`);
+    expect(unitContent(renderedOpts)).not.toContain(transient);
+    expect(plistContent(renderedOpts)).not.toContain(transient);
+  });
+
   it('the rendered ExecStart actually starts botmux (not: prints help and exits 0)', () => {
     // THE HEART OF THE BUG. A string assertion alone would have passed even in
     // production, because the broken command was still a well-formed command
@@ -165,6 +177,57 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(r.status).toBe(0);              // systemd saw success...
     expect(r.stdout).toContain('usage');   // ...while botmux only printed help
     expect(r.stdout).not.toContain('DAEMON_STARTED');
+  });
+});
+
+describe('autostart PATH normalization', () => {
+  it('filters AI CLI argv0 shims, preserves order, and removes duplicates on POSIX', () => {
+    expect(autostartPath(
+      [
+        '/home/u/.trae/tmp/arg0/traecli-a',
+        '/home/u/.trae/cli/tmp/arg0/traecli-b',
+        '/home/u/.codex/tmp/arg0/codex-execve-wrapper',
+        '/home/u/.local/bin',
+        '/usr/bin',
+        '/home/u/.local/bin',
+      ].join(':'),
+      'linux',
+    )).toBe('/home/u/.local/bin:/usr/bin');
+  });
+
+  it('requires tmp/arg0 to be a complete path segment', () => {
+    expect(autostartPath(
+      '/opt/tmp/arg0bin:/usr/tmp/arg00:/var/tmp/arg0-tools/bin',
+      'linux',
+    )).toBe('/opt/tmp/arg0bin:/usr/tmp/arg00:/var/tmp/arg0-tools/bin');
+  });
+
+  it('uses the platform delimiter when filtering Windows PATH', () => {
+    expect(autostartPath(
+      'C:\\Users\\u\\.trae\\tmp\\arg0\\traecli-a;C:\\Tools;C:\\Windows',
+      'win32',
+    )).toBe('C:\\Tools;C:\\Windows');
+  });
+
+  it('falls back to a stable system PATH when every entry is transient', () => {
+    expect(autostartPath('/home/u/.trae/tmp/arg0/traecli-a', 'linux'))
+      .toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
+    expect(autostartPath('C:\\Users\\u\\.trae\\tmp\\arg0\\traecli-a', 'win32'))
+      .toBe('%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem');
+  });
+
+  it('expands the Windows fallback but keeps captured percent references literal', () => {
+    const transient = 'C:\\Users\\u\\.codex\\tmp\\arg0\\codex-execve-wrapper';
+    const fallbackScript = windowsScriptContent(opts({ environmentPath: transient }));
+    expect(fallbackScript).toContain(
+      'set "PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem"',
+    );
+    expect(fallbackScript).not.toContain('%%SystemRoot%%');
+
+    const capturedScript = windowsScriptContent(opts({
+      environmentPath: '%LOCALAPPDATA%\\bin;C:\\Tools',
+    }));
+    expect(capturedScript).toContain('set "PATH=%%LOCALAPPDATA%%\\bin;C:\\Tools"');
   });
 });
 

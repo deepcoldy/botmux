@@ -199,7 +199,11 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
           upstream.destroy();
         });
         client.on('error', cleanup);
-        upstream.on('close', () => client.destroy());
+        upstream.on('close', () => {
+          // pipe() ends the client after a clean EOF. Let pending writes drain
+          // before closing it, or the HTTP response tail can be truncated.
+          if (!upstream.readableEnded) client.destroy();
+        });
         client.on('close', () => upstream.destroy());
       }).catch(() => {
         if (!client.destroyed) writeHttpError(client, 502, 'Bad Gateway', 'proxy error');

@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeLaunchTarget } from '../../src/desktop/main/runtime-service.js';
 import { defaultPm2ListTimeoutMs, listPm2Apps } from '../../src/desktop/main/pm2-apps.js';
@@ -137,12 +140,29 @@ describe('desktop PM2 app listing', () => {
     ].join(':'));
   });
 
-  it('rejects when the selected runtime does not contain a PM2 binary', async () => {
+  it('lists an empty supervisor fleet without requiring a PM2 binary', async () => {
     await expect(listPm2Apps(paths, runtime, {
       existsSync: () => false,
       execPath: '/Electron',
       env: {},
-    })).rejects.toThrow('PM2 binary not found');
+    })).resolves.toEqual([]);
+  });
+
+  it('reads the native fleet and rejects corrupt state when PM2 is absent', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'desktop-native-fleet-'));
+    const statePath = join(home, 'fleet-state.json');
+    const { spawn, calls } = trackedSpawn();
+    try {
+      writeFileSync(statePath, JSON.stringify({ supervisorEntry: '/runtime/dist/index-supervisor.js', procs: [
+        { name: 'botmux-dashboard', appId: '', pid: process.pid, status: 'online' },
+      ] }));
+      expect(await listPm2Apps({ ...paths, botmuxHome: home }, runtime, { spawn: spawn as any })).toEqual([
+        { name: 'botmux-dashboard', status: 'online', script: '/runtime/dist/index-supervisor.js' },
+      ]);
+      writeFileSync(statePath, '{}');
+      await expect(listPm2Apps({ ...paths, botmuxHome: home }, runtime)).rejects.toThrow('Invalid fleet state');
+      expect(calls).toHaveLength(0);
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
   it('rejects when PM2 exits nonzero so runtime state can degrade', async () => {

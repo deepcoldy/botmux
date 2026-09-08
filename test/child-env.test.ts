@@ -6,6 +6,7 @@ import {
   BOTMUX_INJECTED_ENV_KEYS,
   CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
+  COMPANION_STARTUP_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
@@ -19,11 +20,13 @@ import {
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
+  stripCompanionStartupEnv,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
 describe('applySessionOwnerEnv()', () => {
@@ -55,6 +58,7 @@ describe('redactChildEnv()', () => {
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
+      GOFLAGS: '-p=4',
     });
     // The bug this guards: `{ ...env, LARK_APP_ID: undefined }` leaves the key
     // PRESENT (`'LARK_APP_ID' in obj === true`), and node-pty then stringifies
@@ -66,6 +70,8 @@ describe('redactChildEnv()', () => {
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
     expect(out.PATH).toBe('/usr/bin');
+    // Host-scoped build policy reaches the CLI through the ordinary child env.
+    expect(out.GOFLAGS).toBe('-p=4');
   });
 
   it('does not mutate the input env', () => {
@@ -88,6 +94,27 @@ describe('redactChildEnv()', () => {
     }
     // Behavior knob, not an identity marker — must survive.
     expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('removes companion authority from non-serving process environments', () => {
+    const env = Object.fromEntries(COMPANION_STARTUP_ENV_KEYS.map(key => [key, 'private']));
+    stripCompanionStartupEnv(env);
+    for (const key of COMPANION_STARTUP_ENV_KEYS) expect(key in env, key).toBe(false);
+    const daemonEntry = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
+    expect(daemonEntry).toContain('stripCompanionStartupEnv(process.env)');
+  });
+
+  it('removes the companion secret-file path from child env', () => {
+    const out = redactChildEnv({
+      [COMPANION_SECRET_FILE_ENV]: '/run/secrets/botmux/companion',
+      [COMPANION_BOT_APP_ID_ENV]: 'local_test_bot',
+      KEEP: 'v',
+    });
+    expect(COMPANION_SECRET_FILE_ENV in out).toBe(false);
+    expect(COMPANION_BOT_APP_ID_ENV in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_SECRET_FILE_ENV);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_BOT_APP_ID_ENV);
     expect(out.KEEP).toBe('v');
   });
 
@@ -197,13 +224,53 @@ describe('redactChildEnv()', () => {
       const script =
         'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
         `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve) => {
+      const out: string = await new Promise((resolve, reject) => {
         const p = pty.spawn('/bin/sh', ['-c', script], {
           name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
         });
         let buf = '';
-        p.onData((d) => { buf += d; });
-        p.onExit(() => resolve(buf));
+        let settled = false;
+        // node-pty delivers onData and onExit on independent paths: the child can
+        // be reaped before the pty's pending output has been drained, so
+        // resolving straight from onExit can hand back an empty string. That
+        // surfaces as `Expected to contain "R=UNSET" / Received: ""` under CI
+        // load, which reads like a real leak but is only a lost read.
+        //
+        // So settle on having BOTH answers, and let exit only START a short grace
+        // period rather than decide. If the grace period expires with the output
+        // still incomplete, REJECT with the raw buffer instead of resolving it:
+        // the whole point is that a lost read must never again be reported as a
+        // leak-shaped assertion failure. Resolving '' here would rebuild the very
+        // trap this guard exists to remove.
+        const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
+        const finish = (settle: () => void) => {
+          if (settled) return;
+          settled = true;
+          settle();
+        };
+        const fail = () => finish(() => reject(new Error(
+          'pty output incomplete — a lost read, not an env leak. '
+          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+        )));
+        const guard = setTimeout(fail, 10_000);
+        guard.unref?.();
+        p.onData((d) => {
+          buf += d;
+          if (hasBothAnswers()) {
+            clearTimeout(guard);
+            finish(() => resolve(buf));
+          }
+        });
+        p.onExit(() => {
+          // Exit is a deadline, not the signal: give already-queued reads a
+          // moment to land, then decide — complete output resolves, incomplete
+          // output fails loudly as a fixture problem.
+          setTimeout(() => {
+            clearTimeout(guard);
+            if (hasBothAnswers()) finish(() => resolve(buf));
+            else fail();
+          }, 250);
+        });
       });
       expect(out).toContain('R=UNSET');
       expect(out).toContain('S=UNSET');
@@ -599,8 +666,9 @@ describe('session CLI home scrub call sites', () => {
     // TERM is re-pinned (not left absent) inside the shared scrub so pm2
     // CLIENT output on a real TTY keeps supports-color detection.
     expect(fnBody).toContain("env.TERM = 'xterm-256color'");
-    const pluginPm2 = read('core/plugins/pm2.ts');
-    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
+    const pluginSupervisor = read('core/plugins/supervisor-client.ts');
+    expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
+    expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
     // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked

@@ -48,6 +48,23 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 该开关复用现有 `botmux autostart` 能力，只管理下次开机/登录时使用的启动项，不会启动、停止或重启当前 daemon。
 
+## 需认证的集成操作
+
+已认证的宿主集成可以指定一个明确的机器人身份更新飞书群名：
+
+```http
+PUT /api/groups/{chatId}/name/{larkAppId}
+Content-Type: application/json
+
+{"name":"新的群名称"}
+```
+
+两个路径参数都必须做 URL 编码。指定机器人必须当前就在该群内；botmux
+不会失败后改用其它已配置机器人。群名遵循飞书的 100 个 Unicode 码点上限，
+并拒绝控制字符与不可见格式字符。请求体上限为 4 KiB，且只接受 `name`
+字段。鉴权沿用下文所述的 Dashboard 管理权限边界；`publicReadOnly` 不会让该
+写操作变成匿名可用。
+
 ## 对外只读查询
 
 这里重点说明三个对外观测接口：
@@ -127,7 +144,7 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 `publicReadOnly` 默认开启。开启时，`GET /api/dashboard/v1/summary`、`GET /api/sessions` 和 `GET /events` 等只读白名单接口在 Dashboard 监听地址上可以**无 token** 访问。summary 只含上述强脱敏聚合；会话名称、标题、后端和 session / event row 中的其它元数据都应按可公开信息对待。
 
-- 全部 POST / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
+- 全部 POST / PUT / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
 - 关闭 `publicReadOnly` 后，无 token 的 summary 请求会返回 401；持当前 token 的请求仍可访问，且不受上面的匿名限流。错误或已轮换的旧 token 在公开只读开启时按匿名请求处理。
 - `botmux dashboard` 和 `botmux dashboard current` 会复用当前 token（尚无时创建第一个）；`botmux dashboard rotate` 才会显式替换 token、让之前的链接失效。token 只提供 Dashboard 应用层访问权，不代替主机防火墙、VPN 或反向代理鉴权。
 - 不需要无 token 观测时，在 Dashboard 「设置」中关闭「公开只读」。也可先设 `BOTMUX_DASHBOARD_PUBLIC_READONLY=false`；但设置页一旦保存过该开关，`~/.botmux/config.json` 的持久值会优先于环境变量。

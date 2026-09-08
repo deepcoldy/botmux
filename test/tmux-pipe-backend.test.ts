@@ -62,6 +62,7 @@ import {
   tmuxLifecycleInitialDelayMs,
   setStartupTmuxRetrySleepForTests,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { bufferSpawnResult } from './helpers/spawn-result.js';
 
 // Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
 // stub the sleep for the whole suite so retry tests don't add real seconds.
@@ -123,7 +124,7 @@ beforeEach(() => {
   mockedSpawnSync.mockReset();
   mockedUnlinkSync.mockReset();
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
-  mockedSpawnSync.mockReturnValue({ status: 0 } as any);
+  mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
 });
 
 describe('TmuxPipeBackend.spawn', () => {
@@ -424,10 +425,10 @@ describe('TmuxPipeBackend input addressing', () => {
     const be = new TmuxPipeBackend('0:5.0');
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
-    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+    mockedExecFileSync.mockImplementation((_cmd, args) => {
       if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
       return Buffer.from('');
-    }));
+    });
 
     expect(be.pasteText('boom')).toBe(false);
   });

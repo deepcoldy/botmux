@@ -115,7 +115,7 @@ import {
 } from './services/schedule-target-executor.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
-import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
@@ -326,6 +326,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
+import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -341,7 +342,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3510,6 +3511,21 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
+  // turn. This is the per-message acceptance point — every inbound turn passes
+  // through here before reaching the worker — so it is the one place that can
+  // guarantee no turn runs with the previous sender's credentials still on disk.
+  // It precedes the reaction bookkeeping and its early returns: a card-on session
+  // returns below, but its turns need the identity refreshed just the same.
+  //
+  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
+  // here would yield a microtask before the bookkeeping below on every turn of
+  // every bot, reordering concurrent turns that the single-flight paths depend
+  // on. A feature that is off must not perturb timing at all, so the await only
+  // happens once a bot has actually opted in.
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3554,6 +3570,65 @@ export async function noteTurnReceived(
     return;
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+/**
+ * Publish the acting CLI identity for one turn, and tell the sender when they
+ * need to authorize.
+ *
+ * The sender comes from the daemon's own per-turn record (`replyTargets`, via
+ * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
+ * are daemon-owned: a worker contributes only a turn id and can never choose
+ * which human that id denotes.
+ *
+ * The "please authorize" notice is sent at most once per session per tool. A
+ * repeat on every turn would be noise, and the sender already has the link.
+ */
+/** Whether this session's bot opted into trigger-user CLI auth. Synchronous so a
+ *  bot that has not opted in adds no await boundary to the turn path at all. */
+function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
+async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  let botConfig;
+  try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
+  if (!botConfig.triggerUserAuth?.enabled) return;
+
+  // Strictly this turn's sender. NOT `lastCallerOpenId`: that is the last human
+  // who happened to talk to the session, and a turn with no sender of its own
+  // (scheduled run, hook, meeting event, bot-to-bot handoff) is exactly the case
+  // where borrowing them would run someone else's automation under their name,
+  // silently and with their permissions.
+  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+
+  await publishTurnCliIdentity({
+    botConfig,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId,
+    locale: localeForBot(ds.larkAppId),
+    // Stamped so the wrapper can tell these credentials apart from a later
+    // message's: acceptance here is not the same instant as the CLI starting
+    // this turn, and B's message can be accepted while A's turn still runs.
+    turnId,
+  });
+
+  // NO chat notice here.
+  //
+  // This ran at message-acceptance, before the agent had decided which tool it
+  // would use, so it announced every governed tool that lacked credentials.
+  // Ask for lark-cli and you were told to authorize bytedcli as well — advice
+  // for something you were not doing. It was also once-per-session, so the one
+  // time it WOULD have been useful (you finally do call bytedcli and it is
+  // refused) it stayed silent.
+  //
+  // The refusal already carries this. The wrapper prints, on stderr, which tool
+  // was refused and which command authorizes it — at the moment of the refusal,
+  // for that tool only, every time it happens. That is strictly better
+  // information than a guess made a second earlier, so the guess is gone rather
+  // than being made narrower.
 }
 
 async function sessionReply(
@@ -3830,9 +3905,47 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean; alreadyAuthorizedAndCharged?: boolean },
+  opts?: {
+    listenerAuthorized?: boolean;
+    skipCharge?: boolean;
+    alreadyAuthorizedAndCharged?: boolean;
+    /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
+     *  不传 = 调用方没有可判定的正文（纯控制路径），闸仍会跑但 content 为空。 */
+    promptContent?: string;
+    /** 本轮附带的图片/文件**元信息**（type + name，不含内容）。
+     *  闸跑在附件下载之前（下载必须排在授权之后，否则未授权者也能让 bot 拉文件），
+     *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
+     *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
+    promptAttachments?: Array<{ type: string; name: string }>;
+  },
 ): Promise<boolean> {
-  if (opts?.listenerAuthorized) return true;
+  if (opts?.listenerAuthorized) {
+    // Listener matches skip the talk/quota model (a third-party alert bot is
+    // not a "sender" with a grant), but they DO reach a CLI — and their content
+    // is attacker-influenceable third-party text, which is exactly what a
+    // pre-submit gate exists to inspect. Ask the gate before returning; there
+    // is no charge on this path, so the charge-order invariant is not in play.
+    const listenerGate = await evaluatePromptGate('prompt.submit', {
+      larkAppId,
+      chatId,
+      chatType,
+      anchor,
+      messageId,
+      senderOpenId,
+      botSender: !!botSender,
+      talkReason: 'messageListener',
+      content: opts.promptContent,
+      attachments: opts.promptAttachments,
+    });
+    if (!listenerGate.allowed) {
+      logger.info(
+        `[hooks:${larkAppId}] prompt.submit gate denied listener message ${messageId.substring(0, 12)}`
+        + `${listenerGate.reason ? `: ${listenerGate.reason}` : ''}`,
+      );
+      return false;
+    }
+    return true;
+  }
   // 会话群出生轮：**同一条消息**的授权判定与扣费，刚刚由本函数在原 DM 上下文里
   // 一起做完（handleNewTopicAdmitted 的建群前扣费点：扣费被拒必须零外部副作用，
   // 所以它必须排在 createGroupWithBots 之前）。这一轮绝不能再复查一次：
@@ -3866,6 +3979,51 @@ export async function enforceMessageQuotaForCliInput(
   // Control/setup messages still need the authorization decision above, but
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
+
+  // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
+  // 位置是被两条既有不变量夹死的，不能随意挪：
+  //   • 必须在 evaluateTalk 之后——内置权限模型仍是第一道；外部 hook 只能
+  //     在它放行之后再收紧，永远不能把内置闸拒掉的人放进来。
+  //   • 必须在 beginCharge 之前——本文件的硬不变量是「扣了费就不能丢任务，
+  //     丢任务就不能扣费」。放在扣费后被拒 = 用户额度少一格却什么也没发生。
+  // 没配 sync hook 时 evaluatePromptGate 直接返回 allow，零 spawn 零开销。
+  const gate = await evaluatePromptGate('prompt.submit', {
+    larkAppId,
+    chatId,
+    chatType,
+    anchor,
+    messageId,
+    senderOpenId,
+    senderUnionId,
+    memberUnionId,
+    botSender: !!botSender,
+    talkReason: ev.reason,
+    content: opts?.promptContent,
+    attachments: opts?.promptAttachments,
+  });
+  if (!gate.allowed) {
+    logger.info(
+      `[hooks:${larkAppId}] prompt.submit gate denied message ${messageId.substring(0, 12)} `
+      + `from ${senderOpenId?.substring(0, 12) ?? '?'}${gate.reason ? `: ${gate.reason}` : ''}`,
+    );
+    // 明确告诉用户被拦了。静默丢弃在这里是最坏选项：用户有权限、消息也没超额，
+    // 却凭空消失，只能反复重发。（内置权限模型的静默丢弃是另一回事——那里
+    // 沉默本身是为了不向未授权者泄露 bot 的存在。）
+    try {
+      await sessionReply(
+        anchor,
+        gate.reason
+          ? tr('daemon.prompt_gate_denied_reason', { reason: gate.reason }, localeForBot(larkAppId))
+          : tr('daemon.prompt_gate_denied', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    } catch (err) {
+      logger.warn(`[hooks:${larkAppId}] prompt gate denial notify failed: ${err}`);
+    }
+    return false;
+  }
+
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -16909,6 +17067,15 @@ function buildReservedInitialInput(
       // master: thread the joined-chat context into the opening prompt (group-join
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
+      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
+      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
+      // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
+      // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
+      turnId: ds.pendingRawInput
+        ? undefined
+        : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
+      sessionBackendType: ds.session.backendType,
     },
   );
   // R5-B1-1: COPY the frozen new-topic steer authorization onto the opening
@@ -17426,6 +17593,8 @@ async function startInitialPassthroughSession(args: {
   messageId: string;
   replyRootId?: string;
   parsed: LarkMessage;
+  /** 本轮附件元信息，转给 prompt.submit 校验闸（内容不在此传）。 */
+  promptResources?: MessageResource[];
   cmd: string;
   commandContent: string;
   senderOpenId?: string;
@@ -17460,12 +17629,15 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
+    parsed, promptResources, cmd, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
+    promptContent: commandContent || parsed.content,
+    promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
+  })) {
     return;
   }
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
@@ -17798,6 +17970,24 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const quotaTeamTrustUnionId = (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot')
       ? quotaSenderUnionId
       : undefined;
+    // 出生轮的闸也必须看到正文与附件，否则 p2pMode='group' 下**每个会话群的
+    // 第一条消息**（正是开场 prompt）只按元信息判定：sender 级规则还在，内容级
+    // 规则（DLP / 高危指令 / .env 拦截）全盲。改写后的那一轮带
+    // alreadyAuthorizedAndCharged 提前 return，不会补上这一课。
+    //
+    // 这里用**一次性 numberer** 单独解析一遍：parseEventMessage 是纯函数（无网络
+    // 无磁盘无共享状态），而 numberer 的计数器是闭包私有的，所以这次解析不会扰动
+    // 下面 17874 行那次真正的解析（图片/文件编号仍从 1 开始）。解析失败不能拖垮
+    // 收信主路——退回只给元信息，与本次改动前的行为一致。
+    let birthPromptContent: string | undefined;
+    let birthPromptAttachments: Array<{ type: string; name: string }> | undefined;
+    try {
+      const preview = parseEventMessage(data, createImgNumberer());
+      birthPromptContent = preview.parsed.content;
+      birthPromptAttachments = preview.resources.map(r => ({ type: r.type, name: r.name }));
+    } catch (err) {
+      logger.debug(`[hooks:${larkAppId}] birth-turn prompt preview failed, gating on metadata only: ${err}`);
+    }
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -17807,6 +17997,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaTeamTrustUnionId,
       quotaSenderUnionId,
       chatType,
+      undefined,
+      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
     )) return;
     quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
@@ -17883,6 +18075,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -18153,6 +18346,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId,
           chatType,
@@ -18325,12 +18519,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
+    promptContent: content,
+    promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
   })) {
     return;
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources, senderOpenId);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -19349,6 +19545,7 @@ async function handleThreadReplyAdmitted(
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, anchor, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -19643,6 +19840,7 @@ async function handleThreadReplyAdmitted(
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId: threadChatId,
           chatType: ctxChatType,
@@ -19924,6 +20122,7 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
+    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
   )) {
     return;
   }
@@ -19938,11 +20137,14 @@ async function handleThreadReplyAdmitted(
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  // Same value the turn record below is built from; read here because the
+  // user-token fallback for a download should use the SENDER's own credentials.
+  const inboundSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   let attachments: LarkAttachment[];
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
     if (attachments.length > 0) {
       parsed.attachments = attachments;
@@ -19955,7 +20157,7 @@ async function handleThreadReplyAdmitted(
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
-  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const callerOpenId = inboundSenderOpenId;
   if (ds) {
     markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
@@ -20600,6 +20802,10 @@ async function handleThreadReplyAdmitted(
             codexAppText: parsed.content,
             codexAppApplicationContext,
             codexAppMessageContext,
+            // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
+            // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
+            turnId: parsed.messageId,
+            sessionBackendType: ds.session.backendType,
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -20865,6 +21071,11 @@ async function handleThreadReplyAdmitted(
           codexAppText: reforkCodexApp.text,
           codexAppApplicationContext,
           codexAppMessageContext: reforkCodexApp.messageContext,
+          // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
+          // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
+          // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
+          turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          sessionBackendType: ds.session.backendType,
         },
       );
     } else {

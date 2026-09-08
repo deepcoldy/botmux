@@ -20,6 +20,7 @@ import {
   writeManagedOriginAttestationProof,
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
+import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import {
   cliModelSupportsReasoningEffort,
@@ -260,7 +261,9 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { tokenStoreProtection } from '../services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
@@ -296,6 +299,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -2070,7 +2074,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const trigger = proactive ? 'ai_proactive' : 'user_explicit';
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
   await chatRenameSerialQueue.run(cooldownKey, async () => {
-    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+    const response = await executeChatRename({
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      name: normalized.name,
+      trigger,
+      sessionId: ds.session.sessionId,
+      botOpenId: getBotOpenId(ds.larkAppId),
       beforeUpdate: proactive
         ? () => {
             const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
@@ -2079,43 +2089,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
               : { ...cooldown, error: 'rate_limited' as const };
           }
         : undefined,
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
     });
-    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
-    if (!result.ok) {
-      const status = result.error === 'bot_not_in_chat' ? 403
-        : result.error === 'permission_denied' ? 403
-          : result.error === 'rate_limited' ? 429
-            : 502;
-      logger.warn(
-        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
-        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
-      );
-      return jsonRes(res, status, result);
+    if (proactive && response.body.ok && response.body.changed) {
+      proactiveChatRenameCooldown.record(cooldownKey);
     }
-    if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
-      // FR-7: the Lark write already succeeded, so a local cache-refresh
-      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
-      // outcome into an HTTP 500 — best-effort per session, warn and keep the
-      // rename a success. Catch per-session so one bad write can't skip the rest.
-      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-        if (active.chatId !== ds.chatId) continue;
-        active.session.chatDisplayName = result.newName;
-        try {
-          sessionStore.updateSession(active.session);
-        } catch (e) {
-          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      logger.info(
-        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
-      );
-    }
-    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+    return jsonRes(res, response.status, response.body);
   });
 });
 
@@ -2455,15 +2438,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (expect !== undefined && current.whiteboardId !== expect) {
+    // The same command a host applies offline (services/session-commands.ts);
+    // here it runs on the daemon's own live row.
+    const applied = applySessionRowCommand(current, {
+      type: 'whiteboard',
+      whiteboardId: unbind ? null : bindId,
+      ...(expect !== undefined ? { expectWhiteboardId: expect } : {}),
+    }, { now: new Date() });
+    if (applied.outcome === 'refused') {
       return jsonRes(res, 409, {
         ok: false,
         error: 'whiteboard_changed',
         whiteboardId: current.whiteboardId ?? null,
       });
     }
-    if (unbind) current.whiteboardId = undefined;
-    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
     jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });
@@ -4090,6 +4078,40 @@ ipcRoute('GET', '/api/groups/:chatId/membership', async (_req, res, p) => {
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
+});
+
+/** Host-only rename through this daemon's exact bot identity. */
+ipcRoute('PUT', '/api/groups/:chatId/name', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some(key => key !== 'name')) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  }
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const larkAppId = cachedLarkAppId;
+  await chatRenameSerialQueue.run(`${larkAppId}:${p.chatId}`, async () => {
+    const response = await executeChatRename({
+      larkAppId,
+      chatId: p.chatId,
+      name: normalized.name,
+      trigger: 'host_api',
+      botOpenId: getBotOpenId(larkAppId),
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
+    });
+    return jsonRes(res, response.status, response.body);
+  });
 });
 
 ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
@@ -5799,6 +5821,11 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 标签是 owner 自己的收件箱侧边栏，这次授权只可能是他本人的。
+      // 从注册表派生 owner，`ownerOpenId` 只作兜底：那个原始字段实际部署里几乎
+      // 没人填，缺了它 pending 记录就没有归属，回调时也就没法校验「链接是不是
+      // 被转给别人点了」——命令路径有这道校验，Dashboard 这条不该没有。
+      getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
     );
     jsonRes(res, 200, { ok: true, authUrl });
   } catch (e: any) {
@@ -5813,7 +5840,11 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
-    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    // 同上：token 按人存，owner 解析不出来就是拿空 key 去查，徽标会对一个刚
+    // 授权完的人显示「未授权」。
+    const status = getFeedGroupAuthStatus(
+      cfg.larkAppId, normalizeBrand(cfg.brand), getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
+    );
     jsonRes(res, 200, {
       ok: true,
       ...status,
@@ -6133,6 +6164,54 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, body.codexAuthSync);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
+});
+
+// PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
+// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
+// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
+// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { triggerUserAuth?: unknown };
+  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  const spec = findConfigField('triggerUserAuth');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  // '' is the store's "clear" sentinel; anything else goes through the shared
+  // JSON coercion so a malformed policy is rejected the same way here as it is
+  // from chat.
+  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
+    ? ''
+    : JSON.stringify(body.triggerUserAuth);
+  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true });
+});
+
+// GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
+// 边界提示（token 存储保护程度、自带凭证的 MCP server）。
+// 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const policy = cfg.triggerUserAuth ?? null;
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
+    // as the same OS user as botmux and can read other people's token files.
+    const protection = tokenStoreProtection(cfg.sandbox === true);
+    const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    jsonRes(res, 200, {
+      ok: true,
+      policy,
+      authorizedCount,
+      tokenStoreEnforced: protection.enforced,
+      ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
+      ...(mcpAdvisory ? { mcpAdvisory } : {}),
+    });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如

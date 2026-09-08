@@ -18,6 +18,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
+import { checkWorkerAdmission, formatMemoryBytes } from './worker-budget.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import {
@@ -112,6 +113,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../serv
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomBytes(32).toString('base64url');
 const restartCoordinator = new RestartCoordinator();
+const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
@@ -563,6 +565,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { clearAllSessionIdentities } from './cli-identity.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   MAX_STARTUP_AUTO_RETRIES,
@@ -6841,6 +6844,13 @@ export async function closeSession(
   // All authoritative map/status/store/event state above transitions
   // synchronously, before the first await. Lark reaction/unsubscribe cleanup is
   // best-effort and can be slow; it must not leave a resurrection window.
+
+  // Trigger-user credentials die with the session. These files hold a live user
+  // token, so a closed session must not leave one on disk for a future session
+  // (or an operator inspecting the data dir) to pick up.
+  try { clearAllSessionIdentities(config.session.dataDir, sessionId); }
+  catch { /* best-effort; absence is the desired state */ }
+
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
   if (cleanupAppId) {
     for (const target of docReactionTargets) {
@@ -10263,6 +10273,32 @@ export function forkWorker(
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  const admission = checkWorkerAdmission(readGlobalConfig().worker);
+  for (const warning of admission.pressure.warnings) {
+    if (hostPressureWarningsLogged.has(warning)) continue;
+    hostPressureWarningsLogged.add(warning);
+    logger.warn(`[${tag(ds)}] Host memory pressure check degraded (fail-open): ${warning}`);
+  }
+  if (!admission.allowed) {
+    const reason = admission.reasons.join('; ');
+    logger.warn(`[${tag(ds)}] Worker admission blocked by host memory pressure: ${reason}`);
+    const retry = `Host memory pressure is critical: ${reason}. `
+      + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
+      + `(reserve ${formatMemoryBytes(admission.policy.minAvailableMemoryBytes)}, `
+      + `PSI limit ${admission.policy.maxMemoryFullAvg10.toFixed(2)}%).`;
+    void cb.sessionReply(
+      sessionAnchorId(ds),
+      retry,
+      'text',
+      ds.larkAppId,
+      fallbackTurnId(ds, initTurnId),
+      ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+    ).catch(error => logger.error(
+      `[${tag(ds)}] Failed to report blocked worker admission: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ));
+    return true;
+  }
   if (
     botCfg.existingAppServer
     && botCfg.cliId === 'codex'
@@ -10808,6 +10844,9 @@ export function forkWorker(
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     codexAuthSync: botCfg.codexAuthSync ?? 'shared',
+    // Trigger-user CLI auth: the worker needs the policy to know which tools to
+    // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
+    ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.

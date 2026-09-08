@@ -18,8 +18,9 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
-import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
+import { getDocSubscription, type CommentTriggerMode } from '../../services/doc-subs-store.js';
 import { compareReplyIds } from '../../core/doc-comment-poller.js';
+import { config } from '../../config.js';
 
 /**
  * bot 回复的隐形哨兵：追加在 bot 发表的评论末尾（零宽字符，用户不可见）。
@@ -158,6 +159,10 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
   if (!ref) throw new Error(`无法从「${input.slice(0, 40)}」识别出飞书文档链接或 token`);
 
   if (ref.kind === 'wiki') {
+    // No `fileTokenForIdentity` here, and that is not an oversight: this call
+    // is how the file token is obtained, so there is no subscription to look an
+    // owner up by yet. Resolution runs before any subscription exists (and for
+    // documents that never get one), so it uses the bot's own identity.
     const res = await driveApiCall(larkAppId, {
       method: 'GET',
       path: '/open-apis/wiki/v2/spaces/get_node',
@@ -205,6 +210,27 @@ interface DriveCallOpts {
    * provider request. It deliberately sits outside fallback catch blocks so a
    * revoked origin aborts instead of being mistaken for an identity failure. */
   beforeProviderEffect?: () => void | Promise<void>;
+  /**
+   * The document this call acts on, when known. Used ONLY to look up which
+   * person owns the subscription (see `userOpenId`); it is not sent upstream.
+   *
+   * Resolving the owner centrally here — rather than threading `userOpenId`
+   * through all nine exported helpers and their ~20 call sites — means a missed
+   * call site cannot silently revert to the bot-level token lookup.
+   */
+  fileTokenForIdentity?: string;
+  /**
+   * Whose user token to use — the person who created this subscription
+   * (`DocSubscription.ownerOpenId`).
+   *
+   * A document subscription is a long-lived task with no "current sender": the
+   * comment that triggers a turn may come from anyone, including people who
+   * never authorized this bot. So the identity is fixed at subscribe time rather
+   * than taken from whoever commented. Omitted → resolved from the subscription
+   * store via `fileTokenForIdentity`, and failing that the historical bot-level
+   * lookup, which is what pre-existing subscriptions rely on.
+   */
+  userOpenId?: string;
 }
 
 export interface DocProviderEffectOptions {
@@ -306,6 +332,26 @@ function buildQuery(params?: DriveCallOpts['params']): string {
 }
 
 /**
+ * Which person owns the subscription for this document.
+ *
+ * Read from the on-disk subscription record rather than passed down the call
+ * chain: a document subscription outlives any one turn, so the acting identity
+ * has to come from durable state, not from whoever happens to be talking.
+ *
+ * Returns undefined for an unknown document or a pre-existing record with no
+ * recorded owner — the caller then falls back to the bot-level token lookup, so
+ * subscriptions created before this field keep working.
+ */
+function subscriptionOwnerOpenId(larkAppId: string, fileToken: string | undefined): string | undefined {
+  if (!fileToken) return undefined;
+  try {
+    return getDocSubscription(config.session.dataDir, larkAppId, fileToken)?.ownerOpenId;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 调一个 drive/wiki OpenAPI。优先 user token（裸 fetch），拿不到 token 或遇
  * 401/403 时回退 tenant（SDK client.request 自带 tenant_access_token + GET
  * 空 body 守卫）。返回飞书统一响应体 `{ code, msg, data }`。
@@ -318,6 +364,23 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   assertLarkTransport(larkAppId, `driveApiCall ${opts.method} ${opts.path}`);
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
+  // Under trigger-user auth, act as the person who created this subscription.
+  // Resolved once, here, so every helper below inherits it — a per-call-site
+  // opt-in would silently fall back to the bot-level token wherever it was
+  // forgotten. An explicit `userOpenId` wins; otherwise it comes from the
+  // subscription record for this document.
+  //
+  // NOT gated on the policy. `ownerOpenId` on the subscription record predates
+  // this feature, and tokens are stored per person regardless of it — so the
+  // ungated branch was a lookup with no key, which returns nothing the moment
+  // the subscriber re-authorizes. Comments then silently degrade to the tenant
+  // identity: the API still answers, so nothing looks broken, and attribution
+  // is quietly wrong. Resolving by owner in both cases is the same behavior the
+  // policy wanted, and strictly better than a keyless lookup when it is off.
+  const actingUserOpenId = opts.userOpenId
+    ?? subscriptionOwnerOpenId(larkAppId, opts.fileTokenForIdentity);
+  const resolveActingUserToken = () =>
+    resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, actingUserOpenId);
 
   // tenant（应用身份）：走 SDK client.request（带 token/缓存/GET 空 body 守卫）。
   const callTenant = async () => {
@@ -334,7 +397,7 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     // Fence both that refresh and the actual Drive request: revocation in
     // either interval must stop before the next provider-visible effect.
     await opts.beforeProviderEffect?.();
-    const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+    const userToken = await resolveActingUserToken();
     if (!userToken) throw new UserTokenMissingError('该操作需要 User Token（请在话题中 /login 授权）。');
     await opts.beforeProviderEffect?.();
     return fetchWithUserToken(brand, userToken, opts);
@@ -377,7 +440,7 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   // 默认：优先 user（有 token），401/403 回退 tenant。
   let userForbidden: UserTokenForbiddenError | undefined;
   await opts.beforeProviderEffect?.();
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+  const userToken = await resolveActingUserToken();
   if (userToken) {
     try {
       await opts.beforeProviderEffect?.();
@@ -485,6 +548,7 @@ export async function subscribeDocFile(larkAppId: string, file: ResolvedDocFile)
   const res = await driveApiCall(larkAppId, {
     method: 'POST',
     path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/subscribe`,
+    fileTokenForIdentity: file.fileToken,
     params: { file_type: file.fileType },
     classifySubscriptionPermission: true,
   });
@@ -505,6 +569,7 @@ export async function unsubscribeDocFile(larkAppId: string, file: ResolvedDocFil
     const res = await driveApiCall(larkAppId, {
       method: 'DELETE',
       path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/delete_subscribe`,
+      fileTokenForIdentity: file.fileToken,
       params: { file_type: file.fileType },
     });
     ensureOk(res, '退订文档');
@@ -544,6 +609,7 @@ export async function getDocComment(
     const res = await driveApiCall(larkAppId, {
       method: 'POST',
       path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/batch_query`,
+      fileTokenForIdentity: file.fileToken,
       params: { file_type: file.fileType, user_id_type: 'open_id' },
       data: { comment_ids: [commentId] },
     });
@@ -615,6 +681,7 @@ async function hydrateTruncatedReplies(
       const res = await driveApiCall(larkAppId, {
         method: 'GET',
         path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(comment.commentId)}/replies`,
+        fileTokenForIdentity: file.fileToken,
         params: {
           file_type: file.fileType,
           user_id_type: 'open_id',
@@ -711,6 +778,7 @@ export async function listDocComments(
     const res = await driveApiCall(larkAppId, {
       method: 'GET',
       path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments`,
+      fileTokenForIdentity: file.fileToken,
       params: {
         file_type: file.fileType,
         user_id_type: 'open_id',
@@ -768,6 +836,7 @@ export async function replyToDocComment(
     res = await driveApiCall(larkAppId, {
       method: 'POST',
       path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(commentId)}/replies`,
+      fileTokenForIdentity: file.fileToken,
       params: { file_type: file.fileType, user_id_type: 'open_id' },
       data: { content: { elements } },
       preferTenant: true, // 回复显示为 bot 本身（应用身份）；bot 无访问权时回退 user
@@ -831,6 +900,7 @@ export async function createDocComment(
   const res = await driveApiCall(larkAppId, {
     method: 'POST',
     path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments`,
+    fileTokenForIdentity: file.fileToken,
     params: { file_type: file.fileType, user_id_type: 'open_id' },
     data: { reply_list: { replies: [{ content: { elements } }] } },
     preferTenant: true, // 评论显示为 bot 本身（应用身份）；bot 无访问权时回退 user
@@ -911,6 +981,7 @@ export async function addCommentReactionChecked(
     const res = await driveApiCall(larkAppId, {
       method: 'POST',
       path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      fileTokenForIdentity: file.fileToken,
       params: { file_type: file.fileType },
       data: { action: 'add', comment_id: commentId, reply_id: replyId, reaction_type: reactionType },
       // tenantOnly 与 preferTenant 互斥：前者禁用 user 回退，后者允许。
@@ -949,6 +1020,7 @@ export async function removeCommentReaction(
     await driveApiCall(larkAppId, {
       method: 'DELETE',
       path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      fileTokenForIdentity: file.fileToken,
       params: {
         file_type: file.fileType,
         comment_id: commentId,

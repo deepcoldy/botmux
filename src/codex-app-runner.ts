@@ -745,7 +745,14 @@ const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
       family: args.browserFamily,
+      codexBin: args.codexBin,
       ...(args.browserPluginRoot ? { pluginRoot: args.browserPluginRoot } : {}),
+      readConfig: params => client.request('config/read', params, { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }),
+      readConfigRequirements: () => client.request(
+        'configRequirements/read',
+        {},
+        { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS },
+      ),
     })
   : undefined;
 let threadReady = false;
@@ -1497,6 +1504,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         // Keep Codex App's rich history in sync with turns created by this
         // external runner so the desktop UI can render follow-up messages.
         persistExtendedHistory: true,
+        ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
       if (args.strictResume && resumedThreadId !== threadId) {
@@ -2461,20 +2469,20 @@ async function main(): Promise<void> {
   prompt();
 }
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
-  browserBroker?.close();
+  await browserBroker?.close().catch(() => {});
   client?.close();
   process.exit(0);
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
-  browserBroker?.close();
+  await browserBroker?.close().catch(() => {});
   client?.close();
   process.exit(130);
 });

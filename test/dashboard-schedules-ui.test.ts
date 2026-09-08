@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { store } from '../src/dashboard/web/store.js';
+import { cssRuleBody } from './helpers/css-rule.js';
 import {
   buildSchedulePreconditionFormFields,
   canSubmitSchedule,
@@ -880,6 +881,6 @@ describe('dashboard schedules React page helpers', () => {
     expect(css).not.toContain('.schedule-error-chip');
     expect(css).toContain('.schedule-row-head .schedule-state {');
     expect(css).toMatch(/\.schedules-list \{[\s\S]*?grid-auto-rows:\s*max-content/);
-    expect(css).toMatch(/\.schedule-list-row \.schedule-actions \{[\s\S]*?flex-wrap:\s*nowrap/);
+    expect(cssRuleBody(css, '.schedule-list-row .schedule-actions')).toMatch(/flex-wrap:\s*nowrap/);
   });
 });
