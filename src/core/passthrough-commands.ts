@@ -11,6 +11,7 @@
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
 export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli']);
+DAEMON_COMMANDS.add('/manager'); // Human-only, sessionless interception in Lark ingress.
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.

@@ -47,6 +47,28 @@ See [Session & Topic Model](/en/session-model) for the repository-picker and pin
 
 These forms create the topic and select a repository or create a worktree directly, without starting an empty session and switching it afterward. Send the task as the next message in the topic.
 
+## Group Manager (`/manager`)
+
+Mention exactly one target bot in a top-level message in a regular group:
+
+| Command | Behavior |
+| --- | --- |
+| `/manager`, `/manager status` | Show the shared manager claim and whether this bot is enabled locally |
+| `/manager set` | Select this bot as manager and append ` · bot name` to the group name |
+| `/manager clear` | Clear this manager; restore the original name unless someone manually renamed the group |
+
+Only the target bot's owner/allowedUsers may set or clear it. Talk-authorized users may inspect status. Commands do not create CLI sessions and are not supported in DMs, independent topics, or automatically managed session groups.
+
+The manager answers unmentioned, top-level regular-group messages from talk-authorized humans, but yields when only another member is mentioned. `@all` is not a redirect. Explicit mentions keep their existing behavior. This grants neither additional talk access nor operational permissions to humans or bots.
+
+To switch, have the old bot's administrator send `@old-bot /manager clear`, then have the new bot's administrator send `@new-bot /manager set`. There is no forced takeover.
+
+Cross-host coordination uses `[botmux:manager=app-id]` in the group description plus a local administrator opt-in. Every manager-only unmentioned response reads the current remote marker; failed reads do not enable this extra addressing path. A marker alone cannot enable a bot. Descriptions exceeding 100 characters are rejected without truncating human text. Long display names retain a saved original for restoration; manual group renames are preserved.
+
+The bot's existing `/reply-mode` still applies. This feature does not create projects, dispatch tasks, share model contexts, or change other bots' reply locations. Independently configured `never`/`ambient` policies and message listeners remain effective after clearing the manager.
+
+Mutations sharing a data directory use a file lock. Lark descriptions have no cross-host conditional update, so simultaneous cross-host claims are not strongly consistent: perform clear/set serially and check `/manager status`. After network errors or `chat_update_unconfirmed`, inspect status before retrying. Local records live in `chat-managers/` under the data directory with file mode `0600`; back them up with that directory. A lost local record is not silently reconstructed from the remote marker.
+
 ## 💬 Reply Mode (`/reply-mode`)
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.
