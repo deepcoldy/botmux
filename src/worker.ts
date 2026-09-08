@@ -19432,7 +19432,7 @@ process.on('message', async (raw: unknown) => {
       lastInitConfig = msg;
       if (!codexUpgradeTimer && (msg.cliId === 'codex' || msg.cliId === 'codex-app')
           && !msg.adoptMode && !msg.existingAppServerEndpoint) {
-        codexUpgradeTimer = setInterval(() => { void codexUpgradeMonitor.tick(); }, 60_000);
+        codexUpgradeTimer = setInterval(() => { void codexUpgradeMonitor.tick(); }, 10 * 60_000);
         codexUpgradeTimer.unref();
       }
       initialInputOwnershipPending = !!msg.prompt;
