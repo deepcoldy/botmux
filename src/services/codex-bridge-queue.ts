@@ -112,6 +112,10 @@ export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
+  /** Recently closed native turns. Providers can replay terminal/CoT records
+   *  after the owning local turn has already drained; without this tombstone
+   *  those stable-id events could fall back onto a newer id-less turn. */
+  private closedNativeTurns: Array<{ sourceSessionId?: string; sourceTurnId: string }> = [];
   /** Cosmetic observer for 'cot' events attributed to the collecting turn —
    *  feeds the native CoT (thinking process) message. Never affects
    *  attribution or lifecycle; exceptions are swallowed at the call site. */
@@ -123,8 +127,28 @@ export class CodexBridgeQueue {
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
   private localLowerBoundMs = 0;
+  private static readonly CLOSED_NATIVE_TURNS_MAX = 4_096;
 
   constructor(private readonly now: () => number = Date.now) {}
+
+  private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
+    return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
+      && (!closed.sourceSessionId || !sourceSessionId || closed.sourceSessionId === sourceSessionId));
+  }
+
+  private rememberClosedNativeTurn(turn: CodexPendingTurn): void {
+    if (!turn.sourceTurnId
+      || this.isClosedNativeTurn(turn.sourceSessionId, turn.sourceTurnId)) return;
+    this.closedNativeTurns.push({
+      ...(turn.sourceSessionId ? { sourceSessionId: turn.sourceSessionId } : {}),
+      sourceTurnId: turn.sourceTurnId,
+    });
+    if (this.closedNativeTurns.length > CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX) {
+      this.closedNativeTurns.splice(
+        0, this.closedNativeTurns.length - CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX,
+      );
+    }
+  }
 
   /** Register events as historical without producing pending-turn side
    *  effects. Used at attach time when resume mode wants to swallow prior
@@ -431,6 +455,9 @@ export class CodexBridgeQueue {
   }
 
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    // A stable-id replay from a closed turn is never evidence for the current
+    // id-less turn. Reject it before any compatibility fallback can run.
+    if (ev.sourceTurnId && this.isClosedNativeTurn(ev.sourceSessionId, ev.sourceTurnId)) return;
     if (ev.kind === 'turn_bind') {
       // A provider may expose its stable turn id only in a duplicate user
       // record after an id-less legacy record already started the turn. Bind
@@ -587,6 +614,7 @@ export class CodexBridgeQueue {
         target.terminalStatus = ev.terminalStatus;
         target.terminalErrorCode = ev.terminalErrorCode;
         target.terminalErrorSummary = ev.terminalErrorSummary;
+        this.rememberClosedNativeTurn(target);
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
         if (this.collecting === target) this.collecting = null;
         // CoCo-style type-ahead writes the next user event only after this
@@ -618,6 +646,7 @@ export class CodexBridgeQueue {
       target.finalText = '';
       target.terminalStatus = ev.terminalStatus ?? 'ambiguous';
       target.terminalErrorCode = ev.terminalErrorCode ?? 'structured_turn_aborted';
+      this.rememberClosedNativeTurn(target);
       if (this.collecting === target) this.collecting = null;
       this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
       this.refreshNextPreStartLease();

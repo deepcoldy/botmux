@@ -67,6 +67,49 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     expect(seen).toEqual(['t1']);
   });
 
+  it('rejects late native CoT and terminals after their turn has closed and drained', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([
+      { ...userEv('first', 'u-first', 200), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+      { ...asstEv('answer-a', 'a-first', 300), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-a' }),
+    ]);
+
+    q.ingest([userEv('second', 'u-second', 400)]);
+    q.ingest([
+      {
+        ...cotEv([{ kind: 'thinking', text: 'late-a-cot' }], 'c-late-a', 500),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...asstEv('late-a-final', 'a-late-a', 501),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...abortEv('late-a-abort', 'x-late-a', 502, 'session-1'),
+        sourceTurnId: 'native-a',
+      },
+    ]);
+
+    expect(seen).toEqual([]);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 't2', started: true })]);
+    expect(q.peek()[0]).not.toHaveProperty('finalText');
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('answer-b', 'a-second', 600), sourceSessionId: 'session-1', sourceTurnId: 'native-b',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 't2', finalText: 'answer-b', sourceTurnId: 'native-b',
+    })]);
+  });
+
   it('keeps distinct native turns instead of treating them as a steer merge', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'same', 100);
