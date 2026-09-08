@@ -961,6 +961,33 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
     });
   });
 
+  it('?t=<correct> on the fragment-free Workbench entries → set-cookie + one-hop redirect into the immersive workbench', () => {
+    // `/workbench` 与 `/workbench/dock` 自己就是跳板，登录跳转直接落到真实目的地；
+    // 直达入口落沉浸式壳（hash 带 botmuxWorkbenchShell=immersive），不带侧栏。
+    expect(decideDashboardAuth({
+      method: 'GET',
+      pathname: '/workbench',
+      hasTokenParam: true,
+      presentedToken: TOK,
+      activeToken: TOK,
+    })).toEqual({
+      kind: 'allow+set-cookie',
+      token: TOK,
+      redirectTo: '/#/agent-workbench?botmuxWorkbenchShell=immersive',
+    });
+    expect(decideDashboardAuth({
+      method: 'GET',
+      pathname: '/workbench/dock',
+      hasTokenParam: true,
+      presentedToken: TOK,
+      activeToken: TOK,
+    })).toEqual({
+      kind: 'allow+set-cookie',
+      token: TOK,
+      redirectTo: '/#/agent-workbench-dock?botmuxWorkbenchShell=immersive',
+    });
+  });
+
   it('?t=<wrong> on protected route → deny401 (no cookie minted)', () => {
     const d = decideDashboardAuth({
       method: 'GET',
