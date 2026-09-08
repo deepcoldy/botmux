@@ -203,7 +203,14 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('data-input="quotaFallbackMessage"');
     expect(page).toContain("res.body?.error === 'quota_fallback_cycle'");
     expect(page).toContain("toast(text, { kind: 'error', duration: 8_000 })");
-    for (const key of ['quotaFallbackTitle', 'quotaFallbackTarget', 'quotaFallbackCycle', 'quotaFallbackSave']) {
+    expect(page).toContain("bot.startupBlocked?.reason === 'quota_fallback_cycle'");
+    expect(page).toContain('data-startup-blocked');
+    expect(page).toContain("setActiveTab('advanced')");
+    expect(page).toContain('res.body.restartRequired');
+    for (const key of [
+      'quotaFallbackTitle', 'quotaFallbackTarget', 'quotaFallbackCycle', 'quotaFallbackSave',
+      'startupBlockedBadge', 'startupBlockedTitle', 'startupBlockedHelp', 'metaOffline',
+    ]) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
   });

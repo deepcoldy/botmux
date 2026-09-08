@@ -25,9 +25,9 @@ describe('quotaFallbackBot public documentation', () => {
     expect(en).toContain('A → B → C → A');
     expect(zh).toContain('5 分钟去重');
     expect(en).toContain('five minutes');
-    expect(zh).toContain('只关闭环路相关 Bot 的交接功能');
-    expect(en).toContain('disables handoff only for Bots in that cycle');
-    expect(zh).toContain('Bot 配置 → 高级');
-    expect(en).toContain('Bot Configuration → Advanced');
+    expect(zh).toContain('跳过环路中的 Bot，但仍启动 Dashboard 和无关 Bot');
+    expect(en).toContain('skips Bots in that cycle while still starting the Dashboard and unrelated Bots');
+    expect(zh).toContain('高级 → 额度耗尽交接');
+    expect(en).toContain('Advanced → Quota-limit handoff');
   });
 });

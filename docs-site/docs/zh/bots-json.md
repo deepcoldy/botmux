@@ -82,7 +82,10 @@
 - `targetAppId` 必须是备用 Bot 的稳定飞书 App ID；不要配置或复制 `ou_xxx`，因为 `open_id` 按发送应用隔离。daemon 会在发送时从当前群的实时成员解析接收方视角下的 mention handle。
 - `kinds` 可选 `usage`（用量上限）和 / 或 `rate`（速率限制）；省略时两类都处理。`message` 省略时使用示例中的默认文案，最多 1000 字符，不能为空或包含原生 `<at>` 标签。
 - 目标必须是本机已配置且当前确实在群内的 Bot；跨部署 / 团队目录目标暂不支持，因为 daemon 目前无法安全证明远端 App ID 对应哪个实时 `open_id`。非本机目标、self、不在群或实时解析失败都会安全跳过。
-- 保存、复制 Bot 和 `botmux start/restart` 都会用「即将落盘」的完整配置检查交接图，拒绝 self 和 `A → B → C → A` 这类环路；无环链可以继续级联。Dashboard 会展示完整环路，start/restart 会在改动进程前给出原因和修复入口。若 supervisor 自动重启 daemon 等无人值守路径加载到手工改出的环路，只关闭环路相关 Bot 的交接功能并记录 warning，不会让无关 Bot 因此无法恢复。
+- 保存和复制 Bot 时会用「即将落盘」的完整配置检查交接图，拒绝 self 和 `A → B → C → A` 这类环路；无环链可以继续级联。若手工修改配置引入环路，`botmux start/restart` 会跳过环路中的 Bot，但仍启动 Dashboard 和无关 Bot；Dashboard 的 Bot 配置列表会标记这些未启动 Bot，并允许在「高级 → 额度耗尽交接」直接修复，保存后重启即可恢复。supervisor 重拉 daemon 时仍会在加载层禁用环路交接并记录 warning，避免异常配置扩大影响。
+
+![Dashboard 标记因交接环路而未启动的 Bot，并直接打开高级修复入口](/img/quota-fallback-cycle-recovery-dashboard.png)
+
 - daemon 内按「源 Bot + 限额类型」在所有会话间做 5 分钟去重；身份解析或发送失败也会占用这个去重窗口，避免短时重试风暴。
 - chat-scope 会落回原群，thread-scope 会落回原话题；上下文由备用 Bot 自己读取当前历史。daemon 重启恢复旧限额状态时不会补发历史交接。
 - 整个配置块缺省或 `enabled` 不为 `true` 时完全关闭，保持旧行为。可在 Dashboard「Bot 配置 → 高级 → 额度耗尽交接」配置，也可手工编辑 `bots.json`。

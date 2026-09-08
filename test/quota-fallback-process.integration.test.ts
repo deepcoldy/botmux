@@ -1,4 +1,3 @@
-import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -13,9 +12,10 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FleetSupervisor, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
+import { resolveFleetBotsFromEntries } from '../src/core/fleet-runtime.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
-const CLI_PATH = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
+const SUPERVISOR_PATH = fileURLToPath(new URL('../src/index-supervisor.ts', import.meta.url));
 const DAEMON_HOST = fileURLToPath(new URL('./fixtures/quota-fallback-daemon-host.ts', import.meta.url));
 const dirs: string[] = [];
 
@@ -39,24 +39,6 @@ async function waitFor(fn: () => boolean, timeoutMs = 8_000): Promise<boolean> {
   return fn();
 }
 
-function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawnTsScript(CLI_PATH, args, {
-      cwd: process.cwd(),
-      env: { ...process.env, ...env, BOTMUX_WORKFLOW: '' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
-    let stdout = '';
-    let stderr = '';
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', status => resolve({ status, stdout, stderr }));
-  });
-}
-
 function cyclicBots() {
   return [
     {
@@ -78,24 +60,44 @@ function cyclicBots() {
 }
 
 describe('quota fallback process boundaries', () => {
-  it('start rejects a cyclic topology before creating fleet state or daemon processes', async () => {
+  it('projects only non-cyclic bot daemons into the startup fleet', () => {
+    expect(resolveFleetBotsFromEntries(cyclicBots()).map(bot => bot.appId)).toEqual(['cli_safebot']);
+  });
+
+  it('supervisor cold boot brings up the dashboard while skipping cyclic bot daemons', async () => {
     const home = tmp();
     const configDir = join(home, '.botmux');
     mkdirSync(configDir, { recursive: true });
-    writeFileSync(join(configDir, 'bots.json'), JSON.stringify(cyclicBots()));
+    writeFileSync(join(configDir, 'bots.json'), JSON.stringify(cyclicBots().slice(0, 2)));
 
-    const result = await runCli(['start'], {
-      HOME: home,
-      SESSION_DATA_DIR: join(configDir, 'data'),
-      BOTS_CONFIG: join(configDir, 'bots.json'),
+    const child = spawnTsScript(SUPERVISOR_PATH, [], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOME: home,
+        SESSION_DATA_DIR: join(configDir, 'data'),
+        BOTS_CONFIG: join(configDir, 'bots.json'),
+        BOTMUX_WORKFLOW: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('daemon start 前自检失败');
-    expect(result.stderr).toContain('cli_cyclea → cli_cycleb → cli_cyclea');
-    expect(result.stderr).toContain('Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
-    expect(result.stderr).toContain('未创建新的 daemon 进程');
-    expect(existsSync(join(configDir, 'fleet-state.json'))).toBe(false);
+    try {
+      const statePath = join(configDir, 'fleet-state.json');
+      const dashboardOnline = await waitFor(() => {
+        if (!existsSync(statePath)) return false;
+        const state = JSON.parse(readFileSync(statePath, 'utf8'));
+        return state.procs.length === 1
+          && state.procs[0].name === 'botmux-dashboard'
+          && state.procs[0].status === 'online';
+      });
+      expect(dashboardOnline).toBe(true);
+      const state = JSON.parse(readFileSync(statePath, 'utf8'));
+      expect(state.procs.map((proc: any) => proc.name)).toEqual(['botmux-dashboard']);
+      expect(state.procs[0].status).toBe('online');
+    } finally {
+      child.kill('SIGTERM');
+      await new Promise<void>(resolve => child.once('close', () => resolve()));
+    }
   });
 
   it('supervisor respawn reloads the same soft-degraded daemon config while unrelated bots stay online', async () => {

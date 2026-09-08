@@ -10742,6 +10742,10 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   border-radius: var(--radius-sm);
   padding: 1px 7px;
 }
+.bd-roster-flag-blocked {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+}
 
 /* 右：档案 */
 .bd-profile { max-width: none; padding: 0; background: transparent; border: 0; box-shadow: none; }
@@ -11210,6 +11214,24 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   background: color-mix(in srgb, var(--success) 10%, var(--surface));
   color: var(--success);
 }
+.bd-profile-meta .bd-meta-blocked {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  color: var(--danger);
+}
+.bd-startup-blocked {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 18px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-soft));
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  color: var(--danger);
+  font-size: 12px;
+}
+.bd-startup-blocked span { color: var(--muted); }
 
 .bd-tile {
   border-radius: var(--radius-xl);

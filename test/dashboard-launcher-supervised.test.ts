@@ -116,7 +116,7 @@ describe('dashboard launcher — source pins', () => {
     expect(cli).toContain('fleetMemberNames');
   });
 
-  it('preflights quota fallback cycles before restart mutates the live fleet', () => {
+  it('reports quota fallback cycles before restart and keeps the recoverable fleet path', () => {
     const cli = read('cli.ts');
     const restart = cli.slice(
       cli.indexOf('async function cmdRestart()'),
@@ -127,7 +127,8 @@ describe('dashboard launcher — source pins', () => {
     expect(preflight).toBeLessThan(restart.indexOf("cleanupLegacyPm2('restart')"));
     expect(preflight).toBeLessThan(restart.indexOf('stopPluginServicesForCli'));
     expect(preflight).toBeLessThan(restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })'));
-    expect(cli).toContain('已中止重启，当前运行中的 daemon 未停止。');
+    expect(cli).toContain('Dashboard 和其它 Bot 将继续启动。');
+    expect(cli).toContain('已跳过');
     expect(cli).toContain('修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
   });
 

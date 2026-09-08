@@ -129,6 +129,11 @@ export type BotDefaultsRow = {
     kinds: Array<'usage' | 'rate'>;
     message: string;
   } | null;
+  online?: boolean;
+  startupBlocked?: {
+    reason: 'quota_fallback_cycle';
+    cycle: string[];
+  };
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;
   summaryMemoryPath?: string;
