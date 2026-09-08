@@ -407,6 +407,45 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
   });
 
+  it('manifest excludes the scopes the tenant auto-rejects (nothing in botmux calls them)', async () => {
+    // 2026-09: 飞书把这几项加进了《不开放权限（自动驳回）汇总》，新建应用只要
+    // 申请到其中任意一项，「企业自建应用发布申请」就被规则引擎**整批自动拒绝**，
+    // 且驳回通知不点名是哪一项（只给一份政策文档链接）——线上实际踩到过。
+    //
+    // 它们从 375418fd9「权限对齐内部 wiki 完整 JSON」整份粘进来那天起就没有
+    // 调用方：全仓（含 dist / docs / 脚本）搜这几个名字，唯一命中就是 manifest
+    // 自己。删掉零功能损失。
+    //
+    // ⚠️ 这条测试防的是**再次整份粘贴** wiki 全量权限包把它们带回来：那样
+    // 每个新用户建 bot 都会被自动驳回，而且症状（无具体原因的驳回）极难归因。
+    // 特别提示 `im:app_feed_card:write`（应用消息流卡片）**不是**会话标签/消息
+    // 分组用的那个——后者是 `im:feed_group_v1:read/write`，走 user 身份的
+    // /open-apis/im/v1/groups，仍在清单里，别混淆后把它加回来。
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const autoRejected = [
+      'drive:file:favorite',
+      'drive:file:favorite:readonly',
+      'im:app_feed_card:write',
+      'im:special_focus',
+      'im:url_preview.update',
+    ];
+    const reintroduced = autoRejected.filter(name => declared.has(name));
+    expect(
+      reintroduced,
+      `lark-scopes.json 含被飞书自动驳回的权限，会让新建应用发版申请被整批拒绝: ${reintroduced.join(', ')}`,
+    ).toEqual([]);
+
+    // 阴性对照：别让上面那条因为 manifest 读空/路径写错而恒真地"通过"。
+    expect(declared.has('im:message')).toBe(true);
+    expect(declared.has('im:feed_group_v1:write')).toBe(true);
+  });
+
   it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
     expect([...VC_MEETING_BOT_EVENTS]).toEqual([
       'vc.bot.meeting_invited_v1',

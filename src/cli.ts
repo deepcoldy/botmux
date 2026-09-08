@@ -576,7 +576,7 @@ function botBrand(b: any): Brand {
 
 /**
  * 把 botmux 推荐的完整 scope JSON (从 src/setup/lark-scopes.json) 写到
- * 用户配置目录, 同时给出跨平台一键复制命令. JSON 长 (293 项, 297 行),
+ * 用户配置目录, 同时给出跨平台一键复制命令. JSON 很长 (数百项),
  * terminal 直接打印用户也复制不了, 写文件 + pbcopy/xclip 才是顺手的姿势.
  *
  * Returns: 写出的 JSON 文件绝对路径.
