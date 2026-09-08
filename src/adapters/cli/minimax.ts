@@ -17,9 +17,11 @@ import { delay } from '../../utils/timing.js';
  * `botmux send` wrapper the way agentic CLIs do. botmux relays its answers
  * the same way it does for other tool-less TUIs: quiescence detection +
  * headless screen capture of the streamed reply. Hence no `skillsDir`
- * (nothing to install into) and no shell routing hints (it can't act on
- * them). The first user prompt is written to stdin after idle detection —
- * `mmx text repl` has no launch-time `-i`/prompt flag.
+ * (nothing to install into) and `injectsSessionContext: true` to suppress
+ * the inline routing/identity envelope it cannot act on (see below). The
+ * first user prompt is written to stdin after idle detection — `mmx text
+ * repl` has no launch-time `-i`/prompt flag, and its readline input accepts
+ * a single line only, so `writeInput` folds newlines to spaces (see below).
  *
  * Auth: `mmx auth login` writes `~/.mmx/config.json` (the whole `~/.mmx`
  * dir is the authPath so a sandboxed first login persists). The `--api-key`
@@ -72,15 +74,26 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // mmx's repl is a readline-style prompt (not an Ink bracketed-paste
-      // widget): it echoes typed characters and submits on Enter. Prefer the
-      // tmux literal-send + Enter path; fall back to raw write + CR.
+      // `mmx text repl` is a single-line readline prompt. Embedded newlines are
+      // NOT multi-line input: verified on mmx 1.0.25 that its readline SWALLOWS
+      // interior '\n'/'\r' (the whole payload accretes onto one input line) and
+      // only the FINAL terminator submits — so a raw multi-line write submits
+      // once but the model receives every line jammed together with no
+      // separator (e.g. "line1line2"), and a leading-only routing/scaffold line
+      // makes the real question invisible → empirically an empty/garbled reply.
+      // It is a plain readline, not an Ink bracketed-paste widget: it never
+      // requests ?2004h, so paste markers (\e[200~…) are echoed literally to the
+      // model, not consumed. There is therefore no way to preserve hard line
+      // breaks here; fold every run of whitespace-with-newline down to a single
+      // space so the model at least sees the full text as one coherent line.
+      const flattened = content.replace(/\s*\n\s*/g, ' ').replace(/[ \t]+/g, ' ').trim();
+      // Prefer the tmux literal-send + Enter path; fall back to raw write + CR.
       if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
+        pty.sendText(flattened);
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(content);
+        pty.write(flattened);
         await delay(1000);
         pty.write('\r');
       }
@@ -89,7 +102,14 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,   // quiescence only — no explicit marker
     readyPattern: undefined,        // rely on quiescence; '> ' prompt is too generic
     // Tool-less chat loop: it has no shell/file surface to act on botmux's
-    // routing hints, so inject none (same as mira / riff / mojo).
+    // routing/@/send hints, and (verified) an inline <botmux_routing> block on
+    // the first turn just becomes noise the model apologizes about. So set
+    // `injectsSessionContext: true` — the same suppression switch mira / riff /
+    // mojo use — which makes session-manager skip the inline routing / identity
+    // / session_id envelope entirely. Unlike those three we push NOTHING back
+    // via a system-prompt flag (`mmx text repl` has none), so `systemHints` is
+    // also empty: the bot runs as a plain chat model with no botmux scaffolding.
+    injectsSessionContext: true,
     systemHints: [],
     // mmx repl redraws its input line in place (cursor hide + line clears)
     // but does NOT switch into the alternate screen buffer.
