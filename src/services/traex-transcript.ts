@@ -39,10 +39,11 @@ import {
   readdirSync,
   readlinkSync,
   statSync,
+  type Dirent,
 } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
@@ -93,6 +94,22 @@ export interface TraexRuntimeSnapshot {
 
 const IS_LINUX = platform() === 'linux';
 const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+const TRAEX_ROLLOUT_LOOKUP_INITIAL_BACKOFF_MS = 2_000;
+const TRAEX_ROLLOUT_LOOKUP_MAX_BACKOFF_MS = 8_000;
+const TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX = 256;
+const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
+const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
+const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
+
+interface TraexRolloutLookupMiss {
+  nextFilesystemScanAtMs: number;
+  backoffMs: number;
+}
+
+/** Per-process fallback throttle. The authoritative SQLite lookup still runs
+ *  on every call, so a newly indexed rollout attaches immediately; only the
+ *  compatibility filesystem scan is delayed after repeated misses. */
+const traexRolloutLookupMisses = new Map<string, TraexRolloutLookupMiss>();
 
 type DatabaseSyncLike = {
   prepare(sql: string): StatementSyncLike;
@@ -117,7 +134,7 @@ function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   // logic had moved here from the traex adapter — where the Bun fix lived. A
   // clean merge is not a correct merge; re-check this call whenever the file
   // moves again.
-  const db = openDatabaseSyncNow(dbPath) as DatabaseSyncLike | null;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true }) as DatabaseSyncLike | null;
   if (!db) return null;
   try {
     return fn(db);
@@ -951,29 +968,125 @@ export function traexHistorySidIsOwned(
 }
 
 
-/** Locate the rollout file for a given TRAE session UUID. Filename shape is
- *  identical to Codex: `rollout-<ts>-<sid>.jsonl`, so a suffix match over the
- *  TRAE sessions tree is unambiguous. */
-export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
-  const sessionsRoot = traeSessionsRoot();
-  if (!cliSessionId || !existsSync(sessionsRoot)) return undefined;
-  const suffix = `-${cliSessionId}.jsonl`;
-  const stack: string[] = [sessionsRoot];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const name of entries) {
-      const full = join(dir, name);
-      let st: ReturnType<typeof statSync>;
-      try { st = statSync(full); } catch { continue; }
-      if (st.isDirectory()) {
-        stack.push(full);
-      } else if (st.isFile() && name.endsWith(suffix)) {
-        return full;
+function readTraexDirectory(path: string): Dirent[] {
+  try {
+    return readdirSync(path, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function isCanonicalTraexRolloutPath(
+  path: string,
+  sessionsRoot: string,
+  suffix: string,
+): boolean {
+  if (!path.endsWith(suffix)) return false;
+  const rel = relative(sessionsRoot, path);
+  if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) return false;
+  const parts = rel.split(sep);
+  return parts.length === 4
+    && TRAEX_YEAR_DIR_RE.test(parts[0]!)
+    && TRAEX_MONTH_DIR_RE.test(parts[1]!)
+    && TRAEX_DAY_DIR_RE.test(parts[2]!)
+    && parts[3]!.startsWith('rollout-');
+}
+
+function findIndexedTraexRollout(
+  cliSessionId: string,
+  sessionsRoot: string,
+  suffix: string,
+): string | undefined {
+  const rows = withTraeDb((db) => db.prepare(
+    'SELECT rollout_path AS rolloutPath FROM threads WHERE id = ? LIMIT 1',
+  ).all(cliSessionId) as { rolloutPath?: string }[]) ?? [];
+  const path = rows[0]?.rolloutPath;
+  if (typeof path !== 'string' || !isCanonicalTraexRolloutPath(path, sessionsRoot, suffix)) {
+    return undefined;
+  }
+  try {
+    return statSync(path).isFile() ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function findTraexRolloutInDateTree(sessionsRoot: string, suffix: string): string | undefined {
+  const years = readTraexDirectory(sessionsRoot)
+    .filter((entry) => entry.isDirectory() && TRAEX_YEAR_DIR_RE.test(entry.name))
+    .sort((a, b) => b.name.localeCompare(a.name));
+  for (const year of years) {
+    const yearPath = join(sessionsRoot, year.name);
+    const months = readTraexDirectory(yearPath)
+      .filter((entry) => entry.isDirectory() && TRAEX_MONTH_DIR_RE.test(entry.name))
+      .sort((a, b) => b.name.localeCompare(a.name));
+    for (const month of months) {
+      const monthPath = join(yearPath, month.name);
+      const days = readTraexDirectory(monthPath)
+        .filter((entry) => entry.isDirectory() && TRAEX_DAY_DIR_RE.test(entry.name))
+        .sort((a, b) => b.name.localeCompare(a.name));
+      for (const day of days) {
+        const dayPath = join(monthPath, day.name);
+        const rollout = readTraexDirectory(dayPath)
+          .find((entry) => entry.isFile()
+            && entry.name.startsWith('rollout-')
+            && entry.name.endsWith(suffix));
+        if (rollout) return join(dayPath, rollout.name);
       }
     }
   }
+  return undefined;
+}
+
+function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
+  const previous = traexRolloutLookupMisses.get(key);
+  const backoffMs = previous
+    ? Math.min(previous.backoffMs * 2, TRAEX_ROLLOUT_LOOKUP_MAX_BACKOFF_MS)
+    : TRAEX_ROLLOUT_LOOKUP_INITIAL_BACKOFF_MS;
+  // Refresh insertion order so the bounded map evicts the least-recent miss.
+  traexRolloutLookupMisses.delete(key);
+  traexRolloutLookupMisses.set(key, {
+    nextFilesystemScanAtMs: nowMs + backoffMs,
+    backoffMs,
+  });
+  if (traexRolloutLookupMisses.size > TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX) {
+    const oldest = traexRolloutLookupMisses.keys().next().value as string | undefined;
+    if (oldest !== undefined) traexRolloutLookupMisses.delete(oldest);
+  }
+}
+
+/** Locate the rollout file for a given TRAE session UUID.
+ *
+ * TRAE's `threads` table is the authoritative session→path index. Older TRAE
+ * versions may not expose `rollout_path`, so lookup degrades to the documented
+ * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. The fallback never
+ * descends into rollout sidecars (`*.artifacts`, `tool-results`,
+ * `rollout-blobs`), whose contents cannot be top-level sessions and may span
+ * gigabytes. Repeated fallback misses are backed off, while the cheap indexed
+ * lookup remains live on every late-attach tick. */
+export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
+  if (!cliSessionId) return undefined;
+  const sessionsRoot = traeSessionsRoot();
+  const suffix = `-${cliSessionId}.jsonl`;
+  const missKey = `${sessionsRoot}\0${cliSessionId.toLowerCase()}`;
+
+  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot, suffix);
+  if (indexed) {
+    traexRolloutLookupMisses.delete(missKey);
+    return indexed;
+  }
+  if (!existsSync(sessionsRoot)) return undefined;
+
+  const nowMs = Date.now();
+  const miss = traexRolloutLookupMisses.get(missKey);
+  if (miss && nowMs < miss.nextFilesystemScanAtMs) return undefined;
+
+  const scanned = findTraexRolloutInDateTree(sessionsRoot, suffix);
+  if (scanned) {
+    traexRolloutLookupMisses.delete(missKey);
+    return scanned;
+  }
+  recordTraexRolloutLookupMiss(missKey, nowMs);
   return undefined;
 }
 

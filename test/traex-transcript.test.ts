@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -10,12 +10,14 @@ import {
 } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTraexRollout,
+  findTraexRolloutBySessionId,
   readLatestTraexRuntime,
   traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
   traexHistorySize,
   traexHistorySidIsOwned,
 } from '../src/services/traex-transcript.js';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
 let dir: string;
@@ -160,6 +162,133 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('findTraexRolloutBySessionId', () => {
+  it('does not resolve rollout-shaped files inside TRAE sidecar directories', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const sidecarDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04', 'rollout-blobs');
+    const internalRollout = join(sidecarDir, `rollout-internal-${SID}.jsonl`);
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(sidecarDir, { recursive: true });
+    writeFileSync(internalRollout, line(user('internal sidecar record')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+    db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(SID, internalRollout);
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBeUndefined();
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('resolves a rollout recorded in the TRAE threads index', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const rollout = join(dayDir, `rollout-2026-06-04T12-00-00-${SID}.jsonl`);
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(rollout, line(user('indexed rollout')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+    db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(SID, rollout);
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('falls back to the canonical date tree when an older threads schema has no rollout_path', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const rollout = join(dayDir, `rollout-2026-06-04T12-00-00-${SID}.jsonl`);
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(rollout, line(user('fallback rollout')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY)');
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('backs off repeated filesystem misses while keeping discovery bounded', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const rollout = join(dayDir, `rollout-2026-06-04T12-00-00-${SID}.jsonl`);
+    mkdirSync(dayDir, { recursive: true });
+    process.env.TRAE_HOME = traeHome;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-04T12:00:00.000Z'));
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBeUndefined();
+      writeFileSync(rollout, line(user('appeared after miss')));
+
+      vi.advanceTimersByTime(1_000);
+      expect(findTraexRolloutBySessionId(SID)).toBeUndefined();
+      vi.advanceTimersByTime(999);
+      expect(findTraexRolloutBySessionId(SID)).toBeUndefined();
+      vi.advanceTimersByTime(1);
+      expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      vi.useRealTimers();
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('observes a newly indexed rollout during filesystem backoff', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const rollout = join(dayDir, `rollout-2026-06-04T12-00-00-${SID}.jsonl`);
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(dayDir, { recursive: true });
+    process.env.TRAE_HOME = traeHome;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-04T12:00:00.000Z'));
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBeUndefined();
+
+      writeFileSync(rollout, line(user('indexed during backoff')));
+      const db = openDatabaseSyncNow(dbPath);
+      expect(db).not.toBeNull();
+      db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+      db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(SID, rollout);
+      db!.close();
+      vi.advanceTimersByTime(1_000);
+
+      expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      vi.useRealTimers();
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
 });
 
 describe('drainTraexRollout', () => {
