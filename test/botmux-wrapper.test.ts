@@ -81,10 +81,16 @@ describe('botmuxWrapperFiles', () => {
   it('writes the main and dedicated native-hook sh wrappers on POSIX', () => {
     const files = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/usr/bin/node', 'linux');
     expect(files.map(f => f.name)).toEqual(['botmux', 'botmux-native-subagent-runtime-hook']);
-    expect(files[0].content).toBe('#!/bin/sh\nexec node "/opt/botmux/dist/cli.js" "$@"\n');
+    // The interpreter is PINNED (absolute process.execPath), never a bare `node`:
+    // a bare name is resolved by PATH at exec time, and a PATH that resolved it to
+    // a Node without node:sqlite killed all 55 bot daemons at boot (2026-09-08).
+    expect(files[0].content).toBe('#!/bin/sh\nexec "/usr/bin/node" "/opt/botmux/dist/cli.js" "$@"\n');
     expect(files[1].content).toBe(
-      '#!/bin/sh\nexec node "/opt/botmux/dist/cli.js" native-subagent-runtime-hook "$@"\n',
+      '#!/bin/sh\nexec "/usr/bin/node" "/opt/botmux/dist/cli.js" native-subagent-runtime-hook "$@"\n',
     );
+    // Regression guard: the bare form must not come back.
+    expect(files[0].content).not.toMatch(/exec node /);
+    expect(files[1].content).not.toMatch(/exec node /);
     expect(files[0].mode).toBe(0o755);
     expect(files[1].mode).toBe(0o755);
   });

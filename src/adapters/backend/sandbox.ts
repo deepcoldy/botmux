@@ -294,7 +294,18 @@ export function botmuxShimExecLine(): string {
   if (isStandaloneBinary()) {
     return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`;
   }
-  return `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`;
+  // Pin the interpreter to this daemon's own `process.execPath` rather than a bare
+  // `node`. In-sandbox PATH is `/run/sbxbin:<canonicalExecDirs>:<host PATH>`, and
+  // that host tail can resolve `node` to a DIFFERENT build than the daemon runs on.
+  // MEASURED (2026-09-08): `node dist/cli.js send --help` under Node v18.20.4 exits
+  // 1 from the session store's SQLite gate before printing anything, so an
+  // in-sandbox `botmux send` fails outright. Pinning also makes Bun work here:
+  // execPath is then the bun binary, which runs dist/*.js and has bun:sqlite.
+  //
+  // Safe inside bwrap: `dirname(realpath(process.execPath))` is always bound and
+  // prepended to the sandbox PATH (see canonicalExecDirs / pushExecDir below), so
+  // the pinned absolute path resolves for the child that actually runs this shim.
+  return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(distCliJs())} "$@"\n`;
 }
 
 /**
