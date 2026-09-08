@@ -427,6 +427,41 @@ describe('schedule-store', () => {
       expect(reloaded!.lastRunAt).toBe('2026-01-01T00:00:00.000Z');
     });
 
+    // 每次 reload 都按 normalizeTask 的字段白名单重建任务对象，白名单漏一个字段就
+    // 会在重启后静默丢失（ownerOpenId 踩过一次）。这条往返用例是那两行的红灯：
+    // 只测 createTask 的返回值不会发现丢字段，因为丢弃发生在读盘那一侧。
+    it('should persist the per-task model / reasoningEffort across reloads', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask({
+        ...TASK_PARAMS,
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      });
+      expect(task.model).toBe('gpt-5.6-sol');
+
+      const store2 = await freshImport();
+      const reloaded = store2.getTask(task.id);
+      expect(reloaded).toBeDefined();
+      expect(reloaded!.model).toBe('gpt-5.6-sol');
+      expect(reloaded!.reasoningEffort).toBe('ultra');
+    });
+
+    // 手改过的 JSON 里的垃圾值不该被带到执行时 —— 那里只会变成一次 CLI 报错。
+    it('should drop a hand-edited junk model / effort on reload', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask(TASK_PARAMS);
+      const fp = storeFp();
+      const raw = JSON.parse(readFileSync(fp, 'utf-8'));
+      raw[task.id].model = '   ';
+      raw[task.id].reasoningEffort = 'turbo';
+      writeFileSync(fp, JSON.stringify(raw));
+
+      const store2 = await freshImport();
+      const reloaded = store2.getTask(task.id);
+      expect(reloaded!.model).toBeUndefined();
+      expect(reloaded!.reasoningEffort).toBeUndefined();
+    });
+
     it('should persist removals across reloads', async () => {
       const store1 = await freshImport();
       const task = store1.createTask(TASK_PARAMS);

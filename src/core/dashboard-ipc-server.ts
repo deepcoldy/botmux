@@ -3743,6 +3743,10 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     followActive = b.followActive;
   }
+  // 用 `cachedLarkAppId` 校验，与下面落盘的 `larkAppId: cachedLarkAppId` 是同一个
+  // 值：任务归哪个 bot，就必须用那个 bot 的 CLI 判定模型/强度是否可用。表单虽然能
+  // 选 bot，但 POST 目前不接受 body 里的 larkAppId，所以两者恒等。若将来放开，这两
+  // 处必须一起改，否则会变成「用 A bot 的 CLI 去校验 B bot 的任务」。
   const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'create');
   if (!modelWrite.ok) {
     return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });

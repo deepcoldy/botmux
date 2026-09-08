@@ -18,6 +18,7 @@ import { parseForceTopicInvocation, parseSlashCommandInvocation, resolvePassthro
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -4194,13 +4195,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const triggeredCommand = isControlCommand
         ? parseSlashCommandInvocation(strippedRoutingText)?.cmd
         : undefined;
-      // 命令是不是这条消息的开头 —— 即「未剥 mention 前」就以 / 开头。
-      // 用来区分 @ 的两种位置（两者的 mentionsAnotherMember 都为 true，光看这个
-      // 布尔值分不出来）：
+      // 命令是不是排在所有 @ 之前 —— 用来区分 @ 的两种位置（两者的
+      // mentionsAnotherMember 都为 true，光看那个布尔值分不出来）：
       //   `@张三 /solve 看看`  → 先点名再下命令，是把活儿交给张三 → 让路
       //   `/solve @张三 看看`  → 命令在前，@ 是命令的参数（让 bot 去找谁 / 处理谁）
       //                          → 仍然是发给本 bot 的，要触发
-      const commandLeadsMessage = !!routingText && routingText.trimStart().startsWith('/');
+      // 判定必须回到原始 content：post 富文本的 @ 是独立的 `at` 节点，
+      // extractMessageTextForRouting 只 join text 节点，拼出来的正文天然以命令开头，
+      // 拿它做位置判断会把前导 @ 误判成「命令在最前」（见 commandPrecedesMentions）。
+      const commandLeadsMessage = commandPrecedesMentions(message);
       let pairedForwardSeed;
       let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a

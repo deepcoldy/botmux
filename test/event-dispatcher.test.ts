@@ -8891,6 +8891,74 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     }));
   });
 
+  // post（富文本）形态：@ 是独立的 `at` 节点，不在 text 里 —— 位置判断不能只看
+  // extractMessageTextForRouting 拼出来的字符串，否则前导 @ 的让路语义在富文本下失效。
+  function firePost(nodes: any[], mentions?: TestMention[]) {
+    return makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions,
+    });
+  }
+
+  it('post 形态：命令前的 @ 同样让路（at 节点不在 text 里，不能只看拼出的字符串）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](firePost([
+      { tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' },
+      { tag: 'text', text: ' /solve 看看这个' },
+    ], [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }]));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('post 形态：命令后的 @ 仍然触发（它是命令的参数）', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = firePost([
+      { tag: 'text', text: '/solve ' },
+      { tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' },
+      { tag: 'text', text: ' 看看这个' },
+    ], [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }]);
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
+  // @ 与命令分处不同段落：段落边界不该改变先后判定。
+  it('post 形态：@ 与命令分处不同段落时按节点先后判定', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ zh_cn: { title: '', content: [
+        [{ tag: 'at', user_id: 'ou_zhangsan', user_name: '张三' }],
+        [{ tag: 'text', text: '/solve 看看' }],
+      ] } }),
+      messageId: `msg-cmd-post-${++fireSeq}`,
+      chatId: 'chat-cmd',
+      chatType: 'group',
+      messageType: 'post',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   // 命令前有 @ 就仍然让路，哪怕命令后面也 @ 了人：开头那个 @ 已经把活儿指出去了。
   it('yields when a mention leads the message even if another follows the command', async () => {
     setup({ enabled: true, commands: [{ cmd: '/solve' }] });

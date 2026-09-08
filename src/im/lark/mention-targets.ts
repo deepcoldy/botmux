@@ -136,6 +136,47 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined, cmdPat
  *  - post：@ 是独立的 `at` 节点（不在 text 里、mentions 可能为空），按文档节点
  *    顺序比较本 bot 的 `at` 节点与含命令词的 text 节点的先后。
  */
+/**
+ * 斜杠命令是否排在这条消息里**所有** @ 之前。
+ *
+ * 免@ 斜杠命令用它区分 @ 的两种角色（两者的 mentionsAnotherMember 都为 true，
+ * 光看那个布尔值分不出来）：
+ *  - `@张三 /solve 看看` —— 先点名再下命令，是把活儿交给张三 → 让路；
+ *  - `/solve @张三 看看` —— 命令在前，@ 是命令自己的参数 → 仍然发给本 bot。
+ *
+ * 两种消息形态的位置信息藏在不同地方，必须分开判（与 isCommandTargetOnly 同款）：
+ *  - text：mention 以 `@_user_N` 占位符内联在正文里，字符位置即先后，正文
+ *    trimStart 后以 `/` 开头就说明命令在最前。
+ *  - post：@ 是独立的 `at` 节点，**根本不在 text 里** —— 拼接出来的正文天然以命令
+ *    开头，只看字符串会把「前导 @」误判成「命令在最前」，让路语义在富文本下失效。
+ *    所以按文档节点顺序比较首个 `at` 与首个以 `/` 开头的 text 节点。
+ *
+ * 形态无法识别（合成消息 / 非法 JSON）时返回 false，即退回「有 @ 就让路」的保守
+ * 历史行为。
+ */
+export function commandPrecedesMentions(message: any): boolean {
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { return false; }
+
+  if (typeof content?.text === 'string') return /^\s*\//.test(content.text);
+
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (Array.isArray(inner?.content)) {
+    let seq = 0, cmdSeq = -1, atSeq = -1;
+    for (const para of inner.content) {
+      if (!Array.isArray(para)) continue;
+      for (const node of para) {
+        // 段落只是排版，节点序在整篇文档内连续累加 —— 换行不该改变先后判定。
+        if (cmdSeq < 0 && node?.tag === 'text' && /^\s*\//.test(node.text ?? '')) cmdSeq = seq;
+        if (atSeq < 0 && node?.tag === 'at') atSeq = seq;
+        seq++;
+      }
+    }
+    return cmdSeq >= 0 && (atSeq < 0 || cmdSeq < atSeq);
+  }
+  return false;
+}
+
 export function isCommandTargetOnly(
   message: any, botOpenId: string | undefined, cmdPattern: CommandPattern, botAppId?: string,
 ): boolean {
