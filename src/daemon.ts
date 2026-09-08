@@ -17038,6 +17038,16 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
   return true;
 }
 
+/** True while a failed release still has work: the route is held, or a
+ * durable tail entry is waiting for promotion. Do not key this only on
+ * `initialStartPending` — inline promote can fail after the opening already
+ * cleared that flag, and `promoteQueuedActivationTail` setting it again
+ * before a store throw is not a contract. */
+function queuedActivationReleaseDue(ds: DaemonSession): boolean {
+  return ds.initialStartPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0;
+}
+
 /** Retry a route release whose durable promotion failed (a store write or the
  * worker IPC) while the route is still held. The retry is one more command on
  * the session's turn queue, so it cannot overtake an admission that arrived in
@@ -17046,11 +17056,11 @@ function scheduleQueuedActivationTailReleaseRetry(
   ds: DaemonSession,
   acknowledgedToken?: string,
 ): void {
-  if (!ds.initialStartPending || ds.queuedActivationTailReleaseRetryTimer) return;
+  if (!queuedActivationReleaseDue(ds) || ds.queuedActivationTailReleaseRetryTimer) return;
   const timer = setTimeout(() => {
     if (ds.queuedActivationTailReleaseRetryTimer !== timer) return;
     ds.queuedActivationTailReleaseRetryTimer = undefined;
-    if (!ds.initialStartPending) return;
+    if (!queuedActivationReleaseDue(ds)) return;
     void releaseQueuedActivationReservation(ds, acknowledgedToken).then(released => {
       if (!released) scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
     }, err => {

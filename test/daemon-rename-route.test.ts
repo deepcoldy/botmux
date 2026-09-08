@@ -207,7 +207,7 @@ import {
   hasQueuedActivationAdmissionGate,
   reserveQueuedActivationTailAdmission,
 } from '../src/core/worker-pool.js';
-import { runSessionTurn } from '../src/core/session-turn-queue.js';
+import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -525,6 +525,7 @@ function resetRouteTestState(): void {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   activeSessions.clear();
+  __testOnly_resetSessionTurnQueues();
   rmSync(crossRefPath(), { force: true });
   rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
@@ -571,6 +572,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
+    __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
     // master: clear per-bot store files so a seeded cross-ref / bots config from
     // one test can't leak into the next (see the known-peer + /fast tests).
@@ -2566,6 +2568,46 @@ describe('/rename production routing — must not pre-create a session (review P
     }));
     expect(ds.session.queuedActivationPending).toBe(true);
     expect(ds.session.queuedActivationTail).toBeUndefined();
+  });
+
+  it('retries inline promote when the opening already released and the store write fails', async () => {
+    const ds = seedThreadSession('om_inline_promote_retry', 'inline promote retry');
+    ds.session.cliId = 'claude-code';
+    ds.initialStartPending = true;
+    ds.hasHistory = true;
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    mocks.updateSession
+      .mockImplementationOnce((session: any) => { mocks.sessions.set(session.sessionId, session); })
+      .mockImplementationOnce(() => { throw new Error('promote persist unavailable'); });
+    const admission = admitFollowerBehindOpening(ds, reservation, {
+      userPrompt: 'AFTER_RELEASE_RETRY',
+      turnId: 'turn-after-release-retry',
+      build: async () => ({ content: 'AFTER_RELEASE_RETRY' }),
+    });
+    await expect(ack).resolves.toBe(true);
+    await admission;
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'turn-after-release-retry' }),
+    ]);
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeDefined();
+
+    const deadline = Date.now() + 1_000;
+    while (!ds.session.queuedActivationPending && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('turn-after-release-retry');
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-after-release-retry',
+      content: 'AFTER_RELEASE_RETRY',
+    }));
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
   });
 
   it('holds the admission gate while a follower is still being built, so a live-worker turn cannot overtake it', async () => {
