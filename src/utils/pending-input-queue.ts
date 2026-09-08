@@ -131,11 +131,13 @@ export function pendingInputAllowsTypeAhead(
  * launch-argument path; adopt observes an already-running process. */
 export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
+  durableInitialPromptViaArgs?: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
   queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
+    && !opts.durableInitialPromptViaArgs
     && !opts.adoptMode
     && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }

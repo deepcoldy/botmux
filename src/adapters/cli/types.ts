@@ -250,6 +250,22 @@ export interface CliAdapter {
    *  triggered the resume would be lost. */
   readonly initialPromptArgsIgnoredOnResume?: boolean;
 
+  readonly durableInitialPromptViaArgs?: boolean;
+  captureInitialPromptArgSubmission?(): number | null;
+  confirmInitialPromptArgSubmission?(
+    baseline: number | null,
+    content: string,
+  ): Promise<{
+    submitted: boolean;
+    cliSessionId?: string;
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+  }>;
+  findInitialPromptArgSubmission?(baseline: number, content: string): {
+    submitted: boolean;
+    cliSessionId?: string;
+  };
+  isInitialPromptComplete?(baseline: number, cliSessionId: string): boolean;
+
   readonly rawCommandInputMode?: 'paste-line';
   readonly rawCommandSettleMs?: number;
 

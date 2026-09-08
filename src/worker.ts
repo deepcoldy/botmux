@@ -1882,8 +1882,76 @@ let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
+let lastSpawnArgvDurableInitialPrompt = false;
+let lastSpawnArgvDurableInitialPromptSubmission: { baseline: number | null; content: string } | undefined;
+let argvDurableInitialPromptCompletionTimer: ReturnType<typeof setInterval> | null = null;
+let argvDurableInitialPromptCompletion: {
+  baseline: number;
+  content: string;
+  cliSessionId?: string;
+  turnId: string;
+  dispatchAttempt: number;
+  adapter: CliAdapter;
+} | undefined;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
+
+function watchArgvDurableInitialPromptCompletion(opts: {
+  baseline: number;
+  cliSessionId: string;
+  turnId: string;
+  dispatchAttempt: number;
+  adapter: CliAdapter;
+  backend: SessionBackend;
+  generation: number;
+}): void {
+  if (argvDurableInitialPromptCompletionTimer) {
+    clearInterval(argvDurableInitialPromptCompletionTimer);
+    argvDurableInitialPromptCompletionTimer = null;
+  }
+  const check = () => {
+    if (cliSpawnGeneration !== opts.generation || backend !== opts.backend) {
+      if (argvDurableInitialPromptCompletionTimer) {
+        clearInterval(argvDurableInitialPromptCompletionTimer);
+        argvDurableInitialPromptCompletionTimer = null;
+      }
+      return;
+    }
+    if (!opts.adapter.isInitialPromptComplete?.(opts.baseline, opts.cliSessionId)) return;
+    if (argvDurableInitialPromptCompletionTimer) {
+      clearInterval(argvDurableInitialPromptCompletionTimer);
+      argvDurableInitialPromptCompletionTimer = null;
+    }
+    argvDurableInitialPromptCompletion = undefined;
+    emitTurnTerminal(opts.turnId, 'completed', undefined, opts.dispatchAttempt);
+  };
+  check();
+  if (argvDurableInitialPromptCompletionTimer) return;
+  argvDurableInitialPromptCompletionTimer = setInterval(check, 1_000);
+  argvDurableInitialPromptCompletionTimer.unref?.();
+}
+
+function drainArgvDurableInitialPromptCompletion(): boolean {
+  const completion = argvDurableInitialPromptCompletion;
+  if (!completion
+    || completion.turnId !== currentBotmuxTurnId
+    || completion.dispatchAttempt !== currentBotmuxDispatchAttempt) return false;
+  const submission = completion.cliSessionId
+    ? { submitted: true, cliSessionId: completion.cliSessionId }
+    : completion.adapter.findInitialPromptArgSubmission?.(
+      completion.baseline,
+      completion.content,
+    );
+  if (!submission?.submitted
+    || !submission.cliSessionId
+    || !completion.adapter.isInitialPromptComplete?.(
+      completion.baseline,
+      submission.cliSessionId,
+    )) return false;
+  argvDurableInitialPromptCompletion = undefined;
+  emitTurnTerminal(completion.turnId, 'completed', undefined, completion.dispatchAttempt);
+  return true;
+}
 // True when this session runs under an outer bwrap supervisor (file sandbox OR
 // Linux credential-only bwrap) — both make getChildPid() the supervisor, not the
 // CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
@@ -10955,6 +11023,7 @@ function scheduleSubmitFailureNotify(
   turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
+  onConfirmed?: (cliSessionId?: string) => void,
 ): void {
   const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
@@ -11040,6 +11109,7 @@ function scheduleSubmitFailureNotify(
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         }
+        onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         redriveRejectedStructuredReady();
         return;
@@ -14195,12 +14265,18 @@ async function spawnCli(
     preparedInitialPrompt = prepared?.initialPrompt ?? cfg.prompt;
     promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;
   }
+  const hasDurableInitialPrompt = cfg.dispatchAttempt !== undefined || !!cfg.queuedActivationToken;
+  const durableInitialPromptArgBaseline = hasDurableInitialPrompt
+    ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
+    : undefined;
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
     hasStartupCommands: !!cfg.startupCommands?.length,
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || shouldDeferArgsBakedDurablePrompt({
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+    durableInitialPromptViaArgs: cliAdapter.durableInitialPromptViaArgs === true
+      && durableInitialPromptArgBaseline !== null,
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
     queuedActivationToken: cfg.queuedActivationToken,
@@ -14247,6 +14323,17 @@ async function spawnCli(
     piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
   }
   lastSpawnDeferInitialPrompt = deferInitialPrompt;
+  lastSpawnArgvDurableInitialPrompt = !deferInitialPrompt
+    && !effectiveResume
+    && !willReattachPersistent
+    && !!preparedInitialPrompt
+    && cliAdapter.durableInitialPromptViaArgs === true
+    && !!cliAdapter.confirmInitialPromptArgSubmission
+    && durableInitialPromptArgBaseline !== null
+    && hasDurableInitialPrompt;
+  lastSpawnArgvDurableInitialPromptSubmission = lastSpawnArgvDurableInitialPrompt
+    ? { baseline: durableInitialPromptArgBaseline!, content: preparedInitialPrompt! }
+    : undefined;
   kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
   kiroSessionIdCaptureBuffer = '';
   // Sandboxed sessions: write this bot's OWN send-credential into its BOT_HOME.
@@ -15665,6 +15752,7 @@ async function spawnCli(
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
   // has returned we know whether a FRESH generation was actually established.
@@ -16364,7 +16452,7 @@ async function spawnCli(
       );
       return;
     }
-    if (cliAdapter?.reliableTurnTerminal === true
+    if ((cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt)
       && exitedTurnId
       && exitedDispatchAttempt !== undefined) {
       // The CLI may have durably appended its terminal record immediately
@@ -16372,14 +16460,17 @@ async function spawnCli(
       // synchronously before claiming `cli_exit`; otherwise ambiguous wins the
       // deduper and needlessly replays a turn that actually completed.
       drainReliableTerminalBeforeInterrupt();
-      // Race-safe with transcript final / submit-failure: the worker-local
-      // terminal deduper lets exactly one status win for this attempt.
-      emitTurnTerminal(
-        exitedTurnId,
-        'ambiguous',
-        'cli_exit',
-        exitedDispatchAttempt,
-      );
+      if (drainArgvDurableInitialPromptCompletion()) {
+      } else {
+        // Race-safe with transcript final / submit-failure: the worker-local
+        // terminal deduper lets exactly one status win for this attempt.
+        emitTurnTerminal(
+          exitedTurnId,
+          'ambiguous',
+          'cli_exit',
+          exitedDispatchAttempt,
+        );
+      }
     }
     durableTurnInFlight = false;
     // Hybrid RPC mode: the `codex --remote` viewer just died — tear down the
@@ -19284,6 +19375,93 @@ process.on('message', async (raw: unknown) => {
           // A successful spawn with a non-queued prompt means the adapter baked
           // it into argv or the RPC engine already accepted it.
           initialInputCommitted = true;
+          if (lastSpawnArgvDurableInitialPrompt) {
+            if (msg.dispatchAttempt !== undefined) durableTurnInFlight = true;
+            const submission = lastSpawnArgvDurableInitialPromptSubmission;
+            const confirm = cliAdapter?.confirmInitialPromptArgSubmission;
+            if (submission
+              && submission.baseline !== null
+              && msg.turnId
+              && msg.dispatchAttempt !== undefined
+              && cliAdapter) {
+              argvDurableInitialPromptCompletion = {
+                baseline: submission.baseline,
+                content: submission.content,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+            }
+            const argvGeneration = cliSpawnGeneration;
+            const argvBackend = backend;
+            const finalizeArgvSubmission = (cliSessionId?: string) => {
+              if (!submission
+                || submission.baseline === null
+                || !cliSessionId
+                || !msg.turnId
+                || msg.dispatchAttempt === undefined
+                || !cliAdapter?.isInitialPromptComplete
+                || !argvBackend) return;
+              const completion = {
+                baseline: submission.baseline,
+                content: submission.content,
+                cliSessionId,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+              argvDurableInitialPromptCompletion = completion;
+              watchArgvDurableInitialPromptCompletion({
+                ...completion,
+                backend: argvBackend,
+                generation: argvGeneration,
+              });
+              if (msg.queuedActivationToken) {
+                send({
+                  type: 'queued_activation_submitted',
+                  sessionId,
+                  activationToken: msg.queuedActivationToken,
+                });
+              }
+            };
+            if (submission && confirm && argvBackend) {
+              try {
+                const result = await confirm(submission.baseline, submission.content);
+                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
+                  if (result.cliSessionId) persistCliSessionId(result.cliSessionId);
+                  if (result.submitted) {
+                    finalizeArgvSubmission(result.cliSessionId);
+                  } else {
+                    scheduleSubmitFailureNotify(
+                      submission.content,
+                      result.recheck,
+                      t('worker.transcriptLabel'),
+                      undefined,
+                      undefined,
+                      usageLimitTracker.currentTurn(),
+                      { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
+                      'failed',
+                      false,
+                      cliSessionId => finalizeArgvSubmission(cliSessionId),
+                    );
+                  }
+                }
+              } catch {
+                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
+                  scheduleSubmitFailureNotify(
+                    submission.content,
+                    undefined,
+                    t('worker.transcriptLabel'),
+                    undefined,
+                    undefined,
+                    usageLimitTracker.currentTurn(),
+                    { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
+                    'failed',
+                  );
+                }
+              }
+            }
+          }
         }
         // The first turn is now either at queue head or already owned by the
         // argv/RPC startup path. Only now may an early idle edge drain
@@ -19629,7 +19807,10 @@ process.on('message', async (raw: unknown) => {
       settleDurableTurnForRestart({
         hasInFlightTurn: durableTurnInFlight,
         hasCurrentTurnId: !!currentBotmuxTurnId,
-        drain: () => drainReliableTerminalBeforeInterrupt(),
+        drain: () => {
+          drainReliableTerminalBeforeInterrupt();
+          drainArgvDurableInitialPromptCompletion();
+        },
         isStillInFlight: () => durableTurnInFlight,
         emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
