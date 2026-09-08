@@ -18155,8 +18155,14 @@ function _followFixedGridBottom(){
 function _scrollFixedGrid(dx,dy){
   if(!fixedSize)return false;
   var host=document.getElementById('terminal'),x=host.scrollLeft,y=host.scrollTop;
-  host.scrollLeft+=dx;host.scrollTop+=dy;
-  return host.scrollLeft!==x||host.scrollTop!==y;
+  // Consume only the dominant axis: minor cross-axis drift must not swallow
+  // a gesture that should reach terminal history at the canvas boundary.
+  if(Math.abs(dy)>=Math.abs(dx)){
+    host.scrollTop+=dy;
+    return host.scrollTop!==y;
+  }
+  host.scrollLeft+=dx;
+  return host.scrollLeft!==x;
 }
 // Reveal the canvas before xterm or the remote-wheel handler consumes gestures.
 // At the canvas edge, normal terminal history scrolling resumes.
