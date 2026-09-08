@@ -136,6 +136,11 @@ function runDelete(
       SESSION_DATA_DIR: dataDir,
       ...envOverrides,
     };
+    // The CLI classifies itself as sandboxed from positive env signals; a
+    // read-isolated host running this suite must not leak that into the
+    // offline cases (the sandboxed cases set BOTMUX_SEND_RELAY explicitly).
+    if (envOverrides.BOTMUX_READ_ISOLATED === undefined) delete env.BOTMUX_READ_ISOLATED;
+    if (envOverrides.BOTMUX_ORIGIN_CHANNEL_ID === undefined) delete env.BOTMUX_ORIGIN_CHANNEL_ID;
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete env[key];
     }
@@ -409,6 +414,72 @@ describe('botmux delete — daemon-first close', () => {
     expect(stored[session.sessionId].status).toBe('closed');
     expect(stored[session.sessionId].closedAt).toBeTruthy();
     expect(stored[session.sessionId]).not.toHaveProperty('previewTarget');
+  });
+
+  it('never writes a token snapshot from the host shell (the daemon samples it, the host leaves the field alone)', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-no-usage');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    const stored = readSessions(dataDir)[session.sessionId];
+    expect(stored.status).toBe('closed');
+    expect(stored).not.toHaveProperty('tokenUsage');
+  });
+
+  it('fails closed when only BOTMUX_ORIGIN_CHANNEL_ID is set and no daemon is reachable', async () => {
+    // The worker stamps this on every isolated child (full sandbox, read
+    // isolation, credential-only). Those children must not become a store
+    // host: credential-only still leaves ~/.botmux writable, so this is a
+    // confused-deputy gate, not "the write would fail anyway". A host shell
+    // never receives the variable from device enrollment.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-origin-channel');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('隔离会话内不能离线修改会话');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('fails closed inside a sandboxed CLI when no daemon is reachable — no offline write', async () => {
+    // A sandboxed / read-isolated CLI can only SEND commands (design §1). With
+    // no daemon it must fail explicitly, not degrade into a write behind the
+    // sandbox's read-only store grant.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const relayDir = join(dataDir, 'relay');
+    mkdirSync(relayDir, { recursive: true });
+    const session = makeSession('sess-delete-sandboxed');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: relayDir,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('隔离会话内不能离线修改会话');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
   });
 
   it('orders the current session last for delete all', async () => {

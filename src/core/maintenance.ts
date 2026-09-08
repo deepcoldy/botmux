@@ -419,7 +419,14 @@ export function prepareRestartDriverContext(
   }
 
   if (leaseBound) {
-    for (const key of DAEMON_ENV_KEYS) delete env[key];
+    for (const key of DAEMON_ENV_KEYS) {
+      // Companion start/restart flags are one-shot authority for the target
+      // dashboard and must survive the lease handoff; unlike ordinary fleet
+      // settings they cannot be recovered from a stale persisted snapshot.
+      if ((key === 'BOTMUX_COMPANION_SECRET_FILE' || key === 'BOTMUX_COMPANION_BOT_APP_ID')
+        && env[key]?.trim()) continue;
+      delete env[key];
+    }
     return {
       refreshPersistedEnv: true,
       readFailureFallback: outerFallback,

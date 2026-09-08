@@ -281,6 +281,43 @@ describe('opencode writeInput DB verification', () => {
     expect(events).toEqual([`paste:${content.length}`, 'key:Enter']);
   });
 
+  it.each([
+    ['long deferred first prompt', `FIRST\n${'中文多行 0123456789\n'.repeat(700)}LAST`],
+    ['short multiline follow-up', 'first line\nsecond line'],
+    ['long single line', '内容'.repeat(100)],
+  ])('uses bracketed paste on raw PTY for a %s', async (_label, content) => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const writes: string[] = [];
+    const pty: PtyHandle = {
+      write(data) {
+        writes.push(data);
+        if (data === '\r' && writes[0] === `\x1b[200~${content}\x1b[201~`) {
+          seedUserPart(db, 'ses_target', content, Date.now());
+        }
+      },
+    };
+
+    try {
+      const result = await createOpenCodeAdapter().writeInput(pty, content);
+      expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+      expect(writes).toEqual([`\x1b[200~${content}\x1b[201~`, '\r']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([
+    ['short follow-up', 'short follow-up'],
+    ['short slash command', '/session'],
+    ['long slash command', `/compact ${'a'.repeat(300)}`],
+    ['multiline slash command', '/ask first line\nsecond line'],
+  ])('keeps raw PTY typing for %s', async (_label, content) => {
+    const writes: string[] = [];
+    await createOpenCodeAdapter().writeInput({ write(data) { writes.push(data); } }, content);
+    expect(writes).toEqual([content, '\r']);
+  });
+
   it('recognizes the submission when OpenCode prepends a Directory Context block to the stored user part', async () => {
     const db = openDb();
     seedSession(db, { id: 'ses_target' });

@@ -16,7 +16,7 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { assertProjectionIdentity, type FleetState, type FleetProcState } from './fleet-supervisor-policy.js';
 
 /** Shape guard for a parsed state file — tolerant of an absent/partial file. */
-function coerceState(raw: unknown): FleetState | null {
+export function parseFleetState(raw: unknown): FleetState | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
   if (!Array.isArray(o.procs)) return null;
@@ -41,11 +41,13 @@ function coerceState(raw: unknown): FleetState | null {
       // round-trips. Kept absent (rather than `undefined`) when missing so bot
       // and dashboard entries serialize byte-identically to before.
       ...(typeof q.configHash === 'string' ? { configHash: q.configHash } : {}),
+      ...(typeof q.processStart === 'string' ? { processStart: q.processStart } : {}),
     });
   }
   return {
     supervisorPid: Number.isSafeInteger(o.supervisorPid) ? (o.supervisorPid as number) : 0,
     supervisorStartedAt: typeof o.supervisorStartedAt === 'string' ? o.supervisorStartedAt : '',
+    ...(typeof o.supervisorEntry === 'string' ? { supervisorEntry: o.supervisorEntry } : {}),
     procs,
   };
 }
@@ -54,7 +56,7 @@ function coerceState(raw: unknown): FleetState | null {
 export function readFleetState(statePath: string): FleetState | null {
   if (!existsSync(statePath)) return null;
   try {
-    return coerceState(JSON.parse(readFileSync(statePath, 'utf-8')));
+    return parseFleetState(JSON.parse(readFileSync(statePath, 'utf-8')));
   } catch {
     return null;
   }

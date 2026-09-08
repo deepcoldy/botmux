@@ -167,6 +167,71 @@ describe('installHook — claude-settings', () => {
     })).toBe(true);
   });
 
+  it.each([
+    '/repo/dist-bin/botmux-linux-x64',
+    '/repo/dist-bin/botmux-linux-arm64',
+    '/repo/dist-bin/botmux-linux-x64-musl',
+    '/repo/dist-bin/botmux-linux-arm64-musl',
+    '/repo/dist-bin/botmux-darwin-x64',
+    '/repo/dist-bin/botmux-darwin-arm64',
+    'C:\\repo\\dist-bin\\botmux-windows-x64',
+    'C:\\repo\\dist-bin\\botmux-windows-x64.exe',
+    'C:\\repo\\dist-bin\\botmux-windows-arm64',
+    'C:\\repo\\dist-bin\\botmux-windows-arm64.exe',
+  ])('识别 dev dist-bin 产物并保持三类 hook 幂等: %s', (first) => {
+    const second = '/opt/botmux/bin/botmux';
+    const firstInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: `${first} session-ready`,
+      userPromptSubmitCommand: `${first} user-prompt-hook`,
+    };
+    installHook('claude-code', firstInstall, `${first} hook claude-code`);
+    installHook('claude-code', {
+      ...firstInstall,
+      sessionStartCommand: `${second} session-ready`,
+      userPromptSubmitCommand: `${second} user-prompt-hook`,
+    }, `${second} hook claude-code`);
+
+    const hooks = JSON.parse(readFileSync(configPath, 'utf-8')).hooks;
+    for (const event of ['PreToolUse', 'SessionStart', 'UserPromptSubmit']) {
+      expect(hooks[event]).toHaveLength(1);
+      expect(hooks[event][0].hooks).toHaveLength(1);
+      expect(hooks[event][0].hooks[0].command).toContain(second);
+    }
+  });
+
+  it.each([
+    'botmux-helper',
+    'botmux-wrapper',
+    'botmux-linux',
+    'botmux-x64',
+    'botmux-linux-x64-extra',
+    'botmux-linux-x64.exe',
+    'botmux-linux-arm64-musl.exe',
+    'botmux-darwin-arm64.exe',
+    'botmux-darwin-arm64-musl',
+    'botmux-windows-x64-musl',
+    'botmux-windows-arm64-musl.exe',
+  ])('不把第三方同前缀程序 %s 当成 botmux hook', (basename) => {
+    const thirdPartyCommand = `/usr/local/bin/${basename} session-ready`;
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: thirdPartyCommand }] }] },
+    }));
+
+    const currentBinary = '/repo/dist-bin/botmux-linux-x64';
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: `${currentBinary} session-ready`,
+    }, `${currentBinary} hook claude-code`);
+
+    const commands = JSON.parse(readFileSync(configPath, 'utf-8'))
+      .hooks.SessionStart.flatMap((group: any) => group.hooks.map((entry: any) => entry.command));
+    expect(commands).toContain(thirdPartyCommand);
+  });
+
   it('ready preflight fails closed for malformed or unrelated SessionStart config', () => {
     mkdirSync(join(tmpDir, '.claude'), { recursive: true });
     writeFileSync(configPath, JSON.stringify({

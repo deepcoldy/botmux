@@ -126,12 +126,10 @@ function botmuxHookSuffix(hookCommand: string): string {
  * `botmux`（`botmux-linux-x64/botmux` 的 basename 同为 `botmux`；Windows 上为 `botmux.exe`）。
  * 两者取其一即视为同一条 botmux hook，无论它指向哪个安装路径、由 node 还是打包二进制执行。
  *
- * ⚠️ basename 白名单**故意只认这三个字面量**，不要放宽成 `botmux-*` 前缀匹配：那会把
+ * ⚠️ basename 白名单**故意枚举正式产物名**，不要放宽成 `botmux-*` 前缀匹配：那会把
  * 第三方同前缀程序（`botmux-helper` / `botmux-wrapper` 等）也当成自己的 hook 删掉。
- * 已知未覆盖形态：本地 `bun run use:here --binary` 指向的 `dist-bin/botmux-<plat>-<arch>`
- * （basename 带平台后缀）。生产两条安装路径都落在 `botmux` 上（npm 平台子包
- * `…/node_modules/botmux-<plat>-<arch>/botmux`、install.sh 的 `~/.botmux/bin/botmux`），
- * 故仅影响开发机；真要覆盖须**枚举死平台后缀**而非放宽为任意后缀。
+ * 生产安装入口通常叫 `botmux`；本地 `bun run use:here --binary` 会指向
+ * `dist-bin/botmux-<plat>-<arch>[-musl]`，因此也需精确覆盖这些构建产物名。
  */
 function isBotmuxHookCommand(command: string, suffix: string): boolean {
   const trimmed = command.trimEnd();
@@ -141,7 +139,12 @@ function isBotmuxHookCommand(command: string, suffix: string): boolean {
   if (!target) return false;
   const slash = Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\'));
   const basename = target.slice(slash + 1);
-  return basename === 'cli.js' || basename === 'botmux' || basename === 'botmux.exe';
+  return basename === 'cli.js'
+    || basename === 'botmux'
+    || basename === 'botmux.exe'
+    || /^botmux-linux-(?:x64|arm64)(?:-musl)?$/.test(basename)
+    || /^botmux-darwin-(?:x64|arm64)$/.test(basename)
+    || /^botmux-windows-(?:x64|arm64)(?:\.exe)?$/.test(basename);
 }
 
 /**

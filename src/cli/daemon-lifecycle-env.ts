@@ -34,6 +34,11 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_DASHBOARD_PORT',
   'BOTMUX_DAEMON_IPC_BASE_PORT',
   'BOTMUX_DASHBOARD_PUBLIC_READONLY',
+  // Closed local companion control surface. The values are lifecycle settings:
+  // start/restart flags override them in inherited env; ~/.botmux/.env keeps
+  // them across boot-time starts. Session CLI boundaries redact both keys.
+  'BOTMUX_COMPANION_SECRET_FILE',
+  'BOTMUX_COMPANION_BOT_APP_ID',
   // Self-hosted reverse-proxy base for terminal/dashboard links
   // (publicReverseProxyBaseUrl). Left out of this list it only survived as
   // long as every restart came from a shell that exported it — one restart
@@ -82,8 +87,17 @@ export function resolveDaemonEnv(
   refreshPersistedEnv = Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim()),
 ): Record<DaemonEnvKey, string> {
   const fileEnv = envFileText === undefined ? {} : parse(envFileText);
+  const companionKeys = new Set<DaemonEnvKey>([
+    'BOTMUX_COMPANION_SECRET_FILE',
+    'BOTMUX_COMPANION_BOT_APP_ID',
+  ]);
   const resolve = (key: DaemonEnvKey): string => {
-    const value = refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
+    // start/restart flags are authoritative even when invoked from a managed
+    // session. Do not let refreshPersistedEnv discard the freshly validated
+    // companion binding before the supervisor receives it.
+    const value = companionKeys.has(key)
+      ? inheritedEnv[key] ?? fileEnv[key]
+      : refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
     return value?.trim() ?? '';
   };
 

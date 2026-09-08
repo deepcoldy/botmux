@@ -5,10 +5,13 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
+import { logger } from '../src/utils/logger.js';
 
 import {
   filterMatches,
   emitHookEvent,
+  emitHookEventLocal,
+  evaluatePromptGate,
   forwardEmitToDaemon,
   loadHookConfigs,
   parseHookCommand,
@@ -472,5 +475,480 @@ describe('runHookCommandForTest', () => {
     expect(result.status).toBe(0);
     // Give any (unintended) spawned hook child a moment to land its file.
     expect(existsSync(marker)).toBe(false);
+  });
+});
+
+// ─── 同步前置校验闸（sync gate hooks） ──────────────────────────────────────
+
+describe('sync gate hooks (prompt.submit)', () => {
+  /** 写一个按参数决定行为的 hook 脚本，返回可直接放进 command 的路径。 */
+  function writeHook(name: string, body: string, dir = tmpDir): string {
+    const script = join(dir, name);
+    writeFileSync(script, body);
+    return `${process.execPath} ${script}`;
+  }
+
+  function gateHooks(hooks: HookConfig[]): void {
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify(hooks);
+  }
+
+  // async(通知型) hook 是 fire-and-forget 且句柄被 unref，它落盘的时刻**不在**本
+  // 用例的 await 链上。两件事因此不能沿用 suite 的 `tmpDir`：
+  //   • `afterEach` 会在子进程 exec 到脚本之前就把 tmpDir（**连脚本一起**）删掉。
+  //     Bun 下实测 ENOENT——unref 的子进程比 Node 起得慢一步，红的是清理竞态而
+  //     不是被测行为。
+  //   • 固定 sleep 在负载高的机器上同样不稳。
+  // 所以：自己的目录（脚本和产物都放这里）、自己负责删、用轮询等落盘。
+  const observerDirs: string[] = [];
+  function observerDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-hook-observer-'));
+    observerDirs.push(dir);
+    return dir;
+  }
+  async function waitForFile(path: string, timeoutMs = 5_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (existsSync(path)) return true;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    return false;
+  }
+  afterEach(() => {
+    for (const dir of observerDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    delete process.env.BOTMUX_HOOKS_JSON;
+  });
+
+  it('allows when no sync hook is configured (zero spawn)', async () => {
+    gateHooks([{ event: 'prompt.submit', command: '/bin/false', mode: 'async' }]);
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('denies on a JSON verdict and surfaces the reason to the caller', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny.js', `
+        console.log(JSON.stringify({ decision: 'deny', reason: 'not on the allowlist' }));
+      `),
+    }]);
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('not on the allowlist');
+  });
+
+  it('allows on a JSON allow verdict', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('allow.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('receives the prompt payload on stdin', async () => {
+    const output = join(tmpDir, 'seen-payload.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('capture.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          writeFileSync(${JSON.stringify(output)}, input);
+          console.log(JSON.stringify({ decision: 'allow' }));
+        });
+      `),
+    }]);
+    await evaluatePromptGate('prompt.submit', { content: 'review this', senderOpenId: 'ou_x' });
+    expect(JSON.parse(readFileSync(output, 'utf-8'))).toMatchObject({
+      event: 'prompt.submit',
+      content: 'review this',
+      senderOpenId: 'ou_x',
+    });
+  });
+
+  it('falls back to the exit code when stdout carries no verdict', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('exit1.js', `process.exit(1);`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(false);
+
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('exit0.js', `process.exit(0);`),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('gives a sync gate the FULL content, so padding cannot hide past the preview limit', async () => {
+    // Regression: prepareHookPayload truncates content at 600 chars for
+    // notification hooks. Reusing that for a gate made it structurally blind —
+    // an attacker pads 600 chars and hides the payload behind them. Verified
+    // pre-fix: a grep gate allowed 'A'.repeat(700) + ' rm -rf /'.
+    const seen = join(tmpDir, 'gate-content.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('content-gate.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify({
+            len: p.content.length,
+            truncated: p.contentTruncated,
+            sawTail: p.content.includes('SENTINEL_TAIL'),
+          }));
+          console.log(JSON.stringify({
+            decision: p.content.includes('SENTINEL_TAIL') ? 'deny' : 'allow',
+          }));
+        });
+      `),
+    }]);
+
+    const padded = `${'A'.repeat(700)} SENTINEL_TAIL`;
+    const decision = await evaluatePromptGate('prompt.submit', { content: padded });
+
+    expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+      len: padded.length,
+      truncated: false,
+      sawTail: true,
+    });
+    expect(decision.allowed).toBe(false);
+  });
+
+  it('still truncates content for async hooks, including on the gate event', () => {
+    const long = 'B'.repeat(900);
+    const asyncOnGateEvent = prepareHookPayload(
+      { event: 'prompt.submit', command: '/bin/true', mode: 'async' },
+      { event: 'prompt.submit', content: long },
+    );
+    expect(asyncOnGateEvent.content).toHaveLength(600);
+    expect(asyncOnGateEvent.contentTruncated).toBe(true);
+
+    // `sync` on a non-gate event is degraded to async at load time, but guard
+    // the raw shape too: full content must follow the GATE event, not the flag.
+    const syncOnNonGateEvent = prepareHookPayload(
+      { event: 'session.idle', command: '/bin/true', mode: 'sync' },
+      { event: 'session.idle', content: long },
+    );
+    expect(syncOnNonGateEvent.content).toHaveLength(600);
+    expect(syncOnNonGateEvent.contentTruncated).toBe(true);
+  });
+
+  it('lets a stdout verdict win over a conflicting exit code (documented precedence)', async () => {
+    // A checker that prints "allow" and then dies in its own cleanup still meant
+    // allow. Documented in hooks.md as "stdout JSON takes precedence".
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('allow-then-crash.js', `
+        console.log(JSON.stringify({ decision: 'allow' }));
+        process.exit(3);
+      `),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+
+    // ...and the reverse: exit 0 but an explicit deny on stdout still denies.
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny-then-ok.js', `
+        console.log(JSON.stringify({ decision: 'deny', reason: 'policy' }));
+        process.exit(0);
+      `),
+    }]);
+    const denied = await evaluatePromptGate('prompt.submit', {});
+    expect(denied.allowed).toBe(false);
+    expect(denied.reason).toBe('policy');
+  });
+
+  it('ignores non-JSON chatter on stdout and uses the exit code', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('chatty.js', `
+        console.log('checking permissions...');
+        process.exit(0);
+      `),
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', {})).allowed).toBe(true);
+  });
+
+  it('fails open on timeout by default, and closed when onError is deny', async () => {
+    const hang = writeHook('hang.js', `setTimeout(() => {}, 60000);`);
+
+    gateHooks([{ event: 'prompt.submit', mode: 'sync', command: hang, timeoutMs: 300 }]);
+    const openDecision = await evaluatePromptGate('prompt.submit', {});
+    expect(openDecision.allowed).toBe(true);
+    expect(openDecision.fromError).toBe(true);
+
+    gateHooks([{ event: 'prompt.submit', mode: 'sync', command: hang, timeoutMs: 300, onError: 'deny' }]);
+    const closedDecision = await evaluatePromptGate('prompt.submit', {});
+    expect(closedDecision.allowed).toBe(false);
+    expect(closedDecision.fromError).toBe(true);
+  });
+
+  it('fails open when the hook binary does not exist', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: join(tmpDir, 'definitely-not-here'),
+    }]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(true);
+    expect(decision.fromError).toBe(true);
+  });
+
+  it('ANDs multiple sync hooks and short-circuits after the first deny', async () => {
+    const secondRan = join(tmpDir, 'second-ran');
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('first-deny.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'first' }));`),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('second.js', `
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(secondRan)}, 'ran');
+          console.log(JSON.stringify({ decision: 'allow' }));
+        `),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('first');
+    expect(existsSync(secondRan)).toBe(false);
+  });
+
+  it('requires every sync hook to allow', async () => {
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('ok.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('nope.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'second' }));`),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('second');
+  });
+
+  it('honours filters, so an unmatched sender is not adjudicated', async () => {
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('deny-all.js', `console.log(JSON.stringify({ decision: 'deny' }));`),
+      filter: { senderOpenId: 'ou_someone_else' },
+    }]);
+    expect((await evaluatePromptGate('prompt.submit', { senderOpenId: 'ou_me' })).allowed).toBe(true);
+    expect((await evaluatePromptGate('prompt.submit', { senderOpenId: 'ou_someone_else' })).allowed).toBe(false);
+  });
+
+  it('degrades mode:sync to async on non-gate events instead of pretending to block', () => {
+    const hooks = loadHookConfigs({
+      env: {
+        BOTMUX_HOOKS_JSON: JSON.stringify([
+          { event: 'session.start', command: '/bin/true', mode: 'sync' },
+          { event: 'prompt.submit', command: '/bin/true', mode: 'sync' },
+        ]),
+      },
+    });
+    expect(hooks.find(h => h.event === 'session.start')?.mode).toBe('async');
+    expect(hooks.find(h => h.event === 'prompt.submit')?.mode).toBe('sync');
+  });
+
+  it('never runs a sync gate hook a second time as a fire-and-forget notification', async () => {
+    // emitHookEventLocal, NOT emitHookEvent: this test process inherits
+    // BOTMUX_SESSION_ID/BOTMUX_LARK_APP_ID from the botmux session running it,
+    // so emitHookEvent takes the forward-to-daemon branch and spawns nothing
+    // locally — the assertion would pass no matter what the dedup filter did.
+    // (Verified: mutating away `hook.mode !== 'sync'` left the old version green.)
+    const marker = join(tmpDir, 'notify-ran');
+    const dup = `${marker}.dup`;
+    gateHooks([{
+      event: 'prompt.submit',
+      mode: 'sync',
+      command: writeHook('gate-once.js', `
+        import { writeFileSync, existsSync } from 'node:fs';
+        writeFileSync(existsSync(${JSON.stringify(marker)}) ? ${JSON.stringify(dup)} : ${JSON.stringify(marker)}, 'x');
+        console.log(JSON.stringify({ decision: 'allow' }));
+      `),
+    }]);
+    await evaluatePromptGate('prompt.submit', {});
+    expect(existsSync(marker)).toBe(true);
+
+    emitHookEventLocal('prompt.submit', {});
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(existsSync(dup)).toBe(false);
+  });
+
+  // 生产中 gate 事件**没有任何 emitHookEvent 发射点**（grep 全 src/ 为 0），唯一
+  // 产出它的地方就是 evaluatePromptGate。所以「async hook 会不会跑」必须从
+  // evaluatePromptGate 进去验；用 emitHookEventLocal 手工发射等于自造一条生产
+  // 不存在的路径，那样断言无论实现怎样都会绿。
+  it('runs async hooks on a gate event through the gate itself (no emit site exists)', async () => {
+    const dir = observerDir();
+    const ran = join(dir, 'async-on-gate-event');
+    gateHooks([{
+      event: 'prompt.submit',
+      // 不写 mode —— 运维照事件表配置时最自然的写法，语义即 async。
+      command: writeHook('async-notify.js', `
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(ran)}, 'x');
+      `, dir),
+    }]);
+    const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
+    // 通知型 hook 不参与裁决：它跑了，但不影响放行。
+    expect(decision.allowed).toBe(true);
+    expect(await waitForFile(ran)).toBe(true);
+  });
+
+  it('runs async observers alongside a sync gate without weakening the verdict', async () => {
+    const dir = observerDir();
+    const observed = join(dir, 'observer-ran');
+    gateHooks([
+      {
+        event: 'prompt.submit',
+        command: writeHook('observer.js', `
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(observed)}, 'x');
+        `, dir),
+      },
+      {
+        event: 'prompt.submit',
+        mode: 'sync',
+        command: writeHook('verdict.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'blocked' }));`),
+      },
+    ]);
+    const decision = await evaluatePromptGate('prompt.submit', {});
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('blocked');
+    // 被拒也要通知：「这条消息被拦了」正是审计类 hook 想知道的事实，
+    // 不能被 deny 的短路吞掉（通知在短路之前就已投递）。
+    expect(await waitForFile(observed)).toBe(true);
+  });
+
+  it('keeps async observers on the truncated payload even on a gate event', async () => {
+    // 全文豁免只给做裁决的 sync hook。通知型 hook 不该因为「恰好订阅了 gate 事件」
+    // 就拿到完整正文——那会把隐私边界悄悄放宽。
+    const dir = observerDir();
+    const seen = join(dir, 'observer-payload.json');
+    gateHooks([{
+      event: 'prompt.submit',
+      command: writeHook('observer-payload.js', `
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => { writeFileSync(${JSON.stringify(seen)}, input); });
+      `, dir),
+    }]);
+    await evaluatePromptGate('prompt.submit', { content: 'Z'.repeat(900) });
+    expect(await waitForFile(seen)).toBe(true);
+    const payload = JSON.parse(readFileSync(seen, 'utf-8'));
+    expect(payload.content).toHaveLength(600);
+    expect(payload.contentTruncated).toBe(true);
+  });
+
+  // 钉住的是：**坏掉的 observer 不能影响裁决**（变异实测：把 observer 也算进
+  // 裁决集合 ⟹ 本例转红）。
+  //
+  // ⚠️ 这条**不能**证明 `runHooksFireAndForget` 里那个 `.catch()` 有效：
+  // `runHookCommand` 是 `new Promise((resolve) => …)`，**根本不会 reject**，
+  // 所以 `.catch()` 只在 `.then()` 回调自身抛错时才可达（那里只有 logger 调用）。
+  // 实测删掉那个 `.catch()`，本用例仍全绿。它是纵深防御 —— 保留的理由是
+  // #1224 的阻断项正是「fire-and-forget 少 .catch() ⟹ unhandledRejection ⟹
+  // daemon 无 handler ⟹ Node v22 终止进程」，而 `.then()` 回调将来一旦加入
+  // 会抛的代码，它就是唯一的兜底。别因为「测试删了也绿」就把它删掉。
+  it('survives a broken async observer without affecting the verdict or leaking a rejection', async () => {
+    const dir = observerDir();
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => { rejections.push(err); };
+    process.on('unhandledRejection', onRejection);
+    try {
+      gateHooks([
+        // spawn 不到（ENOENT）
+        { event: 'prompt.submit', command: join(dir, 'does-not-exist') },
+        // 跑起来了但非 0 退出
+        { event: 'prompt.submit', command: writeHook('boom.js', 'process.exit(7);', dir) },
+        { event: 'prompt.submit', mode: 'sync', command: writeHook('verdict.js', `console.log(JSON.stringify({ decision: 'deny', reason: 'still-works' }));`, dir) },
+      ]);
+      const decision = await evaluatePromptGate('prompt.submit', { content: 'x' });
+      expect(decision.allowed).toBe(false);
+      expect(decision.reason).toBe('still-works');
+      // 给 fire-and-forget 的失败回调跑完的机会，再断言没有漏出去的 rejection。
+      await new Promise(resolve => setTimeout(resolve, 800));
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  it('warns that timeoutMs:0 on a sync gate is an instant timeout, not "no timeout"', () => {
+    const warnings: string[] = [];
+    const original = logger.warn;
+    (logger as any).warn = (msg: string) => { warnings.push(String(msg)); };
+    try {
+      loadHookConfigs({
+        env: {
+          BOTMUX_HOOKS_JSON: JSON.stringify([
+            { event: 'prompt.submit', mode: 'sync', command: '/bin/true', timeoutMs: 0 },
+          ]),
+        },
+      });
+    } finally {
+      (logger as any).warn = original;
+    }
+    expect(warnings.some(w => /timeoutMs:0/.test(w) && /INSTANT timeout/.test(w))).toBe(true);
+  });
+
+  it('does not warn about timeoutMs:0 for a plain async hook (only sync gates are affected)', () => {
+    const warnings: string[] = [];
+    const original = logger.warn;
+    (logger as any).warn = (msg: string) => { warnings.push(String(msg)); };
+    try {
+      loadHookConfigs({
+        env: {
+          BOTMUX_HOOKS_JSON: JSON.stringify([
+            { event: 'session.start', command: '/bin/true', timeoutMs: 0 },
+          ]),
+        },
+      });
+    } finally {
+      (logger as any).warn = original;
+    }
+    expect(warnings.some(w => /timeoutMs:0/.test(w))).toBe(false);
+  });
+
+  it('captures stdout only for sync hooks', async () => {
+    const talker: HookConfig = {
+      event: 'prompt.submit',
+      command: writeHook('talker.js', `console.log('some output'); process.exit(0);`),
+    };
+    const captured = await runHookCommandForTest(talker, { event: 'prompt.submit' }, { captureStdout: true });
+    expect(captured.stdout).toContain('some output');
+
+    const ignored = await runHookCommandForTest(talker, { event: 'prompt.submit' });
+    expect(ignored.stdout ?? '').toBe('');
   });
 });

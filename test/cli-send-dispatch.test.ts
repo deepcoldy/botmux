@@ -385,6 +385,22 @@ describe('normalizeInteractiveCardInput', () => {
     if (!res.ok) expect(res.error).toContain('callback');
   });
 
+  it('accepts Card 2.0 callback behaviors only for the selected plugin', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [{
+      tag: 'button', text: { tag: 'plain_text', content: 'approve' },
+      behaviors: [{ type: 'callback', value: { action: 'example.approve' } }],
+    }] } });
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'example.approve' },
+    });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) expect(accepted.cardJson).toBe(raw);
+    expect(normalizeInteractiveCardInput(raw).ok).toBe(false);
+    expect(normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another.submit' },
+    }).ok).toBe(false);
+  });
+
   it('accepts form callbacks only through an explicitly selected plugin action route', () => {
     const pluginAction = 'example_plugin_review_submit';
     const raw = JSON.stringify({

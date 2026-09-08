@@ -70,7 +70,6 @@
     "croner": "^10.0.1",
     "dotenv": "^17.3.1",
     "markdown-it": "^14.1.1",
-    "pm2": "^6.0.0",
     "proxy-agent": "^6.5.0",
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.7",

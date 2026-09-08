@@ -226,7 +226,13 @@ async function runHook(
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGKILL');
-    }, options.exitTimeoutMs ?? 5_000);
+    }, options.exitTimeoutMs ?? (
+      // `trackTranscriptAccess` eval-imports the whole CLI after patching fs.
+      // Under a loaded shard that spawn regularly exceeds 5s (CI shard 3:
+      // hostile case 5074ms → SIGKILL → status null). Hang protection stays;
+      // the bound just has to outlast a cold CLI import, not win a race.
+      options.trackTranscriptAccess ? 20_000 : 5_000
+    ));
     child.once('exit', code => {
       clearTimeout(timer);
       resolveExit(code);
@@ -505,6 +511,7 @@ describe('native-subagent-runtime-hook CLI', () => {
         trackTranscriptAccess: true,
       });
 
+      expect(result.timedOut, `hook killed before exit; stderr=${result.stderr}`).toBe(false);
       expect(result.status).toBe(0);
       expect(result.stderr).toBe('');
       expect(result.transcriptAccessed).toBe(false);
@@ -520,5 +527,6 @@ describe('native-subagent-runtime-hook CLI', () => {
         },
       });
     },
+    25_000,
   );
 });

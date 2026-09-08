@@ -12,6 +12,7 @@ import {
   ensureManagedOriginRootLocator,
   hasMatchingManagedOriginCapability,
   hasManagedOriginIsolationMarker,
+  isIsolatedCliProcess,
   managedOriginAttestationDirectory,
   managedOriginCapabilityPath,
   managedOriginDataRootProbeAccess,
@@ -291,5 +292,23 @@ describe('managed origin capability transport', () => {
     chmodSync(fakeProbe, 0o000);
     expect(managedOriginDataRootProbeAccess(realpathSync(sibling), 'session-a'))
       .toBe('missing_or_unsafe');
+  });
+});
+
+describe('isIsolatedCliProcess', () => {
+  it('treats only positive isolation stamps as isolated — never a bare host env', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-origin-host-'));
+    try {
+      expect(isIsolatedCliProcess({}, home)).toBe(false);
+      expect(isIsolatedCliProcess({ BOTMUX_READ_ISOLATED: '0' }, home)).toBe(false);
+      expect(isIsolatedCliProcess({ BOTMUX_SEND_RELAY: '/tmp/relay' }, home)).toBe(true);
+      expect(isIsolatedCliProcess({ BOTMUX_READ_ISOLATED: '1' }, home)).toBe(true);
+      // Worker-stamped origin channel (sandbox / read-isolation / credential-only
+      // children). Credential-only can still write ~/.botmux; this arm is the
+      // confused-deputy gate. A host shell is never given this variable.
+      expect(isIsolatedCliProcess({ BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32) }, home)).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

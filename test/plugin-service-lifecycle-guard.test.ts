@@ -3,15 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const pm2 = vi.hoisted(() => ({
-  capture: vi.fn<(...args: any[]) => string>(),
+const supervisor = vi.hoisted(() => ({
+  capture: vi.fn<(...args: any[]) => any[]>(),
   run: vi.fn(),
 }));
 
-vi.mock('../src/core/plugins/pm2.js', () => ({
-  capturePluginPm2: pm2.capture,
-  pluginPm2AppName: (pluginId: string) => `botmux-plugin-${pluginId}`,
-  runPluginPm2: pm2.run,
+vi.mock('../src/core/plugins/supervisor-client.js', () => ({
+  readPluginProcesses: supervisor.capture,
+  changePluginService: supervisor.run,
 }));
 
 import {
@@ -22,12 +21,8 @@ import {
 } from '../src/core/plugins/service-manager.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 
-function pm2List(status: string, pid = 0): string {
-  return JSON.stringify([{
-    name: 'botmux-plugin-service-demo',
-    pid,
-    pm2_env: { status },
-  }]);
+function supervisorList(status: string, pid = 0) {
+  return [{ name: 'botmux-plugin-service-demo', ...(pid > 0 ? { pid } : {}), status }];
 }
 
 function writePluginSource(root: string, version: string, marker: string): void {
@@ -54,9 +49,9 @@ describe('plugin service lifecycle guard', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-lifecycle-'));
     source = join(home, 'source');
     vi.stubEnv('HOME', home);
-    pm2.capture.mockReset();
-    pm2.run.mockReset();
-    pm2.capture.mockReturnValue('[]');
+    supervisor.capture.mockReset();
+    supervisor.run.mockReset();
+    supervisor.capture.mockReturnValue([]);
   });
 
   afterEach(() => {
@@ -64,13 +59,13 @@ describe('plugin service lifecycle guard', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it('allows absent, stopped, and errored PM2 apps', () => {
+  it('allows absent, stopped, and errored supervisor apps', () => {
     expect(() => assertPluginServiceStopped('service-demo', 'update')).not.toThrow();
 
-    pm2.capture.mockReturnValue(pm2List('stopped'));
+    supervisor.capture.mockReturnValue(supervisorList('stopped'));
     expect(() => assertPluginServiceStopped('service-demo', 'update')).not.toThrow();
 
-    pm2.capture.mockReturnValue(pm2List('errored'));
+    supervisor.capture.mockReturnValue(supervisorList('errored'));
     expect(() => assertPluginServiceStopped('service-demo', 'uninstall')).not.toThrow();
   });
 
@@ -79,8 +74,8 @@ describe('plugin service lifecycle guard', () => {
     ['launching', 0],
     ['stopping', 0],
     ['unknown', 0],
-  ])('blocks lifecycle changes while PM2 status is %s', (status, pid) => {
-    pm2.capture.mockReturnValue(pm2List(status, pid));
+  ])('blocks lifecycle changes while supervisor status is %s', (status, pid) => {
+    supervisor.capture.mockReturnValue(supervisorList(status, pid));
     expect(() => assertPluginServiceStopped('service-demo', 'update')).toThrow(PluginServiceRunningError);
     try {
       assertPluginServiceStopped('service-demo', 'update');
@@ -95,29 +90,29 @@ describe('plugin service lifecycle guard', () => {
     }
   });
 
-  it('does not inspect PM2 on first install, but blocks a running-service update before replacing dist', () => {
+  it('does not inspect supervisor on first install, but blocks a running-service update before replacing dist', () => {
     writePluginSource(source, '0.1.0', 'v1');
     const first = installLocalPlugin(source);
-    expect(pm2.capture).not.toHaveBeenCalled();
+    expect(supervisor.capture).not.toHaveBeenCalled();
     expect(readFileSync(join(first.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
 
     writePluginSource(source, '0.2.0', 'v2');
     let observedServiceLock = false;
-    pm2.capture.mockImplementation(() => {
+    supervisor.capture.mockImplementation(() => {
       observedServiceLock = existsSync(join(home, '.botmux', 'plugins', 'service-manager.lock'));
-      return pm2List('online', 4123);
+      return supervisorList('online', 4123);
     });
     expect(() => installLocalPlugin(source)).toThrow(PluginServiceRunningError);
     expect(observedServiceLock).toBe(true);
     expect(readFileSync(join(first.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
     expect(existsSync(join(home, '.botmux', 'plugins', 'service-demo', 'config.json'))).toBe(true);
 
-    pm2.capture.mockReturnValue(pm2List('stopped'));
+    supervisor.capture.mockReturnValue(supervisorList('stopped'));
     const updated = installLocalPlugin(source);
     expect(readFileSync(join(updated.runtimeDir, 'marker.txt'), 'utf8')).toBe('v2\n');
   });
 
-  it('fails closed when PM2 deletion fails and preserves every plugin-owned file', async () => {
+  it('fails closed when supervisor deletion fails and preserves every plugin-owned file', async () => {
     writePluginSource(source, '0.1.0', 'v1');
     const installed = installLocalPlugin(source);
     const pluginRoot = join(home, '.botmux', 'plugins', 'service-demo');
@@ -126,8 +121,8 @@ describe('plugin service lifecycle guard', () => {
     writeFileSync(serviceStatePath, '{"status":"stopped"}\n');
     const registryBefore = readFileSync(registryPath, 'utf8');
 
-    pm2.capture.mockReturnValue(pm2List('stopped'));
-    pm2.run.mockImplementation(() => { throw new Error('simulated pm2 delete failure'); });
+    supervisor.capture.mockReturnValue(supervisorList('stopped'));
+    supervisor.run.mockImplementation(() => { throw new Error('simulated supervisor delete failure'); });
 
     await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
       .rejects.toBeInstanceOf(PluginServiceDeleteError);
@@ -138,10 +133,10 @@ describe('plugin service lifecycle guard', () => {
     expect(existsSync(serviceStatePath)).toBe(true);
   });
 
-  it('treats a PM2 record that remains after delete as a failed deletion', async () => {
+  it('treats a supervisor record that remains after delete as a failed deletion', async () => {
     writePluginSource(source, '0.1.0', 'v1');
     installLocalPlugin(source);
-    pm2.capture.mockReturnValue(pm2List('stopped'));
+    supervisor.capture.mockReturnValue(supervisorList('stopped'));
 
     await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
       .rejects.toMatchObject({
@@ -149,19 +144,19 @@ describe('plugin service lifecycle guard', () => {
         failures: [expect.objectContaining({
           pluginId: 'service-demo',
           action: 'failed',
-          warning: expect.stringContaining('pm2_delete_not_applied'),
+          warning: expect.stringContaining('plugin_delete_not_applied'),
         })],
       });
   });
 
-  it('deletes the PM2 app and service state after a verified successful deletion', async () => {
+  it('deletes the supervisor app and service state after a verified successful deletion', async () => {
     writePluginSource(source, '0.1.0', 'v1');
     installLocalPlugin(source);
     const serviceStatePath = join(home, '.botmux', 'plugins', 'service-demo', 'service.json');
     writeFileSync(serviceStatePath, '{"status":"stopped"}\n');
-    pm2.capture
-      .mockReturnValueOnce(pm2List('stopped'))
-      .mockReturnValueOnce('[]');
+    supervisor.capture
+      .mockReturnValueOnce(supervisorList('stopped'))
+      .mockReturnValueOnce([]);
 
     await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
       .resolves.toEqual([
@@ -170,26 +165,24 @@ describe('plugin service lifecycle guard', () => {
           action: 'deleted',
         }),
       ]);
-    expect(pm2.run).toHaveBeenCalledWith(
-      ['delete', 'botmux-plugin-service-demo'],
-      { inherit: false, timeoutMs: 30_000 },
+    expect(supervisor.run).toHaveBeenCalledWith(
+      'service-demo', 'remove',
     );
     expect(existsSync(serviceStatePath)).toBe(false);
   });
 
-  it('deletes the PM2 app even when the installed service entry is missing', async () => {
+  it('deletes the supervisor app even when the installed service entry is missing', async () => {
     writePluginSource(source, '0.1.0', 'v1');
     const installed = installLocalPlugin(source);
     rmSync(join(installed.runtimeDir, 'service', 'index.js'));
-    pm2.capture
-      .mockReturnValueOnce(pm2List('stopped'))
-      .mockReturnValueOnce('[]');
+    supervisor.capture
+      .mockReturnValueOnce(supervisorList('stopped'))
+      .mockReturnValueOnce([]);
 
     await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
       .resolves.toEqual([expect.objectContaining({ pluginId: 'service-demo', action: 'deleted' })]);
-    expect(pm2.run).toHaveBeenCalledWith(
-      ['delete', 'botmux-plugin-service-demo'],
-      { inherit: false, timeoutMs: 30_000 },
+    expect(supervisor.run).toHaveBeenCalledWith(
+      'service-demo', 'remove',
     );
   });
 
@@ -210,7 +203,7 @@ describe('plugin service lifecycle guard', () => {
     const runtimeDelete = uninstallBranch.indexOf('rmSync(pluginHome(pluginId)');
 
     // The status check and every destructive step must share the same lock;
-    // otherwise a concurrent `plugin service start` can create an orphan PM2 app.
+    // otherwise a concurrent `plugin service start` can create an orphan supervisor app.
     expect(lockStart).toBeGreaterThanOrEqual(0);
     expect(serviceCheck).toBeGreaterThan(lockStart);
     expect(serviceDelete).toBeGreaterThan(serviceCheck);

@@ -20,6 +20,7 @@ import {
   writeManagedOriginAttestationProof,
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
+import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import {
   cliModelSupportsReasoningEffort,
@@ -2435,15 +2436,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (expect !== undefined && current.whiteboardId !== expect) {
+    // The same command a host applies offline (services/session-commands.ts);
+    // here it runs on the daemon's own live row.
+    const applied = applySessionRowCommand(current, {
+      type: 'whiteboard',
+      whiteboardId: unbind ? null : bindId,
+      ...(expect !== undefined ? { expectWhiteboardId: expect } : {}),
+    }, { now: new Date() });
+    if (applied.outcome === 'refused') {
       return jsonRes(res, 409, {
         ok: false,
         error: 'whiteboard_changed',
         whiteboardId: current.whiteboardId ?? null,
       });
     }
-    if (unbind) current.whiteboardId = undefined;
-    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
     jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });

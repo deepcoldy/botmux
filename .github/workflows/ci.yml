@@ -14,9 +14,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Compile + workflow-core only. The unit suite used to live here and dominated
+  # the wall (~10.5 min of a 12 min job on a 4-core runner). Tests now run as
+  # three independent shards; this job stays a compile gate.
+  #
+  # Ruleset "Require CI green on master" still lists only `build`. The suite
+  # now reports as the aggregator job named `test` (not `test (1/3)` — those
+  # names change with the shard count). Adding `test` to that ruleset is a
+  # repo-settings change, not a workflow step. Until an admin does that, a
+  # red shard does not block merge.
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # Bun is the package manager (packageManager: bun@1.4.1). node-pty's native
+      # build runs only because it is in `trustedDependencies` — bun skips
+      # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
+      # need a real build/Release/pty.node.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.1
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run workflow-core:test
+
+  # Same unit project as `bun run test`, split across runners with vitest
+  # `--shard=i/N`. Each shard still file-parallel internally (forks). They do
+  # NOT `needs: build` — waiting on tsc would serialize the start; a few files
+  # spawn `dist/cli.js`, so each shard rebuilds (~45s) and starts immediately.
+  # fail-fast is off so a red shard still lets the others report their wall.
+  test:
+    name: test (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@v6
@@ -41,23 +82,39 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      # Bun is the package manager (packageManager: bun@1.4.1). node-pty's native
-      # build runs only because it is in `trustedDependencies` — bun skips
-      # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
-      # need a real build/Release/pty.node.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.1
       - run: bun install --frozen-lockfile
       - run: bun run build
-      - run: bun run test
-      - run: bun run workflow-core:test
+      # Wrapper retries once only when every file already passed and vitest's
+      # fork pool then reports "Worker exited unexpectedly" (teardown flake;
+      # measured on this PR's first shard-3 run). A real failed file is not retried.
+      - name: Unit tests (shard ${{ matrix.shard }}/3)
+        run: node scripts/run-unit-shard.mjs ${{ matrix.shard }}/3
+
+  # One stable check name for the ruleset. Matrix names (`test (1/3)` …)
+  # must not be required — they change if the shard count changes. This
+  # job is AND-of-shards (`if: always()` + fail on any non-success).
+  # Ruleset "Require CI green on master" must list context `test`.
+  test-ok:
+    name: test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every shard
+        run: |
+          case "${{ needs.test.result }}" in
+            success) exit 0 ;;
+            *) echo "shards: ${{ needs.test.result }}"; exit 1 ;;
+          esac
 
   # Second runner leg: the SAME unit files executed on Bun instead of Node.
   #
-  # WHY THIS IS NOT REDUNDANT WITH `bun run test` ABOVE: vitest forks Node
+  # WHY THIS IS NOT REDUNDANT WITH THE `test` SHARDS ABOVE: vitest forks Node
   # workers even when launched through bun (measured — `bun x vitest` still
-  # reports process.versions.node), so every test BODY in the job above runs on
+  # reports process.versions.node), so every test BODY in the jobs above runs on
   # Node. Bun-specific behaviour is therefore structurally invisible there: its
   # `fetch` error taxonomy (which cannot distinguish a sent from an unsent
   # request), its startup-frozen `os.homedir()`, `Bun.file`, compiled-binary

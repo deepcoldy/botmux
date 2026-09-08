@@ -6,6 +6,7 @@ import {
   BOTMUX_INJECTED_ENV_KEYS,
   CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
+  COMPANION_STARTUP_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
@@ -19,11 +20,13 @@ import {
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
+  stripCompanionStartupEnv,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
 describe('applySessionOwnerEnv()', () => {
@@ -91,6 +94,27 @@ describe('redactChildEnv()', () => {
     }
     // Behavior knob, not an identity marker — must survive.
     expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('removes companion authority from non-serving process environments', () => {
+    const env = Object.fromEntries(COMPANION_STARTUP_ENV_KEYS.map(key => [key, 'private']));
+    stripCompanionStartupEnv(env);
+    for (const key of COMPANION_STARTUP_ENV_KEYS) expect(key in env, key).toBe(false);
+    const daemonEntry = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
+    expect(daemonEntry).toContain('stripCompanionStartupEnv(process.env)');
+  });
+
+  it('removes the companion secret-file path from child env', () => {
+    const out = redactChildEnv({
+      [COMPANION_SECRET_FILE_ENV]: '/run/secrets/botmux/companion',
+      [COMPANION_BOT_APP_ID_ENV]: 'local_test_bot',
+      KEEP: 'v',
+    });
+    expect(COMPANION_SECRET_FILE_ENV in out).toBe(false);
+    expect(COMPANION_BOT_APP_ID_ENV in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_SECRET_FILE_ENV);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_BOT_APP_ID_ENV);
     expect(out.KEEP).toBe('v');
   });
 
@@ -642,8 +666,9 @@ describe('session CLI home scrub call sites', () => {
     // TERM is re-pinned (not left absent) inside the shared scrub so pm2
     // CLIENT output on a real TTY keeps supports-color detection.
     expect(fnBody).toContain("env.TERM = 'xterm-256color'");
-    const pluginPm2 = read('core/plugins/pm2.ts');
-    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
+    const pluginSupervisor = read('core/plugins/supervisor-client.ts');
+    expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
+    expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
     // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked

@@ -349,6 +349,41 @@ export function managedOriginLegacyIsolationProbeAccess(
   }
 }
 
+/**
+ * True when this process runs inside a botmux sandbox / read-isolated pane and
+ * therefore cannot act as a session store host (it may only SEND commands to
+ * the owning daemon). Positive signals only: the sandbox outbox marker, the
+ * host-stamped read-isolation env, the host-stamped origin channel, or a
+ * kernel denial (EACCES/EPERM) on a probe inode. `missing_or_unsafe` — an
+ * absent `~/.botmux`, a secret never created because no daemon ran here, a
+ * foreign HOME — is NEVER isolation: a genuine host shell must keep its
+ * offline close / abandon / prune.
+ *
+ * `BOTMUX_ORIGIN_CHANNEL_ID` is stamped by the worker onto the session CLI
+ * child for every isolation flavour (full sandbox, credential-only
+ * Seatbelt/bwrap, read isolation). Device enrollment does NOT put this in
+ * the host shell — a user's `botmux delete` in a normal terminal stays a
+ * host even on a registered machine.
+ *
+ * Fail-closed is a confused-deputy gate, not a filesystem consolation.
+ * Credential-only bwrap masks `device-auth` and leaves `BOTMUX_HOME` itself
+ * live and writable (`worker.ts` prepares that shape). A prompt-injected
+ * agent in that child can still write the session store; this predicate
+ * is what stops `botmux delete` from becoming an offline store host when
+ * the daemon is down. Do not delete the origin-channel arm on the reading
+ * "it couldn't write anyway".
+ */
+export function isIsolatedCliProcess(
+  env: NodeJS.ProcessEnv,
+  osUserHomeDir: string,
+): boolean {
+  if (env.BOTMUX_SEND_RELAY) return true;
+  if (env.BOTMUX_READ_ISOLATED === '1') return true;
+  if (env.BOTMUX_ORIGIN_CHANNEL_ID?.trim()) return true;
+  return managedOriginLegacyIsolationProbeAccess(osUserHomeDir) === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+}
+
 /** Strict bounded reader for host-owned authority metadata. It never follows a
  * leaf symlink and opens FIFOs/devices nonblocking before rejecting them by
  * inode type, ownership, link count, mode, and size. */

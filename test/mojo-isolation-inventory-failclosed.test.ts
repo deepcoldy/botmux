@@ -23,7 +23,8 @@ vi.mock('../src/services/session-store.js', () => ({
   // is why this file reported 0 executed rather than a normal failure).
   countActiveSessionsOnDisk: () => 0,
   loadAllSessionsSnapshot: () => new Map(),
-  mutateSessionRowOffline: () => {},
+  applySessionCommandUnowned: () => ({ outcome: 'missing' }),
+  readSessionRowUnowned: () => ({ outcome: 'missing' }),
   occupancyLeaseIsActive: () => false,
   readOccupancyLease: () => undefined,
   readSessionRowCopiesAcrossStores: () => [],

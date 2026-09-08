@@ -23,6 +23,8 @@ export interface PluginApplyContext {
 export interface PluginServiceDefinition {
   mode?: 'manual' | 'auto';
   port?: number;
+  /** Legacy field name retained for plugin compatibility; the built-in
+   * supervisor interprets this definition, not PM2. */
   pm2: {
     script: string;
     cwd?: string;

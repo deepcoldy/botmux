@@ -208,11 +208,25 @@ export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
  *    client env can't override, so the shell wrapper `unset`s them before exec
  *    (see SHELL_WRAPPER_SCRIPT in tmux-backend.ts).
  */
+export const COMPANION_STARTUP_ENV_KEYS = [
+  'BOTMUX_COMPANION_SECRET_FILE',
+  'BOTMUX_COMPANION_BOT_APP_ID',
+] as const;
+
+/** Remove companion authority from processes that never serve its API. */
+export function stripCompanionStartupEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of COMPANION_STARTUP_ENV_KEYS) delete env[key];
+}
+
 export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Startup-only private secret-file path. A session CLI is not the local
+  // companion process and must not learn even the credential's location.
+  // Kept as a literal because this boundary module is dependency-free.
+  ...COMPANION_STARTUP_ENV_KEYS,
   // Dashboard-only Feishu H5 login config/credential family — see
   // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
   // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend

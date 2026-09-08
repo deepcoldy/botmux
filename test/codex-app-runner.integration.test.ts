@@ -2564,7 +2564,12 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const control = new ControlCollector(dir);
     await control.listen();
     const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
-      extraArgs: ['--thread-id', 'thread-existing-1', '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh'],
+      extraArgs: [
+        '--thread-id', 'thread-existing-1',
+        '--model', 'gpt-5.6-terra',
+        '--reasoning-effort', 'xhigh',
+        '--browser-family', 'chrome',
+      ],
     });
     try {
       await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
@@ -2577,6 +2582,12 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(start).toBeFalsy();            // a warm resume must not fresh-start
       expect(resume.params.model).toBeUndefined();                          // no top-level model
       expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+      expect(resume.params.dynamicTools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'botmux_browser',
+        }),
+      ]);
     } finally {
       await stopChild(harness.child);
       await control.close();
