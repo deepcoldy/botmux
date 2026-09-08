@@ -76,6 +76,11 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  /** Host-owned relay outbox, bound read-WRITE so the confined `botmux send`
+   *  can drop its request for the host watcher. Everything else this flavour
+   *  binds is read-only; see prepareCredentialOnlySandbox for why the relay
+   *  (not an in-pane file proof) is the only sound channel here. */
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -124,6 +129,13 @@ export function buildCredentialOnlySandboxArgs(input: {
   }
   for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
+  // AFTER the masks on purpose: `--tmpfs` over an ancestor of the outbox would
+  // otherwise shadow this bind away and the confined `botmux send` would write
+  // its request into a throwaway tmpfs no host watcher is reading.
+  if (input.writableOutbox !== undefined) {
+    const outbox = assertCredentialIsolationPath(input.writableOutbox, 'writable outbox');
+    args.push('--bind', outbox, outbox);
+  }
   args.push(
     '--unshare-user',
     '--unshare-pid',
@@ -209,11 +221,56 @@ export function credentialOnlySandboxAvailable(): boolean {
   return false;
 }
 
+/** Host-owned relay outbox for a credential-only pane, provisioned in the SAME
+ * per-session tree the full sandbox uses so close/exit cleanup and the orphan
+ * sweep already cover it.
+ *
+ * WHY THIS FLAVOUR NEEDS A RELAY AT ALL (all four points MEASURED on bwrap
+ * 0.8.0, and each one independently breaks the in-pane alternative):
+ *
+ *  1. `--unshare-pid` gives the child pid=2/ppid=1 with only 2 visible /proc
+ *     entries, so `findAncestorSessionContext`'s process-tree marker walk can
+ *     NEVER resolve — the marker directory is readable, the host pids simply
+ *     are not in this namespace. `cmdSend` therefore classifies the pane via
+ *     the isolation MARKER arm and demands a data-root locator.
+ *  2. That locator is only written on the `sandboxRequested && darwin` path, so
+ *     it does not exist here.
+ *  3. Writing it does not help: its basename is `.dashboard-secret.origin-root-
+ *     <hash>.json`, which this flavour's own mask enumeration matches, so it is
+ *     ro-bound to /dev/null and reads back as a 0-byte char device (EACCES).
+ *  4. Even past that, the follow-up gate wants the data-root probe to read
+ *     EPERM, but the `--tmpfs` over `read-isolation/` makes it ENOENT.
+ *
+ * And an in-pane proof cannot substitute: with `--unshare-user` the child can
+ * `mount --bind` a writable directory OVER a host ro-bind (measured: succeeds),
+ * so neither "this path is read-only" nor "this file exists" is a trust root
+ * inside the pane. Only a host-side channel is sound — which is exactly the
+ * relay the full sandbox already uses, with the daemon-side watcher performing
+ * the authoritative policy check. */
+export function prepareCredentialOnlyRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): { outbox: string; cleanup: () => void } | null {
+  if (process.platform !== 'linux') return null;
+  const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
+  const outbox = join(sessionRoot, 'outbox');
+  try { mkdirSync(outbox, { recursive: true, mode: 0o700 }); }
+  catch { return null; }
+  return {
+    outbox,
+    // No deny-mask mountpoints are created on this flavour (it masks in-place
+    // with --tmpfs/--ro-bind rather than carving empties), so a plain remove of
+    // the session tree is the whole teardown.
+    cleanup: () => { try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ } },
+  };
+}
+
 export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];

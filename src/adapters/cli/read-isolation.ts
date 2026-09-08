@@ -361,7 +361,15 @@ export function buildSeatbeltProfile(
 // adds the host CA bundle startup env a sandboxed Codex pane needs — a pane spawned
 // before it keeps its ORIGINAL environment, so it would never see SSL_CERT_FILE and
 // would keep failing TLS on UnknownIssuer with no output at all.
-export const ISOLATION_PANE_MARKER_VERSION = 13;
+//   · 13 → 14: a Linux credential-only pane now gets a read-WRITE relay outbox
+//     bind plus BOTMUX_SEND_RELAY in its startup env, because `botmux send` had
+//     no satisfiable authority inside that flavour at all (the pane's own
+//     `--unshare-pid` makes the marker walk unresolvable, and the data-root
+//     locator it then demands is both never written AND masked to /dev/null by
+//     this flavour's own `.dashboard-secret.*` enumeration). A v13 pane carries
+//     neither the mount nor the env, so a warm reattach would keep failing every
+//     send; it must cold-spawn once to obtain them.
+export const ISOLATION_PANE_MARKER_VERSION = 14;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

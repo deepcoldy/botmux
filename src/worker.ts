@@ -338,6 +338,7 @@ import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
   credentialOnlySandboxAvailable,
+  prepareCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
   startOutboxWatcher,
@@ -15718,7 +15719,23 @@ async function spawnCli(
     }
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    // A credential-only pane has no sound in-pane send authority (see
+    // prepareCredentialOnlyRelayOutbox for the four measured reasons), so give it
+    // the SAME host-side relay the full sandbox uses. Without this the confined
+    // `botmux send` fails closed on the data-root locator gate and the agent
+    // cannot answer the user at all.
+    const credentialRelay = prepareCredentialOnlyRelayOutbox({
+      sessionId: cfg.sessionId,
+      dataDir: isolationRuntimeDataDir,
+    });
+    if (!credentialRelay) {
+      throw new Error(
+        `[device-credential-isolation] refusing to start session ${cfg.sessionId}: `
+        + 'credential-only relay outbox could not be prepared',
+      );
+    }
     const credentialSandbox = prepareCredentialOnlySandbox({
+      writableOutbox: credentialRelay.outbox,
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
       privateReadonlyDirectories: [
@@ -15751,9 +15768,29 @@ async function spawnCli(
     }
     spawnBin = credentialSandbox.bin;
     spawnArgs = credentialSandbox.args;
+    // Same contract as the full sandbox: the child sees only the outbox path and
+    // never a Feishu credential; the host watcher re-execs the send outside the
+    // pane and performs the authoritative origin check.
+    childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+    sandboxCleanup = credentialRelay.cleanup;
+    sandboxRelayOutbox = credentialRelay.outbox;
+    // session-id is FORCED so a relayed send cannot target another session.
+    sandboxStopWatcher = startOutboxWatcher(
+      credentialRelay.outbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    // Re-publish so the outbox capability leaf exists too: the earlier
+    // credential-only publish ran before an outbox existed and therefore wrote
+    // only the managed-origin copy.
+    publishSandboxRelayCapability({ failClosed: true });
     log(
       `[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only bwrap `
-      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s))`,
+      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s), `
+      + `relay outbox=${credentialRelay.outbox})`,
     );
   }
 
