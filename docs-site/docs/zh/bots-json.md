@@ -204,6 +204,10 @@
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
 
+Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同一配置的可视化开关：
+
+![实时卡片按钮配置](/img/streaming-card-button-settings.png)
+
 ## Prompt 注入
 
 | 字段 | 说明 |
