@@ -2256,12 +2256,12 @@ async function inspectCodexUpgradeRuntime(): Promise<CodexProcess[]> {
 }
 
 async function observeCodexRuntimeVersionOnReady(): Promise<void> {
-  const observedBackend = backend;
+  const versionObservationBackend = backend;
   const observedGeneration = cliSpawnGeneration;
   const running = await inspectCodexUpgradeRuntime();
   // A late observation must not label another backend generation, or bypass
   // the upgrade's own runtime/thread verification before it releases input.
-  if (!observedBackend || backend !== observedBackend || cliSpawnGeneration !== observedGeneration
+  if (!versionObservationBackend || backend !== versionObservationBackend || cliSpawnGeneration !== observedGeneration
       || cliRestartInProgress || codexAutoUpgrade) return;
   const version = running[0]?.version;
   if (!version || running.some(item => item.version !== version)) {
@@ -2347,7 +2347,7 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
     codexAutoUpgrade = { stage: 'failed', threadId };
     cliRestartInProgress = true;
     rawInputRestartGate = true;
-    send({ type: 'user_notify', message: `Codex 会话自动升级未完成，原会话和待处理消息已保留。请检查后手动重启会话。原因：${error instanceof Error ? error.message : String(error)}` });
+    send({ type: 'user_notify', message: `Codex 会话自动升级未完成，原会话和待处理消息已保留。请检查后在当前会话发送 /restart 重启。原因：${error instanceof Error ? error.message : String(error)}` });
     throw error;
   } finally {
     replacementSpawnInProgress = false;
@@ -14172,8 +14172,8 @@ async function spawnCli(
   // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
-  hasRunStartupCommands = codexAutoUpgrade?.stage === 'restoring'
-    || !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })
+    || codexAutoUpgrade?.stage === 'restoring';
   // Re-arm the bare-shell launch detector for this spawn (fresh OR reattach). It
   // runs once on the first flush and only fires when the pane leaf is actually a
   // bare shell, so a healthy reattach (leaf = the live CLI) self-excludes while a
