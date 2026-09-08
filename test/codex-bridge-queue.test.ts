@@ -84,6 +84,19 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     ]);
   });
 
+  it('binds a native id onto an id-less collecting turn without advancing the queue', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([userEv('first', 'u1', 200)]);
+    q.ingest([{ uuid: 'bind1', timestampMs: 201, kind: 'turn_bind', text: '', sourceTurnId: 'native-1' }]);
+
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 't1', started: true, sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', started: false }),
+    ]);
+  });
+
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
     const q = new CodexBridgeQueue();
     const seen: { turnId: string; entries: readonly unknown[] }[] = [];

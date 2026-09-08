@@ -586,6 +586,8 @@ export function drainTraexRollout(
               ...events[legacyIndex],
               ...(sourceTurnId ? { sourceTurnId } : {}),
             };
+          } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
+            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
           } else if (!expectedMirror) {
             events.push({ ...base, kind: 'user', text: userText, ...(sourceTurnId ? { sourceTurnId } : {}) });
           }

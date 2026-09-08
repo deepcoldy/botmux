@@ -431,6 +431,19 @@ export class CodexBridgeQueue {
   }
 
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    if (ev.kind === 'turn_bind') {
+      // A provider may expose its stable turn id only in a duplicate user
+      // record after an id-less legacy record already started the turn. Bind
+      // that id without treating the mirror as another user/steer boundary.
+      const target = this.queue.find(turn => turn.started && turn.finalText === undefined
+        && turn.sourceTurnId === ev.sourceTurnId)
+        ?? (this.collecting && !this.collecting.sourceTurnId ? this.collecting : null);
+      if (!target || !ev.sourceTurnId) return;
+      if (target.sourceSessionId && ev.sourceSessionId
+        && target.sourceSessionId !== ev.sourceSessionId) return;
+      target.sourceTurnId = ev.sourceTurnId;
+      return;
+    }
     if (ev.kind === 'cot') {
       // Cosmetic thinking-timeline record. Only meaningful while a turn is
       // collecting; history replay / unmatched events are dropped (never
