@@ -36,6 +36,7 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
@@ -345,7 +346,12 @@ export class BridgeTurnQueue {
           continue;
         }
         const terminalOutcome = classifyClaudeTerminalEvent(ev);
-        if (ev.isApiErrorMessage === true) {
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
             this.collecting.terminalOutcome = terminalOutcome;
             this.collecting.terminalObserved = true;

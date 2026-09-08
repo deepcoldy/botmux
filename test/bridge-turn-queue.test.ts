@@ -608,6 +608,60 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
+  describe('synthetic no-model-reply assistant records', () => {
+    // Claude Code bridge-resume placeholder (see isSyntheticNoModelReplyEvent):
+    // visible text, terminal stop_reason, isApiErrorMessage:false — every
+    // attribute the queue used to read as "the model's final answer", but no
+    // model call happened and the Lark message was never answered.
+    function metaContinue(uuid: string): TranscriptEvent {
+      return {
+        type: 'user', uuid, isMeta: true,
+        message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
+      } as TranscriptEvent;
+    }
+    function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model, stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] },
+      } as TranscriptEvent;
+    }
+
+    it('closes the pending Lark turn as a retryable failure instead of attributing the placeholder text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].assistantUuids).toEqual([]);
+      expect(ready[0].terminalObserved).toBe(true);
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+    });
+
+    it('control: the same record served by a real model is the completed reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['s1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    it('does not synthesise a headless local turn out of the placeholder', () => {
+      const q = new BridgeTurnQueue();
+      q.ingest([metaContinue('m1'), syntheticNoReply('s1')]);
+      expect(q.size()).toBe(0);
+      // control: a real headless reply still gets its local turn
+      const q2 = new BridgeTurnQueue();
+      q2.ingest([metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      expect(q2.size()).toBe(1);
+      expect(q2.peek()[0].isLocal).toBe(true);
+    });
+  });
+
   describe('synthetic / non-meaningful user events', () => {
     function syntheticUser(content: string, extra: Record<string, unknown> = {}): TranscriptEvent {
       return { type: 'user', uuid: `sx-${content.slice(0, 10)}`, message: { role: 'user', content }, ...extra } as TranscriptEvent;
