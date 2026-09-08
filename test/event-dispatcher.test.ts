@@ -8857,6 +8857,56 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  // …但让路只看**命令之前**的 @。`/solve @张三` 里的 @ 是命令自己的参数（点名让
+  // bot 去找谁/处理谁），命令仍然是冲本 bot 来的 —— 之前一律按「点名了别人」拦掉，
+  // 用户敲的免@命令后面一带 @ 就整条失灵。
+  it('still fires when the @mention comes AFTER the command (it is an argument)', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const event = fire('/solve @张三 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+  });
+
+  // 参数原样带上 @名字 交给 daemon 渲染模板 —— 否则命令收到的是被吃掉 @ 的半句话。
+  it('keeps the trailing mention in the args handed to the daemon', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '处理：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve @张三 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: expect.objectContaining({ cmd: '/solve', args: '@张三 看看这个' }),
+    }));
+  });
+
+  // 命令前有 @ 就仍然让路，哪怕命令后面也 @ 了人：开头那个 @ 已经把活儿指出去了。
+  it('yields when a mention leads the message even if another follows the command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve @李四 看看', {
+      mentions: [
+        { key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } },
+        { key: '@_user_2', name: '李四', id: { open_id: 'ou_lisi' } },
+      ],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('does not fire in a topic group (话题群另有续话规则)', async () => {
     setup({ enabled: true, commands: [{ cmd: '/solve' }] });
     mockGetChatMode.mockResolvedValue('topic');

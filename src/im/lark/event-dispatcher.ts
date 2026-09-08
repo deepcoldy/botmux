@@ -4194,6 +4194,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const triggeredCommand = isControlCommand
         ? parseSlashCommandInvocation(strippedRoutingText)?.cmd
         : undefined;
+      // 命令是不是这条消息的开头 —— 即「未剥 mention 前」就以 / 开头。
+      // 用来区分 @ 的两种位置（两者的 mentionsAnotherMember 都为 true，光看这个
+      // 布尔值分不出来）：
+      //   `@张三 /solve 看看`  → 先点名再下命令，是把活儿交给张三 → 让路
+      //   `/solve @张三 看看`  → 命令在前，@ 是命令的参数（让 bot 去找谁 / 处理谁）
+      //                          → 仍然是发给本 bot 的，要触发
+      const commandLeadsMessage = !!routingText && routingText.trimStart().startsWith('/');
       let pairedForwardSeed;
       let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a
@@ -4290,11 +4297,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         //     （建 Set + 解析 adapter 默认集）只在真是斜杠命令时才求值，不进每条
         //     群消息的热路径。
         //   • `!mentionsOther` 与 ambient 同款语义：`@张三 /solve` 是指给张三的，
-        //     命令形态不改变「点名了别人就让路」这条群礼仪。
+        //     命令形态不改变「点名了别人就让路」这条群礼仪。但只有**命令之前**的
+        //     @ 才算点名让路：`/solve @张三` 里的 @ 是命令自己的参数，命令仍然是
+        //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
         const commandTriggerEntry = isAllowed
-          && !mentionsOther
+          && (!mentionsOther || commandLeadsMessage)
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
