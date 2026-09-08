@@ -32,7 +32,7 @@ describe('streaming-card button policy wiring', () => {
       const source = readFileSync(resolve(rel), 'utf8');
       const sites = buildStreamingCardCallSites(source);
       expect(sites.length).toBeGreaterThan(0);
-      const missing = sites.filter(s => !s.includes('resolveHiddenStreamingCardButtons(ds.larkAppId)'));
+      const missing = sites.filter(s => !s.includes('resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config)'));
       expect(missing).toEqual([]);
     });
   }

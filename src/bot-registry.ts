@@ -2408,12 +2408,6 @@ export function getBot(larkAppId: string): BotState {
   return state;
 }
 
-/** Resolve the live per-bot streaming-card button policy for card re-renders. */
-export function resolveHiddenStreamingCardButtons(larkAppId: string): StreamingCardButtonId[] {
-  const state = bots.get(larkAppId);
-  return normalizeHiddenStreamingCardButtons(state?.config.hiddenStreamingCardButtons) ?? [];
-}
-
 export function getBotClient(larkAppId: string): Lark.Client {
   const bot = getBot(larkAppId);
   // Bot-level transport boundary at the TRUE shared base. `apiOnly` (core-only)

@@ -30,6 +30,12 @@ export function normalizeHiddenStreamingCardButtons(value: unknown): StreamingCa
   return normalized.length > 0 ? [...normalized] : undefined;
 }
 
+export function resolveHiddenStreamingCardButtons(
+  config: { hiddenStreamingCardButtons?: unknown },
+): StreamingCardButtonId[] {
+  return normalizeHiddenStreamingCardButtons(config.hiddenStreamingCardButtons) ?? [];
+}
+
 /** `/botconfig set hiddenStreamingCardButtons output,terminal,...` parser. */
 export function parseHiddenStreamingCardButtonsInput(raw: string): StreamingCardButtonId[] {
   const tokens = raw.split(/[\s,，]+/).filter(Boolean);
