@@ -488,6 +488,77 @@ describe('shouldSuppressBridgeEmit', () => {
     expect(shouldSuppressBridgeEmit(turn(100, true), 200, [], false)).toBe(true);
   });
 
+  describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {
+    // Markers MUST come from the real builder: hand-writing { sentAtMs,
+    // contentLength } always produces the structured shape and would test the
+    // no-contentLength path as a false negative. `--images` with no body and
+    // the `--voice` path both yield a marker with no contentLength, because
+    // buildBridgeSendMarkerContent returns undefined for empty content.
+    const realMarker = (sentAtMs: number, body: string): BridgeSendMarker =>
+      ({ sentAtMs, ...(buildBridgeSendMarkerContent(body) ?? {}) });
+
+    const ANSWER = '这是本轮真正的答案，比中途那条进度消息长一些，但远没到两倍加一百二十字。';
+
+    it('a short mid-turn send no longer swallows the real answer', () => {
+      // send mode: the length ratio gate (2x + 120) suppresses this final...
+      const markers = [realMarker(150, '好的，我看一下')];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false,
+      )).toBe(true);
+      // ...transcript mode delivers it: the lengths differ, so it is not the
+      // same content that already went out.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('a body-less send (--images / --voice shape) never suppresses', () => {
+      const imagesOnly = realMarker(150, '');
+      expect(imagesOnly.contentLength).toBeUndefined();   // the shape under test
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, [imagesOnly], false, 'transcript',
+      )).toBe(false);
+      // Mixing one body-less marker with a structured one must not resurrect
+      // the old back-compat "suppress everything" behaviour either.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200,
+        [imagesOnly, realMarker(160, '进度')], false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('prose + trailing sentinel is delivered as the prose, even after a send', () => {
+      const markers = [realMarker(150, '附件发你了')];
+      const finalText = `${ANSWER}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+      // send mode suppresses this regardless of length; transcript must not.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText }, 200, markers, false,
+      )).toBe(true);
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('identical content is still suppressed — dedup must survive the fix', () => {
+      const markers = [realMarker(150, ANSWER)];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false, 'transcript',
+      )).toBe(true);
+      // Same length but different text: the preview prefix rejects the match,
+      // so it is delivered rather than mistaken for the same message.
+      const other = 'X'.repeat(ANSWER.length);
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: other }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('a bare sentinel final stays suppressed in transcript mode too', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
+        200, [], false, 'transcript',
+      )).toBe(true);
+    });
+  });
+
   it('non-adopt: emits when no marker landed in window', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 50 }, { sentAtMs: 250 }];
     // window is [100, 200); both markers fall outside
