@@ -14,11 +14,23 @@
  *
  * Run:  npx vitest run --project unit test/credential-boundary-prompt.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   buildCredentialBoundaryBlock,
   buildBotmuxSystemPromptText,
 } from '../src/adapters/cli/shared-hints.js';
+import { buildNewTopicPrompt } from '../src/core/session-manager.js';
+
+/** Stub only getBot: the credential block is gated on this bot's config, and
+ *  everything else session-manager imports from the registry must stay real. */
+const stubbedBots = new Map<string, unknown>();
+vi.mock('../src/bot-registry.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getBot: (id: string) => {
+    if (stubbedBots.has(id)) return stubbedBots.get(id);
+    throw new Error(`unknown bot ${id}`);
+  },
+}));
 
 describe('buildCredentialBoundaryBlock', () => {
   it('names the exact files an agent must not read', () => {
@@ -84,5 +96,62 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       locale: 'zh', botName: 'b', botOpenId: 'ou_x', triggerUserAuth: true,
     });
     expect(text.match(/<botmux_credentials>/g)).toHaveLength(1);
+  });
+});
+
+/**
+ * The INLINE prompt path — the half this file's header always claimed but never
+ * covered.
+ *
+ * The claude-family assertions above go through buildBotmuxSystemPromptText.
+ * codex/gemini/… never call it: they get the block inline, from
+ * buildNewTopicPrompt. Until this suite existed, deleting the inline push left
+ * every test green — and the inline CLIs then ran with no credential constraint
+ * at all, which in a release with no kernel-level isolation is the whole
+ * protection gone.
+ *
+ * Also pinned here: the block must survive HOOK mode. #998 splits opening blocks
+ * into a hook envelope and PTY text by key; `credentials` is deliberately NOT in
+ * ENVELOPE_KEYS, so it stays in the PTY text both ways. An agent that cannot
+ * read the envelope must still see the boundary.
+ */
+describe('buildNewTopicPrompt — inline prompt path', () => {
+  const inlineCli = 'codex';
+  const APP = 'cli_credboundary';
+
+  function withTriggerUserAuth(enabled: boolean, run: () => void): void {
+    stubbedBots.set(APP, {
+      config: {
+        larkAppId: APP,
+        ...(enabled
+          ? { triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' } }
+          : {}),
+      },
+    });
+    try { run(); } finally { stubbedBots.delete(APP); }
+  }
+
+  const opening = (larkAppId?: string) => buildNewTopicPrompt(
+    'read the linked doc', 'sess-cred', inlineCli, undefined, undefined, undefined,
+    undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+    larkAppId ? { larkAppId } : {},
+  );
+
+  it('includes the credential boundary when the policy is on', () => {
+    withTriggerUserAuth(true, () => {
+      expect(opening(APP)).toContain('<botmux_credentials>');
+    });
+  });
+
+  it('omits it when the policy is off', () => {
+    withTriggerUserAuth(false, () => {
+      expect(opening(APP)).not.toContain('<botmux_credentials>');
+    });
+  });
+
+  it('omits it when no bot is named (uncertain answer must not claim a boundary)', () => {
+    withTriggerUserAuth(true, () => {
+      expect(opening(undefined)).not.toContain('<botmux_credentials>');
+    });
   });
 });

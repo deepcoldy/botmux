@@ -1244,10 +1244,17 @@ function buildNewTopicBlocks(
     // (codex/gemini/…) would run with NO constraint at all — and since that is
     // this release's only protection, a missing block there is a silent hole.
     //
-    // Deliberately NOT in ENVELOPE_KEYS: the block must reach the agent in BOTH
-    // inline and hook mode, so it stays in the PTY text either way. Putting it in
-    // the envelope would drop it for any CLI whose hook path is unavailable —
-    // silently, since nothing errors when a constraint is merely absent.
+    // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:
+    // hook mode requires `supportsInvisiblePromptHook`, which only claude-code
+    // has, and claude-code has `injectsSessionContext` — so this whole branch is
+    // skipped for it and a `credentials` block is never produced in hook mode
+    // (verified: claude-code's opening prompt carries no <botmux_credentials>;
+    // it gets the block via --append-system-prompt instead).
+    //
+    // Kept out of the envelope anyway, because the day another CLI becomes
+    // hook-capable this is the difference between the agent seeing the boundary
+    // and not. An envelope the CLI cannot read drops the block silently —
+    // nothing errors when a constraint is merely absent.
     if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
       blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
     }
