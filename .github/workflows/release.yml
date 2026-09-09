@@ -288,6 +288,9 @@ jobs:
   # tag-push-only restriction is inherited through `preflight`, which carries
   # `if: github.event_name == 'push'`. If you ever add an `if:` here you MUST
   # also re-assert `needs.<each>.result == 'success'` for every entry in `needs`.
+  # `binary-subpackages` below is the deliberate counterpart: it needs an `if:`
+  # to admit a skipped signing job on prereleases, so it explicitly re-asserts
+  # success for every other prerequisite and for stable signing.
   release:
     needs: [preflight, bun-binaries, bun-binaries-musl, binary-subpackages]
     runs-on: ubuntu-latest
@@ -630,7 +633,7 @@ jobs:
         run: |
           echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
           echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
-          echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
+          echo "If Desktop signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach Desktop assets."
   bun-binaries:
     # Build the self-contained Bun single-file executables (see
     # scripts/build-bun-binary.mjs). These let users run botmux with NO Node on
@@ -999,6 +1002,9 @@ jobs:
         run: |
           chmod +x dist-bin/botmux-darwin-arm64
           node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64
+
+      - name: Smoke-test the signed darwin native PTY path
+        run: dist-bin/botmux-darwin-arm64 __pty-smoke
 
       - name: Replace darwin artifact with Developer ID signed binaries
         uses: actions/upload-artifact@v4

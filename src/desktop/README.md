@@ -10,6 +10,10 @@
 standalone CLI 提供 Developer ID 签名。正式版会等 CLI 签名审批通过后再发布 npm
 平台包和 GitHub Release，确保 macOS TCC 权限绑定稳定的 designated requirement，
 不会因升级替换二进制而退化为新程序。Desktop DMG/ZIP 仍异步构建和挂载。
+CLI 签名使用 `build/entitlements.mac.plist`：Bun 单文件运行时会把 `pty.node` 等
+原生载荷释放后动态加载，必须保留 `disable-library-validation`；Desktop 内的
+原生文件会被 electron-builder 逐个同身份签名，仍使用更严格的
+`entitlements.mac.release.plist`。
 
 其他 contributor 从分支推送 canary、beta、rc 或其它 prerelease tag 时，仍会发布对应的 npm dist-tag 和 GitHub prerelease，但签名 job 会被跳过，因此不会读取签名凭据，也不会生成 macOS 附件。预览版 CLI 仍使用 ad-hoc 签名；正式版缺少成功的 CLI 签名产物时会直接拒绝发布。
 

@@ -45,6 +45,11 @@ const GLIBC_SH = stripHashComments(read('scripts/build-linux-glibc-baseline.sh')
 const SMOKE = stripJsComments(read('scripts/smoke-bun-binary.mjs'));
 const BUILD = stripJsComments(read('scripts/build-bun-binary.mjs'));
 const STABLE_SIGN = stripHashComments(read('scripts/sign-macos-cli-binaries.sh'));
+const EMBED_PLUGIN = stripJsComments(read('scripts/bun-native-embed-plugin.mjs'));
+const PTY_SMOKE = stripJsComments(read('src/cli/pty-smoke.ts'));
+const CLI = stripJsComments(read('src/cli.ts'));
+const CLI_ENTITLEMENTS = read('build/entitlements.mac.plist');
+const STALE_APPROVAL = stripHashComments(read('.github/workflows/cancel-stale-release-approvals.yml'));
 const PKG = JSON.parse(read('package.json')) as { packageManager?: string };
 
 /** The step body from its `- name:` line up to the next step. */
@@ -216,12 +221,16 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
   });
 
   it('replaces the darwin artifact only after both binaries are signed and smoked', () => {
-    expect(signJob).toContain('scripts/sign-macos-cli-binaries.sh dist-bin');
-    expect(signJob).toContain('node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64');
+    const sign = signJob.indexOf('scripts/sign-macos-cli-binaries.sh dist-bin');
+    const generalSmoke = signJob.indexOf('node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64');
+    const ptySmoke = signJob.indexOf('dist-bin/botmux-darwin-arm64 __pty-smoke');
+    const replace = signJob.indexOf('overwrite: true');
+    expect(sign).toBeGreaterThan(-1);
+    expect(generalSmoke).toBeGreaterThan(sign);
+    expect(ptySmoke).toBeGreaterThan(generalSmoke);
+    expect(replace).toBeGreaterThan(ptySmoke);
     expect(signJob).toContain('name: bun-binaries-darwin');
     expect(signJob).toMatch(/overwrite:\s*true/);
-    expect(signJob.indexOf('scripts/sign-macos-cli-binaries.sh'))
-      .toBeLessThan(signJob.indexOf('overwrite: true'));
   });
 
   it('fails stable npm publication closed when signing was skipped or failed', () => {
@@ -240,6 +249,8 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
     expect(STABLE_SIGN).toContain('--options runtime');
     expect(STABLE_SIGN).toContain('--timestamp');
     expect(STABLE_SIGN).toContain('--entitlements "$ENTITLEMENTS"');
+    expect(STABLE_SIGN).toContain('build/entitlements.mac.plist');
+    expect(CLI_ENTITLEMENTS).toContain('com.apple.security.cs.disable-library-validation');
     expect(STABLE_SIGN).not.toMatch(/--sign\s+['"]?-['"]?/);
   });
 
@@ -250,6 +261,28 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
     expect(STABLE_SIGN).toContain('darwin x64 and arm64 designated requirements differ');
     expect(STABLE_SIGN).toContain('cd "$DIST_DIR"');
     expect(STABLE_SIGN).toContain('shasum -a 256 "$binary_name" > "$binary_name.sha256"');
+  });
+
+  it('uses a native PTY probe that reaches the embedded spawn-helper without tty.ReadStream', () => {
+    expect(CLI).toContain("case '__pty-smoke'");
+    expect(PTY_SMOKE).toContain("loadNativeModule('pty')");
+    expect(PTY_SMOKE).toContain('loaded.module.fork(');
+    expect(PTY_SMOKE).not.toMatch(/\bpty\.spawn\(/);
+    expect(EMBED_PLUGIN).toContain('materializeSpawnHelper()');
+    expect(EMBED_PLUGIN).toContain('ensurePrivateDirectory(root, uid)');
+    expect(EMBED_PLUGIN).toContain("writeFileSync(temp, bytes, { mode: 0o700 })");
+    expect(EMBED_PLUGIN).toContain('return { dir, helperPath, module: ptyNative }');
+  });
+
+  it('never lets the stale-approval sweep cancel a release-blocking stable signing run', () => {
+    expect(STALE_APPROVAL).toContain('databaseId,createdAt,displayTitle,event,headBranch,url');
+    expect(STALE_APPROVAL).toContain('[ "$event" = "push" ]');
+    expect(STALE_APPROVAL).toContain('[[ "$ref" == v* ]]');
+    expect(STALE_APPROVAL).toContain('[[ "$version" != *"-"* ]]');
+    const exemption = STALE_APPROVAL.indexOf('keep stable release run');
+    const cancellation = STALE_APPROVAL.indexOf('gh run cancel "$id"');
+    expect(exemption).toBeGreaterThan(-1);
+    expect(cancellation).toBeGreaterThan(exemption);
   });
 });
 

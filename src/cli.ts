@@ -14736,6 +14736,17 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
+  case '__pty-smoke': {
+    try {
+      const { runNativePtySmoke } = await import('./cli/pty-smoke.js');
+      const result = await runNativePtySmoke();
+      process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+    } catch (error) {
+      console.error(`__pty-smoke: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'capabilities': {
     const { botmuxCapabilities, parseCapabilitiesArgs } = await import('./cli/capabilities.js');
     const parsed = parseCapabilitiesArgs(process.argv.slice(3));

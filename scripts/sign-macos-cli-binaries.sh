@@ -8,7 +8,7 @@ set -euo pipefail
 
 DIST_DIR="${1:-dist-bin}"
 IDENTIFIER="${BOTMUX_CODESIGN_IDENTIFIER:-com.botmux.cli}"
-ENTITLEMENTS="${BOTMUX_CODESIGN_ENTITLEMENTS:-build/entitlements.mac.release.plist}"
+ENTITLEMENTS="${BOTMUX_CODESIGN_ENTITLEMENTS:-build/entitlements.mac.plist}"
 CERT_LINK="${MAC_CSC_LINK:-}"
 CERT_PASSWORD="${MAC_CSC_KEY_PASSWORD:-}"
 RUNNER_TMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
@@ -95,8 +95,9 @@ for arch in x64 arm64; do
 
   [ "$actual_identifier" = "$IDENTIFIER" ] \
     || fail "$binary has identifier '$actual_identifier', expected '$IDENTIFIER'"
-  [ -n "$team_identifier" ] && [ "$team_identifier" != "not set" ] \
-    || fail "$binary has no stable TeamIdentifier"
+  if [ -z "$team_identifier" ] || [ "$team_identifier" = "not set" ]; then
+    fail "$binary has no stable TeamIdentifier"
+  fi
   case "$authority" in
     "Developer ID Application:"*) ;;
     *) fail "$binary is not signed by a Developer ID Application identity" ;;
