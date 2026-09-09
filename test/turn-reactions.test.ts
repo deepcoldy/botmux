@@ -85,10 +85,11 @@ describe('two-phase turn reactions', () => {
     mocks.removeReaction.mockResolvedValue(undefined);
   });
 
-  it('streaming card on (default): no reaction on receipt', async () => {
+  it('streaming card on (default): no reaction on receipt and no async boundary', () => {
     registerWith(false);
     const ds = makeDs();
-    await noteTurnReceived(ds, 'om_a');
+    const pending = noteTurnReceived(ds, 'om_a');
+    expect(pending).toBeUndefined();
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
