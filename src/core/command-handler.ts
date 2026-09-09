@@ -685,6 +685,7 @@ export interface CommandHandlerDeps {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -2491,10 +2492,11 @@ export async function handleCommand(
             // its first turn and must carry the full new-topic opening — see
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
+            if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;

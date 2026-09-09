@@ -5152,6 +5152,7 @@ const commandDeps: CommandHandlerDeps = {
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
 };
 
