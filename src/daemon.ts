@@ -20599,6 +20599,11 @@ async function handleThreadReplyAdmitted(
         stagePendingRepoSetup(ds, {
           mode: existingSetup?.mode ?? 'picker',
           ...(existingSetup?.baseDir ? { baseDir: existingSetup.baseDir } : {}),
+          ...(existingSetup?.force !== undefined ? { force: existingSetup.force } : {}),
+          ...(existingSetup?.worktreePath ? { worktreePath: existingSetup.worktreePath } : {}),
+          ...(existingSetup?.branch ? { branch: existingSetup.branch } : {}),
+          ...(existingSetup?.reuseExisting !== undefined ? { reuseExisting: existingSetup.reuseExisting } : {}),
+          ...(existingSetup?.targetSubdir ? { targetSubdir: existingSetup.targetSubdir } : {}),
           turnId: parsed.messageId,
         });
       } else {
