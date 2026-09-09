@@ -204,6 +204,7 @@ vi.mock('../src/services/git-worktree.js', () => ({
   pushWorktreeBranch: vi.fn(async () => {}),
   isLinkedWorktree: vi.fn(async () => false),
   mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
+  worktreeRootFor: vi.fn(async (dir: string) => dir),
   removeRepoWorktree: vi.fn(async () => {}),
   worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
 }));
@@ -570,7 +571,7 @@ import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
-import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';

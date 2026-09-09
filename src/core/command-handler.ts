@@ -17,7 +17,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeSafetyStatus } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
@@ -1913,7 +1913,7 @@ export async function handleCommand(
             logger.info(`[${logTag}] /close treated as shared-adopt disconnect`);
             break;
           }
-          const worktreeDir = ds.workingDir ?? ds.session.workingDir;
+          let worktreeDir = ds.workingDir ?? ds.session.workingDir;
           let worktreeMain: string | undefined;
           let siblingSessions: import('../types.js').Session[] = [];
           if (removeWorktree) {
@@ -1921,10 +1921,12 @@ export async function handleCommand(
               await sessionReply(rootId, t('cmd.close.worktree_thread_only', undefined, loc));
               break;
             }
-            if (!worktreeDir || !(await isLinkedWorktree(worktreeDir))) {
+            const containingRoot = worktreeDir ? await worktreeRootFor(worktreeDir) : null;
+            if (!containingRoot || !(await isLinkedWorktree(containingRoot))) {
               await sessionReply(rootId, t('cmd.close.worktree_not_linked', undefined, loc));
               break;
             }
+            worktreeDir = containingRoot;
             worktreeMain = await mainWorktreeFor(worktreeDir);
             siblingSessions = sessionStore.findActiveSessionsByWorkingDir(worktreeDir)
               .filter(s => s.sessionId !== ds.session.sessionId);

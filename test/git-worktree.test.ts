@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -280,6 +280,20 @@ describe('createRepoWorktree', () => {
     mkdirSync(plain);
 
     await expect(createRepoWorktree(plain)).rejects.toThrow();
+  });
+});
+
+describe('worktreeRootFor', () => {
+  it('resolves a nested directory to its containing linked worktree root', async () => {
+    const upstream = makeUpstream('root-upstream');
+    const repo = makeClone(upstream, 'root-proj');
+    const wt = await createRepoWorktree(repo);
+    const nested = join(wt.path, 'nested', 'deep');
+    mkdirSync(nested, { recursive: true });
+
+    expect(await worktreeRootFor(nested)).toBe(wt.path);
+    expect(await worktreeRootFor(wt.path)).toBe(wt.path);
+    expect(await worktreeRootFor(repo)).toBe(repo);
   });
 });
 

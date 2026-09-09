@@ -384,6 +384,12 @@ export async function mainWorktreeFor(dir: string): Promise<string> {
   return resolveMainWorktree(resolve(dir));
 }
 
+/** Root of the specific worktree containing `dir`, not the main checkout. */
+export async function worktreeRootFor(dir: string): Promise<string | null> {
+  const root = await tryGit(['rev-parse', '--show-toplevel'], resolve(dir), 5_000);
+  return root ? resolve(root) : null;
+}
+
 export async function isLinkedWorktree(dir: string): Promise<boolean> {
   const resolved = resolve(dir);
   try {
