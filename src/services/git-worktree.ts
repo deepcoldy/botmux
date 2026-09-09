@@ -328,6 +328,20 @@ export function withWorktreeTargetLock<T>(
   return withFileLock(target, fn, { maxWaitMs: 180_000 });
 }
 
+export async function createRepoWorktreeAndCommit<T>(
+  repoPath: string,
+  opts: CreateRepoWorktreeOptions,
+  commit: (creation: WorktreeCreation) => Promise<T>,
+): Promise<{ creation: WorktreeCreation; result: T }> {
+  const run = async () => {
+    const creation = await createRepoWorktreeUnlocked(repoPath, opts);
+    return { creation, result: await commit(creation) };
+  };
+  return opts.reuseExisting && opts.worktreePath
+    ? withWorktreeTargetLock(opts.worktreePath, run)
+    : run();
+}
+
 export async function createRepoWorktree(
   repoPath: string,
   opts: CreateRepoWorktreeOptions = {},

@@ -18507,7 +18507,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
-    if (resolvePassthroughCommands(larkAppId).has(cmd)) {
+    if (forceTopic?.mode !== 'worktree' && resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
           promptResources: resources,

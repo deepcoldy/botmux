@@ -25,7 +25,7 @@
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
-import { createRepoWorktree, isGitWorkTree, pushWorktreeBranch } from './git-worktree.js';
+import { createRepoWorktree, createRepoWorktreeAndCommit, isGitWorkTree, pushWorktreeBranch, type WorktreeCreation } from './git-worktree.js';
 import { worktreeSlugFromContextAI } from './worktree-slug-ai.js';
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/types.js';
@@ -53,6 +53,8 @@ export interface MaybeCreateWorktreeCtx {
   branch?: string;
   /** Reuse an existing linked worktree at `worktreePath`. */
   reuseExisting?: boolean;
+  /** Keep a deterministic target lock through caller-side admission/publication. */
+  commitCreated?: (creation: WorktreeCreation) => Promise<void>;
 }
 
 /**
@@ -106,12 +108,18 @@ export async function maybeCreateDefaultWorktree(
   await notify(t('worktree.auto_creating', undefined, ctx.locale));
   try {
     const slug = ctx.branch ? undefined : await worktreeSlugFromContextAI(ctx.title, ctx.prompt);
-    const creation = await createRepoWorktree(baseDir, {
+    const createOpts = {
       slug,
       branch: ctx.branch,
       worktreePath: ctx.worktreePath,
       reuseExisting: ctx.reuseExisting,
-    });
+    };
+    const committed = ctx.commitCreated
+      ? await createRepoWorktreeAndCommit(baseDir, createOpts, async creation => {
+          await ctx.commitCreated!(creation);
+        })
+      : undefined;
+    const creation = committed?.creation ?? await createRepoWorktree(baseDir, createOpts);
     logger.info(`[auto-worktree:${larkAppId}] ${baseDir} → ${creation.path} (branch ${creation.branch} from ${creation.baseRef})`);
     // riff：远程沙箱从 origin 克隆，本地新分支必须先推送才能被任务钉住。
     // 推送失败不阻塞（会话仍可用，riff 侧回退默认分支并在卡片注入告警）。

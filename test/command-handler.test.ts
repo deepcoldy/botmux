@@ -644,12 +644,14 @@ function closeWorktreeState(
   sessionId: string,
   siblingSessionIds: string[] = [],
   safetyFingerprint = 'clean-state',
+  invokerOpenId = 'ou_sender',
 ): string {
   return createHash('sha256').update(JSON.stringify({
     sessionId,
     worktreeDir: resolve('/home/testuser/project-wt-task'),
     siblingSessionIds: [...siblingSessionIds].sort(),
     safetyFingerprint,
+    invokerOpenId,
   })).digest('hex');
 }
 
@@ -2488,6 +2490,24 @@ describe('handleCommand', () => {
       expect(removeRepoWorktree).not.toHaveBeenCalled();
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('inventory unavailable');
+    });
+
+    it('binds worktree confirmation state to the requesting operator', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValue(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValue('/home/testuser/project');
+      const state = closeWorktreeState(ds.session.sessionId, [], 'clean-state', 'ou_requester');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${state}`, {
+        senderId: 'ou_other_operator',
+      }), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n'))
+        .toContain('状态在确认卡生成后发生变化');
     });
 
     it('`/close wt` asks for confirmation when other sessions share the worktree', async () => {

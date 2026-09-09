@@ -937,8 +937,26 @@ export async function runAutoWorktreeCommit(deps: {
   announcePendingRepoSession(ds);
   try {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
+    let committedUnderTargetLock = false;
+    const commitCreated = async (creation: { path: string }) => {
+      if (!ds.pendingRepo) return;
+      const targetDir = targetSubdir ? join(creation.path, targetSubdir) : creation.path;
+      if (targetSubdir && !existsSync(targetDir)) {
+        throw new Error(`worktree 中不存在原工作目录对应的子目录：${targetSubdir}`);
+      }
+      committedUnderTargetLock = await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
+        {
+          ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
+          sessionReply: async () => '', prepareTurn, noteTurnReceived,
+        },
+        targetDir,
+        pathBasename(targetDir),
+        { suppressConfirmReply: true },
+      ));
+    };
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
       isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify, force, worktreePath, branch, reuseExisting,
+      ...(reuseExisting && worktreePath ? { commitCreated } : {}),
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
@@ -948,6 +966,7 @@ export async function runAutoWorktreeCommit(deps: {
     // session. Bail on the late result instead: the takeover already owns the
     // session. (commitRepoSelection also re-checks pendingRepo under its claim,
     // but that check runs after an await — fence here before any mutation.)
+    if (committedUnderTargetLock) return;
     if (!ds.pendingRepo) {
       logger.info(`[${tag(ds)}] auto-worktree completion ignored — pendingRepo already consumed (session taken over)`);
       return;

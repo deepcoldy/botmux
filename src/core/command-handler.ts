@@ -448,6 +448,7 @@ function closeWorktreeConfirmationState(args: {
   worktreeDir: string;
   siblingSessionIds: string[];
   safetyFingerprint: string;
+  invokerOpenId: string;
 }): string {
   return createHash('sha256')
     .update(JSON.stringify({
@@ -455,6 +456,7 @@ function closeWorktreeConfirmationState(args: {
       worktreeDir: resolve(args.worktreeDir),
       siblingSessionIds: [...args.siblingSessionIds].sort(),
       safetyFingerprint: args.safetyFingerprint,
+      invokerOpenId: args.invokerOpenId,
     }))
     .digest('hex');
 }
@@ -2027,6 +2029,7 @@ export async function handleCommand(
               worktreeDir,
               siblingSessionIds: siblingSessions.map(s => s.sessionId),
               safetyFingerprint: safety.fingerprint,
+              invokerOpenId: message.senderId,
             });
             if (!confirmedWorktreeCleanup || expectedWorktreeState !== confirmationState) {
               if (confirmedWorktreeCleanup) {
