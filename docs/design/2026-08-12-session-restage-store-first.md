@@ -2,7 +2,7 @@
 title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单。同日二次修订：三项待定项落定——放弃扁平 legacy 行、只读库 fail-fast、导入删除条件；补阅读指引、决策记录与验收标准。三次修订：会话内定位改为 daemon 优先、库兜底（A-9），常态可见性提前进前置 PR（B-11））
+updated: 2026-09-08（基线切到含 Stage 3 的 master；升级窗口改为「用户手动重启 + 新代码 fail closed 并提示重启」，不再等 fleet 自动重启；按此重写现状差距、收尾 PR 分解与测试面收缩清单。同日二次修订：三项待定项落定——放弃扁平 legacy 行、只读库 fail-fast、导入删除条件；补阅读指引、决策记录与验收标准。三次修订：会话内定位改为 daemon 优先、库兜底（A-9），常态可见性提前进前置 PR（B-11）。2026-09-09 四次修订：撤回「daemon 内部 updateSession 命令化」，Stage 2 结束条件改为事务原语唯一 + 进程边界只走命令）
 topic: session-virtual-actor
 status: active
 baseline: origin/master@0aba0fdd（含已合入的 #852、#1073、#1093、#1051、#1202、#1280、#1308）
@@ -30,7 +30,7 @@ references:
 | 开收尾 PR（删跨进程 JSON 读写、心跳改语义、unmigrated 文案、mojo 修复、会话内定位 daemon 优先） | §5 A、§3.3、§3.4、§3.6、§3.9 | §6 测试面、下方验收标准 |
 | 开前置 PR 里的常态可见性（status 版本列、dashboard 提示、安装提示） | §3.8、§5 B-11 | — |
 | 开前置 PR（descriptor 能力位、supervisor killTimeout、宿主侧租约规则） | §5 B、§3.5、§3.7 | 验收标准 |
-| daemon 侧租约不变量 / owner 侧命令化 / Stage 3 残留 | §5 C、§4 对应 stage | §7 |
+| daemon 侧租约不变量 / lineage 事务收口 / Stage 3 残留 | §5 C、§4 对应 stage | §7 |
 | 判断某条兼容分支能不能删 | §0 原则 7、8；§3.1、§3.2 | 决策记录 |
 
 **决策记录**（已拍板，不要在 PR 里重新讨论；改变需要更新本表）：
@@ -43,9 +43,10 @@ references:
 | 2026-09-08 | descriptor 加 presence-based 能力位与仅用于文案的版本号；任何地方不做版本大小比较 | §3.5 |
 | 2026-09-08 | 无 `larkAppId` 的扁平 legacy 行直接放弃；扁平 store 的全部支持点随收尾 PR 删除 | 扁平 store 只存在于 2026-03-11 至 03-22（首次发布到 per-bot 拆分），早于第一个发布 tag v2.16.1（2026-05-07），没有任何发布版本写过它 |
 | 2026-09-08 | 只读库 / `loadFailure` 的 daemon 从「降级运行」改为「有界重试后 fail-fast」 | §3.7：写不了会话库的 daemon 不能服务，降级运行只会让宿主与它竞争 |
-| 2026-09-08 | 一次性导入 + 中毒库恢复的删除条件：latest ≥ v3.19 满 90 天（2026-12-06 之后）且线上 `session-stores/` 的 `*.tmp*` 孤儿核查为零 | §5 C-16 |
+| 2026-09-08 | 一次性导入 + 中毒库恢复的删除条件：latest ≥ v3.19 满 90 天（2026-12-06 之后）且线上 `session-stores/` 的 `*.tmp*` 孤儿核查为零 | §5 C-15 |
 | 2026-09-08 | 会话内定位（`botmux send` 与 detectCurrentSession / resolveSessionAppId）改为「先问活着的 daemon，问不到再读库」；daemon 侧路由补全路由字段 | §3.9：daemon 在时内存行才是权威（原则 4）；顺带让旧 daemon 窗口里的 send 降级可达 |
 | 2026-09-08 | 常态可见性（status 版本列、dashboard 提示、安装后提示）从单独排期提前进前置 PR | §3.8：会话里 agent 背后的人看不到事后报错，只能靠事前提醒 |
+| 2026-09-09 | **不做** daemon 内部 `updateSession` 的命令化。类型化命令只用于两种转换：跨进程边界的，或多字段必须原子成立且有多个写者的 | 命令化消不掉任何真实故障（丢更新靠租约、交错靠队列、per-field 命令没有 tsc 能守的不变量）；138 处必然长期两套写法并存，是 #831 的形状 |
 
 **验收标准**（收尾 PR 与前置 PR 合并前必须全部成立）：
 
@@ -149,7 +150,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 |---|---|---|
 | **身份** | `sessionId` 寻址；跨 store 只读发现（`getSession` → `findInOtherFiles`） | 扁平 legacy store（appId 为空）仍有 8 处支持点（`session-store.ts:440-442/446-448/469-470/725-733/1219-1228/2465/2493-2495`，`init` 的 `appId?`）。这种 store 只存在于项目最初 11 天（2026-03-11 首次发布到 2026-03-22 per-bot 拆分，e5aa28e6），早于第一个发布 tag v2.16.1（2026-05-07）：没有任何发布版本写过它，生产上 `init` 只有 daemon 与 worker 两处调用且 appId 必填。**真 bug**：扁平 `sessions.json` 里的行被按 larkAppId 导入 per-bot `.db` 后源文件不删，`readSessionRowCopiesAcrossStores` 把两者算成两个 store，身份扫描答「重复」（实测复现）。 |
 | **occupancy** | 同库 `occupancy` 表；首次 `load()` 的 `BEGIN IMMEDIATE` 内领取；有效租约一票否决宿主写；接管规则看过期与 `ownerPid` 存活 | ① daemon 侧没有任何消费者：`occupancyState` 只用于日志去重（`daemon.ts:22673-22692`），`restoreActiveSessions` 不看 claim 结果，`persistRow` 不查租约——被判 `displaced` 的 daemon 照常 restore / fork / 写行。设计 §1「至多一个激活」在运行时层面没有实现点，今天的租约只是给宿主看的互斥锁。② claim 失败 / displaced 只 warn 并随 30s 心跳重试；`'unavailable'` 连日志都没有。③ 关停期 `claimOccupancy()` 返回值被丢弃（`daemon.ts:23683`）。④ 宿主侧 `occupancyLeaseIsActive` 只看 `leaseUntil`，不看 `ownerPid` 是否存活。⑤ supervisor 默认 `killTimeoutMs` 8s（`fleet-supervisor.ts:138`，`index-supervisor.ts` 未传）小于 daemon 关停预算 28s（`shutdown-budgets.ts:39`），超 8s 的关停被 SIGKILL、租约不释放，留下最长 90s 的「未过期但进程已死」的行；`shutdown-budgets.ts:53-55` 仍在对着 PM2 常量做断言。⑥ 心跳仍作为 `abortIf` 参与判定（§3.4）。 |
-| **apply** | `applySessionRowCommand` 是 close / prune / whiteboard / worker-exited 的唯一变换；宿主与 daemon 的 `closeSession` 都走它；`HostSessionCommand` 用 `never` 把 daemon 专属字段挡在 tsc 边界外 | ① owner 侧没有命令层：`sessionStore.updateSession(session)` 全仓 138 处 / 14 个模块，形态是「就地改对象 + 整行 upsert」，只有 `closeSession` 走命令。这是 Stage 2 从非 owner 侧删掉的 `mutateSessionRowOffline` 在 owner 侧的等价物，也是 Stage 3 只能包住开场窗口的根因——没有命令边界就没有可入队的单位。② `persistActiveRemoteLineage*` 三个函数（`session-store.ts:1435/1498/2203`，约 240 行）是第二套手写行级事务，`SessionRowCommand` 没有 lineage 命令；`'postrename_ambiguity'` 是 JSON 时代的命名。③ `whiteboard-store.ts:466-486`：daemon 应答了非 2xx 非 409（如 400/500）也落到宿主 apply，与 `cli.ts:3856` 的「已应答即权威」不同构。 |
+| **apply** | `applySessionRowCommand` 是 close / prune / whiteboard / worker-exited 的唯一变换；宿主与 daemon 的 `closeSession` 都走它；`HostSessionCommand` 用 `never` 把 daemon 专属字段挡在 tsc 边界外 | ① daemon 内部的 `sessionStore.updateSession(session)` 全仓 138 处 / 14 个模块，形态是「就地改对象 + 整行 upsert」。这是激活自己改自己的状态，**不要求命令化**（决策记录 2026-09-09）：对它们的约束只有三条——写前持有租约（C-11）、有交错证据的段落用 `runSessionTurn` 包住（它入队的是闭包，不需要命令类型）、多字段必须原子成立的转换用 `closeSession` 那种「副本 → 变换 → 落盘 → 合并回内存」的形态（`reactivateClosedSession`、mojo journal 已是；`admit` / `promote` 见 Stage 3 残留）。② `persistActiveRemoteLineage*` 三个函数（`session-store.ts:1435/1498/2203`，约 240 行）是第二套手写行级事务，`SessionRowCommand` 没有 lineage 命令；`'postrename_ambiguity'` 是 JSON 时代的命名。③ `whiteboard-store.ts:466-486`：daemon 应答了非 2xx 非 409（如 400/500）也落到宿主 apply，与 `cli.ts:3856` 的「已应答即权威」不同构。 |
 | **turn** | `runSessionTurn` 按 `sessionId` 的 Promise 链；开场激活窗口内的 follower 落盘、开场释放都走它；`hasPendingSessionTurns` 替代计数 | ① `admitQueuedActivationTail` / `promoteQueuedActivationTail` 仍在 store 外备份再回滚（promote 4 份快照），且 promote 的回滚漏还原 `ds.session.queued`（`worker-pool.ts:9742` vs `9784-9787`；对照同文件 `10294` 有还原）。② `initialStartClaimToken` 在 worker-pool 有 4 处绕过 token fence 的裸清除（`9159/10670/11585/14246`）。③ `utils/anchor-serializer.ts#serializeByAnchor` 仍是第二套按会话串行（键是 anchor 不是 sessionId），5s 后主动放弃排序，4 个消费点在 `event-dispatcher.ts`。④ `session-store.ts:1660` 的 `bridgeMarkerCleanupFences` 是第三个 per-session Promise fence，给旁路文件排序却住在会话库模块里。⑤ `hasQueuedActivationAdmissionGate` 有 5 个消费点、4 类后果：两处改路由进 durable tail，一处抑制 live takeover，`daemon.ts:19886` 直接拒绝 passthrough 命令，`trigger-session.ts:1191` 对带幂等 key 的 HTTP trigger 回 `trigger_failed`——Stage 3 之后队列上一条几毫秒的 release 命令就能让后两处在正常时序下拒绝用户。⑥ `hasPendingSessionTurns` 把正在运行的命令自己也算 pending，「命令内不得对同 session 再入队」只靠注释维护。 |
 | **持久化仅 SQLite** | daemon 只写 SQLite（#1051） | 跨进程 db-else-json 仍在：`StoreFileRef.kind` 分流 11 处（含 `session-store.ts:1700` 的内联字面量）、`resolveStoreFile` / `listStoreRefs` 的 JSON 登记、三个读原语（`readStoreEntries` / `readStoreRowByKey` / `readStoreActiveRows`）与 `countActiveSessionsOnDisk` 的 JSON 分支、`getSessionFresh` 的 JSON 文件锁读、`owner:false` 无库时的 `loadFromFrozenJson`、`runUnownedRowTxn` 的 JSON 文件锁写分支、`fs-policy.ts:825-828/1002-1007` 对 `sessions-<self>.json` 的只读授权。 |
 | **host 可更换 / 沙盒只发命令** | CLI、dashboard 都能做宿主；沙盒 CLI 用正向信号拒绝离线写 | `cli.ts` 里隔离判定（`3924`、`3823`）排在 IPC 连接失败后的 `occupancyHeld`（`3915`、`3850`）之后：隔离 CLI 可能先拿到宿主专用的报错文案。 |
@@ -270,7 +271,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
    - 向该 bot 的 daemon 发 `GET /api/sessions/:id`（`dashboard-ipc-server.ts:1189`，2026-04-30 起存在，早于第一个发布 tag；宿主 HMAC 鉴权，2026-07-16 起所有 v3.x daemon 都认）。200 → 用它返回的行；**404 来自已应答的 daemon，是权威的「不存在」**，不再回落读库；连接失败 / 无 descriptor / 本进程读不到 secret（隔离 CLI）→ 读库（含 §3.3 的 unmigrated 判别）。
    - 返回行的 `larkAppId` 必须与 env 一致、`sessionId` 必须等于请求的 id，否则拒绝。descriptor 只用于寻址（§0 原则 7）：伪造 descriptor 至多让请求打到一个假端口，返回的行过不了这两条核对。
 2. daemon 侧把路由返回补全为 send 需要的字段：当前轮的 `replyTargets` 条目、`currentReplyTarget`、`quoteTargetId` / `quoteTargetSenderOpenId`、`codexAppDispatchLedger`。旧 daemon 只返回基础行（`sessionId` / `larkAppId` / `chatId` / `chatType` / `rootMessageId` / `scope` / `status`），send 据此降级：无每轮锚点时回到话题根，`--mention-back` 退回会话级发送者。
-3. `botmux list` 仍是快照，但组装方式改成 dashboard 已经在用的那种：在线 daemon 走 `GET /api/sessions`，只对离线 bot 读库。这一步不在收尾 PR 里（§5 C-17 的枚举器收敛时一起做）。
+3. `botmux list` 仍是快照，但组装方式改成 dashboard 已经在用的那种：在线 daemon 走 `GET /api/sessions`，只对离线 bot 读库。这一步不在收尾 PR 里（§5 C-16 的枚举器收敛时一起做）。
 4. 沙盒：Linux bwrap 的 send 由宿主侧 re-exec 完成，能读 secret，走 daemon 优先；macOS 凭证隔离的 CLI 读不到 secret，保持读库。不为它新开一条免鉴权的读路由——那等于把会话路由暴露给任何本机进程。
 
 效果：正常状态下 send 不再依赖跨进程读库，会话库的跨进程读只剩「daemon 不在」这一种情形；旧 daemon 窗口里的 send 从「未找到 session」变成降级可达。这不是兼容分支：它不读任何旧格式，走的是首发就有的正式通道，窗口关闭后仍是主路径。
@@ -281,7 +282,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 **删除条件已满足**（按 §3 的策略，不再等 fleet 自动重启，也不设复核日期）。收尾范围见 §5 A-1。
 
-删除后保留的 JSON 认知只有两处：owner daemon 首次 `load()` 的一次性导入（含文件锁、中毒库恢复），以及 §3.3 的 `unmigrated` 判别（只看文件是否存在）。导入的删除条件见 §5 C-16。
+删除后保留的 JSON 认知只有两处：owner daemon 首次 `load()` 的一次性导入（含文件锁、中毒库恢复），以及 §3.3 的 `unmigrated` 判别（只看文件是否存在）。导入的删除条件见 §5 C-15。
 
 ### Stage 1 — Occupancy 写入 SQLite【已落地；收尾：daemon 侧不变量 + 心跳定性】
 
@@ -291,13 +292,16 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 2. daemon 侧不变量按 §3.7。
 3. `occupancy` 行增加 `owner_start_identity`（显式 ALTER，须能在 v3.18.x 建出的库上安全运行），之后宿主侧 `processAlive` 判定改用它，消除 PID 复用误拒。
 
-### Stage 2 — 单一 apply 路径【已落地；缺口：owner 侧命令化】
+### Stage 2 — 单一 apply 路径【已落地；缺口：lineage 事务收口】
 
-已落地内容见 2.2。仍未纳入且必须写明结束条件的：
+已落地内容见 2.2。类型化命令的适用范围（决策记录 2026-09-09）：**只用于跨进程边界的转换，或多字段必须原子成立且有多个写者的转换**。close / prune / whiteboard / worker-exited 属前者，close / reactivate / mojo journal 属后者；daemon 内部的 activity bump / pid / 流式卡片状态两者都不是，保持就地改、行级落盘。
 
-1. `persistActiveRemoteLineage*` 三函数收进 `session-commands.ts`（或明确为 daemon-only 命令），删除 `'postrename_ambiguity'` 命名。结束条件：`session-store.ts` 里除 `applySessionRowCommand` 调用外不再有手写 `BEGIN IMMEDIATE … UPDATE sessions`。
-2. owner 侧 `updateSession` 的 138 处按命令收敛。先做 `session-store.ts:1614-1616` 注释自己点名的三类（activity bump / pid / stream-card state），不要一次全收。结束条件：`updateSession` 在 daemon 侧变为 internal，对外只暴露命令入口，`admit` / `promote` 是第一批（Stage 3 残留）。
-3. `whiteboard-store#unbindSessionWhiteboard`：daemon 已应答（任何状态码）即终态，不再落到宿主 apply。
+仍未纳入且必须写明结束条件的：
+
+1. `persistActiveRemoteLineage*` 三函数（`session-store.ts:1435/1498/2203`）是第二套手写「`BEGIN IMMEDIATE` → 读新鲜行 → CAS 前检 → UPDATE → 回读」。收口为与宿主路径 `runUnownedRowTxn` 共用的一个事务原语（读新鲜行 → 变换 → CAS 写回），不强求进 `SessionRowCommand` 联合；删除 `'postrename_ambiguity'` 命名。结束条件：`session-store.ts` 里手写的行级事务只剩这一个原语。
+2. `whiteboard-store#unbindSessionWhiteboard`：daemon 已应答（任何状态码）即终态，不再落到宿主 apply（收尾 PR A-5）。
+
+结束条件里**不包含**「`updateSession` 变 internal / 对外只暴露命令入口」。非 owner 进程只能施加 `HostSessionCommand` 这条边界已由 tsc 成立，这就是 Stage 2 在进程边界上的全部要求。
 
 ### Stage 3 — Per-session turn【已落地：开场激活窗口】
 
@@ -307,7 +311,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 残留（按 §5 D 项排期）：
 
-1. `admitQueuedActivationTail` / `promoteQueuedActivationTail` 改走 store 的命令入口：`SessionRowCommand` 加两条 daemon-only 命令，store 导出 `applyDaemonSessionCommand(sessionId, cmd)`，内部复用 `closeSession` 已有的「`next` 副本 → 纯 apply → `persistRow` → `Object.assign` 保别名」三步。promote 依赖的 `acceptCodexAppDispatch` 不纯（读 bot 配置与 delivery sink），ledger entry 要像 `tokenUsage` 一样在锁外算好作为命令字段传入。做完后 5 份 store 外备份与 `queued` 回滚遗漏一起消失。测试面：4 个文件必改（`session-lifecycle-start` 的字面量工厂只列 6 个导出、`daemon-rename-route` 与 `daemon-ordinary-ingress-failure-notice` 把 `updateSession` 换成内存 Map、`trigger-session-root-message` 手抄了实现），4 个建议同步，其余约 54 个 mock 了 `updateSession` 的文件不动。新入口内部仍复用 `updateSession` 可把前三个文件的改动降到零。
+1. `admitQueuedActivationTail` / `promoteQueuedActivationTail` 改成 `closeSession` 已有的副本形态：session-store 内部抽一个 helper（`next` 副本 → 变换 → `persistRow(next)` → `Object.assign(session, next)` 保别名），三处共用；**不新增命令类型**（决策记录 2026-09-09）。promote 依赖的 `acceptCodexAppDispatch` 不纯（读 bot 配置与 delivery sink），ledger entry 在变换外算好再传入。做完后 5 份 store 外备份与 `queued` 回滚遗漏一起消失。测试面：4 个文件必改（`session-lifecycle-start` 的字面量工厂只列 6 个导出、`daemon-rename-route` 与 `daemon-ordinary-ingress-failure-notice` 把 `updateSession` 换成内存 Map、`trigger-session-root-message` 手抄了实现），helper 内部仍走 `updateSession` 可把前三个文件的改动降到零。
 2. `initialStartClaimToken` 的 4 处裸清除改为调用带 token 的导出入口；`worker-pool.ts:11584-11585` 在 daemon 内不可达，删除。搭车在上一项。
 3. `hasQueuedActivationAdmissionGate` 的两处用户可见拒绝（`daemon.ts:19886` passthrough、`trigger-session.ts:1191` HTTP trigger）改为排进 durable tail 或等待队列排空，而不是回一条提示。
 4. `serializeByAnchor` 并入 `runSessionTurn`：键从 anchor 换成 sessionId，去掉 5s 放弃排序。这是 §1 点名要被替换的「FIFO」。
@@ -327,6 +331,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - 为 actor 引入 BotId 分配或注册表。
 - 为升级窗口保留跨进程 JSON 读写、或任何「新代码读旧格式」的分支。
 - 用 descriptor 或版本号比较作为放行依据。
+- 把 daemon 内部的 `updateSession` 收成命令联合（ActivityBumpCommand / SetPidCommand 一类）。它消不掉任何真实故障，per-field 命令没有 tsc 能守的不变量，138 处的迁移必然长期两套写法并存——那正是 #831 的形状，对以 agent 为主的改码者更糟：agent 就近复制模式，两套并存会被无限延续。
 - 以「本 PR 净行数未减少」否决朝终态收敛的改动。
 
 ## 5. 收尾分解（PR 粒度）
@@ -355,12 +360,11 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 11. **M** daemon 侧租约状态机 + `persistRow` 断言 + 关停期续租检查（§3.7-1/2/3/4），含只读库 fail-fast（已决定）。
 12. **L** occupancy 接进 daemon runtime：restore / fork / tmux adopt 的 boot gate（§3.7-6）。这是 §1「至多一个激活」第一次真正成立。
 13. **L** `occupancy` 加 `owner_start_identity` 列 + 宿主侧改用它（Stage 1-3）。
-14. **M** `persistActiveRemoteLineage*` 收进命令；`bridgeMarkerCleanupFences` 移出（Stage 2-1、Stage 3-5）。
-15. **L** owner 侧 `updateSession` 命令化，先三类（Stage 2-2）。
-16. **M** 删除一次性导入、其文件锁与中毒库恢复（约 400 行）以及 `frozenJsonRows` 一族测试夹具；届时 `storeJsonFileName` 只剩 §3.3 的 `unmigrated` 判别一个用途，`utils/file-lock.ts` 对会话库的依赖整体解除。**条件（已决定）**：latest ≥ v3.19 满 90 天（2026-12-06 之后），且对线上 `session-stores/` 做一次 `find … -name '*.tmp*'` 孤儿核查为零。
-17. **M** 6 个跨 store 枚举入口（顺带把 `botmux list` 改成「在线 daemon 走 IPC、离线 bot 读库」，§3.9-3）（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
-18. **M** Stage 3 残留 1–3（admit / promote 命令化、claim token 清除、gate 的两处用户可见拒绝）。
-19. **L** Stage 3 残留 4（`serializeByAnchor` 并入 `runSessionTurn`）。
+14. **M** `persistActiveRemoteLineage*` 与宿主路径共用一个事务原语（Stage 2-1）；`bridgeMarkerCleanupFences` 移出 session-store（Stage 3-5）。
+15. **M** 删除一次性导入、其文件锁与中毒库恢复（约 400 行）以及 `frozenJsonRows` 一族测试夹具；届时 `storeJsonFileName` 只剩 §3.3 的 `unmigrated` 判别一个用途，`utils/file-lock.ts` 对会话库的依赖整体解除。**条件（已决定）**：latest ≥ v3.19 满 90 天（2026-12-06 之后），且对线上 `session-stores/` 做一次 `find … -name '*.tmp*'` 孤儿核查为零。
+16. **M** 6 个跨 store 枚举入口（顺带把 `botmux list` 改成「在线 daemon 走 IPC、离线 bot 读库」，§3.9-3）（`findInOtherFiles` / `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities` / `loadAllSessionsSnapshot` / `readSessionRowCopiesAcrossStores` / `findActiveSessionsMatching`）收成一个带显式失败策略的枚举器 + 一个投影，并借此给跨 bot 读加「该 store 不可读 / 未迁移」的返回通道。
+17. **M** Stage 3 残留 1–3（admit / promote 改为副本形态、claim token 清除、gate 的两处用户可见拒绝）。
+18. **L** Stage 3 残留 4（`serializeByAnchor` 并入 `runSessionTurn`）。
 
 ## 6. 测试面收缩
 
@@ -405,7 +409,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 ### 6.4 保留（含删除条件）
 
-- 导入与中毒库恢复用例（`session-store.test.ts:172/195/227/415/425/438/445/526/1322/1423/1453/1479`、`session-store-sqlite.test.ts:94-181`、`session-store-sqlite-poisoned-recovery.test.ts` 全部 18 条）随 §5 C-16 一起删除。`frozenJsonRows` 夹具在 poisoned-recovery 里有 10 处引用（`60/333/363/388/405/426/464/481/499/584`）。
+- 导入与中毒库恢复用例（`session-store.test.ts:172/195/227/415/425/438/445/526/1322/1423/1453/1479`、`session-store-sqlite.test.ts:94-181`、`session-store-sqlite-poisoned-recovery.test.ts` 全部 18 条）随 §5 C-15 一起删除。`frozenJsonRows` 夹具在 poisoned-recovery 里有 10 处引用（`60/333/363/388/405/426/464/481/499/584`）。
 - `session-store-sqlite.test.ts:225`（冻结 JSON 不是 store）、`:323`（改新鲜行）、`:337`（SQLITE_BUSY → contended）是终态保证，保留。
 - `session-delete-cli.test.ts:312`（daemon 拒绝不因过期租约翻成离线写许可）、`:352`（无 descriptor 但有租约必须让位）、`:438` / `:462`（沙盒与 origin-channel 闸）是终态核心。
 - `initial-user-turn-opening.test.ts`（28 条，运行时 38）与 `session-turn-queue.test.ts`（5 条）没有一条在钉 Stage 3 之前的排序机制，全部保留。
@@ -432,3 +436,5 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 2026-08-28 至 09-08：#1051 删除 daemon 侧 JSON 写路径并把落盘改成行级 upsert，同时把删板解绑、离线写与 daemon 发现各收敛成一份实现；#1202 落地库内租约；#1280 落地单一 apply 并删除「任意闭包改行」的离线写入口；#1308 把开场激活窗口的串行化收进 `runSessionTurn`。期间跨进程读写按「升级窗口无上界」保留了 db-else-json 与心跳回落，删除条件曾定为「fleet 自动重启落地或 2026-11-26 复核」。
 
 2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。同日二次修订把三项待定项落定为决策（阅读指引的决策记录）：扁平 legacy 行放弃并随收尾 PR 删除支持点；只读库 daemon fail-fast；导入与中毒恢复按日期 + 磁盘核查删除。三次修订：会话内定位改为 daemon 优先、库兜底（§3.9、A-9），§3.2 中「会话内 agent 回不了消息」的代价改为「降级但可达」；常态可见性从单独排期提前进前置 PR（B-11）。
+
+2026-09-09 四次修订：经评审撤回「daemon 内部 updateSession 命令化」（原 Stage 2-2 / C-15）。理由：`runSessionTurn` 入队的是闭包，Stage 3 止于开场窗口是因为没有更多有复现的交错，不是缺命令类型；per-field 命令没有 tsc 能守的不变量；138 处必然长期两套并存。类型化命令的适用范围收窄为「跨进程边界」与「多字段原子且多写者」两类；Stage 2 结束条件改为「手写行级事务只剩一个原语」。
