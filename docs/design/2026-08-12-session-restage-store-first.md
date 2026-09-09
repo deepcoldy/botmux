@@ -46,6 +46,9 @@ references:
 | 2026-09-08 | 一次性导入 + 中毒库恢复的删除条件：latest ≥ v3.19 满 90 天（2026-12-06 之后）且线上 `session-stores/` 的 `*.tmp*` 孤儿核查为零 | §5 C-15 |
 | 2026-09-08 | 会话内定位（`botmux send` 与 detectCurrentSession / resolveSessionAppId）改为「先问活着的 daemon，问不到再读库」；daemon 侧路由补全路由字段 | §3.9：daemon 在时内存行才是权威（原则 4）；顺带让旧 daemon 窗口里的 send 降级可达 |
 | 2026-09-08 | 常态可见性（status 版本列、dashboard 提示、安装后提示）从单独排期提前进前置 PR | §3.8：会话里 agent 背后的人看不到事后报错，只能靠事前提醒 |
+| 2026-09-09 | A-8（删扁平 store）拆成紧随 A+B 之后的独立 PR，与 A+B 同时开、先后合；其验收 grep 在 A-8 PR 达标 | 实际改动面是约 20 个测试文件、100+ 处无参 `init()`，会把 A-1 / A-2 / A-9 的协议删除淹没在夹具改写里；扁平 store 在生产上零调用，多留一个 PR 不构成半套协议 |
+| 2026-09-09 | descriptor 的 `supervisorShutdownProtocol` 字段停写，dashboard 前端 `bootstrapRequired` 死分支与 i18n、`RestartLifecycleFlags` 一起删；关停协议常量与关停状态机不动 | 该字段零读者（白名单过滤），前端文案指向已不存在的 flag；「旧进程要重启」由 B-11 的版本可见性覆盖。将来若关停协议再 bump 且需要广告能力，加进与 `sessionStoreProtocol` 同一组能力位并同时加读者 |
+| 2026-09-09 | dashboard 历史弹层的 `sessions.history.staleHint` 改成真判定：仅当该 bot 的 `descriptor.botmuxVersion` 存在、非 `0.0.0`、且与 dashboard 磁盘版本不相等时提示重启；其余只显示原始错误。猜测式原文删除 | 历史 404 是会话里的人会撞到的面；判定只比「是否相等」，不比大小 |
 | 2026-09-09 | **不做** daemon 内部 `updateSession` 的命令化。类型化命令只用于两种转换：跨进程边界的，或多字段必须原子成立且有多个写者的 | 命令化消不掉任何真实故障（丢更新靠租约、交错靠队列、per-field 命令没有 tsc 能守的不变量）；138 处必然长期两套写法并存，是 #831 的形状 |
 
 **验收标准**（收尾 PR 与前置 PR 合并前必须全部成立）：
@@ -57,7 +60,7 @@ grep -nF 'sessions-${ctx.currentAppId}.json' src/adapters/cli/fs-policy.ts      
 grep -nF 'sessions(-[^.]+)?' src/core/mojo-containment-command.ts                                                                    # 期望 0 行
 grep -nE "withFileLockSync" src/services/session-store.ts                                                                             # 期望只剩导入与中毒恢复两处
 grep -nE "sessions\.get\(sid\)" src/cli.ts                                                                                           # 期望 0（cmdSend 与会话内定位底座已改走 resolveSessionById）
-grep -rnE "sessionStore\.init\(\s*\)" test | wc -l                                                                                    # 期望 0（扁平 store 支持已删；init(appId) 必填后 tsc 也会报）
+grep -rnE "sessionStore\.init\(\s*\)" test | wc -l                                                                                    # 期望 0；在 A-8 PR 达标（A+B PR 里允许非 0）
 # B：descriptor 能力位与关停预算
 grep -nE "sessionStoreProtocol|botmuxVersion" src/daemon.ts src/utils/daemon-discovery.ts src/dashboard/registry.ts                   # 三个文件都应命中
 grep -nE "PM2_DAEMON_KILL_TIMEOUT_MS" src/core/shutdown-budgets.ts                                                                    # 断言对象应换成 fleet supervisor 的 killTimeoutMs
@@ -227,7 +230,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 - `DaemonDescriptor` 增加 `sessionStoreProtocol: 'occupancy-v1'`（presence-based，与已有的 `workflowIpcProtocol: 'v1'` 同构），随每次 30s 心跳整体重写。旧 daemon 天然不写它。**它只决定文案，不决定是否放行**：新 daemon 在启动窗口（`daemon.ts:22671` 先写 descriptor，`22694` 才 claim）与 claim 持续失败时同样是「有字段、无租约、活着」。
 - 另加 `botmuxVersion: string`（取 `utils/install-info.ts#botmuxVersion()`），**只用于文案**。不做版本大小比较：`package.json` 的 version 是 `0.0.0`，源码 checkout 与本地编译的二进制都报 `0.0.0`，而 live fleet 就是从 checkout 起的；canary/beta 后缀与回滚场景也让「谁新」没有唯一答案。
-- 读侧两处都要改：`daemon-discovery.ts:19-30/78-91`（字段白名单）与 `dashboard/registry.ts:5-28`（整体 cast）。`supervisorShutdownProtocol` 要么泛化成同一组能力声明，要么与 `bootstrapRequired` 前端死路径一起删，不要两者并存。
+- 读侧两处都要改：`daemon-discovery.ts:19-30/78-91`（字段白名单）与 `dashboard/registry.ts:5-28`（整体 cast）。`supervisorShutdownProtocol` 字段停写并删除其前端死路径（决策记录 2026-09-09）；`core/supervisor-shutdown-protocol.ts` 的常量与关停状态机不动，`test/shutdown-supervisor-contract.test.ts` 改为不再断言该字段。
 - descriptor 的新鲜度只看文件内 `lastHeartbeat` 字段，不看 mtime、不查 pid。`cli.ts:2578` 按 mtime 清 5 分钟前的 descriptor 不会把「拦住」翻成「放行」。闸绝不能把「descriptor 文件不存在」解读成「旧版本 daemon」。
 
 ### 3.6 受众与文案
@@ -260,7 +263,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - `botmux status` 增加 VERSION 列（`listOnlineDaemons` 按 appId join fleet 行），表尾提示「N 个 daemon 仍在跑 vX（磁盘 vY），运行 `botmux restart` 应用」。
 - dashboard「版本与更新」卡增加「运行中的 daemon：n 个 v3.20.0 / m 个 v3.19.3 ⇒ 需要重启」，数据源 `registry.list()`，对照量是 `currentInstalledVersion()`。版本不进 `botsRosterSignature`，靠轮询刷新。
 - `postinstall-bin.mjs` 与 `install.sh` 在升级成功后无条件打一行「若 daemon 正在运行，请执行 `botmux restart` 应用新版本」（它们读不到、也不该读 `~/.botmux/data`）。
-- dashboard i18n `sessions.history.staleHint` 是猜测式提示，有版本字段后改成真判定或删掉。
+- dashboard 历史弹层的 `sessions.history.staleHint` 改成真判定（决策记录 2026-09-09）：仅当该 bot 的 `descriptor.botmuxVersion` 存在、非 `0.0.0`、且与 `currentInstalledVersion()` 不相等时，附一句「运行中的 daemon vX 与磁盘 vY 不一致，运行 `botmux restart` 应用」；否则只显示原始 not_found。文案与版本卡共用同一个 helper，不比版本大小。dashboard 面向操作员，带 `botmux restart` 指令合法。
 
 ### 3.9 会话内定位：先问活着的 daemon，问不到再读库
 
@@ -345,15 +348,15 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 5. **S** 隔离判定前移（§3.6）；`whiteboard-store` 的「已应答即终态」。
 6. **S** 死代码与过时注释：`__testOnly_setAfterRemoteBatchRename`、`test/session-store.test.ts:25` 的 fs mock 注入、`daemon.ts:4212-4214`、`dashboard-ipc-server.ts:2247`。
 7. **S** 测试改造，按 §6。
-8. **S** 删扁平 legacy store：`init(appId: string)` 必填，删 8 处支持点与 `hostOptions` 的无 `larkAppId` 分支、`cli.ts:3877-3882` 的离线路径特例，约 30 处测试夹具的无参 `init()` 改为传 appId。无 `larkAppId` 的行已决定放弃（见阅读指引的决策记录），PR 描述里写明。这一项与 A-1 之后的代码没有耦合，若让 PR 过大可拆成紧随其后的独立 PR，但不设任何前置条件。
+8. **M** 删扁平 legacy store（**独立 PR，与 A+B 同时开、紧随其后合**；决策记录 2026-09-09）：`init(appId: string)` 必填，删 8 处支持点与 `hostOptions` 的无 `larkAppId` 分支、`cli.ts:3877-3882` 的离线路径特例。实际改动面约 20 个测试文件、100+ 处无参 `init()`（`session-store.test.ts` 42、`dashboard-ipc.test.ts` 22、`restore-zombie-close.test.ts` 12，其余多为 1 处），全是机械补 appId。无 `larkAppId` 的行已决定放弃，PR 描述里写明。它与 A-1 之后的代码没有耦合；拆出去是为了让 A-1 / A-2 / A-9 的协议删除在审查时不被夹具改写淹没。
 9. **M** 会话内定位改为 daemon 优先（§3.9）：`resolveSessionById` 替换 `cmdSend` / `detectCurrentSession` / `currentWhiteboardContext` / `resolveSessionAppId` 里的 `loadSessions().get(sid)`；daemon 侧 `GET /api/sessions/:id` 补全路由字段；返回行与 env 的一致性核对；测试补「daemon 应答 200 / 404 / 连接失败」三种分支与 larkAppId 不一致拒绝。
 
 ### B. 必须同 PR 或紧邻的前置 PR（否则 A-2 是回归）
 
-8. **M** descriptor 加 `sessionStoreProtocol` 与 `botmuxVersion`，读侧两处同步（§3.5）；`supervisorShutdownProtocol` 与前端 `bootstrapRequired` 死路径、`RestartLifecycleFlags` 一起处置。
+8. **M** descriptor 加 `sessionStoreProtocol` 与 `botmuxVersion`，读侧两处同步（§3.5）；停写 descriptor 的 `supervisorShutdownProtocol` 字段，删 dashboard 前端 `bootstrapRequired` 死分支及其 i18n、`cli.ts` 的 `RestartLifecycleFlags`；关停协议常量与关停状态机不动，合同测试改为不再断言该字段。
 9. **M** supervisor `killTimeoutMs` 对齐关停预算；`shutdown-budgets.ts:53-55` 断言改对象（§3.7-5）。
 10. **M** 宿主侧租约有效性两段规则（§3.4）。
-11. **S** 常态可见性（§3.8，依赖 B-8 的 `botmuxVersion`）：`botmux status` 的 VERSION 列与表尾提示、dashboard「版本与更新」卡的「运行中的 daemon 需要重启」、`postinstall-bin.mjs` 与 `install.sh` 升级后的一行提示。
+11. **S** 常态可见性（§3.8，依赖 B-8 的 `botmuxVersion`）：`botmux status` 的 VERSION 列与表尾提示、dashboard「版本与更新」卡的「运行中的 daemon 需要重启」、`postinstall-bin.mjs` 与 `install.sh` 升级后的一行提示；历史弹层 `staleHint` 改为基于 `botmuxVersion` 的真判定（§3.8）。
 
 ### C. 单独排期
 
@@ -437,4 +440,4 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 2026-09-08 起：维护者决定不再等 fleet 自动重启，升级窗口由用户手动重启关闭，新代码遇到旧 daemon 时 fail closed 并提示。据此跨进程 JSON 读写按 §5 A 净删除；心跳探针经复核不是兼容路径而是与版本无关的存活兜底，改为只拒绝、带原因，不删除（§3.4）。同日二次修订把三项待定项落定为决策（阅读指引的决策记录）：扁平 legacy 行放弃并随收尾 PR 删除支持点；只读库 daemon fail-fast；导入与中毒恢复按日期 + 磁盘核查删除。三次修订：会话内定位改为 daemon 优先、库兜底（§3.9、A-9），§3.2 中「会话内 agent 回不了消息」的代价改为「降级但可达」；常态可见性从单独排期提前进前置 PR（B-11）。
 
-2026-09-09 四次修订：经评审撤回「daemon 内部 updateSession 命令化」（原 Stage 2-2 / C-15）。理由：`runSessionTurn` 入队的是闭包，Stage 3 止于开场窗口是因为没有更多有复现的交错，不是缺命令类型；per-field 命令没有 tsc 能守的不变量；138 处必然长期两套并存。类型化命令的适用范围收窄为「跨进程边界」与「多字段原子且多写者」两类；Stage 2 结束条件改为「手写行级事务只剩一个原语」。
+2026-09-09 四次修订：经评审撤回「daemon 内部 updateSession 命令化」（原 Stage 2-2 / C-15）。理由：`runSessionTurn` 入队的是闭包，Stage 3 止于开场窗口是因为没有更多有复现的交错，不是缺命令类型；per-field 命令没有 tsc 能守的不变量；138 处必然长期两套并存。类型化命令的适用范围收窄为「跨进程边界」与「多字段原子且多写者」两类；Stage 2 结束条件改为「手写行级事务只剩一个原语」。同日实施侧提出三处取舍并已裁定：A-8 拆为紧随其后的独立 PR；`supervisorShutdownProtocol` 字段停写、前端死路径删除；`staleHint` 改为版本真判定。
