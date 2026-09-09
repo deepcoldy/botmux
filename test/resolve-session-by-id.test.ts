@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveSessionById } from '../src/cli/resolve-session-by-id.js';
 import { UNMIGRATED_OPERATOR_HINT } from '../src/services/session-store-copy.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 describe('resolveSessionById', () => {
   it('uses a 200 from the owning daemon and rejects an appId mismatch', async () => {
@@ -54,6 +55,57 @@ describe('resolveSessionById', () => {
       fetchIpc: async () => new Response(JSON.stringify({ session: row }), { status: 200 }),
     });
     expect(result).toEqual({ ok: true, source: 'daemon', session: row });
+  });
+
+  it('without BOTMUX_LARK_APP_ID, a 404 from a non-owning daemon does not short-circuit the store', async () => {
+    // Bot A is online and does not own s1; bot B (the owner) is offline and
+    // its row lives only in B's SQLite store. The host shell has no appId.
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    const rowB = { sessionId: 's1', larkAppId: 'cli_b', chatId: 'oc_b', rootMessageId: 'om_b', status: 'active' };
+    seedPersistedSessionRows(dataDir, 'cli_b', { s1: rowB });
+    let asked = 0;
+    const result = await resolveSessionById('s1', {
+      dataDir,
+      env: {},
+      listDaemons: () => [{ larkAppId: 'cli_a', ipcPort: 9 }],
+      loadSecret: () => 'secret',
+      fetchIpc: async () => { asked += 1; return new Response(JSON.stringify({ error: 'not_found' }), { status: 404 }); },
+    });
+    expect(asked).toBe(1);
+    expect(result).toMatchObject({ ok: true, source: 'store', session: { sessionId: 's1', larkAppId: 'cli_b' } });
+  });
+
+  it('without BOTMUX_LARK_APP_ID and no online daemon, reads the store', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    seedPersistedSessionRows(dataDir, 'cli_b', {
+      s1: { sessionId: 's1', larkAppId: 'cli_b', chatId: 'oc_b', rootMessageId: 'om_b', status: 'active' },
+    });
+    const result = await resolveSessionById('s1', {
+      dataDir,
+      env: {},
+      listDaemons: () => [],
+      loadSecret: () => 'secret',
+      fetchIpc: async () => { throw new Error('must not be called'); },
+    });
+    expect(result).toMatchObject({ ok: true, source: 'store', session: { sessionId: 's1', larkAppId: 'cli_b' } });
+  });
+
+  it('without BOTMUX_LARK_APP_ID, an enumerated daemon that answers 200 wins over the store', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    seedPersistedSessionRows(dataDir, 'cli_b', {
+      s1: { sessionId: 's1', larkAppId: 'cli_b', chatId: 'oc_stale', rootMessageId: 'om_b', status: 'active' },
+    });
+    const live = { sessionId: 's1', larkAppId: 'cli_b', chatId: 'oc_live', rootMessageId: 'om_b', status: 'active' };
+    const result = await resolveSessionById('s1', {
+      dataDir,
+      env: {},
+      listDaemons: () => [{ larkAppId: 'cli_a', ipcPort: 9 }, { larkAppId: 'cli_b', ipcPort: 10 }],
+      loadSecret: () => 'secret',
+      fetchIpc: async (port: number) => port === 10
+        ? new Response(JSON.stringify({ session: live }), { status: 200 })
+        : new Response(JSON.stringify({ error: 'not_found' }), { status: 404 }),
+    });
+    expect(result).toEqual({ ok: true, source: 'daemon', session: live });
   });
 
   it('falls back to unmigrated when the daemon does not answer', async () => {

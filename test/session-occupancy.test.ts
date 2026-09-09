@@ -117,7 +117,7 @@ describe('occupancy vs heartbeat window', () => {
   it('expired lease + fresh heartbeat without capability is legacy_daemon', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     seedOccupancyLease(tempDir, 'appA', {
-      ownerPid: 4242,
+      ownerPid: deadPid(),
       bootId: 'boot-crashed-newer-build',
       leaseUntil: Date.now() - 1,
     });
@@ -144,7 +144,7 @@ describe('occupancy vs heartbeat window', () => {
   it('expired lease + stale heartbeat allows the offline write', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     seedOccupancyLease(tempDir, 'appA', {
-      ownerPid: 4242,
+      ownerPid: deadPid(),
       bootId: 'boot-dead',
       leaseUntil: Date.now() - 1,
     });
@@ -367,11 +367,15 @@ describe('claim / release occupancy', () => {
   });
 
   it('an expired lease that is then re-claimed blocks the next offline write', () => {
+    // The seeded owner must be a pid that is provably dead: the host rule is
+    // "unexpired OR owner alive", so a live pid (99 can be a kernel thread on
+    // the host pid namespace) would keep the expired lease held.
+    const ownerPid = deadPid();
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
-    init('appA', { occupancy: { bootId: 'boot-owner', pid: 99 } });
+    init('appA', { occupancy: { bootId: 'boot-owner', pid: ownerPid } });
     listSessions();
     seedOccupancyLease(tempDir, 'appA', {
-      ownerPid: 99,
+      ownerPid,
       bootId: 'boot-owner',
       leaseUntil: Date.now() - 1,
     });
@@ -383,7 +387,7 @@ describe('claim / release occupancy', () => {
     )).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
 
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
-    expect(claimOccupancyLease({ bootId: 'boot-owner', pid: 99 })).toBe('held');
+    expect(claimOccupancyLease({ bootId: 'boot-owner', pid: ownerPid })).toBe('held');
     expect(applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
       { type: 'close' },
