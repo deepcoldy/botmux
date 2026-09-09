@@ -247,7 +247,11 @@ import {
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
 } from './dashboard/groups-action-helpers.js';
+import { getProjectGroupMode, putProjectGroupMode, summarizeProjectRuntime } from './dashboard/project-group-mode-api.js';
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
+import { listGroupCollaborationModes } from './services/group-collaboration-mode-store.js';
+import { listProjectGroups, type ProjectGroupState } from './services/project-group-store.js';
+import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
@@ -1688,6 +1692,52 @@ const groupsActionDeps: GroupsActionDeps = {
   closeSessionsMatching,
   fetch: fetchDaemonUrl,
   invalidateGroups: () => groupsMatrixSnapshot.invalidate(),
+};
+const projectGroupModeApiDeps = {
+  dataDir: config.session.dataDir,
+  groups: () => groupsMatrixSnapshot.get(),
+  ensureOnboardingCard: async (
+    chatId: string,
+    coordinatorAppId: string,
+    input: { coordinatorName: string; workerNames: string[] },
+  ): Promise<void> => {
+    const response = await proxyToDaemon(
+      coordinatorAppId,
+      `/api/project-groups/${encodeURIComponent(chatId)}/ensure-onboarding-card`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+      },
+    );
+    const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (!response.ok || !body.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
+  },
+  clearOnboardingCard: async (chatId: string, coordinatorAppId: string): Promise<void> => {
+    const response = await proxyToDaemon(
+      coordinatorAppId,
+      `/api/project-groups/${encodeURIComponent(chatId)}/clear-onboarding-card`,
+      { method: 'POST' },
+    );
+    const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (!response.ok || !body.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
+  },
+  refreshProjectCard: async (chatId: string, coordinatorAppId: string): Promise<ProjectGroupState> => {
+    const response = await proxyToDaemon(
+      coordinatorAppId,
+      `/api/project-groups/${encodeURIComponent(chatId)}/refresh-card`,
+      { method: 'POST' },
+    );
+    const body = await response.json().catch(() => ({})) as {
+      ok?: boolean;
+      error?: string;
+      project?: ProjectGroupState;
+    };
+    if (!response.ok || !body.ok || !body.project) {
+      throw new Error(body.error ?? `HTTP ${response.status}`);
+    }
+    return body.project;
+  },
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
@@ -5968,10 +6018,65 @@ const server = createServer(async (req, res) => {
       if (url.searchParams.get('view') === 'names') {
         return jsonRes(res, 200, groupsNamesMatrix(matrix));
       }
+      const collaborationModes = authed
+        ? new Map(listGroupCollaborationModes(config.session.dataDir).map(mode => [mode.chatId, mode]))
+        : new Map();
+      const projectRuntimeByChat = authed
+        ? new Map(listProjectGroups(config.session.dataDir).map(project => [project.chatId, summarizeProjectRuntime(project)]))
+        : new Map();
+      const authenticatedChats = authed
+        ? matrix.chats.map(chat => {
+            const mode = collaborationModes.get(chat.chatId);
+            return {
+              ...chat,
+              collaborationMode: mode?.mode ?? 'standard',
+              ...(mode?.progressCard
+                ? { projectProgressCard: resolveProjectProgressCardConfig(mode.progressCard) }
+                : {}),
+              ...(mode?.mode === 'project'
+                ? {
+                    projectCoordinatorAppId: mode.coordinatorAppId,
+                    projectWorkerAppIds: mode.workerAppIds ?? [],
+                    projectAutoEnrollWorkers: mode.autoEnrollWorkers === true,
+                    ...(!mode.progressCard
+                      ? { projectProgressCard: resolveProjectProgressCardConfig(undefined) }
+                      : {}),
+                  }
+                : {}),
+              ...(projectRuntimeByChat.get(chat.chatId)
+                ? { projectRuntime: projectRuntimeByChat.get(chat.chatId) }
+                : {}),
+            };
+          })
+        : [];
       return jsonRes(res, 200, {
-        chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
+        chats: authed ? authenticatedChats : redactGroupsForPublic(matrix.chats),
         bots: matrix.bots,
       });
+    }
+
+    let mCollaborationMode: RegExpMatchArray | null;
+    if ((mCollaborationMode = url.pathname.match(/^\/api\/groups\/([^/]+)\/collaboration-mode$/))) {
+      const chatId = decodeURIComponent(mCollaborationMode[1]);
+      if (req.method === 'GET') {
+        const result = await getProjectGroupMode(chatId, projectGroupModeApiDeps);
+        return jsonRes(res, result.status, result.body);
+      }
+      if (req.method === 'PUT') {
+        let body: unknown;
+        try {
+          body = await readJsonBody(req, 32 * 1024);
+        } catch (error) {
+          const tooLarge = error instanceof DashboardJsonBodyTooLargeError;
+          return jsonRes(res, tooLarge ? 413 : 400, {
+            ok: false,
+            error: tooLarge ? 'body_too_large' : 'bad_json',
+          });
+        }
+        const result = await putProjectGroupMode(chatId, body, projectGroupModeApiDeps);
+        return jsonRes(res, result.status, result.body);
+      }
+      return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
     }
 
     // ─── Roles (proxy to daemon) ────────────────────────────────────────────

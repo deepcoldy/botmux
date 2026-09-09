@@ -19,7 +19,63 @@ export interface GroupChat {
   name?: string;
   ownerId?: string | null;
   avatar?: string;
+  chatMode?: string;
+  sessionGroup?: boolean;
+  collaborationMode?: 'standard' | 'project';
+  projectCoordinatorAppId?: string;
+  projectWorkerAppIds?: string[];
+  projectAutoEnrollWorkers?: boolean;
+  projectProgressCard?: ProjectProgressCardConfig;
+  projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];
+}
+
+export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
+export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+
+export interface ProjectProgressCardConfig {
+  schemaVersion: 1;
+  templateId: ProjectProgressCardTemplateId;
+  sections: ProjectProgressCardSectionId[];
+  milestonesExpanded: boolean;
+}
+
+export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
+  return {
+    schemaVersion: 1,
+    templateId: 'status-dashboard',
+    sections: ['goal', 'blockers', 'workstreams', 'milestones'],
+    milestonesExpanded: false,
+  };
+}
+
+export interface ProjectGroupRuntimeSummary {
+  status: 'active' | 'paused' | 'completed';
+  phase: string;
+  focus: string;
+  progress: number;
+  remaining: string;
+  workstreamCount: number;
+  completedWorkstreamCount: number;
+  blockerCount: number;
+  cardPinned: boolean;
+  updatedAt: string;
+}
+
+export interface GroupCollaborationModeResponse {
+  ok: boolean;
+  config: {
+    chatId: string;
+    mode: 'standard' | 'project';
+    coordinatorAppId?: string;
+    workerAppIds?: string[];
+    autoEnrollWorkers?: boolean;
+    progressCard?: ProjectProgressCardConfig;
+  };
+  project: ProjectGroupRuntimeSummary | null;
+  cardRefresh?: 'updated' | 'deferred' | 'not_needed';
+  cardRefreshError?: string;
+  error?: string;
 }
 
 export interface GroupsSnapshot {
@@ -171,4 +227,33 @@ export async function setGroupPinStreamingCard(
   );
   const body = await r.json().catch(() => ({}));
   return { ok: r.ok && body?.ok !== false, status: r.status, body };
+}
+
+export async function fetchGroupCollaborationMode(chatId: string): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`);
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
+}
+
+export async function saveGroupCollaborationMode(
+  chatId: string,
+  input:
+    | { mode: 'standard' }
+    | {
+        mode: 'project';
+        coordinatorAppId: string;
+        workerAppIds: string[];
+        autoEnrollWorkers: boolean;
+        progressCard: ProjectProgressCardConfig;
+      },
+): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
 }

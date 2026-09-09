@@ -43,7 +43,7 @@ import {
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -5292,7 +5292,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'project',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5448,6 +5448,85 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+async function cmdProject(argv: string[]): Promise<void> {
+  const subcommand = argv[0] ?? '';
+  const { parseProjectArgs } = await import('./cli/project-args.js');
+  const parsed = parseProjectArgs(subcommand, argv.slice(1));
+  if (!parsed.ok) {
+    console.error(`botmux project: ${parsed.error}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.help) {
+    console.log(`botmux project — 普通群项目控制面（持久状态 + 置顶进度卡）
+
+用法:
+  botmux project init --title <项目名> --goal <目标> [--phase <阶段>] [--focus <当前焦点>]
+  botmux project status [--json]
+  botmux project update [--goal <目标>] [--phase <阶段>] [--focus <当前焦点>]
+                        [--progress <0-100>] [--remaining <待完成>]
+                        [--blocker <阻塞>] [--clear-blockers]
+                        [--milestone <里程碑>] [--next-milestone <下一节点>]
+  botmux project close [--milestone <完成说明>]
+  botmux project resume [--phase <阶段>] [--focus <当前焦点>]
+
+说明:
+  仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
+  botmux dispatch 会自动登记子任务，botmux report 会把进展同步回同一张卡。
+  所有命令可加 --session-id <id>；--json 输出完整状态。`);
+    return;
+  }
+  const sid = parsed.sessionId ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id；请在普通群主控会话中运行，或传 --session-id。');
+    process.exitCode = 1;
+    return;
+  }
+  const session = loadSessions().get(sid);
+  if (!session?.larkAppId) {
+    console.error(`未找到可用 session ${sid}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (session.chatType !== 'group' || session.scope !== 'chat') {
+    console.error('project 模式只能在普通群的 chat-scope 主控会话中使用。');
+    process.exitCode = 1;
+    return;
+  }
+  const daemon = findDaemon(session.larkAppId);
+  const ipcPort = resolveDaemonIpcPort(daemon?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('当前 Bot daemon 不在线。');
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(
+    ipcPort,
+    session.sessionId,
+    'project',
+    parsed.action as unknown as Record<string, unknown>,
+  );
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; project?: Record<string, unknown> };
+  if (!response.ok || !body.ok || !body.project) {
+    console.error(`project 操作失败: ${body.error ?? `HTTP ${response.status}`}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (parsed.json || subcommand === 'status') {
+    console.log(JSON.stringify(body.project, null, 2));
+  } else {
+    const project = body.project as { title?: string; revision?: number; card?: { messageId?: string; pinned?: boolean } };
+    console.log(JSON.stringify({
+      success: true,
+      action: subcommand,
+      title: project.title,
+      revision: project.revision,
+      cardMessageId: project.card?.messageId,
+      pinned: project.card?.pinned === true,
+    }));
+  }
 }
 
 /** botmux slash "<斜杠命令>"：请求 daemon 在本会话 idle 后把命令敲入自己的 CLI。
@@ -6360,6 +6439,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
   report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
+  project init|status|update|close|resume [...]
+                                       普通群项目控制面与置顶进度卡（详见 \`botmux project --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -10687,6 +10768,59 @@ async function postCurrentSessionDaemonRoute(input: {
   });
 }
 
+async function trySyncProjectDispatch(input: {
+  sessionId: string;
+  larkAppId: string;
+  action: ReturnType<typeof buildProjectDispatchSyncAction>;
+}): Promise<boolean> {
+  try {
+    const response = await postCurrentSessionDaemonRoute({
+      path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project`,
+      sessionId: input.sessionId,
+      larkAppId: input.larkAppId,
+      body: { ...input.action },
+    });
+    const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (response.ok && body.ok) return true;
+    if (response.status === 404 && body.error === 'project_not_found') return false;
+    console.error(`⚠️  子任务已派发，但项目进度卡同步失败: ${body.error ?? `HTTP ${response.status}`}`);
+  } catch (error) {
+    console.error(`⚠️  子任务已派发，但项目进度卡同步失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return false;
+}
+
+async function assertProjectDispatchPolicy(input: {
+  sessionId: string;
+  larkAppId: string;
+  targetChatId: string;
+  targetAppIds: string[];
+  hasLegacyBots: boolean;
+  title: string;
+  existingDispatch: boolean;
+}): Promise<void> {
+  const response = await postCurrentSessionDaemonRoute({
+    path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project-dispatch-policy`,
+    sessionId: input.sessionId,
+    larkAppId: input.larkAppId,
+    body: {
+      targetChatId: input.targetChatId,
+      targetAppIds: input.targetAppIds,
+      hasLegacyBots: input.hasLegacyBots,
+      title: input.title,
+      existingDispatch: input.existingDispatch,
+    },
+  });
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    disallowedAppIds?: string[];
+  };
+  if (response.ok && body.ok) return;
+  const disallowed = body.disallowedAppIds?.length ? ` (${body.disallowedAppIds.join(', ')})` : '';
+  throw new Error(`${body.error ?? `HTTP ${response.status}`}${disallowed}`);
+}
+
 async function cmdDispatch(rest: string[]): Promise<void> {
   const parsedArgs = parseDispatchArgs(rest);
   if (!parsedArgs.ok) {
@@ -10849,6 +10983,21 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  try {
+    await assertProjectDispatchPolicy({
+      sessionId: sid,
+      larkAppId: appId,
+      targetChatId,
+      targetAppIds: parsedBotApps.map(item => item.appId),
+      hasLegacyBots: legacyBots.length > 0,
+      title: title.trim(),
+      existingDispatch: !!intoRoot,
+    });
+  } catch (error) {
+    console.error(`dispatch 不符合当前群的协作模式: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+
   let appBots: Array<{ openId: string; name?: string; role?: string }> = [];
   if (parsedBotApps.length > 0) {
     const appIds = parsedBotApps.map(item => item.appId);
@@ -10935,12 +11084,29 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         acceptedBotAppIds: acceptance?.acceptedBotAppIds,
         missingBotAppIds: acceptance?.missingBotAppIds,
       });
+      const projectSynced = await trySyncProjectDispatch({
+        sessionId: sid,
+        larkAppId: s.larkAppId,
+        action: buildProjectDispatchSyncAction({
+          existingDispatch: true,
+          dispatchRoot: intoRoot,
+          // --into coordinates an existing workstream. An omitted title/purpose
+          // must preserve the original card metadata instead of replacing it
+          // with the generic fallback or a one-off steering message.
+          title: title.trim(),
+          purpose: '',
+          owners: bots.map(bot => bot.name ?? bot.openId),
+          status: accepted ? 'in_progress' : 'blocked',
+          progress: accepted ? 20 : 0,
+        }),
+      });
       console.log(JSON.stringify({
         success: accepted, taskSent: true, mode: 'into', sourceSessionId: sid,
         targetAppIds: parsedBotApps.map(item => item.appId),
         ...receiptState, threadRootId: intoRoot,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
+        projectSynced,
         ...(acceptance ? {
           accepted,
           acceptedBotAppIds: acceptance.acceptedBotAppIds,
@@ -10964,8 +11130,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
         acceptanceRequested: !standby && parsedBotApps.length > 0,
+        hasLegacyBots: legacyBots.length > 0,
         title: title.trim(),
         bots: built.mentionedOpenIds,
+        purpose: brief,
+        owners: bots.map(bot => bot.name ?? bot.openId),
       },
     });
     const registrationBody: any = await registration.json().catch(() => ({}));
@@ -11036,6 +11205,19 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       acceptedBotAppIds: acceptance?.acceptedBotAppIds,
       missingBotAppIds: acceptance?.missingBotAppIds,
     });
+    const projectSynced = await trySyncProjectDispatch({
+      sessionId: sid,
+      larkAppId: s.larkAppId,
+      action: buildProjectDispatchSyncAction({
+        existingDispatch: false,
+        dispatchRoot: seedId,
+        title: title.trim() || '子任务',
+        purpose: brief,
+        owners: bots.map(bot => bot.name ?? bot.openId),
+        status: standby ? 'pending' : accepted ? 'in_progress' : 'blocked',
+        progress: standby || !accepted ? 0 : 20,
+      }),
+    });
     console.log(JSON.stringify({
       success: accepted,
       sourceSessionId: sid,
@@ -11051,6 +11233,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       chatId: targetChatId,
       bots: built.mentionedOpenIds,
       collaborationReady: parsedBotApps.length > 0,
+      projectSynced,
       ...(acceptance ? {
         accepted,
         acceptedBotAppIds: acceptance.acceptedBotAppIds,
@@ -11072,6 +11255,19 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         transportState: 'failed',
         acceptanceState: 'failed',
         errorCode: 'TRANSPORT_FAILED',
+      });
+      await trySyncProjectDispatch({
+        sessionId: sid,
+        larkAppId: s.larkAppId,
+        action: buildProjectDispatchSyncAction({
+          existingDispatch: Boolean(intoRoot),
+          dispatchRoot: dispatchRootForLifecycle,
+          title: title.trim() || (intoRoot ? '' : '子任务'),
+          purpose: intoRoot ? '' : brief,
+          owners: bots.map(bot => bot.name ?? bot.openId),
+          status: 'failed',
+          progress: 0,
+        }),
       });
     }
     console.error(JSON.stringify({
@@ -11129,6 +11325,10 @@ async function cmdReport(rest: string[]): Promise<void> {
   --into <root_id>       显式发进指定话题（覆盖默认落点）
   --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
+  --status <状态>        同步子任务状态：pending|in_progress|blocked|completed|failed
+  --progress <0-100>     同步子任务完成百分比
+  --remaining <text>     同步该子任务待完成内容
+  --milestone <text>     同步一条项目里程碑
   --legacy-dispatch      legacy / 跨机器 dispatch 自动注入的兼容标记
   --session-id <id>      指定来源会话（默认自动推断）`);
     return;
@@ -11160,6 +11360,25 @@ async function cmdReport(rest: string[]): Promise<void> {
     console.error('--dispatch-root 必须是有效的 om_ 消息 id。');
     process.exit(1);
   }
+  const projectStatusRaw = argValue(rest, '--status')?.trim();
+  for (const flag of ['--status', '--progress', '--remaining', '--milestone']) {
+    if (flagPresentButValueMissing(rest, flag)) {
+      console.error(`${flag} 需要一个值。`);
+      process.exit(1);
+    }
+  }
+  const projectStatuses = new Set(['pending', 'in_progress', 'blocked', 'completed', 'failed']);
+  if (projectStatusRaw && !projectStatuses.has(projectStatusRaw)) {
+    console.error('--status 必须是 pending|in_progress|blocked|completed|failed。');
+    process.exit(1);
+  }
+  const projectProgressRaw = argValue(rest, '--progress')?.trim();
+  if (projectProgressRaw !== undefined && (!/^\d{1,3}$/.test(projectProgressRaw) || Number(projectProgressRaw) > 100)) {
+    console.error('--progress 必须是 0-100 的整数。');
+    process.exit(1);
+  }
+  const projectRemaining = argValue(rest, '--remaining')?.trim();
+  const projectMilestone = argValue(rest, '--milestone')?.trim();
 
   let content = '';
   const contentFile = argValue(rest, '--content-file');
@@ -11309,13 +11528,20 @@ async function cmdReport(rest: string[]): Promise<void> {
   // means this is an ordinary report and falls through to normal placement;
   // an explicit root, invalid signature, or any other failure stays fail-closed.
   if (!hasExplicitPlacement && dispatchRootCandidate) {
+    const reportRelayBase = { body: { dispatchRoot: dispatchRootCandidate, content } };
     let response: Response;
     try {
       response = await postCurrentSessionDaemonRoute({
         path: REPORT_SESSION_RELAY_ROUTE,
         sessionId: sid,
         larkAppId: s.larkAppId,
-        body: { dispatchRoot: dispatchRootCandidate, content },
+        body: {
+          ...reportRelayBase.body,
+          ...(projectStatusRaw ? { status: projectStatusRaw } : {}),
+          ...(projectProgressRaw !== undefined ? { progress: Number(projectProgressRaw) } : {}),
+          ...(projectRemaining ? { remaining: projectRemaining } : {}),
+          ...(projectMilestone ? { milestone: projectMilestone } : {}),
+        },
       });
     } catch (err: any) {
       console.error(`无法完成主编排会话回注: ${err?.message ?? err}`);
@@ -11349,6 +11575,7 @@ async function cmdReport(rest: string[]): Promise<void> {
           botAppId: target?.larkAppId,
         },
         triggerId: triggerBody.triggerId,
+        projectSynced: triggerBody.projectSynced === true,
       }));
       return;
     }
@@ -14765,6 +14992,7 @@ switch (command) {
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
+  case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

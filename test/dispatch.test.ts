@@ -21,6 +21,7 @@ import {
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
+  buildProjectDispatchSyncAction,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -103,6 +104,26 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+});
+
+describe('buildProjectDispatchSyncAction', () => {
+  const input = {
+    dispatchRoot: 'om_existing', title: '', purpose: '', owners: ['worker-a'],
+    status: 'in_progress' as const, progress: 20,
+  };
+
+  it('omits lifecycle and owners when coordinating an existing topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: true })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+    });
+  });
+
+  it('includes initial projection fields for a newly dispatched topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: false })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+      owners: ['worker-a'], status: 'in_progress', progress: 20,
+    });
   });
 });
 

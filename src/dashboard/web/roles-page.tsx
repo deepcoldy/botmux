@@ -34,6 +34,7 @@ import {
   filterRoleProfiles,
   formatListenerPreviewTime,
   hashChatId,
+  hashBotId,
   isValidProfileId,
   loadGroupMemberDisplays,
   loadGroups,
@@ -399,9 +400,14 @@ function RolesPage(props: { tab: RolesTab }) {
       await loadNameMaps();
       if (!alive.current) return;
 
-      setExpandedGroups(new Set(snapshot.groups.filter(groupHasAnyRoleOrListener).map(group => group.chatId)));
+      const requestedChatId = hashChatId();
+      const requestedBotId = hashBotId();
+      const initialExpanded = new Set(snapshot.groups.filter(groupHasAnyRoleOrListener).map(group => group.chatId));
+      if (requestedChatId && snapshot.groups.some(group => group.chatId === requestedChatId)) {
+        initialExpanded.add(requestedChatId);
+      }
+      setExpandedGroups(initialExpanded);
       if (props.tab === 'profiles') {
-        const requestedChatId = hashChatId();
         setSelectedApplyGroupId(current => {
           if (current) return current;
           if (requestedChatId && snapshot.groups.some(group => group.chatId === requestedChatId)) return requestedChatId;
@@ -409,6 +415,16 @@ function RolesPage(props: { tab: RolesTab }) {
         });
       } else {
         setSelectedApplyGroupId(current => current ?? snapshot.groups[0]?.chatId ?? null);
+        const requestedGroup = requestedChatId
+          ? snapshot.groups.find(group => group.chatId === requestedChatId)
+          : undefined;
+        if (requestedGroup) {
+          setSelectedGroupId(requestedGroup.chatId);
+          const requestedBot = requestedBotId
+            ? requestedGroup.memberBots.find(bot => bot.inChat && bot.larkAppId === requestedBotId)
+            : undefined;
+          if (requestedBot) setSelectedBotId(requestedBot.larkAppId);
+        }
       }
       setLoadingTree(false);
       setProfileListLoading(false);

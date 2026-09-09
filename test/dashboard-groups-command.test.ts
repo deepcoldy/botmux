@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { handleDashboardCommand } from '../src/core/dashboard-command/index.js';
-import { handleDashboardGroups } from '../src/core/dashboard-command/groups.js';
+import { handleDashboardGroups, handleProjectGroupRoles } from '../src/core/dashboard-command/groups.js';
 import type { LarkMessage } from '../src/types.js';
 
 const LARK_APP_ID = 'cli_test';
@@ -153,6 +153,48 @@ describe('handleDashboardGroups (command path)', () => {
 
     const topicCalls = (deps.sessionReply as any).mock.calls;
     expect(topicCalls[0][1]).toContain('lark_dm_403');
+  });
+});
+
+describe('handleProjectGroupRoles', () => {
+  it('replies with a focused role card in the current project group', async () => {
+    const deps = makeDeps();
+    const dm = captureDM();
+    const createClient = vi.fn(() => ({
+      request: async () => ({
+        status: 200,
+        body: {
+          chats: [{
+            chatId: 'oc_project', name: 'project-room',
+            memberBots: [
+              { larkAppId: LARK_APP_ID, botName: 'coordinator', inChat: true, hasRole: true },
+              { larkAppId: 'cli_worker', botName: 'worker', inChat: true, hasRole: false },
+            ],
+          }],
+          bots: [
+            { larkAppId: LARK_APP_ID, botName: 'coordinator' },
+            { larkAppId: 'cli_worker', botName: 'worker' },
+          ],
+        },
+        raw: '',
+      }),
+    } as any));
+
+    await handleProjectGroupRoles(
+      'om_root', 'oc_project', deps, LARK_APP_ID, OWNER,
+      { coordinatorAppId: LARK_APP_ID, workerAppIds: ['cli_worker'] },
+      { createClient, sendUserMessage: dm.sendUserMessage, locale: 'zh' },
+    );
+
+    expect(dm.calls).toHaveLength(0);
+    const groupCalls = (deps.sessionReply as any).mock.calls;
+    expect(groupCalls).toHaveLength(1);
+    expect(groupCalls[0][0]).toBe('om_root');
+    expect(groupCalls[0][1]).toContain('项目群角色配置');
+    expect(groupCalls[0][1]).toContain('coordinator');
+    expect(groupCalls[0][1]).toContain('worker');
+    expect(groupCalls[0][2]).toBe('interactive');
+    expect(groupCalls[0][3]).toBe(LARK_APP_ID);
   });
 });
 

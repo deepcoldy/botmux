@@ -22,6 +22,7 @@ import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
+import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -118,6 +119,10 @@ import {
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
+import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import { readProjectGroup } from '../services/project-group-store.js';
+import { projectCoordinator } from '../services/project-coordinator-runtime.js';
+import { runProjectGroupSlashCommand } from './project-group-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -137,7 +142,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -3914,6 +3919,128 @@ export async function handleCommand(
         break;
       }
 
+      case '/project': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = message.chatId ?? ds?.chatId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.project.no_bot', undefined, loc));
+          break;
+        }
+        if (!chatId) {
+          await sessionReply(rootId, t('cmd.project.no_chat', undefined, loc));
+          break;
+        }
+
+        // This mutates the durable group policy, so keep the stricter
+        // /botconfig-style admin gate instead of canOperate's ownerless
+        // fail-open compatibility mode. A conversation grant is never enough.
+        const admins = getBot(appId).resolvedAllowedUsers;
+        if (admins.length === 0) {
+          await sessionReply(rootId, t('cmd.project.no_owner', undefined, loc));
+          break;
+        }
+        if (!message.senderId || !admins.includes(message.senderId)) {
+          await sessionReply(rootId, t('cmd.project.not_admin', undefined, loc));
+          break;
+        }
+
+        let result;
+        try {
+          result = await runProjectGroupSlashCommand({ content: message.content, larkAppId: appId, chatId }, {
+            dataDir: config.session.dataDir,
+            getChatMode: getChatModeStrict,
+            listChatBotMembers,
+            readConfig: readGroupCollaborationMode,
+            writeConfig: writeGroupCollaborationMode,
+            readProject: readProjectGroup,
+            ensureOnboardingCard: (context, input) => projectCoordinator.ensureOnboardingCard(context, input),
+            clearOnboardingCard: context => projectCoordinator.clearOnboardingCard(context),
+          });
+        } catch (error) {
+          await sessionReply(rootId, t('cmd.project.failed', {
+            reason: error instanceof Error ? error.message : String(error),
+          }, loc));
+          break;
+        }
+
+        if (result.kind === 'help') {
+          await sessionReply(rootId, t('cmd.project.help', undefined, loc));
+          break;
+        }
+        if (result.kind === 'error') {
+          const errorKey = {
+            chat_lookup_failed: 'cmd.project.chat_lookup_failed',
+            ordinary_group_required: 'cmd.project.ordinary_group_required',
+            bot_roster_unavailable: 'cmd.project.bot_roster_unavailable',
+            coordinator_not_in_chat: 'cmd.project.coordinator_not_in_chat',
+            coordinator_conflict: 'cmd.project.coordinator_conflict',
+            project_mode_required: 'cmd.project.project_mode_required',
+            unknown_subcommand: 'cmd.project.unknown_subcommand',
+            unexpected_arguments: 'cmd.project.unexpected_arguments',
+          }[result.error];
+          const detail = result.error === 'coordinator_conflict' && result.detail
+            ? botDisplayName(result.detail)
+            : result.detail ?? '';
+          await sessionReply(rootId, t(errorKey, { value: detail }, loc));
+          break;
+        }
+        if (result.kind === 'status') {
+          if (result.config?.mode !== 'project') {
+            await sessionReply(rootId, t('cmd.project.status_standard', undefined, loc));
+            break;
+          }
+          const workers = (result.config.workerAppIds ?? []).map(botDisplayName).join('、')
+            || t('cmd.project.none', undefined, loc);
+          const runtime = result.project
+            ? `${result.project.title} · ${result.project.phase}`
+            : t('cmd.project.waiting', undefined, loc);
+          const workerPolicy = t(result.config.autoEnrollWorkers
+            ? 'cmd.project.worker_policy_auto'
+            : 'cmd.project.worker_policy_manual', undefined, loc);
+          await sessionReply(rootId, t('cmd.project.status_project', {
+            coordinator: botDisplayName(result.config.coordinatorAppId ?? appId),
+            workers,
+            workerPolicy,
+            runtime,
+          }, loc));
+          break;
+        }
+        if (result.kind === 'roles') {
+          await handleProjectGroupRoles(rootId, chatId, deps, appId, message.senderId, {
+            coordinatorAppId: result.config.coordinatorAppId ?? appId,
+            workerAppIds: result.config.workerAppIds ?? [],
+          });
+          break;
+        }
+        if (result.kind === 'disabled') {
+          const key = result.alreadyDisabled ? 'cmd.project.already_disabled' : 'cmd.project.disabled';
+          const retained = result.projectRetained ? `\n${t('cmd.project.project_retained', undefined, loc)}` : '';
+          await sessionReply(rootId, t(key, undefined, loc) + retained);
+          break;
+        }
+
+        const workers = (result.config.workerAppIds ?? []).map(botDisplayName).join('、')
+          || t('cmd.project.none', undefined, loc);
+        const workerPolicy = t(result.config.autoEnrollWorkers
+          ? 'cmd.project.worker_policy_auto'
+          : 'cmd.project.worker_policy_manual', undefined, loc);
+        const key = result.alreadyEnabled
+          ? 'cmd.project.already_enabled'
+          : result.project
+            ? 'cmd.project.reenabled'
+            : 'cmd.project.enabled';
+        const cardNote = result.cardRefresh === 'deferred'
+          ? `\n${t('cmd.project.card_deferred', undefined, loc)}`
+          : '';
+        await sessionReply(rootId, t(key, {
+          coordinator: botDisplayName(result.config.coordinatorAppId ?? appId),
+          workers,
+          workerPolicy,
+        }, loc) + cardNote);
+        logger.info(`[${logTag}] /project enabled chat=${chatId} coordinator=${appId} workers=${result.config.workerAppIds?.length ?? 0}`);
+        break;
+      }
+
       case '/group':
       case '/g': {
         const creatorAppId = larkAppId ?? ds?.larkAppId;
@@ -5211,6 +5338,7 @@ export async function handleCommand(
           '',
           t('help.heading_group', undefined, loc),
           t('help.group', undefined, loc),
+          t('help.project', undefined, loc),
           '',
           t('help.list_slash', undefined, loc),
           t('help.help', undefined, loc),

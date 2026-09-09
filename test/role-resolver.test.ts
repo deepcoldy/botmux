@@ -176,6 +176,32 @@ describe('role injection mode', () => {
     expect(followUp).not.toContain('ONCE_PERSONA');
     expect(followUp).not.toContain('<role');
   });
+
+  it('keeps the coordinator project protocol on follow-ups when a custom role is injected once', async () => {
+    await fresh();
+    const { writeRoleFile, writeRoleInjectMode } = await import('../src/core/role-resolver.js');
+    const { writeGroupCollaborationMode } = await import('../src/services/group-collaboration-mode-store.js');
+    writeRoleFile('app1', 'oc_project', 'CUSTOM_COORDINATOR_ROLE');
+    writeRoleInjectMode('app1', 'oc_project', 'once');
+    await writeGroupCollaborationMode(dataDir, {
+      chatId: 'oc_project', mode: 'project', coordinatorAppId: 'app1', workerAppIds: ['worker1'],
+    });
+    const { buildNewTopicPrompt, buildFollowUpContent } = await import('../src/core/session-manager.js');
+
+    const opening = buildNewTopicPrompt(
+      '开始讨论', 's1', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { larkAppId: 'app1', chatId: 'oc_project' },
+    );
+    expect(opening).toContain('CUSTOM_COORDINATOR_ROLE');
+    expect(opening).toContain('<project_group_mode');
+
+    const followUp = buildFollowUpContent('继续', 's1', { larkAppId: 'app1', chatId: 'oc_project' });
+    expect(followUp).not.toContain('CUSTOM_COORDINATOR_ROLE');
+    expect(followUp).not.toContain('<role');
+    expect(followUp).toContain('<project_group_mode');
+    expect(followUp).toContain('independent of custom &lt;role&gt; content');
+  });
 });
 
 describe('buildNewTopicPrompt role injection', () => {

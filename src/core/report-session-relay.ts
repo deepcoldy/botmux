@@ -1,6 +1,7 @@
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
+import type { ProjectWorkstreamStatus } from '../services/project-group-store.js';
 
 export const REPORT_SESSION_RELAY_ROUTE = '/api/report-relay';
 export const REPORT_SESSION_RELAY_MAX_BYTES = 256 * 1024;
@@ -25,6 +26,12 @@ export type ReportSessionRelayDecision =
       dispatchRoot: string;
       sourceName: string;
       content: string;
+      projectUpdate: {
+        status?: ProjectWorkstreamStatus;
+        progress?: number;
+        remaining?: string;
+        milestone?: string;
+      };
     }
   | { ok: false; status: number; error: string };
 
@@ -49,6 +56,18 @@ export function authorizeReportSessionRelayRequest(input: {
     return { ok: false, status: 400, error: 'bad_dispatch_root' };
   }
   if (!content) return { ok: false, status: 400, error: 'missing_content' };
+  const projectStatus = body.status === undefined ? undefined
+    : body.status === 'pending' || body.status === 'in_progress' || body.status === 'blocked'
+      || body.status === 'completed' || body.status === 'failed'
+      ? body.status
+      : null;
+  if (projectStatus === null) return { ok: false, status: 400, error: 'bad_project_status' };
+  const progress = body.progress === undefined ? undefined : body.progress;
+  if (progress !== undefined && (
+    typeof progress !== 'number' || !Number.isInteger(progress) || progress < 0 || progress > 100
+  )) return { ok: false, status: 400, error: 'bad_project_progress' };
+  const remaining = typeof body.remaining === 'string' ? body.remaining.trim().slice(0, 300) : undefined;
+  const milestone = typeof body.milestone === 'string' ? body.milestone.trim().slice(0, 300) : undefined;
 
   const current = input.session;
   const verified = authorizeSessionScopedIpc({
@@ -118,6 +137,12 @@ export function authorizeReportSessionRelayRequest(input: {
     dispatchRoot,
     sourceName: resolved.binding.sourceName,
     content,
+    projectUpdate: {
+      ...(projectStatus ? { status: projectStatus } : {}),
+      ...(typeof progress === 'number' ? { progress } : {}),
+      ...(remaining ? { remaining } : {}),
+      ...(milestone ? { milestone } : {}),
+    },
   };
 }
 
@@ -145,6 +170,7 @@ export function buildOrchestratorReportTrigger(
         dispatchRoot: decision.dispatchRoot,
         sourceSessionId: decision.source.sessionId,
         sourceBotAppId: decision.source.larkAppId,
+        ...decision.projectUpdate,
       },
       rawText: decision.content,
     },

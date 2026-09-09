@@ -6600,6 +6600,368 @@ dialog.onboarding-dialog::backdrop {
   white-space: nowrap;
 }
 
+#g-drawer .g-collaboration-mode {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  overflow: hidden;
+  padding-left: 16px;
+}
+
+#g-drawer .g-collaboration-mode::before {
+  position: absolute;
+  inset: 10px auto 10px 0;
+  width: 3px;
+  border-radius: var(--radius-full);
+  background: linear-gradient(180deg, var(--accent), var(--info));
+  content: '';
+}
+
+#g-drawer .g-collaboration-mode > p {
+  margin: -4px 0 0;
+  color: var(--muted);
+}
+
+#g-drawer .g-mode-rail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+#g-drawer .g-mode-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast), box-shadow var(--t-fast);
+}
+
+#g-drawer .g-mode-option:hover {
+  border-color: var(--border-strong);
+}
+
+#g-drawer .g-mode-option.selected {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+#g-drawer .g-mode-option input {
+  margin: 3px 0 0;
+}
+
+#g-drawer .g-mode-option > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+#g-drawer .g-mode-option strong {
+  color: var(--fg);
+  font-size: var(--fs-13);
+  line-height: var(--lh-title);
+}
+
+#g-drawer .g-mode-option small {
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+#g-drawer .g-project-policy {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface));
+}
+
+#g-drawer .g-project-coordinator,
+#g-drawer .g-project-workers {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-s);
+}
+
+#g-drawer .g-project-coordinator select {
+  width: 100%;
+  min-height: var(--button-height);
+  margin: 0;
+  border-color: var(--border-strong);
+  background: var(--surface);
+}
+
+#g-drawer .g-project-worker-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+#g-drawer .g-project-worker-grid .checkbox-row {
+  flex: 0 1 auto;
+  min-height: 30px;
+  background: var(--surface);
+}
+
+#g-drawer .g-project-role-config {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 92%, #7c3aed 8%);
+}
+
+#g-drawer .g-project-role-config > header {
+  display: grid;
+  gap: 3px;
+}
+
+#g-drawer .g-project-role-config > header small {
+  color: var(--muted);
+}
+
+#g-drawer .g-project-role-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+#g-drawer .g-project-role-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+}
+
+#g-drawer .g-project-role-link:hover {
+  border-color: #7c3aed;
+}
+
+#g-drawer .g-project-role-link > span {
+  display: grid;
+  min-width: 0;
+}
+
+#g-drawer .g-project-role-link small,
+#g-drawer .g-project-role-link em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+#g-drawer .g-project-role-link em.configured {
+  color: var(--success);
+}
+
+#g-drawer .g-project-protocol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+#g-drawer .g-project-protocol > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  border-left: 1px solid var(--border-soft);
+  color: var(--muted);
+  font-size: var(--fs-11);
+  line-height: 1.35;
+}
+
+#g-drawer .g-project-protocol > span:first-child {
+  border-left: none;
+}
+
+#g-drawer .g-project-protocol b {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+}
+
+#g-drawer .g-project-card-config {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--accent-border);
+}
+
+#g-drawer .g-project-card-config > header {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  text-align: left;
+}
+
+#g-drawer .g-project-card-config > header strong {
+  color: var(--fg);
+  font-size: var(--fs-12);
+}
+
+#g-drawer .g-project-card-config > header small {
+  color: var(--muted);
+  font-weight: var(--fw-r);
+  line-height: 1.45;
+}
+
+#g-drawer .g-card-template-rail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+#g-drawer .g-card-template-option {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+
+#g-drawer .g-card-template-option.selected {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+#g-drawer .g-card-template-option input {
+  margin: 3px 0 0;
+}
+
+#g-drawer .g-card-template-option > span {
+  display: grid;
+  gap: 2px;
+}
+
+#g-drawer .g-card-template-option strong {
+  color: var(--fg);
+  font-size: var(--fs-12);
+}
+
+#g-drawer .g-card-template-option small {
+  color: var(--muted);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-r);
+  line-height: 1.4;
+}
+
+#g-drawer .g-card-section-config {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-s);
+}
+
+#g-drawer .g-card-section-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+#g-drawer .g-card-section-grid .checkbox-row,
+#g-drawer .g-card-milestone-default {
+  min-height: 30px;
+}
+
+#g-drawer .g-card-milestone-default {
+  width: fit-content;
+}
+
+#g-drawer .g-project-runtime {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+#g-drawer .g-project-runtime > div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+#g-drawer .g-project-runtime strong {
+  font-size: var(--fs-12);
+}
+
+#g-drawer .g-project-runtime small {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-project-runtime > span {
+  flex: none;
+  max-width: 42%;
+  overflow: hidden;
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  background: var(--success-soft);
+  color: var(--success);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-s);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-project-runtime > span.warn {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+#g-drawer .g-project-mode-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-height: var(--button-height);
+}
+
+#g-drawer .g-project-mode-actions > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #g-drawer .g-leave-picker {
   display: flex;
   align-items: center;
@@ -6670,6 +7032,21 @@ dialog.onboarding-dialog::backdrop {
 
   #g-drawer .g-manage-meta > span {
     max-width: 100%;
+  }
+
+  #g-drawer .g-mode-rail,
+  #g-drawer .g-project-protocol,
+  #g-drawer .g-card-template-rail {
+    grid-template-columns: 1fr;
+  }
+
+  #g-drawer .g-project-protocol > span {
+    border-top: 1px solid var(--border-soft);
+    border-left: none;
+  }
+
+  #g-drawer .g-project-protocol > span:first-child {
+    border-top: none;
   }
 }
 
@@ -14704,6 +15081,14 @@ tbody tr[data-chat]:hover {
 .groups-list-row .groups-row-owner-tag {
   flex: 0 1 auto;
   max-width: none;
+}
+
+.groups-list-row .groups-row-project-tag {
+  flex: none;
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  letter-spacing: .04em;
 }
 
 .groups-list-row .groups-row-tag > span,

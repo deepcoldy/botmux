@@ -12,7 +12,15 @@ import {
 } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
-import { setGroupPinStreamingCard } from './groups-api.js';
+import {
+  defaultProjectProgressCardConfig,
+  saveGroupCollaborationMode,
+  setGroupPinStreamingCard,
+  type ProjectGroupRuntimeSummary,
+  type ProjectProgressCardConfig,
+  type ProjectProgressCardSectionId,
+  type ProjectProgressCardTemplateId,
+} from './groups-api.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
@@ -274,6 +282,9 @@ const GroupListRow = memo(function GroupListRow(props: {
         <div className="groups-row-head">
           <b>{chat.name ?? chat.chatId}</b>
           <span className="groups-row-meta">
+            {chat.collaborationMode === 'project' ? (
+              <span className="groups-row-tag groups-row-project-tag">{tr('groups.projectModeBadge')}</span>
+            ) : null}
             <span className="groups-row-tag"><code>{chat.chatId}</code></span>
             {chat.ownerId ? (
               <span className="groups-row-tag groups-row-owner-tag">
@@ -1226,6 +1237,333 @@ function GroupPinStreamingCardRow(props: {
   );
 }
 
+function collaborationModeSignature(
+  mode: 'standard' | 'project',
+  coordinatorAppId: string,
+  workerAppIds: Iterable<string>,
+  autoEnrollWorkers: boolean,
+  progressCard: ProjectProgressCardConfig,
+): string {
+  return JSON.stringify({
+    mode,
+    coordinatorAppId: mode === 'project' ? coordinatorAppId : '',
+    workerAppIds: mode === 'project' ? [...workerAppIds].sort() : [],
+    autoEnrollWorkers: mode === 'project' ? autoEnrollWorkers : false,
+    progressCard: mode === 'project' ? progressCard : null,
+  });
+}
+
+const PROJECT_CARD_SECTION_OPTIONS: Array<{
+  id: ProjectProgressCardSectionId;
+  labelKey: string;
+}> = [
+  { id: 'goal', labelKey: 'groups.projectCardSectionGoal' },
+  { id: 'blockers', labelKey: 'groups.projectCardSectionBlockers' },
+  { id: 'workstreams', labelKey: 'groups.projectCardSectionWorkstreams' },
+  { id: 'milestones', labelKey: 'groups.projectCardSectionMilestones' },
+];
+
+export function ProjectGroupModeSection(props: {
+  chat: GroupChat;
+  members: GroupChat['memberBots'];
+  disabled?: boolean;
+  tr: Translator;
+  onSaved(): Promise<GroupsSnapshot>;
+}) {
+  const { chat, members, tr } = props;
+  const memberIds = useMemo(() => members.map(member => member.larkAppId), [members]);
+  const initialCoordinator = chat.projectCoordinatorAppId ?? memberIds[0] ?? '';
+  const initialWorkers = chat.projectWorkerAppIds
+    ?? memberIds.filter(appId => appId !== initialCoordinator);
+  const [mode, setMode] = useState<'standard' | 'project'>(chat.collaborationMode ?? 'standard');
+  const [coordinatorAppId, setCoordinatorAppId] = useState(initialCoordinator);
+  const [workerAppIds, setWorkerAppIds] = useState<Set<string>>(() => new Set(initialWorkers));
+  const [autoEnrollWorkers, setAutoEnrollWorkers] = useState(
+    chat.collaborationMode === 'project' ? chat.projectAutoEnrollWorkers === true : true,
+  );
+  const [progressCard, setProgressCard] = useState<ProjectProgressCardConfig>(
+    () => chat.projectProgressCard ?? defaultProjectProgressCardConfig(),
+  );
+  const [runtime, setRuntime] = useState<ProjectGroupRuntimeSummary | null>(chat.projectRuntime ?? null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null);
+  const savedSignatureRef = useRef(collaborationModeSignature(
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard,
+  ));
+
+  const signature = collaborationModeSignature(mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard);
+  const dirty = signature !== savedSignatureRef.current;
+
+  function selectMode(nextMode: 'standard' | 'project'): void {
+    setMode(nextMode);
+    setStatus(null);
+    if (nextMode !== 'project') return;
+    const coordinator = coordinatorAppId || memberIds[0] || '';
+    setCoordinatorAppId(coordinator);
+    if (workerAppIds.size === 0) setWorkerAppIds(new Set(memberIds.filter(appId => appId !== coordinator)));
+  }
+
+  function selectCoordinator(nextCoordinator: string): void {
+    setCoordinatorAppId(nextCoordinator);
+    setWorkerAppIds(current => {
+      const next = new Set(current);
+      next.delete(nextCoordinator);
+      return next;
+    });
+    setStatus(null);
+  }
+
+  function selectCardTemplate(templateId: ProjectProgressCardTemplateId): void {
+    setProgressCard(current => ({ ...current, templateId }));
+    setStatus(null);
+  }
+
+  function toggleCardSection(section: ProjectProgressCardSectionId, enabled: boolean): void {
+    setProgressCard(current => ({
+      ...current,
+      sections: enabled
+        ? current.sections.includes(section) ? current.sections : [...current.sections, section]
+        : current.sections.filter(currentSection => currentSection !== section),
+    }));
+    setStatus(null);
+  }
+
+  async function save(): Promise<void> {
+    if (props.disabled || saving || !dirty) return;
+    if (mode === 'project' && !coordinatorAppId) {
+      setStatus({ text: tr('groups.projectModeNeedCoordinator'), tone: 'warn' });
+      return;
+    }
+    setSaving(true);
+    setStatus(null);
+    try {
+      const response = await saveGroupCollaborationMode(
+        chat.chatId,
+        mode === 'standard'
+          ? { mode }
+          : { mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers, progressCard },
+      );
+      const nextCoordinator = response.config.coordinatorAppId ?? coordinatorAppId;
+      const nextWorkers = response.config.workerAppIds ?? [];
+      const nextAutoEnrollWorkers = response.config.autoEnrollWorkers === true;
+      const nextProgressCard = response.config.progressCard ?? progressCard;
+      setAutoEnrollWorkers(nextAutoEnrollWorkers);
+      setProgressCard(nextProgressCard);
+      savedSignatureRef.current = collaborationModeSignature(
+        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextProgressCard,
+      );
+      setRuntime(response.project);
+      setStatus(response.cardRefresh === 'deferred'
+        ? { text: tr('groups.projectModeSavedCardDeferred'), tone: 'warn' }
+        : { text: tr('groups.projectModeSaved'), tone: 'ok' });
+      try {
+        await props.onSaved();
+      } catch (error) {
+        setStatus({ text: tr('groups.projectModeRefreshFailed', { error: error instanceof Error ? error.message : String(error) }), tone: 'warn' });
+      }
+    } catch (error) {
+      setStatus({ text: tr('groups.projectModeSaveFailed', { error: error instanceof Error ? error.message : String(error) }), tone: 'warn' });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <fieldset className="g-collaboration-mode">
+      <legend>{tr('groups.collaborationMode')}</legend>
+      <p><small>{tr('groups.collaborationModeHelp')}</small></p>
+      <div className="g-mode-rail" role="radiogroup" aria-label={tr('groups.collaborationMode')}>
+        <label className={`g-mode-option${mode === 'standard' ? ' selected' : ''}`}>
+          <input
+            type="radio"
+            name={`group-mode-${chat.chatId}`}
+            value="standard"
+            checked={mode === 'standard'}
+            disabled={props.disabled || saving}
+            onChange={() => selectMode('standard')}
+          />
+          <span><strong>{tr('groups.standardMode')}</strong><small>{tr('groups.standardModeHelp')}</small></span>
+        </label>
+        <label className={`g-mode-option project${mode === 'project' ? ' selected' : ''}`}>
+          <input
+            type="radio"
+            name={`group-mode-${chat.chatId}`}
+            value="project"
+            checked={mode === 'project'}
+            disabled={props.disabled || saving}
+            onChange={() => selectMode('project')}
+          />
+          <span><strong>{tr('groups.projectMode')}</strong><small>{tr('groups.projectModeHelp')}</small></span>
+        </label>
+      </div>
+
+      {mode === 'project' ? (
+        <div className="g-project-policy">
+          <label className="g-project-coordinator">
+            <span>{tr('groups.projectCoordinator')}</span>
+            <select
+              value={coordinatorAppId}
+              disabled={props.disabled || saving}
+              onChange={event => selectCoordinator(event.currentTarget.value)}
+            >
+              {members.map(member => (
+                <option key={member.larkAppId} value={member.larkAppId}>{member.botName ?? member.larkAppId}</option>
+              ))}
+            </select>
+          </label>
+          <div className="g-project-workers">
+            <span>{tr('groups.projectWorkers')}</span>
+            <div className="g-project-worker-grid">
+              {members.filter(member => member.larkAppId !== coordinatorAppId).map(member => (
+                <label className="checkbox-row" key={member.larkAppId}>
+                  <input
+                    type="checkbox"
+                    checked={workerAppIds.has(member.larkAppId)}
+                    disabled={props.disabled || saving}
+                    onChange={event => {
+                      const checked = event.currentTarget.checked;
+                      setWorkerAppIds(current => {
+                        const next = new Set(current);
+                        if (checked) next.add(member.larkAppId); else next.delete(member.larkAppId);
+                        return next;
+                      });
+                      setStatus(null);
+                    }}
+                  />
+                  <span className="checkbox-row-main"><strong>{member.botName ?? member.larkAppId}</strong></span>
+                </label>
+              ))}
+            </div>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                data-project-auto-enroll-workers={chat.chatId}
+                checked={autoEnrollWorkers}
+                disabled={props.disabled || saving}
+                onChange={event => {
+                  setAutoEnrollWorkers(event.currentTarget.checked);
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main">
+                <strong>{tr('groups.projectAutoEnrollWorkers')}</strong>
+                <small>{tr('groups.projectAutoEnrollWorkersHelp')}</small>
+              </span>
+            </label>
+          </div>
+          <section className="g-project-role-config" aria-labelledby={`project-role-config-${chat.chatId}`}>
+            <header>
+              <strong id={`project-role-config-${chat.chatId}`}>{tr('groups.projectRoleConfig')}</strong>
+              <small>{tr('groups.projectRoleConfigHelp')}</small>
+            </header>
+            <div className="g-project-role-grid">
+              {members
+                .filter(member => member.larkAppId === coordinatorAppId || workerAppIds.has(member.larkAppId))
+                .map(member => {
+                  const isCoordinator = member.larkAppId === coordinatorAppId;
+                  const href = `#/roles?chatId=${encodeURIComponent(chat.chatId)}&botId=${encodeURIComponent(member.larkAppId)}`;
+                  return (
+                    <a className="g-project-role-link" href={href} key={`project-role-${member.larkAppId}`}>
+                      <span>
+                        <strong>{member.botName ?? member.larkAppId}</strong>
+                        <small>{tr(isCoordinator ? 'groups.projectRoleCoordinator' : 'groups.projectRoleWorker')}</small>
+                      </span>
+                      <em className={member.hasRole ? 'configured' : ''}>
+                        {tr(member.hasRole ? 'groups.projectRoleConfigured' : 'groups.projectRoleInherited')}
+                      </em>
+                    </a>
+                  );
+                })}
+            </div>
+          </section>
+          <div className="g-project-protocol" aria-label={tr('groups.projectProtocol')}>
+            <span><b>01</b>{tr('groups.projectProtocolDispatch')}</span>
+            <span><b>02</b>{tr('groups.projectProtocolReport')}</span>
+            <span><b>03</b>{tr('groups.projectProtocolCard')}</span>
+          </div>
+          <section className="g-project-card-config" aria-labelledby={`project-card-config-${chat.chatId}`}>
+            <header>
+              <strong id={`project-card-config-${chat.chatId}`}>{tr('groups.projectCardConfig')}</strong>
+              <small>{tr('groups.projectCardConfigHelp')}</small>
+            </header>
+            <div className="g-card-template-rail" role="radiogroup" aria-label={tr('groups.projectCardTemplate')}>
+              {([
+                ['status-dashboard', 'groups.projectCardTemplateDashboard', 'groups.projectCardTemplateDashboardHelp'],
+                ['compact-list', 'groups.projectCardTemplateCompact', 'groups.projectCardTemplateCompactHelp'],
+              ] as Array<[ProjectProgressCardTemplateId, string, string]>).map(([templateId, labelKey, helpKey]) => (
+                <label className={`g-card-template-option${progressCard.templateId === templateId ? ' selected' : ''}`} key={templateId}>
+                  <input
+                    type="radio"
+                    name={`project-card-template-${chat.chatId}`}
+                    value={templateId}
+                    checked={progressCard.templateId === templateId}
+                    disabled={props.disabled || saving}
+                    onChange={() => selectCardTemplate(templateId)}
+                  />
+                  <span><strong>{tr(labelKey)}</strong><small>{tr(helpKey)}</small></span>
+                </label>
+              ))}
+            </div>
+            <div className="g-card-section-config">
+              <span>{tr('groups.projectCardSections')}</span>
+              <div className="g-card-section-grid">
+                {PROJECT_CARD_SECTION_OPTIONS.map(option => (
+                  <label className="checkbox-row" key={option.id}>
+                    <input
+                      type="checkbox"
+                      checked={progressCard.sections.includes(option.id)}
+                      disabled={props.disabled || saving}
+                      onChange={event => toggleCardSection(option.id, event.currentTarget.checked)}
+                    />
+                    <span className="checkbox-row-main"><strong>{tr(option.labelKey)}</strong></span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <label className="checkbox-row g-card-milestone-default">
+              <input
+                type="checkbox"
+                checked={progressCard.milestonesExpanded}
+                disabled={props.disabled || saving || !progressCard.sections.includes('milestones')}
+                onChange={event => {
+                  const checked = event.currentTarget.checked;
+                  setProgressCard(current => ({ ...current, milestonesExpanded: checked }));
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main"><strong>{tr('groups.projectCardMilestonesExpanded')}</strong></span>
+            </label>
+          </section>
+        </div>
+      ) : null}
+
+      <div className="g-project-runtime" data-project-runtime={runtime ? runtime.status : 'empty'}>
+        <div>
+          <strong>{tr('groups.projectRuntime')}</strong>
+          {runtime ? (
+            <small>{tr('groups.projectRuntimeSummary', {
+              status: runtime.status,
+              completed: runtime.completedWorkstreamCount,
+              total: runtime.workstreamCount,
+            })}</small>
+          ) : <small>{tr('groups.projectRuntimeEmpty')}</small>}
+        </div>
+        {runtime ? <span className={runtime.blockerCount > 0 ? 'warn' : ''}>{runtime.phase}</span> : null}
+      </div>
+
+      <div className="g-project-mode-actions">
+        <span className={status?.tone === 'ok' ? 'hint-ok' : status ? 'hint-warn-inline' : ''}>{status?.text ?? ''}</span>
+        <button
+          type="button"
+          className="primary"
+          disabled={props.disabled || saving || !dirty}
+          onClick={() => void save()}
+        >{saving ? tr('groups.projectModeSaving') : tr('groups.projectModeSave')}</button>
+      </div>
+    </fieldset>
+  );
+}
+
 export function ManageDialog(props: {
   chat: GroupChat;
   available?: boolean;
@@ -1364,6 +1702,14 @@ export function ManageDialog(props: {
       {!available ? (
         <p className="hint-warn" data-chat-unavailable>该群聊已不在最新列表中，管理操作已禁用。</p>
       ) : null}
+
+      <ProjectGroupModeSection
+        chat={chat}
+        members={inChat}
+        disabled={!available}
+        tr={tr}
+        onSaved={() => props.onReloadGroups({ force: true })}
+      />
 
       <fieldset>
         <legend>{tr('groups.oncall')}</legend>

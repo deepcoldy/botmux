@@ -17707,6 +17707,13 @@ body{display:flex;flex-direction:column;height:100vh;height:100dvh}
 @media(prefers-reduced-motion:reduce){#toolbar,#toolbar.collapsed{transition:opacity .12s linear}}
 #terminal{flex:1;min-width:0;min-height:0;width:100%;height:100%}
 #terminal .xterm{height:100%}
+/* Fixed remote grids need canvas scrolling in addition to xterm history.
+   Reserve the same 15px scrollbar allowance as FitAddon beside the last column. */
+#terminal.fixed-grid{overflow:auto}
+#terminal.fixed-grid .xterm{height:auto;width:max-content;padding-right:15px}
+/* Hidden input helpers can retain old cursor coordinates after a font resize.
+   They must not extend the outer scroll range past the rendered final row. */
+#terminal.fixed-grid .xterm-screen{overflow:clip}
 /* Real scroll container is xterm's own viewport — kill iOS rubber-band bounce
    and momentum here (not just on body), and reserve gestures for pinch-zoom so
    single-finger drag is driven manually by the touch handler below. */
@@ -18016,8 +18023,8 @@ window.addEventListener('message',function(_ev){
     // 1.3 对中文密集的 TUI 内容还是偏松：汉字撑满 em 框，行间空隙观感接近隔行，于是
     // 再收一档到 1.15（单元格高约 18.2px），比经典松一成半，读起来才连成一段。
     term.options.lineHeight=_d.termStyle==='reader'?1.15:1;
-    // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
-    fit.fit();
+    // Refit only an owned grid; followers must preserve the remote row/column count.
+    if(!fixedSize)fit.fit();
   }catch(_e){}
 });
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
@@ -18033,11 +18040,11 @@ function _cancelInitialFollow(){
 }
 function _settleInitialBottom(){
   if(!_initialFollow)return;
-  try{term.scrollToBottom()}catch(_e){}
+  try{term.scrollToBottom();_followFixedGridBottom()}catch(_e){}
   clearTimeout(_initialFollowT);
   _initialFollowT=setTimeout(function(){
     if(!_initialFollow)return;
-    try{term.scrollToBottom()}catch(_e){}
+    try{term.scrollToBottom();_followFixedGridBottom()}catch(_e){}
     _initialFollow=false;
   },500);
 }
@@ -18229,6 +18236,52 @@ term.onData(function(d){
   _sendInput(d);
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
+function _setFixedGrid(enabled){
+  fixedSize=enabled;
+  var host=document.getElementById('terminal');
+  host.classList.toggle('fixed-grid',enabled);
+  if(!enabled){host.scrollTop=0;host.scrollLeft=0;}
+}
+function _followFixedGridBottom(){
+  if(fixedSize){var host=document.getElementById('terminal');host.scrollTop=host.scrollHeight;}
+}
+function _scrollFixedGrid(dx,dy){
+  if(!fixedSize)return false;
+  var host=document.getElementById('terminal'),x=host.scrollLeft,y=host.scrollTop;
+  // Consume only the dominant axis: minor cross-axis drift must not swallow
+  // a gesture that should reach terminal history at the canvas boundary.
+  if(Math.abs(dy)>=Math.abs(dx)){
+    host.scrollTop+=dy;
+    return host.scrollTop!==y;
+  }
+  host.scrollLeft+=dx;
+  return host.scrollLeft!==x;
+}
+// Reveal the canvas before xterm or the remote-wheel handler consumes gestures.
+// At the canvas edge, normal terminal history scrolling resumes.
+var _fixedHost=document.getElementById('terminal'),_fixedTouch=null;
+_fixedHost.addEventListener('wheel',function(e){
+  if(e.ctrlKey)return;
+  var unit=e.deltaMode===1?16:e.deltaMode===2?_fixedHost.clientHeight:1;
+  if(_scrollFixedGrid(e.deltaX*unit,e.deltaY*unit)){
+    e.preventDefault();e.stopImmediatePropagation();
+  }
+},{capture:true,passive:false});
+_fixedHost.addEventListener('touchstart',function(e){
+  _fixedTouch=e.touches.length===1?{x:e.touches[0].clientX,y:e.touches[0].clientY}:null;
+},{capture:true,passive:true});
+_fixedHost.addEventListener('touchmove',function(e){
+  if(!_fixedTouch||e.touches.length!==1){_fixedTouch=null;return;}
+  var touch=e.touches[0],dx=_fixedTouch.x-touch.clientX,dy=_fixedTouch.y-touch.clientY;
+  _fixedTouch={x:touch.clientX,y:touch.clientY};
+  if(_scrollFixedGrid(dx,dy)){
+    // Keep the downstream touch handler's anchor current when it resumes.
+    _tLastY=touch.clientY;
+    e.preventDefault();e.stopImmediatePropagation();
+  }
+},{capture:true,passive:false});
+_fixedHost.addEventListener('touchend',function(){_fixedTouch=null;},{passive:true});
+_fixedHost.addEventListener('touchcancel',function(){_fixedTouch=null;},{passive:true});
 function sendResize(){
   if(!ws_||ws_.readyState!==1)return;
   // Dedup: a fit that lands on the same grid must NOT re-emit a resize — for a
@@ -18318,20 +18371,20 @@ if(typeof ResizeObserver!=='undefined'){
     // own viewport and reports the new size back to the worker.
     var _hf=data.match(/\\x1b\\]1989;follower;(\\d+);(\\d+)\\x07/);
     if(_hf){
-      fixedSize=true;var _hc=+_hf[1],_hr=+_hf[2];
+      _setFixedGrid(true);var _hc=+_hf[1],_hr=+_hf[2];
       if(_hc>0&&_hr>0){try{term.resize(_hc,_hr)}catch(ex){}_lastC=_hc;_lastR=_hr}
       data=data.replace(_hf[0],'');
     }
     var _ho=data.match(/\\x1b\\]1989;owner\\x07/);
     if(_ho){
-      fixedSize=false;data=data.replace(_ho[0],'');
+      _setFixedGrid(false);data=data.replace(_ho[0],'');
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
-    if(_fs){fixedSize=true;var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}

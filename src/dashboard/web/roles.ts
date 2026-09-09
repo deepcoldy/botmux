@@ -178,6 +178,12 @@ export function hashChatId(hash = location.hash): string | null {
   return chatId || null;
 }
 
+export function hashBotId(hash = location.hash): string | null {
+  const [, query = ''] = hash.split('?');
+  const botId = new URLSearchParams(query).get('botId')?.trim();
+  return botId || null;
+}
+
 export function roleKey(larkAppId: string, chatId: string): string {
   return effectiveRoleKey(larkAppId, chatId);
 }

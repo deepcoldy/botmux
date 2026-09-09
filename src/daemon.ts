@@ -297,6 +297,12 @@ import {
 } from './core/dispatch-report-binding.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
+import { projectCoordinator } from './services/project-coordinator-runtime.js';
+import {
+  addProjectWorkerIfNeeded,
+  evaluateProjectDispatchPolicy,
+  readGroupCollaborationMode,
+} from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -6162,6 +6168,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
   const acceptanceRequested = body?.acceptanceRequested === true;
   const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 200) : '';
+  const purpose = typeof body?.purpose === 'string' ? body.purpose.trim().slice(0, 500) : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
   if (!seedText) {
     return jsonRes(res, 400, { ok: false, error: 'missing_seed_text' });
@@ -6190,6 +6197,24 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
   }
 
+  const stringArray = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+      .map(item => item.trim()).filter(Boolean).slice(0, 64)
+    : [];
+  const targetAppIds = stringArray(body?.targetAppIds);
+  const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+  const dispatchPolicy = evaluateProjectDispatchPolicy({
+    config: groupMode,
+    sourceAppId: ds.larkAppId,
+    sourceChatId: ds.chatId,
+    targetChatId,
+    targetAppIds,
+    hasLegacyBots: body?.hasLegacyBots === true,
+    title,
+    existingDispatch: false,
+  });
+  if (!dispatchPolicy.ok) return jsonRes(res, 403, dispatchPolicy);
+
   let dispatchRoot: string;
   try {
     dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
@@ -6212,10 +6237,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     sourceName: title || 'dispatched subtask',
     issuedAt,
   });
-  const stringArray = (value: unknown): string[] => Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string')
-      .map(item => item.trim()).filter(Boolean).slice(0, 64)
-    : [];
+  const botOpenIds = stringArray(body?.bots);
   try {
     await recordDispatchRegistryEntry(
       join(config.session.dataDir, 'orchestrate-dispatch.json'),
@@ -6227,9 +6249,9 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
         orchAppId: ds.larkAppId,
         orchSessionId: ds.session.sessionId,
         targetChatId,
-        targetAppIds: stringArray(body?.targetAppIds),
+        targetAppIds,
         title,
-        bots: stringArray(body?.bots),
+        bots: botOpenIds,
         ...initialDispatchLifecycle(acceptanceRequested),
         createdAt: issuedAt,
         updatedAt: issuedAt,
@@ -6243,7 +6265,26 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
-  return jsonRes(res, 201, { ok: true, dispatchRoot });
+  let projectSynced = false;
+  if (dispatchPolicy.projectMode && ds.chatType === 'group' && ds.scope === 'chat' && targetChatId === ds.chatId) {
+    try {
+      await projectCoordinator.run({
+        dataDir: config.session.dataDir,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        coordinatorSessionId: ds.session.sessionId,
+      }, {
+        action: 'dispatch', dispatchRoot, title: title || '子任务', purpose,
+        owners: stringArray(body?.owners), status: 'pending', progress: 0,
+      });
+      projectSynced = true;
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'project_not_found')) {
+        logger.warn(`[project:${ds.chatId}] dispatch projection failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  return jsonRes(res, 201, { ok: true, dispatchRoot, projectSynced });
 });
 
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
@@ -6316,11 +6357,38 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       body: JSON.stringify(trigger),
     });
     const responseBody: unknown = await response.json().catch(() => ({}));
+    let projectSynced = false;
+    let projectSyncError: string | undefined;
+    if (response.ok) {
+      try {
+        const projectResponse = await fetchDaemonIpc(
+          targetDaemon.ipcPort,
+          `/api/sessions/${encodeURIComponent(decision.target.sessionId)}/project`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
+              ...decision.projectUpdate,
+            }),
+          },
+        );
+        const projectBody = await projectResponse.json().catch(() => ({})) as { ok?: boolean; error?: string };
+        projectSynced = projectResponse.ok && projectBody.ok === true;
+        if (!projectSynced && !(projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
+          projectSyncError = projectBody.error ?? `HTTP ${projectResponse.status}`;
+        }
+      } catch (error) {
+        projectSyncError = error instanceof Error ? error.message : String(error);
+      }
+    }
     return jsonRes(res, response.status, {
       ...(responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
         ? responseBody as Record<string, unknown>
         : {}),
       reportTarget: decision.target,
+      projectSynced,
+      ...(projectSyncError ? { projectSyncError } : {}),
     });
   } catch (error) {
     return jsonRes(res, 502, {
@@ -19130,6 +19198,18 @@ async function handleBotAdded(
     forcePrompt?: string;
   },
 ): Promise<void> {
+  try {
+    const projectConfig = await addProjectWorkerIfNeeded(config.session.dataDir, chatId, larkAppId);
+    if (projectConfig) {
+      logger.info(`[project:${chatId.substring(0, 12)}] joined bot enrolled as worker: ${larkAppId}`);
+    }
+  } catch (error) {
+    logger.warn(
+      `[project:${chatId.substring(0, 12)}] failed to enroll joined bot ${larkAppId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
   const bot = getBot(larkAppId);
   const botCfg = bot.config;
   const forced = typeof opts?.forcePrompt === 'string';
