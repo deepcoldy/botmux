@@ -660,6 +660,55 @@ describe('BridgeTurnQueue', () => {
       expect(q2.size()).toBe(1);
       expect(q2.peek()[0].isLocal).toBe(true);
     });
+
+    // The placeholder is the WEAKEST terminal signal there is: it says "no model
+    // call happened". It must never overwrite a stronger outcome the same turn
+    // already carries, because worker.ts (`terminalOutcome.status !== 'completed'
+    // → continue`) would then withhold the real answer text AND let the daemon
+    // post a failure card for a turn that was in fact answered.
+    function realReply(uuid: string, text: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+      } as TranscriptEvent;
+    }
+    function apiErrorLine(uuid: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 500,
+        message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 500' }] },
+      } as TranscriptEvent;
+    }
+
+    it('does not downgrade a turn that already completed with a real reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    it('same first-signal-wins rule for the API-error arm it shares', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    it('still records the failure when the turn has no earlier terminal', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+      expect(ready[0].terminalObserved).toBe(true);
+    });
   });
 
   describe('synthetic / non-meaningful user events', () => {

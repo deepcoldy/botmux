@@ -353,7 +353,15 @@ export class BridgeTurnQueue {
         // with the retryable failure the classifier produced.
         if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
-            this.collecting.terminalOutcome = terminalOutcome;
+            // `??=`, matching the normal terminal arm below: the FIRST terminal
+            // signal of a turn wins. A `<synthetic>` placeholder is the weakest
+            // possible one ("no model call happened"), and an execution-metadata
+            // error line is not stronger than a real reply either. Overwriting
+            // with `=` downgraded an already-`completed` turn to `failed`, and
+            // `emitReadyTurns` (`status !== 'completed' → continue`) then withheld
+            // the real answer text and let the daemon post a failure card for a
+            // turn that had in fact been answered. MEASURED both arms.
+            this.collecting.terminalOutcome ??= terminalOutcome;
             this.collecting.terminalObserved = true;
           }
           continue;
