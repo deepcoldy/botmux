@@ -45,6 +45,8 @@ function retryAction(): any {
 
 async function fresh() {
   vi.resetModules();
+  const sessionStore = await import('../src/services/session-store.js');
+  sessionStore.init('h1');
   const types = await import('../src/core/types.js');
   const registry = await import('../src/bot-registry.js');
   const handler = await import('../src/im/lark/card-handler.js');
@@ -57,6 +59,7 @@ beforeEach(() => {
   const cfg = join(dir, 'bots.json');
   writeFileSync(cfg, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code' }], null, 2));
   process.env.BOTS_CONFIG = cfg;
+  process.env.SESSION_DATA_DIR = dir;
   deps.activeSessions = new Map();
 });
 afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });

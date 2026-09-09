@@ -55,6 +55,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 });
 
 import { registerBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { noteTurnReceived } from '../src/daemon.js';
 import {
   initWorkerPool,
@@ -128,6 +129,7 @@ describe('rate-limit proactive notification', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-ratelimit-'));
+    sessionStore.init(APP_CARD_OFF);
     registerBot({
       larkAppId: APP_CARD_OFF,
       larkAppSecret: 's',

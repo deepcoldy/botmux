@@ -92,6 +92,7 @@ vi.mock('../src/services/team-groups-store.js', async () => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
   enforceMessageQuotaForCliInput,
@@ -479,6 +480,8 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
 
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-quota-p2p-'));
+    sessionStore.init(APP);
     mocks.beginCharge.mockReturnValue('fresh');
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, exhausted: false, used: 1, limit: 3 });
     mocks.getGrantExpiresAt.mockReturnValue(undefined);
