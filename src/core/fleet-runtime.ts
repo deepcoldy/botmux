@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync, openSync, mkdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { needsSupervisorIsolation, preflightSupervisorIsolation, startIsolatedSupervisor } from './supervisor-isolation.js';
 import type { FleetBotSpec } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -284,16 +285,25 @@ export function startFleetViaSupervisor(options: StartFleetOptions = {}): StartF
   if (existing !== undefined) {
     return { action: 'already-running', supervisorPid: existing, botCount: bots.length };
   }
+  preflightSupervisorIsolation();
   mkdirSync(LOG_DIR, { recursive: true });
-  const out = openSync(join(LOG_DIR, 'supervisor-out.log'), 'a');
-  const err = openSync(join(LOG_DIR, 'supervisor-err.log'), 'a');
   const { command, args } = resolveEntrySpawn('supervisor', fleetDistDir());
   const nodeArgs = args.length > 0 && args[0].startsWith('__') ? [] : ['--enable-source-maps'];
+  const env = resolveFleetDaemonEnv(process.env, readFleetDaemonEnvFile(), options);
+  if (needsSupervisorIsolation()) {
+    const pid = startIsolatedSupervisor({
+      command, args: [...nodeArgs, ...args], cwd: CONFIG_DIR, env,
+      stdout: join(LOG_DIR, 'supervisor-out.log'), stderr: join(LOG_DIR, 'supervisor-err.log'),
+    });
+    return { action: 'started', supervisorPid: pid, botCount: bots.length };
+  }
+  const out = openSync(join(LOG_DIR, 'supervisor-out.log'), 'a');
+  const err = openSync(join(LOG_DIR, 'supervisor-err.log'), 'a');
   const child = spawn(command, [...nodeArgs, ...args], {
     cwd: CONFIG_DIR,
     detached: true,
     stdio: ['ignore', out, err],
-    env: resolveFleetDaemonEnv(process.env, readFleetDaemonEnvFile(), options),
+    env,
   });
   child.unref();
   return { action: 'started', supervisorPid: child.pid ?? 0, botCount: bots.length };
@@ -349,6 +359,7 @@ export interface RestartFleetOptions extends StartFleetOptions {
 }
 
 export function restartFleet(options: RestartFleetOptions = {}): RestartFleetResult {
+  preflightSupervisorIsolation();
   const stop = stopFleet(options.timeoutMs);
   const start = startFleetViaSupervisor({
     refreshPersistedEnv: options.refreshPersistedEnv,
