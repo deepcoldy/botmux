@@ -191,7 +191,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 ### 3.3 「无 `.db`」的判别与文案落点
 
-- `session-store` 对每个 store 给出三态：`ready`（有 `.db`）、`unmigrated`（无 `.db`、有 `sessions-<appId>.json`）、`absent`（两者都无）。判别只做 `existsSync`，不解析 JSON。这是删除 JSON 读路径后 store 对 JSON 文件名仅存的两处认知之一（另一处是导入源）。
+- `session-store` 对每个 store 给出三态：`ready`（有 `.db`）、`unmigrated`（无 `.db`、有 `sessions-<appId>.json`）、`absent`（两者都无）。判别只做 `existsSync`，不解析 JSON。**只对仍然存在的 bot 判 `unmigrated`**：bots.json 里配置的、当前有 descriptor 在线的、以及本进程所属的 appId（`services/known-bot-app-ids.ts`）。被移出 bots.json 的 bot 留下的 `sessions-<appId>.json` 是废弃数据，没有任何 daemon 会再导入它，不能让 `botmux list` 永远提示「请重启 daemon」（dogfooding 时本机就有 4 份这样的残留）。这是删除 JSON 读路径后 store 对 JSON 文件名仅存的两处认知之一（另一处是导入源）。
 - `UnownedRowBlocked` 增加 `unmigrated` 判别值，与 `missing`（行不存在）分开；`loadAllSessionsSnapshot` 的返回带上 `unmigratedAppIds`。
 - 一条共享文案常量，三个落点：`cli.ts#loadSessions()` 之上做一次「本次命令涉及哪些 appId」的统一判定并打印；`offlineBlockedError` 映射 `unmigrated`；`whiteboard-store#deleteWhiteboard` 的返回增加 reason 通道（今天只有 `unresolvedSessions` 计数，dashboard 看不到原因）。
 - 「没有活跃会话。」这句话有 4 个出口（`cli.ts:4960` cmdList、`4985` cmdDelete、`6061` cmdTermLink、`4565` TUI 空态）；有 `unmigrated` store 时都不得打它。
