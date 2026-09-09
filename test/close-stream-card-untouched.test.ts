@@ -73,7 +73,7 @@ describe('closeSession leaves the streaming card alone', () => {
   });
   afterEach(() => {
     workerPool.setActiveSessionsRegistry(new Map());
-    sessionStore.init();
+    sessionStore.init('test-app');
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 

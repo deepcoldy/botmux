@@ -414,28 +414,20 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
     });
   });
 
-  it('rescues rows from the LEGACY snapshot without pulling in another bot rows', () => {
+  it('rescues rows from the per-bot frozen JSON snapshot', () => {
     withDirs((dataDir, home) => {
       poison(dataDir, home);
-      // Damage the orphan so only a snapshot can rescue, and provide ONLY the
-      // legacy flat `sessions.json` (no per-bot file). Recovery must resolve it
-      // the same way the import does — filtered by larkAppId, so a sibling
-      // bot's rows can never leak into this store.
+      // Damage the orphan so only a snapshot can rescue.
       truncateSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'), 20_000);
-      const legacy: Record<string, unknown> = {};
+      const rows: Record<string, unknown> = {};
       for (const [id, row] of Object.entries(frozenJsonRows())) {
-        legacy[id] = { ...(row as Record<string, unknown>), larkAppId: 'appA' };
+        rows[id] = { ...(row as Record<string, unknown>), larkAppId: 'appA' };
       }
-      legacy.OTHERBOT = {
-        sessionId: 'OTHERBOT', larkAppId: 'appZ', chatId: 'oc_other', rootMessageId: 'om_other',
-        title: 'someone else', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', scope: 'topic',
-      };
-      writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(legacy));
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(rows));
 
       const after = load(dataDir, home);
       expect(after.visible).toBe(SESSION_ROWS);
       expect(after.strict).toBe(SESSION_ROWS);
-      expect(after.ids).not.toContain('OTHERBOT');
     });
   });
 
@@ -548,22 +540,16 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
     });
   });
 
-  it('accepts a readable legacy snapshot that holds zero rows for this bot', () => {
+  it('accepts a readable per-bot snapshot that holds zero rows', () => {
     withDirs((dataDir, home) => {
       // A store whose import legitimately had NOTHING to copy: the poisoned
-      // shell carries only schema. The only snapshot is a flat legacy file whose
-      // rows all belong to a DIFFERENT app, so it filters down to zero rows here
-      // — yet it was READ, which positively attests this bot held nothing.
-      // Judging attestation by row count instead of by "which source resolved"
-      // would wrongly report the store unavailable forever.
+      // shell carries only schema. An empty `sessions-appA.json` was READ,
+      // which positively attests this bot held nothing. Judging attestation
+      // by row count instead of by "which source resolved" would wrongly
+      // report the store unavailable forever.
       const report = poison(dataDir, home, { rows: 0 });
       expect(report.rowCount).toBe(0);
-      writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify({
-        OTHERBOT: {
-          sessionId: 'OTHERBOT', larkAppId: 'appZ', chatId: 'oc_other', rootMessageId: 'om_other',
-          title: 'someone else', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', scope: 'topic',
-        },
-      }));
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify({}));
 
       const after = load(dataDir, home);
       expect(after.strict).toBe(0);

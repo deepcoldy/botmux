@@ -3748,9 +3748,10 @@ async function requireSessionById(sid: string): Promise<SessionData> {
  * the store's write exclusion (so a stale CLI snapshot can never be written
  * back), re-evaluates occupancy inside that exclusion, and runs the ONE
  * command apply the daemon also uses (services/session-commands.ts). */
-function hostTarget(session: SessionData): { sessionId: string; larkAppId?: string } {
+function hostTarget(session: SessionData): { sessionId: string; larkAppId: string } | undefined {
   const larkAppId = session.larkAppId;
-  return { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) };
+  if (!larkAppId) return undefined;
+  return { sessionId: session.sessionId, larkAppId };
 }
 
 type OfflineRowRead =
@@ -3771,7 +3772,9 @@ function offlineBlockedError(blocked: { outcome: 'owned' | 'missing' | 'unmigrat
 
 /** Exclusion-ordered fresh read that yields while a daemon holds the store. */
 function readSessionOffline(session: SessionData): OfflineRowRead {
-  const read = readSessionRowAsHost(hostTarget(session), { dataDir: resolveDataDir() });
+  const target = hostTarget(session);
+  if (!target) return { ok: false, error: 'session 缺少 larkAppId' };
+  const read = readSessionRowAsHost(target, { dataDir: resolveDataDir() });
   if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
   return { ok: false, error: offlineBlockedError(read) };
 }
@@ -3781,7 +3784,9 @@ function applySessionOffline(
   command: HostSessionCommand,
   options: { expectAdopted?: boolean } = {},
 ): UnownedRowApply {
-  return applySessionCommandAsHost(hostTarget(session), command, { dataDir: resolveDataDir(), ...options });
+  const target = hostTarget(session);
+  if (!target) return { outcome: 'missing' };
+  return applySessionCommandAsHost(target, command, { dataDir: resolveDataDir(), ...options });
 }
 
 /** True inside a sandboxed / read-isolated / credential-only pane: such a
@@ -3998,52 +4003,50 @@ async function abandonSessionAuthoritatively(
   session: SessionData,
   online: DaemonDescriptorLite[] = listOnlineDaemons(),
 ): Promise<AuthoritativeAbandonResult> {
-  // Legacy larkAppId-less rows live in sessions.json; a per-bot daemon writes
-  // only its own sessions-<appId>.json and silently no-ops on close, so keep
-  // them on the offline path (which persists to the legacy file correctly).
-  if (session.larkAppId) {
-    const daemon = online.find(d => d.larkAppId === session.larkAppId);
-    const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
-    const injectedPort = isCurrentSession
-      ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-      : undefined;
-    const ipcPort = daemon?.ipcPort ?? injectedPort;
-    if (ipcPort) {
-      try {
-        // Explicit abandon boundary: route through the owning daemon so the
-        // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
-        // the trusted-host HMAC (non-isolated) OR this session's rotating origin
-        // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
-        // stays fail-closed at the daemon's sessionCliIpcAuth check.
-        const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
-        const body = await res.json().catch(() => ({} as Record<string, unknown>));
-        if (res.ok && (body as { ok?: unknown }).ok) {
-          // Shared parser: a body that DECLARES a residual must warn even when the
-          // `residual` object is missing/malformed, or a bad payload silently
-          // becomes an ordinary success again.
-          const residual = parseCloseResidual(body);
-          return residual
-            ? { ok: true, mode: 'daemon', residual }
-            : { ok: true, mode: 'daemon' };
-        }
-        // Surface the daemon's own rejection reason (e.g. origin_unproven) and
-        // never fall back to a partial local kill: a daemon that answered is
-        // alive and holds authoritative in-memory state, whatever the lease
-        // or heartbeat file say.
-        return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
-      } catch (err) {
-        if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
-        // No answer. Only when nothing holds the store (no live lease, no fresh
-        // heartbeat) is the descriptor/injected port a leftover we may bypass.
-        const held = occupancyHeld(session.larkAppId);
-        if (held) {
-          return {
-            ok: false,
-            error: formatStoreHoldMessage(held, {
-              sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
-            }),
-          };
-        }
+  if (!session.larkAppId) {
+    return { ok: false, error: 'session 缺少 larkAppId' };
+  }
+  const daemon = online.find(d => d.larkAppId === session.larkAppId);
+  const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
+  const injectedPort = isCurrentSession
+    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const ipcPort = daemon?.ipcPort ?? injectedPort;
+  if (ipcPort) {
+    try {
+      // Explicit abandon boundary: route through the owning daemon so the
+      // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
+      // the trusted-host HMAC (non-isolated) OR this session's rotating origin
+      // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
+      // stays fail-closed at the daemon's sessionCliIpcAuth check.
+      const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
+      const body = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (res.ok && (body as { ok?: unknown }).ok) {
+        // Shared parser: a body that DECLARES a residual must warn even when the
+        // `residual` object is missing/malformed, or a bad payload silently
+        // becomes an ordinary success again.
+        const residual = parseCloseResidual(body);
+        return residual
+          ? { ok: true, mode: 'daemon', residual }
+          : { ok: true, mode: 'daemon' };
+      }
+      // Surface the daemon's own rejection reason (e.g. origin_unproven) and
+      // never fall back to a partial local kill: a daemon that answered is
+      // alive and holds authoritative in-memory state, whatever the lease
+      // or heartbeat file say.
+      return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
+    } catch (err) {
+      if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
+      // No answer. Only when nothing holds the store (no live lease, no fresh
+      // heartbeat) is the descriptor/injected port a leftover we may bypass.
+      const held = occupancyHeld(session.larkAppId);
+      if (held) {
+        return {
+          ok: false,
+          error: formatStoreHoldMessage(held, {
+            sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
+          }),
+        };
       }
     }
   }

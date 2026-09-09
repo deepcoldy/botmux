@@ -2995,7 +2995,7 @@ describe('GET /api/sessions', () => {
     } finally {
       usageSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3041,7 +3041,7 @@ describe('GET /api/sessions', () => {
       });
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3137,7 +3137,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     let findSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
       session.cliId = cliId;
       session.cliPathOverride = cliPathOverride;
@@ -3203,7 +3203,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     } finally {
       findSpy?.mockRestore();
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3234,7 +3234,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
     const off = dashboardEventBus.subscribe(e => seen.push(e));
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_lock', 'om_lock', 'lock me', 'group');
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -3263,7 +3263,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       expect(sessionStore.getSession(session.sessionId)?.locked).toBeUndefined();
     } finally {
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -3368,7 +3368,7 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         getActiveCount: () => 0,
         closeSession: vi.fn(),
       });
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = previousDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4163,7 +4163,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     let handle: IpcServerHandle | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume_null', 'om_resume_null', 'resume null body', 'group');
@@ -4267,7 +4267,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       replySpy.mockRestore();
       deleteSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4280,7 +4280,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_listener', 'oc_listener', '[Meeting] meeting-42', 'group');
@@ -4315,7 +4315,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4329,7 +4329,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -4355,7 +4355,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -4371,7 +4371,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -4396,7 +4396,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -4450,7 +4450,7 @@ describe('GET /api/events', () => {
     const registry = new Map<string, any>();
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
 
       const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
@@ -4470,7 +4470,7 @@ describe('GET /api/events', () => {
       expect(typeof ev!.body.session.closedAt).toBe('number');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -6616,7 +6616,7 @@ describe('PUT /api/bot-agent', () => {
       expect(send).not.toHaveBeenCalled();
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -6674,7 +6674,7 @@ describe('PUT /api/bot-agent', () => {
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -6724,7 +6724,7 @@ describe('PUT /api/bot-agent', () => {
       expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(false);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -7085,7 +7085,7 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
         .toHaveProperty('closedMismatchedFailed');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
