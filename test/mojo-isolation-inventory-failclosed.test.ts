@@ -27,8 +27,12 @@ vi.mock('../src/services/session-store.js', () => ({
   applySessionCommandUnowned: () => ({ outcome: 'missing' }),
   readSessionRowUnowned: () => ({ outcome: 'missing' }),
   occupancyLeaseIsActive: () => false,
+  hostOccupancyLeaseHeld: () => false,
   readOccupancyLease: () => undefined,
   readSessionRowCopiesAcrossStores: () => ({ matches: [], unreadableStores: 0 }),
+  SessionStoreSqliteUnavailableError: class SessionStoreSqliteUnavailableError extends Error {
+    override readonly name = 'SessionStoreSqliteUnavailableError';
+  },
   listSessionsStrict: () => {
     const err = new Error('session store unreadable');
     err.name = 'SessionStoreUnavailableError';
