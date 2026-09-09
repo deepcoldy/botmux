@@ -134,6 +134,11 @@ async function resumeRestoredPendingRepoSetup(
       operatorOpenId: ds.session.ownerOpenId,
       activeSessions,
       notify,
+      force: setup.force,
+      worktreePath: setup.worktreePath,
+      branch: setup.branch,
+      reuseExisting: setup.reuseExisting,
+      targetSubdir: setup.targetSubdir,
     }).catch((err) => {
       // Git/worktree recovery is deliberately detached. A failed publish or
       // build may not reject daemon startup or erase this durable setup owner.

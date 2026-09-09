@@ -356,36 +356,57 @@ export interface WorktreeSafetyStatus {
   fingerprint: string;
 }
 
-async function safetyStatusLines(dir: string): Promise<string[]> {
+interface SafetyStatusEntry {
+  status: string;
+  /** Path shown to the caller, relative to the top-level worktree. */
+  path: string;
+  /** Repository whose porcelain output produced this entry. */
+  repoDir: string;
+  /** Path relative to repoDir, used for content hashing. */
+  localPath: string;
+}
+
+/** Parse porcelain v1's NUL form. Unlike the line form, paths are never
+ * C-quoted, so non-ASCII, tabs and newlines remain exact filesystem names. */
+function parsePorcelainZ(raw: string, repoDir: string, prefix = ''): SafetyStatusEntry[] {
+  const records = raw.split('\0');
+  const entries: SafetyStatusEntry[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.length < 4) continue;
+    const status = record.slice(0, 2);
+    const localPath = record.slice(3);
+    entries.push({ status, localPath, repoDir, path: prefix ? `${prefix}/${localPath}` : localPath });
+    // In porcelain v1 -z, rename/copy destinations are followed by the source
+    // path as a second NUL record. The destination above is the path that exists.
+    if (/[RC]/.test(status)) i++;
+  }
+  return entries;
+}
+
+async function safetyStatusEntries(dir: string): Promise<SafetyStatusEntry[]> {
   const status = await gitRaw([
-    'status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
+    'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
   ], dir, 10_000);
-  const lines = status ? status.split('\n') : [];
+  const entries = parsePorcelainZ(status, dir);
   const submodules = await gitRaw([
     'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
   ], dir, 10_000);
   for (const path of submodules.split('\0').filter(Boolean)) {
+    const submoduleDir = join(dir, path);
     const nested = await gitRaw([
-      'status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
-    ], join(dir, path), 10_000);
-    if (!nested) continue;
-    for (const line of nested.split('\n')) {
-      if (line.length > 3) lines.push(`${line.slice(0, 3)}${path}/${line.slice(3)}`);
-    }
+      'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
+    ], submoduleDir, 10_000);
+    entries.push(...parsePorcelainZ(nested, submoduleDir, path));
   }
-  return lines;
+  return entries;
 }
 
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
   const dir = resolve(worktreePath);
-  const statusLines = await safetyStatusLines(dir);
-  const status = statusLines.join('\n');
-  const allDirtyFiles = statusLines
-    .filter(line => line.length > 3)
-    // Porcelain v1 is fixed-width `XY PATH`. Preserve a blank index column
-    // (the common unstaged ` M` / ` D` cases) until after removing the prefix.
-    .map(line => line.slice(3).trim())
-    .filter(Boolean);
+  const statusEntries = await safetyStatusEntries(dir);
+  const status = statusEntries.map(entry => `${entry.status} ${entry.path}`).join('\n');
+  const allDirtyFiles = statusEntries.map(entry => entry.path);
   const dirtyFiles = allDirtyFiles.slice(0, 20);
   let ahead = 0;
   let unpushedCommits: string[] = [];
@@ -418,49 +439,43 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   // directory marker is expanded with the traditional ignored view so ignored
   // directory contents participate without changing the compact display list.
   const contentRows: string[] = [];
-  for (const path of allDirtyFiles) {
-    const absolute = join(dir, path.replace(/\/$/, ''));
-    if (path.endsWith('/')) {
-      const nested = await gitRaw([
-        'status', '--porcelain', '--ignored=traditional', '--untracked-files=all',
-      ], dir, 10_000);
-      const prefix = path;
-      for (const line of nested.split('\n')) {
-        const nestedPath = line.length > 3 ? line.slice(3).trim() : '';
-        if (!nestedPath.startsWith(prefix)) continue;
-        const digest = await git(['hash-object', '--no-filters', join(dir, nestedPath)], dir, 10_000);
-        contentRows.push(`${nestedPath}\0${digest}`);
+  for (const entry of statusEntries) {
+    const path = entry.path;
+    const localPath = entry.localPath;
+    const absolute = join(entry.repoDir, localPath.replace(/\/$/, ''));
+    if (localPath.endsWith('/')) {
+      const nestedRaw = await gitRaw([
+        'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
+      ], entry.repoDir, 10_000);
+      for (const nestedEntry of parsePorcelainZ(nestedRaw, entry.repoDir)) {
+        if (!nestedEntry.localPath.startsWith(localPath)) continue;
+        const digest = await git(['hash-object', '--no-filters', join(entry.repoDir, nestedEntry.localPath)], entry.repoDir, 10_000);
+        const displayPath = path.slice(0, path.length - localPath.length) + nestedEntry.localPath;
+        contentRows.push(`${displayPath}\0${digest}`);
       }
       continue;
     }
     let digest: string;
-    if (!existsSync(absolute) && !path.includes(' -> ')) {
+    if (!existsSync(absolute)) {
       // A tracked deletion is expected dirty state, not a scan failure.
       digest = '<missing>';
-    } else try {
+    } else {
       const stat = lstatSync(absolute);
       if (stat.isDirectory()) {
         const nested = await gitRaw([
-          'status', '--porcelain', '--ignored=traditional', '--untracked-files=all',
+          'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
         ], absolute, 10_000);
         digest = createHash('sha256').update(nested).digest('hex');
       } else {
-        digest = await git(['hash-object', '--no-filters', absolute], dir, 10_000);
-      }
-    } catch (err) {
-      if (path.includes(' -> ')) {
-        const destination = path.slice(path.indexOf(' -> ') + 4);
-        digest = await git(['hash-object', '--no-filters', join(dir, destination)], dir, 10_000);
-      } else {
-        throw err;
+        digest = await git(['hash-object', '--no-filters', absolute], entry.repoDir, 10_000);
       }
     }
     contentRows.push(`${path}\0${digest}`);
   }
-  // The worktree bytes do not reveal the staged blob when a path is modified
-  // again after `git add`. Hash the index tree as a separate snapshot so a
-  // stage-only change invalidates an earlier destructive confirmation too.
-  const indexTree = await git(['write-tree'], dir, 10_000);
+  // `write-tree` rejects unresolved conflicts. `ls-files --stage` serializes
+  // every index entry (including stages 1/2/3), so it remains content-sensitive
+  // for both ordinary staged changes and conflicted indexes.
+  const indexTree = await gitRaw(['ls-files', '--stage', '-z'], dir, 10_000);
   const fingerprint = createHash('sha256')
     .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, status, contentRows, ahead, unpushedCommits }))
     .digest('hex');

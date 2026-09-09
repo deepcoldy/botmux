@@ -1388,6 +1388,16 @@ describe('findActiveSessionsByWorkingDirStrict()', () => {
       .toThrow(/simulated readdir denial/);
   });
 
+  it('fails closed when another legacy JSON store has a malformed active row', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      broken: { status: 'active', workingDir: tempDir },
+    }));
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/malformed active session row/i);
+  });
+
   it('fails closed when another SQLite store has a malformed active row', () => {
     init('app-A');
     const session = createSession('chat1', 'root-a', 'Bot A');

@@ -383,6 +383,39 @@ describe('worktreeSafetyStatus', () => {
     expect(second.fingerprint).not.toBe(first.fingerprint);
   });
 
+  it('handles porcelain-quoted non-ASCII paths and fingerprints their content', async () => {
+    const repo = makeUpstream('quoted-path-fingerprint');
+    const file = join(repo, '中文.txt');
+    writeFileSync(file, 'first\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('中文.txt');
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('fingerprints a conflicted index without requiring write-tree', async () => {
+    const repo = makeUpstream('conflicted-index');
+    const file = join(repo, 'conflict.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'conflict.txt');
+    git(repo, 'commit', '-m', 'add conflict file');
+    git(repo, 'checkout', '-b', 'other');
+    writeFileSync(file, 'other\n');
+    git(repo, 'commit', '-am', 'other change');
+    git(repo, 'checkout', 'master');
+    writeFileSync(file, 'master\n');
+    git(repo, 'commit', '-am', 'master change');
+    try { git(repo, 'merge', 'other'); } catch { /* expected conflict */ }
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toContain('conflict.txt');
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
   it('changes the fingerprint when an already-dirty file content changes', async () => {
     const repo = makeUpstream('content-fingerprint');
     const file = join(repo, 'dirty.txt');
@@ -396,6 +429,28 @@ describe('worktreeSafetyStatus', () => {
     const second = await worktreeSafetyStatus(repo);
 
     expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('changes the fingerprint when an ignored directory file changes inside an initialized submodule', async () => {
+    const subOrigin = makeUpstream('submodule-ignored-dir-origin');
+    writeFileSync(join(subOrigin, '.gitignore'), 'cache/\n');
+    git(subOrigin, 'add', '.gitignore');
+    git(subOrigin, 'commit', '-m', 'ignore local cache');
+
+    const repo = makeUpstream('submodule-ignored-dir-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const cache = join(repo, 'vendor/sub/cache');
+    mkdirSync(cache);
+    const cached = join(cache, 'state.json');
+    writeFileSync(cached, '{"value":1}\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(cached, '{"value":2}\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('vendor/sub/cache/');
     expect(second.fingerprint).not.toBe(first.fingerprint);
   });
 

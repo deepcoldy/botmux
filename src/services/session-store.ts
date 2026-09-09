@@ -547,8 +547,21 @@ function readStoreActiveRows(
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (opts.strict) throw new Error(`malformed active session store in ${ref.path}`);
+      return [];
+    }
+    const out: Session[] = [];
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object' || (value as { status?: unknown }).status !== 'active') continue;
+      const session = value as Partial<Session>;
+      if (typeof session.sessionId !== 'string') {
+        if (opts.strict) throw new Error(`malformed active session row in ${ref.path}: invalid session object`);
+        continue;
+      }
+      out.push(session as Session);
+    }
+    return out;
   }
   const db = openDbForRead(ref.path);
   try {

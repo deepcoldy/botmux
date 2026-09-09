@@ -18994,10 +18994,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  const sharedWorktree = autoWt && pinnedWorkingDir && forceTopic?.mode === 'worktree'
+    ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
+    : undefined;
   if (ds.pendingRepo) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
+      ...(forceTopic?.mode === 'worktree' ? { force: true } : {}),
+      ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
       // Persisted turn identity feeds the eventual fork's turnId; it must be the
       // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
       // session-group first turns that go through the repo picker / worktree.
@@ -19018,9 +19023,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
-    const sharedWorktree = forceTopic?.mode === 'worktree'
-      ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
-      : undefined;
     startAutoWorktreePending(ds, {
       anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
       force: forceTopic?.mode === 'worktree',
