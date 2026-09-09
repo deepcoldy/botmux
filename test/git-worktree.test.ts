@@ -298,6 +298,16 @@ describe('worktreeRootFor', () => {
 });
 
 describe('worktreeSafetyStatus', () => {
+  it('reports the full dirty count while bounding file examples', async () => {
+    const repo = makeUpstream('many-dirty-files');
+    for (let i = 0; i < 25; i++) writeFileSync(join(repo, `dirty-${i}.txt`), `${i}\n`);
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyCount).toBe(25);
+    expect(status.dirtyFiles).toHaveLength(20);
+  });
+
   it('preserves the full path for an unstaged modification', async () => {
     const repo = makeUpstream('safety-status');
     const file = join(repo, 'first-character.ts');

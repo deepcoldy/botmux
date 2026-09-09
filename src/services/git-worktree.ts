@@ -333,6 +333,7 @@ export async function pushWorktreeBranch(worktreePath: string, branch: string): 
 
 export interface WorktreeSafetyStatus {
   dirty: boolean;
+  dirtyCount: number;
   dirtyFiles: string[];
   ahead: number;
   unpushedCommits: string[];
@@ -343,13 +344,13 @@ export interface WorktreeSafetyStatus {
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
   const dir = resolve(worktreePath);
   const status = await gitRaw(['status', '--porcelain'], dir, 10_000);
-  const dirtyFiles = status.split('\n')
+  const allDirtyFiles = status.split('\n')
     .filter(line => line.length > 3)
     // Porcelain v1 is fixed-width `XY PATH`. Preserve a blank index column
     // (the common unstaged ` M` / ` D` cases) until after removing the prefix.
     .map(line => line.slice(3).trim())
-    .filter(Boolean)
-    .slice(0, 20);
+    .filter(Boolean);
+  const dirtyFiles = allDirtyFiles.slice(0, 20);
   let ahead = 0;
   let unpushedCommits: string[] = [];
   const head = await tryGit(['rev-parse', '--verify', 'HEAD'], dir, 5_000) ?? '';
@@ -377,7 +378,7 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   const fingerprint = createHash('sha256')
     .update(JSON.stringify({ head, upstream: upstream ?? '', status, ahead, unpushedCommits }))
     .digest('hex');
-  return { dirty: status.length > 0, dirtyFiles, ahead, unpushedCommits, fingerprint };
+  return { dirty: status.length > 0, dirtyCount: allDirtyFiles.length, dirtyFiles, ahead, unpushedCommits, fingerprint };
 }
 
 export async function mainWorktreeFor(dir: string): Promise<string> {

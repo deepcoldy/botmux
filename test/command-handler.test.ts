@@ -206,7 +206,7 @@ vi.mock('../src/services/git-worktree.js', () => ({
   mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
   worktreeRootFor: vi.fn(async (dir: string) => dir),
   removeRepoWorktree: vi.fn(async () => {}),
-  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
+  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -2477,7 +2477,7 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
-      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyCount: 2, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
 

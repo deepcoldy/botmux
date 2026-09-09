@@ -453,6 +453,7 @@ function buildCloseWorktreeConfirmCard(args: {
   worktreeDir: string;
   sessions: import('../types.js').Session[];
   dirty: boolean;
+  dirtyCount: number;
   dirtyFiles: string[];
   ahead: number;
   unpushedCommits: string[];
@@ -469,7 +470,7 @@ function buildCloseWorktreeConfirmCard(args: {
   // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
   const checkLines: string[] = [
     args.dirty
-      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyFiles.length) }, loc)
+      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyCount) }, loc)
       : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
   ];
   if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
@@ -1945,6 +1946,7 @@ export async function handleCommand(
                 worktreeDir,
                 sessions: [ds.session, ...siblingSessions],
                 dirty: safety.dirty,
+                dirtyCount: safety.dirtyCount,
                 dirtyFiles: safety.dirtyFiles,
                 ahead: safety.ahead,
                 unpushedCommits: safety.unpushedCommits,
@@ -1961,6 +1963,7 @@ export async function handleCommand(
                 worktreeDir,
                 sessions: [ds.session, ...siblingSessions],
                 dirty: safety.dirty,
+                dirtyCount: safety.dirtyCount,
                 dirtyFiles: safety.dirtyFiles,
                 ahead: safety.ahead,
                 unpushedCommits: safety.unpushedCommits,
