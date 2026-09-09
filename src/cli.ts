@@ -303,6 +303,7 @@ import {
 import type { HolderReason } from './services/session-store-copy.js';
 import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
 import { resolveSessionById } from './cli/resolve-session-by-id.js';
+import { knownBotAppIds } from './services/known-bot-app-ids.js';
 import { bindSessionWhiteboard as persistThenRememberWhiteboard, whiteboardBindFailedMessage } from './services/session-whiteboard-bind.js';
 import type { HostSessionCommand } from './services/session-commands.js';
 import {
@@ -3712,9 +3713,11 @@ let lastUnmigratedAppIds: string[] = [];
 const printedUnmigratedHints = new Set<string>();
 
 function loadSessions(): Map<string, SessionData> {
+  const dataDir = resolveDataDir();
   const snapshot: SessionsSnapshot = loadAllSessionsSnapshot({
-    dataDir: resolveDataDir(),
+    dataDir,
     fallbackAppId: process.env.BOTMUX_LARK_APP_ID,
+    knownAppIds: knownBotAppIds({ dataDir }),
   });
   lastUnmigratedAppIds = snapshot.unmigratedAppIds ?? [];
   if (lastUnmigratedAppIds.length > 0 && !isSessionScopedCliProcess()) {

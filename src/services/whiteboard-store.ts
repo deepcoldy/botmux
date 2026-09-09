@@ -11,6 +11,7 @@ import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
 import { applySessionCommandAsHost } from './session-command-host.js';
 import { formatStoreHoldMessage, formatUnmigratedMessage } from './session-store-copy.js';
+import { knownBotAppIds } from './known-bot-app-ids.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -518,7 +519,7 @@ async function clearSessionWhiteboardRefs(
   const dataDir = config.session.dataDir;
   let snapshot: ReturnType<typeof loadAllSessionsSnapshot>;
   try {
-    snapshot = loadAllSessionsSnapshot({ dataDir });
+    snapshot = loadAllSessionsSnapshot({ dataDir, knownAppIds: knownBotAppIds({ dataDir }) });
   } catch { return { cleared: 0, unresolved: 0, reasons: [] }; }
   const reasons: string[] = [];
   if (snapshot.unmigratedAppIds.length > 0) {

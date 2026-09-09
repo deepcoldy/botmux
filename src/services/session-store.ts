@@ -2494,9 +2494,16 @@ export function loadAllSessionsSnapshot(options: {
   /** Per-bot fallback when the data dir cannot be enumerated (the CLI file
    *  sandbox exposes this bot's own store but NOT a listing of data/). */
   fallbackAppId?: string;
+  /** When given, only these app ids (plus `fallbackAppId`) can be reported as
+   *  `unmigrated`. A leftover JSON of a bot that no longer exists is abandoned
+   *  data, not a pending migration — see `services/known-bot-app-ids.ts`. */
+  knownAppIds?: ReadonlySet<string>;
 } = {}): SessionsSnapshot {
   const dataDir = options.dataDir ?? config.session.dataDir;
   const out = emptySnapshot([]);
+  const onlyKnown = (ids: string[]): string[] => options.knownAppIds
+    ? ids.filter(id => options.knownAppIds!.has(id) || id === options.fallbackAppId)
+    : ids;
   const readInto = (ref: StoreFileRef | undefined): void => {
     if (!ref) return;
     let entries: [string, Session][];
@@ -2517,7 +2524,7 @@ export function loadAllSessionsSnapshot(options: {
   let refs: StoreFileRef[];
   try {
     refs = listStoreRefs(dataDir);
-    out.unmigratedAppIds = listUnmigratedAppIds(dataDir);
+    out.unmigratedAppIds = onlyKnown(listUnmigratedAppIds(dataDir));
   } catch {
     if (options.fallbackAppId) {
       readInto(resolveStoreFile(options.fallbackAppId, dataDir));

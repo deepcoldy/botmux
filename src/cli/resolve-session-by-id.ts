@@ -17,6 +17,7 @@ import {
 } from '../services/session-store.js';
 import type { Session } from '../types.js';
 import { formatUnmigratedMessage, isSessionScopedCliProcess } from '../services/session-store-copy.js';
+import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { findOnlineDaemon, listOnlineDaemons, type OnlineDaemonInfo } from '../utils/daemon-discovery.js';
 
 export type ResolveSessionByIdOk = { ok: true; session: Session; source: 'daemon' | 'store' };
@@ -35,6 +36,9 @@ export type ResolveSessionByIdDeps = {
   fetchIpc?: typeof fetchDaemonIpc;
   loadSecret?: typeof loadDaemonIpcSecret;
   loadSnapshot?: typeof loadAllSessionsSnapshot;
+  /** Bots that still exist (configured / online / own); leftover JSON of any
+   *  other app id is abandoned data, not `unmigrated`. Computed when omitted. */
+  knownAppIds?: ReadonlySet<string>;
 };
 
 function asSession(row: unknown): Session | undefined {
@@ -123,6 +127,7 @@ function readFromStore(
   const snapshot: SessionsSnapshot = (deps.loadSnapshot ?? loadAllSessionsSnapshot)({
     dataDir: deps.dataDir,
     fallbackAppId: envAppId,
+    knownAppIds: deps.knownAppIds ?? knownBotAppIds({ dataDir: deps.dataDir, env }),
   });
   const hit = snapshot.get(sessionId);
   if (hit) {

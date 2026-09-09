@@ -1541,6 +1541,21 @@ describe('loadAllSessionsSnapshot()', () => {
       { dataDir: tempDir },
     )).toEqual({ outcome: 'unmigrated' });
   });
+
+  it('reports a leftover JSON as unmigrated only for bots that still exist', () => {
+    // appGone was removed from bots.json long ago; nothing will ever import its
+    // file, so it must not keep telling the operator to restart the daemon.
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedFile('sessions-appGone.json', { g1: row('g1') });
+    seedStore('appA', { a1: row('a1') });
+
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir }).unmigratedAppIds).toEqual(['appB', 'appGone']);
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, knownAppIds: new Set(['appA', 'appB']) }).unmigratedAppIds)
+      .toEqual(['appB']);
+    // The bot this process runs under is always known, even if not configured.
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, knownAppIds: new Set(), fallbackAppId: 'appGone' }).unmigratedAppIds)
+      .toEqual(['appGone']);
+  });
 });
 
 describe('readSessionRowFromDisk()', () => {

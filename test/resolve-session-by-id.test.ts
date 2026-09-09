@@ -108,6 +108,25 @@ describe('resolveSessionById', () => {
     expect(result).toEqual({ ok: true, source: 'daemon', session: live });
   });
 
+  it('without BOTMUX_LARK_APP_ID, a leftover JSON of a bot that no longer exists is not_found, not unmigrated', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    writeFileSync(join(dataDir, 'sessions-cli_gone.json'), JSON.stringify({
+      s1: { sessionId: 's1', larkAppId: 'cli_gone', status: 'active' },
+    }));
+    const base = {
+      dataDir,
+      env: {},
+      listDaemons: () => [],
+      loadSecret: () => 'secret',
+      fetchIpc: async () => { throw new Error('must not be called'); },
+    };
+    expect(await resolveSessionById('s1', { ...base, knownAppIds: new Set(['cli_a']) }))
+      .toMatchObject({ ok: false, reason: 'not_found' });
+    // Still configured → the file really is a pending migration.
+    expect(await resolveSessionById('s1', { ...base, knownAppIds: new Set(['cli_gone']) }))
+      .toMatchObject({ ok: false, reason: 'unmigrated' });
+  });
+
   it('falls back to unmigrated when the daemon does not answer', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
     mkdirSync(dataDir, { recursive: true });
