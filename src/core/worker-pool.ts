@@ -12110,6 +12110,7 @@ function setupWorkerHandlers(
             ? followUp.codexAppInput
             : codexAppInputForSession(ds, followUp?.codexAppInput);
           if (rawTurnId) await requireCallbacks().prepareRawInputTurn?.(ds, rawTurnId);
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
           const accepted = sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
