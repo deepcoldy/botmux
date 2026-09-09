@@ -272,4 +272,5 @@ else
   printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
 fi
 
+printf '\n%s\n' "若 daemon 正在运行，请执行 botmux restart 应用新版本"
 printf '\n%s\n' "Next: botmux setup"

@@ -143,7 +143,6 @@ import { readSupervisorProcessStartIdentity } from './core/process-start-identit
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
   FLEET_SUCCESSOR_SETTLE_MS,
-  PM2_DAEMON_KILL_TIMEOUT_MS,
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
@@ -194,6 +193,7 @@ import {
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
 import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
+import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -293,9 +293,16 @@ import {
   writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
-import { loadAllSessionsSnapshot } from './services/session-store.js';
+import { loadAllSessionsSnapshot, type SessionsSnapshot } from './services/session-store.js';
 import { sqliteEngineAvailable } from './services/sqlite-compat.js';
+import {
+  formatStoreHoldMessage,
+  formatUnmigratedMessage,
+  isSessionScopedCliProcess,
+} from './services/session-store-copy.js';
+import type { HolderReason } from './services/session-store-copy.js';
 import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
+import { resolveSessionById } from './cli/resolve-session-by-id.js';
 import { bindSessionWhiteboard as persistThenRememberWhiteboard, whiteboardBindFailedMessage } from './services/session-whiteboard-bind.js';
 import type { HostSessionCommand } from './services/session-commands.js';
 import {
@@ -2702,14 +2709,6 @@ async function cmdStop(): Promise<void> {
   }, { maxWaitMs: 5_000 });
 }
 
-interface RestartLifecycleFlags {
-  includePm2: boolean;
-  includePluginServices: boolean;
-  bootstrapShutdownProtocol: boolean;
-  bootstrapConfirmed: boolean;
-}
-
-
 async function cmdRestart(): Promise<void> {
   applyCompanionOptions(process.argv.slice(3));
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
@@ -3193,18 +3192,24 @@ async function cmdStatus(): Promise<void> {
     console.log('  （无已配置机器人）');
     return;
   }
-  // Fixed-width table: name | pid | status | ↺restarts | exit.
+  // Fixed-width table: name | pid | status | ↺restarts | exit | version.
+  const online = listOnlineDaemons();
+  const versionByApp = new Map(online.map(d => [d.larkAppId, d.botmuxVersion]));
   const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
-  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  EXIT`;
+  const verCells = status.rows.map(r => versionByApp.get(r.appId) ?? '-');
+  const verW = Math.max(7, ...verCells.map(v => v.length));
+  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}`;
   console.log(header);
-  for (const r of status.rows) {
+  for (const [i, r] of status.rows.entries()) {
     // A row recorded 'online' whose pid is actually dead is shown as such so
     // status never lies while the supervisor is between reconcile ticks.
     const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
-    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol}`);
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}`);
   }
+  const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
+  if (restartHint) console.log(restartHint);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
@@ -3702,13 +3707,37 @@ function resolveDataDir(): string {
 
 /** Load sessions from all session files (legacy + per-bot). Snapshot mechanics
  * live in session-store; the CLI only supplies its own data-dir resolution and
- * the sandbox fallback appId (the file sandbox exposes sessions-<self>.json
- * but not a listing of data/). */
+ * the sandbox fallback appId. */
+let lastUnmigratedAppIds: string[] = [];
+const printedUnmigratedHints = new Set<string>();
+
 function loadSessions(): Map<string, SessionData> {
-  return loadAllSessionsSnapshot({
+  const snapshot: SessionsSnapshot = loadAllSessionsSnapshot({
     dataDir: resolveDataDir(),
     fallbackAppId: process.env.BOTMUX_LARK_APP_ID,
-  }) as unknown as Map<string, SessionData>;
+  });
+  lastUnmigratedAppIds = snapshot.unmigratedAppIds ?? [];
+  if (lastUnmigratedAppIds.length > 0 && !isSessionScopedCliProcess()) {
+    const key = [...lastUnmigratedAppIds].sort().join(',');
+    if (!printedUnmigratedHints.has(key)) {
+      printedUnmigratedHints.add(key);
+      console.error(formatUnmigratedMessage());
+    }
+  }
+  return snapshot as unknown as Map<string, SessionData>;
+}
+
+function hasUnmigratedStores(): boolean {
+  return lastUnmigratedAppIds.length > 0;
+}
+
+async function requireSessionById(sid: string): Promise<SessionData> {
+  const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
+  if (!resolved.ok) {
+    console.error(resolved.message);
+    process.exit(1);
+  }
+  return resolved.session as unknown as SessionData;
 }
 
 /** Host-side offline session commands. Callers must prefer the owning daemon
@@ -3725,9 +3754,13 @@ type OfflineRowRead =
   | { ok: true; current: SessionData }
   | { ok: false; error: string };
 
-function offlineBlockedError(outcome: 'owned' | 'missing' | 'contended'): string {
-  switch (outcome) {
-    case 'owned': return 'owning_daemon_became_available';
+function offlineBlockedError(blocked: { outcome: 'owned' | 'missing' | 'unmigrated' | 'contended'; heldBy?: HolderReason }): string {
+  const sessionScoped = isSessionScopedCliProcess() || isolatedCliProcess();
+  switch (blocked.outcome) {
+    case 'owned':
+      return formatStoreHoldMessage(blocked.heldBy ?? 'lease', { sessionScoped });
+    case 'unmigrated':
+      return formatUnmigratedMessage({ sessionScoped });
     case 'missing': return 'session_row_missing';
     case 'contended': return 'session_store_busy';
   }
@@ -3737,7 +3770,7 @@ function offlineBlockedError(outcome: 'owned' | 'missing' | 'contended'): string
 function readSessionOffline(session: SessionData): OfflineRowRead {
   const read = readSessionRowAsHost(hostTarget(session), { dataDir: resolveDataDir() });
   if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
-  return { ok: false, error: offlineBlockedError(read.outcome) };
+  return { ok: false, error: offlineBlockedError(read) };
 }
 
 function applySessionOffline(
@@ -3766,7 +3799,7 @@ const ISOLATED_CLI_OFFLINE_ERROR = '隔离会话内不能离线修改会话（da
 /** Is this bot's store held by a live host (occupancy lease, or a fresh
  *  heartbeat while no live lease exists)? Same data dir as the store access
  *  above. Never throws. */
-function occupancyHeld(larkAppId: string): boolean {
+function occupancyHeld(larkAppId: string): HolderReason | undefined {
   return isOccupancyHeld(larkAppId, { dataDir: resolveDataDir() });
 }
 
@@ -3787,8 +3820,14 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
   if (ownedWorkerPid) {
     // Narrow the unavoidable occupancy race: do not signal a worker after an
     // owning daemon has claimed the row. The locked command below repeats this.
-    if (current.larkAppId && occupancyHeld(current.larkAppId)) {
-      return { ok: false, error: 'owning_daemon_became_available' };
+    const heldBeforeSignal = current.larkAppId ? occupancyHeld(current.larkAppId) : undefined;
+    if (heldBeforeSignal) {
+      return {
+        ok: false,
+        error: formatStoreHoldMessage(heldBeforeSignal, {
+          sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
+        }),
+      };
     }
     if (isProcessAlive(ownedWorkerPid)) {
       const signalled = killProcess(ownedWorkerPid);
@@ -3918,11 +3957,17 @@ async function postOwningDaemonSessionMutation(
       secret,
     );
   } catch (err) {
+    // Isolation first: a sandboxed CLI never becomes a store host and must
+    // not see occupancy-reason copy that includes `botmux restart`.
+    if (isolatedCliProcess()) return 'forbidden_isolated';
     // No answer on the advertised port. A held store means the daemon is up
-    // but unreachable — surface that; otherwise the descriptor is a leftover
-    // and the offline path may proceed.
-    if (occupancyHeld(session.larkAppId)) {
-      throw new Error(`连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}`);
+    // but unreachable — surface the hold reason; otherwise the descriptor is
+    // a leftover and the offline path may proceed.
+    const held = occupancyHeld(session.larkAppId);
+    if (held) {
+      throw new Error(formatStoreHoldMessage(held, {
+        sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
+      }));
     }
     return unavailable();
   }
@@ -3984,10 +4029,17 @@ async function abandonSessionAuthoritatively(
         // or heartbeat file say.
         return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
       } catch (err) {
+        if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
         // No answer. Only when nothing holds the store (no live lease, no fresh
         // heartbeat) is the descriptor/injected port a leftover we may bypass.
-        if (occupancyHeld(session.larkAppId)) {
-          return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
+        const held = occupancyHeld(session.larkAppId);
+        if (held) {
+          return {
+            ok: false,
+            error: formatStoreHoldMessage(held, {
+              sessionScoped: isSessionScopedCliProcess() || isolatedCliProcess(),
+            }),
+          };
         }
       }
     }
@@ -4639,7 +4691,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       process.stdout.write(`${blankRowPrefix()}${separator}\n`);
       process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
       process.stdout.write(`${blankRowPrefix()}${separator}\n`);
-      process.stdout.write(`\n${blankRowPrefix()}\x1b[2m${fitLine('没有活跃会话', Math.max(0, layout.termWidth - layout.prefixWidth))}\x1b[0m\n`);
+      const emptyLabel = hasUnmigratedStores() ? '会话库待迁移' : '没有活跃会话';
+      process.stdout.write(`\n${blankRowPrefix()}\x1b[2m${fitLine(emptyLabel, Math.max(0, layout.termWidth - layout.prefixWidth))}\x1b[0m\n`);
       process.stdout.write(`${blankRowPrefix()}${separator}\n`);
       process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine('q 退出', footerContentWidth())}\x1b[0m\n`);
       return;
@@ -5034,6 +5087,7 @@ async function cmdList(): Promise<void> {
   live.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   if (live.length === 0) {
+    if (hasUnmigratedStores()) process.exit(1);
     console.log('没有活跃会话。');
     return;
   }
@@ -5059,6 +5113,7 @@ async function cmdDelete(): Promise<void> {
   const active = [...sessions.values()].filter(s => s.status === 'active');
 
   if (active.length === 0) {
+    if (hasUnmigratedStores()) process.exit(1);
     console.log('没有活跃会话。');
     return;
   }
@@ -6214,7 +6269,9 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   const target = rest[0];
   const active = [...loadSessions().values()].filter(s => s.status === 'active');
   if (active.length === 0) {
-    console.error('没有活跃会话。可操作终端只能对 status=active 的会话获取（botmux list 查看）。');
+    if (!hasUnmigratedStores()) {
+      console.error('没有活跃会话。可操作终端只能对 status=active 的会话获取（botmux list 查看）。');
+    }
     process.exit(1);
   }
 
@@ -6562,13 +6619,13 @@ interface CurrentSession {
   ownerOpenId?: string;
 }
 
-/** Detect current session info from ancestor marker + session files. */
-function detectCurrentSession(): CurrentSession | null {
+/** Detect current session info from ancestor marker + live daemon / store. */
+async function detectCurrentSession(): Promise<CurrentSession | null> {
   const sid = findAncestorSessionId();
   if (!sid) return null;
-  const sessions = loadSessions();
-  const s = sessions.get(sid);
-  if (!s) return null;
+  const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
+  if (!resolved.ok) return null;
+  const s = resolved.session;
   return {
     sessionId: s.sessionId,
     chatId: s.chatId,
@@ -6765,11 +6822,13 @@ function readStdinUtf8(): string {
   try { return decodeStdinBytes(readFileSync(0)); } catch { return ''; }
 }
 
-function currentWhiteboardContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string } {
+async function currentWhiteboardContext(args: string[]): Promise<{ session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string }> {
   const sessionIdArg = argValue(args, '--session-id');
-  const sessions = loadSessions();
   const sid = sessionIdArg || findAncestorSessionId() || undefined;
-  const session = sid ? sessions.get(sid) : undefined;
+  const resolved = sid
+    ? await resolveSessionById(sid, { dataDir: resolveDataDir() })
+    : undefined;
+  const session = resolved?.ok ? resolved.session as unknown as SessionData : undefined;
   return {
     session,
     sessionId: session?.sessionId ?? sid,
@@ -6883,7 +6942,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
       console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(id) }, null, 2));
       return;
     }
-    const ctx = currentWhiteboardContext(rest);
+    const ctx = await currentWhiteboardContext(rest);
     let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
@@ -6901,7 +6960,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 
   if (action === 'create') {
     requireWhiteboardEnabled();
-    const ctx = currentWhiteboardContext(rest);
+    const ctx = await currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     if (ctx.session && !ctx.session.whiteboardId) {
       await bindSessionWhiteboard(ctx.session, meta.id);
@@ -6921,7 +6980,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   if (['read', 'update', 'write'].includes(action)) requireWhiteboardEnabled();
 
   const explicitId = argValue(rest, '--id');
-  const ctx = currentWhiteboardContext(rest);
+  const ctx = await currentWhiteboardContext(rest);
   let id = explicitId ?? ctx.session?.whiteboardId;
   if (!id && whiteboardEnabled() && action === 'update') {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
@@ -7020,7 +7079,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // "ownerless task runs on bot-0" semantics; `list` without a bound bot
   // aggregates every readable store instead.
   const cliScopeAppId = argValue(rest, '--lark-app-id')
-    ?? detectCurrentSession()?.larkAppId
+    ?? (await detectCurrentSession())?.larkAppId
     ?? process.env.BOTMUX_LARK_APP_ID;
   // LAZY + sandbox-safe bots.json read: sandboxed sessions always carry a
   // scope (env-injected appId) and must never touch bots.json — it is denied
@@ -7081,7 +7140,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const cur = detectCurrentSession();
+    const cur = await detectCurrentSession();
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7323,12 +7382,7 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
       return { sid, larkAppId: riff.session.larkAppId!, session: riff.session };
     }
   }
-  const sessions = loadSessions();
-  const s = sessions.get(sid);
-  if (!s) {
-    console.error(`未找到 session ${sid}`);
-    process.exit(1);
-  }
+  const s = await requireSessionById(sid);
   if (!s.larkAppId) {
     console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
     process.exit(1);
@@ -8826,9 +8880,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sessions = loadSessions();
   const currentTurnId = originTurnId;
-  let s = sessions.get(sid);
+  let s: SessionData | undefined;
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
   // Fall back to env-var-only mode so `botmux send` works without a daemon.
@@ -8854,21 +8907,26 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   if (!s) {
-    console.error(
-      '[botmux send diagnostic] session_lookup_miss'
-      + ` sessionId=${sid}`
-      + ` source=${sessionIdSource}`
-      + ` dataDir=${sendDataDir}`
-      + ` envSessionId=${process.env.BOTMUX_SESSION_ID ?? '-'}`
-      + ` envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ?? '-'}`
-      + ` originSessionId=${originSessionId ?? '-'}`
-      + ` loadedSessions=${sessions.size}`
-      + ` relayDir=${relayDir ? 'present' : 'absent'}`
-      + ` readIsolation=${isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'}`
-      + ` capability=${isolatedCapabilityCtx ? 'present' : 'absent'}`,
-    );
-    console.error(`未找到 session ${sid}`);
-    process.exit(1);
+    const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
+    if (resolved.ok) {
+      s = resolved.session as unknown as SessionData;
+    } else {
+      console.error(
+        '[botmux send diagnostic] session_lookup_miss'
+        + ` sessionId=${sid}`
+        + ` source=${sessionIdSource}`
+        + ` dataDir=${sendDataDir}`
+        + ` envSessionId=${process.env.BOTMUX_SESSION_ID ?? '-'}`
+        + ` envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ?? '-'}`
+        + ` originSessionId=${originSessionId ?? '-'}`
+        + ` reason=${resolved.reason}`
+        + ` relayDir=${relayDir ? 'present' : 'absent'}`
+        + ` readIsolation=${isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'}`
+        + ` capability=${isolatedCapabilityCtx ? 'present' : 'absent'}`,
+      );
+      console.error(resolved.message);
+      process.exit(1);
+    }
   }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
@@ -8963,7 +9021,10 @@ async function cmdSend(rest: string[]): Promise<void> {
       || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
       throw new Error('managed origin changed before provider effect');
     }
-    const currentOriginSession = loadSessions().get(fresh.sessionId);
+    const currentOriginResolved = await resolveSessionById(fresh.sessionId, { dataDir: resolveDataDir() });
+    const currentOriginSession = currentOriginResolved.ok
+      ? currentOriginResolved.session as unknown as SessionData
+      : undefined;
     const ledgerDecision = validateCodexAppManagedSendOrigin(
       currentOriginSession?.codexAppDispatchLedger,
       fresh,
@@ -11059,9 +11120,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
-  const sessions = loadSessions();
-  const s = sessions.get(sid);
-  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
   // apiOnly source turn is refused even with a real --chat-id override (a
@@ -11533,9 +11592,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   const currentTurnId = reportContext?.sessionId === sid
     ? reportContext.turnId
     : undefined;
-  const sessions = loadSessions();
-  const s = sessions.get(sid);
-  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 
   // ── Issue Board 交付：绑定了平台 issue 的领取群 → 推 in_review（待验收）────────

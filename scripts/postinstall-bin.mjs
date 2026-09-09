@@ -386,3 +386,5 @@ try {
     console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds`);
   }
 }
+
+console.log('[botmux] 若 daemon 正在运行，请执行 botmux restart 应用新版本');

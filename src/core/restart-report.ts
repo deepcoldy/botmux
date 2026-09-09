@@ -9,7 +9,7 @@
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
 import { claimRestartIntentForReport } from '../services/restart-intent-store.js';
-import { countActiveSessionsOnDisk } from '../services/session-store.js';
+import { countActiveSessionsOnDisk, SessionStoreSqliteUnavailableError } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
@@ -129,7 +129,13 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
   const locale = localeForBot(w.primaryLarkAppId);
-  const sessionCount = countActiveSessionsOnDisk();
+  let sessionCount = 0;
+  try {
+    sessionCount = countActiveSessionsOnDisk();
+  } catch (err) {
+    if (!(err instanceof SessionStoreSqliteUnavailableError)) throw err;
+    log(`restart-report: session store unreadable — ${err.message}`);
+  }
   const version = botmuxVersion();
   let changelog: string | undefined;
   if (intent.kind === 'update' && intent.newVersion) {

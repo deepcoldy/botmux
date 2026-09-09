@@ -13,7 +13,7 @@ import { tmpdir } from 'os';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
-const fsControl = vi.hoisted(() => ({ failSessionWrite: false, failReaddir: false }));
+const fsControl = vi.hoisted(() => ({ failReaddir: false }));
 const costCalculatorMock = vi.hoisted(() => ({
   getSessionTokenUsage: vi.fn(() => null),
 }));
@@ -21,12 +21,6 @@ vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
-    writeFileSync: (...args: Parameters<typeof actual.writeFileSync>) => {
-      if (fsControl.failSessionWrite && String(args[0]).includes('sessions.json.')) {
-        throw new Error('simulated session repair write failure');
-      }
-      return actual.writeFileSync(...args);
-    },
     readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
       // Simulates the CLI file sandbox: per-bot files readable, data dir
       // enumeration denied (EPERM-like failure).
@@ -93,7 +87,6 @@ import {
   readSessionRowCopiesAcrossStores,
 } from '../src/services/session-store.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
-import { withFileLockSync } from '../src/utils/file-lock.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -135,7 +128,6 @@ function readPersistedRows(dir: string, appId?: string): Record<string, any> {
 
 beforeEach(() => {
   tempDir = makeTempDir();
-  fsControl.failSessionWrite = false;
   costCalculatorMock.getSessionTokenUsage.mockReset();
   costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
   __testOnly_setBeforeRowPersist(undefined);
@@ -268,38 +260,6 @@ describe('init()', () => {
     expect(repairMissingChatScope(record)).toBe(false);
     expect(repairMissingChatScope(null)).toBe(false);
     expect(repairMissingChatScope({ sessionId: 'malformed' })).toBe(false);
-  });
-
-  it('keeps loaded sessions available when persisting a scope repair fails', () => {
-    mkdirSync(tempDir, { recursive: true });
-    const fp = join(tempDir, 'sessions.json');
-    writeFileSync(fp, JSON.stringify({
-      broken: {
-        sessionId: 'broken',
-        chatId: 'oc_chat',
-        rootMessageId: 'oc_chat',
-        title: 'Broken repo switch',
-        status: 'active',
-        createdAt: '2026-07-18T00:00:00.000Z',
-      },
-      healthy: {
-        sessionId: 'healthy',
-        chatId: 'oc_chat',
-        rootMessageId: 'om_thread',
-        scope: 'thread',
-        title: 'Healthy thread',
-        status: 'active',
-        createdAt: '2026-07-18T00:00:00.000Z',
-      },
-    }));
-
-    fsControl.failSessionWrite = true;
-    init();
-
-    expect(getSession('broken')?.scope).toBe('chat');
-    expect(getSession('healthy')?.title).toBe('Healthy thread');
-    expect(listSessions()).toHaveLength(2);
-    expect(JSON.parse(readFileSync(fp, 'utf-8')).broken.scope).toBeUndefined();
   });
 
   it('should reset state when called again', () => {
@@ -533,6 +493,7 @@ describe('write health gate', () => {
       SessionStoreUnavailableError,
     );
     expect(readFileSync(legacyFp, 'utf-8')).toBe('{broken-legacy');
+    expect(existsSync(sessionStorePath(tempDir, 'app-A'))).toBe(false);
     expect(existsSync(botFp)).toBe(false);
   });
 
@@ -1312,7 +1273,7 @@ describe('Multi-bot isolation', () => {
     expect(listSessions()).toHaveLength(2);
   });
 
-  it('should use legacy sessions.json when no appId is set', () => {
+  it('should use the flat sessions.db when no appId is set', () => {
     init();
     createSession('c1', 'r1', 'Legacy');
     expect(persistedStoreExists(tempDir)).toBe(true);
@@ -1437,13 +1398,6 @@ describe('Edge cases', () => {
 
     init(); // re-init loads from disk
     expect(listSessions()).toHaveLength(2);
-  });
-
-  it('should handle atomic writes (tmp file rename)', () => {
-    const session = createSession('c1', 'r1', 'Atomic');
-    // The .tmp file should not persist after save
-    const tmpFp = join(tempDir, 'sessions.json.tmp');
-    expect(existsSync(tmpFp)).toBe(false);
   });
 });
 
@@ -1571,21 +1525,21 @@ describe('loadAllSessionsSnapshot()', () => {
     mkdirSync(tempDir, { recursive: true });
     expect(loadAllSessionsSnapshot({ dataDir: tempDir }).size).toBe(0);
     // A read-write SQLite open would have CREATED this file, and its mere
-    // existence disables the owning daemon's one-shot JSON import.
+    // existence would hide the unmigrated (JSON-only) probe.
     expect(existsSync(sessionStorePath(tempDir))).toBe(false);
   });
 
-  it('still reads a store whose owning daemon has not imported it yet', () => {
-    // Upgrade window: npm already replaced dist and repointed the launcher, but
-    // the daemon that owns these rows still runs the pre-SQLite build and keeps
-    // writing the JSON. Every live session's `botmux send` resolves itself
-    // through here — going db-only would leave the agent unable to reply until
-    // someone restarts the daemon, which nothing forces them to do.
+  it('marks a leftover JSON store as unmigrated and does not read its rows', () => {
     seedFile('sessions-appB.json', { b1: row('b1') });
     seedStore('appA', { a1: row('a1') });
     const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
-    expect([...snapshot.keys()].sort()).toEqual(['a1', 'b1']);
-    expect(snapshot.get('b1')?.larkAppId).toBe('appB');
+    expect([...snapshot.keys()]).toEqual(['a1']);
+    expect(snapshot.unmigratedAppIds).toEqual(['appB']);
+    expect(applySessionCommandUnowned(
+      { sessionId: 'b1', larkAppId: 'appB' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'unmigrated' });
   });
 });
 
@@ -1613,9 +1567,10 @@ describe('readSessionRowCopiesAcrossStores()', () => {
     seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
     seedStore('appB', { other: row('other') });
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
-    expect(copies.map(c => c.title).sort()).toEqual(['legacy', 'per-bot']);
-    expect(readSessionRowCopiesAcrossStores('other', tempDir)).toHaveLength(1);
-    expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
+    expect(copies.matches.map(c => c.title).sort()).toEqual(['legacy', 'per-bot']);
+    expect(copies.unreadableStores).toBe(0);
+    expect(readSessionRowCopiesAcrossStores('other', tempDir).matches).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('missing', tempDir).matches).toHaveLength(0);
   });
 
   it('skips corrupt stores and key-mismatched rows without failing the scan', () => {
@@ -1624,18 +1579,8 @@ describe('readSessionRowCopiesAcrossStores()', () => {
     seedStore('appB', { s1: row('someOtherId') }); // key ≠ row.sessionId
     seedStore(undefined, { s1: row('s1') });
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
-    expect(copies).toHaveLength(1);
-  });
-
-  it('a frozen pre-SQLite JSON is not a second copy of an imported store', () => {
-    // The identity scan authorises only when a row resolves EXACTLY once. The
-    // frozen import source must not read as a second store, or every migrated
-    // session would be refused as ambiguous.
-    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    init('appA');
-    listSessions(); // import → .db, JSON frozen in place
-    init();
-    expect(readSessionRowCopiesAcrossStores('s1', tempDir)).toHaveLength(1);
+    expect(copies.matches).toHaveLength(1);
+    expect(copies.unreadableStores).toBe(1);
   });
 
   it('throws when the data dir itself cannot be listed (fail-closed identity scan)', () => {
@@ -1709,36 +1654,6 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     )).toEqual({ outcome: 'missing' });
   });
 
-  it('yields owned untouched when abortIf trips at entry — for the read as well as the apply', () => {
-    seedStore('appA', { s1: row('s1') });
-    expect(applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => true },
-    )).toEqual({ outcome: 'owned' });
-    expect(readSessionRowUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { dataDir: tempDir, abortIf: () => true },
-    )).toEqual({ outcome: 'owned' });
-    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-  });
-
-  it('re-checks abortIf immediately before publication and leaves the row untouched', () => {
-    // A daemon that appears during the read/decision phase becomes
-    // authoritative — the second probe must catch it. SQLite's own locking
-    // orders writers but cannot see a daemon holding a stale in-memory cache.
-    seedStore('appA', { s1: row('s1') });
-    let probes = 0;
-    const result = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => ++probes > 1 },
-    );
-    expect(result).toEqual({ outcome: 'owned' });
-    expect(probes).toBe(2);
-    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-  });
-
   it('targets the legacy store when the row carries no larkAppId', () => {
     seedStore(undefined, { s1: row('s1') });
     const published = applySessionCommandUnowned(
@@ -1751,9 +1666,8 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
   });
 
   it('never creates the store — an empty one would disable the daemon import gate', () => {
-    // A read-write SQLite open CREATES the file. If an offline write planted an
-    // empty store here, the owning daemon's `existsSync(db)` gate would skip
-    // the one-shot JSON import and silently discard every pre-SQLite row.
+    // A read-write SQLite open CREATES the file. An empty store here would
+    // hide the unmigrated probe for leftover JSON.
     mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
     expect(applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
@@ -1763,33 +1677,14 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 
-  it('writes the JSON store while its owning daemon has not imported it yet', () => {
-    // Upgrade window: the pre-SQLite daemon still owns these rows and reads the
-    // JSON, so an offline close has to land there. Creating a .db here would
-    // fork the two representations behind that daemon's back — and the empty
-    // store would also disable its one-shot import gate.
+  it('returns unmigrated for a leftover JSON store and never creates a .db', () => {
     seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    const published = applySessionCommandUnowned(
+    expect(applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
       { type: 'close' },
       { dataDir: tempDir },
-    );
-    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
-    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
+    )).toEqual({ outcome: 'unmigrated' });
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
-
-  it('reports contended (not missing) when the JSON store file lock is held past its wait', () => {
-    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    const held = withFileLockSync(
-      join(tempDir, 'sessions-appA.json'),
-      () => applySessionCommandUnowned(
-        { sessionId: 's1', larkAppId: 'appA' },
-        { type: 'close' },
-        { dataDir: tempDir },
-      ),
-    );
-    expect(held).toEqual({ outcome: 'contended' });
-    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
-  }, 15_000);
 });

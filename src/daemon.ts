@@ -50,10 +50,8 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
-import {
-  SUPERVISOR_SHUTDOWN_PROTOCOL,
-  type SupervisorShutdownProtocol,
-} from './core/supervisor-shutdown-protocol.js';
+import { botmuxVersion } from './utils/install-info.js';
+import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
@@ -4218,8 +4216,9 @@ function removePidFile(): void {
 // ─── Daemon descriptor (dashboard registry) ─────────────────────────────────
 // Each per-bot daemon publishes a self-descriptor JSON at
 // <resolvedDataDir>/dashboard-daemons/<larkAppId>.json so the dashboard sibling
-// process can discover all running daemons. The file is touched every 30s as a
-// heartbeat (mtime drives offline detection) and removed on graceful exit.
+// process can discover all running daemons. Freshness is the in-file
+// `lastHeartbeat` field (not mtime); the file is rewritten every 30s and
+// removed on graceful exit.
 
 const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 
@@ -4240,9 +4239,10 @@ interface DaemonDescriptor {
   bootInstanceId: string;
   /** Full-envelope Workflow mutation protocol supported by this process. */
   workflowIpcProtocol: 'v1';
-  /** Exact supervisor protocol this in-memory daemon will execute on signal.
-   * Absent until the SIGTERM/SIGINT handlers and all captured state are ready. */
-  supervisorShutdownProtocol?: SupervisorShutdownProtocol;
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol: 'occupancy-v1';
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion: string;
   lastHeartbeat: number;
   /**
    * Resolved open_ids from this bot's allowedUsers config (post-email
@@ -22502,6 +22502,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     startedAt: Date.now(),
     bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
+    sessionStoreProtocol: SESSION_STORE_PROTOCOL,
+    botmuxVersion: botmuxVersion(),
     lastHeartbeat: Date.now(),
     // Dashboard create-group only consumes app-scoped open_ids — publish ONLY
     // ou_ entries. Before the resolution below runs, the list may still hold raw
@@ -24162,12 +24164,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
   process.on('SIGINT', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
-  // Capability publication is the final startup commit for supervisor-driven
-  // shutdown. The early descriptor intentionally lacks it: a new CLI that
-  // observes this daemon before both handlers/state closures exist must refuse
-  // to signal. Atomic rewrite makes the capability visible only afterward.
+  // SIGTERM/SIGINT handlers and the supervisor-shutdown IPC handler must be
+  // installed before this process is considered ready to take a signal. The
+  // descriptor rewrite after that is a heartbeat bump, not a capability advert
+  // (sessionStoreProtocol is written from the first publish).
   if (readSupervisorProcessStartIdentity(process.pid) !== desc.processStartIdentity) {
-    throw new Error('daemon process-start identity changed before shutdown capability commit');
+    throw new Error('daemon process-start identity changed before shutdown handler commit');
   }
   setSupervisorShutdownHandler({
     larkAppId: cfg.larkAppId,
@@ -24175,7 +24177,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     processStartIdentity: desc.processStartIdentity,
     shutdown,
   });
-  desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   // Best-effort cleanup on plain `exit` (e.g. uncaught fatal). No worker

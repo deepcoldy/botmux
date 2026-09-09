@@ -28,6 +28,7 @@ import {
 } from './fleet-supervisor-policy.js';
 import { mutateFleetState, readFleetState } from './fleet-state-store.js';
 import type { FleetCommand } from './fleet-command-queue.js';
+import { FLEET_DAEMON_KILL_TIMEOUT_MS } from './shutdown-budgets.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -135,7 +136,7 @@ export class FleetSupervisor {
 
   constructor(private readonly opts: FleetSupervisorOptions) {
     this.policy = opts.policy ?? DEFAULT_RESTART_POLICY;
-    this.killTimeoutMs = opts.killTimeoutMs ?? 8000;
+    this.killTimeoutMs = opts.killTimeoutMs ?? FLEET_DAEMON_KILL_TIMEOUT_MS;
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
   }
 

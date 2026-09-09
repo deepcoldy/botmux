@@ -247,27 +247,22 @@ describe('graceful shutdown supervisor contract', () => {
     expect(daemon.slice(start, stop)).toContain('canAbortVerifiedExitedRemotePreparation(');
   });
 
-  it('publishes shutdown capability only after both signal handlers are installed', () => {
+  it('installs shutdown handlers before the attested descriptor rewrite', () => {
     const descStart = daemon.indexOf('const desc: DaemonDescriptor = {');
     const firstDescriptorWrite = daemon.indexOf('writeDaemonDescriptor(desc);', descStart);
     const sigtermHandler = daemon.indexOf("process.on('SIGTERM'", firstDescriptorWrite);
     const sigintHandler = daemon.indexOf("process.on('SIGINT'", sigtermHandler);
-    const capabilityCommit = daemon.indexOf(
-      'desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;',
-      sigintHandler,
-    );
     const ipcHandlerReady = daemon.indexOf('setSupervisorShutdownHandler({', sigintHandler);
-    const attestedWrite = daemon.indexOf('writeDaemonDescriptor(desc);', capabilityCommit);
+    const attestedWrite = daemon.indexOf('writeDaemonDescriptor(desc);', ipcHandlerReady);
 
     expect(descStart).toBeGreaterThanOrEqual(0);
     expect(firstDescriptorWrite).toBeGreaterThan(descStart);
-    expect(daemon.slice(descStart, firstDescriptorWrite))
-      .not.toContain('supervisorShutdownProtocol: SUPERVISOR_SHUTDOWN_PROTOCOL');
+    expect(daemon).not.toContain('supervisorShutdownProtocol');
+    expect(daemon.slice(descStart, firstDescriptorWrite)).toContain('sessionStoreProtocol');
     expect(sigtermHandler).toBeGreaterThan(firstDescriptorWrite);
     expect(sigintHandler).toBeGreaterThan(sigtermHandler);
     expect(ipcHandlerReady).toBeGreaterThan(sigintHandler);
-    expect(capabilityCommit).toBeGreaterThan(ipcHandlerReady);
-    expect(attestedWrite).toBeGreaterThan(capabilityCommit);
+    expect(attestedWrite).toBeGreaterThan(ipcHandlerReady);
   });
 
   it('keeps supervisor shutdown host-authenticated and exact boot/birth bound', () => {

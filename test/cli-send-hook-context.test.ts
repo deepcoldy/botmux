@@ -65,14 +65,14 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('envSessionId=${process.env.BOTMUX_SESSION_ID ??');
     expect(cmdSend).toContain('envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ??');
     expect(cmdSend).toContain('originSessionId=${originSessionId ??');
-    expect(cmdSend).toContain('loadedSessions=${sessions.size}');
+    expect(cmdSend).toContain('reason=${resolved.reason}');
     expect(cmdSend).toContain("relayDir=${relayDir ? 'present' : 'absent'}");
     expect(cmdSend).toContain('readIsolation=${isolatedSendRequired ?');
     expect(cmdSend).toContain("capability=${isolatedCapabilityCtx ? 'present' : 'absent'}");
 
     const diagnosticStart = cmdSend.indexOf('session_lookup_miss');
     expect(diagnosticStart).toBeGreaterThanOrEqual(0);
-    const missingSessionAt = cmdSend.indexOf('未找到 session', diagnosticStart);
+    const missingSessionAt = cmdSend.indexOf('console.error(resolved.message)', diagnosticStart);
     expect(missingSessionAt).toBeGreaterThan(diagnosticStart);
     const diagnosticBlock = cmdSend.slice(diagnosticStart, missingSessionAt);
 
@@ -83,7 +83,7 @@ describe('cmdSend hook context wiring', () => {
       "process.env.BOTMUX_SESSION_ID ?? '-'",
       "process.env.BOTMUX_LARK_APP_ID ?? '-'",
       "originSessionId ?? '-'",
-      'sessions.size',
+      'resolved.reason',
       "relayDir ? 'present' : 'absent'",
       "isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'",
       "isolatedCapabilityCtx ? 'present' : 'absent'",

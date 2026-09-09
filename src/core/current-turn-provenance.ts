@@ -55,7 +55,7 @@ function readPersistedSession(dataDir: string, sessionId: string): PersistedTurn
   // a duplicated row must not be used to infer the caller — stays here.
   let matches: readonly unknown[];
   try {
-    matches = readSessionRowCopiesAcrossStores(sessionId, dataDir);
+    matches = readSessionRowCopiesAcrossStores(sessionId, dataDir).matches;
   } catch (err) {
     throw new CurrentTurnProvenanceError(
       `无法读取 botmux session store：${err instanceof Error ? err.message : String(err)}`,

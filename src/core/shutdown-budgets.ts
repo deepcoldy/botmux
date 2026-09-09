@@ -43,25 +43,26 @@ export const DAEMON_SHUTDOWN_MAX_MS =
   + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
   + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
   + DAEMON_SHUTDOWN_OVERHEAD_MS;
-export const PM2_DAEMON_KILL_TIMEOUT_MS = 29_000;
+/** Supervisor SIGTERM→SIGKILL budget. Must exceed DAEMON_SHUTDOWN_MAX_MS. */
+export const FLEET_DAEMON_KILL_TIMEOUT_MS = 29_000;
 export const PM2_DAEMON_RESTART_DELAY_MS = 3_000;
 /** A full restart-delay plus projection jitter. The fleet helper must observe
  * this quiet window after every signalled generation exits. */
 export const FLEET_SUCCESSOR_SETTLE_MS = PM2_DAEMON_RESTART_DELAY_MS + 500;
 export const FLEET_DAEMON_EXIT_WAIT_MS = 60_000;
 
-if (PM2_DAEMON_KILL_TIMEOUT_MS <= DAEMON_SHUTDOWN_MAX_MS) {
-  throw new Error('PM2 daemon kill timeout must exceed the complete daemon shutdown budget');
+if (FLEET_DAEMON_KILL_TIMEOUT_MS <= DAEMON_SHUTDOWN_MAX_MS) {
+  throw new Error('fleet supervisor killTimeoutMs must exceed the complete daemon shutdown budget');
 }
 if (DAEMON_SHUTDOWN_MAX_MS > 28_000) {
   throw new Error('complete daemon shutdown budget must remain at or below 28 seconds');
 }
-if (FLEET_DAEMON_EXIT_WAIT_MS <= PM2_DAEMON_KILL_TIMEOUT_MS) {
-  throw new Error('fleet restart wait must exceed the PM2 daemon kill timeout');
+if (FLEET_DAEMON_EXIT_WAIT_MS <= FLEET_DAEMON_KILL_TIMEOUT_MS) {
+  throw new Error('fleet restart wait must exceed the fleet supervisor killTimeoutMs');
 }
 if (FLEET_DAEMON_EXIT_WAIT_MS <= DAEMON_SHUTDOWN_MAX_MS + FLEET_SUCCESSOR_SETTLE_MS) {
   throw new Error('fleet restart wait must cover daemon shutdown plus successor quiet window');
 }
-if (FLEET_DAEMON_EXIT_WAIT_MS <= PM2_DAEMON_KILL_TIMEOUT_MS + FLEET_SUCCESSOR_SETTLE_MS) {
-  throw new Error('fleet restart wait must cover PM2 kill timeout plus successor quiet window');
+if (FLEET_DAEMON_EXIT_WAIT_MS <= FLEET_DAEMON_KILL_TIMEOUT_MS + FLEET_SUCCESSOR_SETTLE_MS) {
+  throw new Error('fleet restart wait must cover fleet supervisor killTimeoutMs plus successor quiet window');
 }

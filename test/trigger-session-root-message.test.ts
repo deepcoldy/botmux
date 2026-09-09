@@ -48,14 +48,13 @@ const mockQueuedTailAdmission = vi.fn();
 const activeKeyLocks = vi.hoisted(() => ({
   byMap: new WeakMap<Map<string, any>, Map<string, Promise<void>>>(),
 }));
-vi.mock('../src/core/worker-pool.js', () => ({
+vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
+  return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
-    const gated = ds.session.queuedActivationPending === true
-      || (ds.session.queuedActivationTail?.length ?? 0) > 0
-      || (ds.initialStartPending === true && ds.session.queuedActivationInput !== undefined);
-    if (gated) return mockQueuedTailAdmission(ds, payload, turnId, opts);
+    if (actual.hasQueuedActivationAdmissionGate(ds)) return mockQueuedTailAdmission(ds, payload, turnId, opts);
     ds.worker.send({
       type: 'message',
       content: typeof payload === 'string' ? payload : payload.content,
@@ -69,9 +68,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
     });
     return true;
   },
-  hasQueuedActivationAdmissionGate: (ds: any) => ds.session.queuedActivationPending === true
-    || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.initialStartPending === true && ds.session.queuedActivationInput !== undefined),
+  hasQueuedActivationAdmissionGate: actual.hasQueuedActivationAdmissionGate,
+  admitQueuedActivationTail: actual.admitQueuedActivationTail,
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
   withActiveSessionKeyLock: vi.fn(async (map: Map<string, any>, key: string, action: () => any) => {
     let locks = activeKeyLocks.byMap.get(map);
@@ -98,7 +96,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   },
   closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })),
   getDaemonBootId: () => 'test-boot-id',
-}));
+  };
+});
 
 const mockRememberLastCliInput = vi.fn();
 const mockGetAvailableBots = vi.fn(async () => []);
@@ -132,7 +131,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
-import { withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { admitQueuedActivationTail, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 
 const APP = 'app1';
@@ -181,22 +180,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
     mockGetMessageChatId.mockResolvedValue(CHAT);
     mockQueuedTailAdmission.mockImplementation((ds: any, payload: any, turnId?: string, opts: any = {}) => {
-      const order = (ds.session.queuedActivationTailNextOrder ?? 0) + 1;
-      ds.session.queuedActivationTailNextOrder = order;
-      ds.session.queuedActivationTail = [
-        ...(ds.session.queuedActivationTail ?? []),
-        {
-          id: `tail-${order}`,
-          order,
-          userPrompt: typeof payload === 'string' ? payload : payload.content,
-          cliInput: typeof payload === 'string' ? { content: payload } : payload,
-          turnId: turnId ?? `tail-turn-${order}`,
-          ...(opts.dispatchAttempt !== undefined
-            ? { dispatchAttempt: opts.dispatchAttempt }
-            : {}),
-        },
-      ];
-      mockUpdateSession(ds.session);
+      admitQueuedActivationTail(ds, {
+        userPrompt: typeof payload === 'string' ? payload : payload.content,
+        cliInput: typeof payload === 'string' ? { content: payload } : payload,
+        turnId: turnId ?? `tail-turn-${(ds.session.queuedActivationTail?.length ?? 0) + 1}`,
+        ...(opts.dispatchAttempt !== undefined
+          ? { dispatchAttempt: opts.dispatchAttempt }
+          : {}),
+      });
       return true;
     });
     mockCreateSession.mockImplementation((chatId: string, rootMessageId: string, title: string, chatType: 'group' | 'p2p') => ({
