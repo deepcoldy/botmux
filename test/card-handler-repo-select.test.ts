@@ -221,8 +221,14 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
 function makeDeps(ds: DaemonSession, projects = PROJECTS) {
   const activeSessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
   const sessionReply = vi.fn(async () => 'om_reply');
-  const deps: CardHandlerDeps = { activeSessions, sessionReply, lastRepoScan: new Map([[CHAT_ID, projects]]) };
-  return { deps, sessionReply };
+  const noteTurnReceived = vi.fn(async () => {});
+  const deps: CardHandlerDeps = {
+    activeSessions,
+    sessionReply,
+    lastRepoScan: new Map([[CHAT_ID, projects]]),
+    noteTurnReceived,
+  };
+  return { deps, sessionReply, noteTurnReceived };
 }
 
 function makeSelectEvent(key: 'repo_switch' | 'repo_worktree', path: string) {
@@ -534,6 +540,20 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
+  it('reacts on the original pending turn after repo selection starts the CLI', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'implement feature',
+      pendingTurnId: 'om_original_turn',
+      worker: null,
+    });
+    const { deps, noteTurnReceived } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_original_turn');
+  });
+
   it('raw-passthrough cold start does NOT mark the first turn pending', async () => {
     // `/goal …` owns the first turn (delivered literally on prompt_ready), so
     // this is not an "empty start awaiting its first user turn".
@@ -544,12 +564,14 @@ describe('repo select card — plain switch', () => {
       pendingRawTurnId: 'om_goal_first',
       worker: null,
     });
-    const { deps } = makeDeps(ds);
+    const { deps, noteTurnReceived } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
 
     expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(noteTurnReceived).not.toHaveBeenCalled();
     expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+    expect(ds.pendingRawTurnId).toBe('om_goal_first');
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 

@@ -757,6 +757,8 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     activationToken: string,
   ) => boolean | void | Promise<boolean | void>;
+  /** A delayed cold-start raw input crossed the worker IPC acceptance boundary. */
+  onRawInputAccepted?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -12108,7 +12110,7 @@ function setupWorkerHandlers(
           const followUpCodexAppInput = followUp?.codexAppInputGateFrozen
             ? followUp.codexAppInput
             : codexAppInputForSession(ds, followUp?.codexAppInput);
-          sendWorkerSessionInput(ds, {
+          const accepted = sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
             // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
@@ -12125,6 +12127,9 @@ function setupWorkerHandlers(
               ? { queuedActivationToken: ds.session.queuedActivationToken }
               : {}),
           });
+          if (accepted && rawTurnId) {
+            void requireCallbacks().onRawInputAccepted?.(ds, rawTurnId);
+          }
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
             content: followUp.cliInput,
