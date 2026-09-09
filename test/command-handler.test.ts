@@ -521,6 +521,12 @@ vi.mock('../src/services/platform-team-store.js', () => ({
   isPlatformTeamBot: vi.fn(() => false),
 }));
 
+vi.mock('../src/services/worktree-cleanup-store.js', () => ({
+  putWorktreeCleanupJob: vi.fn((_: string, input: any) => ({ ...input, id: 'cleanup-123', createdAt: 1, updatedAt: 1 })),
+  getWorktreeCleanupJob: vi.fn(() => undefined),
+  deleteWorktreeCleanupJob: vi.fn(() => true),
+}));
+
 vi.mock('../src/services/card-mode-store.js', () => ({
   setCardMode: vi.fn(async () => ({ ok: true })),
 }));
@@ -561,6 +567,7 @@ import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-ev
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
 import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
 import { isPlatformTeamBot } from '../src/services/platform-team-store.js';
@@ -583,7 +590,8 @@ import { bindOncall } from '../src/services/oncall-store.js';
 import { putVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
@@ -629,6 +637,19 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     cliId: 'claude-code',
     ...overrides,
   };
+}
+
+function closeWorktreeState(
+  sessionId: string,
+  siblingSessionIds: string[] = [],
+  safetyFingerprint = 'clean-state',
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    sessionId,
+    worktreeDir: resolve('/home/testuser/project-wt-task'),
+    siblingSessionIds: [...siblingSessionIds].sort(),
+    safetyFingerprint,
+  })).digest('hex');
 }
 
 function makeDaemonSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -706,7 +727,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/close', '/cleanup-wt', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -739,10 +760,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 39 = master 的 36 条 + /quote + /sessions + /project。
+    // 40 = master 的 36 条 + /quote + /sessions + /project + /cleanup-wt。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(39);
+    expect(DAEMON_COMMANDS.size).toBe(40);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -999,6 +1020,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/project')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/skills')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/sessions')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/cleanup-wt')).toBe(true);
   });
 
   it('is a subset of DAEMON_COMMANDS (they are still daemon-handled)', () => {
@@ -2345,6 +2367,42 @@ describe('handleCommand', () => {
 
 
 
+    it('persists a retry job when final worktree removal fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(removeRepoWorktree).mockRejectedValueOnce(new Error('worktree busy'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task',
+        error: 'worktree busy',
+      }));
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('/cleanup-wt cleanup-123');
+    });
+
+    it('retries a durable cleanup job without an active session', async () => {
+      const deps = makeDeps(undefined);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(getWorktreeCleanupJob).mockReturnValueOnce({
+        id: 'cleanup-123', larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project', worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'clean-state', error: 'busy', createdAt: 1, updatedAt: 1,
+      });
+
+      await handleCommand('/cleanup-wt', ROOT_ID, makeLarkMessage('/cleanup-wt cleanup-123'), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      expect(deleteWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), 'cleanup-123');
+    });
+
     it('`/close wt` closes the session and removes a linked worktree', async () => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';
@@ -2352,7 +2410,7 @@ describe('handleCommand', () => {
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
 
       expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
       expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
@@ -2404,6 +2462,26 @@ describe('handleCommand', () => {
       );
     });
 
+    it('`/close wt --yes` without a confirmation state never deletes even a clean worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('confirmation_state'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('`/close wt --yes` refuses to close a cross-bot sibling outside the trusted team', async () => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';
@@ -2443,7 +2521,7 @@ describe('handleCommand', () => {
       })));
 
       try {
-        await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-remote'])}`), deps, LARK_APP_ID);
       } finally {
         vi.unstubAllGlobals();
       }
@@ -2463,7 +2541,7 @@ describe('handleCommand', () => {
         { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
       ]);
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
 
       expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
       expect(closeSession).toHaveBeenCalledWith('sibling-1');
@@ -2506,7 +2584,7 @@ describe('handleCommand', () => {
         .mockResolvedValueOnce({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })
         .mockResolvedValueOnce({ dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'], ahead: 0, unpushedCommits: [], fingerprint: 'changed-state' });
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, [], 'clean-state')}`), deps, LARK_APP_ID);
 
       expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
       expect(removeRepoWorktree).not.toHaveBeenCalled();
@@ -2528,7 +2606,7 @@ describe('handleCommand', () => {
         .mockResolvedValueOnce({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })
         .mockResolvedValueOnce({ ok: false, alreadyClosed: false, error: 'remote_close_failed', retryable: true });
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
 
       expect(closeSession).toHaveBeenCalledWith('sibling-1');
       expect(removeRepoWorktree).not.toHaveBeenCalled();
@@ -2558,7 +2636,7 @@ describe('handleCommand', () => {
       }), { status: 200, headers: { 'content-type': 'application/json' } })));
 
       try {
-        await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-remote'])}`), deps, LARK_APP_ID);
       } finally {
         vi.unstubAllGlobals();
       }

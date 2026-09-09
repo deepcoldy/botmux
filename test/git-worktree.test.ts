@@ -363,6 +363,26 @@ describe('worktreeSafetyStatus', () => {
     expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  it('changes the fingerprint when staged content changes but the worktree bytes stay the same', async () => {
+    const repo = makeUpstream('index-fingerprint');
+    const file = join(repo, 'staged.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'staged.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    writeFileSync(file, 'first staged value\n');
+    git(repo, 'add', 'staged.txt');
+    writeFileSync(file, 'same worktree value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second staged value\n');
+    git(repo, 'add', 'staged.txt');
+    writeFileSync(file, 'same worktree value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
   it('changes the fingerprint when an already-dirty file content changes', async () => {
     const repo = makeUpstream('content-fingerprint');
     const file = join(repo, 'dirty.txt');

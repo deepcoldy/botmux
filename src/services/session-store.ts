@@ -543,6 +543,7 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
+  opts: { strict?: boolean } = {},
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
@@ -568,7 +569,17 @@ function readStoreActiveRows(
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
     for (const r of rows) {
-      try { out.push(JSON.parse(r.row) as Session); } catch { /* skip unparseable row */ }
+      try {
+        const session = JSON.parse(r.row) as Session;
+        if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
+          throw new Error('invalid session object');
+        }
+        out.push(session);
+      } catch (err) {
+        if (opts.strict) {
+          throw new Error(`malformed active session row in ${ref.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
     return out;
   } finally {
@@ -2344,7 +2355,9 @@ export function findActiveSessionsByWorkingDirStrict(workingDir: string): Sessio
   for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
   for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
     if (ref.appId === currentAppId) continue;
-    for (const session of readStoreActiveRows(ref)) if (matchesDir(session)) matches.push(session);
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      if (matchesDir(session)) matches.push(session);
+    }
   }
   return matches;
 }

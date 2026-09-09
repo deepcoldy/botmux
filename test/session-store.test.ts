@@ -1387,6 +1387,25 @@ describe('findActiveSessionsByWorkingDirStrict()', () => {
     expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
       .toThrow(/simulated readdir denial/);
   });
+
+  it('fails closed when another SQLite store has a malformed active row', () => {
+    init('app-A');
+    const session = createSession('chat1', 'root-a', 'Bot A');
+    const dbPath = persistedStorePath(tempDir, 'app-A');
+    expect(dbPath?.endsWith('.db')).toBe(true);
+    const db = new DatabaseSync(dbPath!);
+    try {
+      db.prepare("UPDATE sessions SET row = ? WHERE session_id = ?")
+        .run('{}', session.sessionId);
+    } finally {
+      db.close();
+    }
+
+    init('app-B');
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/malformed active session row/i);
+  });
 });
 
 describe('findActiveSessionsByRoot()', () => {

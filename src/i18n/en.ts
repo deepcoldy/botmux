@@ -758,6 +758,7 @@ export const messages: Record<string, string> = {
   // ─── /help ───────────────────────────────────────────────────────────────
   'help.heading_session': '📌 Session management:',
   'help.close': '/close      - Close current session, kill {cliName}',
+  'help.cleanup_wt': '/cleanup-wt <ID> - Retry a failed worktree cleanup job',
   'help.restart': '/restart    - Restart {cliName} (keep session)',
   'help.topic': '/t [text]  (alias /topic) - Start a topic in a regular group; text becomes the first task (work starts after repo selection when needed); bare /t opens setup (repo picker when needed, otherwise waits for the next task or /repo); /t /repo ... selects a repo up front',
   'help.cd': '/cd <path>  - Change working dir and restart {cliName}',

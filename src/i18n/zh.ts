@@ -756,6 +756,7 @@ export const messages: Record<string, string> = {
   // ─── /help ───────────────────────────────────────────────────────────────
   'help.heading_session': '📌 会话管理：',
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
+  'help.cleanup_wt': '/cleanup-wt <ID> - 重试失败的 worktree 清理任务',
   'help.restart': '/restart    - 重启 {cliName} 进程（保留 session）',
   'help.topic': '/t [内容]  (别名 /topic) - 普通群内新开话题；带内容作为首轮任务（需选仓则选择后开工）；裸命令进入话题设置（需选仓则弹卡，否则等待下一条任务或 /repo）；可用 /t /repo ... 直接选仓',
   'help.cd': '/cd <path>  - 切换工作目录并重启 {cliName} 进程',

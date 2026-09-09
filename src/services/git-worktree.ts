@@ -457,8 +457,12 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
     }
     contentRows.push(`${path}\0${digest}`);
   }
+  // The worktree bytes do not reveal the staged blob when a path is modified
+  // again after `git add`. Hash the index tree as a separate snapshot so a
+  // stage-only change invalidates an earlier destructive confirmation too.
+  const indexTree = await git(['write-tree'], dir, 10_000);
   const fingerprint = createHash('sha256')
-    .update(JSON.stringify({ head, upstream: upstream ?? '', status, contentRows, ahead, unpushedCommits }))
+    .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, status, contentRows, ahead, unpushedCommits }))
     .digest('hex');
   return { dirty: status.length > 0, dirtyCount: allDirtyFiles.length, dirtyFiles, ahead, unpushedCommits, fingerprint };
 }

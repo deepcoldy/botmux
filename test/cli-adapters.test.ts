@@ -2366,6 +2366,11 @@ describe('busyPattern', () => {
       'Tasks (1 active)',
       '  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens',
     ].join('\n'))).toBe(true);
+    expect(busy.test([
+      'Tasks (1 active, 1 done)',
+      '  ✔ Explore  Located the affected adapter',
+      '  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens',
+    ].join('\n'))).toBe(true);
     // A copied task row in transcript prose is not live panel state.
     expect(busy.test('  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens')).toBe(false);
     expect(busy.test([

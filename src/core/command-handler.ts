@@ -125,6 +125,7 @@ import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
+import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
@@ -145,7 +146,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -1874,6 +1875,56 @@ export async function handleCommand(
         }
         break;
       }
+      case '/cleanup-wt': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const cleanupId = message.content.replace(/^\/cleanup-wt\s*/i, '').trim();
+        if (!appId || !cleanupId) {
+          await sessionReply(rootId, '用法：`/cleanup-wt <id>`');
+          break;
+        }
+        if (!canOperate(appId, message.chatId ?? ds?.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
+          break;
+        }
+        let job;
+        try {
+          job = getWorktreeCleanupJob(config.session.dataDir, cleanupId);
+        } catch (err) {
+          await sessionReply(rootId, `⚠️ 无法读取 worktree 清理任务：${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
+        if (!job || job.larkAppId !== appId) {
+          await sessionReply(rootId, '未找到该 worktree 清理任务。');
+          break;
+        }
+        try {
+          const containingRoot = await worktreeRootFor(job.worktreeDir);
+          const main = containingRoot ? await mainWorktreeFor(containingRoot) : undefined;
+          if (!containingRoot || resolve(containingRoot) !== resolve(job.worktreeDir)
+            || resolve(main ?? '') !== resolve(job.worktreeMain)
+            || !(await isLinkedWorktree(containingRoot))) {
+            await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
+            break;
+          }
+          const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
+          if (active.length > 0) {
+            await sessionReply(rootId, `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`);
+            break;
+          }
+          const safety = await worktreeSafetyStatus(job.worktreeDir);
+          if (safety.fingerprint !== job.safetyFingerprint) {
+            await sessionReply(rootId, '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。');
+            break;
+          }
+          await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
+          deleteWorktreeCleanupJob(config.session.dataDir, job.id);
+          await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
+        } catch (err) {
+          await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+
       case '/close': {
         const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
         const closeTokens = closeArg.split(/\s+/).filter(Boolean);
@@ -1971,25 +2022,10 @@ export async function handleCommand(
               siblingSessionIds: siblingSessions.map(s => s.sessionId),
               safetyFingerprint: safety.fingerprint,
             });
-            if (confirmedWorktreeCleanup && expectedWorktreeState && expectedWorktreeState !== confirmationState) {
-              await sessionReply(rootId, t('cmd.close.worktree_state_changed', undefined, loc));
-              await sessionReply(rootId, buildCloseWorktreeConfirmCard({
-                rootId,
-                sessionId: ds.session.sessionId,
-                worktreeDir,
-                sessions: [ds.session, ...siblingSessions],
-                dirty: safety.dirty,
-                dirtyCount: safety.dirtyCount,
-                dirtyFiles: safety.dirtyFiles,
-                ahead: safety.ahead,
-                unpushedCommits: safety.unpushedCommits,
-                invokerOpenId: message.senderId,
-                confirmationState,
-                loc,
-              }), 'interactive');
-              break;
-            }
-            if ((siblingSessions.length > 0 || safety.dirty || safety.ahead > 0) && !confirmedWorktreeCleanup) {
+            if (!confirmedWorktreeCleanup || expectedWorktreeState !== confirmationState) {
+              if (confirmedWorktreeCleanup) {
+                await sessionReply(rootId, t('cmd.close.worktree_state_changed', undefined, loc));
+              }
               await sessionReply(rootId, buildCloseWorktreeConfirmCard({
                 rootId,
                 sessionId: ds.session.sessionId,
@@ -2174,7 +2210,19 @@ export async function handleCommand(
               await removeRepoWorktree(worktreeMain, worktreeDir);
               await sessionReply(rootId, t('cmd.close.worktree_removed', { path: worktreeDir, count: closedSiblings }, loc));
             } catch (err) {
-              await sessionReply(rootId, t('cmd.close.worktree_remove_failed', { path: worktreeDir, error: err instanceof Error ? err.message : String(err) }, loc));
+              const error = err instanceof Error ? err.message : String(err);
+              const job = putWorktreeCleanupJob(config.session.dataDir, {
+                larkAppId: ds.larkAppId,
+                worktreeMain,
+                worktreeDir,
+                safetyFingerprint: finalSafety.fingerprint,
+                error,
+              });
+              await sessionReply(
+                rootId,
+                `${t('cmd.close.worktree_remove_failed', { path: worktreeDir, error }, loc)}\n`
+                + `已保存清理任务，可稍后发送 \`/cleanup-wt ${job.id}\` 重试。`,
+              );
             }
           }
           logger.info(`[${logTag}] Session closed by /close command${removeWorktree ? ' with worktree cleanup' : ''}`);
@@ -5317,6 +5365,7 @@ export async function handleCommand(
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
+          t('help.cleanup_wt', undefined, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),
