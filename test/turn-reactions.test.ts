@@ -302,6 +302,26 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions).toEqual([]);
   });
 
+  it('idle settlement waits for a post-acceptance reaction registration', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    let release!: () => void;
+    const registration = new Promise<void>((resolve) => { release = resolve; });
+    ds.pendingAckReactionRegistrations = new Set([registration]);
+
+    const finish = finishTurnReactions(ds);
+    await Promise.resolve();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_fast', 'DONE');
+
+    ds.pendingAckReactions = [{ messageId: 'om_fast', reactionId: 'rid_fast' }];
+    release();
+    await finish;
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_fast', 'rid_fast');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_fast', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
   it('finishTurnReactions with no pending acks is a no-op', async () => {
     const ds = makeDs();
     await finishTurnReactions(ds);

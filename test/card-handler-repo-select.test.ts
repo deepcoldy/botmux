@@ -1994,9 +1994,10 @@ describe('auto-worktree detached commit admission', () => {
     const ds = makeDs({
       pendingRepo: true,
       pendingPrompt: 'delayed first turn',
+      pendingTurnId: 'om_auto_worktree_turn',
       worker: null,
     });
-    const { deps } = makeDeps(ds);
+    const { deps, noteTurnReceived } = makeDeps(ds);
     const { activeSessions } = deps;
     const worktreeReady = deferred<{ dir: string }>();
     vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(worktreeReady.promise);
@@ -2009,6 +2010,7 @@ describe('auto-worktree detached commit admission', () => {
       prompt: 'delayed first turn',
       activeSessions,
       notify: vi.fn(),
+      noteTurnReceived,
     });
     await vi.waitFor(() => expect(maybeCreateDefaultWorktree).toHaveBeenCalledOnce());
 
@@ -2022,6 +2024,7 @@ describe('auto-worktree detached commit admission', () => {
     finishMutation.resolve();
     await Promise.all([mutation, detached]);
     expect(forkWorker).toHaveBeenCalledOnce();
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_auto_worktree_turn');
     expect(ds.workingDir).toBe('/repos/alpha-wt');
   });
 });

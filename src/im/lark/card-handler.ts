@@ -165,7 +165,9 @@ export interface CardHandlerDeps {
       messageId: string;
       replyRootId?: string;
     },
-  ) => void;
+  ) => void | Promise<void>;
+  /** Prepare per-turn credentials before a pending repo selection reaches the CLI. */
+  prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
   /** Register the original Lark turn after a pending repo selection starts its CLI. */
   noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
 }
@@ -452,6 +454,7 @@ export async function commitRepoSelection(
     operatorOpenId?: string;
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+    prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
     noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
   },
   dirPath: string,
@@ -466,7 +469,7 @@ export async function commitRepoSelection(
     riffRepoDirs?: string[];
   },
 ): Promise<boolean> {
-  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, noteTurnReceived } = ctx;
+  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn, noteTurnReceived } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -632,6 +635,7 @@ export async function commitRepoSelection(
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+      if (pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
       forkWorker(
         ds,
         prompt,
@@ -903,12 +907,14 @@ export async function runAutoWorktreeCommit(deps: {
   operatorOpenId?: string;
   activeSessions: Map<string, DaemonSession>;
   notify: (message: string) => Promise<unknown> | void;
+  prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
+  noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
   force?: boolean;
   worktreePath?: string;
   branch?: string;
   reuseExisting?: boolean;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, force, worktreePath, branch, reuseExisting } = deps;
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, noteTurnReceived, force, worktreePath, branch, reuseExisting } = deps;
   ds.worktreeCreating = true;
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
@@ -946,6 +952,8 @@ export async function runAutoWorktreeCommit(deps: {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
+        prepareTurn,
+        noteTurnReceived,
       },
       wt.dir,
       pathBasename(wt.dir),
@@ -3978,7 +3986,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (!deps.deliverPassthroughCommand) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
       }
-      deps.deliverPassthroughCommand(ds, '/compact', {
+      await deps.deliverPassthroughCommand(ds, '/compact', {
         anchor: sessionAnchorId(ds),
         senderOpenId: operatorOpenId,
         senderIsBot: false,
@@ -4061,7 +4069,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // helper gives this card path the bot mutation, exact-owner recheck,
         // buffered-sidecar handling, and fork-before-release ordering.
         const started = await commitRepoSelection(
-          { ds, rootId, cardMessageId, larkAppId: larkAppId ?? ds.larkAppId, operatorOpenId, activeSessions, sessionReply, noteTurnReceived: deps.noteTurnReceived },
+          { ds, rootId, cardMessageId, larkAppId: larkAppId ?? ds.larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn: deps.prepareTurn, noteTurnReceived: deps.noteTurnReceived },
           cwd,
           cwd,
           {
@@ -4106,7 +4114,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedPath = validation.resolvedPath;
       const displayName = pathBasename(selectedPath) || selectedPath;
       await commitRepoSelection(
-        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, noteTurnReceived: deps.noteTurnReceived },
+        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn: deps.prepareTurn, noteTurnReceived: deps.noteTurnReceived },
         selectedPath,
         displayName,
       );
@@ -4369,7 +4377,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Shared commit context for a resolved directory — funnels the dropdown,
   // worktree and manual-entry flows through the same module-level
   // commitRepoSelection (pin dir, then fork pending CLI or close+recreate).
-  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, noteTurnReceived: deps.noteTurnReceived };
+  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn: deps.prepareTurn, noteTurnReceived: deps.noteTurnReceived };
 
   if (isWorktreeOpen) {
     // Worktree creation involves a `git fetch` that can take many seconds —
