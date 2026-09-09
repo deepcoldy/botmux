@@ -314,8 +314,14 @@ function previewMatchesFinal(previewText: string, finalNormalized: string): bool
  */
 function markerSetDuplicatesFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
   const finalNormalized = normaliseForFingerprint(finalText ?? '');
-  // Nothing deliverable: there is no answer to protect, keep the old behaviour.
-  if (!finalNormalized) return true;
+  // Empty final. This is NOT only "the model said nothing": emitReadyCodexTurns
+  // re-runs this gate for SYNTHESISED failure cards / empty-turn diagnostics,
+  // whose visible text lives in `content`, never in finalText. Suppressing them
+  // unconditionally would swallow the failure reason on a turn where the model
+  // sent nothing at all — and it would not even match `send`, which delivers on
+  // "empty final + zero markers" (markerSetCoversFinal returns false there).
+  // So mirror that: suppress only when something actually went out this turn.
+  if (!finalNormalized) return markers.length > 0;
   return markers.some(marker => {
     if (marker.contentLength !== finalNormalized.length) return false;
     return marker.previewText === undefined
@@ -452,15 +458,16 @@ export function structuredFallbackKind(
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
   hasDedicatedRateLimitChain: boolean,
+  replyDelivery: 'send' | 'transcript' = 'send',
 ): StructuredFallbackKind {
   const rateLimitHandled = hasDedicatedRateLimitChain
     && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
   if (!rateLimitHandled
-    && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
+    && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode, replyDelivery)) {
     return 'failed';
   }
   if (turn.finalText && turn.finalText.trim()) return 'final';
-  if (shouldEmitEmptyCompletedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
+  if (shouldEmitEmptyCompletedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode, replyDelivery)) {
     return 'empty_completed';
   }
   return 'none';

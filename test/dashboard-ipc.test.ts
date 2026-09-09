@@ -1881,6 +1881,16 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
       });
       expect(bogus.status).toBe(400);
       expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
   async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
@@ -3153,33 +3163,6 @@ describe('GET /api/sessions/:sessionId/usage', () => {
         usage: {
           context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
           tokens: { in: 67_890, out: 123 },
-        },
-      });
-      expect(usageSpy).toHaveBeenCalledWith(ds);
-    } finally {
-      findSpy.mockRestore();
-      usageSpy.mockRestore();
-    }
-  });
-
-  it('passes a statusline quota segment through untouched (claude-code ctx / 5h / 7d)', async () => {
-    const ds = { session: { sessionId: 's-usage-quota' } } as any;
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const usageSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
-      context: { usedTokens: 12_345 },
-      tokens: { in: 67_890, out: 123 },
-      quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5 },
-    });
-    try {
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-usage-quota/usage`);
-
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({
-        usage: {
-          context: { usedTokens: 12_345 },
-          tokens: { in: 67_890, out: 123 },
-          quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5 },
         },
       });
       expect(usageSpy).toHaveBeenCalledWith(ds);

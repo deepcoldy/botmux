@@ -551,6 +551,19 @@ describe('shouldSuppressBridgeEmit', () => {
       )).toBe(false);
     });
 
+    it('an empty final is delivered when nothing was sent — synthesised failure cards depend on it', () => {
+      // emitReadyCodexTurns re-runs this gate for synthesised failure / empty-turn
+      // diagnostics, whose visible text is in `content`, not finalText. Suppressing
+      // on empty finalText would swallow the failure reason — and would not even
+      // match send mode, which delivers on "empty final + zero markers".
+      const empty = { markTimeMs: 100, isLocal: false, finalText: '' };
+      expect(shouldSuppressBridgeEmit(empty, 200, [], false, 'transcript')).toBe(false);
+      expect(shouldSuppressBridgeEmit(empty, 200, [], false)).toBe(false);  // send parity
+      // But a mid-turn send in the window still suppresses, same as send mode.
+      const markers = [realMarker(150, '进度更新')];
+      expect(shouldSuppressBridgeEmit(empty, 200, markers, false, 'transcript')).toBe(true);
+    });
+
     it('a bare sentinel final stays suppressed in transcript mode too', () => {
       expect(shouldSuppressBridgeEmit(
         { markTimeMs: 100, isLocal: false, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
