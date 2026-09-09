@@ -4144,12 +4144,14 @@ function forceTopicCommandLabel(content: string): '/t' | '/topic' {
 }
 
 
-function forceTopicWorktreeTarget(baseDir: string, anchor: string): { worktreePath: string; branch: string } {
+async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promise<{ worktreePath: string; branch: string }> {
+  const { mainWorktreeFor } = await import('./services/git-worktree.js');
+  const repoRoot = await mainWorktreeFor(baseDir);
   const short = createHash('sha1').update(anchor).digest('hex').slice(0, 12);
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(baseDir), `${basename(baseDir)}-wt-botmux-${short}`),
+    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
   };
 }
 
@@ -18999,7 +19001,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     const sharedWorktree = forceTopic?.mode === 'worktree'
-      ? forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
+      ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
       : undefined;
     startAutoWorktreePending(ds, {
       anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
