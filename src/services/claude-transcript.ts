@@ -762,6 +762,9 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
@@ -783,12 +786,21 @@ function stringifyToolResultContent(content: unknown): string {
 /**
  * Extract the CoT (thinking process) entries from one transcript event, in
  * content-block order:
- *   - assistant events → `thinking` blocks and `tool_use` blocks
- *     (id + name + JSON-stringified input, truncated);
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
  *   - user events → `tool_result` blocks (tool_use_id + flattened text,
  *     truncated).
  * Returns [] for events carrying neither. Sidechain / error filtering is the
  * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
  */
 export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
   const content = event.message?.content;
@@ -798,6 +810,8 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (!block || typeof block !== 'object') continue;
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
       // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
       const subject = boundSubjectForTransport(subjectFromInputObject(block.input));

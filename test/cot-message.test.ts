@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
+import { t, localeForBot } from '../src/i18n/index.js';
 
 // Orphan markers land under config.session.dataDir — point it at a tmp dir so
 // tests never touch the packaged data directory.
@@ -42,6 +43,9 @@ const makeDs = (over: any = {}): any => ({
 });
 
 const think = (text: string): any => ({ kind: 'thinking', text });
+const say = (text: string): any => ({ kind: 'text', text });
+/** Same source as the renderer, so the assertion is locale-independent. */
+const placeholder = (): string => t('cot.thinking_placeholder', undefined, localeForBot('app1'));
 const upd = (entries: any[], turnId = 'om_turn1'): any => ({ type: 'thinking_update', entries, turnId });
 
 /** All PUT event batches flattened to [event_type, parsed content] pairs. */
@@ -211,6 +215,75 @@ describe('handleCotThinkingUpdate', () => {
     expect(start2.content.icon).toBe('search');
     expect(events.filter(e => e.type === 'TOOL_CALL_ARGS').length).toBe(1);
     expect(events.filter(e => e.type === 'TOOL_CALL_END').map(e => e.content.toolCallId)).toEqual(['toolu_1', 'toolu_2']);
+  });
+
+  it('renders interim assistant narration (text entries) as reasoning nodes, in transcript order', async () => {
+    const ds = makeDs();
+    // Extended thinking OFF is Claude Code's default: the turn carries text
+    // blocks and tool calls, no thinking at all. Both kinds must reach the
+    // bubble, interleaved exactly as the transcript ordered them.
+    handleCotThinkingUpdate(ds, upd([
+      say('先看一眼配置'),
+      { kind: 'tool_call', id: 'x1', name: 'Read', args: '{"file_path":"/a/b.json"}' },
+      { kind: 'tool_result', id: 'x1', result: '{}' },
+      say('确认了，改这里'),
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual(['先看一眼配置', '确认了，改这里']);
+    // The narration node is a real reasoning node — the tool hangs under it,
+    // so no placeholder is needed.
+    const start = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!;
+    expect(start.content.parentMessageId).toBeDefined();
+    expect(deltas).not.toContain(placeholder());
+  });
+
+  it('opens with a placeholder reasoning node when the turn starts straight into tooling', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'p1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'p1', result: 'a' },
+      { kind: 'tool_call', id: 'p2', name: 'Bash', args: '{"command":"pwd"}' },
+    ]));
+    await flush();
+    const events = pushedEvents();
+    // Placeholder is emitted BEFORE the first tool node, once only...
+    const deltas = events.filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual([placeholder()]);
+    expect(events.findIndex(e => e.type === 'REASONING_MESSAGE_START'))
+      .toBeLessThan(events.findIndex(e => e.type === 'TOOL_CALL_START'));
+    // ...and every tool node hangs under it, including the second one.
+    const parents = events.filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.parentMessageId);
+    expect(parents).toHaveLength(2);
+    expect(new Set(parents).size).toBe(1);
+    expect(parents[0]).toBeDefined();
+  });
+
+  it('never inserts the placeholder when real thinking leads the turn', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      think('先想清楚'),
+      { kind: 'tool_call', id: 'q1', name: 'Bash', args: '{"command":"ls"}' },
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual(['先想清楚']);
+  });
+
+  it('inserts the placeholder only once across incremental updates of the same turn', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([{ kind: 'tool_call', id: 'i1', name: 'Bash', args: '' }]));
+    await flush();
+    // Cumulative list grows; the already-sent entries are not re-pushed, and
+    // the placeholder must not reappear ahead of the newly arrived tool.
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'i1', name: 'Bash', args: '' },
+      { kind: 'tool_result', id: 'i1', result: 'ok' },
+      { kind: 'tool_call', id: 'i2', name: 'Bash', args: '' },
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual([placeholder()]);
   });
 
   /**

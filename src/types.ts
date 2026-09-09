@@ -1339,11 +1339,22 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   : never;
 
 /** One node of the native CoT (thinking process) message, in transcript
- *  order. `thinking` renders as a reasoning paragraph; `tool_call` /
- *  `tool_result` render as the tool timeline (icon + args + result). The
- *  worker truncates args/results before shipping. */
+ *  order. `thinking` (the model's private reasoning) and `text` (the interim
+ *  narration it writes between tool calls) both render as reasoning
+ *  paragraphs; `tool_call` / `tool_result` render as the tool timeline
+ *  (icon + args + result). The worker truncates args/results before shipping.
+ *
+ *  `thinking` and `text` stay SEPARATE kinds even though today's renderer
+ *  treats them alike: only their distinction lets the bubble tell「模型在想」
+ *  from「模型在说」, and the placeholder logic keys off a turn having neither
+ *  at its head. Extended thinking is off by default on Claude Code, so a
+ *  plain turn ships `text` + tools and no `thinking` at all. */
 export type CotEntry =
   | { kind: 'thinking'; text: string }
+  /** Assistant narration addressed to the user, mid-turn. Not reasoning —
+   *  it is the running commentary a long agentic turn writes between tool
+   *  calls, dropped from the final reply card by `trailingAssistantText`. */
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 转写层从**未截断**的完整 input 提取的单行主题（command / file_path /
