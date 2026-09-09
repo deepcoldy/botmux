@@ -1,9 +1,9 @@
-import * as pty from 'node-pty';
 import { chmodSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { ptyRuntime, spawnPty, type PtyHandle } from './pty-spawn.js';
 
 // npx may strip execute bits from prebuilt binaries — fix before first spawn.
 try {
@@ -14,8 +14,11 @@ try {
   if (!(mode & 0o111)) chmodSync(helper, mode | 0o755);
 } catch { /* best effort */ }
 
+// 真正的 spawn 在 pty-spawn.ts 里按运行时分流：Node 走 node-pty，Bun（含编译版
+// 单文件二进制）走 Bun 原生 PTY——node-pty 在 Bun 下会让子进程 spawn 即 SIGHUP，
+// 原因见那个文件的头注释。
 export class PtyBackend implements SessionBackend {
-  private process: pty.IPty | null = null;
+  private process: PtyHandle | null = null;
 
   /** Claude Code session JSONL path — set by worker for claude-code sessions so
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
@@ -30,9 +33,9 @@ export class PtyBackend implements SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     logger.debug(
       `[pty] spawn bin=${bin} args=${JSON.stringify(args)} ` +
-      `cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
+      `cwd=${opts.cwd} ${opts.cols}x${opts.rows} runtime=${ptyRuntime()}`,
     );
-    this.process = pty.spawn(bin, args, {
+    this.process = spawnPty(bin, args, {
       name: 'xterm-256color',
       cols: opts.cols,
       rows: opts.rows,
@@ -62,9 +65,7 @@ export class PtyBackend implements SessionBackend {
 
   /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
   onExit(cb: (code: number | null, signal: string | null) => void): void {
-    this.process?.onExit(({ exitCode, signal }) => {
-      cb(exitCode, signal !== undefined ? String(signal) : null);
-    });
+    this.process?.onExit(cb);
   }
 
   getChildPid(): number | null {

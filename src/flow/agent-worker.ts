@@ -89,6 +89,11 @@ export function serveAgentWorker(transport: AgentTransport, deps: AgentWorkerDep
         const adapter = await createAdapter(input.cli as CliId, input.cliPath);
         if (adapter.id === 'claude-code') ensureClaudeFolderTrust(input.cwd, adapter.claudeStateJsonPath);
         const env: Record<string, string> = { ...input.env, [FLOW_ATTEMPT_ENV_KEY]: `${input.runId}/${input.identity}/${input.gen}-${input.attempt}` };
+        // 与 worker 的会话 spawn 同一条规则：Claude 家族在 root/sudo 下拒绝
+        // --dangerously-skip-permissions 并立即退出（真 CLI 冒烟踩过：屏幕只有一行红字，
+        // 归为 spawn_failed）。flow 同样没法交互审批，root 时走 IS_SANDBOX=1 逃生舱；
+        // 已显式设置的不覆盖。
+        if (adapter.claudeDataDir && process.getuid?.() === 0 && env.IS_SANDBOX === undefined) env.IS_SANDBOX = '1';
         // 所有可配置 env 合并完成之后注入并冻结 owner 身份；ownerless 时删除两个变量（CLAUDE.md）
         applySessionOwnerEnv(env, input.ownerOpenId);
         const backend = createBackend();

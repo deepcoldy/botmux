@@ -1,16 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
 
 /**
- * PtyBackend 必须把 bin/args 原样交给 pty.spawn，忽略 launchShell（那是
- * tmux/zellij/zmx 的壳包装）。用 mock 抓 spawn 参数，不走真 PTY：bun 进程内
- * node-pty 对短命 sh -c 经常丢 onData（CI tmux-backend-env 收到空串）。
+ * PtyBackend 必须把 bin/args 原样交给 spawnPty（pty-spawn.ts 的运行时分流层：
+ * Node 走 node-pty、Bun 走原生 PTY），忽略 launchShell（那是 tmux/zellij/zmx 的
+ * 壳包装）。用 mock 抓 spawn 参数，不走真 PTY；真 PTY 的存活性由
+ * pty-spawn-runtime.test.ts 在两种 runner 下各验一遍。
  *
  * 工厂体内建 calls 数组，禁止顶层 vi.fn 被 hoist 到 mock 之前。
  */
-vi.mock('node-pty', () => {
-  const spawn = Object.assign(
+vi.mock('../src/adapters/backend/pty-spawn.js', () => {
+  const spawnPty = Object.assign(
     (bin: string, args: string[], opts: Record<string, unknown>) => {
-      spawn.calls.push({ bin, args, opts });
+      spawnPty.calls.push({ bin, args, opts });
       return {
         pid: 1,
         onData() {},
@@ -22,14 +23,14 @@ vi.mock('node-pty', () => {
     },
     { calls: [] as Array<{ bin: string; args: string[]; opts: Record<string, unknown> }> },
   );
-  return { spawn };
+  return { spawnPty, ptyRuntime: () => 'mock' };
 });
 
-import * as nodePty from 'node-pty';
+import * as ptySpawn from '../src/adapters/backend/pty-spawn.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 
 function spawnCalls(): Array<{ bin: string; args: string[]; opts: Record<string, unknown> }> {
-  return (nodePty.spawn as typeof nodePty.spawn & {
+  return (ptySpawn.spawnPty as typeof ptySpawn.spawnPty & {
     calls: Array<{ bin: string; args: string[]; opts: Record<string, unknown> }>;
   }).calls;
 }

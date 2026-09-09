@@ -20,6 +20,8 @@ bun run daemon:logs          # 查看日志
 
 注意与「用户怎么装 botmux」区分开：`install-diagnostics.ts` 的 `InstallKind`（含 `'pnpm-global'`）与 `maintenance.ts` 的自动更新说的是**终端用户的安装方式**，线上确实有人 `pnpm i -g botmux`。那些**不是**本仓库的构建工具链，不要跟着一起改。
 
+⚠️ **node-pty 在 Bun 运行时下不可用**（编译版二进制、`bun run daemon:bun` 都算）：它把 pty master 包成 `tty.ReadStream`，Bun 的实现在 master 暂时没数据时把 `read()` 的 EAGAIN 当 error 抛出并自毁关 fd，子进程 ~10ms 内被内核 SIGHUP——与子进程有没有输出无关，Node 下同一段代码正常（实测 Bun 1.4.0 + node-pty 1.1.0）。默认 tmux 会话走 pipe 模式不经过 node-pty，所以线上一直没暴露；flow 的 agent worker 第一次真飞书运行就踩中（`spawn_failed: … exited before its prompt was ready`，屏幕空白）。`PtyBackend` 已改走 `src/adapters/backend/pty-spawn.ts` 分流（Node → node-pty，Bun → `Bun.spawn` 的 `terminal` 原生 PTY）。**仍直接 `pty.spawn` 的站点在编译态同样是坏的**：tmux / zellij / herdr 的 attach 客户端、`dashboard/debug-terminal.ts`、`worker.ts` 的 web 终端 attach——要让它们在编译态可用，走同一个分流层，别再新增直接 `import * as pty from 'node-pty'` 的 spawn 点。`vitest` 永远在 Node 里跑测试体，Bun 下的行为只有 `bun test <file>` 能看到（`test/pty-spawn-runtime.test.ts` 就是为此在两种 runner 下各跑一遍的真 PTY 用例）。
+
 ### Bun 开发链路
 
 daemon / supervisor / dashboard 都能直接跑 TypeScript，不必先 `bun run build`：
