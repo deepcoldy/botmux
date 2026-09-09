@@ -645,9 +645,10 @@ export async function commitRepoSelection(
         const registration = noteTurnReceived?.(ds, pendingTurnId);
         if (registration) {
           const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-          registrations.add(registration);
+          const tracked = { messageId: pendingTurnId, promise: registration };
+          registrations.add(tracked);
           void registration.finally(() => {
-            registrations.delete(registration);
+            registrations.delete(tracked);
             if (registrations.size === 0) ds.pendingAckReactionRegistrations = undefined;
           });
         }

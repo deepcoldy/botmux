@@ -14593,11 +14593,16 @@ function shouldDropMismatchedHermesFinalOutput(
  */
 async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   const registrations = [...(ds.pendingAckReactionRegistrations ?? [])];
-  if (registrations.length > 0) await Promise.allSettled(registrations);
+  const settleIds = new Set((ds.pendingAckReactions ?? []).map(ack => ack.messageId));
+  for (const registration of registrations) settleIds.add(registration.messageId);
+  if (registrations.length > 0) await Promise.allSettled(registrations.map(r => r.promise));
   const list = ds.pendingAckReactions;
   if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
+  // Detach only the batch visible at this idle edge. A newer turn may register
+  // while the older registrations above are awaiting Lark; it belongs to its
+  // own future idle edge and must remain pending.
+  const settling = list.filter(ack => settleIds.has(ack.messageId));
+  ds.pendingAckReactions = list.filter(ack => !settleIds.has(ack.messageId));
   // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
   // reactions only ever exist for a real inbound user message (the ✋ is placed
   // when that message arrives — transcript deliveries have no inbound message to
@@ -14605,7 +14610,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   // must settle to ✅ like any session. No VC special-case.
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
-  for (const ack of list) {
+  for (const ack of settling) {
     if (ack.reactionId) {
       try {
         await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);

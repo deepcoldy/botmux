@@ -334,7 +334,7 @@ export interface DaemonSession {
   pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
   /** Received-reaction writes started after worker acceptance. Idle settlement
    *  waits for these so a fast turn cannot strand a late-arriving reaction. */
-  pendingAckReactionRegistrations?: Set<Promise<void>>;
+  pendingAckReactionRegistrations?: Set<{ messageId: string; promise: Promise<void> }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
