@@ -985,6 +985,76 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
+  it('retains a preserved legacy predecessor beyond the mirror window across three type-ahead turns', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000141';
+    const secondTurnId = '00000000-0000-7000-8000-000000000142';
+    const thirdTurnId = '00000000-0000-7000-8000-000000000143';
+    writeFileSync(path, line(user('first', '2000-01-01T00:00:01.000Z')));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    queue.mark('d3', 'third', 0);
+
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+
+    appendFileSync(path, line(user(
+      'second', '2000-01-01T00:00:02.000Z', secondTurnId,
+    )));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([expect.objectContaining({
+      kind: 'user', sourceTurnId: secondTurnId, preserveCollecting: true,
+    })]);
+    queue.ingest(second.events);
+
+    // This successor arrives after the ordinary 5-second mirror window. The
+    // first turn is already preserved behind a native successor, so its
+    // binding evidence must survive until the delayed terminal arrives.
+    appendFileSync(path, line(user(
+      'third', '2000-01-01T00:00:07.000Z', thirdTurnId,
+    )));
+    const third = drainTraexRollout(path, second.newOffset);
+    expect(third.events).toEqual([expect.objectContaining({
+      kind: 'user', sourceTurnId: thirdTurnId, preserveCollecting: true,
+    })]);
+    queue.ingest(third.events);
+
+    appendFileSync(path, line({
+      ...taskComplete('answer-2'),
+      timestamp: '2000-01-01T00:00:08.000Z',
+      payload: { ...taskComplete('answer-2').payload, turn_id: secondTurnId },
+    }));
+    const fourth = drainTraexRollout(path, third.newOffset);
+    queue.ingest(fourth.events);
+
+    appendFileSync(path, line({
+      ...taskComplete('answer-3'),
+      timestamp: '2000-01-01T00:00:09.000Z',
+      payload: { ...taskComplete('answer-3').payload, turn_id: thirdTurnId },
+    }));
+    const fifth = drainTraexRollout(path, fourth.newOffset);
+    queue.ingest(fifth.events);
+
+    appendFileSync(path, line({
+      ...taskComplete('answer-1'),
+      timestamp: '2000-01-01T00:00:10.000Z',
+      payload: { ...taskComplete('answer-1').payload, turn_id: firstTurnId },
+    }));
+    const sixth = drainTraexRollout(path, fifth.newOffset);
+    expect(sixth.events).toEqual([
+      expect.objectContaining({ kind: 'turn_bind', sourceTurnId: firstTurnId }),
+      expect.objectContaining({ kind: 'assistant_final', sourceTurnId: firstTurnId }),
+    ]);
+    queue.ingest(sixth.events);
+
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'd1', sourceTurnId: firstTurnId, finalText: 'answer-1' }),
+      expect.objectContaining({ turnId: 'd2', sourceTurnId: secondTurnId, finalText: 'answer-2' }),
+      expect.objectContaining({ turnId: 'd3', sourceTurnId: thirdTurnId, finalText: 'answer-3' }),
+    ]);
+  });
+
   it('keeps a delayed item mirror from duplicating a predecessor bound by CoT', () => {
     const firstTurnId = '00000000-0000-7000-8000-000000000133';
     const secondTurnId = '00000000-0000-7000-8000-000000000134';

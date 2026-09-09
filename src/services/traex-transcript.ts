@@ -278,6 +278,12 @@ function shouldPreserveUnboundLegacyPredecessor(
 
 function expireTraexUserMirrors(pending: TraexDrainUserMirror[], timestampMs: number): void {
   for (let index = pending.length - 1; index >= 0; index--) {
+    // Once a native successor has started behind an id-less legacy turn, this
+    // candidate is the only durable evidence that a later native terminal
+    // belongs to that predecessor. A normal model turn can outlive the short
+    // dialect-mirror window, so retain it until its mirror/bind/terminal
+    // consumes it (the per-path mirror cap still bounds retained state).
+    if (pending[index].preservedBeforeSuccessor) continue;
     const ageMs = timestampMs - pending[index].timestampMs;
     if (ageMs > TRAEX_LEGACY_USER_MIRROR_WINDOW_MS) pending.splice(index, 1);
   }
