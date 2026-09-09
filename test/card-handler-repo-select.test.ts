@@ -2030,6 +2030,29 @@ describe('repo select card — worktree open', () => {
 });
 
 describe('auto-worktree detached commit admission', () => {
+  it('keeps an explicit failed worktree start actionable while pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(new Error('cannot create worktree'));
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+    });
+
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.worker).toBeNull();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/repo'));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/tw'));
+  });
+
   it('holds the delayed commit/fork behind a same-bot mutation after the caller lease ended', async () => {
     const ds = makeDs({
       pendingRepo: true,

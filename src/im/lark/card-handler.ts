@@ -975,10 +975,13 @@ export async function runAutoWorktreeCommit(deps: {
   } catch (e) {
     // No recovery fork here: forking with an empty prompt would DROP the buffered
     // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
-    // the session as commitRepoSelection left it — the inbound router's worker=null
-    // branch re-forks (with the pinned dir) on the user's next message, and a still-
-    // pending session keeps buffering. Loud log so the rare mid-commit throw is seen.
-    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${e instanceof Error ? e.message : e}`);
+    // the session pending and give the user explicit command-based recovery even
+    // when the forced /tw flow never had a repo picker card.
+    const error = e instanceof Error ? e.message : String(e);
+    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${error}`);
+    if (force && ds.pendingRepo) {
+      await notify(`⚠️ worktree 创建失败，任务仍在等待中。可发送 \`/tw\` 重试，或发送 \`/repo\` 选择/直接启动仓库。\n${error}`);
+    }
   } finally {
     ds.worktreeCreating = false;
   }
