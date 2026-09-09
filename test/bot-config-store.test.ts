@@ -803,6 +803,94 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
   });
 
+  it('replyDelivery: claude-code defaults to transcript; explicit send persists; unset clears back to the CLI default', async () => {
+    const { registry, store } = await loaded({ cliId: 'claude-code' });
+    const spec = store.findConfigField('replyDelivery')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(spec.clearable).toBe(true);
+    expect(store.coerceConfigValue(spec, 'TRANSCRIPT')).toEqual({ ok: true, value: 'transcript' });
+    expect(store.coerceConfigValue(spec, 'send')).toEqual({ ok: true, value: 'send' });
+    expect(store.coerceConfigValue(spec, 'auto')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    // 缺省展示随 CLI（而非 ∅）：claude-code 未配置时 /config get 读到的生效值是 transcript。
+    const before = store.getConfigSnapshot('app_default');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
+
+    // set send：显式落盘 'send'——claude-code 退回旧行为（模型自己 botmux send）的唯一方式。
+    const r1 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r1.ok).toBe(true);
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send', effect: 'next-session' });
+    expect(readConfig().replyDelivery).toBe('send');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+
+    // set transcript：显式落盘 'transcript'。
+    const r2 = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+
+    // unset：删 key，回 CLI 缺省（claude-code 展示仍是 transcript），内存同步为 undefined。
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3).toMatchObject({ oldText: 'transcript', newText: 'transcript' });
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+    expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
+  });
+
+  it('replyDelivery: an explicit "send" in bots.json survives loadBotConfigs (claude-code opts back out)', async () => {
+    const { registry, store } = await loaded({ cliId: 'claude-code', replyDelivery: 'send' });
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+    const snap = store.getConfigSnapshot('app_default');
+    expect(snap.ok && snap.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+  });
+
+  it('replyDelivery: non-claude CLIs default to send; transcript persists on structured-bridge CLIs (codex) and unset clears', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const before = store.getConfigSnapshot('app_default');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
+
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r1.ok).toBe(true);
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+  });
+
+  it('rejects replyDelivery=transcript for CLIs without transcript capture', async () => {
+    const { registry, store } = await loaded({ cliId: 'cursor' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const before = store.getConfigSnapshot('app_default');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect('replyDelivery' in readConfig()).toBe(false);
+    expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
+
+    // send 在不支持的 CLI 上照样允许，且同样显式落盘。
+    const r2 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r2.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;

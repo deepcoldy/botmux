@@ -171,6 +171,16 @@ export interface CliAdapter {
      *  has such a knob declare these keys; the rest ignore the field, since for
      *  them a plain child inherits the environment anyway. */
     shellSubprocessEnv?: Record<string, string>;
+    /** Per-bot `replyDelivery` frozen for this session (core/reply-delivery.ts).
+     *  'transcript' → injectsSessionContext adapters reword the routing block:
+     *  the final assistant message is auto-forwarded by the daemon, so `botmux
+     *  send` is only for mid-turn pushes / attachments / cross-bot @. Omitted or
+     *  'send' → today's text byte-for-byte. `noTransport` takes precedence. */
+    replyDelivery?: 'send' | 'transcript';
+    /** transcript-only: this session is a solo chat (owner + this bot). Drops
+     *  the identity routing_rules (no other bot to route to). Ignored for
+     *  'send'. */
+    solo?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

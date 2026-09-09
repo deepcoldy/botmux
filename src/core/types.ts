@@ -38,6 +38,9 @@ export interface FrozenCard {
   /** Whether this historical turn deliberately completed with no reply. The
    *  value belongs to this frozen card, not to the session's latest turn. */
   silentIdle?: boolean;
+  /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
+   *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
+  idleLabel?: 'silent' | 'completed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -351,6 +354,10 @@ export interface DaemonSession {
    *  silence" from "stuck". Cleared by every new-turn entry point
    *  (beginNewTurn and both worker-exited re-fork branches). In-memory only. */
   silentIdleTurnId?: string;
+  /** transcript 模式（replyDelivery=transcript）下最终回复卡已投递成功的轮次：
+   *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
+   *  完全一致（每个新轮次入口）。内存态，不落盘。 */
+  completedIdleTurnId?: string;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -359,6 +366,11 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** replyDelivery=transcript 下本轮是否 solo 会话（只有 owner 与本 bot：私聊，或
+   *  仅 owner + 本 bot 的普通群）。solo 时逐轮信封去壳：裸文本、无 <sender/>。
+   *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
+   *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
+  soloSession?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a

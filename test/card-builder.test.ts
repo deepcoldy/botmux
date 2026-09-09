@@ -26,6 +26,7 @@ import {
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
+  frozenIdleLabel,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -948,6 +949,71 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, true,
       ));
       expect(card.header.title.content).toContain('工作中');
+    });
+
+    // transcript 模式：最终回复卡已投递 → idle 卡头「已完成」。颜色沿用 idle 的绿色。
+    it("idle + 'completed' label renders 「已完成」 instead of 「等待输入」", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('已完成');
+      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).not.toContain('已处理 · 判定无需回复');
+    });
+
+    it("idle + 'completed' label renders 'Completed' in English", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('Completed');
+      expect(card.header.title.content).not.toContain('Awaiting input');
+    });
+
+    it("idle + 'silent' string label equals the legacy boolean flag", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'silent',
+      ));
+      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+    });
+
+    it("'completed' label is inert for non-idle statuses (working keeps its label)", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('工作中');
+      expect(card.header.title.content).not.toContain('已完成');
+    });
+
+    // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
+    it('frozenIdleLabel: idleLabel wins, legacy silentIdle maps to silent, neither → undefined', () => {
+      expect(frozenIdleLabel({ idleLabel: 'completed' })).toBe('completed');
+      expect(frozenIdleLabel({ idleLabel: 'completed', silentIdle: true })).toBe('completed');
+      expect(frozenIdleLabel({ silentIdle: true })).toBe('silent');
+      expect(frozenIdleLabel({ silentIdle: false })).toBeUndefined();
+      expect(frozenIdleLabel({})).toBeUndefined();
+
+      const completed = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ idleLabel: 'completed' }),
+      ));
+      expect(completed.header.title.content).toContain('已完成');
+
+      const legacySilent = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ silentIdle: true }),
+      ));
+      expect(legacySilent.header.title.content).toContain('已处理 · 判定无需回复');
     });
 
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {

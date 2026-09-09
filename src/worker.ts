@@ -283,8 +283,9 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
+import { statuslineDir } from './services/statusline-snapshot.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
@@ -2248,6 +2249,13 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+
+/** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
+ *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
+ *  fail-closed 等于历史行为。 */
+function replyDeliveryMode(): 'send' | 'transcript' {
+  return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
+}
 let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
@@ -4774,7 +4782,7 @@ function deliverMojoTurnFinal(text: string): void {
     isLocal: false,
     finalText: text,
   };
-  if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode)) {
+  if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode, replyDeliveryMode())) {
     log(
       `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
       + `(${isBridgeNothingToSendFinal(text) ? 'nothing-to-send sentinel' : 'model already called botmux send'})`,
@@ -6052,7 +6060,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+    if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       continue;
@@ -6078,7 +6086,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
       // Hardcoded 'answered' rather than bridgeTurnOutcome(turn): this queue has
@@ -7708,7 +7716,7 @@ function emitReadyCodexTurns(): void {
     // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
     // generic failed fallback would post nothing at all.
     const fallbackKind = structuredFallbackKind(
-      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
+      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(), replyDeliveryMode(),
     );
     const content = fallbackKind === 'failed'
       ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
@@ -7728,11 +7736,11 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -9818,6 +9826,7 @@ async function handleTrustedCodexAppMarker(
         completedAtMs + 5_001,
         suppressMarkers,
         false,
+        replyDeliveryMode(),
       );
       if (suppressDelivery) {
         log(`${cliName()} final_output suppressed (model already called botmux send)`);
@@ -14431,6 +14440,9 @@ async function spawnCli(
     // Adapters whose CLI filters the environment of the shell commands it runs
     // (codex) re-declare these; the rest ignore them and inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
+    // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
+    replyDelivery: cfg.replyDelivery,
+    solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,
@@ -14782,6 +14794,25 @@ async function spawnCli(
   // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
   childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
+  // Claude Code statusline 链：botmux 的进程级 --settings 会遮蔽用户自己的 statusLine
+  // （单值、不合并），这里按 Claude 的优先级把它找回来，交给 `botmux statusline` 在落盘
+  // 后转发。只对真 claude-code 做（seed / relay 不注入 statusLine）。不按 wrapperCli 分流：
+  // aiden 会剥掉 --settings ⇒ Claude 直接用用户自己的 statusLine、`botmux statusline` 根本
+  // 不会被调用，这个 env 只是闲置；而 cjadk / ccr / ttadk 会透传 --settings、沙盒开启时
+  // wrapperCli 又被整体忽略——这些形态都需要链，按 wrapperCli 跳过会静默吞掉用户的状态栏。
+  // userSettingsPath 用 CLI 实际读的那份：read-isolation 下是 <BOT_HOME>/claude/settings.json
+  // （effectiveReadyHookInstall 已改写）。无用户配置时**显式 delete**，理由同上方
+  // BOTMUX_READ_ISOLATION：rcfile / tmux 里残留的旧值会让别的项目的 statusline 命令在本会话里执行。
+  if (cliAdapter.id === 'claude-code') {
+    const shadowed = resolveShadowedStatusLine({
+      workingDir: cfg.workingDir,
+      userSettingsPath: effectiveReadyHookInstall?.configPath ?? cliAdapter.hookInstall?.configPath,
+    });
+    if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
+    else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  } else {
+    delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  }
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (cfg.dispatchAttempt !== undefined) {
@@ -15072,6 +15103,9 @@ async function spawnCli(
     } catch { /* */ }
     // UserPromptSubmit sidecar 目录（#794）：daemon 逐 turn 写入，沙盒内 hook 只读。
     try { mkdirSync(join(dataDir, 'prompt-ctx', cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
+    // Claude statusline 快照目录：沙盒内 `botmux statusline` 原子写 latest.json（tmp+rename
+    // 需要目录可写），fs-policy 授的是这个目录；bwrap 不能 bind 不存在的源，先建好。
+    try { mkdirSync(statuslineDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)

@@ -424,6 +424,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   'BOTMUX_READY_COMMAND',
+  // Per-session computed shell command string: the user's own statusLine
+  // command that `botmux statusline` chains to after persisting the snapshot.
+  // Not a credential — it is what the user already put in their settings.json.
+  'BOTMUX_STATUSLINE_CHAIN',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
@@ -537,6 +541,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Ready-gate hook command, sessionReadyHookCommand() per session.
   'BOTMUX_READY_COMMAND',
+  // Shadowed user statusLine command, resolved per session from the spawn cwd
+  // + user settings (worker.ts); an inherited copy points at another project.
+  'BOTMUX_STATUSLINE_CHAIN',
   // Per-app value pinned by the ecosystemConfig env block; an inherited copy
   // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
   'BOTMUX_LARK_APP_ID',

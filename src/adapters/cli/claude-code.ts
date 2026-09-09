@@ -20,7 +20,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -715,6 +715,56 @@ function resolveClaudeChatKeybindings(keybindingsPath: string): ClaudeChatKeybin
  *  across multiple adapter instances shares the warmup state. */
 const claudeFirstWriteSeen = new WeakSet<PtyHandle>();
 
+/** 用户自己配置的 statusLine（被 botmux 进程级 --settings 遮蔽的那一条）。 */
+export interface ShadowedStatusLine {
+  command?: string;
+  padding?: number;
+  refreshInterval?: number;
+}
+
+/**
+ * 找回被 botmux 进程级 `--settings` 遮蔽的用户 statusLine。
+ *
+ * 背景：Claude 的 settings 里 `statusLine` 是**单值**（不像 hooks 按事件合并数组），
+ * 而 --settings 优先级最高，所以 botmux 一注入，用户在项目 / 用户 settings 里配的
+ * statusline 命令就再也不会被 Claude 调用。为了不吞掉它，worker 在 spawn 前按 Claude
+ * 自己的优先级找到那条命令，经 `BOTMUX_STATUSLINE_CHAIN` 交给 `botmux statusline`：
+ * 落盘之后把**原始 stdin 字节**转发给它并透传其 stdout / 退出码——对用户的终端来说
+ * 状态栏行为不变。
+ *
+ * 优先级（高 → 低，取第一个 `type === 'command'` 且 command 非空的）：
+ *   `<cwd>/.claude/settings.local.json` > `<cwd>/.claude/settings.json` > `userSettingsPath`
+ * （后者通常是 `~/.claude/settings.json`；read-isolation 下是 `<BOT_HOME>/claude/settings.json`）。
+ * 不看 managed / enterprise 策略层：那一层 botmux 本来就无权覆盖，Claude 会自行处理。
+ *
+ * 纯函数、fail-open：任何读 / parse 失败视为该层无配置，继续向下找；全部没有 ⇒ `{}`。
+ * 不做全局 settings 兜底写入——全局只能有一个 statusLine，写进去就覆盖用户自己的。
+ * wrapperCli=aiden 会把 --settings 整个剥掉，此时 Claude 直接用用户自己的 statusLine，
+ * `botmux statusline` 不会被调用，worker 照常算出的 BOTMUX_STATUSLINE_CHAIN 只是闲置无害
+ * （cjadk / ccr / ttadk 会透传 --settings，沙盒开启时 wrapperCli 又被整体忽略，都需要链）。
+ */
+export function resolveShadowedStatusLine(opts: { workingDir: string; userSettingsPath?: string }): ShadowedStatusLine {
+  const candidates = [
+    join(opts.workingDir, '.claude', 'settings.local.json'),
+    join(opts.workingDir, '.claude', 'settings.json'),
+    ...(opts.userSettingsPath ? [opts.userSettingsPath] : []),
+  ];
+  for (const path of candidates) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(path, 'utf-8')); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const sl = (parsed as Record<string, unknown>).statusLine;
+    if (!sl || typeof sl !== 'object' || Array.isArray(sl)) continue;
+    const o = sl as Record<string, unknown>;
+    if (o.type !== 'command' || typeof o.command !== 'string' || o.command.trim() === '') continue;
+    const out: ShadowedStatusLine = { command: o.command };
+    if (typeof o.padding === 'number' && Number.isFinite(o.padding)) out.padding = o.padding;
+    if (typeof o.refreshInterval === 'number' && Number.isFinite(o.refreshInterval)) out.refreshInterval = o.refreshInterval;
+    return out;
+  }
+  return {};
+}
+
 /** A member of the Claude-family CLIs: Claude Code itself and forks that share
  *  its on-disk session layout (per-project JSONL transcripts, `sessions/<pid>.json`
  *  pid-state, `tasks/` fd locks, keybindings.json, settings.json hooks) but
@@ -852,7 +902,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, replyDelivery, solo }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -908,7 +958,22 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
+      // statusLine（仅 claude-code）：Claude 把 context_window / rate_limits 等 JSON 喂给
+      // 这条命令的 stdin，`botmux statusline` 落盘到 `<DATA_DIR>/statusline/<sid>/`，
+      // 卡片用量段据此渲染 `ctx 23% · 5h 18% · 7d 5%`。它**必须**走进程级 --settings 而
+      // 不能像就绪 hook 那样写全局：settings 里 statusLine 只能有一个（不是 hooks 那样按
+      // 事件合并的数组），写全局会覆盖用户自己的 statusline。进程级这份优先级最高，会
+      // **遮蔽**用户在项目 / 用户 settings 里的 statusLine——worker 用
+      // resolveShadowedStatusLine 找回它并经 BOTMUX_STATUSLINE_CHAIN 交给 `botmux
+      // statusline` 转发，用户终端里的状态栏不受影响。wrapperCli=aiden 会剥掉本
+      // --settings ⇒ 无数据 ⇒ 卡片省略配额段（fail-open），不做全局兜底。
+      // refreshInterval=60：实测冷启动 0.24–0.34s，每分钟一次可承受，且能在无消息时
+      // 跟上 5h/7d 窗口滚动；快照 10 min 陈旧自动失效（STATUSLINE_STALE_MS）。
+      if (variant.id === 'claude-code') {
+        inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
+      }
+      // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass 键）
+      // 时才传，disableCliBypass 下没东西可传就不传。
       // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
       // 注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉 memory carve-out。）
       if (Object.keys(inlineSettings).length > 0) {
@@ -924,7 +989,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth }));
+      // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
+      // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, replyDelivery: effectiveReplyDelivery, solo }));
       return args;
     },
 

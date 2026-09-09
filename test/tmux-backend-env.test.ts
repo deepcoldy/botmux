@@ -219,6 +219,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards BOTMUX_STATUSLINE_CHAIN so `botmux statusline` inside the pane can chain the user statusLine', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_STATUSLINE_CHAIN: 'bash ~/.claude/statusline.sh',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_STATUSLINE_CHAIN=bash ~/.claude/statusline.sh');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('forwards only a Codex App bootstrap path and strips the retired shared-secret env', () => {
     const retiredSharedSecret = 'A'.repeat(43);
     const bootstrapPath = '/private/bot-home/control.bootstrap';

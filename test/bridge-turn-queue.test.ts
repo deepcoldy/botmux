@@ -1232,6 +1232,43 @@ describe('BridgeTurnQueue', () => {
   });
 });
 
+// ─── replyDelivery=transcript + solo：裸文本（无 <user_message> 壳）也能按指纹命中 ──
+// solo 会话的 PTY 输入是 buildBridgeInputContent 的裸文本 + `[附件]` 行；worker 的
+// bridgeMarkPendingTurn 用同一段原文取前 30 字符指纹 + 全文归一化，转写里的 user
+// 事件正文就是这段裸文本本身——这里钉住"信封去壳不影响 turn 归属"。
+describe('BridgeTurnQueue — bare (solo transcript) input fingerprint', () => {
+  function markLike(q: BridgeTurnQueue, turnId: string, text: string): void {
+    q.mark(turnId, makeFingerprint(text), Date.now(), makeFingerprintFull(text));
+  }
+
+  it('bare text mark matches the identical user event (attachment lines included)', () => {
+    const q = new BridgeTurnQueue();
+    const bare = '帮我看下这张图\n\n[附件]\n- x.jpg (/tmp/x.jpg)';
+    markLike(q, 't1', bare);
+    // 与裸文本无关的本地输入不得吃掉这个 pending turn。
+    q.ingest([user('local-u', 'ls -la'), assistant('local-a', 'listing')]);
+    expect(q.peek().find(t => t.turnId === 't1')?.started).toBe(false);
+    q.ingest([user('u1', bare), assistant('a1', '看到了')]);
+    const ready = q.drainEmittable();
+    const t1 = ready.find(t => t.turnId === 't1');
+    expect(t1?.assistantUuids).toEqual(['a1']);
+    expect(q.size()).toBe(0);
+  });
+
+  it('two different bare texts bind FIFO to their own user events', () => {
+    const q = new BridgeTurnQueue();
+    const first = '第一条：把 README 翻译成英文';
+    const second = '第二条：顺便修一下拼写\n\n[@提及]\n- @Alice';
+    markLike(q, 't1', first);
+    markLike(q, 't2', second);
+    q.ingest([user('u1', first), assistant('a1', 'done 1'), user('u2', second), assistant('a2', 'done 2')]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['t1', 't2']);
+    expect(ready[0].assistantUuids).toEqual(['a1']);
+    expect(ready[1].assistantUuids).toEqual(['a2']);
+  });
+});
+
 /** Local helper: full normalised content (what the worker stores as
  *  contentNormalized), distinct from the 30-char makeFingerprint. */
 function makeFingerprintFull(message: string): string {
