@@ -885,7 +885,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     ...(larkTransport ? [`${sd}/dashboard-daemons`] : []),
     `${sd}/bots-info.json`,     // bot display names / avatars for <available_bots> + recipient rendering
     `${sd}/bot-openids-${app}.json`,  // OWN routing cross-ref (sibling ones stay denied)
-    // own sessions-<self>.json + attachments/<self> already pushed above (readOnly)
+    // own session-stores/<self> + attachments/<self> already pushed above (readOnly)
   ], 'readOnly', 'internal');
   // turn-sends: the CLI APPENDS its OWN dedup marker to
   // `turn-sends/<sessionId>.jsonl` (write, not read). Grant the SINGLE file, not
