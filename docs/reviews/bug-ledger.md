@@ -4,20 +4,20 @@
 
 | ID | 标题 | 状态 | 严重度 | 层级 | 是否阻塞下一步开发 |
 |---|---|---|---|---|---|
-| BUG-20260828-001 | Mojo 本地工具继承宿主 PM2 污染环境后不可用 | 待验证 | S1 | 基础 | 是 |
+| BUG-20260828-001 | Mojo 本地工具继承宿主 PM2 污染环境后不可用 | 已修复 | S1 | 基础 | 否 |
 
 ## 详细记录
 
 ### BUG-20260828-001 Mojo 本地工具继承宿主 PM2 污染环境后不可用
 
-- 状态：待验证
+- 状态：已修复
 - 严重度：S1
 - 层级：基础
 - 来源：用户手测 / 本机回归
 - 首次发现时间：2026-08-28
 - 发现版本 / commit：Botmux 3.17.0；上游基线 `524e2ce5d49868bd8d44b4295e7f877ebb5b1a35`
 - 影响范围：由 Botmux/PM2 启动、默认使用宿主本地工具的 Mojo 会话；已在 macOS arm64 复现
-- 是否阻塞下一步开发：是
+- 是否阻塞下一步开发：否
 - 关联文件：`src/worker.ts`、`src/adapters/backend/mojo-backend.ts`、`src/adapters/backend/mojo-types.ts`、相关测试
 - 关联 spec / 文档：无
 
@@ -49,7 +49,7 @@
 #### 初步判断
 
 - 疑似根因：worker 以 `process.env` 为 Mojo 基础环境，Mojo backend 再将其与显式 Bot/Mojo 环境整体合并；当前边界只剔除少量控制变量，PM2 管理元数据会进入 Mojo 进程。
-- 当前外部阻塞：Mojo daemon 已连接、注册、Ready 并被控制面标为 online，能力表也包含 Bash，但 host 回合仍随机在工具派发前或工具成功返回后进入 `turn_error`。同一登录态、模型和提示在 cloud sandbox 下可完成 Bash，故问题收敛到 Mojo 本地 daemon 执行链路；该异常与本次 PM2 环境清理是两个问题。
+- 历史外部现象（已解除）：Mojo 1.0.11 下 daemon 已连接、注册、Ready 并被控制面标为 online，能力表也包含 Bash，但 host 回合仍随机在工具派发前或工具成功返回后进入 `turn_error`。升级到 Mojo 1.0.12 后，同一 host 链路的直接 CLI 与真实 Botmux backend smoke 均已完成 Bash 回合。
 - 次要问题：Mojo 在 macOS 上的辅助组件 bootstrap 反复报告 internal channel 仅发布 Linux binary，需另向 Mojo 侧反馈。
 - 临时 workaround：`mojo.cloud=true` 可完成 Bash，但会把工具移到云端，无法等价替代需要访问 Botmux 宿主机的本地模式；不能静默启用。最小环境对照也不稳定，不作为 workaround。
 
@@ -66,7 +66,7 @@
 
 #### 验证记录
 
-- 验证方式：实现者自动化验证 + 未参与改动的 Reviewer 独立代码复审；历史审查修订后的增量已复核通过，最新主线对齐后的终审待执行
+- 验证方式：实现者自动化验证 + 未参与改动的 Reviewer 独立代码复审；历史审查修订后的增量和最新主线对齐后的最终差异均已复核通过
 - 验证设备 / 环境：macOS arm64 + Node/Bun 自动化
 - 自动化结果：
   - 修复前 focused 基线：3 个测试文件，135 项通过。
@@ -78,5 +78,5 @@
 - 后续真机补充：云端真实 Bash 成功，host daemon online 且声明 Bash 能力；host 在完整环境和“保留代理的最小环境”下仍未稳定完成，结果覆盖无工具事件停滞、Bash 前 `turn_error`、Bash 命令成功后回合 `turn_error` 三种形态。
 - 2026-09-09 复验：经用户允许将全局 Mojo CLI 从 1.0.11 升级到当时最新的 1.0.12；升级后 `logged_in=true`、`refreshable=true`，无需重新登录。实时读取 `stream-json` 后确认，直接 host 两轮只读 Bash `pwd` 分别在 21.853 秒和 23.725 秒完成，均为 `result.status=completed`、`num_tool_calls=1`、Bash `return_code=0`。结果事件后裸 CLI 仍陪跑其子进程 `~/.mojo/bin/mojo-daemon`，不会立即退出；这不是回合未完成，Botmux backend 已按 `result` 事件结算并隔离后续迟到输出。cloud 对照在放宽空闲护栏后于 26.491 秒完成并正常退出。
 - 真实 Botmux backend smoke：使用候选分支的 `MojoBackend` 在独立 workspace 启动默认 host 回合，约 19 秒收到任务完成回调、Bash 结果和最终答案，功能链路通过。结束 smoke 时，macOS 缺少 Linux `/proc`，现有进程树证明无法自动证明 quiescence，因此保留 1 个该 smoke 专用的 containment handle；经 cwd 复核属于本轮的孤立 CLI/daemon 已按精确 PID 清理，未触碰其他 Botmux/Mojo 会话。该清理证明边界不影响本次 host 功能通过结论，但需在最终交付中单列证据限制。
-- 合并门禁：host 真机功能验证现已通过；候选分支已无冲突对齐 `origin/master=9387fa19`，对齐后的完整 Mojo 回归和构建通过。主线已移除 PM2 运行时依赖，因此漂移测试改为仅在本地实际安装 PM2 时读取其 `Common.js`；静态 fixture 仍始终覆盖清洗行为。当前分支不落后主线，待对最新差异完成独立终审后即可进入 push / 提 PR 阶段。
-- 独立复审状态：首名 Reviewer 确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；指定的 V37F Reviewer 因其自身 API key 401 未能进入审查，Sekiro 替补路径又遇模型服务错误。随后 Wallpaper 完成实质终审并给出 `PASS`（blocker 0、major 0、minor 4）；Lead 全部采纳并修正真实 PM2 实例序号判断、关键环境键保护、测试依赖报错、Mojo 开关命名和 `PM2_HOME` 说明。Wallpaper 对修订增量再次给出 `PASS`（blocker 0、major 0），其两条可读性 minor 已通过测试名和注释澄清；关于未列入 Botmux 会话白名单的自定义 `BOTMUX_*` 实例键提醒不改，因为这类键被明确配置为 PM2 `instance_var` 时属于应清理的 PM2 元数据。
+- 合并门禁：host 真机功能验证现已通过；候选分支已无冲突对齐 `origin/master=9387fa19`，对齐后的完整 Mojo 回归和构建通过。主线已移除 PM2 运行时依赖，因此漂移测试改为仅在本地实际安装 PM2 时读取其 `Common.js`；静态 fixture 仍始终覆盖清洗行为。当前分支不落后主线，最新差异的独立终审已通过，可以进入 push / 提 PR 阶段。
+- 独立复审状态：首名 Reviewer 确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；指定的 V37F Reviewer 因其自身 API key 401 未能进入审查，Sekiro 替补路径又遇模型服务错误。随后 Wallpaper 完成实质终审并给出 `PASS`（blocker 0、major 0、minor 4）；Lead 全部采纳并修正真实 PM2 实例序号判断、关键环境键保护、测试依赖报错、Mojo 开关命名和 `PM2_HOME` 说明。Wallpaper 对修订增量再次给出 `PASS`（blocker 0、major 0），其两条可读性 minor 已通过测试名和注释澄清；关于未列入 Botmux 会话白名单的自定义 `BOTMUX_*` 实例键提醒不改，因为这类键被明确配置为 PM2 `instance_var` 时属于应清理的 PM2 元数据。2026-09-09 对齐最新主线后的独立终审再次给出 `PASS`（blocker 0、major 0、minor 1）；Lead 接受唯一的台账状态 minor，并在本次收口中同步修正。
