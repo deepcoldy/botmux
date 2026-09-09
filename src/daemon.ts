@@ -18645,7 +18645,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // CLI input, but it creates no AI turn and therefore must not consume a
   // message-quota unit. `buildQuoteHint` distinguishes a real user quote from
   // parent_id values that merely point at the current thread root.
-  const isBareForceTopic = forceTopic?.mode === 'default'
+  const isBareForceTopic = !!forceTopic
     && forceTopic.prompt === ''
     && content === ''
     && resources.length === 0
