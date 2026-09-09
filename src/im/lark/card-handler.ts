@@ -168,7 +168,7 @@ export interface CardHandlerDeps {
   ) => void | Promise<void>;
   /** Prepare per-turn credentials before a pending repo selection reaches the CLI. */
   prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
-  /** Register the original Lark turn after a pending repo selection starts its CLI. */
+  /** Register and track the original Lark turn after a pending repo selection starts its CLI. */
   noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
 }
 
@@ -642,7 +642,15 @@ export async function commitRepoSelection(
         !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
       );
       if (!pendingRawInput && pendingTurnId) {
-        void noteTurnReceived?.(ds, pendingTurnId);
+        const registration = noteTurnReceived?.(ds, pendingTurnId);
+        if (registration) {
+          const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
+          registrations.add(registration);
+          void registration.finally(() => {
+            registrations.delete(registration);
+            if (registrations.size === 0) ds.pendingAckReactionRegistrations = undefined;
+          });
+        }
       }
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every

@@ -554,6 +554,24 @@ describe('repo select card — plain switch', () => {
     expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_original_turn');
   });
 
+  it('tracks repo-start reaction registration until the async write settles', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'quick task',
+      pendingTurnId: 'om_quick_turn',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+    const reaction = deferred<void>();
+    deps.noteTurnReceived = vi.fn(() => reaction.promise);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(ds.pendingAckReactionRegistrations?.size).toBe(1);
+    reaction.resolve();
+    await vi.waitFor(() => expect(ds.pendingAckReactionRegistrations).toBeUndefined());
+  });
+
   it('raw-passthrough cold start does NOT mark the first turn pending', async () => {
     // `/goal …` owns the first turn (delivered literally on prompt_ready), so
     // this is not an "empty start awaiting its first user turn".
