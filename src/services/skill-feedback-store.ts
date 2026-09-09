@@ -719,19 +719,65 @@ export class SkillFeedbackStore {
       this.db.exec('COMMIT');
       const wanted = new Set(ids);
       return this.listFeedbackOutbox().filter(row => wanted.has(row.outboxId) && row.claimToken === input.claimToken);
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* BEGIN may have failed before a transaction existed */ }
+      throw error;
+    }
+  }
+
+  /**
+   * Daemon-safe outbox claim. The shared feedback database is opened by every
+   * bot daemon, so a normal synchronous SQLite busy timeout can stall the whole
+   * event loop for seconds. Webhook polling is best-effort and recurring: fail
+   * fast on contention and let the next tick retry instead.
+   */
+  tryClaimFeedbackOutbox(input: { now: number; limit: number; claimToken: string }): { done: true; rows: Array<any> } | { done: false; busy: true } {
+    return this.withNonblockingBusy(() => this.claimFeedbackOutbox(input), rows => ({ done: true, rows }));
   }
 
   settleFeedbackOutboxDelivered(outboxId: string, claimToken: string, httpStatus: number, deliveredAt: string): boolean {
     return this.db.prepare(`UPDATE feedback_outbox SET status='delivered',last_http_status=?,delivered_at=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(httpStatus, deliveredAt, outboxId, claimToken).changes === 1;
   }
+  trySettleFeedbackOutboxDelivered(outboxId: string, claimToken: string, httpStatus: number, deliveredAt: string): { done: true; changed: boolean } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.settleFeedbackOutboxDelivered(outboxId, claimToken, httpStatus, deliveredAt),
+      changed => ({ done: true, changed }),
+    );
+  }
 
   rescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): boolean {
     return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=?,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
   }
+  tryRescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): { done: true; changed: boolean } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.rescheduleFeedbackOutbox(outboxId, claimToken, input),
+      changed => ({ done: true, changed }),
+    );
+  }
 
   resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): number {
     return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
+  }
+  tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): { done: true; changed: number } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs),
+      changed => ({ done: true, changed }),
+    );
+  }
+
+  /** Borrow busy_timeout=0 for one fully synchronous operation. */
+  private withNonblockingBusy<T, R>(operation: () => T, success: (value: T) => R): R | { done: false; busy: true } {
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      try {
+        return success(operation());
+      } catch (error) {
+        if (isSqliteBusyError(error)) return { done: false, busy: true };
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000;');
+    }
   }
 
   private reconcileTurnCompletion(deliveryId: string): TurnCompletionEventPayload | undefined {
