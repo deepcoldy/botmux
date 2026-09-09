@@ -689,14 +689,22 @@ describe('BridgeTurnQueue', () => {
       expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
     });
 
-    it('same first-signal-wins rule for the API-error arm it shares', () => {
+    // The API-error arm does NOT share that rule: an error line is authoritative
+    // execution metadata, and the `end_turn` before it is, in the connection-lost
+    // case, a force-closed half sentence. The error must win so the turn stays
+    // `failed` + retryable - the only shape ordinary-turn-recovery acts on
+    // (ordinary-turn-recovery.ts: `status !== 'failed' || retryable !== true`
+    // → no continuation). Maintainer ruling on PR #1330.
+    it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
       q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
-      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      });
     });
 
     it('still records the failure when the turn has no earlier terminal', () => {
