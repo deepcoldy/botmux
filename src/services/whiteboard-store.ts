@@ -486,8 +486,9 @@ async function unbindSessionWhiteboard(
       }
     } catch { /* connection failed: the re-probe below decides whether we may write */ }
   }
+  if (!larkAppId) return { status: 'unresolved' };
   const published = applySessionCommandAsHost(
-    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
+    { sessionId: session.sessionId, larkAppId },
     { type: 'whiteboard', whiteboardId: null, expectWhiteboardId: boardId },
     { dataDir },
   );

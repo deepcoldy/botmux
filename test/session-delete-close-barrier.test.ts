@@ -15,7 +15,7 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   workerPool.setActiveSessionsRegistry(new Map());
-  sessionStore.init();
+  sessionStore.init('test-app');
   vi.restoreAllMocks();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });

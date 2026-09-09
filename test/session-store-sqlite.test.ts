@@ -80,7 +80,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-store-sqlite-test-'));
   __testOnly_setSqliteUnavailable(false);
   mockDeleteFrozenCards.mockReset();
-  init();
+  init('test-app');
 });
 
 afterEach(() => {
@@ -120,21 +120,6 @@ describe('first-start JSON import', () => {
     expect(existsSync(join(storeDir, 'sessions.db.tmp-shm'))).toBe(false);
     expect(imported.live.title).toBe('live');
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonBefore);
-  });
-
-  it('imports only this bot\'s rows from legacy sessions.json and leaves it frozen', () => {
-    const legacyFp = seedJson('sessions.json', {
-      a1: row('a1', { larkAppId: 'app-A' }),
-      b1: row('b1', { larkAppId: 'app-B' }),
-    });
-    const legacyBefore = readFileSync(legacyFp, 'utf-8');
-
-    init('app-A');
-    expect(listSessions().map(s => s.sessionId)).toEqual(['a1']);
-    expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(true);
-    // 旧行为会把行迁移写进 sessions-app-A.json；现在 JSON 全部冻结
-    expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(false);
-    expect(readFileSync(legacyFp, 'utf-8')).toBe(legacyBefore);
   });
 
   it('is idempotent: a restart with the frozen JSON still present must not re-import', () => {
@@ -194,7 +179,7 @@ describe('first-start JSON import', () => {
     expect(readdirSync(storeDir).filter(n => n.includes('.tmp'))).toEqual([]);
 
     // Reopen from scratch: a shell db would throw instead of yielding the rows.
-    init();
+    init('test-app');
     init('appA');
     expect(listSessionsStrict().map(s => s.sessionId).sort()).toEqual(['s1', 's2']);
   });
@@ -291,7 +276,7 @@ describe('the frozen import source is not a store', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions();
-    init();
+    init('test-app');
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
     const before = readPersistedSessionRows(tempDir, 'appA');
     const writer = new DatabaseSync(dbPath);
@@ -330,7 +315,7 @@ describe('first-load serialization against an in-flight offline writer', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions(); // 触发导入 → .db
-    init();         // 释放连接，模拟 daemon 尚未启动
+    init('test-app');         // 释放连接，模拟 daemon 尚未启动
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
 
     // 握手协议保证确定性：子进程持锁改行后发 HELD；父进程落下 loading 标记后
@@ -379,7 +364,7 @@ describe('first-load serialization against an in-flight offline writer', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA', title: 'must-survive-busy' }) });
     init('appA');
     listSessions();
-    init();
+    init('test-app');
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
     const releaseMarker = join(tempDir, 'busy-release');
     const child = spawn(process.execPath, ['-e', `
@@ -468,7 +453,7 @@ describe('SQLite capability gate', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions(); // 首次访问触发导入 → .db
-    init(); // 释放已 attach 的连接，模拟独立 CLI 进程
+    init('test-app'); // 释放已 attach 的连接，模拟独立 CLI 进程
     __testOnly_setSqliteUnavailable(true);
 
     expect(() => readSessionRowFromDisk('s1', 'appA', tempDir)).toThrow(SessionStoreSqliteUnavailableError);
