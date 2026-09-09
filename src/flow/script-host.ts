@@ -134,11 +134,23 @@ function requireTimeout(spec: Record<string, unknown>): number | undefined {
 function normalizeAgentSpec(raw: unknown): AgentSpec {
   if (!raw || typeof raw !== 'object') throw new ScriptHardError('invalid_spec', 'agent(spec) needs an object');
   const spec = raw as Record<string, unknown>;
-  const out: AgentSpec = { cli: requireString(spec, 'cli', true)!, prompt: requireString(spec, 'prompt', true)! };
+  // `cli` 与 `bot` 至少一个（bot 执行器下都不给也行：落到本 run 所属 bot；pty 执行器要 `cli`，
+  // 缺了在 runner 侧以 setup_required 结算，这里不预判执行器）。
+  const out: AgentSpec = { prompt: requireString(spec, 'prompt', true)! };
+  const cli = requireString(spec, 'cli', false);
+  const bot = requireString(spec, 'bot', false);
   const session = requireString(spec, 'session', false);
   const model = requireString(spec, 'model', false);
   const cwd = requireString(spec, 'cwd', false);
   const timeoutMs = requireTimeout(spec);
+  if (cli !== undefined) {
+    if (cli.length === 0) throw new ScriptHardError('invalid_spec', 'cli must be a non-empty string');
+    out.cli = cli;
+  }
+  if (bot !== undefined) {
+    if (bot.length === 0) throw new ScriptHardError('invalid_spec', 'bot must be a non-empty string');
+    out.bot = bot;
+  }
   if (session !== undefined) out.session = session;
   if (model !== undefined) out.model = model;
   if (cwd !== undefined) out.cwd = cwd;
@@ -245,6 +257,7 @@ export class ScriptRuntime {
         const content = contentHash({
           kind: 'agent',
           cli: spec.cli,
+          bot: spec.bot,
           model: spec.model,
           cwd: spec.cwd ?? this.opts.cwd,
           execConfigDigest: this.opts.execConfigDigest,

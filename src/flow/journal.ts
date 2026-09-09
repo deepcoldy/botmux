@@ -190,6 +190,11 @@ export interface AttemptProjection {
   content: string;
   kind: 'agent' | 'signal';
   cli?: string;
+  /** `bot` 执行器：执行 bot（larkAppId）与展示名。 */
+  bot?: string;
+  botName?: string;
+  /** `bot` 执行器：daemon 为这个 attempt 开的虚拟会话（接管时据此关掉上一代留下的会话）。 */
+  sessionId: string | null;
   /** 创建该 attempt 的代次。 */
   gen: number;
   phase: AttemptPhase | null;
@@ -285,6 +290,7 @@ export function project(valid: readonly JournalRow[]): Projection {
         attempt,
         content: '',
         kind: 'agent',
+        sessionId: null,
         gen: rowGen,
         phase: null,
         container: null,
@@ -329,6 +335,8 @@ export function project(valid: readonly JournalRow[]): Projection {
         entry.content = row.content;
         entry.kind = row.kind;
         if (row.cli !== undefined) entry.cli = row.cli;
+        if (row.bot !== undefined) entry.bot = row.bot;
+        if (row.botName !== undefined) entry.botName = row.botName;
         break;
       }
       case 'attempt.state': {
@@ -338,6 +346,8 @@ export function project(valid: readonly JournalRow[]): Projection {
         if (row.pid !== undefined) entry.pid = row.pid;
         if (row.pidIdentity !== undefined) entry.pidIdentity = row.pidIdentity;
         if (row.cliPid !== undefined) entry.cliPid = row.cliPid;
+        if (row.bot !== undefined) entry.bot = row.bot;
+        if (row.sessionId !== undefined) entry.sessionId = row.sessionId;
         break;
       }
       case 'send.intent': {

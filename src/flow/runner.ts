@@ -36,6 +36,7 @@ import {
   type ReclaimResult,
 } from './container.js';
 import { attemptSessionId, canonicalJson, identityDirName, outboxFileName, scriptHash } from './identity.js';
+import { closeBotSession, defaultBotExecutorDeps, dispatchTurn, pollTurn, resolveAgentBot, type BotExecutorDeps, type ResolvedBot } from './bot-executor.js';
 import { controlSocketPath } from './paths.js';
 import {
   appendRowsLocked,
@@ -87,6 +88,7 @@ import {
   type Evidence,
   type FailedOutcome,
   type FailedRow,
+  type FlowExecutor,
   type JournalRow,
   type OkOutcome,
   type OpenWait,
@@ -222,6 +224,14 @@ export interface RunnerOptions {
   limits?: Partial<RunLimits>;
   cliPaths?: Record<string, string>;
   model?: string;
+  /**
+   * agent 执行器。`bot`（默认）：每个 agent 交给对应 bot 的 daemon 以 headless 虚拟会话跑；
+   * `pty`：runner 自己在容器里起裸 CLI（无 daemon 的调试 / 测试）。resume 缺省沿用 run.json 记录。
+   * 注入了 `spawnAgentWorker`（进程内测试）而没显式给执行器时按 `pty`。
+   */
+  executor?: FlowExecutor;
+  /** 注入：`bot` 执行器的 daemon 访问（测试用；默认真 loopback IPC）。 */
+  botExecutor?: BotExecutorDeps;
   ownerOpenId?: string;
   /**
    * 话题绑定（M2）：全新 run 写进 run.started；resume 缺省沿用 run.json 的记录。
@@ -287,6 +297,9 @@ interface InflightAttempt {
   link: AgentLink | null;
   cancel: (reason: string) => void;
   slot: SlotEntry | null;
+  /** `bot` 执行器：执行 bot 与它开的虚拟会话（finish / interrupt 时关掉）。 */
+  bot?: ResolvedBot;
+  botSessionId?: string;
 }
 
 interface PendingWait {
@@ -364,6 +377,8 @@ export class FlowRunner {
   private control: Server | null = null;
   private fenced = false;
   private finishing = false;
+  /** interrupt / 围栏之后：lease 已放，attempt 不得再写 journal。 */
+  private interrupted = false;
   private canceled: string | null = null;
   private hardError: { code: string; message: string; stack?: string } | null = null;
   private finishResolve: ((summary: RunSummary) => void) | null = null;
@@ -372,6 +387,8 @@ export class FlowRunner {
   private cwd = '';
   private cliPaths: Record<string, string> = {};
   private model: string | undefined;
+  private executor: FlowExecutor = 'bot';
+  private readonly botDeps: BotExecutorDeps;
   private scriptSource = '';
   private scriptHashValue = '';
   private runJson: RunJson | null = null;
@@ -380,6 +397,7 @@ export class FlowRunner {
     this.limits = { ...DEFAULT_RUN_LIMITS, ...(opts.limits ?? {}), ...(opts.requireContainment ? { requireContainment: true } : {}) };
     this.hooks = opts.hooks ?? {};
     this.projection = project([]);
+    this.botDeps = opts.botExecutor ?? defaultBotExecutorDeps();
   }
 
   /**
@@ -389,17 +407,23 @@ export class FlowRunner {
    */
   private resolveExecConfig(prior: RunJson | null): void {
     const explicitCliPaths = this.opts.cliPaths && Object.keys(this.opts.cliPaths).length > 0 ? this.opts.cliPaths : undefined;
+    // 执行器：显式 > resume 记录 > 假 worker（注入的 spawnAgentWorker / 测试 env BOTMUX_FLOW_FAKE_AGENT）
+    // 则 pty > bot。canary.2 之前的 run.json 没记 executor，它们全是 pty 跑的，resume 时沿用 pty。
+    const implicitExecutor: FlowExecutor = this.opts.spawnAgentWorker || (this.opts.baseEnv ?? process.env).BOTMUX_FLOW_FAKE_AGENT ? 'pty' : 'bot';
     if (this.opts.mode === 'resume' && prior) {
       const recorded = prior.execConfig ?? { cwd: prior.cwd, cliPaths: {}, model: null };
       this.cwd = this.opts.cwd ? safeRealpath(this.opts.cwd) : recorded.cwd;
       this.cliPaths = explicitCliPaths ?? recorded.cliPaths;
       this.model = this.opts.model ?? recorded.model ?? undefined;
+      this.executor = this.opts.executor ?? recorded.executor ?? (prior.execConfig ? 'pty' : implicitExecutor);
       this.limits = { ...DEFAULT_RUN_LIMITS, ...prior.limits, ...(this.opts.limits ?? {}), ...(this.opts.requireContainment ? { requireContainment: true } : {}) };
     } else {
       this.cwd = safeRealpath(this.opts.cwd ?? process.cwd());
       this.cliPaths = explicitCliPaths ?? {};
       this.model = this.opts.model;
+      this.executor = this.opts.executor ?? implicitExecutor;
     }
+    // executor 不进摘要：它决定「在哪跑」，不决定「跑什么」——同一 content 在两种执行器下的结果同样可复用。
     this.execConfigDigest = createHash('sha256').update(canonicalJson({ cliPaths: this.cliPaths, model: this.model ?? null })).digest('hex');
     if (this.opts.mode === 'resume' && prior && (this.cwd !== prior.cwd || (prior.execConfigDigest !== undefined && this.execConfigDigest !== prior.execConfigDigest))) {
       this.log(`exec config differs from the recorded run (cwd ${prior.cwd} → ${this.cwd}, digest ${(prior.execConfigDigest ?? '?').slice(0, 12)} → ${this.execConfigDigest.slice(0, 12)}); cached results will not replay`);
@@ -434,8 +458,24 @@ export class FlowRunner {
     mkdirSync(runDir, { recursive: true });
     const snapshotPath = join(runDir, SCRIPT_SNAPSHOT_FILE);
 
-    // 1. 能力探测
-    if (this.opts.containerBackend !== undefined) {
+    // 1. 脚本：全新 run 写快照；resume 读快照
+    if (this.opts.mode === 'run') {
+      if (!this.opts.script) throw new Error('script is required for a fresh run');
+      if (existsSync(join(runDir, 'journal.jsonl'))) throw new Error(`run ${runId} already exists; use resume`);
+      this.scriptSource = this.opts.script.source;
+      atomicWriteFileSync(snapshotPath, this.scriptSource);
+    } else {
+      if (!existsSync(snapshotPath)) throw new Error(`run ${runId} has no script snapshot; nothing to resume`);
+      this.scriptSource = readFileSync(snapshotPath, 'utf8');
+    }
+    this.scriptHashValue = scriptHash(this.scriptSource);
+    const existingRunJson = readRunJson(runDir);
+    this.resolveExecConfig(existingRunJson);
+
+    // 2. 能力探测（只有 pty 执行器需要容器：bot 执行器的进程归各 bot 的 daemon 管，档位 delegated）
+    if (this.executor === 'bot') {
+      this.backend = null;
+    } else if (this.opts.containerBackend !== undefined) {
       this.backend = this.opts.containerBackend;
     } else {
       const probed = probeContainerBackend();
@@ -452,20 +492,6 @@ export class FlowRunner {
       // M1 一律 cooperative：要求 contained 就是拒绝运行
       throw new Error('container_unavailable: --require-containment is set but M1 only provides the cooperative tier (contained needs the M3 sandbox boundary)');
     }
-
-    // 2. 脚本：全新 run 写快照；resume 读快照
-    if (this.opts.mode === 'run') {
-      if (!this.opts.script) throw new Error('script is required for a fresh run');
-      if (existsSync(join(runDir, 'journal.jsonl'))) throw new Error(`run ${runId} already exists; use resume`);
-      this.scriptSource = this.opts.script.source;
-      atomicWriteFileSync(snapshotPath, this.scriptSource);
-    } else {
-      if (!existsSync(snapshotPath)) throw new Error(`run ${runId} has no script snapshot; nothing to resume`);
-      this.scriptSource = readFileSync(snapshotPath, 'utf8');
-    }
-    this.scriptHashValue = scriptHash(this.scriptSource);
-    const existingRunJson = readRunJson(runDir);
-    this.resolveExecConfig(existingRunJson);
     // 话题绑定：全新 run 用 opts；resume 缺省沿用记录（显式给了才覆盖）
     this.binding = this.opts.mode === 'resume' ? (this.opts.binding ?? existingRunJson?.binding ?? null) : (this.opts.binding ?? null);
     this.attachDaemon();
@@ -493,7 +519,7 @@ export class FlowRunner {
           const ts = nowMs();
           const holder = { pid: process.pid, identity };
           const verdict = this.verdict;
-          const containment = verdict?.containment ?? 'cooperative';
+          const containment = this.executor === 'bot' ? 'delegated' : verdict?.containment ?? 'cooperative';
           const boundary = verdict?.boundary ?? 'none';
           const probe = verdict?.probe ?? null;
           const rows: JournalRow[] =
@@ -523,7 +549,7 @@ export class FlowRunner {
             createdAt: prior?.createdAt ?? ts,
             updatedAt: ts,
             limits: this.limits,
-            execConfig: { cwd: this.cwd, cliPaths: this.cliPaths, model: this.model ?? null },
+            execConfig: { cwd: this.cwd, cliPaths: this.cliPaths, model: this.model ?? null, executor: this.executor },
             execConfigDigest: this.execConfigDigest,
           };
           writeRunJsonLocked(runDir, this.runJson);
@@ -595,6 +621,10 @@ export class FlowRunner {
         const choice = await this.pauseRun('escape', `processes carrying this run's marker are outside its containers: ${escapes.map((e) => `${e.pid} (${e.cgroup})`).join(', ')}`);
         if (choice !== 'assume-clean') return this.cancelRun('escaped processes');
       }
+    } else if (this.executor === 'bot') {
+      // delegated：上一代在途 attempt 的进程在各 bot 的 daemon 里。按 journal 记录的会话逐个关掉
+      // （daemon 不在就算了：它重启时会自己回收无主的虚拟会话），不需要人来决策。
+      await this.closeInheritedBotSessions();
     } else if (this.opts.mode === 'resume') {
       const loaded = loadJournal(runDir);
       if (loaded.projection.counts.inflight > 0 && !this.opts.assumeClean) {
@@ -859,18 +889,28 @@ export class FlowRunner {
     const container = containerName(self.gen, n);
     const attemptDir = join(this.opts.runDir, 'agents', identityDirName(identity), 'attempts', `${self.gen}-${attempt}`);
     mkdirSync(attemptDir, { recursive: true });
+    // bot 执行器：先选执行 bot，started 行就带上它（卡片 / inspect 从一开始就能显示「谁在跑」）。
+    // 选不到不在这里抛：照样登记 attempt，再以 setup_required 结算，让失败进 journal、进决策卡。
+    const resolved = this.executor === 'bot' ? resolveAgentBot(spec, this.binding?.larkAppId ?? null, this.botDeps.listDaemons()) : null;
+    const bot = resolved?.ok ? resolved.bot : null;
     const rows: JournalRow[] = [];
     if (disposition.divergence) rows.push({ t: 'divergence', gen: self.gen, ts: nowMs(), identity, expected: disposition.divergence.expected, actual: disposition.divergence.actual });
-    rows.push({ t: 'started', gen: self.gen, ts: nowMs(), identity, attempt, content, kind: 'agent', cli: spec.cli });
+    rows.push({
+      t: 'started', gen: self.gen, ts: nowMs(), identity, attempt, content, kind: 'agent',
+      ...(spec.cli !== undefined || bot ? { cli: bot?.cliId || spec.cli } : {}),
+      ...(bot ? { bot: bot.larkAppId, botName: bot.botName } : {}),
+    });
     rows.push({ t: 'attempt.state', gen: self.gen, ts: nowMs(), identity, attempt, container, state: 'queued' });
     await this.append(rows);
     this.projection = loadJournal(this.opts.runDir).projection;
 
-    const entry: InflightAttempt = { identity, attempt, container, containerPath: null, link: null, cancel: () => {}, slot: null };
+    const entry: InflightAttempt = { identity, attempt, container, containerPath: null, link: null, cancel: () => {}, slot: null, ...(bot ? { bot } : {}) };
     this.inflight.set(identity, entry);
     this.noteClockTransition();
     try {
-      const outcome = await this.executeAttempt(entry, content, spec, attemptDir);
+      const outcome = this.executor === 'bot'
+        ? await this.executeBotAttempt(entry, spec, attemptDir, resolved!)
+        : await this.executeAttempt(entry, content, spec, attemptDir);
       await this.hook('after_settled', { identity, attempt, ok: outcome.ok });
       return outcome;
     } finally {
@@ -893,6 +933,8 @@ export class FlowRunner {
     const slotWait = await this.waitForSlot(entry);
     if (!slotWait.ok) return failRow('slot_timeout', 'auto', 'none', slotWait.detail, { source: 'none', attemptDir });
     if (this.canceled) return failRow('canceled', 'manual', 'none', `run canceled (${this.canceled}) before the attempt started`, { source: 'none', attemptDir });
+    const cli = spec.cli?.trim();
+    if (!cli) return failRow('setup_required', 'manual', 'none', 'agent needs `cli` under the pty executor (`bot` is only resolved by the bot executor)', { source: 'none', attemptDir });
 
     // 容器：记录与 mkdir 同一临界区
     const cpath = this.backend ? containerPath(this.backend, this.opts.runId, container) : null;
@@ -963,8 +1005,8 @@ export class FlowRunner {
         attempt,
         gen: self.gen,
         sessionId: attemptSessionId(this.opts.runId, identity, self.gen, attempt),
-        cli: spec.cli,
-        cliPath: this.cliPaths[spec.cli],
+        cli,
+        cliPath: this.cliPaths[cli],
         model: spec.model ?? this.model,
         cwd: spec.cwd ? safeRealpath(spec.cwd) : this.cwd,
         env: stringEnv(env),
@@ -1061,6 +1103,181 @@ export class FlowRunner {
       }
     } finally {
       await cleanup();
+    }
+  }
+
+  /**
+   * `bot` 执行器的一个 attempt：交给执行 bot 的 daemon 跑（headless 虚拟会话）。
+   *
+   * 生命周期与 pty 路径同构、journal 行完全一致（queued → spawning → ready → send.intent →
+   * send.confirmed → result / failed），只是「进程」换成了「daemon 里的会话」：
+   *   - `spawning` = 派发请求发出；`ready` = daemon 已开会话（行里记 sessionId，接管时据此关它）
+   *   - `send.intent` 在派发前写（daemon 可能已收到而我们没收到应答 → effects 只能 uncertain）
+   *   - `send.confirmed` = 派发应答 ok（prompt 已进会话队列）
+   *   - 结果轮询 `trigger-result`；超时 / 取消 → 关会话
+   *   - schema 修复轮回到同一个会话（sessionId 不变，turn+1）
+   *   - 结算后关掉虚拟会话：daemon 不会自己关 HTTP 虚拟会话。
+   */
+  private async executeBotAttempt(entry: InflightAttempt, spec: AgentSpec, attemptDir: string, resolved: ReturnType<typeof resolveAgentBot>): Promise<Outcome> {
+    const self = this.self!;
+    const { identity, attempt, container } = entry;
+    const failRow = async (category: FailedOutcome['category'], retry: FailedOutcome['retry'], effects: FailedOutcome['effects'], error: string, evidence: Evidence): Promise<FailedOutcome> => {
+      const row: FailedRow = { t: 'failed', gen: self.gen, ts: nowMs(), identity, attempt, category, retry, effects, error, evidence: trimEvidence(evidence, attemptDir) };
+      await this.append([row]);
+      return { ok: false, identity, attempt, evidence: row.evidence, error, category, retry, effects };
+    };
+    if (!resolved.ok) return failRow('setup_required', 'manual', 'none', resolved.error, { source: 'none', attemptDir });
+    const bot = resolved.bot;
+    const botEvidence = (extra: Partial<Evidence>): Evidence => ({ source: 'none', attemptDir, bot: bot.larkAppId, botName: bot.botName, ...extra });
+
+    const slotWait = await this.waitForSlot(entry);
+    if (!slotWait.ok) return failRow('slot_timeout', 'auto', 'none', slotWait.detail, botEvidence({}));
+    if (this.canceled) return failRow('canceled', 'manual', 'none', `run canceled (${this.canceled}) before the attempt started`, botEvidence({}));
+
+    // 容器行照写（kind none）：投影按 container 名关联 attempt.state / send.intent
+    await this.append([{ t: 'container.created', gen: self.gen, ts: nowMs(), container, kind: 'none', path: '' }]);
+    await this.hook('after_container_created', { identity, attempt, container });
+    const timeoutMs = spec.timeoutMs ?? this.limits.agentTimeoutMs;
+    const workingDir = spec.cwd ? safeRealpath(spec.cwd) : this.cwd;
+    let sessionId: string | null = null;
+    // 会话只关一次：取消 / 超时 / 结算 / 收尾路径（closeInflightBotSession 清掉 entry.botSessionId）谁先到谁关
+    const closeOnce = async (reason: string): Promise<void> => {
+      if (!sessionId || !entry.botSessionId) return;
+      const id = sessionId;
+      entry.botSessionId = undefined;
+      const closed = await closeBotSession(this.botDeps, bot, id, `flow ${this.opts.runId} ${identity} attempt ${attempt}: ${reason}`);
+      if (!closed.ok) this.log(`bot session ${id} on ${bot.botName} not closed (${reason}): ${closed.error}`);
+    };
+    const cleanup = async (): Promise<void> => {
+      await closeOnce('settled');
+      if (entry.slot) {
+        await releaseSlot(this.opts.slotsFile, entry.slot).catch(() => undefined);
+        entry.slot = null;
+      }
+    };
+
+    try {
+      let turn = 0;
+      let prompt = spec.prompt;
+      let repaired = false;
+      for (;;) {
+        turn++;
+        const outboxFile = outboxFileName(self.gen, turn, identity);
+        if (turn === 1) await this.append([{ t: 'attempt.state', gen: self.gen, ts: nowMs(), identity, attempt, container, state: 'spawning', bot: bot.larkAppId }]);
+        await this.hook('before_send_intent', { identity, attempt, turn, outboxFile });
+        await this.append([{ t: 'send.intent', gen: self.gen, ts: nowMs(), identity, attempt, container, turn, outboxFile }]);
+        await this.hook('after_send_intent', { identity, attempt, turn, outboxFile });
+        if (this.canceled) return failRow('canceled', 'manual', 'uncertain', `run canceled (${this.canceled}) after send intent`, botEvidence({}));
+        await this.hook('before_authorize', { identity, attempt, turn });
+        const dispatched = await dispatchTurn(this.botDeps, bot, {
+          runId: this.opts.runId, identity, attempt, gen: self.gen, turn, sessionId, prompt, workingDir, timeoutMs,
+          ...(spec.model ?? this.model ? { model: spec.model ?? this.model } : {}),
+        });
+        await this.hook('after_authorize', { identity, attempt, turn });
+        if (!dispatched.ok) {
+          const setup = dispatched.code === 'flow_not_enabled' || dispatched.code === 'bad_request';
+          // 首轮派发失败：daemon 明确拒绝（有应答）→ 没起会话，effects none；网络层失败 → 不知道
+          const effects: FailedOutcome['effects'] = dispatched.code === 'bot_offline' || dispatched.code === 'http_error' ? 'uncertain' : 'none';
+          return failRow(setup ? 'setup_required' : 'spawn_failed', setup ? 'manual' : 'auto', effects, `${bot.botName}: ${dispatched.error}`, botEvidence({ dispatchCode: dispatched.code, sessionId }));
+        }
+        if (turn === 1) {
+          sessionId = dispatched.sessionId;
+          entry.botSessionId = sessionId;
+          await this.append([{ t: 'attempt.state', gen: self.gen, ts: nowMs(), identity, attempt, container, state: 'ready', cliPid: null, bot: bot.larkAppId, sessionId }]);
+        } else if (dispatched.sessionId !== sessionId) {
+          return failRow('crashed', 'auto', 'uncertain', `repair turn landed on session ${dispatched.sessionId}, expected ${sessionId}`, botEvidence({ sessionId }));
+        }
+        await this.append([{ t: 'send.confirmed', gen: self.gen, ts: nowMs(), identity, attempt }]).catch(() => undefined);
+
+        // 轮询结果；取消 / 超时都是「停轮询 + 关会话」
+        const poll = pollTurn(this.botDeps, bot, sessionId!, dispatched.triggerId, timeoutMs);
+        let cancelReason: string | null = null;
+        entry.cancel = (reason) => {
+          if (cancelReason) return;
+          cancelReason = reason;
+          poll.stop();
+          void closeOnce(reason);
+        };
+        let polled: Awaited<typeof poll.result>;
+        try {
+          polled = await poll.result;
+        } finally {
+          entry.cancel = () => {};
+        }
+        // 被中断（interrupt / 围栏）：lease 已释放，不能再写 journal；resume 会把这个 attempt 诚实结算
+        if (this.interrupted) {
+          return { ok: false, identity, attempt, evidence: botEvidence({ sessionId }), error: 'runner interrupted while the bot was working', category: 'interrupted', retry: 'manual', effects: 'uncertain' };
+        }
+        if (polled.status === 'timeout') {
+          await closeOnce('timeout');
+          return failRow('timeout', 'auto', 'uncertain', `${bot.botName} did not finish the turn within ${timeoutMs}ms`, botEvidence({ sessionId, triggerId: dispatched.triggerId }));
+        }
+        if (polled.status === 'aborted' || cancelReason) {
+          return failRow('canceled', 'manual', 'uncertain', `canceled (${cancelReason ?? 'runner'}) while ${bot.botName} was working`, botEvidence({ sessionId, triggerId: dispatched.triggerId }));
+        }
+        if (polled.status === 'lost') {
+          return failRow('crashed', 'auto', 'uncertain', `${bot.botName}: ${polled.error}`, botEvidence({ sessionId, triggerId: dispatched.triggerId }));
+        }
+        if (polled.status === 'failed') {
+          return failRow('crashed', 'auto', 'uncertain', `${bot.botName}: ${polled.error}`, botEvidence({ sessionId, triggerId: dispatched.triggerId, errorCode: polled.errorCode }));
+        }
+        // completed：与 pty 路径同一套 schema 校验（最后一个平衡 JSON 块，一次修复）
+        const evidence = botEvidence({ source: 'daemon', confidence: 'high', sessionId, triggerId: dispatched.triggerId });
+        if (Buffer.byteLength(polled.content, 'utf8') > AGENT_RESPONSE_MAX_BYTES) {
+          return failRow('schema_mismatch', 'manual', 'uncertain', `agent response exceeds ${AGENT_RESPONSE_MAX_BYTES} bytes`, evidence);
+        }
+        let value: unknown = polled.content;
+        if (spec.schema !== undefined) {
+          const parsed = extractLastJsonBlock(polled.content);
+          const issues = parsed === null ? [{ path: '$', message: 'no JSON block found in the response' }] : validateValue(spec.schema, parsed);
+          if (issues.length > 0) {
+            if (!repaired) {
+              repaired = true;
+              prompt = `Your previous reply did not satisfy the required JSON schema:\n${issues.map((i) => `- ${i.path}: ${i.message}`).join('\n')}\nReply again with ONLY the corrected JSON object (no prose).`;
+              continue;
+            }
+            return failRow('schema_mismatch', 'manual', 'uncertain', `response does not match schema after one repair: ${issues.map((i) => `${i.path}: ${i.message}`).join('; ')}`, evidence);
+          }
+          value = parsed;
+        }
+        try {
+          writeFileSync(join(attemptDir, 'response.md'), polled.content);
+        } catch {
+          // best effort
+        }
+        const row = await this.resultRow(identity, attempt, value, evidence, attemptDir);
+        await this.append([row]);
+        return { ok: true, value, identity, attempt, evidence: row.evidence };
+      }
+    } finally {
+      await cleanup();
+    }
+  }
+
+  /** 收尾路径（finish / interrupt / fenced）：在途 attempt 的虚拟会话不能留在 daemon 里。 */
+  private async closeInflightBotSession(entry: InflightAttempt, reason: string): Promise<void> {
+    if (!entry.bot || !entry.botSessionId) return;
+    const sessionId = entry.botSessionId;
+    entry.botSessionId = undefined;
+    const closed = await closeBotSession(this.botDeps, entry.bot, sessionId, `flow ${this.opts.runId} ${entry.identity}: ${reason}`).catch((err: unknown) => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    if (!closed.ok) this.log(`bot session ${sessionId} on ${entry.bot.botName} not closed (${reason}): ${closed.error}`);
+  }
+
+  /** 接管时：上一代在途 attempt 在各 bot daemon 里的虚拟会话，按 journal 记录逐个关掉。 */
+  private async closeInheritedBotSessions(): Promise<void> {
+    const loaded = loadJournal(this.opts.runDir);
+    const daemons = this.botDeps.listDaemons();
+    for (const ident of loaded.projection.identities.values()) {
+      const a = ident.latest;
+      if (a.state !== 'inflight' || !a.sessionId || !a.bot) continue;
+      const d = daemons.find((x) => x.larkAppId === a.bot);
+      if (!d) {
+        this.log(`inherited bot session ${a.sessionId} (${a.bot}) for ${a.identity}: daemon offline, left for its own cleanup`);
+        continue;
+      }
+      const bot: ResolvedBot = { larkAppId: d.larkAppId, botName: d.botName ?? d.larkAppId, cliId: d.cliId ?? '', ipcPort: d.ipcPort };
+      const closed = await closeBotSession(this.botDeps, bot, a.sessionId, `flow ${this.opts.runId} takeover: gen ${a.gen} attempt of ${a.identity} did not settle`);
+      this.log(`inherited bot session ${a.sessionId} on ${bot.botName} for ${a.identity}: ${closed.ok ? 'closed' : `not closed (${closed.error})`}`);
     }
   }
 
@@ -1535,6 +1752,7 @@ export class FlowRunner {
         state: a.state,
         phase: a.phase,
         ...(a.cli ? { cli: a.cli } : {}),
+        ...(a.botName ? { botName: a.botName } : {}),
         ...(a.failed ? { category: a.failed.category, error: a.failed.error } : {}),
       });
     }
@@ -1676,6 +1894,7 @@ export class FlowRunner {
     while (this.inflight.size > 0 && nowMs() < waitUntil) await sleep(100);
     for (const entry of this.inflight.values()) {
       entry.link?.kill('SIGKILL');
+      await this.closeInflightBotSession(entry, 'run finished');
       if (this.backend && entry.containerPath) await reclaimContainer(this.backend, entry.containerPath, { drainTimeoutMs: 3_000 });
       if (entry.slot) await releaseSlot(this.opts.slotsFile, entry.slot).catch(() => undefined);
     }
@@ -1724,7 +1943,9 @@ export class FlowRunner {
 
   /** 被围栏：不写 journal，只回收自己代次的资源后退出。 */
   private async exitFenced(): Promise<void> {
+    this.interrupted = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    for (const entry of this.inflight.values()) entry.cancel('runner fenced');
     for (const wait of this.pendingWaits.values()) wait.resolve('canceled');
     for (const wait of this.openWaits.values()) {
       if (wait.timer) clearTimeout(wait.timer);
@@ -1733,6 +1954,7 @@ export class FlowRunner {
     this.openWaits.clear();
     for (const entry of this.inflight.values()) {
       entry.link?.kill('SIGKILL');
+      await this.closeInflightBotSession(entry, 'runner fenced');
       if (this.backend && entry.containerPath) await reclaimContainer(this.backend, entry.containerPath, { drainTimeoutMs: 3_000 }).catch(() => undefined);
     }
     this.script?.kill('SIGKILL');
@@ -1754,6 +1976,7 @@ export class FlowRunner {
   async interrupt(reason: string): Promise<void> {
     if (this.finishing || this.fenced || !this.self) return;
     this.finishing = true;
+    this.interrupted = true;
     const self = this.self;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
@@ -1761,9 +1984,16 @@ export class FlowRunner {
     for (const wait of this.openWaits.values()) if (wait.timer) clearTimeout(wait.timer);
     const inflightIds = [...this.inflight.keys(), ...this.openWaits.keys()];
     for (const entry of this.inflight.values()) {
+      // bot 执行器：停轮询 + 关会话——resume 后这个 attempt 会被诚实结算成 interrupted 再重跑，
+      // 留着旧会话只会让 daemon 里多一个无主的 CLI。pty 执行器：cancel 只是给 worker 的提示，随后 SIGKILL。
+      entry.cancel(`runner interrupted (${reason})`);
       entry.link?.kill('SIGKILL');
+      await this.closeInflightBotSession(entry, `runner interrupted (${reason})`);
       if (this.backend && entry.containerPath) await reclaimContainer(this.backend, entry.containerPath, { drainTimeoutMs: 3_000 }).catch(() => undefined);
-      if (entry.slot) await releaseSlot(this.opts.slotsFile, entry.slot).catch(() => undefined);
+      if (entry.slot) {
+        await releaseSlot(this.opts.slotsFile, entry.slot).catch(() => undefined);
+        entry.slot = null;
+      }
     }
     this.script?.kill('SIGKILL');
     try {

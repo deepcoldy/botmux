@@ -29,16 +29,18 @@ import { decisionKey, loadJournal, type Projection } from '../flow/journal.js';
 import { readLeaseUnlocked, holderAlive } from '../flow/ownership.js';
 import { FlowRunner, readRunJson, resolveFlowEntry, type RunnerOptions } from '../flow/runner.js';
 import { assertScriptLint, ScriptLintError } from '../flow/script-lint.js';
-import { DEFAULT_RUN_LIMITS, type ControlRequest, type ControlResponse, type RunBinding, type RunLimits } from '../flow/types.js';
+import { DEFAULT_RUN_LIMITS, type ControlRequest, type ControlResponse, type FlowExecutor, type RunBinding, type RunLimits } from '../flow/types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const FLOW_USAGE = `Usage:
-  botmux flow run <script.mjs> [--input '<json>'|--input-file <f>] [--cli-path <cli>=<path>]... [--model <m>]
+  botmux flow run <script.mjs> [--input '<json>'|--input-file <f>] [--executor bot|pty] [--model <m>]
                   [--concurrency N] [--cwd <dir>] [--max-duration-min N] [--max-resident-runs N]
-                  [--require-containment] [--unsafe-no-container] [--follow] [--foreground]
+                  [--cli-path <cli>=<path>]... [--require-containment] [--unsafe-no-container] [--follow] [--foreground]
+                  (--executor bot = each agent runs as a headless session on its bot's daemon [default];
+                   pty = the runner spawns bare CLIs itself; --cli-path / containment flags apply to pty only)
   botmux flow resume <runId> [--accept-journal] [--assume-clean] [--retry-uncertain] [--follow] [--foreground]
-                  (cwd / --cli-path / --model / limits are restored from the run record unless given again)
+                  (cwd / executor / --cli-path / --model / limits are restored from the run record unless given again)
   botmux flow inspect <runId> [--json]
   botmux flow ls [--json]
   botmux flow cancel <runId>
@@ -60,7 +62,7 @@ interface ParsedArgs {
   multi: Map<string, string[]>;
 }
 
-const VALUE_FLAGS = new Set(['--input', '--input-file', '--cli-path', '--model', '--concurrency', '--cwd', '--attempt', '--by', '--data-dir', '--dist-dir', '--max-duration-min', '--max-resident-runs', '--payload', '--version']);
+const VALUE_FLAGS = new Set(['--input', '--input-file', '--cli-path', '--model', '--executor', '--concurrency', '--cwd', '--attempt', '--by', '--data-dir', '--dist-dir', '--max-duration-min', '--max-resident-runs', '--payload', '--version']);
 
 export function parseFlowArgs(args: string[]): ParsedArgs {
   const positionals: string[] = [];
@@ -242,6 +244,7 @@ async function cmdRun(p: ParsedArgs, ctx: Ctx): Promise<number> {
     limits: parseLimits(p),
     cliPaths: parseCliPaths(p),
     model: str(p, '--model'),
+    executor: parseExecutor(p),
     slotsFile: flowSlotsFile(ctx.dataDir),
     requireContainment: has(p, '--require-containment'),
     unsafeNoContainer: has(p, '--unsafe-no-container'),
@@ -269,6 +272,7 @@ async function cmdResume(p: ParsedArgs, ctx: Ctx): Promise<number> {
     limits: parseLimits(p),
     cliPaths: parseCliPaths(p),
     model: str(p, '--model'),
+    executor: parseExecutor(p),
     slotsFile: flowSlotsFile(ctx.dataDir),
     requireContainment: has(p, '--require-containment'),
     unsafeNoContainer: has(p, '--unsafe-no-container'),
@@ -281,7 +285,14 @@ async function cmdResume(p: ParsedArgs, ctx: Ctx): Promise<number> {
   return launch(options, p, ctx);
 }
 
-type SerializableRunnerOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'distDir'> & { distDir?: string };
+type SerializableRunnerOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'distDir' | 'botExecutor'> & { distDir?: string };
+
+function parseExecutor(p: ParsedArgs): FlowExecutor | undefined {
+  const v = str(p, '--executor');
+  if (v === undefined) return undefined;
+  if (v === 'bot' || v === 'pty') return v;
+  throw new Error(`--executor expects bot or pty, got ${JSON.stringify(v)}`);
+}
 
 async function launch(options: SerializableRunnerOptions, p: ParsedArgs, ctx: Ctx): Promise<number> {
   if (has(p, '--foreground')) {
@@ -329,7 +340,7 @@ async function followRun(runDir: string, ctx: Ctx): Promise<number> {
           ctx.out(`  [note] ${row.text}`);
           break;
         case 'started':
-          ctx.out(`  [${row.identity}] attempt ${row.attempt} started (${row.cli ?? row.kind})`);
+          ctx.out(`  [${row.identity}] attempt ${row.attempt} started (${row.botName ? `${row.botName}${row.cli ? ` · ${row.cli}` : ''}` : row.cli ?? row.kind})`);
           break;
         case 'result':
           ctx.out(`  [${row.identity}] attempt ${row.attempt} ok`);
@@ -391,7 +402,9 @@ export interface InspectReport {
   counts: Projection['counts'];
   activeMs: number;
   cpuMs: number;
-  attempts: Array<{ identity: string; attempt: number; state: string; phase: string | null; container: string | null; intent: boolean; category?: string; retry?: string; effects?: string; error?: string }>;
+  /** `executor`：run.json 记录的执行器（canary.2 之前的 run 没记 → null，实际是 pty）。 */
+  executor: string | null;
+  attempts: Array<{ identity: string; attempt: number; state: string; phase: string | null; container: string | null; intent: boolean; cli?: string; bot?: string; botName?: string; sessionId?: string; category?: string; retry?: string; effects?: string; error?: string }>;
   pending: Array<{ identity: string; attempt: number; reason: string; error: string }>;
   /** 逻辑 open 的信号等待与其投递状态（§7.3）。 */
   waits: Array<{ identity: string; version: number; state: string; delivery: string | null; messageId: string | null; error: string | null; prompt: string }>;
@@ -421,6 +434,10 @@ export function inspectRun(runDir: string): InspectReport {
       phase: a.phase,
       container: a.container,
       intent: a.intent !== null,
+      ...(a.cli ? { cli: a.cli } : {}),
+      ...(a.bot ? { bot: a.bot } : {}),
+      ...(a.botName ? { botName: a.botName } : {}),
+      ...(a.sessionId ? { sessionId: a.sessionId } : {}),
       ...(a.failed ? { category: a.failed.category, retry: a.failed.retry, effects: a.failed.effects, error: a.failed.error } : {}),
     };
   });
@@ -445,6 +462,7 @@ export function inspectRun(runDir: string): InspectReport {
     holder: lease ? { pid: lease.holderPid, alive: holderIsAlive } : null,
     containment: p.takeovers.length > 0 ? { containment: p.takeovers[p.takeovers.length - 1]!.containment, probe: p.takeovers[p.takeovers.length - 1]!.probe } : p.started ? { containment: p.started.containment, probe: p.started.probe } : null,
     integrity: { dropped: loaded.integrity.dropped.length },
+    executor: runJson?.execConfig?.executor ?? null,
     counts: p.counts,
     activeMs: p.activity?.activeMs ?? runJson?.activeMs ?? 0,
     cpuMs: p.activity?.cpuMs ?? runJson?.cpuMs ?? 0,
@@ -469,10 +487,11 @@ function cmdInspect(p: ParsedArgs, ctx: Ctx): number {
     return 0;
   }
   ctx.out(`run ${report.runId} gen ${report.gen}: ${report.status} (${report.health})`);
-  ctx.out(`  holder: ${report.holder ? `pid ${report.holder.pid} ${report.holder.alive ? 'alive' : 'dead'}` : 'none'}; containment: ${JSON.stringify(report.containment?.containment ?? null)}`);
+  ctx.out(`  holder: ${report.holder ? `pid ${report.holder.pid} ${report.holder.alive ? 'alive' : 'dead'}` : 'none'}; executor: ${report.executor ?? 'pty (unrecorded)'}; containment: ${JSON.stringify(report.containment?.containment ?? null)}`);
   ctx.out(`  active ${Math.round(report.activeMs / 1000)}s, script cpu ${Math.round(report.cpuMs)}ms; journal dropped rows: ${report.integrity.dropped}`);
   for (const a of report.attempts) {
-    ctx.out(`  ${a.identity} attempt ${a.attempt}: ${a.state}${a.phase ? ` (${a.phase})` : ''}${a.intent ? ' intent' : ''}${a.category ? ` ${a.category} ${a.retry}/${a.effects}: ${a.error}` : ''}`);
+    const who = a.botName ? ` on ${a.botName}${a.cli ? ` · ${a.cli}` : ''}${a.sessionId ? ` [${a.sessionId.slice(0, 8)}]` : ''}` : a.cli ? ` (${a.cli})` : '';
+    ctx.out(`  ${a.identity} attempt ${a.attempt}${who}: ${a.state}${a.phase ? ` (${a.phase})` : ''}${a.intent ? ' intent' : ''}${a.category ? ` ${a.category} ${a.retry}/${a.effects}: ${a.error}` : ''}`);
   }
   for (const d of report.pending) ctx.out(`  pending decision: ${d.identity} attempt ${d.attempt} (${d.reason}) → botmux flow decide ${report.runId} '${d.identity}' --attempt ${d.attempt} --accept-failed|--retry`);
   if (report.binding) {

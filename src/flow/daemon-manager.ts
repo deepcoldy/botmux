@@ -670,7 +670,7 @@ export class FlowRunManager {
 // 工具
 // ---------------------------------------------------------------------------
 
-type SerializableRunnerOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'daemonLink'>;
+type SerializableRunnerOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'daemonLink' | 'botExecutor'>;
 
 function waitKey(wait: Pick<OpenWait, 'identity' | 'version'>): string {
   return `${wait.identity}:${wait.version}`;

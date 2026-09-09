@@ -87,7 +87,7 @@ export default async function (ctx) {
 
 | 成员 | 语义 | journal |
 |---|---|---|
-| `agent(spec)` | 独立 PTY 跑一个 CLI 回合，返回 `Outcome` | 是 |
+| `agent(spec)` | 让一个 bot 跑一个 CLI 回合（默认 `bot` 执行器：bot 的 daemon 开 headless 虚拟会话；`pty` 执行器：runner 自己起裸 CLI），返回 `Outcome` | 是 |
 | `signal(spec)` | 发信号卡等人，返回 `Outcome` | 是 |
 | `parallel(thunks)` | `thunk(branchCtx)`；等全部结束返回 `Outcome[]`（按输入顺序）；不捕获异常 | 占位置 |
 | `pipeline(items, ...stages)` | `stage(value, item, branchCtx)`；每 item 独立流水线；stage 返回 `ok:false` 则该 item 短路 | 占位置 |
@@ -100,7 +100,9 @@ export default async function (ctx) {
 - **生命周期**：分支 thunk 返回时其 ctx 被撤销；之后任何调用是硬错误 `ctx_revoked`。thunk 返回时该 ctx 仍有在途副作用（未 `await`）是硬错误 `unawaited_effect`，runner 取消该 attempt（成为 `interrupted / uncertain`）后终止脚本。根 ctx 在脚本返回后同样撤销。
 - 这些检查由 script host 在调用时刻执行，不依赖 AsyncLocalStorage。
 
-`agent(spec)`：`cli`、`prompt` 必填；`schema`（§4.7）、`session`、`model`、`cwd`（默认触发时 cwd）、`timeoutMs`（默认 30 分钟）可选。`signal(spec)`：`prompt`、`schema` 必填；`timeoutMs` 默认 7 天。
+`agent(spec)`：`prompt` 必填；`bot`（执行 bot：bots.json 的 `displayName` 或 larkAppId）、`cli`、`schema`（§4.7）、`session`、`model`、`cwd`（默认触发时 cwd）、`timeoutMs`（默认 30 分钟）可选。`signal(spec)`：`prompt`、`schema` 必填；`timeoutMs` 默认 7 天。
+
+**执行 bot 的解析**（`bot` 执行器，§6.1）：显式 `bot` → 就它（给了 `cli` 还要一致）；否则按 `cli` 找在线 bot——本 run 所属 bot（触发话题的那个）的 CLI 相同就用它，否则第一个在线的同 CLI bot；都没给就是本 run 所属 bot（终端起的 run 没有所属 bot：只有一个 bot 在线时用它，否则必须点名）。只在**在线** daemon 里找（`dashboard-daemons/` 描述符）——离线的 bot 本来就跑不了，找不到以 `setup_required / manual` 结算。`bot` 进 content hash（§5.2），按 `cli` 解析出来的 bot 不进：换台同 CLI 的机器结果仍可复用。
 
 ### 4.3 Outcome
 
@@ -179,7 +181,7 @@ sessionChain[n] = sha256(sessionChain[n-1], identity_n, outcomeDigest_n)
 ### 5.4 journal 行与投影
 
 ```jsonl
-{"t":"run.started","gen":1,"runId":"…","script":"…","scriptHash":"…","input":{…},"binding":{…},"cwd":"…","execConfigDigest":"…","bootId":"…","containment":"contained|cooperative","boundary":"none|cgroupns+userns","probe":{…},"ts":…}
+{"t":"run.started","gen":1,"runId":"…","script":"…","scriptHash":"…","input":{…},"binding":{…},"cwd":"…","execConfigDigest":"…","bootId":"…","containment":"contained|cooperative|delegated","boundary":"none|cgroupns+userns","probe":{…},"ts":…}
 {"t":"run.takeover","gen":2,"from":{"pid":…,"identity":"…"},"reason":"holder_dead|heartbeat_stale|lease_missing|lock_holder_stale","containment":"…","boundary":"…","probe":{…},"ts":…}
 {"t":"container.created","gen":1,"container":"c-1-0","kind":"cgroup2-kill|cgroup2-freeze|cgroup1-freezer","path":"…","ts":…}
 {"t":"attempt.state","gen":1,"identity":"#1/par:0#0","attempt":1,"container":"c-1-0","state":"queued|spawning|ready|settling","pid":…,"pidIdentity":"…","ts":…}
@@ -261,12 +263,16 @@ daemon ──resolveEntrySpawn('flow-runner')──▶ runner（特权，一个 
              │                                 ├─ journal、宿主 IPC 发卡、信号裁决、决策、槽位、心跳、容器管理、秒表与 CPU 采样
              │                                 ├─ resolveEntrySpawn('flow-script') ▶ script host（受限，RLIMIT_CPU）
              │                                 │     跑脚本快照；ctx 是 IPC RPC；无文件、无网络
-             │                                 └─ resolveEntrySpawn('flow-agent')  ▶ agent worker（每 attempt 或每会话，由 runner 移入容器）
+             │                                 ├─ [bot 执行器，默认] POST /api/flow/agent-turn ▶ 执行 bot 的 daemon（本 bot 或别的 bot，loopback IPC + HMAC）
+             │                                 │     daemon 开 headless 虚拟会话（`http_async_*`，不进群、不发卡、不占话题），跑一回合，runner 轮询 trigger-result 取 final_output，用完 close
+             │                                 └─ [pty 执行器] resolveEntrySpawn('flow-agent')  ▶ agent worker（每 attempt 或每会话，由 runner 移入容器）
              │                                       PtyTurnRunner + 契约 + 证据
              └─ 入站：卡片回调、控制命令 → IPC → runner
 ```
 
 三个入口都是新增 `BotmuxEntry`。两层子进程都经 `applySessionOwnerEnv`。总时限与取消由 runner 在进程外执行。runner 与 daemon 的 IPC 携带 `runId` 与 `gen`。
+
+**两种执行器。** `agent()` 默认走 **`bot` 执行器**：一个 attempt = 执行 bot 的 daemon 上一个 headless 虚拟会话里的一回合（`triggerSessionTurn` 的 `asyncReturnSessionId` 路径，内部 `promptMode: 'task'` 只渲染任务本身、不带「外部事件」包装），bot 用的是它自己已配好的 CLI、模型、沙箱、工作目录规则与 hooks——**bot 就是执行者，flow 只负责编排**；bot 不需要在任何群里，run 里也看不到它「露脸」。runner 与该 daemon 之间只有三条 HTTP 路由：`POST /api/flow/agent-turn`（新增，开会话/续会话并投递 prompt）、`GET /api/sessions/:id/trigger-result`（既有，轮询）、`POST /api/sessions/:id/close`（既有，attempt 结算后关闭；runner 接管时先关上一代次遗留的会话）。本 bot 与其它 bot 走同一条路径，终端 `botmux flow run` 也一样。虚拟会话是 **ownerless** 的（不跨 daemon 传 `ou_`，见 CLAUDE.md 的 owner 身份边界）。`--executor pty`（或 `RunnerOptions.executor`）切回自起裸 CLI 的旧路径，测试与调试用；注入 `spawnAgentWorker` 或设 `BOTMUX_FLOW_FAKE_AGENT` 时隐式为 `pty`。执行器记在 `run.json.execConfig.executor`，resume 沿用，但**不进** `execConfigDigest`（换执行器不该让已有结果失效）。
 
 ### 6.2 lease、代次、接管与「写即核对」
 
@@ -297,8 +303,9 @@ daemon ──resolveEntrySpawn('flow-runner')──▶ runner（特权，一个 
 |---|---|---|
 | `contained` | 已核验的 cgroupns + userns 边界（M3 沙箱，v2 `nsdelegate` 宿主） | 容器子树为空 ⇔ 该 attempt 派生的所有进程都已不存在 |
 | `cooperative` | 其余一切，含 M1 全部与 v1 宿主 | 容器子树为空 ⇔ 所有进程都已不存在，**前提是整个派生进程树从未有任何一员迁出**。迁出的进程随后 fork 的后代自己没改写归属，却同样在容器外，所以前提落在整棵树上。普通 CLI、工具与 daemonize 手法都不改写 cgroup 归属；迁出需要显式写 cgroupfs |
+| `delegated` | `bot` 执行器（§6.1 默认）：CLI 进程不由 runner 派生，归执行 bot 的 daemon 管 | runner 不建容器、不探测、不扫描；清理保证等同该 daemon 对普通会话的保证（close 会话 → worker 退出）。attempt 结算、取消、超时、runner 中断与接管都会 close 对应会话；daemon 离线时记 `uncertain` |
 
-`--require-containment`（或配置 `flow.requireContainment`）打开时 `cooperative` 直接拒绝运行，错误 `container_unavailable` 并附探测与核验详情；M1 默认关闭，M3 沙箱落地后评估翻转（§16）。
+`--require-containment`（或配置 `flow.requireContainment`）打开时 `cooperative` 直接拒绝运行，错误 `container_unavailable` 并附探测与核验详情；M1 默认关闭，M3 沙箱落地后评估翻转（§16）。`delegated` 不受它约束——容器化是执行 bot 自己的事（bot 开了 sandbox 就在 sandbox 里跑）。
 
 `cooperative` 档附加**逃逸检测**（只是检测，不是清理证明）：回收后扫描 `/proc/*/cgroup` 与 env 标记，发现带本 run 标记但 cgroup 路径不在 `botmux-flow/<runId>` 之下的进程 → 记 `escape` 行，resume 进入 `paused` 并列出 pid；扫描为空不改变档位表述。
 
@@ -543,6 +550,9 @@ runner 是唯一裁决者。daemon 卡片处理器做前置门（action 白名�
 8. daemon 清扫器是否允许对 `pending_reclaim` 条目直接回收容器（本稿：允许，理由见 §9），还是只标记、等 resume。
 9. Claude 候选 `exact` spike 的通过标准。
 10. 三个 `BotmuxEntry` 与 `src/flow/` 的最终命名。
+12. `bot` 执行器下 `pty` 执行器的去留：现在只有测试与调试在用。若长期保留，§6.3 的容器/探测/逃逸检测那套只对 `pty` 有意义；若删掉，`FakeAgent` 类测试要换成假 daemon（`test/flow-runner-bot-executor-e2e.test.ts` 已有 `FakeDaemon`）。
+13. `bot` 执行器的会话复用：现在一个 attempt 一个虚拟会话、结算即 close（schema 修复回合复用同一会话）。`session` 字段跨 attempt 续会话尚未接到 bot 执行器上；接上要考虑 daemon 重启后 `sessionId` 失效的恢复。
+14. 虚拟会话的 owner：现在 ownerless。若某些 bot 的 hooks / skills 依赖 session owner（如按 owner 选 Lark 凭证），需要 daemon 侧用**目标 app 自己**解析出的 owner 注入，绝不能从 runner 侧带 `ou_` 过去。
 11. 是否补 v3 的「按名保存 / 复用」：轻量档（约定目录 `<工作目录>/.botmux/flow/<名>.mjs` + 脚本 `export const inputs` 声明参数 schema + `/flow run <名> k=v` + `/flow ls` 列脚本，持久化仍是 git）还是完整档（`~/.botmux/flow-library/`，复刻 owner/scope/不可变 revision 与 `/flow save`）。本稿倾向轻量档（原则 1、10）。
 12. webhook 触发（M2 已落地为接入点 `target.kind: 'flow'`）里事件体的注入防护放在哪一层：现在是脚本作者自己在拼 prompt 时标注 `envelope` 为不可信数据（文档约定）；是否要在 `ctx` 层提供一个把 `input` 包成 `<event trusted="false">` 的辅助，或在 launch 层强制。
 
@@ -551,11 +561,11 @@ runner 是唯一裁决者。daemon 卡片处理器做前置门（action 白名�
 | 维度 | v3 | acpus | Claude Code Workflow | 本设计 |
 |---|---|---|---|---|
 | 编排描述 | 静态 `dag.json` | TS DSL → IR | JS 脚本 | JS 脚本，显式分支 ctx |
-| 执行单元 | `/goal` 多轮 | ACP 单回合 | SDK 内 Task agent | PTY 单回合 + 命名会话 |
+| 执行单元 | `/goal` 多轮 | ACP 单回合 | SDK 内 Task agent | 执行 bot 的 daemon 上 headless 虚拟会话一回合（默认）/ PTY 单回合（`pty` 执行器） |
 | 调用身份 | nodeId | 图节点 | 内容哈希 | scope 位置 + 内容哈希 + 会话链 |
 | 副作用确定性 | manifest | 状态机 | 无（失败不写行） | 所有权临界区内持久化意图 |
 | 恢复 | journal + STATE | 持久化图状态 | 重放，失败自动重跑 | 重放；不确定即待决策并持久化 |
-| 进程归属 | fence 文件 | daemon 锁 | 无 | cgroup 容器（命名空间边界才算 contained）+ lease + 写即核对 |
+| 进程归属 | fence 文件 | daemon 锁 | 无 | `bot`：委托给执行 bot 的 daemon（`delegated`）；`pty`：cgroup 容器（命名空间边界才算 contained）+ lease + 写即核对 |
 | 人在环 | 审批卡 | `runs signal` | 无 | `signal()`，逻辑等待与投递分离 |
 | 跨 CLI | 是 | ACP 适配 | 否 | 是 |
 | 引擎体量 | 36k | 56k（Effect） | 0 | 约 6.9k 新 + 2k 复用 |

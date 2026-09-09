@@ -83,7 +83,8 @@ export function buildFlowProgressCard(input: FlowProgressCardInput): string {
     const rows = s.attempts.slice(-ATTEMPT_ROWS_MAX).map((a) => {
       const mark = a.state === 'result' ? '✅' : a.state === 'failed' ? '❌' : '⏳';
       const tail = a.state === 'failed' ? ` ${a.category ?? ''}` : a.state === 'inflight' ? ` ${a.phase ?? 'queued'}` : '';
-      return `${mark} ${a.identity} #${a.attempt}${a.cli ? ` (${a.cli})` : ''}${tail}`;
+      const who = a.botName ? `${a.botName}${a.cli ? ` · ${a.cli}` : ''}` : a.cli;
+      return `${mark} ${a.identity} #${a.attempt}${who ? ` (${who})` : ''}${tail}`;
     });
     if (s.attempts.length > ATTEMPT_ROWS_MAX) rows.unshift(`… 另有 ${s.attempts.length - ATTEMPT_ROWS_MAX} 个更早的 attempt`);
     elements.push({ tag: 'hr' });

@@ -160,6 +160,7 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import { FLOW_AGENT_TURN_ROUTE, type FlowAgentTurnResponse } from '../flow/types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -248,6 +249,14 @@ export type FlowTriggerHandler = (req: TriggerRequest) => Promise<TriggerRespons
 let flowTriggerHandler: FlowTriggerHandler | null = null;
 export function setFlowTriggerHandler(handler: FlowTriggerHandler | null): void {
   flowTriggerHandler = handler;
+}
+
+// `POST /api/flow/agent-turn`：flow 的 `bot` 执行器——runner 请本 bot 以 headless 虚拟会话跑一轮
+// agent。同样由 daemon 启动时注册（core-only bot 也注册：它本来就只有虚拟会话）。
+export type FlowAgentTurnHandler = (body: unknown) => Promise<{ status: number; body: FlowAgentTurnResponse }>;
+let flowAgentTurnHandler: FlowAgentTurnHandler | null = null;
+export function setFlowAgentTurnHandler(handler: FlowAgentTurnHandler | null): void {
+  flowAgentTurnHandler = handler;
 }
 
 type SupervisorShutdownRegistration = SupervisorShutdownIdentity & {
@@ -3962,6 +3971,27 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     return jsonRes(res, status, result);
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
+  }
+});
+
+// flow `bot` 执行器：runner → 执行 bot 的 daemon。loopback + daemon IPC secret 认证（非 public 路由），
+// 不经 dashboard 代理、不接受连接器请求。结果轮询与取消复用 trigger-result / close 两条既有路由。
+ipcRoute('POST', FLOW_AGENT_TURN_ROUTE, async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, code: 'dispatch_failed', error: 'larkAppId_not_set' });
+  if (!flowAgentTurnHandler) {
+    return jsonRes(res, 501, { ok: false, code: 'flow_not_enabled', error: 'flow agent turns are not enabled on this bot (daemon too old)' });
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, code: 'bad_request', error: 'invalid JSON body' });
+  }
+  try {
+    const out = await flowAgentTurnHandler(body);
+    return jsonRes(res, out.status, out.body);
+  } catch (e: any) {
+    return jsonRes(res, 500, { ok: false, code: 'dispatch_failed', error: e?.message ?? String(e) });
   }
 });
 

@@ -27,8 +27,8 @@ export type RetryPolicy = 'auto' | 'manual';
 export type EffectsCertainty = 'none' | 'uncertain';
 
 export interface Evidence {
-  /** 结算来源：契约文件 / 屏幕 / 信号（人的提交）/ 无（未到结算）。 */
-  source?: 'contract_file' | 'screen' | 'signal' | 'none';
+  /** 结算来源：契约文件 / 屏幕 / daemon 的 final_output（bot 执行器）/ 信号（人的提交）/ 无（未到结算）。 */
+  source?: 'contract_file' | 'screen' | 'daemon' | 'signal' | 'none';
   confidence?: 'high' | 'low';
   screenTail?: string;
   exitCode?: number | null;
@@ -74,8 +74,20 @@ export type RunStatus =
 
 export type RunHealth = 'ok' | 'degraded' | 'all_failed';
 
-export type Containment = 'contained' | 'cooperative';
+/**
+ * `contained` / `cooperative`：runner 自己起 CLI 进程（`pty` 执行器）时的隔离层级。
+ * `delegated`：agent 由 bot 的 daemon 以 headless 虚拟会话执行（`bot` 执行器），进程归 daemon 管，
+ * runner 不建容器、不做逃逸检测；取消 / 清理通过关闭那个会话完成。
+ */
+export type Containment = 'contained' | 'cooperative' | 'delegated';
 export type ContainmentBoundary = 'none' | 'cgroupns+userns';
+
+/**
+ * agent 执行器：`bot` = 每个 agent 一次调用对应 bot 的 daemon（`bots.json` 里的 CLI、模型、env、
+ * 沙箱、插件全部沿用，会话不露脸：HTTP 虚拟会话，不进任何群）；`pty` = runner 自己在容器里起裸 CLI
+ * （无 daemon 的终端调试 / 测试）。
+ */
+export type FlowExecutor = 'bot' | 'pty';
 
 export type ContainerKind = 'cgroup2-kill' | 'cgroup2-freeze' | 'cgroup1-freezer' | 'none';
 
@@ -167,6 +179,9 @@ export interface AttemptStateRow extends RowBase {
   pid?: number;
   pidIdentity?: string;
   cliPid?: number | null;
+  /** `bot` 执行器：执行这个 attempt 的 bot 与它开的虚拟会话（resume 时据此关掉上一代留下的会话）。 */
+  bot?: string;
+  sessionId?: string;
 }
 
 export interface StartedRow extends RowBase {
@@ -176,6 +191,9 @@ export interface StartedRow extends RowBase {
   content: string;
   kind: 'agent' | 'signal';
   cli?: string;
+  /** `bot` 执行器：解析出来的执行 bot（larkAppId）与展示名。 */
+  bot?: string;
+  botName?: string;
 }
 
 export interface SendIntentRow extends RowBase {
@@ -368,7 +386,7 @@ export interface RunJson {
    * 执行配置（content hash 的一部分，见 §4 `execConfigDigest`）。resume 默认原样恢复，
    * 否则 cwd / cliPaths / model 任一变化都会让全部 identity 的 content 变化、缓存全部失效。
    */
-  execConfig: { cwd: string; cliPaths: Record<string, string>; model: string | null };
+  execConfig: { cwd: string; cliPaths: Record<string, string>; model: string | null; executor?: FlowExecutor };
   execConfigDigest: string;
 }
 
@@ -438,7 +456,12 @@ export const FLOW_WORKER_ENV_KEYS = [FLOW_ATTEMPT_ENV_KEY, 'BOTMUX_FLOW_RUN_ID',
 // ---------------------------------------------------------------------------
 
 export interface AgentSpec {
-  cli: string;
+  /**
+   * 执行 bot（`bots.json` 里的 larkAppId / botName / displayName）。`bot` 执行器下的解析顺序：
+   * 显式 `bot` → 按 `cli` 找在线 bot（本 run 所属 bot 的 CLI 相同时优先它）→ 都没给就是本 run 所属 bot。
+   */
+  bot?: string;
+  cli?: string;
   prompt: string;
   schema?: unknown;
   session?: string;
@@ -598,6 +621,8 @@ export interface RunSnapshot {
     state: 'inflight' | 'result' | 'failed';
     phase: AttemptPhase | null;
     cli?: string;
+    /** `bot` 执行器：执行 bot 的展示名。 */
+    botName?: string;
     category?: FailureCategory;
     error?: string;
   }>;
@@ -632,6 +657,35 @@ export type DaemonResponse = { ok: true; messageId: string | null } | { ok: fals
 export type DaemonToRunnerMessage =
   | { t: 'request'; id: number; req: ControlRequest }
   | { t: 'response'; id: number; res: DaemonResponse };
+
+// ---------------------------------------------------------------------------
+// `bot` 执行器：runner ↔ 执行 bot 的 daemon 的 loopback IPC 契约（`POST /api/flow/agent-turn`）。
+// 与话题绑定的 daemon 通道无关：任何 runner（daemon 起的、终端起的）都直接找**执行 bot** 的 daemon，
+// 本 bot 与别的 bot 走同一条路。结果用现成的 `GET /api/sessions/:id/trigger-result` 轮询，
+// 取消 / 清理用现成的 `POST /api/sessions/:id/close`。
+// ---------------------------------------------------------------------------
+
+export const FLOW_AGENT_TURN_ROUTE = '/api/flow/agent-turn';
+
+export interface FlowAgentTurnRequest {
+  runId: string;
+  identity: string;
+  attempt: number;
+  gen: number;
+  /** 同一 attempt 内的第几轮（schema 修复是第 2 轮，回到同一个会话）。 */
+  turn: number;
+  /** 首轮 null（daemon 开一个 headless 虚拟会话）；修复轮传首轮返回的 sessionId。 */
+  sessionId: string | null;
+  prompt: string;
+  workingDir: string;
+  model?: string;
+  /** 单轮上限（daemon 侧不 cap；runner 自己按它轮询超时）。 */
+  timeoutMs: number;
+}
+
+export type FlowAgentTurnResponse =
+  | { ok: true; sessionId: string; triggerId: string; bot: string; botName: string; cliId: string }
+  | { ok: false; code: 'bad_request' | 'session_not_found' | 'dispatch_failed' | 'flow_not_enabled'; error: string };
 
 export class FlowHardError extends Error {
   constructor(readonly code: string, message: string) {

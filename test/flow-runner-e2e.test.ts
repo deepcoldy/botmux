@@ -112,7 +112,8 @@ describeIf('flow runner 进程级（真实三进程拓扑 + 真实 cgroup）', (
     const s1 = summaryOf(first);
     expect(s1.status).toBe('completed');
     const rj1 = readRunJson(h.runDir)!;
-    expect(rj1.execConfig).toEqual({ cwd: realpathSync(h.dataDir), cliPaths: { codex: '/opt/fake/codex' }, model: 'm-1' });
+    // 假 agent（BOTMUX_FLOW_FAKE_AGENT）隐含 pty 执行器，并记进 run.json 供 resume 沿用
+    expect(rj1.execConfig).toEqual({ cwd: realpathSync(h.dataDir), cliPaths: { codex: '/opt/fake/codex' }, model: 'm-1', executor: 'pty' });
     expect(rj1.execConfigDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(rj1.limits.maxConcurrency).toBe(3);
 

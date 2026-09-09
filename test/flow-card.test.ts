@@ -90,6 +90,10 @@ describe('flow card builders', () => {
     const interrupted = buildFlowProgressCard({ snapshot: snapshot(), scriptName: 'slogan.mjs', interrupted: { reason: 'daemon_disconnect' } });
     expect(buttons(interrupted)).toHaveLength(0);
     expect(interrupted).toContain('daemon_disconnect');
+    // bot 执行器：attempt 行显示执行 bot（与 CLI）；pty 执行器只显示 CLI
+    expect(running).toContain('gen#1 #1 (codex)');
+    const onBot = buildFlowProgressCard({ snapshot: snapshot({ attempts: [{ identity: 'gen#1', attempt: 1, state: 'inflight', phase: 'ready', cli: 'codex', botName: 'Codex 小助手' }] }), scriptName: 'slogan.mjs' });
+    expect(onBot).toContain('gen#1 #1 (Codex 小助手 · codex)');
   });
 
   it('决策卡：两个按钮带 identity/attempt/content 与 nonce；冻结后无按钮', () => {

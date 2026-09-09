@@ -276,7 +276,8 @@ import {
   recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setFlowTriggerHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setFlowTriggerHandler, setFlowAgentTurnHandler } from './core/dashboard-ipc-server.js';
+import { handleFlowAgentTurn } from './flow/agent-turn.js';
 import { getBotSandbox } from './services/sandbox-store.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -23490,6 +23491,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  // flow `bot` 执行器：任何 runner（本 bot 的、别的 bot 的、终端起的）都可以请本 bot 以 headless
+  // 虚拟会话跑一轮 agent（`POST /api/flow/agent-turn`）。core-only bot 也注册——它本来就只有虚拟会话，
+  // 正是最纯粹的执行器。会话 ownerless，不进群，不发飞书消息。
+  setFlowAgentTurnHandler((body) => handleFlowAgentTurn(body, {
+    larkAppId: cfg.larkAppId,
+    activeSessions: () => activeSessions,
+    bot: () => {
+      const state = getBot(cfg.larkAppId);
+      return { botName: effectiveBotDisplayName(state), cliId: state.config.cliId };
+    },
+    trigger: (req, deps, internal) => triggerSessionTurn(req, deps, internal),
+  }));
+
   // flow（JS as runtime 编排）M2：本 bot 的 run 管理器。绑定话题的 runner 由 daemon 起（IPC 子进程，
   // 不 detached：daemon 死 → runner 自己写 run.interrupted 并退出），卡片走 sessionReply /
   // updateMessage。cold-attach：本 app 绑定、未结束且 runner 不在的 run → 补发中断卡（§6.4）。
@@ -23952,6 +23966,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopFlowSlotSweeper?.();
     // 断开绑定 runner 的 IPC：runner 自己写 run.interrupted 退出，下次启动 cold-attach 补中断卡。
     setFlowTriggerHandler(null);
+    setFlowAgentTurnHandler(null);
     flowRunManager?.close();
     flowRunManager = null;
     v3ProgressCardManager.close();

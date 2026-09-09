@@ -201,7 +201,10 @@ describe('生命周期硬错误（首次执行即拒绝）', () => {
 
   it('非法 spec / 非法 schema / signal 在 M1 / 脚本异常 / default export 不是函数', async () => {
     const fb = fakeBridge();
-    expect(await run(`export default async (ctx) => ctx.agent({ prompt: 'no cli' });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'invalid_spec' });
+    // `{ prompt }` 单独合法（bot 执行器：落到本 run 所属 bot）；cli / bot 给了就不能是空串
+    expect(await run(`export default async (ctx) => ctx.agent({ cli: '', prompt: 'empty cli' });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'invalid_spec' });
+    expect(await run(`export default async (ctx) => ctx.agent({ bot: '', prompt: 'empty bot' });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'invalid_spec' });
+    expect(await run(`export default async (ctx) => ctx.agent({ cli: 'x' });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'invalid_spec', message: /prompt/ });
     expect(await run(`export default async (ctx) => ctx.agent({ cli: 'x', prompt: 'p', schema: { type: 'string', pattern: 'a' } });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'schema_invalid' });
     expect(await run(`export default async (ctx) => ctx.signal({ prompt: 'p', schema: { type: 'object' } });`, fb.bridge)).toMatchObject({ kind: 'error', code: 'runner_rejected', message: /M1/ });
     expect(await run(`export default async () => { throw new Error('my bug'); }`, fb.bridge)).toMatchObject({ kind: 'error', code: 'script_threw', message: 'my bug' });

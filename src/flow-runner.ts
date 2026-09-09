@@ -15,7 +15,7 @@ if (!argJson || !argJson.startsWith('{')) {
   process.exit(2);
 }
 
-type SerializedOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'distDir'> & { distDir?: string };
+type SerializedOptions = Omit<RunnerOptions, 'spawnScriptHost' | 'spawnAgentWorker' | 'hooks' | 'distDir' | 'botExecutor'> & { distDir?: string };
 const parsed = JSON.parse(argJson) as SerializedOptions;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

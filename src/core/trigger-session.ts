@@ -60,6 +60,17 @@ export interface TriggerSessionInternalOptions {
    *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
    *  recovery asks the hub to resend the frozen envelope instead. */
   persistInputHistory?: boolean;
+  /**
+   * `task`：只渲染 `<botmux_task>`（+ HTTP 应答模式块），不附 `<botmux_external_event>` 数据块。
+   * 给 daemon 内部已知可信的调用方用（flow 的 agent 回合：prompt 是脚本作者写的任务，没有外部事件）。
+   * 缺省 `event`：连接器触发的原有渲染。
+   */
+  promptMode?: 'event' | 'task';
+  /**
+   * 新建会话的工作目录（绝对路径，会经 validateWorkingDir 校验）。缺省按群解析
+   * （oncall 绑定 → bot 默认目录 → …）。只影响新建会话；投递到既有会话时忽略。
+   */
+  workingDir?: string;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -194,6 +205,13 @@ export function resolveTriggerWorkingDir(larkAppId: string, chatId: string): { o
   // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
   const fromBotDefault = !oncall && !!botDefault;
   return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
+}
+
+/** daemon 内部调用方显式指定的工作目录：只校验，不做 auto-worktree（`fromBotDefault` 恒 false）。 */
+function resolveExplicitWorkingDir(larkAppId: string, workingDir: string): { ok: true; workingDir: string; fromBotDefault: false } | { ok: false; error: string } {
+  const v = validateWorkingDir(workingDir, localeForBot(larkAppId));
+  if (!v.ok) return { ok: false, error: v.error };
+  return { ok: true, workingDir: v.resolvedPath, fromBotDefault: false };
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -823,11 +841,14 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const prompt = buildUntrustedEventPrompt(req, triggerId);
+  // task 模式（daemon 内部可信调用方，如 flow 的 agent 回合）：没有外部事件可附，
+  // prompt 只有任务块 + 应答模式块；Codex App 的 untrusted message context 为空即不注入。
+  const taskOnly = internal?.promptMode === 'task';
+  const prompt = taskOnly ? buildExternalEventApplicationContext(req) : buildUntrustedEventPrompt(req, triggerId);
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
-  const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
+  const codexAppMessageContext = taskOnly ? '' : buildExternalEventDataContext(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
@@ -1554,7 +1575,9 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = resolveTriggerWorkingDir(larkAppId, chatId);
+  const wd = internal?.workingDir
+    ? resolveExplicitWorkingDir(larkAppId, internal.workingDir)
+    : resolveTriggerWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
