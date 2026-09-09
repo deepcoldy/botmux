@@ -10276,7 +10276,18 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
 
-    if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    // Turn-completion bookkeeping is INDEPENDENT of the feedback card. A
+    // delivery row is what a later `turn_terminal` correlates against to emit
+    // `turn.completed` (with the real completion time and native duration), so
+    // gating it on `feedbackPolicy` used to mean "feedback off → no completion
+    // record at all". Record every canonical in-session final answer; the
+    // feedback policy/card only decides whether a *control* rides along.
+    // The excluded shapes (custom card, pure video, managed VC send) are not
+    // canonical final-answer cards — and they are exactly the shapes the
+    // feedback gate above rejects outright, so the recorded set stays identical
+    // whether feedback is on or off.
+    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+      const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
       try {
@@ -10296,17 +10307,23 @@ async function cmdSend(rest: string[]): Promise<void> {
           dispatchAttempt: originDispatchAttempt,
           content: text,
           cliId: s.cliId,
-          cardMode: 'feedback',
+          // 'card' records a canonical final answer that carries no feedback
+          // control, so analytics can tell the two apart.
+          cardMode: carriesFeedbackControl ? 'feedback' : 'card',
           status: 'delivered',
-          policy: feedbackPolicy,
-          baseCard: feedbackBaseCard,
-          requesterSubjectId: feedbackRequesterSubjectId,
+          // Only a card that actually shows the control persists a policy and a
+          // replayable base card; without them the callback path fails closed.
+          ...(carriesFeedbackControl ? { policy: feedbackPolicy } : {}),
+          ...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {}),
+          ...(carriesFeedbackControl ? { requesterSubjectId: feedbackRequesterSubjectId } : {}),
+          // turn.completed webhooks are a completion concern, not a feedback
+          // one: they must keep firing with the card turned off.
           webhookDestinations: feedbackWebhookDestinations,
           context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
         });
       } catch (error) {
         console.error(
-          `botmux send: feedback indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+          `botmux send: turn delivery indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }

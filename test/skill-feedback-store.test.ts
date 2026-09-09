@@ -43,7 +43,7 @@ describe('SkillFeedbackStore', () => {
     });
     expect(JSON.stringify(reopened.getResponse(response.responseId))).not.toContain('secret answer');
     expect(reopened.pragmas()).toMatchObject({ journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 });
-    expect(reopened.schemaVersion()).toBe(7);
+    expect(reopened.schemaVersion()).toBe(8);
     reopened.close();
   });
 
@@ -72,9 +72,9 @@ describe('SkillFeedbackStore', () => {
     dirs.push(dataDir);
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
-    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=8;');
+    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=9;');
     db.close();
-    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:8');
+    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:9');
     const verify = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
     expect((verify.prepare('SELECT value FROM sentinel').get() as any).value).toBe('keep');
     verify.close();
@@ -126,7 +126,7 @@ describe('SkillFeedbackStore', () => {
     `);
     db.close();
     const store = await SkillFeedbackStore.open(dataDir);
-    expect(store.schemaVersion()).toBe(7);
+    expect(store.schemaVersion()).toBe(8);
     expect(store.findDeliveryByPlatformMessage('lark', 'app', 'om_old')).toMatchObject({ policy: undefined, baseCard: undefined, requesterSubjectId: undefined });
     store.close();
   });

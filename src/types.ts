@@ -1579,6 +1579,15 @@ export type WorkerToDaemon =
         generation: string;
         seq: number;
         dispatchId: string;
+        /** Real completion instant / native execution span for the terminal the
+         *  daemon synthesizes from this settlement. The daemon persists that
+         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+         *  these the durable path would durably win with a timing-less row and
+         *  permanently mask the worker's real numbers. Same optional-means-
+         *  unknown contract as `turn_terminal`. */
+        completedAtMs?: number;
+        durationMs?: number;
       };
       /** The model already delivered through botmux send; settle without fallback output. */
       suppressDelivery?: boolean;
@@ -1624,6 +1633,18 @@ export type WorkerToDaemon =
        *  emits `completed` with no final_output after fs-lag and must NOT be
        *  read as silence (that would mask a real, still-arriving answer). */
       outputDisposition?: 'nothing_to_send';
+      /** Wall-clock epoch ms at which the CLI turn actually reached its native
+       *  terminal. Absent when the emitter cannot vouch for a real instant, in
+       *  which case the recorder falls back to its own write time (which is NOT
+       *  the completion time — that fallback is exactly why this field exists). */
+      completedAtMs?: number;
+      /** True native execution time: from the moment this turn's input was
+       *  literally written to the CLI, to `completedAtMs`. Deliberately excludes
+       *  daemon/worker queueing before the write, so it measures the CLI, not the
+       *  backlog. Omitted (never guessed, never zero-filled) whenever the start
+       *  instant is unknown — an absent duration is honest, a fabricated one is
+       *  not. Always a non-negative integer when present. */
+      durationMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

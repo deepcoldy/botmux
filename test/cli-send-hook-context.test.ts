@@ -697,12 +697,20 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).not.toContain('const deliveryTurnId = `send:${messageId}`');
     expect(cmdSend).not.toContain('--feedback-level');
     const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
-    const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
+    const deliveryIndex = cmdSend.indexOf('turn delivery indexing failed after delivery');
     expect(primarySend).toBeGreaterThanOrEqual(0);
-    expect(feedbackIndex).toBeGreaterThan(primarySend);
-    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', feedbackIndex), feedbackIndex)).toContain('getSkillFeedbackStore');
-    expect(cmdSend).toContain('policy: feedbackPolicy');
-    expect(cmdSend).toContain('baseCard: feedbackBaseCard');
+    // The delivery record is written AFTER the message is actually sent.
+    expect(deliveryIndex).toBeGreaterThan(primarySend);
+    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
+    // Turn-completion recording is gated on the response KIND, not on the
+    // feedback policy — feedback off must still produce a correlatable record.
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    // The feedback control (policy + card snapshot) rides along only when a
+    // policy actually applies; the record itself is unconditional.
+    expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');
+    expect(cmdSend).toContain("cardMode: carriesFeedbackControl ? 'feedback' : 'card'");
+    expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
+    expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
   });
 });

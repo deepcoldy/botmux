@@ -22528,7 +22528,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           dataDir: config.session.dataDir,
           botAppId: ds.larkAppId,
           sessionId: ds.session.sessionId,
-          terminal: { turnId: terminal.turnId, dispatchAttempt: terminal.dispatchAttempt, status: terminal.status },
+          terminal: {
+            turnId: terminal.turnId,
+            dispatchAttempt: terminal.dispatchAttempt,
+            status: terminal.status,
+            // Carry the worker's real completion instant and native execution
+            // span. Without these the store can only stamp its own write time
+            // and leave duration NULL, which is what made recorded "completion
+            // time" unusable for measuring how long a turn actually took.
+            ...(terminal.completedAtMs !== undefined ? { completedAtMs: terminal.completedAtMs } : {}),
+            ...(terminal.durationMs !== undefined ? { durationMs: terminal.durationMs } : {}),
+          },
           onError: error => logger.error(
             `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
             + `${error instanceof Error ? error.message : String(error)}`,
