@@ -2,9 +2,12 @@
  * Locate one session by id: ask a live daemon first, read the store only
  * when no daemon answered.
  *
- * A 404 from an answering daemon is authoritative absence — never fall back
- * to the store. Connection failure / no descriptor / unread secret (isolated
- * CLI) fall back to the snapshot, including the unmigrated existence probe.
+ * A 404 from the OWNING daemon (the one `BOTMUX_LARK_APP_ID` names) is
+ * authoritative absence — never fall back to the store. Without an appId the
+ * resolver enumerates every online daemon; each answers only for its own bot,
+ * so a 404 there says nothing about other bots' stores and the store is still
+ * read afterwards. Connection failure / no descriptor / unread secret
+ * (isolated CLI) fall back to the snapshot, including the unmigrated probe.
  */
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import {
@@ -167,8 +170,10 @@ export async function resolveSessionById(
     if (asked.status === 'ok') return { ok: true, session: asked.session, source: 'daemon' };
     if (asked.status === 'rejected') return asked.err;
     if (asked.status === 'not_found') {
-      sawAuthoritativeMiss = true;
-      if (envAppId) break;
+      // Only the owning daemon's 404 is authoritative. A 404 from a daemon
+      // reached by enumeration covers just that bot's store — keep asking,
+      // then read the store (an offline bot's rows live only on disk).
+      if (envAppId) { sawAuthoritativeMiss = true; break; }
     }
   }
   if (sawAuthoritativeMiss) {
