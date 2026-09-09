@@ -251,12 +251,12 @@ describe('Mojo ambient child environment isolation', () => {
     expect(out.BOTMUX_SESSION_ID).toBe('0');
   });
 
-  it('covers every PM2 Common.js process-metadata key', () => {
+  it('covers every installed PM2 Common.js process-metadata key', () => {
     const commonUrl = new URL('../node_modules/pm2/lib/Common.js', import.meta.url);
-    expect(
-      existsSync(commonUrl),
-      'pm2 is a declared runtime dependency; update this drift guard deliberately if that dependency is removed',
-    ).toBe(true);
+    // Newer Botmux releases no longer depend on PM2. Keep the live upstream
+    // drift guard when a developer still has PM2 installed; the static scrub
+    // behaviour remains covered by the focused fixtures above when it is absent.
+    if (!existsSync(commonUrl)) return;
     const common = readFileSync(commonUrl, 'utf-8');
     const match = common.match(/var keysToIgnore\s*=\s*\[([\s\S]*?)\];/);
     expect(match).not.toBeNull();
