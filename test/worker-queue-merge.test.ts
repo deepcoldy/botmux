@@ -27,11 +27,27 @@ describe('mergeQueuedCliInput', () => {
   });
 
   it('merges incremental queued messages into the pending tail', () => {
-    const pending = [{ content: 'first', turnId: 't1' }];
+    const trustedCaller = {
+      requestUserOpenId: 'ou_same', requestUserUnionId: 'on_same',
+      requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    const pending = [{ content: 'first', turnId: 't1', trustedCaller }];
 
-    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2' })).toBe(true);
+    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2', trustedCaller })).toBe(true);
 
-    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2' }]);
+    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
+  });
+
+  it('never merges queue items across trusted caller boundaries', () => {
+    const pending = [{
+      content: 'first', turnId: 't1',
+      trustedCaller: { requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const },
+    }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 't2',
+      trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(pending).toHaveLength(1);
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {

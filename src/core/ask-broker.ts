@@ -53,7 +53,12 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    *  waiter here so all callers get the one result — no second ask/card
    *  (codex P1-1 active-replay). */
   waiters: Array<(result: AskResult) => void>;
-  timeoutHandle: NodeJS.Timeout;
+  timeoutHandle?: NodeJS.Timeout;
+  /** Relative timeout retained so host-owned asks can start the human action
+   *  window only after the card is confirmed delivered. */
+  timeoutMs: number;
+  timeoutStartsAfterDelivery: boolean;
+  timeoutStartedAt?: number;
   /** epoch ms when settle ran; undefined while still pending. */
   settledAt?: number;
   /** Terminal result, retained briefly after settle so a same-requestId replay
@@ -145,6 +150,7 @@ export function setCanTalkChecker(
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
+  if (ask.answererOpenId && ask.answererOpenId !== by) return false;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
 }
 
@@ -175,12 +181,27 @@ export function setCardDispatcher(d: AskCardDispatcher): void {
  *  daemon-misconfiguration bug, not a runtime ask failure.
  */
 export function registerAsk(input: CreateAskInput): Promise<AskResult> {
+  return registerAskInternal(input, false);
+}
+
+/**
+ * Register a restart-safe ask whose reconnecting claimant is the daemon host,
+ * not a surviving CLI hook.  Keep this as a separate entry point rather than a
+ * caller-controlled flag on CreateAskInput: `/api/asks` must never let an
+ * untrusted CLI manufacture an orphanable host-owned record by choosing an
+ * origin string.
+ */
+export function registerHostAsk(input: CreateAskInput): Promise<AskResult> {
+  return registerAskInternal(input, true);
+}
+
+function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promise<AskResult> {
   if (!dispatcher) {
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
 
   const originKind = input.originKind ?? 'hook';
-  // Resumability is gated by TWO independent facts (codex P1-4):
+  // CLI-origin resumability is gated by TWO independent facts (codex P1-4):
   //  1. the origin has a reconnecting claimant (only 'hook' re-POSTs after a
   //     restart; an explicit `botmux ask buttons` process exits), AND
   //  2. the issuing session's backend actually SURVIVES a daemon restart —
@@ -188,11 +209,14 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
   //     (tmux/herdr/zellij/zmx), NOT trusted from the client. A PTY-backed hook
   //     dies with the daemon, so persisting it would orphan a record no one can
   //     ever re-claim. Undefined backend signal → false (fail closed).
-  // A caller-supplied requestId is still required (it's the re-attach identity).
-  const resumable =
-    RESUMABLE_ORIGINS.has(originKind) &&
-    input.requestId !== undefined &&
-    input.backendSurvivesRestart === true;
+  // A host-managed ask has a different reconnecting claimant: the daemon
+  // recovers its matching durable Session record and re-registers through the
+  // non-IPC registerHostAsk entry point. Both kinds require a stable requestId.
+  const resumable = input.requestId !== undefined && (
+    hostManaged
+      ? originKind.startsWith('host_cross_principal_')
+      : RESUMABLE_ORIGINS.has(originKind) && input.backendSurvivesRestart === true
+  );
   // Invocation identity: prefer the caller-supplied requestId (hook generates it
   // once and reuses it across reconnect retries). A caller without one (explicit
   // `botmux ask buttons`) gets a synthesized id and is NOT resumable — it has no
@@ -247,11 +271,6 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
   const deadlineAt = createdAt + input.timeoutMs;
 
   return new Promise<AskResult>((resolve) => {
-    const timeoutHandle = setTimeout(() => {
-      settle(askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
-    }, input.timeoutMs);
-    timeoutHandle.unref?.();
-
     const selections = new Map<number, Set<string>>();
     for (let i = 0; i < input.questions.length; i++) selections.set(i, new Set<string>());
 
@@ -267,14 +286,17 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       rootMessageId: input.rootMessageId,
       sessionId: input.sessionId,
       chatType: input.chatType,
+      answererOpenId: input.answererOpenId,
       questions: input.questions,
       createdAt,
       deadlineAt,
       settled: false,
       waiters: [resolve],
-      timeoutHandle,
+      timeoutMs: input.timeoutMs,
+      timeoutStartsAfterDelivery: hostManaged,
       selections,
     };
+    if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
     // lands still leaves a resumable record; restore/re-attach re-sends.
@@ -296,6 +318,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.chatId === input.chatId &&
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
+    ask.answererOpenId === input.answererOpenId &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -342,10 +365,19 @@ function sendCardForAsk(ask: InternalPending): void {
       const live = pending.get(ask.askId);
       if (!live || live.settled) return;
       try {
+        // The displayed deadline is a best estimate made immediately before
+        // dispatch. Correctness does not depend on it: the broker clock below
+        // starts only after the Lark API confirms delivery.
+        if (live.timeoutStartsAfterDelivery && live.timeoutStartedAt === undefined) {
+          live.deadlineAt = Date.now() + live.timeoutMs;
+        }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
         if (cur && !cur.settled) {
           cur.cardMessageId = messageId;
+          if (cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
+            armAskTimeout(cur, cur.timeoutMs, Date.now());
+          }
           if (cur.resumable) persistFromInternal(cur);
         }
         return; // sent (or server-deduped to the original) — done
@@ -373,6 +405,16 @@ function sendCardForAsk(ask: InternalPending): void {
       }
     }
   })();
+}
+
+function armAskTimeout(ask: InternalPending, timeoutMs: number, startedAt: number): void {
+  clearTimeout(ask.timeoutHandle);
+  ask.timeoutStartedAt = startedAt;
+  ask.deadlineAt = startedAt + timeoutMs;
+  ask.timeoutHandle = setTimeout(() => {
+    settle(ask.askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+  }, timeoutMs);
+  ask.timeoutHandle.unref?.();
 }
 
 /** Promise-based sleep whose timer never keeps the process alive (unref). */
@@ -415,11 +457,9 @@ function reattachByRequest(ask: InternalPending): Promise<AskResult> {
     ask.dormant = false;
     ask.waiters.push(resolve);
     clearTimeout(ask.timeoutHandle);
-    const remaining = Math.max(0, ask.deadlineAt - Date.now());
-    ask.timeoutHandle = setTimeout(() => {
-      settle(ask.askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
-    }, remaining);
-    ask.timeoutHandle.unref?.();
+    const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
+    const remaining = awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
+    if (!awaitsDelivery) armAskTimeout(ask, remaining, Date.now());
     logger.info?.(
       `ask-broker: re-attached hook to restored ask ${ask.askId} (key=${ask.askKey}, ` +
       `${Math.round(remaining / 1000)}s left, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
@@ -447,9 +487,13 @@ function persistFromInternal(ask: InternalPending): void {
     rootMessageId: ask.rootMessageId,
     sessionId: ask.sessionId,
     chatType: ask.chatType,
+    answererOpenId: ask.answererOpenId,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
+    timeoutMs: ask.timeoutMs,
+    timeoutStartsAfterDelivery: ask.timeoutStartsAfterDelivery,
+    timeoutStartedAt: ask.timeoutStartedAt,
     cardMessageId: ask.cardMessageId,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
@@ -737,8 +781,11 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // hook's claim — it must NOT arm a deadline timer (there's nothing left to
     // time out). A still-awaiting-click restore arms the ORIGINAL absolute
     // deadline so it can't linger forever if the CLI never returns.
-    const remaining = Math.max(0, p.deadlineAt - now);
-    const timeoutHandle = hasStashedAnswer
+    const awaitsDelivery = p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
+    const remaining = awaitsDelivery
+      ? (p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt))
+      : Math.max(0, p.deadlineAt - now);
+    const timeoutHandle = hasStashedAnswer || awaitsDelivery
       ? undefined
       : setTimeout(() => {
           settle(p.askId, {
@@ -759,9 +806,13 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       rootMessageId: p.rootMessageId,
       sessionId: p.sessionId,
       chatType: p.chatType,
+      answererOpenId: p.answererOpenId,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
+      timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
+      timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
+      timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
       // A stashed-answer restore is terminal-but-unclaimed: settled=true so
       // gcSettled/other paths treat it as done, dormant=true so a hook re-POST
@@ -883,7 +934,8 @@ function snapshot(ask: InternalPending): PendingAsk {
   const {
     // Runtime-only / broker-internal fields excluded from the IM contract:
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
-    askKey: _ak, requestId: _rid, originKind: _ok, resumable: _rs,
+    timeoutMs: _tm, timeoutStartsAfterDelivery: _td, timeoutStartedAt: _ts,
+    askKey: _ak, requestId: _rid, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
     ...rest
   } = ask;

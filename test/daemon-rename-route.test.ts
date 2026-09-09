@@ -2046,6 +2046,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/fast',
       turnId: 'om_fast_live',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Cold (no existing session): /fast is a tier toggle, not "start work", so
@@ -2133,6 +2138,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/model',
       turnId: 'om_model_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
   });
 
@@ -2173,6 +2183,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/goal',
       turnId: 'om_goal_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Inverse: bot default is interactive Codex, but a frozen Codex App session
