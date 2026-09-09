@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { config } from '../src/config.js';
 import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, readGlobalConfig } from '../src/global-config.js';
 
-describe('automatic Codex session upgrades (default ON)', () => {
+describe('automatic Codex session upgrades (experimental, default OFF)', () => {
   let configDir: string;
 
   beforeEach(() => {
@@ -21,23 +21,23 @@ describe('automatic Codex session upgrades (default ON)', () => {
     rmSync(configDir, { recursive: true, force: true });
   });
 
-  it('enables upgrades when no configuration has been saved', () => {
-    expect(config.autoUpgradeCodexSessions).toBe(true);
+  it('leaves upgrades disabled when no configuration has been saved', () => {
+    expect(config.autoUpgradeCodexSessions).toBe(false);
   });
 
   it('reads saved disable and re-enable changes without reloading the runtime configuration', () => {
-    mergeDashboardConfig({ autoUpgradeCodexSessions: false, codexRpcInput: true });
-    expect(config.autoUpgradeCodexSessions).toBe(false);
-    expect(readGlobalConfig().dashboard?.autoUpgradeCodexSessions).toBe(false);
-
-    mergeDashboardConfig({ autoUpgradeCodexSessions: true });
+    mergeDashboardConfig({ autoUpgradeCodexSessions: true, codexRpcInput: true });
     expect(config.autoUpgradeCodexSessions).toBe(true);
+    expect(readGlobalConfig().dashboard?.autoUpgradeCodexSessions).toBe(true);
+
+    mergeDashboardConfig({ autoUpgradeCodexSessions: false });
+    expect(config.autoUpgradeCodexSessions).toBe(false);
     expect(readGlobalConfig().dashboard?.codexRpcInput).toBe(true);
   });
 
-  it.each([{}, { autoUpgradeCodexSessions: 'false' }])('defaults ON for an absent or invalid saved value: %j', (dashboard) => {
+  it.each([{}, { autoUpgradeCodexSessions: 'true' }])('defaults OFF for an absent or invalid saved value: %j', (dashboard) => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard }));
-    expect(config.autoUpgradeCodexSessions).toBe(true);
+    expect(config.autoUpgradeCodexSessions).toBe(false);
     expect(readGlobalConfig().dashboard?.autoUpgradeCodexSessions).toBeUndefined();
   });
 });

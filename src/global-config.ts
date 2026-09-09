@@ -294,8 +294,9 @@ export interface DashboardGlobalConfig {
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
   /** Automatically replace outdated Codex session processes when safely idle
-   *  and resume the same thread without sending a new prompt. Default ON;
-   *  read live so an explicit false stops scheduling upgrades without restart. */
+   *  and resume the same thread without sending a new prompt. Experimental,
+   *  default OFF; read live so an explicit true starts scheduling upgrades and
+   *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x

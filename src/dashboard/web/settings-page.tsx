@@ -178,7 +178,7 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
-    autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions !== false,
+    autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     codexNotifier: {
