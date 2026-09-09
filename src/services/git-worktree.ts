@@ -55,6 +55,16 @@ async function tryGit(args: string[], cwd: string, timeoutMs = 10_000): Promise<
   }
 }
 
+async function gitRaw(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
+  try {
+    const { stdout } = await execFileP('git', args, { cwd, timeout: timeoutMs, encoding: 'utf-8' });
+    return stdout.replace(/\r?\n$/, '');
+  } catch (e: any) {
+    const stderr = typeof e?.stderr === 'string' ? e.stderr.trim() : '';
+    throw new Error(stderr || e?.message || String(e));
+  }
+}
+
 async function localBranchExists(repo: string, branch: string): Promise<boolean> {
   return (await tryGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repo)) !== null;
 }
@@ -332,10 +342,11 @@ export interface WorktreeSafetyStatus {
 
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
   const dir = resolve(worktreePath);
-  const status = await git(['status', '--porcelain'], dir, 10_000);
+  const status = await gitRaw(['status', '--porcelain'], dir, 10_000);
   const dirtyFiles = status.split('\n')
-    .map(line => line.trim())
-    .filter(Boolean)
+    .filter(line => line.length > 3)
+    // Porcelain v1 is fixed-width `XY PATH`. Preserve a blank index column
+    // (the common unstaged ` M` / ` D` cases) until after removing the prefix.
     .map(line => line.slice(3).trim())
     .filter(Boolean)
     .slice(0, 20);

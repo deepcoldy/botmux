@@ -8,11 +8,11 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -280,6 +280,21 @@ describe('createRepoWorktree', () => {
     mkdirSync(plain);
 
     await expect(createRepoWorktree(plain)).rejects.toThrow();
+  });
+});
+
+describe('worktreeSafetyStatus', () => {
+  it('preserves the full path for an unstaged modification', async () => {
+    const repo = makeUpstream('safety-status');
+    const file = join(repo, 'first-character.ts');
+    writeFileSync(file, 'initial\n');
+    git(repo, 'add', 'first-character.ts');
+    git(repo, 'commit', '-m', 'add file');
+    writeFileSync(file, 'changed\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toEqual(['first-character.ts']);
   });
 });
 
