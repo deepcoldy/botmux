@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { existsSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
+import { withFileLock } from '../utils/file-lock.js';
 
 const execFileP = promisify(execFile);
 
@@ -183,7 +184,7 @@ async function addWorktreeOrReuseAfterRace(
  * The base ref is fetched first so the worktree starts from the remote's
  * latest state; fetch failure degrades to the local (possibly stale) ref.
  */
-export async function createRepoWorktree(
+async function createRepoWorktreeUnlocked(
   repoPath: string,
   opts: CreateRepoWorktreeOptions = {},
 ): Promise<WorktreeCreation> {
@@ -316,6 +317,20 @@ export async function createRepoWorktree(
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
 }
+
+
+export async function createRepoWorktree(
+  repoPath: string,
+  opts: CreateRepoWorktreeOptions = {},
+): Promise<WorktreeCreation> {
+  if (!opts.reuseExisting || !opts.worktreePath) {
+    return createRepoWorktreeUnlocked(repoPath, opts);
+  }
+  const target = resolve(opts.worktreePath);
+  mkdirSync(dirname(target), { recursive: true });
+  return withFileLock(target, () => createRepoWorktreeUnlocked(repoPath, opts), { maxWaitMs: 60_000 });
+}
+
 
 /**
  * Push a freshly created worktree branch to origin (`push -u`). Used by the
