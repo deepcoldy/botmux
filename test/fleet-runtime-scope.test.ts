@@ -67,6 +67,16 @@ describe('fleet isolation from a closing session scope', () => {
     expect(io.run.mock.calls.some(([command, args]) => command === 'systemctl' && args.includes('stop'))).toBe(true);
   });
 
+  it('cleans up the attempted unit if MainPID cannot be read', async () => {
+    io.run.mockImplementation((_command, args) => args.includes('--property=MainPID')
+      ? { status: null, stdout: null, stderr: null, error: new Error('spawn failed') }
+      : { status: 0, stdout: '', stderr: '' });
+    const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
+    expect(() => startFleetViaSupervisor()).toThrow(/no live MainPID/);
+    expect(io.spawn).not.toHaveBeenCalled();
+    expect(io.run.mock.calls.some(([command, args]) => command === 'systemctl' && args.includes('stop'))).toBe(true);
+  });
+
   it('checks the user manager before stopping the live fleet', async () => {
     writeFileSync(join(home, '.botmux/fleet-state.json'), JSON.stringify({ supervisorPid: process.pid, procs: [] }));
     io.run.mockReturnValue({ status: 1, stdout: '', stderr: 'bus unavailable' });

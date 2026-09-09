@@ -37,7 +37,7 @@ export function preflightSupervisorIsolation(): void {
     ['systemd-run', ['--version']],
   ] as const) {
     if (run(command, [...args], process.env).status !== 0) {
-      throw new Error('[supervisor] Independent user service is unavailable; the existing fleet was not stopped.');
+      throw new Error('[supervisor] Independent user service is unavailable; refusing an unsafe supervisor launch.');
     }
   }
 }
@@ -76,7 +76,7 @@ export function startIsolatedSupervisor(spec: IsolatedSupervisorCommand): number
     throw new Error(`[supervisor] Independent service launch failed (${unit}); inspect its user journal.`);
   }
   const shown = run('systemctl', ['--user', 'show', unit, '--property=MainPID', '--value'], spec.env);
-  const pid = Number(shown.stdout.trim());
+  const pid = Number(shown.stdout?.trim());
   if (shown.status !== 0 || !Number.isSafeInteger(pid) || pid <= 1) {
     run('systemctl', ['--user', 'stop', unit], spec.env);
     throw new Error(`[supervisor] Independent service has no live MainPID (${unit}).`);
