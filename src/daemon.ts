@@ -18765,7 +18765,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // task (or `/repo`) will create its Session. Attachments, quotes, forwarded
   // context, and listener prompts remain real inputs and must not be dropped.
   let prefetchedRepoProjects: import('./services/project-scanner.js').ProjectInfo[] | undefined;
-  if (isBareForceTopic) {
+  if (isBareForceTopic && forceTopic?.mode !== 'worktree') {
     const setupDirs = pinnedWorkingDir
       ? [pinnedWorkingDir]
       : getProjectScanDirsForBot(larkAppId);
