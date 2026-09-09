@@ -592,6 +592,15 @@ const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut
  *  also appears in transcript prose on the same screen (busyProbeRegion scans
  *  the bottom third), which would pin an idle session busy forever. */
 const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc to interrupt\b/m;
+/** Active Claude task-panel row. The parent composer remains interactive while
+ *  background agents run, so `❯` is not a turn-completion signal by itself.
+ *  Require the running glyph plus the panel's aligned label/description gap and
+ *  elapsed-time suffix; completed/open rows and prose must stay inert. */
+const CLAUDE_ACTIVE_AGENT_ROW_RE = /^\s*◯\s+\S(?:.*\S)?\s{2,}\d+(?:h|m|s)(?:\s+\d+(?:m|s))?\s*(?:·\s*[↓↑]\s*[\d.]+[kKmM]?\s+tokens)?\s*$/m;
+const CLAUDE_BUSY_PATTERN = new RegExp(
+  `${CLAUDE_BUSY_FOOTER_RE.source}|${CLAUDE_ACTIVE_AGENT_ROW_RE.source}`,
+  'm',
+);
 /** Escape hatch: force a specific chat:submit key regardless of
  *  keybindings.json. Accepts the same spellings as the config (e.g.
  *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
@@ -1210,8 +1219,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // footer + ctrl+t 变体），散文 8/8 不误报（reviewer 与本机双向实测）。
     // 窄视口（<80 列）footer 截断时拿不到中断段——安全降级回 2s 静默裸奔，
     // 不产生误报。本机 242 个 tmux pane 扫末行实测 0 误报。
-    busyPattern: CLAUDE_BUSY_FOOTER_RE,
-    idleToBusyPattern: CLAUDE_BUSY_FOOTER_RE,
+    busyPattern: CLAUDE_BUSY_PATTERN,
+    idleToBusyPattern: CLAUDE_BUSY_PATTERN,
     // Claude 家族在 spawn 时注入 SessionStart hook，回调
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
