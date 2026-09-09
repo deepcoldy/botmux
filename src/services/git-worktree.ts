@@ -10,7 +10,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
@@ -356,12 +356,31 @@ export interface WorktreeSafetyStatus {
   fingerprint: string;
 }
 
-export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
-  const dir = resolve(worktreePath);
+async function safetyStatusLines(dir: string): Promise<string[]> {
   const status = await gitRaw([
     'status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
   ], dir, 10_000);
-  const allDirtyFiles = status.split('\n')
+  const lines = status ? status.split('\n') : [];
+  const submodules = await gitRaw([
+    'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
+  ], dir, 10_000);
+  for (const path of submodules.split('\0').filter(Boolean)) {
+    const nested = await gitRaw([
+      'status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
+    ], join(dir, path), 10_000);
+    if (!nested) continue;
+    for (const line of nested.split('\n')) {
+      if (line.length > 3) lines.push(`${line.slice(0, 3)}${path}/${line.slice(3)}`);
+    }
+  }
+  return lines;
+}
+
+export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
+  const dir = resolve(worktreePath);
+  const statusLines = await safetyStatusLines(dir);
+  const status = statusLines.join('\n');
+  const allDirtyFiles = statusLines
     .filter(line => line.length > 3)
     // Porcelain v1 is fixed-width `XY PATH`. Preserve a blank index column
     // (the common unstaged ` M` / ` D` cases) until after removing the prefix.
@@ -392,8 +411,54 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
       }
     }
   }
+  // `git status` records paths and states, not bytes. Hash the current worktree
+  // content for every dirty entry so an already-dirty file changing between the
+  // confirmation card and deletion invalidates the confirmation. `git hash-object`
+  // handles regular files, symlinks and paths inside initialized submodules; a
+  // directory marker is expanded with the traditional ignored view so ignored
+  // directory contents participate without changing the compact display list.
+  const contentRows: string[] = [];
+  for (const path of allDirtyFiles) {
+    const absolute = join(dir, path.replace(/\/$/, ''));
+    if (path.endsWith('/')) {
+      const nested = await gitRaw([
+        'status', '--porcelain', '--ignored=traditional', '--untracked-files=all',
+      ], dir, 10_000);
+      const prefix = path;
+      for (const line of nested.split('\n')) {
+        const nestedPath = line.length > 3 ? line.slice(3).trim() : '';
+        if (!nestedPath.startsWith(prefix)) continue;
+        const digest = await git(['hash-object', '--no-filters', join(dir, nestedPath)], dir, 10_000);
+        contentRows.push(`${nestedPath}\0${digest}`);
+      }
+      continue;
+    }
+    let digest: string;
+    if (!existsSync(absolute) && !path.includes(' -> ')) {
+      // A tracked deletion is expected dirty state, not a scan failure.
+      digest = '<missing>';
+    } else try {
+      const stat = lstatSync(absolute);
+      if (stat.isDirectory()) {
+        const nested = await gitRaw([
+          'status', '--porcelain', '--ignored=traditional', '--untracked-files=all',
+        ], absolute, 10_000);
+        digest = createHash('sha256').update(nested).digest('hex');
+      } else {
+        digest = await git(['hash-object', '--no-filters', absolute], dir, 10_000);
+      }
+    } catch (err) {
+      if (path.includes(' -> ')) {
+        const destination = path.slice(path.indexOf(' -> ') + 4);
+        digest = await git(['hash-object', '--no-filters', join(dir, destination)], dir, 10_000);
+      } else {
+        throw err;
+      }
+    }
+    contentRows.push(`${path}\0${digest}`);
+  }
   const fingerprint = createHash('sha256')
-    .update(JSON.stringify({ head, upstream: upstream ?? '', status, ahead, unpushedCommits }))
+    .update(JSON.stringify({ head, upstream: upstream ?? '', status, contentRows, ahead, unpushedCommits }))
     .digest('hex');
   return { dirty: status.length > 0, dirtyCount: allDirtyFiles.length, dirtyFiles, ahead, unpushedCommits, fingerprint };
 }

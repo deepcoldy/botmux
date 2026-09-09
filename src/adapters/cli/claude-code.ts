@@ -596,9 +596,9 @@ const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc 
  *  background agents run, so `❯` is not a turn-completion signal by itself.
  *  Require the running glyph plus the panel's aligned label/description gap and
  *  elapsed-time suffix; completed/open rows and prose must stay inert. */
-const CLAUDE_ACTIVE_AGENT_ROW_RE = /^\s*◯\s+\S+(?:\s\S+)*?\s{2,}\S(?:.*\S)?\s{2,}\d+(?:h|m|s)(?:\s+\d+(?:m|s))?\s+·\s*[↓↑]\s*[\d.]+[kKmM]?\s+tokens\s*$/m;
+const CLAUDE_ACTIVE_AGENT_PANEL_RE = /^\s*Tasks(?:\s*\([^\n]*\))?\s*\n(?:\s*[─━]+\s*\n)?\s*◯\s+\S+(?:\s\S+)*?\s{2,}\S(?:.*\S)?\s{2,}\d+(?:h|m|s)(?:\s+\d+(?:m|s))?\s+·\s*[↓↑]\s*[\d.]+[kKmM]?\s+tokens\s*$/m;
 const CLAUDE_BUSY_PATTERN = new RegExp(
-  `${CLAUDE_BUSY_FOOTER_RE.source}|${CLAUDE_ACTIVE_AGENT_ROW_RE.source}`,
+  `${CLAUDE_BUSY_FOOTER_RE.source}|${CLAUDE_ACTIVE_AGENT_PANEL_RE.source}`,
   'm',
 );
 /** Escape hatch: force a specific chat:submit key regardless of

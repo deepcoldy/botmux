@@ -6,7 +6,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -4145,14 +4145,21 @@ function forceTopicCommandLabel(content: string): '/t' | '/topic' {
 }
 
 
-async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promise<{ worktreePath: string; branch: string }> {
-  const { mainWorktreeFor } = await import('./services/git-worktree.js');
+async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promise<{
+  worktreePath: string;
+  branch: string;
+  targetSubdir?: string;
+}> {
+  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
+  const subdir = containingRoot ? relative(containingRoot, baseDir) : '';
   const short = createHash('sha1').update(anchor).digest('hex').slice(0, 12);
   const branch = `wt/botmux-${short}`;
   return {
     branch,
     worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
 
@@ -5156,6 +5163,7 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+  noteTurnReceived: (ds, messageId) => registerTurnReceivedReaction(ds, messageId),
   prewarmDocCommentSession,
 };
 
@@ -17163,12 +17171,13 @@ function willAutoWorktree(larkAppId: string, pinnedWorkingDir: string | undefine
  * row is announced inside runAutoWorktreeCommit (one place for all callers). */
 function startAutoWorktreePending(ds: DaemonSession, args: {
   anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string; force?: boolean;
-  worktreePath?: string; branch?: string; reuseExisting?: boolean;
+  worktreePath?: string; branch?: string; reuseExisting?: boolean; targetSubdir?: string;
 }): void {
   void runAutoWorktreeCommit({
     ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
     title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId, force: args.force,
     worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
+    targetSubdir: args.targetSubdir,
     activeSessions,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
     prepareTurn: (session, messageId) => prepareTurnCliIdentity(session, messageId),
@@ -18897,6 +18906,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
     pendingTurnId: replyAnchorId,
+    // A session-group birth runs the CLI turn under the generated in-group intro,
+    // but progress reactions belong on the original inbound DM message.
+    pendingReactionMessageId: replyAnchorId === parsed.messageId ? undefined : parsed.messageId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,

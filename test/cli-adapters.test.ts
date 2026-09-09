@@ -2358,8 +2358,25 @@ describe('busyPattern', () => {
   it('claude-code treats active task-panel agents as busy but ignores non-running rows and prose', () => {
     const claude = createCliAdapterSync('claude-code');
     const busy = claude.busyPattern!;
-    expect(busy.test('  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens')).toBe(true);
-    expect(busy.test('  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens')).toBe(true);
+    expect(busy.test([
+      'Tasks',
+      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
+    ].join('\n'))).toBe(true);
+    expect(busy.test([
+      'Tasks (1 active)',
+      '  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens',
+    ].join('\n'))).toBe(true);
+    // A copied task row in transcript prose is not live panel state.
+    expect(busy.test('  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens')).toBe(false);
+    expect(busy.test([
+      '❯ Here is the row you asked me to copy:',
+      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
+    ].join('\n'))).toBe(false);
+    expect(busy.test([
+      'Tasks are described below in prose.',
+      '❯ copied output:',
+      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
+    ].join('\n'))).toBe(false);
     expect(busy.test('  ✔ Explore  Checking plugin aliases')).toBe(false);
     expect(busy.test('  ◻ Explore  Checking plugin aliases')).toBe(false);
     expect(busy.test('The symbol ◯ and 6m 8s are examples in this paragraph.')).toBe(false);

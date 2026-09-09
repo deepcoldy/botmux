@@ -697,6 +697,7 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -2544,6 +2545,19 @@ export async function handleCommand(
               pendingRawInput ? '' : (wrappedInput ?? ''),
               !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
             );
+            if (!emptyStart && !pendingRawInput && pendingTurnId) {
+              const reactionMessageId = current.pendingReactionMessageId ?? pendingTurnId;
+              const registration = deps.noteTurnReceived?.(current, reactionMessageId);
+              if (registration) {
+                const registrations = (current.pendingAckReactionRegistrations ??= new Set());
+                const tracked = { messageId: reactionMessageId, promise: registration };
+                registrations.add(tracked);
+                void registration.finally(() => {
+                  registrations.delete(tracked);
+                  if (registrations.size === 0) current.pendingAckReactionRegistrations = undefined;
+                });
+              }
+            }
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
             // Queued activation ownership lasts through adapter submission.
@@ -2572,6 +2586,7 @@ export async function handleCommand(
             current.pendingCodexAppFollowUpContexts = undefined;
             current.pendingCodexAppFollowUpGateAccepted = undefined;
             current.pendingTurnId = undefined;
+            current.pendingReactionMessageId = undefined;
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;

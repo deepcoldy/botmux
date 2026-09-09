@@ -23,6 +23,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -1413,7 +1414,10 @@ describe('/rename production routing — must not pre-create a session (review P
 
 
   it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
-    const currentDir = makeRepoFixtureDir();
+    const repoRoot = makeRepoFixtureDir();
+    const currentDir = join(repoRoot, 'packages', 'app');
+    mkdirSync(currentDir, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoRoot });
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -1444,6 +1448,7 @@ describe('/rename production routing — must not pre-create a session (review P
       baseDir: currentDir,
       prompt: expect.stringContaining('检查实现'),
       force: true,
+      targetSubdir: join('packages', 'app'),
     }));
   });
 

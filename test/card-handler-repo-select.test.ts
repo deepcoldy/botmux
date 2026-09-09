@@ -555,6 +555,27 @@ describe('repo select card — plain switch', () => {
     expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_original_turn');
   });
 
+  it('reacts on the source DM when a p2p-group intro owns the worker turn', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'implement feature',
+      pendingTurnId: 'om_group_intro',
+      pendingReactionMessageId: 'om_source_dm',
+      worker: null,
+    });
+    const { deps, noteTurnReceived } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'om_group_intro' },
+    );
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_source_dm');
+    expect(ds.pendingReactionMessageId).toBeUndefined();
+  });
+
   it('tracks repo-start reaction registration until the async write settles', async () => {
     const ds = makeDs({
       pendingRepo: true,

@@ -348,6 +348,57 @@ describe('worktreeSafetyStatus', () => {
 
     expect(status.dirtyFiles).toEqual(['first-character.ts']);
   });
+
+  it('fingerprints a tracked deletion without treating the missing path as a scan error', async () => {
+    const repo = makeUpstream('deleted-fingerprint');
+    const file = join(repo, 'deleted.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'deleted.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    rmSync(file);
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toEqual(['deleted.txt']);
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('changes the fingerprint when an already-dirty file content changes', async () => {
+    const repo = makeUpstream('content-fingerprint');
+    const file = join(repo, 'dirty.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'dirty.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    writeFileSync(file, 'first value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('detects ignored files inside an initialized submodule', async () => {
+    const subOrigin = makeUpstream('submodule-origin');
+    writeFileSync(join(subOrigin, '.gitignore'), 'secret.env\n');
+    git(subOrigin, 'add', '.gitignore');
+    git(subOrigin, 'commit', '-m', 'ignore local secret');
+
+    const repo = makeUpstream('submodule-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const secret = join(repo, 'vendor/sub/secret.env');
+    writeFileSync(secret, 'local\n');
+    const status = await worktreeSafetyStatus(repo);
+
+    writeFileSync(secret, 'changed\n');
+    const changed = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles).toContain('vendor/sub/secret.env');
+    expect(changed.fingerprint).not.toBe(status.fingerprint);
+  });
 });
 
 describe('worktree semantic slug helpers', () => {

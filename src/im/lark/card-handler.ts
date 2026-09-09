@@ -642,10 +642,11 @@ export async function commitRepoSelection(
         !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
       );
       if (!emptyStart && !pendingRawInput && pendingTurnId) {
-        const registration = noteTurnReceived?.(ds, pendingTurnId);
+        const reactionMessageId = ds.pendingReactionMessageId ?? pendingTurnId;
+        const registration = noteTurnReceived?.(ds, reactionMessageId);
         if (registration) {
           const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-          const tracked = { messageId: pendingTurnId, promise: registration };
+          const tracked = { messageId: reactionMessageId, promise: registration };
           registrations.add(tracked);
           void registration.finally(() => {
             registrations.delete(tracked);
@@ -679,6 +680,7 @@ export async function commitRepoSelection(
       ds.pendingCodexAppFollowUpContexts = undefined;
       ds.pendingCodexAppFollowUpGateAccepted = undefined;
       ds.pendingTurnId = undefined;
+      ds.pendingReactionMessageId = undefined;
       return true;
       });
       if (!started) return false;
@@ -922,8 +924,10 @@ export async function runAutoWorktreeCommit(deps: {
   worktreePath?: string;
   branch?: string;
   reuseExisting?: boolean;
+  /** Relative directory inside a newly-created worktree to preserve as cwd. */
+  targetSubdir?: string;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, noteTurnReceived, force, worktreePath, branch, reuseExisting } = deps;
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, noteTurnReceived, force, worktreePath, branch, reuseExisting, targetSubdir } = deps;
   ds.worktreeCreating = true;
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
@@ -964,8 +968,8 @@ export async function runAutoWorktreeCommit(deps: {
         prepareTurn,
         noteTurnReceived,
       },
-      wt.dir,
-      pathBasename(wt.dir),
+      targetSubdir ? join(wt.dir, targetSubdir) : wt.dir,
+      pathBasename(targetSubdir ? join(wt.dir, targetSubdir) : wt.dir),
       { suppressConfirmReply: true },
     ));
   } catch (e) {
