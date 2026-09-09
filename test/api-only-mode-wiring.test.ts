@@ -801,7 +801,10 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
     );
     expect(helperCall).toContain(
-      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),',
+      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
+    );
+    expect(helperCall).toContain(
+      'prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
     );
     expect(helperCall).toContain('markSessionsRestored: () => {');
     expect(helperCall).toContain('sessionsRestored = true;');
