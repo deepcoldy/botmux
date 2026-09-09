@@ -6309,9 +6309,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-  worker-budget status 查看主机内存准入阈值与 session scope 能力
-       set             设置 --min-available-mib / --max-memory-full-avg10 / --session-memory-max-mib
-       unset           清除主机 worker 内存策略覆盖
+  worker-budget status 查看 worker 内存准入来源、阈值与 session scope 能力
+       set             设置 --memory-admission-enabled true|false / --min-available-mib /
+                       --max-memory-full-avg10 / --session-memory-max-mib
+       unset           清除 worker 内存策略覆盖
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
        --unset         清除（global 或 --bot N 配合）
@@ -6546,14 +6547,51 @@ function positiveNumber(value: string | undefined, label: string): number {
   return parsed;
 }
 
+function positiveMibBytes(value: string | undefined, label: string): number {
+  const bytes = Math.round(positiveNumber(value, label) * 1024 ** 2);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error(`${label} must resolve to a positive safe byte count`);
+  return bytes;
+}
+
+function strictBoolean(value: string | undefined, label: string): boolean {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${label} must be true or false`);
+}
+
+function validateWorkerBudgetSetArgs(args: string[]): void {
+  const flags = new Set([
+    '--memory-admission-enabled',
+    '--min-available-mib',
+    '--max-memory-full-avg10',
+    '--session-memory-max-mib',
+  ]);
+  const seen = new Set<string>();
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+    if (!flags.has(flag)) throw new Error(`unknown worker-budget flag: ${token}`);
+    if (seen.has(flag)) throw new Error(`duplicate worker-budget flag: ${flag}`);
+    seen.add(flag);
+    if (token === flag) {
+      const value = args[++i];
+      if (value === undefined || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    } else if (token.slice(token.indexOf('=') + 1) === '') {
+      throw new Error(`${flag} requires a value`);
+    }
+  }
+}
+
 function cmdWorkerBudget(args: string[]): void {
   const sub = (args[0] ?? 'status').toLowerCase();
   if (sub === 'status') {
-    const pressure = readHostMemoryPressure();
-    const decision = evaluateWorkerAdmission(pressure, readGlobalConfig().worker);
+    if (args.length > 1) throw new Error('worker-budget status does not accept arguments');
+    const sampledPressure = readHostMemoryPressure();
+    const decision = evaluateWorkerAdmission(sampledPressure, readGlobalConfig().worker);
+    const pressure = decision.pressure;
     const scope = sessionScopeCapabilities();
     const bots = loadBotsJson();
-    console.log('Worker host protection');
+    console.log('Worker memory protection');
     console.log(`  resident ceiling policy: unchanged (per-bot maxLiveWorkers; default ${DEFAULT_MAX_LIVE_WORKERS})`);
     if (bots.length === 0) {
       console.log(`  effective resident ceiling: ${DEFAULT_MAX_LIVE_WORKERS} (default; no configured bots)`);
@@ -6575,11 +6613,13 @@ function cmdWorkerBudget(args: string[]): void {
         );
       });
     }
-    console.log(`  MemAvailable: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)}`);
+    console.log(`  memory admission: ${decision.policy.memoryAdmissionEnabled ? 'enabled' : 'disabled'} (${decision.policy.memoryAdmissionEnabledSource})`);
+    console.log(`  effective total memory: ${formatMemoryBytes(pressure.totalMemoryBytes)} (${pressure.totalMemorySource})`);
+    console.log(`  available memory: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)} (${pressure.availableMemorySource})`);
     console.log(`  reserve: ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)} (${decision.policy.minAvailableMemorySource})`);
-    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`}`);
+    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`} (${pressure.memoryFullAvg10Source})`);
     console.log(`  PSI limit: ${decision.policy.maxMemoryFullAvg10.toFixed(2)}% (${decision.policy.maxMemoryFullAvg10Source})`);
-    console.log(`  admission: ${decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`}`);
+    console.log(`  admission: ${decision.policy.memoryAdmissionEnabled ? (decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`) : 'disabled'}`);
     console.log(`  session scope cleanup: ${scope.cleanupSupported ? 'supported' : 'unsupported'}`);
     console.log(`  MemoryMax enforceable: ${scope.memoryControllerSupported ? 'yes' : 'no'}`);
     console.log(`  configured session MemoryMax: ${decision.policy.sessionMemoryMaxBytes === undefined ? 'unset' : formatMemoryBytes(decision.policy.sessionMemoryMaxBytes)}`);
@@ -6590,29 +6630,33 @@ function cmdWorkerBudget(args: string[]): void {
   }
   if (sub === 'set') {
     const rest = args.slice(1);
+    validateWorkerBudgetSetArgs(rest);
+    const enabled = argValue(rest, '--memory-admission-enabled');
     const minMib = argValue(rest, '--min-available-mib');
     const psi = argValue(rest, '--max-memory-full-avg10');
     const memoryMaxMib = argValue(rest, '--session-memory-max-mib');
-    if (minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
+    if (enabled === undefined && minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
       throw new Error('worker-budget set requires at least one policy flag');
     }
     const patch: WorkerConfig = {};
-    if (minMib !== undefined) patch.minAvailableMemoryBytes = Math.round(positiveNumber(minMib, '--min-available-mib') * 1024 ** 2);
+    if (enabled !== undefined) patch.memoryAdmissionEnabled = strictBoolean(enabled, '--memory-admission-enabled');
+    if (minMib !== undefined) patch.minAvailableMemoryBytes = positiveMibBytes(minMib, '--min-available-mib');
     if (psi !== undefined) {
       const value = positiveNumber(psi, '--max-memory-full-avg10');
       if (value > 100) throw new Error('--max-memory-full-avg10 must be <= 100');
       patch.maxMemoryFullAvg10 = value;
     }
-    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = Math.round(positiveNumber(memoryMaxMib, '--session-memory-max-mib') * 1024 ** 2);
+    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = positiveMibBytes(memoryMaxMib, '--session-memory-max-mib');
     const resolved = mergeWorkerConfig(patch);
-    console.log('Updated worker host protection policy.');
+    console.log('Updated worker memory protection policy.');
     console.log(JSON.stringify(resolved, null, 2));
     console.log('New worker admissions use this policy without changing resident-session ceilings.');
     return;
   }
   if (sub === 'unset' || sub === 'clear') {
+    if (args.length > 1) throw new Error(`worker-budget ${sub} does not accept arguments`);
     clearWorkerConfig();
-    console.log('Cleared worker host protection overrides; defaults apply.');
+    console.log('Cleared worker memory protection overrides; defaults apply.');
     return;
   }
   console.error('Usage: botmux worker-budget [status|set|unset]');

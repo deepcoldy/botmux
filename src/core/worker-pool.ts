@@ -10266,12 +10266,12 @@ export function forkWorker(
   for (const warning of admission.pressure.warnings) {
     if (hostPressureWarningsLogged.has(warning)) continue;
     hostPressureWarningsLogged.add(warning);
-    logger.warn(`[${tag(ds)}] Host memory pressure check degraded (fail-open): ${warning}`);
+    logger.warn(`[${tag(ds)}] Memory pressure check degraded (fail-open): ${warning}`);
   }
   if (!admission.allowed) {
     const reason = admission.reasons.join('; ');
-    logger.warn(`[${tag(ds)}] Worker admission blocked by host memory pressure: ${reason}`);
-    const retry = `Host memory pressure is critical: ${reason}. `
+    logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
+    const retry = `Memory pressure is critical: ${reason}. `
       + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
       + `(reserve ${formatMemoryBytes(admission.policy.minAvailableMemoryBytes)}, `
       + `PSI limit ${admission.policy.maxMemoryFullAvg10.toFixed(2)}%).`;
