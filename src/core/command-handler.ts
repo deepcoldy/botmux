@@ -17,7 +17,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
@@ -1906,22 +1906,28 @@ export async function handleCommand(
             await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
             break;
           }
-          const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
-          if (active.length > 0) {
-            await sessionReply(rootId, `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`);
+          const refusal = await withWorktreeTargetLock(job.worktreeDir, async () => {
+            const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
+            if (active.length > 0) {
+              return `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`;
+            }
+            const safety = await worktreeSafetyStatus(job.worktreeDir);
+            if (safety.fingerprint !== job.safetyFingerprint) {
+              return '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。';
+            }
+            await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
+            deleteWorktreeCleanupJob(config.session.dataDir, job.id);
+            return undefined;
+          });
+          if (refusal) {
+            await sessionReply(rootId, refusal);
             break;
           }
-          const safety = await worktreeSafetyStatus(job.worktreeDir);
-          if (safety.fingerprint !== job.safetyFingerprint) {
-            await sessionReply(rootId, '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。');
-            break;
-          }
-          await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
-          deleteWorktreeCleanupJob(config.session.dataDir, job.id);
-          await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
         } catch (err) {
           await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
+          break;
         }
+        await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
         break;
       }
 
@@ -2195,27 +2201,38 @@ export async function handleCommand(
               }, loc));
               break;
             }
-            const finalSafety = await worktreeSafetyStatus(worktreeDir);
-            const finalInventory = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir);
-            if (finalSafety.fingerprint !== initialWorktreeFingerprint || finalInventory.length > 0) {
+            const removal = await withWorktreeTargetLock(worktreeDir, async () => {
+              const finalSafety = await worktreeSafetyStatus(worktreeDir);
+              const finalInventory = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir);
+              if (finalSafety.fingerprint !== initialWorktreeFingerprint || finalInventory.length > 0) {
+                return {
+                  status: 'changed' as const,
+                  contentChanged: finalSafety.fingerprint !== initialWorktreeFingerprint,
+                };
+              }
+              try {
+                await removeRepoWorktree(worktreeMain, worktreeDir);
+                return { status: 'removed' as const };
+              } catch (error) {
+                return { status: 'failed' as const, error, safetyFingerprint: finalSafety.fingerprint };
+              }
+            });
+            if (removal.status === 'changed') {
               await sessionReply(
                 rootId,
-                finalSafety.fingerprint !== initialWorktreeFingerprint
+                removal.contentChanged
                   ? '⚠️ 关闭会话后 worktree 内容发生变化，已取消删除。请检查后重试 `/close wt`。'
                   : '⚠️ 关闭会话后仍检测到活动会话，已取消删除。请稍后重试 `/close wt`。',
               );
               break;
             }
-            try {
-              await removeRepoWorktree(worktreeMain, worktreeDir);
-              await sessionReply(rootId, t('cmd.close.worktree_removed', { path: worktreeDir, count: closedSiblings }, loc));
-            } catch (err) {
-              const error = err instanceof Error ? err.message : String(err);
+            if (removal.status === 'failed') {
+              const error = removal.error instanceof Error ? removal.error.message : String(removal.error);
               const job = putWorktreeCleanupJob(config.session.dataDir, {
                 larkAppId: ds.larkAppId,
                 worktreeMain,
                 worktreeDir,
-                safetyFingerprint: finalSafety.fingerprint,
+                safetyFingerprint: removal.safetyFingerprint,
                 error,
               });
               await sessionReply(
@@ -2223,6 +2240,8 @@ export async function handleCommand(
                 `${t('cmd.close.worktree_remove_failed', { path: worktreeDir, error }, loc)}\n`
                 + `已保存清理任务，可稍后发送 \`/cleanup-wt ${job.id}\` 重试。`,
               );
+            } else {
+              await sessionReply(rootId, t('cmd.close.worktree_removed', { path: worktreeDir, count: closedSiblings }, loc));
             }
           }
           logger.info(`[${logTag}] Session closed by /close command${removeWorktree ? ' with worktree cleanup' : ''}`);

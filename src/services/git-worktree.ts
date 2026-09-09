@@ -319,6 +319,15 @@ async function createRepoWorktreeUnlocked(
 }
 
 
+export function withWorktreeTargetLock<T>(
+  worktreePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const target = resolve(worktreePath);
+  mkdirSync(dirname(target), { recursive: true });
+  return withFileLock(target, fn, { maxWaitMs: 180_000 });
+}
+
 export async function createRepoWorktree(
   repoPath: string,
   opts: CreateRepoWorktreeOptions = {},
@@ -326,9 +335,10 @@ export async function createRepoWorktree(
   if (!opts.reuseExisting || !opts.worktreePath) {
     return createRepoWorktreeUnlocked(repoPath, opts);
   }
-  const target = resolve(opts.worktreePath);
-  mkdirSync(dirname(target), { recursive: true });
-  return withFileLock(target, () => createRepoWorktreeUnlocked(repoPath, opts), { maxWaitMs: 180_000 });
+  return withWorktreeTargetLock(
+    opts.worktreePath,
+    () => createRepoWorktreeUnlocked(repoPath, opts),
+  );
 }
 
 

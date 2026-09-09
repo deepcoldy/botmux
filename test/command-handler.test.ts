@@ -206,6 +206,7 @@ vi.mock('../src/services/git-worktree.js', () => ({
   isLinkedWorktree: vi.fn(async () => false),
   mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
   worktreeRootFor: vi.fn(async (dir: string) => dir),
+  withWorktreeTargetLock: vi.fn(async (_path: string, fn: () => Promise<unknown>) => fn()),
   removeRepoWorktree: vi.fn(async () => {}),
   worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
 }));
@@ -595,7 +596,7 @@ import { createHash } from 'node:crypto';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
-import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
@@ -2377,6 +2378,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
 
+      expect(withWorktreeTargetLock).toHaveBeenCalledWith('/home/testuser/project-wt-task', expect.any(Function));
       expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         larkAppId: LARK_APP_ID,
         worktreeMain: '/home/testuser/project',
@@ -2385,6 +2387,43 @@ describe('handleCommand', () => {
       }));
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('/cleanup-wt cleanup-123');
+    });
+
+    it('does not persist a cleanup job when removal succeeded but its success reply fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, content) => {
+        if (String(content).includes('额外关闭 0 个同 worktree 会话')) throw new Error('reply unavailable');
+      });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
+    });
+
+    it('does not report a retained retry job when cleanup succeeded but its success reply fails', async () => {
+      const deps = makeDeps(undefined);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(getWorktreeCleanupJob).mockReturnValueOnce({
+        id: 'cleanup-123', larkAppId: LARK_APP_ID,
+        worktreeMain: '/home/testuser/project', worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'clean-state', error: 'busy', createdAt: 1, updatedAt: 1,
+      });
+      vi.mocked(deps.sessionReply).mockImplementation(async (_root, content) => {
+        if (String(content).includes('已重试并移除 worktree')) throw new Error('reply unavailable');
+      });
+
+      await handleCommand('/cleanup-wt', ROOT_ID, makeLarkMessage('/cleanup-wt cleanup-123'), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalled();
+      expect(deleteWorktreeCleanupJob).toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1])).join('\n'))
+        .not.toContain('任务已保留');
     });
 
     it('retries a durable cleanup job without an active session', async () => {
@@ -2399,6 +2438,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/cleanup-wt', ROOT_ID, makeLarkMessage('/cleanup-wt cleanup-123'), deps, LARK_APP_ID);
 
+      expect(withWorktreeTargetLock).toHaveBeenCalledWith('/home/testuser/project-wt-task', expect.any(Function));
       expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
       expect(deleteWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), 'cleanup-123');
     });
