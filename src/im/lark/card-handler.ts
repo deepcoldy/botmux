@@ -635,13 +635,13 @@ export async function commitRepoSelection(
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-      if (pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
       forkWorker(
         ds,
         prompt,
-        !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+        !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
       );
-      if (!pendingRawInput && pendingTurnId) {
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
         const registration = noteTurnReceived?.(ds, pendingTurnId);
         if (registration) {
           const registrations = (ds.pendingAckReactionRegistrations ??= new Set());

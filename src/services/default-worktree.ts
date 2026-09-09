@@ -92,8 +92,14 @@ export async function maybeCreateDefaultWorktree(
   // fallback directly WITHOUT a preceding "creating…" (which would be misleading),
   // and skip the doomed createRepoWorktree call entirely.
   if (!(await isGitWorkTree(baseDir))) {
+    const error = t('worktree.err_not_git', undefined, ctx.locale);
+    if (ctx.force) {
+      logger.warn(`[auto-worktree:${larkAppId}] explicit worktree refused: ${baseDir} is not a git work tree`);
+      await notify(error);
+      throw new Error(error);
+    }
     logger.warn(`[auto-worktree:${larkAppId}] default dir is not a git work tree, using it as-is: ${baseDir}`);
-    await notify(t('worktree.auto_fallback', { dir: baseDir, error: t('worktree.err_not_git', undefined, ctx.locale) }, ctx.locale));
+    await notify(t('worktree.auto_fallback', { dir: baseDir, error }, ctx.locale));
     return { dir: baseDir };
   }
 
@@ -130,6 +136,11 @@ export async function maybeCreateDefaultWorktree(
     return { dir: creation.path };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
+    if (ctx.force) {
+      logger.warn(`[auto-worktree:${larkAppId}] explicit worktree creation failed for ${baseDir}: ${error}`);
+      await notify(error);
+      throw e;
+    }
     logger.warn(`[auto-worktree:${larkAppId}] failed for ${baseDir}, falling back to base dir: ${error}`);
     await notify(t('worktree.auto_fallback', { dir: baseDir, error }, ctx.locale));
     return { dir: baseDir };

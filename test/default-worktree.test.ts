@@ -134,6 +134,23 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices).toHaveLength(1);    // ONLY the fallback — no misleading "creating…" first
   });
 
+  it('an explicit force request fails closed for a non-git directory', async () => {
+    const plain = join(tempRoot, 'forced-not-a-repo');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, false);
+    const notices: string[] = [];
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true,
+      locale: 'zh',
+      force: true,
+      notify: (m) => { notices.push(m); },
+    })).rejects.toThrow();
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).not.toContain(`\`${plain}\``);
+  });
+
   it('an explicit force request creates and then reuses the deterministic topic worktree when the toggle is off', async () => {
     const repo = makeRepo('forced-topic');
     const { mod } = await loadWithBot(repo, false);

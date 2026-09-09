@@ -516,7 +516,7 @@ describe('repo select card — plain switch', () => {
   // next real message gets the full new-topic opening context.
 
   it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', pendingTurnId: 'om_bare_worktree', worker: null });
     const { deps } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
@@ -527,6 +527,7 @@ describe('repo select card — plain switch', () => {
     expect(buildNewTopicCliInput).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(false);
     expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(deps.noteTurnReceived).not.toHaveBeenCalled();
     expect(updateSession).toHaveBeenCalledWith(ds.session);
   });
 
