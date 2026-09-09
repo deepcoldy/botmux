@@ -1,10 +1,7 @@
 /**
  * Stage 1 occupancy：库内租约与心跳文件拆开后的所有权回归。
  *
- * 核心洞：「心跳陈旧 + 库内租约有效」在旧实现会放行离线写（abortIf 只读
- * dashboard-daemons）。现探测与 persist 必须在同一 BEGIN IMMEDIATE 里完成。
- * 有效租约一票否决；没有有效租约（缺行 / 过期 / 不可读）时心跳仍参与判定——
- * 这是升级窗口（只写会话行、不写 occupancy 的 daemon，含回滚后的旧构建）。
+ * 有效租约一票否决；没有有效租约时新鲜 descriptor 仍拒绝（只拒绝、带原因）。
  *
  * Run:  bunx vitest run test/session-occupancy.test.ts
  */
@@ -35,6 +32,7 @@ import {
   listSessions,
   getSession,
   applySessionCommandUnowned,
+  readSessionRowUnowned,
   readOccupancyLease,
   claimOccupancyLease,
   releaseOccupancyLease,
@@ -59,13 +57,18 @@ function row(sessionId: string, extra: Record<string, unknown> = {}): Record<str
   };
 }
 
-function writeDaemonHeartbeat(appId: string, lastHeartbeat: number): void {
+function writeDaemonHeartbeat(
+  appId: string,
+  lastHeartbeat: number,
+  extra: Record<string, unknown> = {},
+): void {
   const dir = join(tempDir, 'dashboard-daemons');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${appId}.json`), JSON.stringify({
     larkAppId: appId,
     ipcPort: 12345,
     lastHeartbeat,
+    ...extra,
   }));
 }
 
@@ -97,7 +100,7 @@ afterEach(() => {
 });
 
 describe('occupancy vs heartbeat window', () => {
-  it('stale heartbeat + live lease aborts the offline write (the Stage 1 hole)', () => {
+  it('stale heartbeat + live lease aborts the offline write', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     seedOccupancyLease(tempDir, 'appA', {
       ownerPid: 4242,
@@ -106,12 +109,12 @@ describe('occupancy vs heartbeat window', () => {
     });
     writeDaemonHeartbeat('appA', Date.now() - 120_000);
 
-    expect(closeS1Offline()).toEqual({ outcome: 'owned' });
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'lease' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(true);
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe('lease');
   });
 
-  it('expired lease + fresh heartbeat still aborts (upgrade window: a daemon that never wrote occupancy, or a rollback behind a stale row)', () => {
+  it('expired lease + fresh heartbeat without capability is legacy_daemon', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     seedOccupancyLease(tempDir, 'appA', {
       ownerPid: 4242,
@@ -120,9 +123,22 @@ describe('occupancy vs heartbeat window', () => {
     });
     writeDaemonHeartbeat('appA', Date.now());
 
-    expect(closeS1Offline()).toEqual({ outcome: 'owned' });
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'legacy_daemon' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(true);
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe('legacy_daemon');
+  });
+
+  it('expired lease + live owner pid still blocks the host (fail-closed)', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
+    seedOccupancyLease(tempDir, 'appA', {
+      ownerPid: process.pid,
+      bootId: 'boot-wedged',
+      leaseUntil: Date.now() - 1,
+    });
+
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'lease' });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe('lease');
   });
 
   it('expired lease + stale heartbeat allows the offline write', () => {
@@ -136,33 +152,60 @@ describe('occupancy vs heartbeat window', () => {
 
     expect(closeS1Offline()).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('closed');
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(false);
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBeUndefined();
   });
 
-  it('missing lease + fresh heartbeat aborts (upgrade-window fallback)', () => {
+  it('missing lease + fresh heartbeat without capability is legacy_daemon', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     writeDaemonHeartbeat('appA', Date.now());
 
-    expect(closeS1Offline()).toEqual({ outcome: 'owned' });
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'legacy_daemon' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(true);
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe('legacy_daemon');
+  });
+
+  it('missing lease + fresh heartbeat with sessionStoreProtocol is daemon_without_lease', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
+    writeDaemonHeartbeat('appA', Date.now(), { sessionStoreProtocol: 'occupancy-v1' });
+
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'daemon_without_lease' });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe('daemon_without_lease');
   });
 
   it('missing lease + no heartbeat allows the offline write', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
 
     expect(closeS1Offline()).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(false);
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBeUndefined();
   });
 
-  it('isOccupancyHeld never throws on an unreadable store — the heartbeat decides', () => {
+  it('isOccupancyHeld never throws on an unreadable store', () => {
     const path = sessionStorePath(tempDir, 'appA');
     mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
     writeFileSync(path, 'definitely not a sqlite database\n'.repeat(64));
 
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(false);
-    writeDaemonHeartbeat('appA', Date.now());
-    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBe(true);
+    expect(() => isOccupancyHeld('appA', { dataDir: tempDir })).not.toThrow();
+    expect(isOccupancyHeld('appA', { dataDir: tempDir })).toBeUndefined();
+  });
+
+  it('read and apply both yield owned when a live lease exists', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
+    seedOccupancyLease(tempDir, 'appA', {
+      ownerPid: 4242,
+      bootId: 'boot-live',
+      leaseUntil: Date.now() + 60_000,
+    });
+    expect(applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'owned', heldBy: 'lease' });
+    expect(readSessionRowUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'owned', heldBy: 'lease' });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 });
 
@@ -213,7 +256,7 @@ describe('load() claims occupancy in the same IMMEDIATE transaction', () => {
     expect(readOccupancyLeaseFromDisk(tempDir, 'appA')).toMatchObject(foreign);
 
     // Offline writers keep yielding to the predecessor until it lets go.
-    expect(closeS1Offline()).toEqual({ outcome: 'owned' });
+    expect(closeS1Offline()).toEqual({ outcome: 'owned', heldBy: 'lease' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
@@ -345,33 +388,8 @@ describe('claim / release occupancy', () => {
       { sessionId: 's1', larkAppId: 'appA' },
       { type: 'close' },
       { dataDir: tempDir },
-    )).toEqual({ outcome: 'owned' });
+    )).toEqual({ outcome: 'owned', heldBy: 'lease' });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
-  });
-});
-
-describe('JSON upgrade-window path still uses abortIf', () => {
-  it('does not create a .db and still honours the heartbeat probe', () => {
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'sessions-appA.json'), JSON.stringify({
-      s1: row('s1', { larkAppId: 'appA' }),
-    }));
-
-    const aborted = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => true },
-    );
-    expect(aborted).toEqual({ outcome: 'owned' });
-
-    const published = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => false },
-    );
-    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
-    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
-    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 });
 

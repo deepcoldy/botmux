@@ -2427,7 +2427,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
 
   // Cross-bot isolation (fail-closed / positive-proof) — see decideAsyncOwnership.
-  // Both sessionStore.getSession() (cross-scans every bot's sessions-*.json) and
+  // Both sessionStore.getSession() (cross-scans every bot's SQLite store) and
   // the async store (machine-wide shared dir) can surface another bot's data for
   // a sessionId routed to THIS daemon; keep only sources positively proven ours.
   const decision = decideAsyncOwnership({

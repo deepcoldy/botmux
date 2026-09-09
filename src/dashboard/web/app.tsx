@@ -67,6 +67,8 @@ type BotmuxUpdateStatus = {
   updateCommand: string | null;
   node: { version: string; required: number; ok: boolean };
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
 };
 
 type NavItem = {
@@ -829,16 +831,6 @@ function TopbarVersionControl(props: {
     try {
       const previousInstance = await dashboardInstance();
       const result = await updateAndRestartBotmux(fetch, setPhase);
-      if (result.bootstrapRequired) {
-        // The new binary is installed, but a normal restart is refused because
-        // live daemons still run the pre-signal-death-autorestart PM2 policy.
-        // Point the operator at the one-time terminal bootstrap instead of
-        // polling a reconnect that can never happen.
-        actionInFlightRef.current = false;
-        setPhase('error');
-        setErrorDetail(t('update.bootstrapRequired'));
-        return;
-      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -1042,6 +1034,9 @@ function TopbarVersionControl(props: {
               role={phase === 'error' || refreshFailed ? 'alert' : 'status'}
               aria-live="polite"
             >{message}</p>
+            {status.runningDaemonRestartHint ? (
+              <p className="dashboard-version-message" role="status">{status.runningDaemonRestartHint}</p>
+            ) : null}
             <a
               className="dashboard-version-release-link"
               href="https://github.com/deepcoldy/botmux/releases"

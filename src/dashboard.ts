@@ -179,6 +179,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
+import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -4504,11 +4505,21 @@ const server = createServer(async (req, res) => {
         lastCheckedAt: entry.lastCheckedAt,
       }));
       const localDev = isLocalDevInstall();
+      const runningDaemons = registry.list().map(d => ({
+        larkAppId: d.larkAppId,
+        version: d.botmuxVersion,
+      }));
+      const runningDaemonRestartHint = formatRunningDaemonsRestartSummary(
+        runningDaemons.map(d => d.version),
+        current,
+      );
       return jsonRes(res, 200, {
         current,
         latest,
         versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),
+        runningDaemons,
+        ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
         localDevInstall: localDev,
