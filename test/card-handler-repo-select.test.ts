@@ -2030,6 +2030,29 @@ describe('repo select card — worktree open', () => {
 });
 
 describe('auto-worktree detached commit admission', () => {
+  it('fails closed when the preserved target subdirectory is absent', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockResolvedValueOnce({ dir: '/repos/alpha-wt' });
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha/packages/app',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+      targetSubdir: 'packages/app',
+    });
+
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('packages/app'));
+  });
+
   it('keeps an explicit failed worktree start actionable while pending', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
     const { deps } = makeDeps(ds);

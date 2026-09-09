@@ -2368,6 +2368,19 @@ describe('handleCommand', () => {
 
 
 
+    it('continues sibling and worktree cleanup when the closed-session card delivery fails', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(deliverEphemeralOrReply).mockRejectedValueOnce(new Error('card delivery unavailable'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
+
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+    });
+
     it('persists a retry job when final worktree removal fails', async () => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';

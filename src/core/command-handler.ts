@@ -2145,14 +2145,23 @@ export async function handleCommand(
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
           // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
-          await deliverEphemeralOrReply(
-            closed.current,
-            message.senderId,
-            closed.card,
-            'interactive',
-            () => sessionReply(rootId, closed.card, 'interactive'),
-            deps.invocationReplyTarget,
-          );
+          try {
+            await deliverEphemeralOrReply(
+              closed.current,
+              message.senderId,
+              closed.card,
+              'interactive',
+              () => sessionReply(rootId, closed.card, 'interactive'),
+              deps.invocationReplyTarget,
+            );
+          } catch (err) {
+            if (!removeWorktree) throw err;
+            // The session is already durably closed. For an explicitly confirmed
+            // worktree cleanup, notification delivery must not strand sibling
+            // sessions or the owned worktree; ordinary /close retains its existing
+            // outer error handling.
+            logger.warn(`[${logTag}] closed-session card delivery failed after close: ${err instanceof Error ? err.message : err}`);
+          }
           if (removeWorktree && worktreeMain && worktreeDir) {
             let closedSiblings = 0;
             const siblingCloseFailures: string[] = [];

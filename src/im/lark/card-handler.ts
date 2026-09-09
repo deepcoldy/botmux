@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
@@ -960,6 +961,10 @@ export async function runAutoWorktreeCommit(deps: {
     // admission. Re-enter with a fresh lease at the delayed commit/fork edge;
     // the outer lease may have ended minutes ago and must not authorize this
     // descendant across a bot-wide config mutation.
+    const targetDir = targetSubdir ? join(wt.dir, targetSubdir) : wt.dir;
+    if (targetSubdir && !existsSync(targetDir)) {
+      throw new Error(`worktree 中不存在原工作目录对应的子目录：${targetSubdir}`);
+    }
     await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
       {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
@@ -968,8 +973,8 @@ export async function runAutoWorktreeCommit(deps: {
         prepareTurn,
         noteTurnReceived,
       },
-      targetSubdir ? join(wt.dir, targetSubdir) : wt.dir,
-      pathBasename(targetSubdir ? join(wt.dir, targetSubdir) : wt.dir),
+      targetDir,
+      pathBasename(targetDir),
       { suppressConfirmReply: true },
     ));
   } catch (e) {
