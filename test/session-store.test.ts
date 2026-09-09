@@ -85,6 +85,7 @@ import {
   readSessionRowUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
+  countActiveSessionsOnDisk,
 } from '../src/services/session-store.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 
@@ -400,6 +401,20 @@ describe('listSessionsStrict()', () => {
     init('test-app');
 
     expect(() => listSessionsStrict()).toThrow(/invalid sessions projection/i);
+  });
+
+  it('does not create a per-bot store when the import source is malformed', () => {
+    // ".db exists" must keep meaning "the import completed": a half-built store
+    // would silently disable the one-shot import gate and drop every
+    // pre-SQLite row. A broken source therefore leaves no .db behind, and the
+    // source file itself is untouched.
+    const fp = join(tempDir, 'sessions-app-A.json');
+    writeFileSync(fp, '{broken-import-source');
+    init('app-A');
+
+    expect(() => createSession('chat-broken', 'root-broken', 'Broken')).toThrow(SessionStoreUnavailableError);
+    expect(existsSync(sessionStorePath(tempDir, 'app-A'))).toBe(false);
+    expect(readFileSync(fp, 'utf-8')).toBe('{broken-import-source');
   });
 });
 
@@ -1421,23 +1436,15 @@ function row(sessionId: string, extra: Record<string, unknown> = {}): Record<str
 
 describe('loadAllSessionsSnapshot()', () => {
   it('merges per-bot stores and stamps larkAppId from the store identity', () => {
-    seedStore('appB', {
-      other1: row('other1'),
-      dup: row('dup', { title: 'other copy' }),
-    });
-    seedStore('appA', {
-      dup: row('dup', { title: 'per-bot copy' }),
-      a1: row('a1'),
-    });
+    // Cross-store duplicate ids have no defined winner in the snapshot (that
+    // is readSessionRowCopiesAcrossStores' job), so none are seeded here.
+    seedStore('appB', { other1: row('other1') });
+    seedStore('appA', { a1: row('a1') });
 
     const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
-    expect(snapshot.size).toBe(3);
+    expect(snapshot.size).toBe(2);
     expect(snapshot.get('other1')?.larkAppId).toBe('appB');
     expect(snapshot.get('a1')?.larkAppId).toBe('appA');
-    expect(['per-bot copy', 'other copy']).toContain(snapshot.get('dup')?.title);
-    expect(snapshot.get('dup')?.larkAppId).toBe(
-      snapshot.get('dup')?.title === 'per-bot copy' ? 'appA' : 'appB',
-    );
   });
 
   it('skips malformed rows', () => {
@@ -1465,11 +1472,29 @@ describe('loadAllSessionsSnapshot()', () => {
 
   it('never creates a store it was only asked to read', () => {
     mkdirSync(tempDir, { recursive: true });
-    expect(loadAllSessionsSnapshot({ dataDir: tempDir }).size).toBe(0);
-    // A read-write SQLite open would have CREATED this file, and its mere
-    // existence would hide the unmigrated (JSON-only) probe.
+    // fallbackAppId is the branch that resolves a concrete store path (the
+    // sandbox cannot list data/); a read-write SQLite open there would CREATE
+    // the file, and its mere existence would hide the unmigrated probe.
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'test-app' }).size).toBe(0);
     expect(existsSync(sessionStorePath(tempDir, 'test-app'))).toBe(false);
-    expect(existsSync(join(tempDir, 'sessions.db'))).toBe(false);
+  });
+
+  it('ignores a pre-existing flat sessions.db / sessions.json left by the first two weeks of the project', () => {
+    // The flat store existed only between 2026-03-11 and 2026-03-22 and never
+    // shipped in a release. Whatever is still on disk is neither a store nor
+    // an unmigrated bot: not enumerated, not counted, not reported.
+    const flatDb = new DatabaseSync(join(tempDir, 'sessions.db'));
+    flatDb.exec('CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT NOT NULL, row TEXT NOT NULL)');
+    flatDb.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?)')
+      .run('flat1', 'active', JSON.stringify(row('flat1')));
+    flatDb.close();
+    seedFile('sessions.json', { flat2: row('flat2') });
+    seedStore('appA', { a1: row('a1') });
+
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()]).toEqual(['a1']);
+    expect(snapshot.unmigratedAppIds).toEqual([]);
+    expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
   });
 
   it('marks a leftover JSON store as unmigrated and does not read its rows', () => {
@@ -1502,12 +1527,13 @@ describe('loadAllSessionsSnapshot()', () => {
 });
 
 describe('readSessionRowFromDisk()', () => {
-  it('reads the owning per-bot store and does not fall back without larkAppId', () => {
+  it('reads only the owning per-bot store', () => {
+    // `larkAppId` is required by type now; there is no other store to fall
+    // back to, so a sibling store holding the same id is never consulted.
     seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
     seedStore('appB', { s1: row('s1', { title: 'other' }) });
     expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('per-bot');
     expect(readSessionRowFromDisk('s1', 'appMissing', tempDir)).toBeUndefined();
-    expect(readSessionRowFromDisk('s1', undefined, tempDir)).toBeUndefined();
     expect(readSessionRowFromDisk('nope', 'appA', tempDir)).toBeUndefined();
   });
 
@@ -1610,16 +1636,6 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
       { sessionId: 'ghost', larkAppId: 'appA' },
       { dataDir: tempDir },
     )).toEqual({ outcome: 'missing' });
-  });
-
-  it('returns missing when the row carries no larkAppId', () => {
-    seedStore('appA', { s1: row('s1') });
-    expect(applySessionCommandUnowned(
-      { sessionId: 's1' },
-      { type: 'close' },
-      { dataDir: tempDir },
-    )).toEqual({ outcome: 'missing' });
-    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
   it('never creates the store — an empty one would disable the daemon import gate', () => {

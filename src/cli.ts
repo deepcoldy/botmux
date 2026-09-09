@@ -296,6 +296,7 @@ import {
 import { loadAllSessionsSnapshot, type SessionsSnapshot } from './services/session-store.js';
 import { sqliteEngineAvailable } from './services/sqlite-compat.js';
 import {
+  SESSION_ROW_MISSING_APP_ID,
   formatStoreHoldMessage,
   formatUnmigratedMessage,
   isSessionScopedCliProcess,
@@ -3773,7 +3774,7 @@ function offlineBlockedError(blocked: { outcome: 'owned' | 'missing' | 'unmigrat
 /** Exclusion-ordered fresh read that yields while a daemon holds the store. */
 function readSessionOffline(session: SessionData): OfflineRowRead {
   const target = hostTarget(session);
-  if (!target) return { ok: false, error: 'session 缺少 larkAppId' };
+  if (!target) return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
   const read = readSessionRowAsHost(target, { dataDir: resolveDataDir() });
   if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
   return { ok: false, error: offlineBlockedError(read) };
@@ -3785,6 +3786,9 @@ function applySessionOffline(
   options: { expectAdopted?: boolean } = {},
 ): UnownedRowApply {
   const target = hostTarget(session);
+  // No `larkAppId` means no store to act on. Folded into `missing` because the
+  // callers of this path (prune / whiteboard) only distinguish applied vs not;
+  // the delete path reports SESSION_ROW_MISSING_APP_ID explicitly.
   if (!target) return { outcome: 'missing' };
   return applySessionCommandAsHost(target, command, { dataDir: resolveDataDir(), ...options });
 }
@@ -4004,7 +4008,7 @@ async function abandonSessionAuthoritatively(
   online: DaemonDescriptorLite[] = listOnlineDaemons(),
 ): Promise<AuthoritativeAbandonResult> {
   if (!session.larkAppId) {
-    return { ok: false, error: 'session 缺少 larkAppId' };
+    return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
   }
   const daemon = online.find(d => d.larkAppId === session.larkAppId);
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;

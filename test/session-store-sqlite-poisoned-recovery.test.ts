@@ -414,23 +414,6 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
     });
   });
 
-  it('rescues rows from the per-bot frozen JSON snapshot', () => {
-    withDirs((dataDir, home) => {
-      poison(dataDir, home);
-      // Damage the orphan so only a snapshot can rescue.
-      truncateSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'), 20_000);
-      const rows: Record<string, unknown> = {};
-      for (const [id, row] of Object.entries(frozenJsonRows())) {
-        rows[id] = { ...(row as Record<string, unknown>), larkAppId: 'appA' };
-      }
-      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(rows));
-
-      const after = load(dataDir, home);
-      expect(after.visible).toBe(SESSION_ROWS);
-      expect(after.strict).toBe(SESSION_ROWS);
-    });
-  });
-
   it('treats a lone leftover .tmp-shm as still poisoned rather than a healthy empty store', () => {
     withDirs((dataDir, home) => {
       // A lone `.tmp-shm` must stay a poison signal. It is tempting to wave it

@@ -64,22 +64,19 @@ function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
 }
 
 // ─── SQLite engine ───────────────────────────────────────────────────────────
-// Per-bot session rows live in `session-stores/<appId>/sessions.db`, one
-// table, whole-row JSON column. The TS
-// `Session` type stays the schema authority; the generated columns below only
-// serve hot lookups.
+// Per-bot session rows live in `session-stores/<appId>/sessions.db`, one table,
+// whole-row JSON column. The TS `Session` type stays the schema authority; the
+// generated columns below only serve hot lookups.
 //
 // SQLite is the only engine the OWNING DAEMON ever writes. It imports its
-// pre-SQLite `sessions*.json` once at first load and never writes JSON again.
+// pre-SQLite `sessions-<appId>.json` once at first load and never writes JSON
+// again.
 //
-// The cross-process surface (worker reads, CLI reads, CLI offline writes) still
-// resolves each store as "use the .db when it exists, else the .json". That is
-// not leftover indecision — it is the upgrade window. `npm i -g` replaces dist
-// and repoints ~/.botmux/bin/botmux immediately, while the daemon that owns the
-// rows keeps running the OLD code (auto-update is off by default and `botmux
-// upgrade` tells the operator to restart by hand), so a store can legitimately
-// have no `.db` for hours or weeks. Dropping the JSON read seam would leave
-// every live session's `botmux send` unable to find itself until that restart.
+// Cross-process readers and host writers open the `.db` or nothing. A leftover
+// `sessions-<appId>.json` without a `.db` means the owning daemon still runs a
+// pre-SQLite build: that store is `unmigrated` (existence only, never parsed)
+// and every cross-process caller fails closed with a restart hint — see
+// docs/design/2026-08-12-session-restage-store-first.md §3.3.
 //
 // The frozen JSON is deliberately never deleted: it is also the only artifact a
 // downgrade to a pre-SQLite botmux can read, and it costs a few hundred KB.
@@ -630,6 +627,7 @@ function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner):
  * engine.
  */
 export function init(appId: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
+  if (!appId) throw new Error('session store init(appId) requires a non-empty appId');
   migratedCodexInstanceConfig = undefined;
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
@@ -1610,7 +1608,7 @@ function persistRow(session: Session): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
-      new Error(`session store ${getDbPath()} is not attached`),
+      new Error(`session store ${currentAppId ? getDbPath() : '<uninitialized>'} is not attached`),
     );
   }
   testOnlyBeforeRowPersist?.(session.sessionId);
@@ -1714,6 +1712,9 @@ export function getOwnedSession(sessionId: string): Session | undefined {
 export function getSessionFresh(sessionId: string): Session | undefined {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  // Same rule as load(): a process that never called init() (a workflow worker
+  // whose sessions are synthetic) has no store and simply sees no row.
+  if (!currentAppId) return undefined;
   ensureDir();
   const dbFp = getDbPath();
   if (!existsSync(dbFp)) return undefined;
@@ -2464,11 +2465,12 @@ function emptySnapshot(unmigratedAppIds: string[]): SessionsSnapshot {
 }
 
 /**
- * Read-only snapshot of every session row across the legacy store and all
- * per-bot SQLite stores. Per-bot rows win duplicate sessionIds and get
- * `larkAppId` stamped from their filename so a later offline mutation
- * resolves the owning store. Deliberately lock-free: WAL transactions keep
- * each store self-consistent.
+ * Read-only snapshot of every session row across all per-bot SQLite stores.
+ * A row missing `larkAppId` gets it stamped from its store's directory name so
+ * a later offline mutation resolves the owning store. The same sessionId in
+ * two stores has no defined winner here — cross-store duplicates are the job
+ * of `readSessionRowCopiesAcrossStores`. Deliberately lock-free: WAL
+ * transactions keep each store self-consistent.
  */
 export function loadAllSessionsSnapshot(options: {
   dataDir?: string;
@@ -2528,10 +2530,9 @@ export function loadAllSessionsSnapshot(options: {
  */
 export function readSessionRowFromDisk(
   sessionId: string,
-  larkAppId?: string,
+  larkAppId: string,
   dataDir: string = config.session.dataDir,
 ): Session | undefined {
-  if (!larkAppId) return undefined;
   const ref = resolveStoreFile(larkAppId, dataDir);
   if (!ref) return undefined;
   try {
@@ -2616,12 +2617,11 @@ function owned(heldBy: HolderReason): UnownedRowBlocked {
 }
 
 function runUnownedRowTxn<T>(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions,
   step: UnownedRowStep<T>,
 ): T | UnownedRowBlocked {
   const dataDir = options.dataDir ?? config.session.dataDir;
-  if (!target.larkAppId) return { outcome: 'missing' };
   const presence = classifyStorePresence(target.larkAppId, dataDir);
   if (presence === 'unmigrated') return { outcome: 'unmigrated' };
   if (presence === 'absent') return { outcome: 'missing' };
@@ -2682,7 +2682,7 @@ function sessionRowIsAdopted(row: Session): boolean {
  * backing, close) can re-judge ownership before each irreversible step.
  */
 export function readSessionRowUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions = {},
 ): UnownedRowRead {
   return runUnownedRowTxn(target, options, current => ({
@@ -2694,14 +2694,15 @@ export function readSessionRowUnowned(
 /**
  * Apply one host command to the FRESH row of its owning per-bot store while
  * no daemon holds it, and publish the result. The caller's snapshot is never
- * written back. A row without `larkAppId` is `missing`.
+ * written back. The target names the owning store (`larkAppId` is required);
+ * a caller-observed row without one is rejected by the caller, not here.
  *
  * `expectAdopted` is a fail-closed precondition for multi-step host commands:
  * the row must still be (non-)adopted exactly as the caller last read it,
  * otherwise the step is `refused` with `row_changed`.
  */
 export function applySessionCommandUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   command: HostSessionCommand,
   options: UnownedRowOptions & { expectAdopted?: boolean } = {},
 ): UnownedRowApply {

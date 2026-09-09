@@ -27,6 +27,10 @@ export const DAEMON_WITHOUT_LEASE_OPERATOR_HINT =
 
 export const STORE_UNREADABLE_OPERATOR_HINT = '会话库不可读';
 
+/** A caller-observed row without `larkAppId` names no store; such rows were
+ *  only ever produced by the pre-2026-03-22 flat store and are abandoned. */
+export const SESSION_ROW_MISSING_APP_ID = 'session 缺少 larkAppId，无法定位其会话库';
+
 export const SESSION_STORE_WRITE_BLOCKED =
   'daemon 当前不接受会话库写入，本次未做任何修改';
 
