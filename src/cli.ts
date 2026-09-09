@@ -170,7 +170,7 @@ import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
-import { isRemoteAccessEnabled } from './global-config.js';
+import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_LOCAL_TOKEN_FLAG,
@@ -10865,6 +10865,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
+  }
+  if (!dispatchArgs.into && !isMultiTopicOrchestrationEnabled()) {
+    console.error(JSON.stringify({
+      success: false,
+      errorCode: 'multi_topic_disabled',
+      detail: '多话题协作已关闭，不能新建子项目话题。可在 Dashboard 设置中开启，或使用 botmux dispatch --into <话题根消息id> 追加到已有话题。',
+    }));
+    process.exit(2);
   }
   const dispatchRelayDir = process.env.BOTMUX_SEND_RELAY;
   if (dispatchRelayDir) {

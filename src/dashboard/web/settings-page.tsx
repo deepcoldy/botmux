@@ -77,6 +77,7 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
+  multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -225,6 +226,7 @@ function parseSettings(s: any): DashboardSettings {
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
@@ -911,6 +913,17 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'workflow'}
             onChange={value => {
               void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionMultiTopic')}>
+          <ToggleRow
+            title={tr('settings.multiTopicEnable')}
+            help={tr('settings.multiTopicEnableHelp')}
+            checked={settings.multiTopic.enabled}
+            disabled={dis || savingKey === 'multiTopic'}
+            onChange={value => {
+              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
             }}
           />
         </SettingsBlock>

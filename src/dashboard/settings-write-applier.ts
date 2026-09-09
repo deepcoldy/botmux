@@ -103,6 +103,8 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
@@ -594,6 +596,20 @@ export async function applySettingsWrite(
     // Merge over existing so a future sibling key in the workflow block survives.
     const current = deps.readGlobalConfig().workflow ?? {};
     deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    touched = true;
+  }
+
+  if ('multiTopic' in obj) {
+    const raw = obj.multiTopic;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_multiTopic' };
+    }
+    const multiTopic = raw as Record<string, unknown>;
+    if (typeof multiTopic.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_enabled' };
+    }
+    const current = deps.readGlobalConfig().multiTopic ?? {};
+    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
     touched = true;
   }
 

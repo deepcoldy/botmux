@@ -131,6 +131,13 @@ export interface WorkflowFeatureGlobalConfig {
   enabled?: boolean;
 }
 
+export interface MultiTopicGlobalConfig {
+  /** Machine-wide multi-topic orchestration switch. Missing means enabled for
+   *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
+   *  `botmux dispatch` may only append to an existing topic via `--into`. */
+  enabled?: boolean;
+}
+
 export interface WorkerConfig {
   /** Refuse a fresh/resumed worker while MemAvailable is below this value. */
   minAvailableMemoryBytes?: number;
@@ -176,6 +183,9 @@ export interface GlobalConfig {
    *  feature OFF; set true to enable it host-wide. The
    *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
   workflow?: WorkflowFeatureGlobalConfig;
+  /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
+   *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
+  multiTopic?: MultiTopicGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -614,6 +624,14 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: MultiTopicGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   return join(homedir(), '.botmux', 'config.json');
 }
@@ -684,6 +702,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
   if (workflow) out.workflow = workflow;
+  const multiTopic = readMultiTopic(raw.multiTopic);
+  if (multiTopic) out.multiTopic = multiTopic;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
@@ -820,6 +840,18 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().workflow?.enabled === true;
+}
+
+/** Machine-wide multi-topic orchestration switch. Defaults ON for backwards
+ * compatibility. The env override is also injected into managed CLI sessions
+ * so sandboxed commands agree with the host daemon. */
+export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_MULTI_TOPIC_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.enabled !== false;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

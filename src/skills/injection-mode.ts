@@ -30,7 +30,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
-import { isWorkflowFeatureEnabled } from '../global-config.js';
+import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
 import {
   BUILTIN_SKILLS,
   WORKFLOW_FEATURE_SKILLS,
@@ -48,13 +48,16 @@ import { renderBotmuxSendSkill } from './reply-style-guide.js';
  *  their historical position (right after `botmux-handoff`) when the machine-wide
  *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
  *  catalog byte-for-byte identical to before the family was factored out; when
- *  the switch is OFF the family is simply absent. `botmux-orchestrate` is part of
- *  BUILTIN_SKILLS and is never gated here. */
-function baseBuiltinSkills(workflowEnabled: boolean): typeof BUILTIN_SKILLS {
-  if (!workflowEnabled) return [...BUILTIN_SKILLS];
-  const anchor = BUILTIN_SKILLS.findIndex((s) => s.name === 'botmux-handoff');
-  const at = anchor >= 0 ? anchor + 1 : BUILTIN_SKILLS.length;
-  return [...BUILTIN_SKILLS.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...BUILTIN_SKILLS.slice(at)];
+ *  the switch is OFF the family is simply absent. The independent multi-topic
+ *  switch similarly filters `botmux-orchestrate`. */
+function baseBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
+  const builtins = multiTopicEnabled
+    ? [...BUILTIN_SKILLS]
+    : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
+  if (!workflowEnabled) return builtins;
+  const anchor = builtins.findIndex((s) => s.name === 'botmux-handoff');
+  const at = anchor >= 0 ? anchor + 1 : builtins.length;
+  return [...builtins.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...builtins.slice(at)];
 }
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
@@ -179,9 +182,12 @@ export function builtinSkillEntries(opts: {
    *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
    *  advertised. Explicit for tests. */
   workflowEnabled?: boolean;
+  /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
+  multiTopicEnabled?: boolean;
 }): BuiltinSkillEntry[] {
   const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
-  let defs = baseBuiltinSkills(workflowEnabled);
+  const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
+  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
@@ -202,7 +208,7 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...baseBuiltinSkills(isWorkflowFeatureEnabled()),
+    ...baseBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
   ];

@@ -42,6 +42,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     },
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
+    multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -256,6 +257,23 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('writes multiTopic.enabled toggle while preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects invalid multiTopic patches', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ multiTopic: 'off' }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic' });
+    expect(await applySettingsWrite({ multiTopic: { enabled: 'no' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_enabled' });
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
