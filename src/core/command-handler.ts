@@ -2208,6 +2208,7 @@ export async function handleCommand(
                 return {
                   status: 'changed' as const,
                   contentChanged: finalSafety.fingerprint !== initialWorktreeFingerprint,
+                  safetyFingerprint: finalSafety.fingerprint,
                 };
               }
               try {
@@ -2218,12 +2219,22 @@ export async function handleCommand(
               }
             });
             if (removal.status === 'changed') {
-              await sessionReply(
-                rootId,
-                removal.contentChanged
-                  ? '⚠️ 关闭会话后 worktree 内容发生变化，已取消删除。请检查后重试 `/close wt`。'
-                  : '⚠️ 关闭会话后仍检测到活动会话，已取消删除。请稍后重试 `/close wt`。',
-              );
+              if (removal.contentChanged) {
+                const job = putWorktreeCleanupJob(config.session.dataDir, {
+                  larkAppId: ds.larkAppId,
+                  worktreeMain,
+                  worktreeDir,
+                  safetyFingerprint: removal.safetyFingerprint,
+                  error: 'worktree content changed after sessions closed',
+                });
+                await sessionReply(
+                  rootId,
+                  '⚠️ 关闭会话后 worktree 内容发生变化，已取消删除。'
+                  + `请检查后发送 \`/cleanup-wt ${job.id}\` 重试。`,
+                );
+              } else {
+                await sessionReply(rootId, '⚠️ 关闭会话后仍检测到活动会话，已取消删除。请稍后重试 `/close wt`。');
+              }
               break;
             }
             if (removal.status === 'failed') {

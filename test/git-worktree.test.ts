@@ -432,6 +432,31 @@ describe('worktreeSafetyStatus', () => {
     expect(second.fingerprint).not.toBe(first.fingerprint);
   });
 
+  it('changes the fingerprint when a submodule index changes but its worktree bytes stay the same', async () => {
+    const subOrigin = makeUpstream('submodule-index-origin');
+    const tracked = join(subOrigin, 'tracked.txt');
+    writeFileSync(tracked, 'base\n');
+    git(subOrigin, 'add', 'tracked.txt');
+    git(subOrigin, 'commit', '-m', 'add tracked file');
+
+    const repo = makeUpstream('submodule-index-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const nestedFile = join(repo, 'vendor/sub/tracked.txt');
+    writeFileSync(nestedFile, 'first staged value\n');
+    git(join(repo, 'vendor/sub'), 'add', 'tracked.txt');
+    writeFileSync(nestedFile, 'same worktree value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(nestedFile, 'second staged value\n');
+    git(join(repo, 'vendor/sub'), 'add', 'tracked.txt');
+    writeFileSync(nestedFile, 'same worktree value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
   it('changes the fingerprint when an ignored directory file changes inside an initialized submodule', async () => {
     const subOrigin = makeUpstream('submodule-ignored-dir-origin');
     writeFileSync(join(subOrigin, '.gitignore'), 'cache/\n');

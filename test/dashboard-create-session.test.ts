@@ -563,6 +563,26 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(active.get(sessionKey('oc_later', APP))?.session.queuedPrompt).toBe('LATER_TASK');
   });
 
+  it('prepares trigger-user identity before restored auto-worktree fork', async () => {
+    const pending: Session = {
+      sessionId: 'pending-auth-worktree', chatId: CHAT, rootMessageId: CHAT,
+      scope: 'chat', larkAppId: APP, title: 'restore auth', status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      queued: true, queuedPrompt: 'OPENING_N', ownerOpenId: 'ou_owner',
+      pendingRepoSetup: {
+        mode: 'auto_worktree', prompt: 'OPENING_N', baseDir: '/tmp', turnId: 'om_original_turn',
+        force: true, worktreePath: '/tmp/shared-wt', branch: 'wt/shared', reuseExisting: true,
+      },
+    };
+    store.set(pending.sessionId, pending);
+    const prepareTurn = vi.fn(async () => {});
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active, new Set(), { prepareTurn });
+
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({ prepareTurn }));
+  });
+
   it('contains detached auto-worktree recovery rejection and leaves the setup retryable', async () => {
     const pending: Session = {
       sessionId: 'pending-auto-worktree',

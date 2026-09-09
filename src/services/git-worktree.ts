@@ -486,8 +486,20 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   // every index entry (including stages 1/2/3), so it remains content-sensitive
   // for both ordinary staged changes and conflicted indexes.
   const indexTree = await gitRaw(['ls-files', '--stage', '-z'], dir, 10_000);
+  const submodulePaths = (await gitRaw([
+    'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
+  ], dir, 10_000)).split('\0').filter(Boolean);
+  const submoduleIndexes: { path: string; head: string; index: string }[] = [];
+  for (const path of submodulePaths) {
+    const submoduleDir = join(dir, path);
+    submoduleIndexes.push({
+      path,
+      head: await gitRaw(['rev-parse', '--verify', 'HEAD'], submoduleDir, 5_000),
+      index: await gitRaw(['ls-files', '--stage', '-z'], submoduleDir, 10_000),
+    });
+  }
   const fingerprint = createHash('sha256')
-    .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, status, contentRows, ahead, unpushedCommits }))
+    .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, submoduleIndexes, status, contentRows, ahead, unpushedCommits }))
     .digest('hex');
   return { dirty: status.length > 0, dirtyCount: allDirtyFiles.length, dirtyFiles, ahead, unpushedCommits, fingerprint };
 }

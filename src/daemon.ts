@@ -23250,7 +23250,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   await restoreSessionsAndScheduleStartupRecovery({
     larkAppId: cfg.larkAppId,
-    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
+    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
+      prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    }),
     // Restore complete → /api/asks may now safely 403 unknown sessions again; a
     // reconnecting ask hook that raced the restore got retryable 503s until here.
     markSessionsRestored: () => {

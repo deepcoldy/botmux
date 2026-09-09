@@ -2628,8 +2628,13 @@ describe('handleCommand', () => {
 
       expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
       expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        worktreeDir: '/home/testuser/project-wt-task',
+        safetyFingerprint: 'changed-state',
+      }));
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('关闭会话后 worktree 内容发生变化');
+      expect(replies).toContain('/cleanup-wt cleanup-123');
     });
 
     it('`/close wt --yes` preserves the worktree when a sibling close is refused', async () => {
