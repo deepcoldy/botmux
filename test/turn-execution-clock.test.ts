@@ -19,6 +19,20 @@ describe('TurnExecutionClock', () => {
     expect(clock.settle('turn_never_written', 0, undefined, 9_000)).toEqual({ completedAtMs: 9_000 });
   });
 
+  it('a submission refused before the write reports a failure instant but no execution span', () => {
+    // Regression: a durable submit can be refused by a pre-write guard (e.g. the
+    // reliable-terminal bridge unavailable check) BEFORE a single byte is handed
+    // to the CLI. Such a turn never executed, so it must not be armed and its
+    // `failed` terminal carries completedAtMs (the failure instant) but no
+    // durationMs — otherwise near-zero fake durations pollute failure/p95 stats.
+    const clock = new TurnExecutionClock();
+    // Pre-write guard refuses the submission: start() is deliberately never called.
+    expect(clock.settle('turn_refused_preflight', 1, undefined, 12_000)).toEqual({
+      completedAtMs: 12_000,
+    });
+    expect(clock.size()).toBe(0);
+  });
+
   it('prefers a backend-supplied completion instant but never lets it exceed now', () => {
     const clock = new TurnExecutionClock();
     clock.start('turn_b', undefined, 1_000);

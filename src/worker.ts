@@ -11615,10 +11615,6 @@ async function flushPending(): Promise<void> {
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
         currentGatewayTrustedCaller = item.trustedCaller;
         currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
-        // Native execution starts HERE — at the literal write that hands this
-        // turn to the CLI — so its reported duration excludes the time it spent
-        // queued behind an earlier turn.
-        markTurnExecutionStart(item.turnId, item.dispatchAttempt);
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
         // this input is known not to have started and must not leave a latch
@@ -11665,6 +11661,14 @@ async function flushPending(): Promise<void> {
           log('Refused durable Claude submit: transcript terminal bridge is unavailable');
           throw new Error('terminal bridge unavailable before submission');
         }
+        // All pre-write guards have passed and the fenced write (the next
+        // operation) is about to hand this turn's input to the CLI. Arm the
+        // execution window HERE, not at the top of the hook: the guard above can
+        // refuse the submission before a single byte is written, and a turn that
+        // never executed must not report a (near-zero) duration — it still gets a
+        // real completedAtMs (the failure instant), just no durationMs. Arming
+        // here also keeps queueing time out of the span.
+        markTurnExecutionStart(item.turnId, item.dispatchAttempt);
         if (lastInitConfig?.cliId === 'codex-app') {
           log(
             `Writing Codex App input to PTY (flush): `
