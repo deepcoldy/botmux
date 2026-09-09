@@ -358,7 +358,9 @@ export interface WorktreeSafetyStatus {
 
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
   const dir = resolve(worktreePath);
-  const status = await gitRaw(['status', '--porcelain'], dir, 10_000);
+  const status = await gitRaw([
+    'status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
+  ], dir, 10_000);
   const allDirtyFiles = status.split('\n')
     .filter(line => line.length > 3)
     // Porcelain v1 is fixed-width `XY PATH`. Preserve a blank index column

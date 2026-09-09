@@ -298,6 +298,34 @@ describe('worktreeRootFor', () => {
 });
 
 describe('worktreeSafetyStatus', () => {
+  it('detects ignored files without recursively enumerating ignored directories', async () => {
+    const repo = makeUpstream('ignored-safety');
+    writeFileSync(join(repo, '.gitignore'), 'secret.env\ncache/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore local data');
+    writeFileSync(join(repo, 'secret.env'), 'secret\n');
+    mkdirSync(join(repo, 'cache'));
+    writeFileSync(join(repo, 'cache', 'a.txt'), 'a\n');
+    writeFileSync(join(repo, 'cache', 'b.txt'), 'b\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles).toContain('secret.env');
+    expect(status.dirtyFiles).toContain('cache/');
+    expect(status.dirtyFiles).not.toContain('cache/a.txt');
+  });
+
+  it('detects untracked files even when git config hides them', async () => {
+    const repo = makeUpstream('untracked-safety');
+    git(repo, 'config', 'status.showUntrackedFiles', 'no');
+    writeFileSync(join(repo, 'new.txt'), 'new\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toContain('new.txt');
+  });
+
   it('reports the full dirty count while bounding file examples', async () => {
     const repo = makeUpstream('many-dirty-files');
     for (let i = 0; i < 25; i++) writeFileSync(join(repo, `dirty-${i}.txt`), `${i}\n`);

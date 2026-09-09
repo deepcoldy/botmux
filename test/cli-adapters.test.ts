@@ -2363,6 +2363,10 @@ describe('busyPattern', () => {
     expect(busy.test('  ✔ Explore  Checking plugin aliases')).toBe(false);
     expect(busy.test('  ◻ Explore  Checking plugin aliases')).toBe(false);
     expect(busy.test('The symbol ◯ and 6m 8s are examples in this paragraph.')).toBe(false);
+    expect(busy.test('◯ The deploy should wrap up in about  10m')).toBe(false);
+    expect(busy.test('◯ Timeboxed:  2h')).toBe(false);
+    expect(busy.test('◯ x  5s')).toBe(false);
+    expect(busy.test('  ◯ Explore  Checking plugin aliases  6m 8s')).toBe(false);
     expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy.source);
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy.source);
   });
