@@ -328,7 +328,7 @@ export async function createRepoWorktree(
   }
   const target = resolve(opts.worktreePath);
   mkdirSync(dirname(target), { recursive: true });
-  return withFileLock(target, () => createRepoWorktreeUnlocked(repoPath, opts), { maxWaitMs: 60_000 });
+  return withFileLock(target, () => createRepoWorktreeUnlocked(repoPath, opts), { maxWaitMs: 180_000 });
 }
 
 

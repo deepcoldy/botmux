@@ -85,6 +85,7 @@ import {
   persistActiveRemoteLineageExact,
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
+  findActiveSessionsByWorkingDirStrict,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
   applySessionCommandUnowned,
@@ -136,6 +137,7 @@ function readPersistedRows(dir: string, appId?: string): Record<string, any> {
 beforeEach(() => {
   tempDir = makeTempDir();
   fsControl.failSessionWrite = false;
+  fsControl.failReaddir = false;
   costCalculatorMock.getSessionTokenUsage.mockReset();
   costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
   __testOnly_setBeforeRowPersist(undefined);
@@ -1354,6 +1356,38 @@ describe('Multi-bot isolation', () => {
 });
 
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
+
+describe('findActiveSessionsByWorkingDirStrict()', () => {
+  it('finds active sessions across stores by canonical worktree path', () => {
+    const worktree = join(tempDir, 'repo-wt');
+    const nested = join(worktree, 'packages', 'app');
+    mkdirSync(nested, { recursive: true });
+    const alias = nested;
+
+    init('app-A');
+    const sA = createSession('chat1', 'root-a', 'Bot A');
+    sA.workingDir = alias;
+    sA.larkAppId = 'app-A';
+    updateSession(sA);
+
+    init('app-B');
+    const sB = createSession('chat1', 'root-b', 'Bot B');
+    sB.workingDir = worktree;
+    sB.larkAppId = 'app-B';
+    updateSession(sB);
+
+    const found = findActiveSessionsByWorkingDirStrict(worktree);
+    expect(found.map(s => s.sessionId).sort()).toEqual([sA.sessionId, sB.sessionId].sort());
+  });
+
+  it('fails closed when the cross-store inventory cannot be enumerated', () => {
+    init('app-A');
+    fsControl.failReaddir = true;
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/simulated readdir denial/);
+  });
+});
 
 describe('findActiveSessionsByRoot()', () => {
   it('finds active sessions across per-bot files for the same rootMessageId', () => {

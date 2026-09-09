@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
+import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -2324,6 +2324,29 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
 
 export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
   return findActiveSessionsMatching(s => s.workingDir === workingDir);
+}
+
+/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
+export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const target = resolve(workingDir);
+  const matches: Session[] = [];
+  const targetReal = realpathSync(target);
+  const matchesDir = (session: Session) => {
+    if (session.status !== 'active' || !session.workingDir) return false;
+    let candidate: string;
+    try { candidate = realpathSync(resolve(session.workingDir)); }
+    catch { candidate = resolve(session.workingDir); }
+    const rel = relative(targetReal, candidate);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  };
+  for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
+  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
+    if (ref.appId === currentAppId) continue;
+    for (const session of readStoreActiveRows(ref)) if (matchesDir(session)) matches.push(session);
+  }
+  return matches;
 }
 
 /**

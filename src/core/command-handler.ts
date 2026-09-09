@@ -121,6 +121,9 @@ import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { readProjectGroup } from '../services/project-group-store.js';
+import { getBotUnionId } from '../services/bot-union-ids-store.js';
+import { isTeamBot } from '../services/team-bots-store.js';
+import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 
@@ -429,6 +432,14 @@ function closeWorktreeInlineDetail(items: string[], limit = 6): string {
   const visible = items.slice(0, limit).map(item => `\`${item}\``);
   if (items.length > limit) visible.push(`… +${items.length - limit}`);
   return `　${visible.join('　')}`;
+}
+
+function trustedTeamBotApp(larkAppId: string): boolean {
+  const unionId = getBotUnionId(config.session.dataDir, larkAppId);
+  return !!unionId && (
+    isTeamBot(config.session.dataDir, unionId)
+    || isPlatformTeamBot(config.session.dataDir, unionId)
+  );
 }
 
 function closeWorktreeConfirmationState(args: {
@@ -1917,6 +1928,7 @@ export async function handleCommand(
           }
           let worktreeDir = ds.workingDir ?? ds.session.workingDir;
           let worktreeMain: string | undefined;
+          let initialWorktreeFingerprint: string | undefined;
           let siblingSessions: import('../types.js').Session[] = [];
           if (removeWorktree) {
             if (ds.scope !== 'thread') {
@@ -1930,9 +1942,28 @@ export async function handleCommand(
             }
             worktreeDir = containingRoot;
             worktreeMain = await mainWorktreeFor(worktreeDir);
-            siblingSessions = sessionStore.findActiveSessionsByWorkingDir(worktreeDir)
-              .filter(s => s.sessionId !== ds.session.sessionId);
+            try {
+              siblingSessions = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir)
+                .filter(s => s.sessionId !== ds.session.sessionId);
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              logger.warn(`[${logTag}] worktree cleanup inventory unavailable: ${reason}`);
+              await sessionReply(rootId, `⚠️ 无法完整读取同 worktree 会话清单，已取消删除：${reason}`);
+              break;
+            }
+            const untrustedSibling = siblingSessions.find(sibling =>
+              sibling.larkAppId
+              && sibling.larkAppId !== ds.larkAppId
+              && !trustedTeamBotApp(sibling.larkAppId));
+            if (untrustedSibling) {
+              logger.warn(
+                `[${logTag}] refusing worktree cleanup across untrusted bot app ${untrustedSibling.larkAppId}`,
+              );
+              await sessionReply(rootId, '⚠️ 同 worktree 中存在不属于可信团队的 Bot 会话，已取消删除。');
+              break;
+            }
             const safety = await worktreeSafetyStatus(worktreeDir);
+            initialWorktreeFingerprint = safety.fingerprint;
             const confirmationState = closeWorktreeConfirmationState({
               sessionId: ds.session.sessionId,
               worktreeDir,
@@ -2083,7 +2114,11 @@ export async function handleCommand(
             let closedSiblings = 0;
             const siblingCloseFailures: string[] = [];
             for (const sibling of siblingSessions) {
-              if (!sibling.larkAppId) continue;
+              if (!sibling.larkAppId) {
+                logger.warn(`[${logTag}] sibling session ${sibling.sessionId} has no owning app; blocking worktree removal`);
+                siblingCloseFailures.push(sibling.sessionId);
+                continue;
+              }
               if (sibling.larkAppId === ds.larkAppId) {
                 try {
                   const result = await closeWorkerPoolSession(sibling.sessionId);
@@ -2121,6 +2156,17 @@ export async function handleCommand(
                 path: worktreeDir,
                 count: String(siblingCloseFailures.length),
               }, loc));
+              break;
+            }
+            const finalSafety = await worktreeSafetyStatus(worktreeDir);
+            const finalInventory = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir);
+            if (finalSafety.fingerprint !== initialWorktreeFingerprint || finalInventory.length > 0) {
+              await sessionReply(
+                rootId,
+                finalSafety.fingerprint !== initialWorktreeFingerprint
+                  ? '⚠️ 关闭会话后 worktree 内容发生变化，已取消删除。请检查后重试 `/close wt`。'
+                  : '⚠️ 关闭会话后仍检测到活动会话，已取消删除。请稍后重试 `/close wt`。',
+              );
               break;
             }
             try {
