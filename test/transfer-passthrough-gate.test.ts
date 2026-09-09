@@ -148,6 +148,11 @@ describe('mid-transfer literal passthrough', () => {
       type: 'raw_input',
       content: '/model opus',
       turnId: 'om_passthrough_turn',
+      trustedController: {
+        senderType: 'user',
+        requestLarkAppId: 'app-transfer-passthrough',
+        requestUserOpenId: 'ou_owner',
+      },
     });
   });
 });
