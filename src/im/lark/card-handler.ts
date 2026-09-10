@@ -170,7 +170,7 @@ export interface CardHandlerDeps {
   /** Prepare per-turn credentials before a pending repo selection reaches the CLI. */
   prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
   /** Register and track the original Lark turn after a pending repo selection starts its CLI. */
-  noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
+  noteTurnReceived?: (ds: DaemonSession, messageId: string, turnId?: string) => Promise<void>;
 }
 
 /**
@@ -456,7 +456,7 @@ export async function commitRepoSelection(
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
     prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
-    noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
+    noteTurnReceived?: (ds: DaemonSession, messageId: string, turnId?: string) => Promise<void>;
   },
   dirPath: string,
   dirLabel: string,
@@ -644,10 +644,10 @@ export async function commitRepoSelection(
       );
       if (!emptyStart && !pendingRawInput && pendingTurnId) {
         const reactionMessageId = ds.pendingReactionMessageId ?? pendingTurnId;
-        const registration = noteTurnReceived?.(ds, reactionMessageId);
+        const registration = noteTurnReceived?.(ds, reactionMessageId, pendingTurnId);
         if (registration) {
           const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-          const tracked = { messageId: reactionMessageId, promise: registration };
+          const tracked = { messageId: reactionMessageId, turnId: pendingTurnId, promise: registration };
           registrations.add(tracked);
           void registration.finally(() => {
             registrations.delete(tracked);
@@ -920,7 +920,7 @@ export async function runAutoWorktreeCommit(deps: {
   activeSessions: Map<string, DaemonSession>;
   notify: (message: string) => Promise<unknown> | void;
   prepareTurn?: (ds: DaemonSession, messageId: string) => Promise<void> | undefined;
-  noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
+  noteTurnReceived?: (ds: DaemonSession, messageId: string, turnId?: string) => Promise<void>;
   force?: boolean;
   worktreePath?: string;
   branch?: string;

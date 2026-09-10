@@ -12392,7 +12392,7 @@ function setupWorkerHandlers(
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
-              void finishTurnReactions(ds);
+              void finishTurnReactions(ds, msg.turnId);
             }
           }
           if (
@@ -14582,8 +14582,8 @@ function shouldDropMismatchedHermesFinalOutput(
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
  * acceptance point (`noteTurnReceived`); the screen_update handler calls this
- * only on working|analyzing → idle|limited (not cold-start starting→idle), to
- * flip every pending ✋ on this session to ✅ DONE and clear the list. When
+ * only on working|analyzing → idle (not cold-start starting→idle), passing the
+ * settled worker turnId so only reactions owned by that turn flip to ✅ DONE. When
  * silentTurnReactions is enabled after a ✋ has already landed, we only remove
  * that received reaction and do not add DONE. Binding the start to the message
  * (not a status edge) means type-ahead / busy-batched messages each get their
@@ -14592,9 +14592,18 @@ function shouldDropMismatchedHermesFinalOutput(
  * Every Feishu call is best-effort — a failure only means a missing emoji, so it
  * must never throw into the status pipeline (callers invoke as `void`).
  */
-async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const registrations = [...(ds.pendingAckReactionRegistrations ?? [])];
-  const settleIds = new Set((ds.pendingAckReactions ?? []).map(ack => ack.messageId));
+async function finishTurnReactions(ds: DaemonSession, settledTurnId?: string): Promise<void> {
+  // Legacy entries created before turn-scoped bookkeeping remain session-bound
+  // and may settle on the next real idle edge. New entries are turn-bound: an
+  // unlabelled or different-turn edge must never DONE them.
+  const matchesTurn = (turnId: string | undefined) => !turnId || (!!settledTurnId && turnId === settledTurnId);
+  const registrations = [...(ds.pendingAckReactionRegistrations ?? [])]
+    .filter(registration => matchesTurn(registration.turnId));
+  const settleIds = new Set(
+    (ds.pendingAckReactions ?? [])
+      .filter(ack => matchesTurn(ack.turnId))
+      .map(ack => ack.messageId),
+  );
   for (const registration of registrations) settleIds.add(registration.messageId);
   if (registrations.length > 0) await Promise.allSettled(registrations.map(r => r.promise));
   const list = ds.pendingAckReactions;
