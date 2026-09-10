@@ -27,7 +27,7 @@ describe('Oncall button configuration', () => {
     expect(oncallGroupEnabled(policy, 'oc_b')).toBe(false);
     expect(oncallGroupEnabled({ ...policy, enabled: false }, 'oc_a')).toBe(false);
   });
-  it.each([null, [], { enabled: 'true' }, { chatIds: 'oc_a' }, { chatIds: ['../secret'] }, { endpoint: 'https://other.test' }])('rejects malformed configuration %j', value => {
+  it.each([[null], [[]], [{ enabled: 'true' }], [{ chatIds: 'oc_a' }], [{ chatIds: ['../secret'] }], [{ endpoint: 'https://other.test' }]])('rejects malformed configuration %j', value => {
     expect(() => normalizeOncallGroupPolicy(value)).toThrow();
   });
 });
