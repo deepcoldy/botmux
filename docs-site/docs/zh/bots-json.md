@@ -45,7 +45,8 @@
 |------|------|
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
-| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
+| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**未设置群级模型的存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
+| `groupDefaultModels` | 按群 ID 配置新话题默认模型，例如 `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`；目前仅支持 Codex 和 Claude。可在 Dashboard「群管理 → 新话题默认模型」按 Bot 配置 |
 | `reasoningEffort` | 新会话默认思考强度。仅对 `codex` / `codex-app` / `traex` / `grok` 这类有结构化思考强度控制的 CLI 生效；按 CLI 与模型能力校验，不支持或未声明支持的组合会被拒绝或忽略 |
 | `nativeSubagentRuntime` | 仅 `traex` 生效的原生子代理运行策略。`model` 与 `reasoningEffort` 可独立省略以透传子代理请求，或设为 `{ "mode": "custom", "value": "..." }` 以指定固定值；两个维度都透传时应删除整个字段。`inherit` 不是受支持的模式 |
 | `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
@@ -61,6 +62,16 @@
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
 
 `nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
+
+### 群级新话题默认模型
+
+每个 Bot 的 `groupDefaultModels` 独立配置；不同群、不同 Bot 的模型互不影响。Dashboard 中的 CLI 跟随 Bot 的 Agent 配置，只显示当前 CLI 的模型和思考强度。下拉列表复用 Agent 配置的静态候选、实时模型探测及强度校验，支持继承默认值和自定义模型名称。旧版模型字符串配置仍兼容。
+
+新话题创建时保存该群的模型快照。后续修改或清空群配置只影响新话题，已有话题在重启、恢复时仍使用创建时的群模型。话题首次选择另一种 CLI 时只使用该 CLI 对应的快照，不会把 Claude 模型传给 Codex。未配置群模型的话题继续使用原有 Bot 默认模型规则；没有 Bot 模型时由 CLI 自行选择。私聊、普通群的 chat-scope 会话和外部接管会话不使用此快照。
+
+优先级：显式触发模型 > 新话题保存的群模型 > 同 CLI 的 Bot 模型 > 原有 CLI 不匹配回退。思考强度也在新话题创建时保存，显式触发参数仍可覆盖。此配置不改变 CLI 类型或运行环境。
+
+Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继承 Agent”可取消相应覆盖；两项都继承时删除当前 CLI 的覆盖，保留其它 CLI 的历史配置。手动编辑 `bots.json` 则沿用原有配置加载方式。
 
 ### CLI 限额自动交接
 

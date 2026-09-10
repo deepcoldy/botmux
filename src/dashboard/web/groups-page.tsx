@@ -1,3 +1,4 @@
+import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
 import {
   memo,
@@ -1726,6 +1727,19 @@ export function ManageDialog(props: {
             onSaved={() => props.onReloadGroups({ force: true })}
           />
         ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>新话题默认模型</legend>
+        <p><small>CLI 跟随 Bot 的 Agent 配置；模型和思考强度可单独覆盖，选择继承则沿用 Agent 配置。修改仅影响新话题。</small></p>
+        {inChat.map(member => <GroupDefaultModelsRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
+          models={member.defaultModels} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
       </fieldset>
 
       <fieldset>

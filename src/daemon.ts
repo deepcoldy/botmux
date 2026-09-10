@@ -22188,6 +22188,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId, {
+    groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],
     occupancy: { bootId: getDaemonBootId(), pid: process.pid },
   });
   chatFirstSeenStore.init(cfg.larkAppId);

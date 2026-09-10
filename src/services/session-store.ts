@@ -26,6 +26,7 @@ import type { Session } from '../types.js';
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+let resolveGroupDefaultModels: ((chatId: string) => Session['groupDefaultModels']) | undefined;
 // Only the store-owning daemon process may create/import the SQLite store.
 // Workers spawned from a NEWER dist by a still-running OLDER daemon must not
 // bootstrap a .db while that daemon keeps writing JSON — the mixed upgrade
@@ -644,8 +645,14 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
  * an old daemon can spawn workers from a newer dist during the upgrade window,
  * and only the daemon itself may flip the on-disk engine.
  */
-export function init(appId?: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
+export function init(appId?: string, opts: {
+  owner?: boolean;
+  occupancy?: OccupancyHolder;
+  /** Called only when creating a row, never when loading/resuming one. */
+  groupDefaultModels?: (chatId: string) => Session['groupDefaultModels'];
+} = {}): void {
   currentAppId = appId;
+  resolveGroupDefaultModels = opts.groupDefaultModels;
   sqliteBootstrapAllowed = opts.owner !== false;
   loaded = false;
   sessions = new Map();
@@ -1646,6 +1653,10 @@ export function createSession(
     status: 'active',
     createdAt: new Date().toISOString(),
   };
+  if (chatType !== 'p2p' && scope !== 'chat') {
+    const models = resolveGroupDefaultModels?.(chatId);
+    if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
+  }
   sessions.set(session.sessionId, session);
   persistRow(session);
   logger.info(`Created session ${session.sessionId} (thread: ${rootMessageId})`);

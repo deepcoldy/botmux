@@ -581,3 +581,33 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     expect(cfg.modelBackendVariant).toBeUndefined();
   });
 });
+
+
+describe('sessionAgentConfig — group defaults', () => {
+  const topic = (overrides: Partial<Session> = {}) => makeSourceDs({
+    cliId: 'codex', cliSessionId: undefined, agentFrozen: false,
+    groupDefaultModels: { codex: { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' } },
+    ...overrides,
+  });
+  const bot = { cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'medium' } as const;
+
+  it.each([false, true])('applies group effort with agentFrozen=%s without changing CLI', (agentFrozen) => {
+    const ds = topic({ agentFrozen });
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBe('gpt-5.6-sol');
+    expect(cfg.reasoningEffort).toBe('ultra');
+  });
+
+  it('preserves explicit session effort', () => {
+    expect(sessionAgentConfig(topic({ reasoningEffort: 'high' }), bot).reasoningEffort).toBe('high');
+  });
+
+  it('ignores captured group settings when session becomes chat scope', () => {
+    const ds = topic();
+    ds.session.scope = 'chat';
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.model).toBe('gpt-5.5');
+    expect(cfg.reasoningEffort).toBe('medium');
+  });
+});

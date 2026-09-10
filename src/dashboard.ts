@@ -243,6 +243,7 @@ import {
   leaveGroup,
   renameGroup,
   setPinStreamingCardForGroup,
+  setDefaultModelsForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -3049,6 +3050,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
+          defaultModels, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3073,6 +3075,8 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           cliId: d.cliId,
           inChat: true,
           oncallChat: oncallChat ?? null,
+          defaultModels: defaultModels ?? {},
+          agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
           pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
@@ -6572,6 +6576,18 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mDefaultModels: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mDefaultModels = url.pathname.match(/^\/api\/groups\/([^/]+)\/default-models\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setDefaultModelsForGroup(
+        decodeURIComponent(mDefaultModels[1]), decodeURIComponent(mDefaultModels[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
     }
 
     let mPinStreamingCard: RegExpMatchArray | null;

@@ -1793,3 +1793,33 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
   }, 15_000);
 });
+
+it('captures group model defaults only for new topics and persists independent snapshots', () => {
+  const groups = { oc_a: { codex: 'first', 'claude-code': 'sonnet' }, oc_b: { codex: 'other' } };
+  init('model-test', { groupDefaultModels: chatId => groups[chatId as keyof typeof groups] });
+  const first = createSession('oc_a', 'root-one', 'one', 'group');
+  const other = createSession('oc_b', 'root-two', 'two', 'group');
+  groups.oc_a.codex = 'changed';
+  const next = createSession('oc_a', 'root-three', 'three', 'group');
+  expect(first.groupDefaultModels?.codex).toBe('first');
+  expect(other.groupDefaultModels?.codex).toBe('other');
+  expect(next.groupDefaultModels?.codex).toBe('changed');
+  expect(createSession('oc_a', 'p2p', 'dm', 'p2p').groupDefaultModels).toBeUndefined();
+  expect(createSession('oc_a', 'chat', 'chat', 'group', 'chat').groupDefaultModels).toBeUndefined();
+  init('model-test');
+  expect(getSession(first.sessionId)?.groupDefaultModels).toEqual({ codex: 'first', 'claude-code': 'sonnet' });
+  expect(createSession('oc_a', 'legacy', 'no resolver', 'group').groupDefaultModels).toBeUndefined();
+});
+
+
+it('deeply snapshots group model and effort without changing runtime identity', () => {
+  const models = {codex:{model:'gpt-5.6-sol',reasoningEffort:'ultra' as const},'claude-code':{model:'sonnet',reasoningEffort:'high' as const}};
+  init('effort-test', {groupDefaultModels:()=>models});
+  const session=createSession('oc_group','root-effort','effort','group');
+  expect(session.reasoningEffort).toBeUndefined();
+  expect(session.cliId).toBeUndefined();
+  models.codex.model='changed';
+  expect(session.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+  init('effort-test');
+  expect(getSession(session.sessionId)?.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+});

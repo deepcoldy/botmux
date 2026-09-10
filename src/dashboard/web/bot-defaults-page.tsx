@@ -473,7 +473,7 @@ type DropdownFieldOption<T extends string> = {
   disabled?: boolean;
 };
 
-function DropdownField<T extends string>(props: {
+export function DropdownField<T extends string>(props: {
   dataInput: string;
   value: T;
   options: DropdownFieldOption<T>[];
@@ -525,6 +525,7 @@ export function ModelPickerField(props: {
   ariaLabel: string;
   defaultLabel: string;
   customLabel: string;
+  includeDefault?: boolean;
   detectedCount?: number;
   detectedLabel?: string;
   /** 下拉菜单样式类：defaults 页传 bd-field-menu，onboarding 传 onboarding-menu。 */
@@ -536,13 +537,14 @@ export function ModelPickerField(props: {
   const current = props.value;
   const dropdownOptions = useMemo(() => {
     const opts: { value: string; label: ReactNode }[] = [];
+    if (props.includeDefault) opts.push({ value: '', label: props.defaultLabel });
     if (current && !props.options.includes(current)) {
       opts.push({ value: current, label: current });
     }
     for (const item of props.options) opts.push({ value: item, label: item });
     opts.push({ value: MODEL_PICKER_CUSTOM, label: props.customLabel });
     return opts;
-  }, [current, props.options, props.customLabel]);
+  }, [current, props.options, props.customLabel, props.includeDefault, props.defaultLabel]);
 
   return (
     <span className="bd-model-picker">

@@ -694,6 +694,8 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** Group defaults at topic creation; absent on legacy sessions. */
+  groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';

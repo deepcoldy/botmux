@@ -33812,3 +33812,20 @@ a.card-menu-item {
     width: min(400px, calc(100vw - 24px));
   }
 }
+
+.group-default-models-row {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 0;
+}
+.group-default-models-row > strong { flex-basis: 100%; }
+.group-default-models-field { display: grid; gap: 6px; flex: 1 1 180px; }
+.group-default-models-row input { width: 100%; min-width: 0; }
+.group-default-models-row > small { flex-basis: 100%; }
+
+.group-default-models-row .sect-sort-menu,
+.group-default-models-row .sect-sort-menu > summary { width: 100%; min-width: 0; }
+.group-default-models-row .sect-sort-value { max-width: none; }
+.group-default-models-field { min-width: 0; }
