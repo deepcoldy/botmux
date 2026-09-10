@@ -16074,6 +16074,13 @@ main:has(.whiteboards-page) {
   background: color-mix(in srgb, var(--surface-muted) 28%, transparent);
 }
 
+.roles-private-reply-notice {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 6px;
+  min-width: 0;
+}
+
 .roles-field-label {
   color: var(--fg);
   font-size: 12px;

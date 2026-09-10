@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 /**
  * CLI entry point for botmux.
  *
@@ -8826,6 +8827,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
+    console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
+    process.exit(2);
+  }
+
 
   const exactOriginDispatch = (() => {
     const unsettledOriginDispatches = originSession?.codexAppDispatchLedger ?? [];
@@ -9183,7 +9189,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       } else {
         revalidateVcMeetingManagedSend();
         const managedProviderOptions = outboundMessageOptions(!!prepared);
-        const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+        await revalidateIsolatedOriginBeforeEffect();
+        const privateMessageId = !sendInto && !overrideChatId
+          ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, prepared?.providerKey)
+          : undefined;
+        const deferred = privateMessageId !== undefined
+          ? { handled: true, messageId: privateMessageId }
+          : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
           ? await dispatchDeferredTopicSend({
               dataDir: resolveDataDir(),
               session: s as SessionData & { larkAppId: string },
@@ -9727,6 +9739,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // This closure also carries attachments, so every Lark call re-checks the
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
+    if (!sendInto && !overrideChatId) {
+      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid);
+      if (privateMessageId !== undefined) return privateMessageId;
+    }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
         dataDir: resolveDataDir(),
