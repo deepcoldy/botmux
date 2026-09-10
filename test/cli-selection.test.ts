@@ -640,3 +640,39 @@ describe('decorateResumeForWrapper', () => {
       .toBe('ttadk coco --skip-check --resume ID');
   });
 });
+
+describe('Codex model-nudge override through wrappers', () => {
+  const override = 'notice.hide_rate_limit_model_nudge=true';
+  it.each([
+    { wrapper: 'aiden x codex', flag: null },
+    { wrapper: 'cjadk codex', flag: '--config' },
+    { wrapper: 'ttadk codex', flag: '-c' },
+  ])('$wrapper handles the enabled override without breaking launch', ({ wrapper, flag }) => {
+    for (const resume of [false, true]) {
+      const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+        sessionId: 'session', resume, resumeSessionId: 'existing-thread',
+        hideRateLimitModelNudge: true,
+      });
+      expect(args).toContain(override);
+      const out = buildWrappedLaunch(wrapper, args);
+      if (flag === null) {
+        expect(out.args).not.toContain(override);
+        expect(out.args).not.toContain('-c');
+        expect(out.args).not.toContain('--config');
+      } else {
+        expect(out.args).toContain(override);
+        expect(out.args[out.args.indexOf(override) - 1]).toBe(flag);
+        if (flag === '--config') expect(out.args).not.toContain('-c');
+      }
+      expect(out.args).toContain('--no-alt-screen');
+      if (resume) expect(out.args).toContain('existing-thread');
+    }
+  });
+
+  it.each(['aiden x codex', 'cjadk codex', 'ttadk codex'])(
+    '%s leaves user-provided notice overrides untouched', (wrapper) => {
+      const userArgs = ['-c', 'notice.hide_rate_limit_model_nudge=false'];
+      expect(buildWrappedLaunch(wrapper, userArgs).args.slice(-2)).toEqual(userArgs);
+    },
+  );
+});

@@ -227,7 +227,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      // TraeX shares Codex's low-quota picker and notice setting. Disable it
+      // per process so a message-submit Enter cannot confirm a model switch.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -236,7 +241,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
         // so an interactive update dialog would freeze the resume. TraeX shares
         // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
       const baseArgs = [
         ...(!disableCliBypass ? [
@@ -252,6 +257,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
+        ...modelNudgeArgs,
         ...goalEnvConfigArgs(),
       ];
       // Keep trigger-user identity wrappers available in tool shells. Set only

@@ -204,7 +204,7 @@ export interface CliAdapter {
      *  treated as false by adapters (the worker always sends an explicit boolean
      *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
     bypassHookTrust?: boolean;
-    /** Codex only: suppress the low-quota model-switch picker per process.
+    /** Codex-family (codex/traex): suppress the low-quota model-switch picker per process.
      *  The worker supplies the global default-ON setting; false/absent adds no override. */
     hideRateLimitModelNudge?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
