@@ -557,6 +557,7 @@ let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let rpcEnginePidMarker: string | null = null;
+let readonlyContinuationRpcGeneration: string | undefined;
 const piInitialPromptCleanupPaths: string[] = [];
 const piInitialPromptCleanupDirs: string[] = [];
 let piInitialPromptReadonlyRoots: string[] = [];
@@ -713,6 +714,7 @@ function stopCodexRpcEngine(): void {
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
   const engine = codexRpcEngine;
+  readonlyContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
     ...rpcLifecycleFailClosedOwners.keys(),
@@ -1222,6 +1224,8 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   let engine: CodexRpcEngine | undefined;
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
+  const readonlyContinuationEnabled = cfg.cliId === 'traex'
+    && process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
   const assertRpcEngagementCurrent = (): void => {
     if (!rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
@@ -1273,6 +1277,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
+      readonlyContinuationHardened: readonlyContinuationEnabled,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1439,6 +1444,19 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     codexRpcEngine = engine;
+    const capability = readonlyContinuationEnabled
+      ? await engine.checkReadonlyContinuationCapabilities()
+      : { ok: false, reason: 'readonly_continuation_disabled' };
+    readonlyContinuationRpcGeneration = capability.ok
+      ? randomBytes(16).toString('hex')
+      : undefined;
+    send({
+      type: 'readonly_continuation_rpc_status',
+      sessionId: cfg.sessionId,
+      rpcGeneration: readonlyContinuationRpcGeneration ?? 'unavailable',
+      eligible: capability.ok,
+      ...(capability.reason ? { reason: capability.reason } : {}),
+    });
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
     persistCliSessionId(threadId);
@@ -3022,6 +3040,10 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(capability.turnId ? { turnId: capability.turnId } : {}),
       ...(capability.dispatchAttempt !== undefined
         ? { dispatchAttempt: capability.dispatchAttempt }
+        : {}),
+      ...(currentBotmuxTurnId?.startsWith('bmx-readonly-')
+        && currentBotmuxDispatchAttempt !== undefined
+        ? { readonlyContinuation: true as const }
         : {}),
     });
   }
@@ -4710,12 +4732,16 @@ function explicitReplyMarkerForTurnWindow(
   return inWindow.at(-1);
 }
 
-function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | undefined): void {
+function notifyExplicitReplyObserved(
+  turnId: string,
+  marker: BridgeSendMarker | undefined,
+): void {
   if (!marker) return;
   send({
     type: 'explicit_reply_observed',
     turnId,
     ...(marker.messageId ? { messageId: marker.messageId } : {}),
+    ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
   });
 }
 
@@ -11738,12 +11764,47 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       try {
+        if (item.readonlyContinuation && !writeRpcEngine) {
+          emitTurnTerminal(
+            item.turnId ?? 'readonly-continuation-unknown',
+            'failed',
+            'readonly_continuation_rpc_unavailable',
+            item.dispatchAttempt,
+          );
+          break;
+        }
         if (writeRpcEngine) {
+          if (item.readonlyContinuation) {
+            const exactRestrictedInput = item.turnId?.startsWith('bmx-readonly-')
+              && item.dispatchAttempt !== undefined
+              && item.readonlyContinuation.rpcGeneration === readonlyContinuationRpcGeneration;
+            if (!exactRestrictedInput) {
+              emitTurnTerminal(
+                item.turnId ?? 'readonly-continuation-unknown',
+                'failed',
+                'readonly_continuation_rpc_proof_mismatch',
+                item.dispatchAttempt,
+              );
+              break;
+            }
+            const capability = await writeRpcEngine.checkReadonlyContinuationCapabilities();
+            if (!capability.ok) {
+              readonlyContinuationRpcGeneration = undefined;
+              emitTurnTerminal(
+                item.turnId!,
+                'failed',
+                capability.reason ?? 'readonly_continuation_capability_probe_failed',
+                item.dispatchAttempt,
+              );
+              break;
+            }
+          }
           rpcTurnIdentity = {
             turnId: item.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
             ...(item.dispatchAttempt !== undefined
               ? { dispatchAttempt: item.dispatchAttempt }
               : {}),
+            ...(item.readonlyContinuation ? { readonlyContinuation: true } : {}),
           };
           rpcTurnGeneration = {
             engine: writeRpcEngine,
@@ -12149,6 +12210,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (item.readonlyContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       if (shouldStopPendingBatch(item, pendingMessages[0])) break;
     }
@@ -12212,6 +12274,7 @@ function sendToPty(
      *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
      *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
     atMostOnce?: true;
+    readonlyContinuation?: import('./types.js').ReadonlyContinuationDispatchMarker;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -12228,6 +12291,7 @@ function sendToPty(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
+    ...(opts.readonlyContinuation ? { readonlyContinuation: opts.readonlyContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
@@ -19902,6 +19966,7 @@ process.on('message', async (raw: unknown) => {
           trustedCaller: msg.trustedCaller,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          ...(msg.readonlyContinuation ? { readonlyContinuation: msg.readonlyContinuation } : {}),
           ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
           ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });

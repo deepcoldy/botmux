@@ -16,12 +16,14 @@
 //                                   on resume)
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;
 const HANG_TURN = process.env.FAKE_HANG_TURN === '1';
+const TURN_ERROR_CODE = process.env.FAKE_TURN_ERROR_CODE || 'fake_failed';
+const TURN_ERROR_MESSAGE = process.env.FAKE_TURN_ERROR_MESSAGE || 'fake failure';
 const HANG_TURN_NOTIFY = process.env.FAKE_HANG_TURN_NOTIFY === '1';
 const TERMINAL_BEFORE_RESPONSE = process.env.FAKE_TERMINAL_BEFORE_RESPONSE === '1';
 const ERROR_AFTER_STARTED = process.env.FAKE_ERROR_AFTER_STARTED === '1';
@@ -36,6 +38,9 @@ const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
 let threadReadAttempt = 0;
 let currentThreadName;
 const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
+const SERVER_REQUEST_METHODS = (process.env.FAKE_SERVER_REQUEST_METHODS ?? '')
+  .split(',').map(value => value.trim()).filter(Boolean);
+const serverRequestIds = new Set();
 let turnCount = 0;
 
 const httpServer = createServer((req, res) => {
@@ -60,7 +65,7 @@ wss.on('connection', (ws) => {
       id: nativeTurnId,
       ...(status ? { status } : {}),
       ...(status === 'failed'
-        ? { error: { code: 'fake_failed', message: 'fake failure' } }
+        ? { error: { code: TURN_ERROR_CODE, message: TURN_ERROR_MESSAGE } }
         : {}),
     };
     const completed = JSON.stringify({
@@ -77,6 +82,13 @@ wss.on('connection', (ws) => {
   };
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (serverRequestIds.has(msg.id) && (msg.result !== undefined || msg.error !== undefined)) {
+      if (process.env.FAKE_SERVER_RESPONSE_FILE) {
+        try { appendFileSync(process.env.FAKE_SERVER_RESPONSE_FILE, `${JSON.stringify(msg)}\n`); } catch { /* test-only */ }
+      }
+      serverRequestIds.delete(msg.id);
+      return;
+    }
     if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
       if (!pendingTurnReply) return;
       // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
@@ -122,6 +134,38 @@ wss.on('connection', (ws) => {
           updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
+      case 'mcpServerStatus/list': {
+        const responseMode = process.env.FAKE_MCP_RESPONSE ?? '';
+        if (responseMode === 'missing-data') return reply({});
+        if (responseMode === 'malformed-data') return reply({ data: {} });
+        if (responseMode === 'malformed-cursor') return reply({ data: [], nextCursor: 7 });
+        const mcpMode = process.env.FAKE_MCP_CAPABILITY ?? '';
+        return reply({ data: mcpMode === 'tools'
+          ? [{ name: 'fake', tools: { mutate: {} } }]
+          : mcpMode === 'empty' ? [{ name: 'fake', tools: {} }] : [] });
+      }
+      case 'skills/list': {
+        const responseMode = process.env.FAKE_SKILLS_RESPONSE ?? '';
+        if (responseMode === 'missing-data') return reply({});
+        if (responseMode === 'malformed-data') return reply({ data: {} });
+        if (responseMode === 'malformed-entry') return reply({ data: [{}] });
+        if (responseMode === 'errors') return reply({
+          data: [{ cwd: process.cwd(), errors: [{ path: '/fake', message: 'broken' }], skills: [] }],
+        });
+        if (responseMode === 'malformed-skill') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{}] }],
+        });
+        if (responseMode === 'malformed-dependencies') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{ name: 'fake', enabled: true, dependencies: {} }] }],
+        });
+        if (responseMode === 'malformed-tool-dependency') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{ name: 'fake', enabled: true, dependencies: { tools: ['shell'] } }] }],
+        });
+        const hasToolDependency = process.env.FAKE_SKILL_TOOL_DEPENDENCY === '1';
+        return reply({ data: [{ cwd: process.cwd(), errors: [], skills: hasToolDependency
+          ? [{ name: 'fake', enabled: true, dependencies: { tools: [{ type: 'command', value: 'shell' }] } }]
+          : [] }] });
+      }
       case 'turn/interrupt': {
         // FAKE_INTERRUPT_ERROR=1 models an interrupt that itself fails: the
         // app-server rejects turn/interrupt with a JSON-RPC error. The engine
@@ -154,6 +198,9 @@ wss.on('connection', (ws) => {
         turnCount++;
         const nativeTurnId = `turn-fake-${turnCount}`;
         const threadId = msg.params?.threadId;
+        if (process.env.FAKE_TURN_CONFIG_FILE) {
+          try { appendFileSync(process.env.FAKE_TURN_CONFIG_FILE, `${JSON.stringify(msg.params ?? {})}\n`); } catch { /* test-only */ }
+        }
         if (HANG_TURN) {
           if (HANG_TURN_NOTIFY) emitTurnLifecycle(threadId, nativeTurnId);
           return;
@@ -176,6 +223,24 @@ wss.on('connection', (ws) => {
               }],
             },
           }));
+          return;
+        }
+        if (SERVER_REQUEST_METHODS.length > 0) {
+          pendingTurnReply = msg.id;
+          pendingNativeTurnId = nativeTurnId;
+          pendingThreadId = threadId;
+          const requestId = 1900 + turnCount;
+          const method = SERVER_REQUEST_METHODS[(turnCount - 1) % SERVER_REQUEST_METHODS.length];
+          serverRequestIds.add(requestId);
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: requestId,
+            method,
+            params: { threadId, turnId: nativeTurnId, itemId: `item-fake-${turnCount}` },
+          }));
+          // Deliberately acknowledge after the server request. WebSocket frame
+          // ordering locks the pre-response ownership race under test.
+          reply({ turn: { id: nativeTurnId } });
           return;
         }
         if (ERROR_AFTER_STARTED) {

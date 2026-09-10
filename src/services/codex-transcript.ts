@@ -354,7 +354,9 @@ export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
  *  so the user-facing card can say "server-side transient, just retry later"
  *  instead of pointing at the local network. */
 export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
+export const CODEX_OUTPUT_LIMIT_ERROR_CODE = 'codex_output_limit_exceeded';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
+export const CODEX_OUTPUT_LIMIT_ERROR_MESSAGE = 'model output limit exceeded: max_output_tokens';
 
 const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
 /** Pre-scan bound applied BEFORE the redaction regexes run. Well above the
@@ -545,6 +547,19 @@ export function codexTaskFailureCode(error: unknown): string {
     return CODEX_CONNECTION_ERROR_CODE;
   }
   return CODEX_TASK_FAILED_ERROR_CODE;
+}
+
+/** Exact opt-in classifier used only by the TraeX read-only continuation
+ * path. Keeping it out of codexTaskFailureCode preserves every other CLI's
+ * existing public error taxonomy. */
+export function isExactCodexOutputLimitError(error: unknown): boolean {
+  const leaf = codexFailureLeaf(error);
+  const leafMessage = typeof leaf === 'string'
+    ? leaf
+    : leaf && typeof leaf === 'object' && typeof (leaf as Record<string, unknown>).message === 'string'
+      ? String((leaf as Record<string, unknown>).message)
+      : '';
+  return leafMessage.trim().toLowerCase() === CODEX_OUTPUT_LIMIT_ERROR_MESSAGE;
 }
 
 export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {

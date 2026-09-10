@@ -76,6 +76,19 @@ export interface DaemonSession {
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
+  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
+  readonlyContinuationRpcProof?: {
+    workerGeneration: number;
+    rpcGeneration: string;
+    checkedAt: number;
+  };
+  /** Exact live synthetic turn whose hook-level native subagent requests must
+   * be denied. Derived only from trusted worker IPC for the current generation. */
+  readonlyContinuationTurnOrigin?: {
+    workerGeneration: number;
+    turnId: string;
+    dispatchAttempt: number;
+  };
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
