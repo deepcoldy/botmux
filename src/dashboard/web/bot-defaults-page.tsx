@@ -55,6 +55,7 @@ import {
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
+import { SearchableGroupPicker } from './searchable-group-picker.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
@@ -1192,6 +1193,37 @@ function BotDefaultsCard(props: {
   );
 }
 
+function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; chats: GroupChat[] }) {
+  const [policy, setPolicy] = useState(props.bot.oncallGroup ?? { enabled: false, chatIds: [] });
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const groupLabel = useId();
+  useEffect(() => { setPolicy(props.bot.oncallGroup ?? { enabled: false, chatIds: [] }); }, [props.bot.oncallGroup]);
+  async function save(next: typeof policy): Promise<void> {
+    const previous = policy;
+    setPolicy(next);
+    setBusy(true); setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/oncall-group`, { oncallGroup: next });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setPolicy(res.body.oncallGroup);
+      props.patchBot(props.bot.larkAppId, { oncallGroup: res.body.oncallGroup });
+    } catch (error) { setPolicy(previous); setStatus({ text: caughtErrorText(error) }); }
+    finally { setBusy(false); }
+  }
+  const options = [...props.chats, ...policy.chatIds.filter(id => !props.chats.some(chat => chat.chatId === id)).map(chatId => ({ chatId }))];
+  return <fieldset className="bd-oncall-settings" disabled={busy} aria-busy={busy}>
+    <ToggleRow checked={policy.enabled} disabled={busy} title="支持拉起 Oncall 群" help={null} onChange={enabled => void save({ ...policy, enabled })} />
+    <div className="bd-oncall-scope">
+      <label htmlFor={groupLabel}>生效群</label>
+      <SearchableGroupPicker id={groupLabel} label="生效群" groups={options} value={policy.chatIds} multiple disabled={!policy.enabled}
+        placeholder="选择生效群" searchPlaceholder="搜索生效群" emptyLabel="暂无匹配群" selectedCountLabel={count => `已选 ${count} 个群`}
+        onChange={value => void save({ ...policy, chatIds: value as string[] })} />
+    </div>
+    <StatusSpan status={status ?? (policy.enabled && !policy.chatIds.length ? { text: '请选择生效群' } : null)} />
+  </fieldset>;
+}
+
 function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
   const enabled = props.bot.feedback?.enabled === true;
   const [on, setOn] = useState(enabled);
@@ -1271,7 +1303,10 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <h3 className="bd-section-title">
         <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
       </h3>
-      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+      <div className="bd-feedback-controls">
+        <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+        <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} />
+      </div>
       <StatusSpan status={status} />
       {on ? (
         <details className="bd-feedback-advanced">

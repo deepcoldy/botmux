@@ -33812,3 +33812,11 @@ a.card-menu-item {
     width: min(400px, calc(100vw - 24px));
   }
 }
+.bd-feedback-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
+.bd-oncall-settings { min-width: 0; border: 0; padding: 0; margin: 0; }
+.bd-oncall-scope { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.bd-oncall-scope > label { flex-shrink: 0; }
+.bd-oncall-scope .connector-group-picker { max-width: 360px; }
+.bd-oncall-scope .connector-group-picker-popover { min-width: 0; }
+.bd-oncall-scope .connector-group-search > input { width: 100%; box-sizing: border-box; padding-left: 34px; }
+@media (max-width: 720px) { .bd-feedback-controls { grid-template-columns: minmax(0, 1fr); gap: 16px; } }

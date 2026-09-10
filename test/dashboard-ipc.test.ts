@@ -5916,6 +5916,37 @@ describe('PUT /api/bot-skills', () => {
   });
 });
 
+describe('PUT /api/bot-oncall-group', () => {
+  it('saves scoped button settings while preserving feedback and rejects malformed input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-oncall-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-oncall-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      const feedback = { enabled: true, allowReselect: true };
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', feedback }]));
+      loadBotConfigs().forEach((bot: any) => registerBot(bot));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (oncallGroup: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-oncall-group`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ oncallGroup }),
+      });
+      const response = await put({ enabled: true, chatIds: ['oc_test'] });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ oncallGroup: { enabled: true, chatIds: ['oc_test'] } });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ feedback, oncallGroup: { enabled: true, chatIds: ['oc_test'] } });
+      expect((await put({ enabled: 'yes' })).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].oncallGroup.enabled).toBe(true);
+      expect((await put({ enabled: false, chatIds: ['oc_test'] })).status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ feedback, oncallGroup: { enabled: false, chatIds: ['oc_test'] } });
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-substitute-mode', () => {
   it('preserves quote reply mode in the response and bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));

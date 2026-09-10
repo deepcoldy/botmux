@@ -6909,6 +6909,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const mOncallGroup = url.pathname.match(/^\/api\/bots\/([^/]+)\/oncall-group$/);
+    if (req.method === 'PUT' && mOncallGroup) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mOncallGroup[1]), '/api/bot-oncall-group', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}',
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     let mBotFeedback: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
       const appId = decodeURIComponent(mBotFeedback[1]);

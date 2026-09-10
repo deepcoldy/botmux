@@ -146,6 +146,7 @@ export type BotDefaultsRow = {
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
+  oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   logicalSessionCount?: number;

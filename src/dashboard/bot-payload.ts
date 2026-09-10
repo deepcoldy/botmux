@@ -152,6 +152,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     docSubscribeDefaultMode: j?.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
+    oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

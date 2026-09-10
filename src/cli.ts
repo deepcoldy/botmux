@@ -7590,6 +7590,7 @@ import {
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
@@ -9450,9 +9451,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   // ───────────────────────────────────────────────────────────────────────────
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+  let oncallGroupPolicy: import('./services/oncall-group-policy.js').OncallGroupPolicy | undefined;
+  let oncallGroupCard: Record<string, any> | undefined;
   let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
   try {
     const botConfig = getBot(s.larkAppId).config;
+    oncallGroupPolicy = botConfig.oncallGroup;
     feedbackWebhookDestinations = botConfig.feedbackWebhooks?.destinations;
     feedbackPolicy = resolveFeedbackPolicyForDelivery({
       dataDir: config.session.dataDir,
@@ -9487,6 +9491,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  const withOncallGroup = (card: string): string => {
+    if (effectiveResponseKind !== 'final' || customCardRequested || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
+    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
+    if (attached !== card) oncallGroupCard = JSON.parse(attached);
+    return attached;
+  };
   // `reviewers`/`everyone` audiences gate clicks without a human requester —
   // this is the bot-triggered auto-analysis case (issue #1178) where the exact
   // turn sender is another bot. Only the `requester` audience needs a resolvable
@@ -10270,10 +10280,17 @@ async function cmdSend(rest: string[]): Promise<void> {
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
-        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
+        messageId = await dispatchPrimary(withOncallGroup(JSON.stringify(feedbackBaseCard)), 'interactive');
+        feedbackBaseCard = oncallGroupCard ?? feedbackBaseCard;
       } else {
-        messageId = await dispatchPrimary(JSON.stringify(createReplyCard(elements, layoutHeader)), 'interactive');
+        messageId = await dispatchPrimary(withOncallGroup(JSON.stringify(createReplyCard(elements, layoutHeader))), 'interactive');
       }
+    }
+
+    if (oncallGroupCard && messageId) {
+      recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId,
+        questionId: currentTurnId ?? messageId,
+        answer: text, card: oncallGroupCard });
     }
 
     if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {

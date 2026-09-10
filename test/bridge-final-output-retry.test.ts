@@ -356,6 +356,26 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_admin_human');
   });
 
+  it.each(['claude-code', 'codex'])('adds an independent Oncall button on the %s final delivery path', async cliId => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId, oncallGroup: { enabled: true, chatIds: ['oc_chat'] } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_oncall_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_different_owner';
+    ds.session.cliId = cliId as any;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('oncall_group_create');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+    const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
+    expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
+    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+  });
+
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },

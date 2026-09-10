@@ -102,6 +102,24 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('persists Oncall button settings without changing feedback or chat overrides', async () => {
+    const original = { feedback: { enabled: true, allowReselect: true }, chatFeedbackPolicies: { oc_a: { enabled: false } } };
+    const { registry, store } = await loaded(original);
+    const spec = store.findConfigField('oncallGroup')!;
+    const parsed = store.coerceConfigValue(spec, JSON.stringify({ enabled: true, chatIds: ['oc_a'] }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject(original);
+    expect(readConfig().oncallGroup).toEqual({ enabled: true, chatIds: ['oc_a'] });
+    expect(registry.loadBotConfigs()[0].oncallGroup).toEqual({ enabled: true, chatIds: ['oc_a'] });
+    expect(registry.getBot('app_default').config.oncallGroup).toEqual({ enabled: true, chatIds: ['oc_a'] });
+    expect(store.coerceConfigValue(spec, '{"enabled":"yes"}').ok).toBe(false);
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().oncallGroup).toBeUndefined();
+    expect(readConfig()).toMatchObject(original);
+  });
+
   it('persists bot and per-chat feedback layers and updates the live registry', async () => {
     const { registry, store } = await loaded();
     expect(await store.setBotFeedbackPolicy('app_default', { enabled: true, allowReselect: true })).toMatchObject({ ok: true });

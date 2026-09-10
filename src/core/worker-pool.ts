@@ -108,6 +108,7 @@ import { RestartCoordinator, type RestartObserver } from './restart-coordinator.
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -15046,7 +15047,7 @@ function deliverFinalOutput(
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
-      const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
+      let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
@@ -15070,6 +15071,9 @@ function deliverFinalOutput(
             localHomeLinkMode,
             usage: cardUsage,
           });
+      if (!managedReceiver) {
+        cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
+      }
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -15206,6 +15210,13 @@ function deliverFinalOutput(
       );
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
+      if (!managedReceiver) {
+        recordOncallGroupDelivery(config.session.dataDir, {
+          appId: ds.larkAppId, chatId: ds.chatId, messageId,
+          questionId: msg.replyTurnId ?? msg.turnId,
+          answer: safeAssistantText, card: JSON.parse(cardJson),
+        });
+      }
       if (msg.turnId.startsWith('mlrp_turn_')) {
         markMessageListenerRunPreviewReplied(msg.turnId, {
           sessionId: ds.session.sessionId,

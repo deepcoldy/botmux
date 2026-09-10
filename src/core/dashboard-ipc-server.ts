@@ -5249,6 +5249,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
+    oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -6429,6 +6430,19 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
+});
+
+ipcRoute('PUT', '/api/bot-oncall-group', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { oncallGroup?: unknown };
+  try { body = await readJsonBody<{ oncallGroup?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('oncallGroup')!;
+  const parsed = coerceConfigValue(spec, JSON.stringify(body.oncallGroup ?? {}));
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.reason });
+  const result = await applyConfigField(cachedLarkAppId, spec, parsed.value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, oncallGroup: parsed.value });
 });
 
 ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {

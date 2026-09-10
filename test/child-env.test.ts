@@ -55,6 +55,7 @@ describe('redactChildEnv()', () => {
     const out = redactChildEnv({
       LARK_APP_ID: 'cli_bot',
       LARK_APP_SECRET: 'secret',
+      ONCALL_SERVICE_JWT: 'oncall-secret',
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
@@ -66,6 +67,8 @@ describe('redactChildEnv()', () => {
     // just falsy value.
     expect('LARK_APP_ID' in out).toBe(false);
     expect('LARK_APP_SECRET' in out).toBe(false);
+    expect('ONCALL_SERVICE_JWT' in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain('ONCALL_SERVICE_JWT');
     expect('CLAUDECODE' in out).toBe(false);
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');

@@ -203,7 +203,7 @@ export interface CardActionData {
     input_value?: unknown;
     form_value?: Record<string, unknown>;  // V2 form input values
   };
-  context?: { open_message_id?: string; [key: string]: unknown };
+  context?: { open_message_id?: string; open_chat_id?: string; [key: string]: unknown };
   open_message_id?: string;
 }
 
@@ -1373,6 +1373,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (value?.action === 'oncall_group_create' && larkAppId) {
+    const { handleOncallGroupAction } = await import('./oncall-group.js');
+    return handleOncallGroupAction(data, larkAppId);
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
