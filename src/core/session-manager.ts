@@ -56,6 +56,7 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -3396,32 +3397,6 @@ export function resolveScheduledTaskExecutionPosition(
   if (task.executionPosition === 'top-level') return 'top-level';
   if (task.deliver === 'new-topic') return 'new-topic';
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
-}
-
-/**
- * Identity a scheduled turn runs as: the task's creator, as captured at
- * creation time. The turn itself is authenticated by the daemon-minted
- * `schedule:<taskId>:<uuid>` turn id (see scheduled-turn-provenance) — this
- * only decides WHICH identity that authenticated turn carries.
- *
- * Returns undefined when the task has no creator union_id (legacy tasks,
- * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
- * fail-closed story: with no identity on the turn, identity-bound tools refuse
- * to run instead of falling back to the bot's own access, while everything that
- * does not need a user identity keeps working.
- */
-function trustedCallerForScheduledTask(
-  task: ScheduledTask,
-  larkAppId: string,
-): CliTurnPayload['trustedCaller'] | undefined {
-  if (!task.ownerUnionId) return undefined;
-  return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
-    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
-    source: 'schedule_creator',
-    taskId: task.id,
-  };
 }
 
 async function buildScheduledTargetNotice(params: {

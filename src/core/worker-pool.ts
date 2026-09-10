@@ -474,6 +474,7 @@ import { trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
+  ordinaryTurnRecoverySilentTurnIds,
   cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
@@ -557,7 +558,13 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
-import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
+import {
+  mintScheduledContinuationTurnId,
+  parseScheduledTurnId,
+  readScheduledTaskForProvenance,
+  trustedCallerForScheduledTask,
+} from './scheduled-turn-provenance.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
@@ -1386,6 +1393,29 @@ function ordinaryTurnRecoveryEligible(
     && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
 }
 
+/** Turns the semantic (ordinary-turn) recovery owns: a Lark inbound message
+ *  turn (`om_*`) or a daemon-fired scheduled turn (`schedule:<taskId>:<uuid>`).
+ *  Scheduled turns used to be excluded by an `om_` prefix check, so a transient
+ *  provider failure inside an hourly task never auto-continued and only raised
+ *  the「未启动自动续跑」card — the most frequent shape of that card on a box that
+ *  runs recurring tasks. Everything else (durable replays, HTTP triggers,
+ *  meeting deliveries, `bmx-recovery-*` continuations themselves) stays out. */
+function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string {
+  return !!turnId && (turnId.startsWith('om_') || parseScheduledTurnId(turnId) !== null);
+}
+
+/** The identity a scheduled continuation runs as — the task creator, exactly as
+ *  the original fire resolved it (see trustedCallerForScheduledTask). Reads the
+ *  task back from the bot's schedules store; a deleted task yields no identity,
+ *  which is the same fail-closed outcome the fire path has. */
+function scheduledContinuationTrustedCaller(
+  ds: DaemonSession,
+  taskId: string,
+): TrustedCaller | undefined {
+  const task = readScheduledTaskForProvenance(config.session.dataDir, ds.larkAppId, taskId);
+  return task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+}
+
 function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
   if (ds.session.status !== 'active') return false;
   if (!activeSessionsRegistry) return true;
@@ -1469,6 +1499,13 @@ export function ensureOrdinaryTurnRecoveryAttached(
     disposeOrdinaryTurnRecovery(ds.session);
     return false;
   }
+  // Re-arm the runtime silent registry from the persisted recovery state BEFORE
+  // the timer is re-armed: an overdue backoff fires on the next tick, and the
+  // enqueue below (plus every terminal-time suppression gate) reads that
+  // registry by exact turn id. Idempotent, so repeated attach calls are fine.
+  for (const turnId of ordinaryTurnRecoverySilentTurnIds(ds.session.ordinaryTurnRecovery)) {
+    if (!isSilentScheduledTurn(ds, turnId)) armSilentScheduledTurn(ds, turnId);
+  }
   attachOrdinaryTurnRecovery(ds.session, {
     schedule: (delayMs, run) => {
       const timer = setTimeout(run, delayMs);
@@ -1477,23 +1514,47 @@ export function ensureOrdinaryTurnRecoveryAttached(
     },
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
+    mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
+      // A scheduled logical turn continues as the same scheduled turn: same
+      // task prefix on the id (minted above), the task creator as trustedCaller,
+      // and the fire's silent flag carried over so a silent task's continuation
+      // stays silent. Ordinary IM turns take none of this and keep their
+      // inherited reply context alone.
+      const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
+      const trustedCaller = scheduledTaskId
+        ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
+        : undefined;
+      // Silence comes from the frozen per-turn attribute in the persisted
+      // state, not from the runtime registry (which a daemon restart empties).
+      const silent = dispatch.silent;
+      if (silent) armSilentScheduledTurn(ds, dispatch.turnId);
+      let enqueued = false;
       try {
         if (!ds.worker || ds.worker.killed || ds.worker.connected === false) {
-          return forkWorker(ds, dispatch.prompt, {
-            resume: true,
-            turnId: dispatch.turnId,
-          });
+          enqueued = forkWorker(
+            ds,
+            trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt,
+            { resume: true, turnId: dispatch.turnId },
+          );
+        } else {
+          enqueued = sendWorkerInput(
+            ds,
+            dispatch.prompt,
+            dispatch.turnId,
+            trustedCaller ? { trustedCaller } : {},
+          );
         }
-        return sendWorkerInput(ds, dispatch.prompt, dispatch.turnId);
       } catch (err) {
         logger.error(
           `[${tag(ds)}] Failed to enqueue ordinary-turn recovery `
           + `${dispatch.continuation}: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return false;
+        enqueued = false;
       }
+      if (!enqueued && silent) disarmSilentScheduledTurn(ds, dispatch.turnId);
+      return enqueued;
     },
     warn: state => {
       const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId));
@@ -9348,7 +9409,12 @@ function recordAdmittedOrdinaryUserTurn(
   let recoveryBookkeepingSucceeded = false;
   try {
     if (opts.beginRecovery) {
-      const state = beginOrdinaryTurnRecovery(ds.session, turnId);
+      // Freeze the fire's silent attribute onto the logical turn now: the
+      // scheduler arms the runtime registry before dispatch, so it is readable
+      // here, and only the persisted copy survives a restart.
+      const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
+        silent: isSilentScheduledTurn(ds, turnId),
+      });
       recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
         && state.currentTurnId === turnId;
     } else {
@@ -9475,7 +9541,7 @@ export function sendWorkerInput(
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
-      if (turnId?.startsWith('om_')) {
+      if (isOrdinaryRecoveryTurnId(turnId)) {
         recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: false });
       }
       return true;
@@ -9574,7 +9640,7 @@ export function sendWorkerInput(
     );
     return false;
   }
-  if (turnId?.startsWith('om_')) {
+  if (isOrdinaryRecoveryTurnId(turnId)) {
     recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: true });
   }
   return true;
@@ -9932,7 +9998,7 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
-    if (head.turnId.startsWith('om_')) {
+    if (isOrdinaryRecoveryTurnId(head.turnId)) {
       recordAdmittedOrdinaryUserTurn(ds, head.turnId, { beginRecovery: true });
     }
   } catch (err) {
@@ -11097,7 +11163,7 @@ export function forkWorker(
   } else {
     worker.send(initMsg);
   }
-  if (prompt.length > 0 && initAttributionTurnId?.startsWith('om_')) {
+  if (prompt.length > 0 && isOrdinaryRecoveryTurnId(initAttributionTurnId)) {
     recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId, { beginRecovery: true });
   }
   ds.spawnedAt = Date.now();

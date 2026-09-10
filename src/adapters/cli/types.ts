@@ -462,6 +462,13 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
+  /** Optional first-start screen gate. Some CLIs draw their composer before
+   * initialization finishes. A pending marker holds screen idle and queued
+   * input until startupReadyPattern or an authoritative transcript idle.
+   * It survives per-turn resets and is retired once per IdleDetector/spawn. */
+  readonly startupPendingPattern?: RegExp;
+  readonly startupReadyPattern?: RegExp;
+
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —
    *  Claude-family via its effective settings.json, Grok via its global

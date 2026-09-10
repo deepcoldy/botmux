@@ -12,8 +12,10 @@ import { dirname, join } from 'node:path';
 
 import {
   authorizeScheduledTurn,
+  mintScheduledContinuationTurnId,
   parseScheduledTurnId,
   readScheduledTaskForProvenance,
+  trustedCallerForScheduledTask,
 } from '../src/core/scheduled-turn-provenance.js';
 import { botHomePath } from '../src/adapters/cli/read-isolation.js';
 
@@ -153,5 +155,66 @@ describe('authorizeScheduledTurn', () => {
       isOwnerAllowed: (app, openId) => { seen.push([app, openId]); return true; },
     });
     expect(seen).toEqual([[appId, owner]]);
+  });
+});
+
+describe('mintScheduledContinuationTurnId', () => {
+  it('keeps the task prefix so the continuation authenticates like the fire', () => {
+    const minted = mintScheduledContinuationTurnId(TURN_ID, () => 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect(minted).toBe(`schedule:${TASK_ID}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`);
+    expect(parseScheduledTurnId(minted!)).toBe(TASK_ID);
+    expect(minted).not.toBe(TURN_ID);
+  });
+
+  it('mints a fresh uuid per continuation by default', () => {
+    const first = mintScheduledContinuationTurnId(TURN_ID)!;
+    const second = mintScheduledContinuationTurnId(TURN_ID)!;
+    expect(parseScheduledTurnId(first)).toBe(TASK_ID);
+    expect(parseScheduledTurnId(second)).toBe(TASK_ID);
+    expect(first).not.toBe(second);
+  });
+
+  it('declines for ordinary IM turns and malformed ids', () => {
+    expect(mintScheduledContinuationTurnId('om_x100')).toBeUndefined();
+    expect(mintScheduledContinuationTurnId('bmx-recovery-abc')).toBeUndefined();
+    expect(mintScheduledContinuationTurnId('schedule:abc:def')).toBeUndefined();
+  });
+});
+
+describe('trustedCallerForScheduledTask', () => {
+  const base = {
+    id: TASK_ID,
+    name: 'hourly',
+    prompt: 'do it',
+    chatId: 'oc_chat',
+    enabled: true,
+  } as any;
+
+  it('runs the turn as the task creator, binding the task id', () => {
+    expect(trustedCallerForScheduledTask({
+      ...base,
+      ownerOpenId: 'ou_owner',
+      ownerUnionId: 'on_owner',
+      creatorLarkAppId: 'cli_creator',
+      larkAppId: 'cli_target',
+    }, 'cli_session')).toEqual({
+      requestUserOpenId: 'ou_owner',
+      requestUserUnionId: 'on_owner',
+      requestLarkAppId: 'cli_creator',
+      source: 'schedule_creator',
+      taskId: TASK_ID,
+    });
+  });
+
+  it('falls back to the task app, then the session app, for the requesting app id', () => {
+    expect(trustedCallerForScheduledTask({ ...base, ownerUnionId: 'on_owner', larkAppId: 'cli_target' }, 'cli_session'))
+      .toEqual(expect.objectContaining({ requestLarkAppId: 'cli_target' }));
+    const sessionFallback = trustedCallerForScheduledTask({ ...base, ownerUnionId: 'on_owner' }, 'cli_session');
+    expect(sessionFallback).toEqual(expect.objectContaining({ requestLarkAppId: 'cli_session' }));
+    expect(sessionFallback).not.toHaveProperty('requestUserOpenId');
+  });
+
+  it('fails closed without a creator union id (legacy / bot-created task)', () => {
+    expect(trustedCallerForScheduledTask({ ...base, ownerOpenId: 'ou_owner' }, 'cli_session')).toBeUndefined();
   });
 });

@@ -27,10 +27,11 @@
  *      in that configuration. This is a known limitation, not a regression:
  *      scheduled tasks themselves (prompt execution) never checked owner.
  */
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask } from '../types.js';
+import type { ScheduledTask, TrustedCaller } from '../types.js';
 
 /** Scheduled turn ids: `schedule:<8-hex-taskId>:<uuid>`. Task ids are minted
  *  by schedule-store as `randomUUID().substring(0, 8)`; the strict shape keeps
@@ -42,6 +43,50 @@ const SCHEDULED_TURN_RE = /^schedule:([0-9a-f]{8}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a
 export function parseScheduledTurnId(turnId: string): string | null {
   const match = SCHEDULED_TURN_RE.exec(turnId);
   return match ? match[1]! : null;
+}
+
+/** Mint the turn id for a semantic-recovery continuation of a scheduled turn.
+ *  A scheduled turn authenticates by its `schedule:<taskId>:<uuid>` id (task
+ *  binding + owner gate, see authorizeScheduledTurn — the uuid is per fire and
+ *  never checked), so its `[BOTMUX_RECOVERY]` continuation must keep the same
+ *  task prefix: a `bmx-recovery-*` id would strip the schedule provenance and
+ *  every `botmux` command in the continuation would lose the creator identity.
+ *  Returns undefined for a non-scheduled logical turn (ordinary IM turns keep
+ *  the coordinator's default id). */
+export function mintScheduledContinuationTurnId(
+  logicalTurnId: string,
+  uuid: () => string = randomUUID,
+): string | undefined {
+  const taskId = parseScheduledTurnId(logicalTurnId);
+  return taskId ? `schedule:${taskId}:${uuid()}` : undefined;
+}
+
+/**
+ * Identity a scheduled turn runs as: the task's creator, as captured at
+ * creation time. The turn itself is authenticated by the daemon-minted
+ * `schedule:<taskId>:<uuid>` turn id (authorizeScheduledTurn above) — this
+ * only decides WHICH identity that authenticated turn carries. Shared by the
+ * scheduler fire path and the ordinary-turn recovery continuation so a
+ * continuation runs as exactly the identity its original fire ran as.
+ *
+ * Returns undefined when the task has no creator union_id (legacy tasks,
+ * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
+ * fail-closed story: with no identity on the turn, identity-bound tools refuse
+ * to run instead of falling back to the bot's own access, while everything that
+ * does not need a user identity keeps working.
+ */
+export function trustedCallerForScheduledTask(
+  task: ScheduledTask,
+  larkAppId: string,
+): TrustedCaller | undefined {
+  if (!task.ownerUnionId) return undefined;
+  return {
+    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
+    requestUserUnionId: task.ownerUnionId,
+    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    source: 'schedule_creator',
+    taskId: task.id,
+  };
 }
 
 /**
