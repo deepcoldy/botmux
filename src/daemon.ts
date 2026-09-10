@@ -3698,7 +3698,7 @@ async function sessionReply(
   }
   if (ds) {
     const privateMessageId = await sendPrivateReply(ds.session,
-      turnId ?? ds.session.quoteTargetId, content, msgType, opts?.uuid);
+      turnId, content, msgType, opts?.uuid);
     if (privateMessageId !== undefined) return privateMessageId;
   }
   const hookContext = ds ? {

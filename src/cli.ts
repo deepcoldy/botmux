@@ -3598,10 +3598,11 @@ interface SessionData {
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
-   *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
+   *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    replyTargetSenderIsBot?: boolean;
     inThread?: boolean;
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];

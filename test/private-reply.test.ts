@@ -78,11 +78,22 @@ describe('private delivery with the existing group session', () => {
     expect(s).toEqual(original);
   });
 
-  it.each([undefined, 'evicted_turn'])('refuses missing sender for %s instead of borrowing the last user', async turn => {
+  it.each([undefined, 'evicted_turn'])('uses ordinary delivery for %s instead of borrowing the last user', async turn => {
     writeRoleReplyPrivately(APP, GROUP, true);
-    await expect(sendPrivateReply(session(), turn, 'secret')).rejects.toThrow('exact turn');
+    expect(await sendPrivateReply(session(), turn, 'answer')).toBeUndefined();
     expect(sendUserMessage).not.toHaveBeenCalled();
     expect(replyMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['turn_a', 'turn_b'])('keeps a bot-originated %s in the group even after a later human turn', async turn => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    const s = session();
+    s.turnReplyContexts = {
+      turn_a: { target: { mode: 'thread', rootMessageId: s.rootMessageId }, replyTargetSenderIsBot: true },
+    };
+    s.quoteTargetSenderIsBot = turn === 'turn_b';
+    expect(await sendPrivateReply(s, turn, 'answer')).toBeUndefined();
+    expect(sendUserMessage).not.toHaveBeenCalled();
   });
 
   it('only posts the configured notice after private delivery succeeds', async () => {
@@ -95,11 +106,11 @@ describe('private delivery with the existing group session', () => {
       .toBeLessThan(vi.mocked(replyMessage).mock.invocationCallOrder[0]);
   });
 
-  it('never posts the answer or a success notice after a private send failure', async () => {
+  it.each(['permission denied', 'network timeout'])('resumes ordinary delivery without a success notice after %s', async error => {
     writeRoleReplyPrivately(APP, GROUP, true);
     writeRolePrivateReplyNotice(APP, GROUP, 'sent');
-    vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('permission denied'));
-    await expect(sendPrivateReply(session(), 'turn_a', 'secret')).rejects.toThrow('permission denied');
+    vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error(error));
+    expect(await sendPrivateReply(session(), 'turn_a', 'answer')).toBeUndefined();
     expect(replyMessage).not.toHaveBeenCalled();
   });
 
