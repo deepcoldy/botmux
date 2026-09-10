@@ -12,6 +12,19 @@ const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
 const SPINNER_GUARD_MS = 3_000;
 
+/** Strip ANSI escape sequences from a screen/PTY text before running
+ *  line-anchored adapter patterns. Shared by the IdleDetector PTY stream path
+ *  and the worker's viewport busy probes: both must see IDENTICAL text, since
+ *  patterns (e.g. claude-code's footer regex) anchor on `^` and tmux
+ *  `capture-pane -e` emits SGR color codes at line starts that break the
+ *  anchor unless stripped first. Cursor-forward sequences (`ESC[nC`) are
+ *  expanded to spaces because they represent real horizontal gaps. */
+export function stripAnsiScreenText(str: string): string {
+  return str
+    .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+}
+
 export class IdleDetector {
   private outputTail = '';
   private lastSpinnerAt = 0;
@@ -315,9 +328,7 @@ export class IdleDetector {
   }
 
   private stripAnsi(str: string): string {
-    return str
-      .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+    return stripAnsiScreenText(str);
   }
 }
 
