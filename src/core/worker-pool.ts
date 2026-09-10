@@ -1798,6 +1798,7 @@ export function ensureReadonlyTaskContinuationAttached(
           content: dispatch.prompt,
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
+          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
           readonlyContinuation: {
             leaseId: current.leaseId,
             rpcGeneration: proof!.rpcGeneration,
