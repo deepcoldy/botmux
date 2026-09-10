@@ -122,7 +122,7 @@ import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
-import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
@@ -306,6 +306,9 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { parseTopicHeader, isTopicHeader, isTopicHeaderError } from './core/topic-header.js';
+import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
+import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -347,7 +350,7 @@ import {
   withBotTurnAdmission,
   withBotTurnMutation,
 } from './core/bot-turn-mutation-gate.js';
-import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
+import { claimInitialUserTurn, isInitialUserTurnPending, markInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
@@ -356,6 +359,7 @@ import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
   extractBotmuxLarkNativeSessionTitlePrompt,
+  updateSessionTitle,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
@@ -17415,6 +17419,32 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   }
 }
 
+/** fork 之前还剩没剩下要提交给 CLI 的内容——含建会话到 fork 之间被路由缓冲进来的
+ *  并发消息。空跑分支必须先问这个，否则那些消息会被 clearInitialStartBuffers 丢掉。 */
+function hasBufferedOpeningInput(ds: DaemonSession): boolean {
+  return (ds.pendingPrompt?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+    || (ds.pendingAttachments?.length ?? 0) > 0
+    || (ds.pendingCodexAppFollowUps?.length ?? 0) > 0
+    || ds.pendingChatContext !== undefined;
+}
+
+/**
+ * 指令头只交代了会话规格、没写首轮任务（`标题 /t /repo X`，也含今天的 `/t /repo X`）：
+ * 把 CLI 空跑起来等下一条，而不是拿一个空 `<user_message>` 烧掉开场。
+ *
+ * 与 `/repo` 冷启动的 emptyStart 分支同语义（command-handler 的 forkPendingCli、
+ * card-handler 的 commitRepoSelection）：空 prompt fork + markInitialUserTurnPending，
+ * 用户下一条真消息才是这个会话的开场。
+ */
+function forkReservedIdleSession(ds: DaemonSession): void {
+  forkWorker(ds, '', false);
+  markInitialUserTurnPending(ds);
+  ds.pendingTurnId = undefined;
+  ds.initialStartPending = ds.session.queuedActivationPending === true;
+  clearInitialStartBuffers(ds);
+}
+
 /** Raw slash-command cold starts type the raw command only after prompt_ready.
  * Buffer later same-anchor messages into the ordered follow-up payload carried
  * on that same raw_input IPC; a separate worker message could overtake the
@@ -18206,17 +18236,48 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // (already thread-scope) it's just a prefix strip — no routing change.
   // Empty prompt is allowed: later setup chooses either a repo picker or a
   // visible thread that waits for the first real task, without an empty worker.
-  const forceTopic = parseForceTopicInvocation(cmdContent);
-  if (forceTopic) {
+  //
+  // 指令头（`[标题] /t /repo … /model … 正文`）走的是同一个入口：解析前先剥掉对本 bot
+  // 的**所有** @（路由判定按 mentions 数组、与 @ 在文本里的位置无关，见设计 D8），
+  // 解析出的规格在建会话时逐项落到 workingDir / title / spawnModelOverride /
+  // reasoningEffort。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
+  // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
+  const selfBotForHeader = getBot(larkAppId);
+  const headerParse = parseTopicHeader(stripBotMentions(
+    cmdContent,
+    followupMentions,
+    { botOpenId: selfBotForHeader.botOpenId, larkAppId },
+  ));
+  const forceTopic = isTopicHeader(headerParse) ? headerParse : null;
+  let topicSpec: TopicSpec | undefined;
+  if (headerParse !== null) {
+    // 授权闸在校验之前：没资格开话题的人，连用法提示都不该拿到。
     if (await replyGrantRestrictionIfNeeded(
       larkAppId,
       chatId,
       senderOpenId,
       anchor,
-      forceTopicCommandLabel(cmdContent),
+      headerParse.sentinel,
     )) {
       return;
     }
+  }
+  if (isTopicHeaderError(headerParse)) {
+    await sessionReply(anchor, topicHeaderErrorText(headerParse, localeForBot(larkAppId)), 'text', larkAppId);
+    logger.info(`[/t] Rejected topic header: ${headerParse.kind}`);
+    return;
+  }
+  if (forceTopic) {
+    const resolved = resolveTopicSpec(forceTopic, {
+      botCfg: selfBotForHeader.config,
+      scanDirs: getProjectScanDirsForBot(larkAppId),
+    });
+    if (!resolved.ok) {
+      await sessionReply(anchor, topicSpecErrorText(resolved.errors, localeForBot(larkAppId)), 'text', larkAppId);
+      logger.info(`[/t] Rejected topic header spec: ${resolved.errors.map(e => e.kind).join(', ')}`);
+      return;
+    }
+    topicSpec = resolved;
     if (!substituteTrigger && scope === 'chat') {
       scope = 'thread';
       anchor = messageId;
@@ -18226,7 +18287,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     content = composeForwardFollowupContent(forwardSeedContent, forceTopic.prompt);
     parsed.content = forceTopic.prompt;
     cmdContent = forceTopic.prompt;
-    logger.info(`[/t] Force-topic invocation: prompt="${forceTopic.prompt.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)})`);
+    logger.info(`[/t] Force-topic invocation: prompt="${forceTopic.prompt.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, repo=${topicSpec.workingDir ?? '-'}, model=${topicSpec.model ?? '-'}, effort=${topicSpec.reasoningEffort ?? '-'}, title=${topicSpec.title ? 'yes' : 'no'})`);
   }
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
@@ -18587,6 +18648,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
     && !ctx.forwardSeedData
     && !messageListener;
+  // 指令头只交代了会话规格、没有首轮任务（`标题 /t /repo X`，也含今天的 `/t /repo X`）。
+  // 这仍然是「话题设置」——不该烧一个空 `<user_message>` 开场——但**不能**走裸 `/t` 那两条
+  // 「回一句 ready 就不建会话」的早退：标题/模型/推理强度是会话状态，没有会话就没地方放。
+  // 于是照常建会话，把 CLI 空跑起来等下一条，与 `/repo` 冷启动的 emptyStart 同语义。
+  const topicHeaderIdleStart = isBareForceTopic && !!topicSpec && (
+    !!topicSpec.title || !!topicSpec.workingDir || !!topicSpec.model || !!topicSpec.reasoningEffort
+  );
   // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
   // (a quota denial must have zero external side effects), so by the time the
   // rewritten group turn gets here THIS message is already authorized AND
@@ -18661,7 +18729,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+  const {
+    pinnedWorkingDir: configPinnedWorkingDir,
+    oncallEntry,
+    inheritedFrom,
+    pinnedFromBotDefault: configPinnedFromBotDefault,
+  } = await resolvePinnedWorkingDir({
     scope,
     anchor,
     chatId,
@@ -18669,6 +18742,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
   });
+  // 指令头里的 `/repo X` 是**用户显式选仓**，与点选仓卡片上的项目按钮同义：钉目录、
+  // 跳过卡片，并且不建 worktree —— auto-worktree 的触发条件是「没人选、目录来自 bot 自己的
+  // defaultWorkingDir」（willAutoWorktree 的 pinnedFromBotDefault），卡片选仓
+  // （card-handler 的 repo_select → commitRepoSelection）同样不建。所以显式选仓要把
+  // pinnedFromBotDefault 一起翻成 false，否则用户点名的目录恰好等于 bot 默认目录时
+  // 会被悄悄改道去建 worktree，与点卡片的结果不一致。
+  const pinnedWorkingDir = topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const pinnedFromBotDefault = topicSpec?.workingDir ? false : configPinnedFromBotDefault;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -18692,27 +18773,32 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       logger.warn(`[/t] configured workingDir missing: ${invalidDirs.join(', ')}`);
       return;
     }
+    // 这两条早退都是「不建会话，等下一条消息再开」。指令头带了标题/仓库/模型/推理强度
+    // 时不能这么做（没有会话就没地方放这些状态），落到下面照常建会话 + 空跑 CLI。
     if (pinnedWorkingDir) {
-      await sessionReply(
-        anchor,
-        tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
-        'text',
-        larkAppId,
-      );
-      return;
-    }
-    const scanDirs = setupDirs.filter(d => existsSync(d));
-    prefetchedRepoProjects = scanDirs.length > 0
-      ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
-      : [];
-    if (prefetchedRepoProjects.length === 0) {
-      await sessionReply(
-        anchor,
-        tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
-        'text',
-        larkAppId,
-      );
-      return;
+      if (!topicHeaderIdleStart) {
+        await sessionReply(
+          anchor,
+          tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+          'text',
+          larkAppId,
+        );
+        return;
+      }
+    } else {
+      const scanDirs = setupDirs.filter(d => existsSync(d));
+      prefetchedRepoProjects = scanDirs.length > 0
+        ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        : [];
+      if (prefetchedRepoProjects.length === 0 && !topicHeaderIdleStart) {
+        await sessionReply(
+          anchor,
+          tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+          'text',
+          larkAppId,
+        );
+        return;
+      }
     }
   }
 
@@ -18771,6 +18857,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     parsed.mentions,
     groupChatName,
   );
+  // 指令头的标题必须写在 nativeSessionTitle 推导**之后**，否则会被上面那行覆盖。
+  // 走 updateSessionTitle 而不是直接赋值：它同时置 nativeSessionTitleUserDefined，
+  // 让 forkWorker 里那段「isFreshNativeSession && !nativeSessionTitleUserDefined」跳过
+  // 自动推导、改从 ds.session.nativeSessionTitle 取值下发 initConfig.nativeSessionTitle
+  // ——于是首次 spawn 就带上原生会话名，不必等一次 requestAgentSessionRename
+  //（那条路在 worker 还没起时只会返回 not_running）。
+  if (topicSpec?.title) updateSessionTitle(session, topicSpec.title, 'user');
+  // 推理强度与 trigger API 同款：持久化在会话上。sessionAgentConfig 首次冻结时用
+  // `ds.session.reasoningEffort ?? botCfg.reasoningEffort`，所以这里写的值会保留。
+  if (topicSpec?.reasoningEffort) session.reasoningEffort = topicSpec.reasoningEffort;
   sessionStore.updateSession(session);
 
   // Control card compensates for the card-less (avatar-style) chat-scope
@@ -18838,6 +18934,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
+    // 本次 spawn 的模型：内存态、不持久化，与 trigger API / 定时任务同一个字段，
+    // resolveSessionLaunchModel 把它排在最高优先级。
+    ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
   if (pinnedWorkingDir) {
     ds.session.workingDir = pinnedWorkingDir;
@@ -18912,6 +19011,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
+    // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
+    if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
+      markIngressAdmitted(ctx);
+      forkReservedIdleSession(ds);
+      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId)), 'text', larkAppId);
+      logger.info(`[${tag(ds)}] topic header → idle start in ${ds.workingDir}, waiting for the first task`);
+      return;
+    }
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,
@@ -18963,6 +19071,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 重复执行——先打接纳标。
     markIngressAdmitted(ctx);
     ds.pendingRepo = false;
+    if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
+      forkReservedIdleSession(ds);
+      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId)), 'text', larkAppId);
+      logger.info(`[${tag(ds)}] topic header → idle start (no projects to select), waiting for the first task`);
+      return;
+    }
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,

@@ -15,7 +15,11 @@ import { parseTopicHeader, type TopicHeaderParse } from '../src/core/topic-heade
 /** 头部对象的可断言快照（省掉 ok/sentinel 噪音，直接比语义三件套）。 */
 function shape(parsed: TopicHeaderParse) {
   if (parsed === null) return null;
-  if (parsed.ok === false) return parsed;
+  // sentinel 是给授权提示/日志用的附加信息，断言时剥掉以免每条用例都要重复它。
+  if (parsed.ok === false) {
+    const { sentinel: _sentinel, ...reason } = parsed;
+    return reason;
+  }
   return { title: parsed.title, directives: parsed.directives, prompt: parsed.prompt };
 }
 

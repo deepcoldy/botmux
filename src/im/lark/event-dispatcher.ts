@@ -14,7 +14,8 @@ import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMe
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
-import { parseForceTopicInvocation, parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
@@ -2718,7 +2719,10 @@ export function maybeApplyForceTopicOverride(
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
   const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-  if (!parseForceTopicInvocation(stripped)) return false;
+  // 指令头（`[标题] /t …`）与裸 `/t` 走同一条判定。只认**解析成功**的头部：写错了的
+  // 头部要留在原地被拒绝（回一句用法错误），不能先把 scope 改成新话题——那已经是副作用。
+  // 这里只需要 yes/no，所以沿用按位置剥前导 @ 即可；daemon 侧会按身份重新精确解析。
+  if (!isTopicHeader(parseTopicHeader(stripped))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
   return true;
@@ -2796,7 +2800,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
     const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    if (parseForceTopicInvocation(stripped)) return undefined;
+    if (isTopicHeader(parseTopicHeader(stripped))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one

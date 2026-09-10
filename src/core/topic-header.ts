@@ -49,10 +49,14 @@ export interface TopicHeader {
   prompt: string;
 }
 
-export type TopicHeaderError =
-  | { ok: false; kind: 'missing_arg'; directive: TopicHeaderDirective }
-  | { ok: false; kind: 'duplicate_directive'; directive: TopicHeaderDirective }
-  | { ok: false; kind: 'unknown_directive'; token: string };
+/** 拒绝原因本身（不含分隔符），拼提示文案时按 `kind` 分派。 */
+export type TopicHeaderErrorReason =
+  | { kind: 'missing_arg'; directive: TopicHeaderDirective }
+  | { kind: 'duplicate_directive'; directive: TopicHeaderDirective }
+  | { kind: 'unknown_directive'; token: string };
+
+/** 拒绝结果一并带上用户实际敲的分隔符，授权提示与错误文案都用它的原文措辞。 */
+export type TopicHeaderError = { ok: false; sentinel: '/t' | '/topic' } & TopicHeaderErrorReason;
 
 export type TopicHeaderParse = TopicHeader | TopicHeaderError | null;
 
@@ -159,18 +163,18 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       // 落到 parseSlashCommandInvocation，不能被解析器提前拒掉（D9 向后兼容）。
       const claimed = title !== undefined || Object.keys(directives).length > 0;
       if (claimed && token.text.startsWith('/')) {
-        return { ok: false, kind: 'unknown_directive', token: token.text };
+        return { ok: false, sentinel, kind: 'unknown_directive', token: token.text };
       }
       break;
     }
     if (directives[directive] !== undefined) {
-      return { ok: false, kind: 'duplicate_directive', directive };
+      return { ok: false, sentinel, kind: 'duplicate_directive', directive };
     }
     const arg = tokens[i + 1];
     // 缺参数：结尾就没有下一个 token，或下一个 token 是另一条头部指令
     //（`/t /repo /model x` —— 把 `/model` 当仓库名只会得到一句莫名其妙的报错）。
     if (!arg || (!arg.quoted && DIRECTIVE_BY_TOKEN.has(arg.text.toLowerCase()))) {
-      return { ok: false, kind: 'missing_arg', directive };
+      return { ok: false, sentinel, kind: 'missing_arg', directive };
     }
     directives[directive] = arg.text;
     i += 1;

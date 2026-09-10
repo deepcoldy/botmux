@@ -318,6 +318,7 @@ export {
   TOPIC_HEADER_DIRECTIVES,
   type TopicHeader,
   type TopicHeaderError,
+  type TopicHeaderErrorReason,
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
