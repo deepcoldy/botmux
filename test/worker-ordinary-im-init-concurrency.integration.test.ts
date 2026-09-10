@@ -242,7 +242,10 @@ setInterval(() => {}, 1_000);
         OPENCODE_DB_PATH: join(dbDir, 'opencode.db'),
         SESSION_DATA_DIR: dataDir,
         BOTMUX_SESSION_ID: 'sid-opencode-activation',
-        BOTMUX_TIME_SCALE: '0.05',
+        // This starts a real Node process: shrinking the 2.4s confirmation
+        // window to 120ms races its SQLite write, then the 20s deferred
+        // recheck falls outside this test's 8s acknowledgement deadline.
+        BOTMUX_TIME_SCALE: '1',
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
       },

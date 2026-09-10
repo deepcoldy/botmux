@@ -66,7 +66,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -4597,7 +4597,7 @@ function emptyCompletedBridgeFallbackContent(): string {
   return t('worker.empty_final_completed', { cliName: cliName() });
 }
 
-function failedBridgeFallbackContent(errorCode?: string, summary?: string, partialText?: string): string {
+function failedBridgeFailureText(errorCode?: string, summary?: string): string {
   const reason = summary || t('worker.failed_reason_unavailable');
   const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
     ? 'worker.empty_final_failed_invalid_request'
@@ -4609,8 +4609,7 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
           ? 'worker.empty_final_failed_upstream'
           : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
-  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
+  return failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -7711,7 +7710,13 @@ function emitReadyCodexTurns(): void {
       gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
     );
     const content = fallbackKind === 'failed'
-      ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
+      ? composeFailedBridgeFallbackContent(
+          failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+          gateInput,
+          nextBoundaryMs,
+          markers,
+          adoptMode,
+        )
       : fallbackKind === 'final'
         ? turn.finalText ?? ''
         : fallbackKind === 'empty_completed'
@@ -7728,11 +7733,11 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode)) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -8991,6 +8996,7 @@ let injectionFlushing = false;
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
   if (cliRestartInProgress) return;
@@ -10647,6 +10653,9 @@ function scheduleSpawnArgvTurnStartFailOpen(): void {
 }
 
 function markPromptReady(): void {
+  // Screen probes and timeout fallbacks must honor the same startup evidence
+  // as quiescence; a skeleton composer is not a ready CLI.
+  if (idleDetector?.isStartupPending()) return;
   if (bareShellLaunchBlocked) {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
     return;
@@ -11316,6 +11325,7 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  if (idleDetector?.isStartupPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
@@ -16759,6 +16769,13 @@ async function spawnCli(
   const firstPromptBackend = backend;
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    // A timeout can recover missing prompt evidence, never contradict explicit
+    // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
+    // normal idle detection and flushes it without replaying a pasted draft.
+    if (idleDetector?.isStartupPending()) {
+      log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
+      return;
+    }
     if (!shouldReleaseFirstPromptTimeout({
       deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
       hasReadyPattern: !!cliAdapter?.readyPattern,

@@ -260,12 +260,23 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
   });
 
-  it('non-owner: replies owner_only, no card', async () => {
+  it('non-admin: replies owner_only, no card', async () => {
     const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_intruder');
     expect(handled).toBe(true);
     const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType ?? 'text').not.toBe('interactive');  // text reply, not a card
-    expect(content).toContain('owner');                 // owner_only message text
+    expect(content).toContain('管理员');                // owner_only message text
+  });
+
+  it('co-owner: can also execute /grant and card reflects co-owner', async () => {
+    const bot = getBot('b1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_coowner'];
+    const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_coowner');
+    expect(handled).toBe(true);
+    const [, , cardStr, msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType).toBe('interactive');
+    const card = JSON.parse(cardStr);
+    expect(card.body.elements[0].content).toContain('ou_coowner');
   });
 
   it('unrelated message is not intercepted', async () => {

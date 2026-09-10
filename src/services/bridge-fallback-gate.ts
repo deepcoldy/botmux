@@ -370,7 +370,7 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }
 
-/** 结构化失败回合补发可见错误；部分回答不能替代失败原因。 */
+/** 结构化失败回合补发可见错误；进度回复不能替代失败原因。 */
 export function shouldEmitFailedBridgeFallback(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
@@ -380,7 +380,48 @@ export function shouldEmitFailedBridgeFallback(
   if (adoptMode) return false;
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== 'failed') return false;
-  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+  // A bare sentinel is an explicit request for silence, even when the provider
+  // also reports a failed terminal. Never turn that internal token into visible
+  // failure content.
+  if (isBridgeNothingToSendFinal(turn.finalText)) return false;
+  // A progress/final send only proves that some user-facing content was already
+  // delivered; it cannot replace the structured terminal failure reason. The
+  // existing delivery path uses the current turn's stable key for deduplication.
+  return true;
+}
+
+/** Failure fallbacks are terminal diagnostics, not another model answer. Only
+ * bypass marker-based suppression; preserve deliberate silence and the existing
+ * local/adopt ownership gates. Non-failure output keeps the ordinary gate. */
+export function shouldSuppressStructuredFallback(
+  fallbackKind: StructuredFallbackKind,
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (fallbackKind !== 'failed') {
+    return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+  }
+  return adoptMode || Boolean(turn.isLocal) || isBridgeNothingToSendFinal(turn.finalText);
+}
+
+/** Compose a failed-turn diagnostic without replaying partial text that the
+ * ordinary marker gate already classifies as delivered or deliberately kept
+ * out of chat. Any retained partial text is sentinel-cleaned before the
+ * diagnostic is appended, so the protocol token can never become body text. */
+export function composeFailedBridgeFallbackContent(
+  failureText: string,
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): string {
+  if (shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode)) {
+    return failureText;
+  }
+  const visiblePartialText = bridgePostText(turn.finalText ?? '', adoptMode).trim();
+  return visiblePartialText ? `${visiblePartialText}\n\n${failureText}` : failureText;
 }
 
 /** Which fallback content the worker should post for a ready structured turn.

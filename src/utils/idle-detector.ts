@@ -26,6 +26,11 @@ export class IdleDetector {
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
+  private startupPendingPattern: RegExp | undefined;
+  private startupReadyPattern: RegExp | undefined;
+  private startupTail = '';
+  private startupPending = false;
+  private startupComplete = false;
   /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
    *  chunks carrying explicit static-busy evidence (scanned across chunks
    *  via the rolling tail); suppresses screen-derived idle until a chunk
@@ -43,6 +48,8 @@ export class IdleDetector {
     this.staticBusyPattern = cli.staticBusyPattern;
     this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
+    this.startupPendingPattern = cli.startupPendingPattern;
+    this.startupReadyPattern = cli.startupReadyPattern;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -86,6 +93,31 @@ export class IdleDetector {
     }
 
     const stripped = this.stripAnsi(data);
+    if (!this.startupComplete && this.startupPendingPattern) {
+      // Preserve raw chunks until decoding: an ANSI style sequence can be
+      // split between reads right before `loading`. Per-chunk stripping would
+      // leave escape fragments inside the word and miss the startup hold.
+      const rawStartup = this.startupTail + data;
+      const startup = this.stripAnsi(rawStartup);
+      const pendingAt = lastMatchIndex(this.startupPendingPattern, startup);
+      const readyAt = this.startupReadyPattern
+        ? lastMatchIndex(this.startupReadyPattern, startup)
+        : -1;
+      // Initialization is monotonic for this CLI process. A restored pane may
+      // seed its entire history in one chunk, including a quoted loading
+      // banner after the actual loaded banner. Treat that exactly like two
+      // feeds: once fully initialized, later text cannot re-arm startup.
+      if (readyAt >= 0) {
+        this.startupComplete = true;
+        this.startupPending = false;
+        this.startupTail = '';
+      } else {
+        if (pendingAt >= 0) this.startupPending = true;
+        // Keep split banner evidence without retaining startup output
+        // indefinitely. Unlike outputTail this survives a per-turn reset.
+        this.startupTail = rawStartup.slice(-8_192);
+      }
+    }
     // Shift the clear position left when the tail window drops characters
     // from the head, so it stays relative to the current window.
     const combined = this.outputTail + stripped;
@@ -175,7 +207,7 @@ export class IdleDetector {
         this.quiescenceTimer = null;
         // A static-busy latch outranks a completion marker: the queue screen
         // can carry both, and the latch only clears on a composer redraw.
-        if (!this.isIdle && !this.staticBusyLatch) this.markIdle('screen');
+        if (!this.isIdle && !this.staticBusyLatch && !this.isStartupPending()) this.markIdle('screen');
       }, 500);
       return;
     }
@@ -223,7 +255,17 @@ export class IdleDetector {
    *  for the next turn — same lifecycle as the internal markIdle path. */
   fireIdle(): void {
     if (this.isIdle) return;
+    // Actual transcript completion proves the session initialized, even if
+    // its loaded banner was omitted or the operator customized the footer.
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
     this.markIdle('external');
+  }
+
+  /** Shared by the worker's screen-ready and hard-timeout write paths. */
+  isStartupPending(): boolean {
+    return this.startupPending && !this.startupComplete;
   }
 
   dispose(): void {
@@ -238,6 +280,7 @@ export class IdleDetector {
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
+    if (this.isStartupPending()) return;
     // Explicit static-busy evidence (capacity queue): the screen is not
     // quiescing into a prompt — it is parked on a queue notice. Do not mark
     // idle and do not re-arm: the latch clears on the composer redraw, whose

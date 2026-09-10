@@ -2724,6 +2724,43 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['running', 'completed'] as const)('restores a %s silent recovery before handling trailing output', async (status) => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const logicalTurnId = 'schedule:abcdef12:11111111-2222-3333-4444-555555555555';
+    const turnId = 'schedule:abcdef12:22222222-2222-3333-4444-555555555555';
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId, currentTurnId: turnId, continuationsStarted: 1,
+      status, silentLogicalTurnIds: [logicalTurnId],
+    };
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    expect(ds.silentScheduledTurns).toBeUndefined();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // A terminal can be persisted before the trailing bridge output arrives.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId,
+      content: 'late silent answer', lastUuid: `silent-restored-${status}`,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'late silent notice', turnId,
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'ordinary notice', turnId: 'om_normal_after_restart',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toBe('ordinary notice');
+  });
+
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
     const ds = makeDs();
     // A loud connector opted into suppressFinalOutput; trigger-session armed this

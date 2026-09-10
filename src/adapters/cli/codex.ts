@@ -412,6 +412,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    // 0.153.x paints a skeleton composer before thread initialization. The
+    // `›` and two seconds of silence do not prove it can submit yet; history
+    // can remain empty throughout bootstrap even when a TUI input is queued.
+    // Release only on complete initialized banner cells, including custom
+    // models/paths. The footer can already show a model during loading. Match
+    // cell boundaries, not literal newlines: PTY redraws also move the cursor.
+    startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
+    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.

@@ -160,9 +160,26 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
+
+// Scheduled-task store seen by the recovery continuation's identity lookup.
+// Keyed by task id; empty means "task deleted" (no identity, fail-closed).
+const { scheduledTasksForProvenance } = vi.hoisted(() => ({
+  scheduledTasksForProvenance: new Map<string, any>(),
+}));
+vi.mock('../src/core/scheduled-turn-provenance.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/scheduled-turn-provenance.js')>();
+  return {
+    ...actual,
+    readScheduledTaskForProvenance: (_dataDir: string, _larkAppId: string, taskId: string) =>
+      scheduledTasksForProvenance.get(taskId),
+  };
+});
+import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  auxUiSuppressedFor,
   detachWorkerForTransfer,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   forkWorker,
   getDaemonBootId,
@@ -4956,5 +4973,349 @@ describe('forkWorker session.workingDir back-fill (cross-bot inherit enabler)', 
     ds.session.workingDir = undefined;
     forkWorker(ds, 'hi', false);
     expect(ds.session.workingDir).toBeFalsy();   // realpath(homeLink) === realpath($HOME) → excluded
+  });
+});
+
+describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () => {
+  const SCHEDULED_TURN = 'schedule:abcdef12:11111111-2222-3333-4444-555555555555';
+
+  async function bootClaudeSession() {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'warm up', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    // The terminal handler is async; let it settle before the next admission.
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    sessionReply.mockClear();
+    return { ds, worker, sessionReply };
+  }
+
+  function ackInput(worker: any, turnId: string) {
+    worker.emit('message', { type: 'turn_input_received', turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId });
+  }
+
+  function sentMessages(worker: any) {
+    return vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message');
+  }
+
+  const CREATOR_IDENTITY = {
+    requestUserOpenId: 'ou_owner',
+    requestUserUnionId: 'on_owner',
+    requestLarkAppId: 'cli_creator',
+    source: 'schedule_creator',
+    taskId: 'abcdef12',
+  };
+
+  beforeEach(() => {
+    scheduledTasksForProvenance.clear();
+    scheduledTasksForProvenance.set('abcdef12', {
+      id: 'abcdef12',
+      name: 'hourly',
+      prompt: 'hourly task prompt',
+      chatId: 'oc_chat',
+      enabled: true,
+      ownerOpenId: 'ou_owner',
+      ownerUnionId: 'on_owner',
+      creatorLarkAppId: 'cli_creator',
+    });
+  });
+
+  it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    armSilentScheduledTurn(ds, SCHEDULED_TURN);
+
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    expect(ds.session.ordinaryTurnRecovery).toEqual({
+      logicalTurnId: SCHEDULED_TURN,
+      currentTurnId: SCHEDULED_TURN,
+      continuationsStarted: 0,
+      status: 'running',
+      silentLogicalTurnIds: [SCHEDULED_TURN],
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await Promise.resolve();
+    // Recovery owns the terminal: no「未启动自动续跑」card for a retryable failure.
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    expect(continuation.turnId).toMatch(/^schedule:abcdef12:[0-9a-f-]{36}$/);
+    expect(continuation.turnId).not.toBe(SCHEDULED_TURN);
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    expect(continuation.content).not.toContain('hourly task prompt');
+    // The continuation IPC runs as the task creator, exactly like the fire.
+    expect(continuation.trustedCaller).toEqual(CREATOR_IDENTITY);
+    // The fire was silent, so its continuation stays silent.
+    expect(isSilentScheduledTurn(ds, continuation.turnId)).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: SCHEDULED_TURN,
+      currentTurnId: continuation.turnId,
+      continuationsStarted: 1,
+      status: 'running',
+    }));
+
+    ackInput(worker, continuation.turnId);
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: continuation.turnId,
+      status: 'completed',
+    });
+    await Promise.resolve();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('bounds a scheduled turn to two continuations and then raises exactly one card', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+
+    const fail = async (turnId: string, advanceMs: number) => {
+      worker.emit('message', {
+        type: 'turn_terminal',
+        sessionId: ds.session.sessionId,
+        turnId,
+        status: 'failed',
+        errorCode: 'provider_server_error',
+        retryable: true,
+      });
+      await vi.advanceTimersByTimeAsync(advanceMs);
+    };
+    const continuations = () => sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN);
+
+    await fail(SCHEDULED_TURN, 2_000);
+    expect(continuations()).toHaveLength(1);
+    ackInput(worker, continuations()[0].turnId);
+    await fail(continuations()[0].turnId, 8_000);
+    expect(continuations()).toHaveLength(2);
+    expect(continuations()[1].turnId).not.toBe(continuations()[0].turnId);
+    for (const message of continuations()) {
+      expect(message.turnId).toMatch(/^schedule:abcdef12:[0-9a-f-]{36}$/);
+      expect(message.trustedCaller).toEqual(CREATOR_IDENTITY);
+    }
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    ackInput(worker, continuations()[1].turnId);
+    await fail(continuations()[1].turnId, 60_000);
+    expect(continuations()).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'exhausted',
+      continuationsStarted: 2,
+    }));
+  });
+
+  it('continues without an identity when the scheduled task was deleted meanwhile', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    scheduledTasksForProvenance.clear();
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation.turnId).toMatch(/^schedule:abcdef12:/);
+    expect(continuation.trustedCaller).toBeUndefined();
+  });
+
+  it('recovers a type-ahead turn that fails after the running turn completed', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'first question', 'om_first')).toBe(true);
+    ackInput(worker, 'om_first');
+    // Type-ahead: admitted while om_first is still running.
+    expect(sendWorkerInput(ds, 'second question', 'om_second')).toBe(true);
+    ackInput(worker, 'om_second');
+    expect(ds.session.ordinaryTurnRecovery).toEqual({
+      logicalTurnId: 'om_first',
+      currentTurnId: 'om_first',
+      continuationsStarted: 0,
+      status: 'running',
+      queuedLogicalTurnIds: ['om_second'],
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_first', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual({
+      logicalTurnId: 'om_second',
+      currentTurnId: 'om_second',
+      continuationsStarted: 0,
+      status: 'running',
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_second',
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    // Before: om_second had no recovery consumer → only the「未启动自动续跑」card.
+    expect(sessionReply).not.toHaveBeenCalled();
+    const continuation = sentMessages(worker).find(message => message.turnId?.startsWith('bmx-recovery-'));
+    expect(continuation).toBeDefined();
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_second',
+      currentTurnId: continuation.turnId,
+      continuationsStarted: 1,
+      status: 'running',
+    }));
+  });
+
+  it('freezes the silent attribute into the persisted recovery state at admission', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    armSilentScheduledTurn(ds, SCHEDULED_TURN);
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    expect(ds.session.ordinaryTurnRecovery?.silentLogicalTurnIds).toEqual([SCHEDULED_TURN]);
+    // A type-ahead ordinary turn is remembered but never marked silent.
+    expect(sendWorkerInput(ds, 'follow-up', 'om_follow')).toBe(true);
+    ackInput(worker, 'om_follow');
+    expect(ds.session.ordinaryTurnRecovery?.queuedLogicalTurnIds).toEqual(['om_follow']);
+    expect(ds.session.ordinaryTurnRecovery?.silentLogicalTurnIds).toEqual([SCHEDULED_TURN]);
+  });
+
+  it('keeps a silent continuation silent across a daemon restart during backoff (zero-delay re-arm)', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    armSilentScheduledTurn(ds, SCHEDULED_TURN);
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    await Promise.resolve();
+    const persisted = structuredClone(ds.session.ordinaryTurnRecovery)!;
+    expect(persisted.status).toBe('backoff');
+
+    // Restart: a fresh DaemonSession rebuilt from the persisted row only — the
+    // runtime silent registry is gone and the backoff deadline already passed.
+    const restored = makeDs({
+      session: { ...structuredClone(ds.session), ordinaryTurnRecovery: { ...persisted, nextAttemptAt: Date.now() - 1 } },
+    });
+    expect(restored.silentScheduledTurns).toBeUndefined();
+    const silentAtSend: Array<[string, boolean]> = [];
+    forkMock.mockImplementation(() => {
+      const w = makeFakeWorker();
+      w.send = vi.fn((message: any) => {
+        if (message?.turnId) silentAtSend.push([message.turnId, isSilentScheduledTurn(restored, message.turnId)]);
+        return true;
+      });
+      return w;
+    });
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const [continuationId, silentWhenSent] = silentAtSend.find(([id]) => id !== SCHEDULED_TURN)!;
+    expect(continuationId).toMatch(/^schedule:abcdef12:/);
+    expect(silentWhenSent).toBe(true);
+    expect(isSilentScheduledTurn(restored, continuationId)).toBe(true);
+    expect(auxUiSuppressedFor(restored, continuationId)).toBe(true);
+    const initMsg = vi.mocked(forkMock.mock.results.at(-1)!.value.send).mock.calls
+      .map((c: any[]) => c[0]).find((m: any) => m?.type === 'init');
+    expect(initMsg.trustedCaller).toEqual(CREATOR_IDENTITY);
+  });
+
+  it('re-arms silence for a delivered continuation that was running when the daemon restarted', async () => {
+    await bootClaudeSession();
+    const continuationId = 'schedule:abcdef12:22222222-2222-2222-2222-222222222222';
+    const restored = makeDs({
+      session: {
+        ...makeDs().session,
+        ordinaryTurnRecovery: {
+          logicalTurnId: SCHEDULED_TURN, currentTurnId: continuationId, continuationsStarted: 1,
+          status: 'running', silentLogicalTurnIds: [SCHEDULED_TURN],
+        },
+      },
+    });
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    expect(isSilentScheduledTurn(restored, continuationId)).toBe(true);
+    expect(isSilentScheduledTurn(restored, SCHEDULED_TURN)).toBe(true);
+    expect(auxUiSuppressedFor(restored, continuationId)).toBe(true);
+    // Unrelated turns stay loud.
+    expect(auxUiSuppressedFor(restored, 'om_other')).toBe(false);
+  });
+
+  it('treats a pre-upgrade archive without the silent field as loud and still recovers', async () => {
+    await bootClaudeSession();
+    const restored = makeDs({
+      session: {
+        ...makeDs().session,
+        ordinaryTurnRecovery: {
+          logicalTurnId: SCHEDULED_TURN, currentTurnId: SCHEDULED_TURN, continuationsStarted: 0,
+          status: 'backoff', nextAttemptAt: Date.now() - 1, lastErrorCode: 'provider_server_error',
+        },
+      },
+    });
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    await vi.advanceTimersByTimeAsync(0);
+    const initMsg = vi.mocked(forkMock.mock.results.at(-1)!.value.send).mock.calls
+      .map((c: any[]) => c[0]).find((m: any) => m?.type === 'init');
+    expect(initMsg.turnId).toMatch(/^schedule:abcdef12:/);
+    expect(isSilentScheduledTurn(restored, initMsg.turnId)).toBe(false);
+    expect(restored.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ continuationsStarted: 1, status: 'running' }));
+  });
+
+  it('still raises the failure card when a scheduled turn fails non-retryably', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_authentication_failed',
+      retryable: false,
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('attention_required');
   });
 });
