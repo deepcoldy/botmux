@@ -7,27 +7,35 @@ import { logger } from '../utils/logger.js';
 // Reuse the group session and its existing per-turn sender record.
 type ReplySession = Pick<Session, 'sessionId' | 'larkAppId' | 'chatId' | 'chatType' | 'scope'
   | 'rootMessageId' | 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId'
-  | 'quoteTargetSenderOpenId' | 'quoteTargetSenderIsBot'>;
+  | 'quoteTargetSenderOpenId' | 'quoteTargetSenderIsBot'> & {
+  turnReplyContexts?: Record<string, { replyTargetSenderIsBot?: boolean }>;
+};
 
 export function privateReplyEnabled(s: Pick<ReplySession, 'larkAppId' | 'chatId' | 'chatType' | 'scope'>): boolean {
   return s.chatType === 'group' && s.scope !== 'chat' && !!s.larkAppId
     && readRoleReplyPrivately(s.larkAppId, s.chatId);
 }
 
-/** Undefined means ordinary delivery. Errors must propagate: never fall back to a public answer. */
+/** Undefined resumes the existing group reply path, including when private delivery fails. */
 export async function sendPrivateReply(
   s: ReplySession, turnId: string | undefined, content: string, msgType = 'text', uuid?: string,
 ): Promise<string | undefined> {
-  if (!privateReplyEnabled(s)) return undefined;
-  const sender = turnId ? pickTurnReplyTarget(s, turnId)?.senderOpenId : undefined;
-  if (!sender?.startsWith('ou_') || (s.quoteTargetId === turnId && s.quoteTargetSenderIsBot)) {
-    throw new Error('Private reply requires the questioner of the exact turn');
+  if (!privateReplyEnabled(s) || !turnId) return undefined;
+  const sender = pickTurnReplyTarget(s, turnId)?.senderOpenId;
+  const senderIsBot = s.turnReplyContexts?.[turnId]?.replyTargetSenderIsBot
+    ?? (s.quoteTargetId === turnId && s.quoteTargetSenderIsBot);
+  if (!sender?.startsWith('ou_') || senderIsBot) return undefined;
+  let messageId: string;
+  try {
+    messageId = await sendUserMessage(s.larkAppId!, sender, content, msgType, uuid);
+  } catch (err) {
+    logger.warn(`[private-reply] delivery failed for turn ${turnId}; using group reply: ${String(err)}`);
+    return undefined;
   }
-  const messageId = await sendUserMessage(s.larkAppId!, sender, content, msgType, uuid);
   const notice = readRolePrivateReplyNotice(s.larkAppId!, s.chatId);
   if (notice) {
     try {
-      // Only the configured text is public. A notice failure must not retry an already delivered answer.
+      // A notice failure must not retry or publicly resend an already delivered answer.
       await replyMessage(s.larkAppId!, s.rootMessageId, notice, 'text', true,
         undefined, undefined, { suppressHook: true });
     } catch (err) {

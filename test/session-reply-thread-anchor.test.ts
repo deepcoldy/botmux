@@ -151,7 +151,7 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
   });
 
-  it.each([false, true])('routes the actual daemon answer privately, failure=%s', async failure => {
+  it.each([false, true])('routes the actual daemon answer privately with group fallback, failure=%s', async failure => {
     const ds = seedSharedSession();
     ds.scope = 'thread';
     Object.assign(ds.session, {
@@ -166,8 +166,9 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     if (failure) mocks.sendUserMessage.mockRejectedValueOnce(new Error('DM denied'));
     const send = sessionReply('om_topic', 'private answer', 'text', APP, 'turn_a');
     if (failure) {
-      await expect(send).rejects.toThrow('DM denied');
-      expect(mocks.replyMessage).not.toHaveBeenCalled();
+      expect(await send).toBe('om_reply');
+      expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'private answer',
+        'text', true, undefined, expect.anything());
     } else {
       expect(await send).toBe('om_private');
       expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_topic', 'sent privately',
@@ -175,6 +176,23 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     }
     expect(mocks.sendUserMessage).toHaveBeenCalledWith(APP, 'ou_a', 'private answer', 'text', undefined);
     expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'om_command', 'evicted_turn'])('keeps an unregistered %s reply in its topic instead of messaging the last user', async turnId => {
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      quoteTargetId: 'turn_b', quoteTargetSenderOpenId: 'ou_b',
+      replyTargets: { turn_b: { senderOpenId: 'ou_b', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    expect(await sessionReply('om_topic', 'reply', 'text', APP, turnId)).toBe('om_reply');
+    expect(mocks.sendUserMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'reply',
+      'text', true, undefined, expect.anything());
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {
