@@ -597,10 +597,26 @@ const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc 
  *  Require the running glyph plus the panel's aligned label/description gap and
  *  elapsed-time suffix; completed/open rows and prose must stay inert. */
 const CLAUDE_ACTIVE_AGENT_PANEL_RE = /^\s*Tasks(?:\s*\([^\n]*\))?\s*\n(?:\s*[─━]+\s*\n)?(?:\s*[✔◻]\s+[^\n]*\n)*\s*◯\s+\S+(?:\s\S+)*?\s{2,}\S(?:.*\S)?\s{2,}\d+(?:h|m|s)(?:\s+\d+(?:m|s))?\s+·\s*[↓↑]\s*[\d.]+[kKmM]?\s+tokens\s*$/m;
+/** Capacity-queue notice Claude prints while a request is parked behind
+ *  the API-side concurrency limit. The TUI does not render the 「esc to
+ *  interrupt」 busy footer during this wait, so without an explicit pattern
+ *  the idle detector would flip to idle and settle the turn reaction to DONE
+ *  while the user's request is still queued. Line-anchored so transcript
+ *  prose quoting the string cannot pin an idle session busy. */
+const CLAUDE_QUEUE_NOTICE_RE = /(?:^|[\n\r])[ \t]*Too many current requests\b/m;
 const CLAUDE_BUSY_PATTERN = new RegExp(
-  `${CLAUDE_BUSY_FOOTER_RE.source}|${CLAUDE_ACTIVE_AGENT_PANEL_RE.source}`,
+  `${CLAUDE_BUSY_FOOTER_RE.source}|${CLAUDE_ACTIVE_AGENT_PANEL_RE.source}|${CLAUDE_QUEUE_NOTICE_RE.source}`,
   'm',
 );
+/** Pre-idle latch for the static queue screen: the notice can render once
+ *  and then emit no further PTY bytes while Claude waits for capacity, so
+ *  the viewport busy probe alone would time out and false-idle. Mirrors the
+ *  Trae adapter's queue handling. */
+const CLAUDE_STATIC_BUSY_PATTERN = CLAUDE_QUEUE_NOTICE_RE;
+/** Clear the queue latch when the real composer prompt redraws after the
+ *  queue resolves. `❯` is Claude's input glyph; the negative lookahead
+ *  excludes numbered list items in transcript prose. */
+const CLAUDE_STATIC_BUSY_CLEAR_PATTERN = /(?:^|[\n\r])\s*❯(?!\s*\d+\.)/;
 /** Escape hatch: force a specific chat:submit key regardless of
  *  keybindings.json. Accepts the same spellings as the config (e.g.
  *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
@@ -1221,6 +1237,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 不产生误报。本机 242 个 tmux pane 扫末行实测 0 误报。
     busyPattern: CLAUDE_BUSY_PATTERN,
     idleToBusyPattern: CLAUDE_BUSY_PATTERN,
+    staticBusyPattern: CLAUDE_STATIC_BUSY_PATTERN,
+    staticBusyClearPattern: CLAUDE_STATIC_BUSY_CLEAR_PATTERN,
     // Claude 家族在 spawn 时注入 SessionStart hook，回调
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
