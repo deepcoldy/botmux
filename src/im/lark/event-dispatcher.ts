@@ -1402,7 +1402,7 @@ export function updateBotOpenIdCrossRef(
 
 /** Command-position match: after stripping leading @mentions, the remaining
  *  text must begin with `/introduce` (optionally followed by whitespace).
- *  This is the same approach `parseForceTopicInvocation` takes for /t /topic.
+ *  This is the same approach `parseTopicHeader` takes for its /t /topic sentinel.
  *  Stricter than a bare token match — "please run /introduce" or similar
  *  quoted/explanatory text won't trigger. */
 const INTRODUCE_RE = /^\/introduce(?:\s|$)/i;
@@ -2665,7 +2665,7 @@ export function extractMessageTextForRouting(message: any): string | null {
     // text shape: {"text":"..."}. Lark stuffs placeholder keys like "@_user_1"
     // into obj.text; the human name only lives in message.mentions[].name. We
     // must resolve keys → @${name} so stripLeadingMentions can strip them
-    // before parseForceTopicInvocation sees the content. Mirrors the
+    // before parseTopicHeader sees the content. Mirrors the
     // resolveMentions logic in parseEventMessage.
     if (typeof obj?.text === 'string') {
       let text: string = obj.text;

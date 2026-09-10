@@ -309,12 +309,16 @@ export { validateWorkingDir };
 // for existing callers, same as `validateWorkingDir` above.
 export { resolveRepoSelection } from './repo-selection.js';
 
-// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让既有的
-// `parseForceTopicInvocation` 调用方在同一个模块面上找到它的升级版。
+// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
+// 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
+//
+// `parseForceTopicInvocation` 已由 `parseTopicHeader` 完全取代并删除：它只认「`/t` 必须
+// 在第 0 位」，认不出带标题的头部，留着会让两套判定在路由与 daemon 之间打架。
 export {
   parseTopicHeader,
   isTopicHeader,
   isTopicHeaderError,
+  topicHeaderCarriesSpec,
   TOPIC_HEADER_DIRECTIVES,
   type TopicHeader,
   type TopicHeaderError,
@@ -322,31 +326,6 @@ export {
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
-
-/**
- * Parse a force-topic invocation: `/t [prompt]` or `/topic [prompt]`.
- *
- * This is a routing meta-command, distinct from `parseSlashCommandInvocation`
- * (which routes to daemon command handlers). The match conditions are
- * deliberately tighter than the regular slash parser:
- *
- * - exact-prefix match (`/t` / `/topic`, case-insensitive); `/tea` / `/topical`
- *   must NOT match, otherwise we'd false-trigger on common /-prefixed words.
- * - tolerates leading whitespace (mention-stripping can leave a space).
- * - prompt is whatever follows the prefix (verbatim, including newlines).
- * - `/t` alone (no args) is allowed → empty prompt; the daemon treats it as
- *   topic setup, choosing either a repository picker or a visible thread that
- *   waits for the first real task according to the bot's cwd configuration.
- *
- * Returns null for anything else, so callers can fall through to the regular
- * `parseSlashCommandInvocation` / message-handling path.
- */
-export function parseForceTopicInvocation(content: string): { prompt: string } | null {
-  const trimmed = content.replace(/^\s+/, '');
-  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (!match) return null;
-  return { prompt: (match[2] ?? '').trim() };
-}
 
 /** Parse a user-authored slash command after leading @mentions have already
  *  been stripped. Messages that look like command examples or command lists

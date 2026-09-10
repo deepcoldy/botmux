@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => {
       openId ? { openId, type: 'user' as const } : undefined
     )),
     forkWorker: vi.fn((..._args: any[]) => undefined),
+    sendWorkerInput: vi.fn((..._args: any[]) => true),
     downloadResources: vi.fn(async (..._args: any[]) => ({ attachments: [] as unknown[], needLogin: false })),
     createdSessions: [] as any[],
     createSession: vi.fn(function (chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') {
@@ -99,7 +100,11 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
+  return {
+    ...actual,
+    forkWorker: (...args: any[]) => mocks.forkWorker(...args),
+    sendWorkerInput: (...args: any[]) => mocks.sendWorkerInput(...args),
+  };
 });
 
 vi.mock('../src/core/session-manager.js', async () => {
@@ -111,7 +116,9 @@ import { registerBot, getBot } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
+  __testOnly_handleThreadReply as handleThreadReply,
 } from '../src/daemon.js';
+import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import { __testOnly_sessionAgentConfig as sessionAgentConfig } from '../src/core/worker-pool.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
@@ -203,6 +210,7 @@ beforeEach(() => {
   mocks.sendMessage.mockResolvedValue('om_sent');
   mocks.getChatMode.mockResolvedValue('group');
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+  mocks.sendWorkerInput.mockReturnValue(true);
   registerAppBot();
 });
 
@@ -413,5 +421,174 @@ describe('指令头：共用层在非 Claude 的 CLI 上同样生效', () => {
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(sentContents()[0]).toContain('不支持推理档位');
+  });
+});
+
+
+// ─── thread 路径（话题内已有会话）───────────────────────────────────────────
+
+const THREAD_ROOT = 'om_thread_root';
+
+/** 在 THREAD_ROOT 上放一个跑着的会话，模拟「话题已在进行中」。 */
+function seedThreadSession(overrides: Record<string, unknown> = {}): DaemonSession {
+  const session: any = {
+    sessionId: 'sess-thread-existing',
+    chatId: GROUP,
+    rootMessageId: THREAD_ROOT,
+    title: '原标题',
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    chatType: 'group',
+    larkAppId: APP,
+    ownerOpenId: OWNER,
+    workingDir: botmuxRepo,
+    scope: 'thread',
+  };
+  const ds = {
+    session,
+    worker: { killed: false },
+    workerPort: null,
+    workerToken: null,
+    larkAppId: APP,
+    chatId: GROUP,
+    chatType: 'group',
+    scope: 'thread',
+    spawnedAt: Date.now(),
+    cliVersion: '1.0.0',
+    lastMessageAt: Date.now(),
+    hasHistory: true,
+    workingDir: botmuxRepo,
+    ...overrides,
+  } as unknown as DaemonSession;
+  activeSessions.set(sessionKey(THREAD_ROOT, APP), ds);
+  return ds;
+}
+
+/** 话题内的一条回复消息。 */
+function threadEvent(text: string, messageId: string): any {
+  return {
+    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      chat_id: GROUP,
+      chat_type: 'group',
+      message_type: 'text',
+      root_id: THREAD_ROOT,
+      thread_id: 'omt_thread_1',
+      content: JSON.stringify({ text }),
+      create_time: String(Date.now()),
+      mentions: [{ key: '@_user_1', name: 'Claude', id: { open_id: BOT_OPEN_ID }, id_type: 'open_id' }],
+    },
+  };
+}
+
+function threadCtx(messageId: string): RoutingContext {
+  return {
+    chatId: GROUP,
+    messageId,
+    chatType: 'group',
+    scope: 'thread',
+    anchor: THREAD_ROOT,
+    larkAppId: APP,
+  } as RoutingContext;
+}
+
+describe('指令头：已有会话的话题里一律拒绝（D6）', () => {
+  const refused: Array<{ name: string; text: string }> = [
+    { name: '带仓库指令', text: '/t /repo homelab 换个仓库' },
+    { name: '带模型指令', text: '/t /model sonnet 换个模型' },
+    { name: '带标题', text: '新标题 /t 继续干活' },
+    { name: '写错的头部', text: '新标题 /t /repo' },
+  ];
+
+  for (const { name, text } of refused) {
+    it(`${name} → 回一句「只在新话题第一条生效」，会话状态一点不动`, async () => {
+      const ds = seedThreadSession();
+
+      await handleThreadReply(threadEvent(text, 'om_thread_header'), threadCtx('om_thread_header'));
+
+      expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(botmuxRepo);
+      expect(ds.session.title).toBe('原标题');
+      expect(ds.spawnModelOverride).toBeUndefined();
+      expect(ds.session.reasoningEffort).toBeUndefined();
+      expect(sentContents()[0]).toContain('只在开新话题的第一条消息里生效');
+    });
+  }
+
+  it('裸 /t 与 /t 文案不受影响：照旧当普通文字交给 CLI', async () => {
+    seedThreadSession();
+
+    await handleThreadReply(threadEvent('/t 继续干活', 'om_thread_plain'), threadCtx('om_thread_plain'));
+
+    expect(sentContents().join('\n')).not.toContain('只在开新话题的第一条消息里生效');
+    expect(mocks.sendWorkerInput).toHaveBeenCalled();
+  });
+
+  it('非 Claude 的 CLI（codex）上同样拒绝', async () => {
+    registerAppBot({ cliId: 'codex' });
+    const ds = seedThreadSession();
+
+    await handleThreadReply(
+      threadEvent('/t /model gpt-5.6-sol 换个模型', 'om_thread_codex'),
+      threadCtx('om_thread_codex'),
+    );
+
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(sentContents()[0]).toContain('只在开新话题的第一条消息里生效');
+  });
+});
+
+describe('指令头：还没有会话的话题（手动转话题后的第一条）', () => {
+  it('照常生效 —— 仓库 / 模型 / 标题逐项落地，且不重复开新话题', async () => {
+    // 用户先手动把一条消息转成话题，再在话题里 @bot 发第一条：入站带 root_id + thread_id，
+    // 但这个 anchor 上还没有会话，路由因此走 handleNewTopic（scope 已经是 thread）。
+    expect(activeSessions.size).toBe(0);
+
+    await handleNewTopic(
+      threadEvent('线上排查 /t /repo homelab /model sonnet 看看告警', 'om_thread_first'),
+      threadCtx('om_thread_first'),
+    );
+
+    const ds = forkedSession();
+    expect(ds.workingDir).toBe(homelabRepo);
+    expect(ds.session.title).toBe('线上排查');
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
+    // scope 本来就是 thread，锚点保持在用户手动创建的那个话题根上。
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe(THREAD_ROOT);
+  });
+});
+
+describe('指令头：远端后端的 /model 能力门', () => {
+  it('riff 后端拒绝 /model，而不是退化成往 pane 敲字', async () => {
+    registerAppBot({
+      cliId: 'codex',
+      backendType: 'riff',
+      riff: { baseUrl: 'https://riff.example.invalid' },
+    });
+
+    await handleNewTopic(
+      groupEvent('/t /repo botmux /model gpt-5.6-sol 干活', 'om_riff_model'),
+      groupCtx('om_riff_model'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createdSessions).toHaveLength(0);
+    expect(sentContents()[0]).toContain('带不了模型');
+  });
+
+  it('mojo 远端后端能带模型 → 放行', async () => {
+    registerAppBot({ cliId: 'mojo', defaultWorkingDir: botmuxRepo });
+
+    await handleNewTopic(
+      groupEvent('/t /model glm-5-turbo 干活', 'om_mojo_model'),
+      groupCtx('om_mojo_model'),
+    );
+
+    const ds = forkedSession();
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('glm-5-turbo');
   });
 });

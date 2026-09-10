@@ -1113,6 +1113,7 @@ export const messages: Record<string, string> = {
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。
+  'daemon.topic_header_needs_new_topic': '⚠️ 话题指令头只在开新话题的第一条消息里生效，本条没有执行。要在进行中的话题里换仓库/模型/推理档位，请分别单独发 `/repo`、`/model`、`/effort`。',
   'daemon.topic_header_ready': '💬 话题已就绪（{summary}）。请在话题内发送任务。',
   'daemon.topic_header_ready_repo': '仓库 {repo}',
   'daemon.topic_header_ready_model': '模型 {model}',

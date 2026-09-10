@@ -1115,6 +1115,7 @@ export const messages: Record<string, string> = {
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.
+  'daemon.topic_header_needs_new_topic': '⚠️ A topic header only takes effect on the first message of a NEW topic, so this one did nothing. To change repo/model/reasoning effort inside a running topic, send `/repo`, `/model` or `/effort` on their own.',
   'daemon.topic_header_ready': '💬 Topic ready ({summary}). Send a task in this topic.',
   'daemon.topic_header_ready_repo': 'repo {repo}',
   'daemon.topic_header_ready_model': 'model {model}',

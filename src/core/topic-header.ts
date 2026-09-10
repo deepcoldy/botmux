@@ -70,6 +70,16 @@ export function isTopicHeaderError(parsed: TopicHeaderParse): parsed is TopicHea
   return parsed !== null && parsed.ok === false;
 }
 
+/**
+ * 这个头部有没有真的交代会话规格（标题或任一指令）。
+ *
+ * 裸 `/t` 与 `/t 文案` 返回 false —— 它们不携带任何只能在会话诞生那一刻落地的状态，
+ * 所以在「已有会话」的场景里可以继续按今天的方式处理，不必拒绝（决策 D6 的边界）。
+ */
+export function topicHeaderCarriesSpec(header: TopicHeader): boolean {
+  return header.title !== undefined || Object.keys(header.directives).length > 0;
+}
+
 interface Token {
   /** token 文本（双引号包裹时是去掉引号后的内容）。 */
   readonly text: string;

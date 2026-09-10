@@ -305,8 +305,8 @@ import {
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
-import { parseTopicHeader, isTopicHeader, isTopicHeaderError } from './core/topic-header.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
+import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderCarriesSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -4122,10 +4122,6 @@ async function replyGrantRestrictionIfNeeded(
   if (!text) return false;
   await sessionReply(anchor, text, 'text', larkAppId);
   return true;
-}
-
-function forceTopicCommandLabel(content: string): '/t' | '/topic' {
-  return /^\/topic(?:\s|$)/i.test(content.trimStart()) ? '/topic' : '/t';
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -19912,15 +19908,33 @@ async function handleThreadReplyAdmitted(
     }
   }
 
-  const threadForceTopic = parseForceTopicInvocation(cmdContent);
-  if (threadForceTopic) {
+  const threadHeaderParse = parseTopicHeader(stripBotMentions(
+    cmdContent,
+    parsed.mentions,
+    { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+  ));
+  if (threadHeaderParse !== null) {
     if (await replyGrantRestrictionIfNeeded(
       larkAppId,
       threadChatId,
       threadSenderOpenId,
       anchor,
-      forceTopicCommandLabel(cmdContent),
+      threadHeaderParse.sentinel,
     )) {
+      return;
+    }
+    // 指令头只在**尚无会话**的场景生效（D6）。标题/仓库/模型/推理强度都只能在会话诞生
+    // 那一刻落地，进行中的话题里让它半截生效（换了模型却没换仓库）比直接报错难查得多。
+    // 裸 `/t` 与 `/t 文案` 不带这类状态，照旧当普通文字交给 CLI，行为不变。
+    // 写错的头部同样拒绝：解析器只在用户已经写了标题或指令时才报错，意图是明确的。
+    if (isTopicHeaderError(threadHeaderParse) || topicHeaderCarriesSpec(threadHeaderParse)) {
+      await sessionReply(
+        anchor,
+        tr('daemon.topic_header_needs_new_topic', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      logger.info(`[/t] Refused topic header inside an existing topic (${anchor.substring(0, 12)})`);
       return;
     }
   }
