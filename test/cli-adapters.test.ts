@@ -2393,6 +2393,16 @@ describe('busyPattern', () => {
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy.source);
   });
 
+  it('claude-code keeps capacity-queued requests busy until the composer returns', () => {
+    const claude = createCliAdapterSync('claude-code');
+    const queued = 'Too many current requests. Your queue position is 202. Please wait for a while.';
+
+    expect(claude.busyPattern!.test(queued)).toBe(true);
+    expect(claude.staticBusyPattern!.test(queued)).toBe(true);
+    expect(claude.staticBusyClearPattern!.test('\n❯ ')).toBe(true);
+    expect(claude.busyPattern!.test(`The transcript said: ${queued}`)).toBe(false);
+  });
+
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
     // Regression: a static capacity-queue screen matches readyPattern's
     // `\d+% left` status-bar arm and survives the 2s quiescence window,
