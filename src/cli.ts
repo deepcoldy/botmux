@@ -42,6 +42,7 @@ import {
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
+import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -322,6 +323,7 @@ import {
   resolveDaemonIpcPort,
   type OnlineDaemonInfo,
 } from './utils/daemon-discovery.js';
+import { isHeadlessChatId } from './services/headless-session-store.js';
 import {
   isSuspendableBackendType,
   killPersistentBackendTarget,
@@ -3572,6 +3574,19 @@ interface SessionData {
   /** 'thread' (legacy default) → cmdSend uses reply_in_thread to rootMessageId.
    *  'chat' → cmdSend posts a plain message to chatId (普通群整群一个会话). */
   scope?: 'thread' | 'chat';
+  headless?: {
+    id: string;
+    createdAt: string;
+    source: 'cli';
+    latestTriggerId?: string;
+    lastRunAt?: string;
+    lastPublishedAt?: string;
+    lastPublishedMessageId?: string;
+    boundAt?: string;
+    boundChatId?: string;
+    boundRootMessageId?: string;
+    boundScope?: 'thread' | 'chat';
+  };
   deferredScheduleRun?: DeferredScheduleRunData;
   vcMeetingReceiver?: {
     listenerAppId: string;
@@ -4110,7 +4125,8 @@ function formatSessionRow(
     const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 18)) : '-';
     parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
   }
-  const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
+  const titleText = `${s.headless ? '[headless] ' : ''}${s.title || '(untitled)'}`;
+  const title = padEndDisplay(truncate(titleText.replace(/[\r\n]+/g, ' '), cols.title), cols.title);
   const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
   const displayPid = sessionDisplayPid(s);
   const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
@@ -4350,11 +4366,13 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
 }
 
 function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
+  if (s.headless || isHeadlessChatId(s.chatId)) return 'headless';
   if (isAdoptedSession(s)) return adoptTargetLabel(s);
   return sessionBackingInfo(s, snapshot).label;
 }
 
 function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSnapshot): boolean {
+  if (s.headless || isHeadlessChatId(s.chatId)) return true;
   if (isSuspendableBackendType(s.backendType)) {
     // Unknown means the backend probe itself was inconclusive; keep the session
     // rather than closing a potentially recoverable conversation from `list`.
@@ -6437,6 +6455,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
                                        v2 历史 run 私有静态归档；retire 在维护窗双验后原子迁入 quarantine
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
+  session create|start|run|send|wait|result|list|bind|publish
+                                       自动化会话接口：后台运行、查询结果、
+                                       并按需发布/绑定到群或话题
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
   report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
   project init|status|update|close|resume [...]
@@ -7971,8 +7992,8 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
 
 /** Central CLI session-transport capability check. A turn has NO Feishu
  *  transport when either the running bot is core-only (apiOnly) OR the turn runs
- *  in an HTTP virtual session (BOTMUX_CHAT_ID starts with http_async_ or
- *  http_wait_). This is the single source of truth every Feishu-touching CLI
+ *  in a virtual session (BOTMUX_CHAT_ID starts with http_async_, http_wait_, or
+ *  headless_). This is the single source of truth every Feishu-touching CLI
  *  command consults — send/dispatch (writes) AND history/quoted/bots (reads) —
  *  so a normal bot in a virtual session can't reach Feishu by reloading
  *  bots.json for a real client (the daemon side is already gated by
@@ -7980,7 +8001,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
  *  read-only and total (never throws). */
 function currentTurnHasNoTransport(): boolean {
   const chatId = process.env.BOTMUX_CHAT_ID ?? '';
-  if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+  if (isHttpVirtualSession(chatId)) return true;
   const appId = process.env.BOTMUX_LARK_APP_ID;
   return !!appId && currentBotIsApiOnly(appId);
 }
@@ -8009,7 +8030,7 @@ function managedOriginHasNoTransport(): boolean {
       return currentTurnHasNoTransport();
     }
     const chatId = s.chatId ?? '';
-    if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+    if (isHttpVirtualSession(chatId)) return true;
     return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
   } catch {
     return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
@@ -8024,13 +8045,19 @@ function managedOriginHasNoTransport(): boolean {
 function assertTurnTransportOrExit(op: string): void {
   if (!currentTurnHasNoTransport()) return;
   const chatId = process.env.BOTMUX_CHAT_ID ?? '';
-  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
+  const headless = chatId.startsWith('headless_');
+  const why = headless
+    ? 'this turn runs in a headless automation session (no Feishu chat)'
+    : isHttpVirtualSession(chatId)
     ? 'this turn runs in an HTTP control-API session (no Feishu chat)'
     : 'this is a core-only (apiOnly) bot with no Feishu connection';
+  const channel = headless
+    ? 'headless session result channel'
+    : 'HTTP control API (input via trigger, output via trigger-result)';
   console.error(
     `botmux ${op} is unavailable: ${why}.\n` +
-    `Feishu read/write is not possible here — the turn communicates only over the HTTP\n` +
-    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+    `Feishu read/write is not possible here — the turn communicates only over the\n` +
+    `${channel}. Produce your normal answer.`,
   );
   process.exit(2);
 }
@@ -8042,7 +8069,7 @@ function assertTurnTransportOrExit(op: string): void {
  *  close the cross-session bypass. Read-only + total (never throws besides exit). */
 function assertSessionTransportOrExit(session: { chatId?: string; larkAppId?: string }, op: string): void {
   const chatId = session.chatId ?? '';
-  const virtual = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  const virtual = isHttpVirtualSession(chatId);
   const apiOnly = !!session.larkAppId && currentBotIsApiOnly(session.larkAppId);
   if (!virtual && !apiOnly) return;
   console.error(
@@ -14665,7 +14692,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
-// or an HTTP virtual session) must not run ANY Lark-facing command. The managed
+// or a virtual/headless session) must not run ANY Lark-facing command. The managed
 // origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
 // process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
 // env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
@@ -14682,9 +14709,9 @@ const LARK_FACING_COMMANDS = new Set([
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
   console.error(
     `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
-    `(core-only apiOnly bot or HTTP control-API session).\n` +
-    `Feishu read/write is not possible for this turn — it communicates only over the HTTP\n` +
-    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+    `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
+    `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
+    `through the current session result channel.`,
   );
   process.exit(2);
 }
@@ -14987,6 +15014,16 @@ switch (command) {
   case 'goal': {
     const { cmdGoal } = await import('./workflows/v3/goal-cli.js');
     process.exitCode = await cmdGoal(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'headless': {
+    const { cmdHeadless } = await import('./cli/headless-command.js');
+    process.exitCode = await cmdHeadless(process.argv.slice(3));
+    break;
+  }
+  case 'session': {
+    const { cmdSession } = await import('./cli/session-command.js');
+    process.exitCode = await cmdSession(process.argv.slice(3));
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;

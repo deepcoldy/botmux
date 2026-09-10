@@ -527,6 +527,7 @@ import {
   sessionAnchorId,
   storedSessionAnchorId,
   isDocNativeSession,
+  isHttpVirtualSession,
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
@@ -877,6 +878,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
     && ds.pendingRawInput === undefined
     && !ds.adoptedFrom
     && !ds.session.adoptedFrom
+    && !ds.session.headless
     && !ds.session.queued
     && !isRelayableRealSession(ds);
 }
@@ -8943,6 +8945,11 @@ function codexAppDeliverySinkForTurn(
   return 'lark';
 }
 
+function virtualDeliverySinkForChatId(chatId: string | undefined | null): CodexAppDeliverySink | undefined {
+  if (!isHttpVirtualSession(chatId)) return undefined;
+  return chatId?.startsWith('http_wait_') ? 'http_wait' : 'http_async';
+}
+
 /** A recovered transient/non-IM sink has no safe provider to replay into.
  * Treat it as consumed so the runner can advance, but never fall through to a
  * Lark card. Doc-comment replay also fails closed: chunk posting has no durable
@@ -8954,11 +8961,7 @@ function codexAppDeliveryMustFailClosed(
   const sink = entry.deliverySink
     ?? (ds.session.docCommentTargets?.[entry.turnId]
       ? 'doc_comment'
-      : ds.chatId.startsWith('http_wait_')
-        ? 'http_wait'
-        : ds.chatId.startsWith('http_async_')
-          ? 'http_async'
-          : 'lark');
+      : virtualDeliverySinkForChatId(ds.chatId) ?? 'lark');
   if (sink === 'suppressed') return true;
   if (sink === 'doc_comment') return !ds.docCommentTurns?.has(entry.turnId);
   if (sink === 'http_wait') return !ds.pendingWaitPromises?.has(entry.turnId);
@@ -13681,7 +13684,8 @@ function setupWorkerHandlers(
           }
 
           const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
-          const asyncSink = !!asyncResult || ds.chatId.startsWith('http_async_');
+          const asyncSink = !!asyncResult
+            || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
             nonLarkFailureHandled = true;
             const failedAt = Date.now();
@@ -15333,8 +15337,7 @@ export function adoptSandboxBlocked(
     // so it could read this host's bots.json / sibling creds on behalf of a
     // no-transport turn. Convert to cold-start instead (same as sandbox adopt).
     || botCfg.apiOnly === true
-    || (typeof session?.chatId === 'string'
-        && (session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')))
+    || isHttpVirtualSession(session?.chatId)
     || session?.sandbox === true
     || sandboxEnabled();
 }

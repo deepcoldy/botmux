@@ -139,7 +139,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -150,7 +150,7 @@ import {
 } from '../services/group-collaboration-mode-store.js';
 import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
 import { parseSpawnRequest } from './session-create.js';
@@ -178,6 +178,12 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import {
+  listHeadlessSessions,
+  readHeadlessSession,
+  updateHeadlessSession,
+  type HeadlessSessionRecord,
+} from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -340,6 +346,8 @@ import {
 // active→closed during THIS run — i.e. restore-time zombies — without replaying
 // the entire closed-session history on every connect.
 const PROCESS_START_MS = Date.now();
+
+type HeadlessReasoningEffort = NonNullable<HeadlessSessionRecord['reasoningEffort']>;
 
 export interface IpcServerHandle {
   port: number;
@@ -2690,6 +2698,293 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
     return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
   }
   jsonRes(res, 200, r);
+  });
+});
+
+function parseHeadlessCreateBody(body: unknown): {
+  ok: true;
+  value: {
+    title?: string;
+    workingDir?: string;
+    model?: string;
+    reasoningEffort?: HeadlessReasoningEffort;
+  };
+} | { ok: false; status: number; error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, status: 400, error: 'bad_request' };
+  }
+  const b = body as Record<string, unknown>;
+  const out: {
+    title?: string;
+    workingDir?: string;
+    model?: string;
+    reasoningEffort?: HeadlessReasoningEffort;
+  } = {};
+  if (b.title !== undefined) {
+    if (typeof b.title !== 'string' || !b.title.trim() || Array.from(b.title.trim()).length > 200) {
+      return { ok: false, status: 400, error: 'invalid_title' };
+    }
+    out.title = b.title.trim();
+  }
+  if (b.workingDir !== undefined) {
+    if (typeof b.workingDir !== 'string' || !b.workingDir.trim()) {
+      return { ok: false, status: 400, error: 'invalid_working_dir' };
+    }
+    out.workingDir = b.workingDir.trim();
+  }
+  if (b.model !== undefined) {
+    if (typeof b.model !== 'string' || !b.model.trim() || b.model.length > 200) {
+      return { ok: false, status: 400, error: 'invalid_model' };
+    }
+    out.model = b.model.trim();
+  }
+  if (b.reasoningEffort !== undefined) {
+    if (!isCodexReasoningEffort(b.reasoningEffort)) {
+      return { ok: false, status: 400, error: 'invalid_reasoning_effort' };
+    }
+    out.reasoningEffort = b.reasoningEffort as HeadlessReasoningEffort;
+  }
+  return { ok: true, value: out };
+}
+
+function findHeadlessRecordForThisDaemon(idOrSessionId: string): HeadlessSessionRecord | null {
+  const record = readHeadlessSession(idOrSessionId);
+  if (!record || record.larkAppId !== cachedLarkAppId) return null;
+  return record;
+}
+
+ipcRoute('GET', '/api/headless/sessions', (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const sessions = new Map(sessionStore.listSessions().map(session => [session.sessionId, session]));
+  const records = listHeadlessSessions()
+    .filter(record => record.larkAppId === cachedLarkAppId)
+    .map(record => {
+      const session = sessions.get(record.sessionId);
+      return {
+        ...record,
+        status: session?.status ?? 'missing',
+        chatId: session?.chatId,
+        rootMessageId: session?.rootMessageId,
+      };
+    });
+  return jsonRes(res, 200, { ok: true, sessions: records });
+});
+
+ipcRoute('POST', '/api/headless/sessions', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const parsed = parseHeadlessCreateBody(body);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
+    const r = await createHeadlessSession(activeSessions, undefined, {
+      larkAppId: cachedLarkAppId,
+      ...parsed.value,
+    });
+    return jsonRes(res, r.ok ? 200 : 400, r);
+  });
+});
+
+ipcRoute('GET', '/api/headless/sessions/:sessionId', (_req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  const ds = findActiveBySessionId(record.sessionId);
+  const session = ds?.session ?? sessionStore.getOwnedSession(record.sessionId);
+  return jsonRes(res, 200, {
+    ok: true,
+    session: record,
+    status: session?.status ?? 'missing',
+    chatId: session?.chatId,
+    rootMessageId: session?.rootMessageId,
+  });
+});
+
+ipcRoute('POST', '/api/headless/sessions/:sessionId/publish', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const targetChatId = typeof body.chatId === 'string' && body.chatId.trim()
+    ? body.chatId.trim()
+    : record.boundChatId ?? '';
+  const rootMessageId = typeof body.rootMessageId === 'string' && body.rootMessageId.trim()
+    ? body.rootMessageId.trim()
+    : record.boundScope === 'thread' ? record.boundRootMessageId ?? '' : '';
+  const triggerId = typeof body.triggerId === 'string' && body.triggerId.trim()
+    ? body.triggerId.trim()
+    : record.latestTriggerId;
+  if (!triggerId) return jsonRes(res, 409, { ok: false, error: 'no_trigger' });
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: record.boundChatId ? 'invalid_chat_id' : 'chat_id_required' });
+  }
+  if (rootMessageId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootMessageId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_root_message_id' });
+  }
+  const result = buildAsyncTriggerLookupResponse(record.sessionId, triggerId);
+  if (result.state !== 'completed' || result.output?.content === undefined) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: result.state === 'running' ? 'trigger_running' : 'result_not_available',
+      result,
+    });
+  }
+  try {
+    const content = result.output.content;
+    if (!content.trim()) {
+      return jsonRes(res, 409, { ok: false, error: 'empty_result', result });
+    }
+    const messageId = rootMessageId
+      ? await replyMessage(cachedLarkAppId, rootMessageId, content, 'text', true)
+      : await sendMessage(cachedLarkAppId, targetChatId, content, 'text');
+    const publishedAt = new Date().toISOString();
+    let updated: HeadlessSessionRecord | null = null;
+    let metadataWarning: string | undefined;
+    try {
+      updated = updateHeadlessSession(record.id, current => {
+        current.lastPublishedAt = publishedAt;
+        current.lastPublishedMessageId = messageId;
+      });
+    } catch (error) {
+      metadataWarning = error instanceof Error ? error.message : String(error);
+      logger.warn(`[headless] publish metadata update failed for ${record.id}: ${metadataWarning}`);
+    }
+    const session = findOwnedSessionRecord(record.sessionId);
+    if (session?.headless) {
+      session.headless.lastPublishedAt = publishedAt;
+      session.headless.lastPublishedMessageId = messageId;
+      sessionStore.updateSession(session);
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      messageId,
+      triggerId: result.triggerId,
+      session: updated ?? record,
+      ...(metadataWarning ? { metadataWarning } : {}),
+    });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const targetChatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  let rootMessageId = typeof body.rootMessageId === 'string' ? body.rootMessageId.trim() : '';
+  const scope = body.scope === 'thread' ? 'thread' : body.scope === 'chat' ? 'chat' : undefined;
+  const replay = body.replay === 'none' ? 'none' : 'latest';
+  const triggerId = typeof body.triggerId === 'string' && body.triggerId.trim()
+    ? body.triggerId.trim()
+    : record.latestTriggerId;
+  const title = typeof body.title === 'string' && body.title.trim()
+    ? body.title.trim().slice(0, 200)
+    : record.title;
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const targetScope = scope ?? 'thread';
+  if (rootMessageId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootMessageId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_root_message_id' });
+  }
+  if (!rootMessageId && targetScope === 'chat') {
+    return jsonRes(res, 400, { ok: false, error: 'root_message_id_required_for_chat_scope' });
+  }
+  let replayContent: string | undefined;
+  let replayTriggerId: string | undefined;
+  if (replay === 'latest') {
+    if (!triggerId) return jsonRes(res, 409, { ok: false, error: 'no_trigger' });
+    const latestResult = buildAsyncTriggerLookupResponse(record.sessionId, triggerId);
+    if (latestResult.state !== 'completed' || latestResult.output?.content === undefined) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: latestResult.state === 'running' ? 'trigger_running' : 'result_not_available',
+        result: latestResult,
+      });
+    }
+    if (!latestResult.output.content.trim()) {
+      return jsonRes(res, 409, { ok: false, error: 'empty_result', result: latestResult });
+    }
+    replayContent = latestResult.output.content;
+    replayTriggerId = latestResult.triggerId;
+  }
+  let createdRootMessage = false;
+  if (!rootMessageId) {
+    try {
+      rootMessageId = await sendMessage(cachedLarkAppId, targetChatId, title, 'text');
+      createdRootMessage = true;
+    } catch (error) {
+      return jsonRes(res, 502, {
+        ok: false,
+        error: 'topic_create_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  const result = await transferSession(record.sessionId, targetChatId, rootMessageId, 'group', targetScope);
+  if (!result.ok) {
+    if (createdRootMessage) {
+      deleteMessage(cachedLarkAppId, rootMessageId).catch(() => { /* best-effort cleanup */ });
+    }
+    return jsonRes(res, 409, { ok: false, error: result.error });
+  }
+  const boundAt = new Date().toISOString();
+  let replayMessageId: string | undefined;
+  let replayError: string | undefined;
+  if (replayContent) {
+    try {
+      replayMessageId = targetScope === 'thread'
+        ? await replyMessage(cachedLarkAppId, rootMessageId, replayContent, 'text', true)
+        : await sendMessage(cachedLarkAppId, targetChatId, replayContent, 'text');
+    } catch (error) {
+      replayError = error instanceof Error ? error.message : String(error);
+      logger.warn(`[headless] replay failed after bind for ${record.id}: ${replayError}`);
+    }
+  }
+  let updated: HeadlessSessionRecord | null = null;
+  let metadataWarning: string | undefined;
+  try {
+    updated = updateHeadlessSession(record.id, current => {
+      current.boundAt = boundAt;
+      current.boundChatId = targetChatId;
+      current.boundRootMessageId = rootMessageId;
+      current.boundScope = targetScope;
+      if (replayMessageId) {
+        current.lastPublishedAt = boundAt;
+        current.lastPublishedMessageId = replayMessageId;
+      }
+    });
+  } catch (error) {
+    metadataWarning = error instanceof Error ? error.message : String(error);
+    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
+  }
+  const session = findOwnedSessionRecord(record.sessionId);
+  if (session?.headless) {
+    session.headless.boundAt = boundAt;
+    session.headless.boundChatId = targetChatId;
+    session.headless.boundRootMessageId = rootMessageId;
+    session.headless.boundScope = targetScope;
+    if (replayMessageId) {
+      session.headless.lastPublishedAt = boundAt;
+      session.headless.lastPublishedMessageId = replayMessageId;
+    }
+    sessionStore.updateSession(session);
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    sessionId: record.sessionId,
+    rootMessageId,
+    replayStatus: replayContent ? (replayMessageId ? 'published' : 'failed') : 'skipped',
+    ...(replayMessageId ? { replayMessageId, replayTriggerId } : {}),
+    ...(replayError ? { replayError } : {}),
+    session: updated ?? record,
+    ...(metadataWarning ? { metadataWarning } : {}),
   });
 });
 

@@ -280,6 +280,23 @@ export interface Session {
   /** This chat-scoped automation deliberately has no topic seed. Prevents the
    *  chat-mode conversion guard from treating chatId as a replyable message id. */
   externalTriggerTopicless?: boolean;
+  /** Session created by `botmux headless`: no Lark chat is bound until an
+   *  explicit publish/bind command provides one. The synthetic chat/root ids
+   *  keep the existing session store and worker lifecycle reusable while every
+   *  Lark-facing path can fail closed through larkTransportEnabled(). */
+  headless?: {
+    id: string;
+    createdAt: string;
+    source: 'cli';
+    latestTriggerId?: string;
+    lastRunAt?: string;
+    lastPublishedAt?: string;
+    lastPublishedMessageId?: string;
+    boundAt?: string;
+    boundChatId?: string;
+    boundRootMessageId?: string;
+    boundScope?: 'thread' | 'chat';
+  };
   /** A silent `executionPosition='new-topic'` schedule starts without a Lark
    *  root message. `routingAnchor` is the durable daemon-internal identity for
    *  that one run; the first successful `botmux send` materializes a real root
