@@ -51,6 +51,7 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -214,6 +215,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_bypassCodexHookTrust'
+  | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -436,6 +438,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
     }
     patch.bypassCodexHookTrust = obj.bypassCodexHookTrust;
+  }
+  if ('hideCodexRateLimitModelNudge' in obj) {
+    if (typeof obj.hideCodexRateLimitModelNudge !== 'boolean') {
+      return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
+    }
+    patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

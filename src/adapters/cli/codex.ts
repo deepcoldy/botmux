@@ -177,18 +177,24 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
       // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
+      // A submit Enter can accept Codex's low-quota picker (default: switch).
+      // Suppress it at the TUI boundary, including the RPC viewer. Keep this
+      // independent of approval/sandbox bypass and leave user config untouched.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       if (remoteWsUrl && remoteThreadId) {
         // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
         // NO terminal input path, so codex's interactive "Update available … Press
         // enter to continue" dialog would block the resume forever and freeze the
         // Web terminal. Disable the check at the PROCESS level (never the user's
         // global config). The bounded startup-dialog watcher is only a fail-safe.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
@@ -220,6 +226,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // not); the host-side daily monitor reports newer versions to the owner.
         '-c',
         'check_for_update_on_startup=false',
+        ...modelNudgeArgs,
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by

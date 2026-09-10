@@ -42,6 +42,10 @@ describe('worker → codex buildArgs wiring (source lock)', () => {
     expect(call).toContain('bypassHookTrust: config.bypassCodexHookTrust,');
   });
 
+  it('passes the live model-nudge toggle into every Codex launch', () => {
+    expect(call).toContain('hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,');
+  });
+
   it('passes the RPC viewer fields so the --remote early-return actually fires', () => {
     // Both together or neither (codex.ts branch guards on both). Their loss is what
     // regressed in a0fa71010 — restore-locked here.

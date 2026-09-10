@@ -309,6 +309,10 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
+  /** Suppress Codex's low-quota model-switch picker for managed launches.
+   *  Default ON; false leaves the CLI's own notice configuration in control.
+   *  Applied per process; never edits the user's Codex config. */
+  hideCodexRateLimitModelNudge?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -450,6 +454,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
+  if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'

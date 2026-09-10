@@ -1015,6 +1015,7 @@ interface ResolvedDashboardSettings {
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1615,6 +1616,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,
