@@ -45,9 +45,17 @@ describe('parseTopicHeader —— §3 边界情况表', () => {
       },
     },
     {
-      row: '指令缺参数（… /t /repo 结尾）→ 拒绝：用法错误',
+      // 设计文档 §3 原表把「缺参数」一律判为拒绝；`/repo` 例外，因为它今天就有裸形式
+      //（`/t /repo` = 在默认目录直接开会话），既有用户习惯必须原样兼容。缺参数的拒绝
+      // 因此只对没有裸形式的 `/model` `/effort` 生效。
+      row: '指令缺参数（… /t /model 结尾）→ 拒绝：用法错误',
+      input: '日常运维 /t /model',
+      expected: { ok: false, kind: 'missing_arg', directive: 'model' },
+    },
+    {
+      row: '裸 /repo（无参数）→ 记成 null，沿用今天「默认目录直接开会话」的语义',
       input: '日常运维 /t /repo',
-      expected: { ok: false, kind: 'missing_arg', directive: 'repo' },
+      expected: { title: '日常运维', directives: { repo: null }, prompt: '' },
     },
     {
       row: '指令位置出现白名单外的 /xxx → 拒绝：未知指令',
@@ -222,9 +230,19 @@ describe('parseTopicHeader —— 指令参数细节', () => {
     });
   });
 
-  it('参数位上出现另一条头部指令 → 判缺参数，而不是把它当仓库名', () => {
-    expect(shape(parseTopicHeader('/t /repo /model opus'))).toEqual({
-      ok: false, kind: 'missing_arg', directive: 'repo',
+  it('参数位上出现另一条头部指令 → 不当仓库名吃掉', () => {
+    // `/repo` 有裸形式：后面那条 `/model` 照常解析，两条指令都生效。
+    expect(shape(parseTopicHeader('/t /repo /model opus 干活'))).toEqual({
+      title: undefined,
+      directives: { repo: null, model: 'opus' },
+      prompt: '干活',
+    });
+    // 没有裸形式的指令仍然判缺参数。
+    expect(shape(parseTopicHeader('/t /model /effort high'))).toEqual({
+      ok: false, kind: 'missing_arg', directive: 'model',
+    });
+    expect(shape(parseTopicHeader('/t /effort'))).toEqual({
+      ok: false, kind: 'missing_arg', directive: 'effort',
     });
   });
 

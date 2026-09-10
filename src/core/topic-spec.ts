@@ -56,6 +56,9 @@ export interface TopicSpec {
   title?: string;
   /** 已解析的绝对目录；缺席表示头部没写 `/repo`，按 bot 现有的钉目录/选仓逻辑走。 */
   workingDir?: string;
+  /** 头部里写的是裸 `/repo`（不带参数）：沿用它今天的语义 —— 不弹选仓卡，直接在默认
+   *  工作目录起会话（选仓卡上「直接开始」按钮的文本孪生）。与 `workingDir` 互斥。 */
+  repoStartInDefaultDir?: true;
   /** 仓库展示名，用于确认回复。 */
   repoDisplayName?: string;
   /** 本次 spawn 的模型（落 `DaemonSession.spawnModelOverride`，内存态、不持久化）。 */
@@ -84,7 +87,10 @@ export function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContext): To
 
   if (header.title) spec.title = header.title;
 
-  const repoArg = header.directives.repo?.trim();
+  const repoDirective = header.directives.repo;
+  // 裸 `/repo`（写了指令但没带参数）—— 解析器记成 null。既有语义原样保留。
+  if (repoDirective === null) spec.repoStartInDefaultDir = true;
+  const repoArg = repoDirective?.trim();
   if (repoArg) {
     if (/^\d+$/.test(repoArg)) {
       errors.push({ kind: 'repo_numeric', arg: repoArg });

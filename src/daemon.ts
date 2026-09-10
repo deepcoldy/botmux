@@ -18649,7 +18649,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 「回一句 ready 就不建会话」的早退：标题/模型/推理强度是会话状态，没有会话就没地方放。
   // 于是照常建会话，把 CLI 空跑起来等下一条，与 `/repo` 冷启动的 emptyStart 同语义。
   const topicHeaderIdleStart = isBareForceTopic && !!topicSpec && (
-    !!topicSpec.title || !!topicSpec.workingDir || !!topicSpec.model || !!topicSpec.reasoningEffort
+    !!topicSpec.title || !!topicSpec.workingDir || !!topicSpec.repoStartInDefaultDir
+    || !!topicSpec.model || !!topicSpec.reasoningEffort
   );
   // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
   // (a quota denial must have zero external side effects), so by the time the
@@ -18744,8 +18745,22 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // （card-handler 的 repo_select → commitRepoSelection）同样不建。所以显式选仓要把
   // pinnedFromBotDefault 一起翻成 false，否则用户点名的目录恰好等于 bot 默认目录时
   // 会被悄悄改道去建 worktree，与点卡片的结果不一致。
-  const pinnedWorkingDir = topicSpec?.workingDir ?? configPinnedWorkingDir;
-  const pinnedFromBotDefault = topicSpec?.workingDir ? false : configPinnedFromBotDefault;
+  //
+  // 裸 `/repo`（不带参数）沿用它今天的语义，一个字都不改：不弹选仓卡、不建 worktree，
+  // 直接在 `getSessionWorkingDir` 解析出的默认目录里起会话 —— 就是 command-handler 里
+  // `!repoArg && ds.pendingRepo` 那条分支（选仓卡「直接开始」按钮的文本孪生）。
+  const headerStartInDefaultDir = topicSpec?.repoStartInDefaultDir === true;
+  const headerDefaultStartDir = headerStartInDefaultDir
+    ? getSessionWorkingDir({ workingDir: configPinnedWorkingDir, larkAppId } as DaemonSession)
+    : undefined;
+  const pinnedWorkingDir = topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
+  const pinnedFromBotDefault = (topicSpec?.workingDir || headerStartInDefaultDir)
+    ? false
+    : configPinnedFromBotDefault;
+  // 写进会话记录（会被兄弟 bot 的 inherit 层继承）的只有「真的钉了目录」那两种来源。
+  // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
+  // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
+  const persistedWorkingDir = topicSpec?.workingDir ?? configPinnedWorkingDir;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -18934,8 +18949,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // resolveSessionLaunchModel 把它排在最高优先级。
     ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
-  if (pinnedWorkingDir) {
-    ds.session.workingDir = pinnedWorkingDir;
+  if (persistedWorkingDir) {
+    ds.session.workingDir = persistedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
   const substituteReplyMode = substituteTrigger
@@ -19012,7 +19027,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
       markIngressAdmitted(ctx);
       forkReservedIdleSession(ds);
-      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId)), 'text', larkAppId);
+      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId), ds.workingDir), 'text', larkAppId);
       logger.info(`[${tag(ds)}] topic header → idle start in ${ds.workingDir}, waiting for the first task`);
       return;
     }
@@ -19069,7 +19084,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ds.pendingRepo = false;
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
       forkReservedIdleSession(ds);
-      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId)), 'text', larkAppId);
+      await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId), ds.workingDir), 'text', larkAppId);
       logger.info(`[${tag(ds)}] topic header → idle start (no projects to select), waiting for the first task`);
       return;
     }

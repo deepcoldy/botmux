@@ -4,7 +4,7 @@
  *
  *   message   := [title] SENTINEL directive* body
  *   SENTINEL  := "/t" | "/topic"                （大小写不敏感，必须是完整 token）
- *   directive := ("/repo" | "/model" | "/effort") WS arg
+ *   directive := ("/model" | "/effort") WS arg | "/repo" [WS arg]
  *   arg       := token | '"' … '"'              （双引号包裹的参数可含空白）
  *   title     := 不含以 "/" 开头 token 的文字，≤ 3 行，归一化后 ≤ SESSION_TITLE_MAX
  *   body      := 从第一个非指令 token 的原始偏移起的全部原文，原样保留
@@ -34,6 +34,15 @@ const DIRECTIVE_BY_TOKEN = new Map<string, TopicHeaderDirective>(
   TOPIC_HEADER_DIRECTIVES.map(d => [`/${d}`, d]),
 );
 
+/**
+ * 允许省略参数的指令。
+ *
+ * 只有 `/repo` 有裸形式，因为它今天就有：`/t /repo` 一直等于选仓卡上的「直接开始」
+ * ——在默认工作目录起会话、不弹卡。这是既有用户的使用习惯，头部语法必须原样兼容。
+ * `/model` `/effort` 没有对应语义，缺参数仍然是写错了。
+ */
+const BARE_FORM_DIRECTIVES: ReadonlySet<TopicHeaderDirective> = new Set(['repo']);
+
 /** 标题最多几行——超过就判定「这不是指令头」，避免长文里的 `/t` 误触发。 */
 const TITLE_MAX_LINES = 3;
 
@@ -43,8 +52,9 @@ export interface TopicHeader {
   sentinel: '/t' | '/topic';
   /** 归一化后的可读标题；没写标题时缺席。 */
   title?: string;
-  /** 头部指令的**原始参数**（已脱掉包裹的双引号），语义校验留给 resolveTopicSpec。 */
-  directives: Partial<Record<TopicHeaderDirective, string>>;
+  /** 头部指令的**原始参数**（已脱掉包裹的双引号），语义校验留给 resolveTopicSpec。
+   *  值为 `null` 表示指令写了但没带参数（只有 `/repo` 允许，见 BARE_FORM_DIRECTIVES）。 */
+  directives: Partial<Record<TopicHeaderDirective, string | null>>;
   /** 首轮任务正文，从第一个非指令 token 的原始偏移起原样保留（仅去掉尾部空白）。 */
   prompt: string;
 }
@@ -161,7 +171,7 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
   );
   if (title === null) return null;
 
-  const directives: Partial<Record<TopicHeaderDirective, string>> = {};
+  const directives: Partial<Record<TopicHeaderDirective, string | null>> = {};
   let i = sentinelIndex + 1;
   for (; i < tokens.length; i += 1) {
     const token = tokens[i]!;
@@ -181,10 +191,15 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       return { ok: false, sentinel, kind: 'duplicate_directive', directive };
     }
     const arg = tokens[i + 1];
-    // 缺参数：结尾就没有下一个 token，或下一个 token 是另一条头部指令
+    // 没有参数：结尾就没有下一个 token，或下一个 token 是另一条头部指令
     //（`/t /repo /model x` —— 把 `/model` 当仓库名只会得到一句莫名其妙的报错）。
+    // `/repo` 有裸形式，记成 null 交给语义层；其余指令是写错了。
     if (!arg || (!arg.quoted && DIRECTIVE_BY_TOKEN.has(arg.text.toLowerCase()))) {
-      return { ok: false, sentinel, kind: 'missing_arg', directive };
+      if (!BARE_FORM_DIRECTIVES.has(directive)) {
+        return { ok: false, sentinel, kind: 'missing_arg', directive };
+      }
+      directives[directive] = null;
+      continue;
     }
     directives[directive] = arg.text;
     i += 1;

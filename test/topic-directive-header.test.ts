@@ -299,7 +299,7 @@ describe('指令头：拒绝路径零副作用', () => {
     { name: '模型名不合法（正文被当成模型名）', text: '/t /repo botmux /model 命令为啥坏了' },
     { name: '推理档位不合法', text: '/t /effort 特别高 干活' },
     { name: '未知头部指令', text: '日常运维 /t /repo botmux /clear' },
-    { name: '指令缺参数', text: '日常运维 /t /repo' },
+    { name: '指令缺参数', text: '日常运维 /t /model' },
     { name: '同一指令重复', text: '/t /repo botmux /repo homelab 干活' },
   ];
 
@@ -363,6 +363,39 @@ describe('指令头：向后兼容（D9）', () => {
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(mocks.createdSessions).toHaveLength(0);
     expect(sentContents()[0]).toContain('新话题已创建');
+  });
+
+  it('/t /repo（裸，无参数）—— 在默认目录直接开会话，不弹选仓卡、不钉目录', async () => {
+    // 今天 `/t /repo` 走的是 command-handler 里 `!repoArg && ds.pendingRepo` 那条分支：
+    // 选仓卡「直接开始」按钮的文本孪生 —— 在默认工作目录起会话，且刻意不把目录钉到
+    // 会话记录上（钉了会被兄弟 bot 的 inherit 层继承）。指令头必须原样兼容。
+    registerAppBot({ workingDir: botmuxRepo });
+
+    await handleNewTopic(groupEvent('/t /repo', 'om_bare_repo'), groupCtx('om_bare_repo'));
+
+    const ds = forkedSession();
+    expect(sentCardCount()).toBe(0);
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(ds.workingDir).toBe(botmuxRepo);
+    expect(ds.session.workingDir).toBeUndefined();
+    // 空 prompt fork + 「下一条真消息才是开场」标记。
+    expect(mocks.forkWorker.mock.calls[0][1]).toBe('');
+    expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('裸 /repo 可以和别的指令同时写', async () => {
+    registerAppBot({ workingDir: botmuxRepo });
+
+    await handleNewTopic(
+      groupEvent('日常运维 /t /repo /model sonnet 干活', 'om_bare_repo_model'),
+      groupCtx('om_bare_repo_model'),
+    );
+
+    const ds = forkedSession();
+    expect(sentCardCount()).toBe(0);
+    expect(ds.workingDir).toBe(botmuxRepo);
+    expect(ds.session.title).toBe('日常运维');
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
   });
 
   it('/t /repo X —— 钉仓库、CLI 空转等下一条（不烧掉一个空开场）', async () => {

@@ -730,7 +730,7 @@ export const messages: Record<string, string> = {
   'help.heading_session': '📌 会话管理：',
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
   'help.restart': '/restart    - 重启 {cliName} 进程（保留 session）',
-  'help.topic': '[标题] /t [/repo 仓库] [/model 模型] [/effort 档位] [首轮任务]  (别名 /topic) - 普通群内新开话题，一条消息交代完标题/仓库/模型/推理强度/首轮任务。换行等价于空格；标题写在 /t 之前（飞书话题列表显示的是原消息，bot 改不了）；带空格的路径用双引号；指令任一项写错则整条不生效并回一句用法错误。裸 /t 进入话题设置（需选仓则弹卡，否则等待下一条任务或 /repo）。注意头部里的 /repo 只吃一个 token，会话中途单发的 /repo 仍吃整行',
+  'help.topic': '[标题] /t [/repo 仓库] [/model 模型] [/effort 档位] [首轮任务]  (别名 /topic) - 普通群内新开话题，一条消息交代完标题/仓库/模型/推理强度/首轮任务。换行等价于空格；标题写在 /t 之前（飞书话题列表显示的是原消息，bot 改不了）；带空格的路径用双引号；指令任一项写错则整条不生效并回一句用法错误。裸 /t 进入话题设置（需选仓则弹卡，否则等待下一条任务或 /repo）；头部里裸写 /repo（不带参数）= 直接在默认目录开会话，与选仓卡的「直接开始」一致。注意头部里的 /repo 只吃一个 token，会话中途单发的 /repo 仍吃整行',
   'help.cd': '/cd <path>  - 切换工作目录并重启 {cliName} 进程',
   'help.repo_list': '/repo       - 仓库待选时直接在默认目录开会话；会话中则弹项目选择卡片',
   'help.repo_n': '/repo <N>   - 切换到第 N 个项目',

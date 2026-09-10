@@ -66,10 +66,16 @@ export function topicSpecErrorText(errors: readonly TopicSpecError[], locale: Lo
  * 这条路径不产生 AI 回合，也就没有流式卡片，这句话是用户唯一能看到的「头部生效了」的
  * 凭据，所以把真正钉下去的东西回显出来，而不是一句笼统的「已就绪」。
  */
-export function topicHeaderReadyText(spec: TopicSpec, locale: Locale): string {
+export function topicHeaderReadyText(
+  spec: TopicSpec,
+  locale: Locale,
+  /** CLI 实际起在哪个目录 —— 裸 `/repo` 没有解析出的仓库名，回显这个兜底目录。 */
+  effectiveWorkingDir?: string,
+): string {
   const parts: string[] = [];
-  if (spec.repoDisplayName ?? spec.workingDir) {
-    parts.push(t('daemon.topic_header_ready_repo', { repo: spec.repoDisplayName ?? spec.workingDir! }, locale));
+  const repo = spec.repoDisplayName ?? spec.workingDir ?? effectiveWorkingDir;
+  if (repo) {
+    parts.push(t('daemon.topic_header_ready_repo', { repo }, locale));
   }
   if (spec.model) parts.push(t('daemon.topic_header_ready_model', { model: spec.model }, locale));
   if (spec.reasoningEffort) {
