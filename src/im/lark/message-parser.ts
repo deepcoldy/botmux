@@ -586,6 +586,64 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
   return { title: '', content: [] };
 }
 
+/** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
+ *  （openId/appId 已解析）与飞书事件里的原始 `message.mentions[]`（id/id_type）。 */
+type LooseMention = {
+  name?: string;
+  openId?: string;
+  appId?: string;
+  id?: { open_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+};
+
+/**
+ * 剥掉**对本 bot** 的所有 `@名字`，不限位置。
+ *
+ * 话题指令头的解析前置步骤：路由判定本来就按 `mentions` 数组（`isBotMentioned`），
+ * 与 @ 在文本里的位置无关，所以 `标题 /t … 正文 @机器人` 里那个结尾的 @ 只是寻址，
+ * 不能占住一个 token 位把正文切歪（决策 D8）。
+ *
+ * 与 {@link stripLeadingMentions} 的分工：那个按**位置**剥（开头连续的 @，谁的都剥），
+ * 这个按**身份**剥（只剥本 bot 的，任意位置）。对其他成员 / 其它 bot 的 @ 一律保留
+ * ——那是正文内容，CLI 需要看到。两者可以叠加：daemon 先按位置剥前导，再按身份剥自己。
+ *
+ * 认不出本 bot（没有 mentions、或没有一条匹配 open_id / app_id）时原样返回。
+ */
+export function stripBotMentions(
+  content: string,
+  mentions: readonly LooseMention[] | undefined,
+  self: { botOpenId?: string; larkAppId?: string },
+): string {
+  if (!mentions || mentions.length === 0) return content;
+  const names = new Set<string>();
+  for (const m of mentions) {
+    const openId = m?.openId ?? mentionOpenId(m as any);
+    const appId = m?.appId ?? mentionAppId(m as any);
+    const isSelf = (!!self.botOpenId && openId === self.botOpenId)
+      || (!!self.larkAppId && appId === self.larkAppId);
+    if (isSelf && typeof m?.name === 'string' && m.name.trim()) names.add(m.name);
+  }
+  if (names.size === 0) return content;
+  // 长名字优先，否则 "@Claude" 会先吃掉 "@Claude分身" 的前半截，留下孤儿 "分身"
+  //（与 stripLeadingMentions 里同一条教训）。
+  const alternation = [...names]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  // 连同紧贴的**行内**空白一起吃掉，只在 @ 两侧都有空白时补回一个空格：句中的
+  // "干活 @bot 继续" 不粘连，行首/行尾的 @ 不留下孤零零的空格。换行与正文缩进
+  // 一个字符都不动——正文要按原始排版交给 CLI。
+  const pattern = new RegExp(`([^\\S\\r\\n]*)@(?:${alternation})([^\\S\\r\\n]*)`, 'g');
+  return content
+    .replace(pattern, (_match, before: string, after: string) => (before && after ? ' ' : ''))
+    .trim();
+}
+
+/** 把用户可控的名字安全地嵌进正则（名字里可能有 `.` `+` `(` 等元字符）。 */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Strip leading `@<name>` mentions from a resolved-content string so callers
  * can detect daemon `/commands` even when the user @-mentioned the bot first.
