@@ -358,7 +358,8 @@ import type {
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
-import { IdleDetector, stripAnsiScreenText } from './utils/idle-detector.js';
+import { IdleDetector } from './utils/idle-detector.js';
+import { busyProbeRegion } from './utils/busy-probe.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -12650,18 +12651,6 @@ function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 
 
 function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): boolean {
   return !!(be.captureCurrentScreen || be.captureViewport || renderer);
-}
-
-function busyProbeRegion(content: string): string {
-  // Strip ANSI FIRST: captureViewport()/captureCurrentScreen() return
-  // tmux `capture-pane -e` output with SGR color codes at line starts
-  // (e.g. `\x1b[39m  \x1b[38;5;211m⏵⏵ …`). Line-anchored busyPatterns
-  // (claude-code's `^\s*[⏵⏸]…`) never match through that lead-in, so the
-  // pre-idle veto silently never fires. Use the SAME stripping as the
-  // IdleDetector PTY stream path so both probes see identical text.
-  const lines = stripAnsiScreenText(content).split(/\r?\n/);
-  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
-  return lines.slice(-tailLineCount).join('\n');
 }
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
