@@ -50,6 +50,7 @@ export interface ResolvedDashboardSettingsView {
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
   codexNotifier: {
     enabled: boolean;
@@ -213,6 +214,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
+  | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
@@ -430,6 +432,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_codexRpcInput' };
     }
     patch.codexRpcInput = obj.codexRpcInput;
+  }
+  if ('autoUpgradeCodexSessions' in obj) {
+    if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {
+      return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
+    }
+    patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {

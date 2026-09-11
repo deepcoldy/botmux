@@ -383,6 +383,10 @@ function handle(request) {
       reject(request.id, -32600, `thread ${request.params.threadId} already has an active writer`);
       return;
     }
+    if (behavior === 'resume-different-thread') {
+      respond(request.id, { thread: { id: 'thread-unexpected' } });
+      return;
+    }
     respond(request.id, { thread: { id: request.params.threadId } });
     return;
   }

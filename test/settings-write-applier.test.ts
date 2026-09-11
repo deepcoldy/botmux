@@ -27,6 +27,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     chatBotDiscovery: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
+    autoUpgradeCodexSessions: true,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -175,6 +176,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
+  it.each([false, true])('writes autoUpgradeCodexSessions=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -453,6 +461,13 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid autoUpgradeCodexSessions=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 

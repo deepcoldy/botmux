@@ -270,6 +270,13 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { resolveCodexUpgradeCommand } from './services/codex-upgrade-target.js';
+import {
+  CodexSessionUpgradeMonitor, hasCodexAutonomousGoal, isCodexProcess, isRestartableCodexHelper,
+  probeCodexExecutable, probeRunningCodex, readUpgradeProcessTable, upgradeProcessTree,
+  upgradeRequired, waitForCodexExit,
+  type CodexExecutable, type CodexProcess,
+} from './services/codex-session-upgrade.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import {
@@ -2285,6 +2292,182 @@ let cliRestartInProgress = false;
  * type-ahead fallback. Keep them fenced across an owned restart until the
  * replacement generation reaches its prompt. */
 let rawInputRestartGate = false;
+let codexAutoUpgrade: {
+  stage: 'stopping' | 'restoring' | 'failed';
+  threadId: string;
+  ready?: () => void;
+  reject?: (error: Error) => void;
+} | undefined;
+let codexUpgradeTimer: ReturnType<typeof setInterval> | undefined;
+let codexUpgradeInspectionBlock: string | undefined;
+let codexRuntimeObservedGeneration = -1;
+
+function codexUpgradeBlocked(): string | undefined {
+  if (!lastInitConfig || !backend || !isPromptReady || awaitingFirstPrompt) return 'waiting for a ready session';
+  if (lastInitConfig.adoptMode || lastInitConfig.existingAppServerEndpoint) return 'externally owned session';
+  if (lastInitConfig.wrapperCli?.trim()) return 'a configured CLI wrapper controls the runtime';
+  if (cliRestartInProgress || codexAutoUpgrade || tmuxRestartTimer) return 'another restart is in progress';
+  if (isFlushing || injectionFlushing || commandLineWritesPending || initialInputOwnershipPending
+      || pendingMessages.length || pendingRawInputs.length || pendingInjections.length
+      || pendingAdoptMessages.length || sessionRenameInFlight() || pendingSessionRename
+      || durableTurnInFlight || tuiPromptBlocking || hookReviewInputHold || bareShellCheckInProgress
+      || ambiguousSubmissionRecoveryHold || submitFailureChains.size()
+      || codexAppTurnLiveness.hasActiveTurn() || codexAppCompletionAwaitingFinal
+      || codexAppTurnDispatchQueue.size() || codexAppRecoveredDispatches.length
+      || hasStructuredLifecycleBlock()) return 'waiting for the current turn and input queues';
+  // Web terminal writes can bypass normal input queues. Never replace a CLI
+  // while a terminal client is attached, including during a pending handshake.
+  if (wsClients.size || clientPtys.size) return 'a Web Terminal is attached';
+  return codexUpgradeInspectionBlock;
+}
+
+async function inspectCodexUpgradeRuntime(): Promise<CodexProcess[]> {
+  const roots = [currentCodexObservedPid(), codexRpcEngine?.appServerPid]
+    .filter((pid): pid is number => typeof pid === 'number' && pid > 1);
+  if (!roots.length) throw new Error('Codex runtime PID is not available');
+  const tree = upgradeProcessTree(await readUpgradeProcessTable(), roots);
+  const native = tree.filter(isCodexProcess);
+  if (!native.length) throw new Error('Codex runtime process is not observable');
+  return Promise.all(native.map(probeRunningCodex));
+}
+
+async function observeCodexRuntimeVersionOnReady(): Promise<void> {
+  const versionObservationBackend = backend;
+  const observedGeneration = cliSpawnGeneration;
+  const running = await inspectCodexUpgradeRuntime();
+  // A late observation must not label another backend generation, or bypass
+  // the upgrade's own runtime/thread verification before it releases input.
+  if (!versionObservationBackend || backend !== versionObservationBackend || cliSpawnGeneration !== observedGeneration
+      || cliRestartInProgress || codexAutoUpgrade) return;
+  const version = running[0]?.version;
+  if (!version || running.some(item => item.version !== version)) {
+    throw new Error('Running Codex processes do not identify a single version');
+  }
+  send({ type: 'cli_runtime_version', version });
+}
+
+async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]): Promise<void> {
+  // No await may separate this final safety check and closing the input gates.
+  const blocked = codexUpgradeBlocked();
+  if (blocked || !config.autoUpgradeCodexSessions) throw new Error(blocked ?? 'automatic upgrade disabled');
+  const cfg = lastInitConfig!;
+  const threadId = remoteThreadId ?? cfg.cliSessionId;
+  if (!threadId) throw new Error('An exact Codex thread ID is required for automatic upgrade');
+  codexAutoUpgrade = { stage: 'stopping', threadId };
+  cliRestartInProgress = true;
+  rawInputRestartGate = true;
+  cliSpawnGeneration++;
+  const oldBackend = backend!;
+  intentionalRestartBackend = oldBackend;
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve(oldBackend.destroySession?.()),
+      new Promise<never>((_, reject) => {
+        readyTimer = setTimeout(() => reject(new Error('Old Codex teardown timed out')), 22_000);
+      }),
+    ]);
+    if (readyTimer) clearTimeout(readyTimer);
+    killCli({ preservePending: true, preservePolicyCapability: true, preserveInjections: true });
+    await waitForCodexExit(running);
+    codexAutoUpgrade.stage = 'restoring';
+    const ready = new Promise<void>((resolve, reject) => {
+      codexAutoUpgrade!.ready = resolve;
+      codexAutoUpgrade!.reject = reject;
+      readyTimer = setTimeout(() => reject(new Error('New Codex did not become ready')), 90_000);
+    });
+    // Attach rejection handling before spawn, which can itself fail or emit an
+    // exit notification. The original error is still awaited below.
+    void ready.catch(() => undefined);
+    const restartCfg = {
+      ...cfg, resume: true, prompt: '', cliSessionId: threadId, forkSession: false,
+      cliPathOverride: target.path, model: undefined, reasoningEffort: undefined,
+      nativeSessionTitle: undefined, nativeSessionTitlePrompt: undefined,
+    };
+    let pluginGenerationPrepared = false;
+    if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
+      await prepareCliPluginGenerationAndGateway(restartCfg, createCliAdapterSync(restartCfg.cliId as CliId, target.path));
+      pluginGenerationPrepared = true;
+      const outcome = await engageCodexRpc(restartCfg);
+      if (outcome !== 'resumed' || remoteThreadId !== threadId) {
+        throw new Error('Codex RPC did not resume the original thread');
+      }
+    }
+    awaitingFirstPrompt = true;
+    startScreenUpdates();
+    startStuckDetector();
+    replacementSpawnInProgress = true;
+    await spawnCli(restartCfg, { pluginGenerationPrepared });
+    await ready;
+    const replacement = await inspectCodexUpgradeRuntime();
+    const resumedOriginal = replacement.some(item => {
+      const open = findCodexRolloutSetByPid(item.pid);
+      return open?.size === 1 && open.has(threadId.toLowerCase());
+    });
+    if (replacement.some(item => item.version !== target.version)
+        || !resumedOriginal || (remoteThreadId ?? lastInitConfig?.cliSessionId) !== threadId) {
+      throw new Error('Replacement Codex runtime or thread identity did not match');
+    }
+    if (cfg.workingDir !== restartCfg.workingDir || cfg.env !== restartCfg.env) {
+      throw new Error('Session launch settings changed during upgrade; restart is required');
+    }
+    send({ type: 'cli_runtime_version', version: target.version });
+    codexAutoUpgrade = undefined;
+    cliRestartInProgress = false;
+    releaseRawInputRestartGate();
+    void flushPendingInjections();
+    void flushPending();
+  } catch (error) {
+    // Keep the worker and its accepted queues alive. Automatic crash recovery
+    // can demote resume to a fresh thread, so it is not a valid upgrade fallback.
+    codexAutoUpgrade = { stage: 'failed', threadId };
+    cliRestartInProgress = true;
+    rawInputRestartGate = true;
+    send({ type: 'user_notify', message: `Codex 会话自动升级未完成，原会话和待处理消息已保留。请检查后在当前会话发送 /restart 重启。原因：${error instanceof Error ? error.message : String(error)}` });
+    throw error;
+  } finally {
+    replacementSpawnInProgress = false;
+    if (readyTimer) clearTimeout(readyTimer);
+  }
+}
+
+const codexUpgradeMonitor = new CodexSessionUpgradeMonitor({
+  enabled: () => config.autoUpgradeCodexSessions
+    && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'codex-app')
+    && !lastInitConfig?.adoptMode && !lastInitConfig?.existingAppServerEndpoint
+    && !lastInitConfig?.wrapperCli?.trim()
+    && !codexAutoUpgrade && !cliRestartInProgress,
+  check: async () => {
+    if (!backend || !isPromptReady || awaitingFirstPrompt) return undefined;
+    const checkedGeneration = cliSpawnGeneration;
+    const target = await probeCodexExecutable(resolveCodexUpgradeCommand(lastInitConfig!));
+    const running = await inspectCodexUpgradeRuntime();
+    if (!upgradeRequired(target, running)) return undefined;
+    codexUpgradeInspectionBlock = undefined;
+    const roots = running.map(item => item.pid);
+    const tree = upgradeProcessTree(await readUpgradeProcessTable(), roots);
+    if (tree.some(row => !isCodexProcess(row)
+        && !isRestartableCodexHelper(row, tree, running, defaultGatewayEntry().command))) {
+      codexUpgradeInspectionBlock = 'background processes are still attached to Codex';
+    }
+    const threadId = remoteThreadId ?? lastInitConfig?.cliSessionId;
+    const owner = codexRpcEngine?.appServerPid
+      ?? running.find(item => findCodexRolloutSetByPid(item.pid)?.has(threadId?.toLowerCase() ?? ''))?.pid;
+    const open = owner ? findCodexRolloutSetByPid(owner) : undefined;
+    if (!threadId || !open || open.size !== 1 || !open.has(threadId.toLowerCase())) {
+      codexUpgradeInspectionBlock = 'waiting for exclusive ownership of the original thread';
+    }
+    const rollout = owner ? findCodexRolloutByPid(owner) : undefined;
+    if (!rollout || await hasCodexAutonomousGoal(rollout.path)) {
+      codexUpgradeInspectionBlock = 'native Goal state cannot be safely resumed without inference';
+    }
+    if (checkedGeneration !== cliSpawnGeneration) return undefined;
+    return { target, running };
+  },
+  blocked: codexUpgradeBlocked,
+  upgrade: autoUpgradeCodex,
+  report: (state, reason) => log(`Codex session upgrade ${state}: ${reason}`),
+});
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -3412,6 +3595,12 @@ function failCodexAppControlGeneration(reason: string): void {
   }
   try { backend?.kill(); } catch { /* process exit is the final fail-close */ }
   backend = null;
+  if (codexAutoUpgrade) {
+    // The rejected replacement stays unusable, but the worker must retain
+    // messages accepted during an automatic version change.
+    codexAutoUpgrade.reject?.(new Error(reason));
+    return;
+  }
   queueMicrotask(() => {
     void sendFatalWorkerErrorAndExit(
       new Error(reason),
@@ -10807,6 +10996,13 @@ function markPromptReady(): void {
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
+  if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
+  if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
+    // Record the actual running version while its executable is still present.
+    // macOS cannot recover an unlinked old binary after an installer replaces it.
+    codexRuntimeObservedGeneration = cliSpawnGeneration;
+    void observeCodexRuntimeVersionOnReady().catch(error => log(`Codex runtime observation unavailable: ${error.message}`));
+  }
   if (
     persistCodexRunnerBuildOnReady
     && lastInitConfig?.cliId === 'codex-app'
@@ -14047,6 +14243,9 @@ async function spawnCli(
   if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
 
   const replacementExpectedFresh = codexRunnerFreshness === 'restarting_fresh';
+  if (codexAutoUpgrade?.stage === 'restoring' && willReattachPersistent) {
+    throw new Error('Automatic Codex upgrade refused to reattach an old persistent process');
+  }
   const freshness = decideCodexRunnerFreshness({
     cliId: cfg.cliId,
     adoptMode: cfg.adoptMode === true,
@@ -14085,7 +14284,8 @@ async function spawnCli(
   // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
-  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })
+    || codexAutoUpgrade?.stage === 'restoring';
   // Re-arm the bare-shell launch detector for this spawn (fresh OR reattach). It
   // runs once on the first flush and only fires when the pane leaf is actually a
   // bare shell, so a healthy reattach (leaf = the live CLI) self-excludes while a
@@ -14171,7 +14371,8 @@ async function spawnCli(
       { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
     )
     : undefined;
-  const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
+  const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2
+    && codexAutoUpgrade?.stage !== 'restoring';
   // Tier 0: see block comment above. The adapter itself drops --resume when
   // the id is missing (its buildArgs starts fresh); demoting HERE keeps
   // effectiveResume honest so the fresh-demotion notice below fires.
@@ -14192,6 +14393,10 @@ async function spawnCli(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
+  if (codexAutoUpgrade?.stage === 'restoring'
+      && (fallBackToFresh || !effectiveResume || effectiveCliSessionId !== codexAutoUpgrade.threadId)) {
+    throw new Error('Automatic Codex upgrade requires the original resume target; fresh fallback is disabled');
+  }
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -14412,6 +14617,7 @@ async function spawnCli(
     resume: effectiveResume,
     workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
+    quietResume: codexAutoUpgrade?.stage === 'restoring',
     // Native session fork (Claude --fork-session / codex fork): resume the
     // source transcript but branch into a fresh CLI-minted id. Only on the
     // child's first spawn (cfg.forkSession) AND only when we actually resume —
@@ -16573,6 +16779,16 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    if (codexAutoUpgrade) {
+      backend = null;
+      isPromptReady = false;
+      if (codexAutoUpgrade.stage === 'restoring') {
+        codexAutoUpgrade.reject?.(new Error(`Replacement Codex exited before readiness (${code ?? signal})`));
+      }
+      // The upgrade owns recovery; a daemon crash-restart could lose the
+      // original thread or replay messages that this worker still owns.
+      return;
+    }
     const recoveryHeld = ambiguousSubmissionRecoveryHold;
     const handedOffDurable = handoffQueuedDurableInputsOnBackendExit(
       pendingMessages,
@@ -16895,6 +17111,7 @@ function restoreMojoLivePatchAfterRespawn(): void {
 
 function killCli(opts: {
   preservePending?: boolean;
+  preserveInjections?: boolean;
   /** An intentional in-worker CLI restart replaces only the live backend. The
    * surviving Node worker keeps its generation-scoped policy authority. */
   preservePolicyCapability?: boolean;
@@ -16996,11 +17213,11 @@ function killCli(opts: {
   // because /rename owned the TUI or an owned CLI restart was already fenced.
   // Preserve them across restart; unlike an in-flight raw command, replaying
   // these cannot duplicate a side effect.
-  // pendingInjections 则无条件清空（不随 preservePending 保留）：barrier /cd 的
+  // 普通重启清空 pendingInjections（不随 preservePending 保留）：barrier /cd 的
   // 目录变更已固化进 lastInitConfig.workingDir 与 daemon 记录，respawn 本身就落在
   // 新目录，重放 /cd 反而多余；非 barrier 注入（如 /compact）是 best-effort，
-  // 不跨进程重放。
-  pendingInjections.length = 0;
+  // 不跨进程重放。自动升级保留换代窗口内尚未写入的注入。
+  if (!opts.preserveInjections) pendingInjections.length = 0;
   scrollback = '';
   herdrWebHistory = null;
   herdrWebScrollDirection = null;
@@ -17029,6 +17246,10 @@ async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
+  if (codexAutoUpgrade) {
+    codexAutoUpgrade.reject?.(new Error(reason));
+    return;
+  }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
@@ -17285,6 +17506,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // `connection` callback is too late: an unauthenticated localhost scanner
       // briefly becomes a client and races the terminal history seed.
       verifyClient: ({ req }, done) => {
+        if (codexAutoUpgrade) {
+          done(false, 503, 'Codex session is restarting');
+          return;
+        }
         const url = parseWorkerRequestUrl(req);
         if (!url) {
           done(false, 400, 'Bad Request');
@@ -17299,6 +17524,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
     });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
+      if (codexAutoUpgrade) {
+        ws.close(1013, 'Codex session is restarting');
+        return;
+      }
       // P1-3 — the pre-handshake verdict is a SNAPSHOT, and this callback runs
       // strictly after it: ws only completes the upgrade once verifyClient
       // called back, and re-resolving access here re-reads `.dashboard-secret`
@@ -19359,6 +19588,11 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      if (!codexUpgradeTimer && (msg.cliId === 'codex' || msg.cliId === 'codex-app')
+          && !msg.adoptMode && !msg.existingAppServerEndpoint) {
+        codexUpgradeTimer = setInterval(() => { void codexUpgradeMonitor.tick(); }, 60 * 60_000);
+        codexUpgradeTimer.unref();
+      }
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
@@ -19974,6 +20208,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (codexAutoUpgrade?.stage === 'failed') {
+        codexAutoUpgrade = undefined;
+        cliRestartInProgress = false;
+      }
       if (effectiveBackendType === 'riff') {
         log('Refused Riff generation restart; the existing lineage-owning worker is retained');
         break;
@@ -20824,6 +21062,8 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
+  codexUpgradeTimer = undefined;
   stopNativeSessionTitleSync();
   cleanupPiInitialPromptFiles();
   stopSessionMcpGatewayHost();

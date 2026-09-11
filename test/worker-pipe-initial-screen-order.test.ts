@@ -430,7 +430,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(spawnStart).toBeGreaterThan(-1);
     expect(prepareIdx).toBeGreaterThan(spawnStart);
     expect(backendSpawnIdx).toBeGreaterThan(prepareIdx);
-    expect(source.match(/await spawnCli\(/g)).toHaveLength(3);
+    expect(source.match(/await spawnCli\(/g)).toHaveLength(4);
     expect(source.slice(spawnStart, prepareIdx)).toContain('const spawnGeneration = ++cliSpawnGeneration;');
     expect(source.slice(prepareIdx, backendSpawnIdx))
       .toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
