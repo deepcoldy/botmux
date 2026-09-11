@@ -14,11 +14,11 @@
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
-| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（仅 Claude 系 / Codex 终端模式） |
+| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
 | `/fork --create <群名>` | 不建子话题，改为把当前会话分身到一个新建群 |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
-| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
+| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（Claude 系 / Codex 或 TraeX 终端模式；Hybrid RPC / 外部 app-server 会话不支持；需在源会话内发起） |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关 |
 | `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；仅 claude-code / codex 支持） |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
