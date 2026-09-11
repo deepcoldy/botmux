@@ -3600,6 +3600,10 @@ function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
   catch { return false; }
 }
 
+function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
+  return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
+}
+
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
