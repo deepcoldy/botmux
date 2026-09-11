@@ -193,7 +193,7 @@ import type { DaemonSession } from '../src/core/types.js';
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-resume-test-'));
   daemonConfig.backendType = 'pty';
-  sessionStore.init();
+  sessionStore.init('app_test');
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();

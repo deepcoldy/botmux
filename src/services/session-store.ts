@@ -64,22 +64,19 @@ function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
 }
 
 // ─── SQLite engine ───────────────────────────────────────────────────────────
-// Per-bot session rows live in `session-stores/<appId>/sessions.db` (legacy
-// no-appId store: `sessions.db`), one table, whole-row JSON column. The TS
-// `Session` type stays the schema authority; the generated columns below only
-// serve hot lookups.
+// Per-bot session rows live in `session-stores/<appId>/sessions.db`, one table,
+// whole-row JSON column. The TS `Session` type stays the schema authority; the
+// generated columns below only serve hot lookups.
 //
 // SQLite is the only engine the OWNING DAEMON ever writes. It imports its
-// pre-SQLite `sessions*.json` once at first load and never writes JSON again.
+// pre-SQLite `sessions-<appId>.json` once at first load and never writes JSON
+// again.
 //
-// The cross-process surface (worker reads, CLI reads, CLI offline writes) still
-// resolves each store as "use the .db when it exists, else the .json". That is
-// not leftover indecision — it is the upgrade window. `npm i -g` replaces dist
-// and repoints ~/.botmux/bin/botmux immediately, while the daemon that owns the
-// rows keeps running the OLD code (auto-update is off by default and `botmux
-// upgrade` tells the operator to restart by hand), so a store can legitimately
-// have no `.db` for hours or weeks. Dropping the JSON read seam would leave
-// every live session's `botmux send` unable to find itself until that restart.
+// Cross-process readers and host writers open the `.db` or nothing. A leftover
+// `sessions-<appId>.json` without a `.db` means the owning daemon still runs a
+// pre-SQLite build: that store is `unmigrated` (existence only, never parsed)
+// and every cross-process caller fails closed with a restart hint — see
+// docs/design/2026-08-12-session-restage-store-first.md §3.3.
 //
 // The frozen JSON is deliberately never deleted: it is also the only artifact a
 // downgrade to a pre-SQLite botmux can read, and it costs a few hundred KB.
@@ -421,8 +418,7 @@ export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => voi
 // ─── Store resolution (SQLite only for cross-process readers) ────────────────
 
 type StoreFileRef = {
-  /** undefined = the legacy no-appId store. */
-  appId?: string;
+  appId: string;
   path: string;
 };
 
@@ -439,32 +435,31 @@ export class SessionStoreUnmigratedError extends Error {
  *  when the last connection closes — a persistent pane surviving a daemon
  *  restart would keep reading the dead WAL forever (or a corrupt hybrid once
  *  checkpoints recycle it). Directory binds resolve names live, so the pane
- *  always sees the current sidecars. The legacy no-appId store (tests /
- *  single-bot dev) stays flat `sessions.db` — it is never sandbox-granted. */
+ *  always sees the current sidecars. */
 const PER_BOT_STORE_DIRNAME = 'session-stores';
 
 export function sessionStoreSqliteDir(appId: string, dataDir: string = config.session.dataDir): string {
   return join(dataDir, PER_BOT_STORE_DIRNAME, appId);
 }
 
-function storeDbPath(appId: string | undefined, dataDir: string): string {
-  return appId ? join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db') : join(dataDir, 'sessions.db');
+function storeDbPath(appId: string, dataDir: string): string {
+  return join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db');
 }
 
 /** The pre-SQLite file for a store: the daemon's one-shot import source, and
  *  the unmigrated existence probe (never parsed by cross-process readers). */
-function storeJsonFileName(appId: string | undefined): string {
-  return appId ? `sessions-${appId}.json` : 'sessions.json';
+function storeJsonFileName(appId: string): string {
+  return `sessions-${appId}.json`;
 }
 
-export function classifyStorePresence(appId: string | undefined, dataDir: string): StorePresence {
+export function classifyStorePresence(appId: string, dataDir: string): StorePresence {
   if (existsSync(storeDbPath(appId, dataDir))) return 'ready';
   if (existsSync(join(dataDir, storeJsonFileName(appId)))) return 'unmigrated';
   return 'absent';
 }
 
 /** Per-store rule for every cross-process reader: the .db, or nothing. */
-function resolveStoreFile(appId: string | undefined, dataDir: string): StoreFileRef | undefined {
+function resolveStoreFile(appId: string, dataDir: string): StoreFileRef | undefined {
   const dbPath = storeDbPath(appId, dataDir);
   if (existsSync(dbPath)) return { appId, path: dbPath };
   return undefined;
@@ -477,10 +472,6 @@ export function listUnmigratedAppIds(dataDir: string): string[] {
   try { names = readdirSync(dataDir); } catch { return []; }
   const ids: string[] = [];
   for (const name of names) {
-    if (name === 'sessions.json') {
-      if (!existsSync(storeDbPath(undefined, dataDir))) ids.push('');
-      continue;
-    }
     if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
     const appId = name.slice('sessions-'.length, -'.json'.length);
     if (appId && classifyStorePresence(appId, dataDir) === 'unmigrated') ids.push(appId);
@@ -494,7 +485,6 @@ export function listUnmigratedAppIds(dataDir: string): string[] {
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
   const refs: StoreFileRef[] = [];
-  if (names.includes('sessions.db')) refs.push({ path: join(dataDir, 'sessions.db') });
   if (names.includes(PER_BOT_STORE_DIRNAME)) {
     let appIds: string[] = [];
     try {
@@ -629,16 +619,15 @@ function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner):
 }
 
 /**
- * Initialise session store for a specific bot (multi-daemon mode).
- * When appId is set, sessions are stored in `session-stores/{appId}/sessions.db`.
- * When unset, uses the legacy no-appId store (`sessions.db`).
+ * Initialise session store for a specific bot.
+ * Sessions are stored in `session-stores/{appId}/sessions.db`.
  *
- * `owner: false` marks a non-owning process (worker): it reads whichever
- * engine exists (db-else-json) but never bootstraps/imports the SQLite store —
- * an old daemon can spawn workers from a newer dist during the upgrade window,
- * and only the daemon itself may flip the on-disk engine.
+ * `owner: false` marks a non-owning process (worker): it never bootstraps or
+ * imports the SQLite store. Only the owning daemon may create the on-disk
+ * engine.
  */
-export function init(appId?: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
+export function init(appId: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
+  if (!appId) throw new Error('session store init(appId) requires a non-empty appId');
   migratedCodexInstanceConfig = undefined;
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
@@ -652,13 +641,20 @@ export function init(appId?: string, opts: { owner?: boolean; occupancy?: Occupa
   }
 }
 
+function requireCurrentAppId(): string {
+  if (!currentAppId) {
+    throw new Error('session store is not initialized; init(appId) is required');
+  }
+  return currentAppId;
+}
+
 /** Pre-SQLite JSON file for this store — the one-shot import source. */
 function getImportJsonPath(): string {
-  return join(config.session.dataDir, storeJsonFileName(currentAppId));
+  return join(config.session.dataDir, storeJsonFileName(requireCurrentAppId()));
 }
 
 function getDbPath(): string {
-  return storeDbPath(currentAppId, config.session.dataDir);
+  return storeDbPath(requireCurrentAppId(), config.session.dataDir);
 }
 
 function ensureDir(): void {
@@ -701,43 +697,30 @@ function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, 
 /** Which snapshot file a recovery/import read actually resolved. `none` means no
  *  readable snapshot existed at all — distinct from "a readable snapshot that
  *  legitimately holds zero rows for this bot", which IS evidence. */
-type FrozenSnapshotSource = 'per-bot' | 'legacy' | 'none';
+type FrozenSnapshotSource = 'per-bot' | 'none';
 
 /** The JSON rows today's load()/migration would have produced for this store,
- *  plus WHICH file they came from. The source matters to recovery: a legacy
- *  `sessions.json` that parses fine but filters down to zero rows for this bot
- *  proves the store held nothing, whereas a missing file proves nothing. */
+ *  plus WHICH file they came from. The source matters to recovery: a per-bot
+ *  `sessions-<appId>.json` that parses (even to zero rows) attests the store;
+ *  a missing file proves nothing. */
 function readFrozenSnapshotForImport(jsonFp: string): {
   entries: [string, Session][];
   source: FrozenSnapshotSource;
 } {
-  let entries: [string, Session][] = [];
-  let source: FrozenSnapshotSource = 'none';
-  if (existsSync(jsonFp)) {
-    const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
-    entries = Object.entries(data);
-    source = 'per-bot';
-  } else if (currentAppId) {
-    const legacyFp = join(config.session.dataDir, 'sessions.json');
-    if (!existsSync(legacyFp)) return { entries: [], source: 'none' };
-    const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
-    entries = Object.entries(data).filter(([, v]) => v?.larkAppId === currentAppId);
-    source = 'legacy';
-  } else {
-    return { entries: [], source: 'none' };
-  }
+  if (!existsSync(jsonFp)) return { entries: [], source: 'none' };
+  const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
+  const entries = Object.entries(data);
   for (const [, value] of entries) {
     if (value && typeof value === 'object') {
       repairMissingChatScope(value);
       stripLegacyPendingCardFields(value as unknown as Record<string, unknown>);
     }
   }
-  return { entries, source };
+  return { entries, source: 'per-bot' };
 }
 
-/** The JSON rows today's load()/migration would have produced for this store:
- *  the per-bot file's entries when it exists, else the legacy `sessions.json`
- *  rows belonging to this bot; scope repair applied, legacy card fields
+/** The JSON rows today's load()/migration would have produced for this store
+ *  from `sessions-<appId>.json`; scope repair applied, legacy card fields
  *  stripped, closed rows included. Parse failures degrade to an empty store —
  *  exactly like the previous loader. */
 function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
@@ -1034,9 +1017,8 @@ function readStrandedImportRows(dbFp: string): {
  *    held. Three things can supply it:
  *      • the orphan demonstrably replayed rows;
  *      • a snapshot file was actually READ — about the source, not the row
- *        count: a legacy `sessions.json` that parses and filters down to zero
- *        rows for this bot proves the store held nothing, while a MISSING file
- *        proves nothing at all;
+ *        count: a `sessions-<appId>.json` that parses (even to zero rows)
+ *        proves the store held nothing, while a MISSING file proves nothing;
  *      • a RECEIPT for this exact orphan digest, written by an earlier pass in
  *        the same transaction as its merge — the only proof that survives a
  *        crash, and the one that lets an interrupted cleanup finish.
@@ -1209,6 +1191,11 @@ function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): {
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
+  if (!currentAppId) {
+    sessions = new Map();
+    loaded = true;
+    return;
+  }
   ensureDir();
   const dbFp = getDbPath();
   const jsonFp = getImportJsonPath();
@@ -1267,9 +1254,10 @@ function load(): void {
     if (!sqliteBootstrapAllowed) {
       // `owner: false` (a worker) must not create a .db or parse frozen JSON.
       // A leftover sessions-*.json without a .db is unmigrated — fail closed.
-      if (classifyStorePresence(currentAppId, config.session.dataDir) === 'unmigrated') {
+      const appId = requireCurrentAppId();
+      if (classifyStorePresence(appId, config.session.dataDir) === 'unmigrated') {
         loadFailure = new SessionStoreUnmigratedError(
-          `会话库尚未迁移到 SQLite（${storeJsonFileName(currentAppId)} 仍在，sessions.db 不存在）`,
+          `会话库尚未迁移到 SQLite（${storeJsonFileName(appId)} 仍在，sessions.db 不存在）`,
         );
       }
       sessions = new Map();
@@ -1620,7 +1608,7 @@ function persistRow(session: Session): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
-      new Error(`session store ${getDbPath()} is not attached`),
+      new Error(`session store ${currentAppId ? getDbPath() : '<uninitialized>'} is not attached`),
     );
   }
   testOnlyBeforeRowPersist?.(session.sessionId);
@@ -1724,11 +1712,14 @@ export function getOwnedSession(sessionId: string): Session | undefined {
 export function getSessionFresh(sessionId: string): Session | undefined {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  // Same rule as load(): a process that never called init() (a workflow worker
+  // whose sessions are synthetic) has no store and simply sees no row.
+  if (!currentAppId) return undefined;
   ensureDir();
   const dbFp = getDbPath();
   if (!existsSync(dbFp)) return undefined;
   try {
-    return readStoreRowByKey({ appId: currentAppId, path: dbFp }, sessionId);
+    return readStoreRowByKey({ appId: requireCurrentAppId(), path: dbFp }, sessionId);
   } catch (err) {
     if (err instanceof SessionStoreSqliteUnavailableError) throw err;
     if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
@@ -2332,20 +2323,9 @@ export function readBotSessionsStrict(appId: string, dataDir = config.session.da
       `会话库尚未迁移到 SQLite（${storeJsonFileName(appId)} 仍在，sessions.db 不存在）`,
     );
   }
-  const result: Session[] = [];
-  const seen = new Set<string>();
-  // A+B still has the flat store; include it so pre-split rows for this bot stay visible.
-  for (const id of [undefined, appId] as const) {
-    const ref = resolveStoreFile(id, dataDir);
-    if (!ref) continue;
-    for (const [, session] of readStoreEntries(ref)) {
-      if (!(id === appId || session.larkAppId === appId)) continue;
-      if (seen.has(session.sessionId)) continue;
-      seen.add(session.sessionId);
-      result.push(session);
-    }
-  }
-  return result;
+  const ref = resolveStoreFile(appId, dataDir);
+  if (!ref) return [];
+  return readStoreEntries(ref).map(([, session]) => session);
 }
 
 /**
@@ -2485,11 +2465,12 @@ function emptySnapshot(unmigratedAppIds: string[]): SessionsSnapshot {
 }
 
 /**
- * Read-only snapshot of every session row across the legacy store and all
- * per-bot SQLite stores. Per-bot rows win duplicate sessionIds and get
- * `larkAppId` stamped from their filename so a later offline mutation
- * resolves the owning store. Deliberately lock-free: WAL transactions keep
- * each store self-consistent.
+ * Read-only snapshot of every session row across all per-bot SQLite stores.
+ * A row missing `larkAppId` gets it stamped from its store's directory name so
+ * a later offline mutation resolves the owning store. The same sessionId in
+ * two stores has no defined winner here — cross-store duplicates are the job
+ * of `readSessionRowCopiesAcrossStores`. Deliberately lock-free: WAL
+ * transactions keep each store self-consistent.
  */
 export function loadAllSessionsSnapshot(options: {
   dataDir?: string;
@@ -2519,7 +2500,7 @@ export function loadAllSessionsSnapshot(options: {
       const session = value as Session;
       if (!session || typeof session !== 'object' || !session.sessionId) continue;
       repairMissingChatScope(session);
-      if (ref.appId && !session.larkAppId) session.larkAppId = ref.appId;
+      if (!session.larkAppId) session.larkAppId = ref.appId;
       out.set(session.sessionId, session);
     }
   };
@@ -2537,38 +2518,29 @@ export function loadAllSessionsSnapshot(options: {
     }
     return out;
   }
-  const flat = refs.filter(ref => !ref.appId);
-  const perBot = refs.filter(ref => ref.appId);
-  for (const ref of [...flat, ...perBot]) readInto(ref);
+  for (const ref of refs) readInto(ref);
   return out;
 }
 
 /**
  * Unlocked point-read of one row straight from disk, bypassing this process's
- * in-memory cache: the owning per-bot store first, then the legacy store.
- * Atomic publication keeps each store self-consistent, so this never blocks
- * on (or throws from) the store lock — safe on hot paths that only need a
- * freshness hint.
+ * in-memory cache. Atomic publication keeps each store self-consistent, so
+ * this never blocks on (or throws from) the store lock — safe on hot paths
+ * that only need a freshness hint.
  */
 export function readSessionRowFromDisk(
   sessionId: string,
-  larkAppId?: string,
+  larkAppId: string,
   dataDir: string = config.session.dataDir,
 ): Session | undefined {
-  const stores = larkAppId
-    ? [resolveStoreFile(larkAppId, dataDir), resolveStoreFile(undefined, dataDir)]
-    : [resolveStoreFile(undefined, dataDir)];
-  for (const ref of stores) {
-    if (!ref || !existsSync(ref.path)) continue;
-    try {
-      const hit = readStoreRowByKey(ref, sessionId);
-      if (hit) return hit;
-    } catch (err) {
-      if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-      /* ignore corrupt/racing session store */
-    }
+  const ref = resolveStoreFile(larkAppId, dataDir);
+  if (!ref) return undefined;
+  try {
+    return readStoreRowByKey(ref, sessionId);
+  } catch (err) {
+    if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+    return undefined;
   }
-  return undefined;
 }
 
 /**
@@ -2645,7 +2617,7 @@ function owned(heldBy: HolderReason): UnownedRowBlocked {
 }
 
 function runUnownedRowTxn<T>(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions,
   step: UnownedRowStep<T>,
 ): T | UnownedRowBlocked {
@@ -2710,7 +2682,7 @@ function sessionRowIsAdopted(row: Session): boolean {
  * backing, close) can re-judge ownership before each irreversible step.
  */
 export function readSessionRowUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions = {},
 ): UnownedRowRead {
   return runUnownedRowTxn(target, options, current => ({
@@ -2720,17 +2692,17 @@ export function readSessionRowUnowned(
 }
 
 /**
- * Apply one host command to the FRESH row of its owning store (per-bot when the
- * caller-observed row carries `larkAppId`, the legacy store otherwise) while
+ * Apply one host command to the FRESH row of its owning per-bot store while
  * no daemon holds it, and publish the result. The caller's snapshot is never
- * written back.
+ * written back. The target names the owning store (`larkAppId` is required);
+ * a caller-observed row without one is rejected by the caller, not here.
  *
  * `expectAdopted` is a fail-closed precondition for multi-step host commands:
  * the row must still be (non-)adopted exactly as the caller last read it,
  * otherwise the step is `refused` with `row_changed`.
  */
 export function applySessionCommandUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   command: HostSessionCommand,
   options: UnownedRowOptions & { expectAdopted?: boolean } = {},
 ): UnownedRowApply {

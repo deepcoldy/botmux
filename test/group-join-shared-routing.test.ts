@@ -101,7 +101,7 @@ async function loadModules() {
   const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
-  sessionStore.init();
+  sessionStore.init('test-app');
   return { collaborationModeStore, daemon, registry, types };
 }
 

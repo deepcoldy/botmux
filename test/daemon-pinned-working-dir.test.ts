@@ -34,7 +34,7 @@ async function loadFreshModules() {
   const botRegistry = await import('../src/bot-registry.js');
   const sessionStore = await import('../src/services/session-store.js');
   const daemon = await import('../src/daemon.js');
-  sessionStore.init();
+  sessionStore.init('test-app');
   return { botRegistry, sessionStore, daemon };
 }
 
