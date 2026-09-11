@@ -1,11 +1,11 @@
 import { closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { loadNativeModule, type NativePtyProcess } from 'node-pty/lib/utils.js';
 
 export interface NativePtySmokeOptions {
   file?: string;
+  helperPath?: string;
   timeoutMs?: number;
 }
 
@@ -31,9 +31,9 @@ export async function runNativePtySmoke(
   const scratch = mkdtempSync(join(scratchRoot, 'botmux-pty-smoke-'));
   const marker = join(scratch, 'result.txt');
   const loaded = loadNativeModule('pty');
-  const utilsPath = createRequire(import.meta.url).resolve('node-pty/lib/utils.js');
-  const helperPath = loaded.helperPath
-    ?? resolve(dirname(utilsPath), loaded.dir, 'spawn-helper');
+  const helperPath = options.helperPath
+    ?? loaded.helperPath
+    ?? resolve(loaded.dir, 'spawn-helper');
   const file = options.file ?? '/bin/sh';
   const timeoutMs = options.timeoutMs ?? 10_000;
   const env = Object.entries({

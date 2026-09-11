@@ -268,6 +268,8 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
     expect(PTY_SMOKE).toContain("loadNativeModule('pty')");
     expect(PTY_SMOKE).toContain('loaded.module.fork(');
     expect(PTY_SMOKE).not.toMatch(/\bpty\.spawn\(/);
+    expect(PTY_SMOKE).not.toContain('createRequire');
+    expect(PTY_SMOKE).not.toMatch(/resolve\(['"]node-pty\/lib\/utils\.js/);
     expect(EMBED_PLUGIN).toContain('materializeSpawnHelper()');
     expect(EMBED_PLUGIN).toContain('ensurePrivateDirectory(root, uid)');
     expect(EMBED_PLUGIN).toContain("writeFileSync(temp, bytes, { mode: 0o700 })");
