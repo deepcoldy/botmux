@@ -8,11 +8,19 @@
 
 | 配置 | 数量 | 位置 | 生效方式 |
 | --- | --- | --- | --- |
-| `ONCALL_SERVICE_SECRET` | 每套 daemon 环境一个 | 部署 Secret 注入或 `~/.botmux/.env` | 更新实际进程环境并重启 |
+| `ONCALL_SERVICE_SECRET` | 每套 daemon 环境一个 | Oncall 页面密码框保存到 `~/.botmux/.env`，或部署 Secret 注入 | 更新实际进程环境并重启 |
 | 建群目标 | 每个 Bot 五项 | `<dataDir>/oncall-group-targets.json` | 下次需要新建或重试时读取 |
 | 开关和来源群 | 每个 Bot 两项 | Bot 配置 `oncallGroup`，推荐由 Dashboard 维护 | 热更新；不会给已发出的无按钮卡片补按钮 |
 
 ### 服务凭据
+
+推荐在 Dashboard 的 Oncall 设置旁填写 Service Secret 并保存。此入口只对具有宿主管理权限的管理员开放，写请求有同源和 CSRF 校验；页面只显示配置状态，保存后清空输入框，不回显密钥。空输入不会删除原凭据。保存后需重启 BotMux，页面不会自动重启机器人。
+
+旧部署若仅使用工作目录下的 `.env`，页面会拒绝创建会覆盖该配置来源的宿主文件；需先迁移到 `~/.botmux/.env` 并重启。
+
+“已配置”表示宿主 `.env` 中存在该项，不证明平台鉴权通过；仅由外部进程环境注入的凭据不在该文件状态的统计范围内。外部注入的旧值仍可能优先于文件，需由部署方同步更新。
+
+也可直接配置环境变量：
 
 ```dotenv
 ONCALL_SERVICE_SECRET="<service-account-service-secret>"
@@ -81,6 +89,7 @@ ONCALL_SERVICE_SECRET="<service-account-service-secret>"
 | 目标加载、邮箱映射、HTTP 调用 | [oncall-group-client.ts](../src/services/oncall-group-client.ts) |
 | 来源索引、文件锁和去重状态 | [oncall-group-store.ts](../src/services/oncall-group-store.ts) |
 | CLI 子进程密钥清理 | [child-env.ts](../src/utils/child-env.ts) 中 `REDACTED_CHILD_ENV_KEYS` |
+| 页面服务凭据读写 | [oncall-service-secret.ts](../src/dashboard/oncall-service-secret.ts)，复用宿主安全文件、文件锁、同源及 CSRF 校验；`GET/PUT /api/oncall-service-secret` |
 
 后续改动继续复用上述入口。不要单独复制一份反馈状态机、按钮工厂或认证 adapter；修改卡片时同时覆盖普通最终回答和 CLI 最终发送。鉴权只在 Oncall 客户端处理，不改全局 CLI 身份注入。
 
@@ -91,6 +100,7 @@ ONCALL_SERVICE_SECRET="<service-account-service-secret>"
 针对 Oncall、凭据隔离、原身份逻辑及 Bun runner 的回归：
 
 ```bash
+bun run test test/oncall-service-secret.test.ts test/oncall-service-secret-ui.test.ts
 bun run test test/oncall-group.test.ts test/oncall-group-callback.test.ts \
   test/bytedcli-auth.test.ts test/child-env.test.ts \
   test/turn-cli-identity.test.ts test/bun-runner-selectors.test.ts
@@ -116,7 +126,7 @@ bun run test:bun:self-check
 
 主要断言包括：默认关闭、空群列表、跨群和私聊不展示、重复装配不新增按钮、二级反馈后回调仍在、点击者映射、Secret 缺失、401/403 提示、并发去重、超时不重建，以及成功落盘但回复失败后的链接复用。自动化中替换 `fetch` 只用于测试，不是部署中的 mock 接口。
 
-本次文档整理前的开发记录：上述前两组共 **671 项通过、5 项跳过**，完整构建和 Bun runner 自检通过。第三组入口集成回归列作后续改动的验证要求，不包含在这个统计中；自检也不代表全量 Bun 测试通过。远端 PR CI 状态应另行确认。
+页面凭据入口增加前的开发记录：Oncall、身份与反馈回归共 **671 项通过、5 项跳过**，完整构建和 Bun runner 自检通过；该统计不含新增的两个页面凭据测试文件。入口集成回归列作后续改动的验证要求，不包含在这个统计中；自检也不代表全量 Bun 测试通过。远端 PR CI 状态应另行确认。
 
 ## 部署验收
 

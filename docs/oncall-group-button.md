@@ -24,11 +24,13 @@ Dashboard 入口是「消息卡片 / 最终回答反馈」旁的「支持拉起 
 
 接入需要三类配置，不需要给每个点击者配置凭据：
 
-- **服务凭据**：一个 `ONCALL_SERVICE_SECRET`，注入 daemon 环境。使用相同环境的 Bot 共用该服务账号。
+- **服务凭据**：一个 `ONCALL_SERVICE_SECRET`。管理员可在 Oncall 设置旁填写 Service Secret，保存到宿主 `~/.botmux/.env`，重启 daemon 后生效；也可由部署环境注入。使用相同环境的 Bot 共用该服务账号。
 - **建群目标**：数据目录中的 `oncall-group-targets.json`，按 Bot App ID 保存五项参数。
 - **按钮范围**：Bot 配置中的 `oncallGroup.enabled` 和 `oncallGroup.chatIds`，由 Dashboard 保存并热更新。
 
 Secret 不进入普通 Bot 配置、目标 JSON、卡片或会话 CLI 环境。目标文件由管理员维护，不能由卡片点击参数指定。具体格式见 [开发文档](oncall-group-development.md)。
+
+凭据页面通过 `GET /api/oncall-service-secret` 读取已保存配置的存在状态，通过 `PUT` 提交新凭据。两者均要求宿主管理权限；写请求复用同源和 CSRF 校验。接口不返回密钥，保存采用现有宿主安全文件读写与文件锁，保留其他 `.env` 配置。输入框不回填原值，保存结束后清空；空值不能覆盖原凭据。状态仅表示文件中是否已配置，不代表运行中的 daemon 已重启或平台授权有效。
 
 ## 鉴权与身份
 

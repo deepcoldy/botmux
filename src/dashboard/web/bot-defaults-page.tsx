@@ -56,6 +56,7 @@ import {
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
@@ -1193,7 +1194,49 @@ function BotDefaultsCard(props: {
   );
 }
 
-function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; chats: GroupChat[] }) {
+export function OncallServiceSecretSettings() {
+  const inputId = useId();
+  const [secret, setSecret] = useState('');
+  const [configured, setConfigured] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void sendJson('GET', '/api/oncall-service-secret').then(res => {
+      if (cancelled) return;
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setConfigured(res.body.configured === true);
+    }).catch(() => { if (!cancelled) setStatus({ text: '无法读取凭据状态，请刷新后重试' }); });
+    return () => { cancelled = true; };
+  }, []);
+  async function saveSecret(): Promise<void> {
+    setBusy(true); setStatus(null);
+    try {
+      const response = await fetch('/api/oncall-service-secret', {
+        method: 'PUT', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() },
+        body: JSON.stringify({ secret }),
+      });
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error(body.error || '保存失败');
+      setConfigured(true);
+      setStatus({ text: '已保存，重启 BotMux 后生效', ok: true });
+    } catch (error) { setStatus({ text: caughtErrorText(error) }); }
+    finally { setSecret(''); setBusy(false); }
+  }
+  return <form className="bd-oncall-secret" onSubmit={event => { event.preventDefault(); if (secret.trim() && !busy && configured !== null) void saveSecret(); }}>
+    <label htmlFor={inputId}>Service Secret <span className="muted">{configured === null ? '状态未确认' : configured ? '已配置' : '未配置'}</span></label>
+    <div className="bd-oncall-secret-input">
+      <input id={inputId} type="password" autoComplete="new-password" spellCheck={false} maxLength={8192}
+        value={secret} disabled={busy || configured === null} placeholder={configured ? '输入新凭据以替换' : '输入 Service Secret'}
+        onChange={event => setSecret(event.currentTarget.value)} />
+      <button type="submit" disabled={busy || configured === null || !secret.trim()}>{busy ? '保存中' : '保存'}</button>
+    </div>
+    <small className="muted">同一部署共用，保存后重启生效。</small>
+    <StatusSpan status={status} />
+  </form>;
+}
+
+function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; chats: GroupChat[]; active: boolean }) {
   const [policy, setPolicy] = useState(props.bot.oncallGroup ?? { enabled: false, chatIds: [] });
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -1221,6 +1264,7 @@ function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; c
         onChange={value => void save({ ...policy, chatIds: value as string[] })} />
     </div>
     <StatusSpan status={status ?? (policy.enabled && !policy.chatIds.length ? { text: '请选择生效群' } : null)} />
+    {props.active && ui.authed ? <OncallServiceSecretSettings key={props.bot.larkAppId} /> : null}
   </fieldset>;
 }
 
@@ -1305,7 +1349,7 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       </h3>
       <div className="bd-feedback-controls">
         <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
-        <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} />
+        <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
       </div>
       <StatusSpan status={status} />
       {on ? (
