@@ -326,7 +326,8 @@ describe('TRAE native subagent hook worker launches', () => {
     expect(hookOverrides(viewer!.argv)).toEqual([]);
     expect(viewer!.argv).toEqual([
       '--remote', expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
-      'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', 'thread-fake-1',
+      'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true', 'thread-fake-1',
     ]);
     expectAuthenticatedSessionEnv(appServer!, harness.sessionId);
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
