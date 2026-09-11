@@ -3512,14 +3512,14 @@ function receivedReactionEmojiFor(ds: DaemonSession): string {
   } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
 }
 
-export function noteTurnReceived(
+export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
   _prompt?: string,
   _sender?: { name?: string },
   _turnId?: string,
   receivedReactionEmoji?: string,
-): Promise<void> | undefined {
+): Promise<void> {
   // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
   // turn. This is the per-message acceptance point — every inbound turn passes
   // through here before reaching the worker — so it is the one place that can
@@ -3533,20 +3533,8 @@ export function noteTurnReceived(
   // on. A feature that is off must not perturb timing at all, so the await only
   // happens once a bot has actually opted in.
   const identityReady = prepareTurnCliIdentity(ds, _turnId ?? triggerMessageId);
-  const reactionEligible = turnReactionEligible(ds, triggerMessageId);
-  if (!identityReady && !reactionEligible) return undefined;
-  return (async () => {
-    if (identityReady) await identityReady;
-    if (reactionEligible) await registerTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
-  })();
-}
-
-function turnReactionEligible(ds: DaemonSession, triggerMessageId: string): boolean {
-  if (ds.session.vcMeetingReceiver
-    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return false;
-  if (!streamingCardDisabledFor(ds, triggerMessageId)) return false;
-  if (silentTurnReactionsFor(ds)) return false;
-  return triggerMessageId.startsWith('om_');
+  if (identityReady) await identityReady;
+  await registerTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
 }
 
 async function registerTurnReceivedReaction(
@@ -3575,7 +3563,14 @@ async function registerTurnReceivedReaction(
   // reaction-free (it is meeting-driven and routes through the audited listener
   // action, not the ordinary progress-reaction channel). Transcript deliveries
   // never reach this inbound-message acceptance point at all.
-  if (!turnReactionEligible(ds, triggerMessageId)) return;
+  if (ds.session.vcMeetingReceiver
+    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
+  // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
+  // not to whichever turn most recently overwrote currentReplyTarget.
+  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
+  if (silentTurnReactionsFor(ds)) return;
+  // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
+  if (!triggerMessageId.startsWith('om_')) return;
   if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
   // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
   // entry before awaiting addReaction, a previous turn's idle edge
