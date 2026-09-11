@@ -309,7 +309,7 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
-  /** Suppress Codex/TraeX's low-quota model-switch picker for managed launches.
+  /** Suppress Codex/TraeX/CoCo's low-quota model-switch picker for managed launches.
    *  Default ON; false leaves the CLI's own notice configuration in control.
    *  Applied per process; never edits the user's CLI config. Aiden's gateway cannot forward it. */
   hideCodexRateLimitModelNudge?: boolean;

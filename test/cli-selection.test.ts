@@ -18,6 +18,7 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from '../src/setup/cli-selection.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
@@ -675,4 +676,22 @@ describe('Codex model-nudge override through wrappers', () => {
       expect(buildWrappedLaunch(wrapper, userArgs).args.slice(-2)).toEqual(userArgs);
     },
   );
+});
+
+
+it('ttadk coco preserves the model-nudge long config option across fresh and resume launches', () => {
+  for (const resume of [false, true]) {
+    for (const enabled of [false, true]) {
+      const args = createCocoAdapter('/usr/bin/coco').buildArgs({
+        sessionId: 'coco-session', resume, model: 'coco-model', hideRateLimitModelNudge: enabled,
+      });
+      const out = buildWrappedLaunch('ttadk coco', args);
+      expect(out.args).toEqual(['coco', '--skip-check', ...args]);
+      expect(out.args.includes('notice.hide_rate_limit_model_nudge=true')).toBe(enabled);
+      if (enabled) {
+        expect(out.args[out.args.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('--config');
+      }
+      expect(out.args).toContain('model.name=coco-model');
+    }
+  }
 });
