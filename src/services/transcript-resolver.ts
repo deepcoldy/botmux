@@ -7,6 +7,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { expandHome } from '../core/working-dir.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
+import { getSession } from './session-store.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
@@ -291,6 +292,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'claude' } : null;
     }
     case 'codex': {
+      const session = getSession(q.sessionId);
+      if (session?.cliInstanceBinding && q.larkAppId && q.larkAppId !== session.larkAppId) return null;
+      const binding = (!q.larkAppId || q.larkAppId === session?.larkAppId) ? session?.cliInstanceBinding : undefined;
+      if (binding) {
+        const path = codexRolloutInHome(q, binding.codexHome, binding.source !== 'legacy');
+        return path ? { path, kind: 'codex' } : null;
+      }
       // Resolve on every call: CODEX_HOME is intentionally dynamic, and the
       // absolute path is part of the cache key so changing it cannot reuse a
       // rollout discovered under a previous root.

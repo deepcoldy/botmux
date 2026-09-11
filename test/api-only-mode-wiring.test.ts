@@ -313,7 +313,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
     // The central gate is defined once and keys on apiOnly bot OR virtual chatId.
     const helper = region(cliSource, 'function currentTurnHasNoTransport(', 'function assertTurnTransportOrExit(');
-    expect(helper).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(helper).toContain('isHttpVirtualSession(chatId)');
     expect(helper).toContain('currentBotIsApiOnly(appId)');
     // Region-scoped per command (NOT file-wide contains): deleting the gate from
     // any ONE command's body must fail this test. Map op → (fn start, fn end).
@@ -352,8 +352,9 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const originGate = region(cliSource, 'function managedOriginHasNoTransport(', '\n}\n');
     expect(originGate).toContain('resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)');
     expect(originGate).toContain('loadSessions().get(ctx.sessionId)');
+    expect(originGate).toContain('isHttpVirtualSession(chatId)');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
-    expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(sessGate).toContain('isHttpVirtualSession(chatId)');
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
   });
 
@@ -435,7 +436,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
-    expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
+    expect(gate).toContain('isHttpVirtualSession(session?.chatId)');
   });
 });
 

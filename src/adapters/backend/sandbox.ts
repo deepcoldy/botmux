@@ -27,6 +27,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
+import { linuxIsolationLaunch } from '../../core/linux-isolation.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -159,7 +160,7 @@ function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe
   if (probe.status !== 0) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  const runtime = spawnSync(executable, [
+  const launch = linuxIsolationLaunch(executable, [
     '--bind', '/', '/',
     '--proc', '/proc',
     '--tmpfs', '/tmp',
@@ -171,7 +172,8 @@ function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe
     '--die-with-parent',
     '--new-session',
     '--', '/bin/true',
-  ], { stdio: 'ignore', timeout: 5_000 });
+  ]);
+  const runtime = spawnSync(launch.bin, launch.args, { stdio: 'ignore', timeout: 5_000 });
   if (runtime.status === 0) return { supported: true, mechanism: 'bwrap', executable };
   return {
     supported: false,
@@ -221,10 +223,7 @@ export function prepareCredentialOnlySandbox(input: {
   if (process.platform !== 'linux' || !ensureSandboxDeps()) return null;
   const probe = probeBubblewrapCredentialMasks();
   if (!probe.supported || probe.mechanism !== 'bwrap') return null;
-  return {
-    bin: probe.executable,
-    args: buildCredentialOnlySandboxArgs(input),
-  };
+  return linuxIsolationLaunch(probe.executable, buildCredentialOnlySandboxArgs(input));
 }
 
 /** Re-expose trusted executable directories hidden below the fresh /run tmpfs. */
@@ -294,7 +293,18 @@ export function botmuxShimExecLine(): string {
   if (isStandaloneBinary()) {
     return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`;
   }
-  return `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`;
+  // Pin the interpreter to this daemon's own `process.execPath` rather than a bare
+  // `node`. In-sandbox PATH is `/run/sbxbin:<canonicalExecDirs>:<host PATH>`, and
+  // that host tail can resolve `node` to a DIFFERENT build than the daemon runs on.
+  // MEASURED (2026-09-08): `node dist/cli.js send --help` under Node v18.20.4 exits
+  // 1 from the session store's SQLite gate before printing anything, so an
+  // in-sandbox `botmux send` fails outright. Pinning also makes Bun work here:
+  // execPath is then the bun binary, which runs dist/*.js and has bun:sqlite.
+  //
+  // Safe inside bwrap: `dirname(realpath(process.execPath))` is always bound and
+  // prepended to the sandbox PATH (see canonicalExecDirs / pushExecDir below), so
+  // the pinned absolute path resolves for the child that actually runs this shim.
+  return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(distCliJs())} "$@"\n`;
 }
 
 /**
@@ -631,9 +641,9 @@ export const __testOnly_maskMounts = {
 };
 
 export interface DirectSandboxSpawn {
-  /** Replace the CLI binary with this (always 'bwrap'). */
+  /** Replace the CLI binary with this (the bwrap isolation launcher). */
   bin: string;
-  /** bwrap args + '--' + original (bin, ...args). */
+  /** Isolation launcher + bwrap args + '--' + original (bin, ...args). */
   args: string[];
   /** Env overrides to merge into childEnv (HOME, PATH, BOTMUX_SEND_RELAY, proxies). */
   env: Record<string, string>;
@@ -680,6 +690,9 @@ export function prepareDirectSandbox(opts: {
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
+
+  // Validate marker support before creating any session files or deny masks.
+  const launch = linuxIsolationLaunch('bwrap', []);
 
   const dataDir = canonical(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
@@ -892,8 +905,8 @@ export function prepareDirectSandbox(opts: {
   args.push('--', execBin, ...opts.cliArgs);
 
   return {
-    bin: 'bwrap',
-    args,
+    bin: launch.bin,
+    args: [...launch.args, ...args],
     env,
     outbox,
     cleanup: () => {

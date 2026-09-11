@@ -24,6 +24,9 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  cliInstanceId?: string;
+  cliInstanceSource?: string;
+  creationSource?: string;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -53,6 +56,7 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
   /** Informational only; callers must not treat it as authenticated identity. */
@@ -136,6 +140,13 @@ function sessionThreadLink(
 ): string | undefined {
   if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
   return threadAppLink(session.chatId, session.larkThreadId, brand);
+}
+
+function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
+  if (session.headless && !session.headless.boundChatId) return '';
+  return session.headless?.boundChatId
+    ? feishuChatLink(session.headless.boundChatId, brand)
+    : feishuChatLink(session.chatId, brand);
 }
 
 let cachedBotName = '';
@@ -241,6 +252,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: ds.session.cliInstanceBinding?.source,
+    creationSource: ds.session.creationSource,
     ...sessionRuntimeFields(ds.session),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
@@ -266,6 +280,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
     titleSource: ds.session.titleSource,
@@ -286,7 +301,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     riffAccessUrl: ds.riffAccessUrl,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(ds.session, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
@@ -310,6 +325,9 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
@@ -323,6 +341,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,
@@ -334,7 +353,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
-    feishuChatLink: feishuChatLink(s.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
@@ -357,6 +376,9 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,
@@ -369,6 +391,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,
@@ -379,7 +402,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: null,
-    feishuChatLink: feishuChatLink(s.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),

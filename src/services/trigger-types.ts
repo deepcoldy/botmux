@@ -1,4 +1,4 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting';
+export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
@@ -39,6 +39,7 @@ export interface TriggerRequest {
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
     topicMessage?: string | null;
+    title?: string;
   };
   options?: {
     dryRun?: boolean;
@@ -238,6 +239,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     }
     if (typeof topicMessage === 'string' && (!topicMessage.trim() || Array.from(topicMessage.trim()).length > 200)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
+    }
+    const title = raw.presentation.title;
+    if (title !== undefined && (typeof title !== 'string' || !title.trim() || Array.from(title.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.title must contain 1 to 200 characters' } };
     }
   }
   if (waitForFinalOutput && target.kind !== 'turn') {

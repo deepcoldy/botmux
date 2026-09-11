@@ -21,7 +21,7 @@
  * keeps the real fifo/read/teardown path intact while touching no real server.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -38,6 +38,13 @@ let failingBinDir: string;
 /** Static `ulimit -n 128; exec "$@"` wrapper — see the emfile note in runFixture. */
 let fdLimitWrapper: string;
 let wrapperDir: string;
+
+/**
+ * Every fifo path a fixture run announced, so afterAll can sweep anything a
+ * wedged (SIGKILLed) run had no chance to unlink. Without this the suite would
+ * litter the shared tmpdir it deliberately no longer asserts against.
+ */
+const announcedFifoPaths = new Set<string>();
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
 type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail' | 'drain';
@@ -72,7 +79,7 @@ async function runFixture(mode: FixtureMode): Promise<{
   child.stdout?.on('data', (b) => { stdout += String(b); });
   child.stderr?.on('data', (b) => { stdout += String(b); });
 
-  return await new Promise((resolvePromise) => {
+  const result = await new Promise<{ timedOut: boolean; code: number | null; stdout: string }>((resolvePromise) => {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       resolvePromise({ timedOut: true, code: null, stdout });
@@ -82,6 +89,18 @@ async function runFixture(mode: FixtureMode): Promise<{
       resolvePromise({ timedOut: false, code, stdout });
     });
   });
+  const announced = /^FIFO_PATH=(.+)$/m.exec(result.stdout)?.[1];
+  if (announced) announcedFifoPaths.add(announced);
+  return result;
+}
+
+/** The exact fifo this run owned. Fails the caller loudly when the fixture did
+ *  not get far enough to announce one — an absent path must never read as
+ *  "cleanup verified". */
+function fifoPathOf(stdout: string): string {
+  const announced = /^FIFO_PATH=(.+)$/m.exec(stdout)?.[1];
+  expect(announced, 'fixture never announced its fifo path').toBeTruthy();
+  return announced!;
 }
 
 beforeAll(() => {
@@ -120,6 +139,11 @@ afterAll(() => {
   rmSync(fakeBinDir, { recursive: true, force: true });
   rmSync(failingBinDir, { recursive: true, force: true });
   rmSync(wrapperDir, { recursive: true, force: true });
+  // A wedged variant is SIGKILLed and never reaches its own unlink; sweep every
+  // fifo this suite announced so it leaves the shared tmpdir as it found it.
+  for (const path of announcedFifoPaths) {
+    try { unlinkSync(path); } catch { /* already gone — the normal case */ }
+  }
 });
 
 describe('TmuxPipeBackend fifo teardown', () => {
@@ -196,7 +220,6 @@ describe('TmuxPipeBackend fifo teardown', () => {
   // Fixing only the teardown sites would leave the original wedge reachable, so
   // the module installs a process-exit hook. This is its regression.
   it('lets the process exit with a LIVE backend and no teardown call at all', async () => {
-    const before = new Set(readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-')));
     const r = await runFixture('directexit');
 
     expect(r.stdout).toContain('DIRECT_EXIT');
@@ -205,9 +228,9 @@ describe('TmuxPipeBackend fifo teardown', () => {
     expect(r.code).toBe(0);
     // A named fifo is a filesystem object and outlives the process, so the exit
     // hook has to unlink as well as wake — otherwise every teardown-bypassing
-    // exit strews /tmp with botmux-pipe-*.
-    const after = readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-'));
-    expect(after.filter((f) => !before.has(f))).toEqual([]);
+    // exit strews the temp dir with botmux-pipe-*. Checked by exact path for the
+    // same reason as the teardown case below: `tmpdir()` is machine-wide.
+    expect(existsSync(fifoPathOf(r.stdout))).toBe(false);
   }, EXIT_TIMEOUT_MS + 15_000);
 
   // Blocker found in review: acquiring the wake fd lazily AT teardown fails in
@@ -264,11 +287,25 @@ describe('TmuxPipeBackend fifo teardown', () => {
     expect(r.timedOut).toBe(true);
   }, EXIT_TIMEOUT_MS + 15_000);
 
+  // Asserts on the ONE fifo this run created, by path, checked from the parent
+  // AFTER the child exited — so it also covers a teardown that unlinks too late
+  // rather than not at all.
+  //
+  // It used to diff `readdirSync(tmpdir())` before/after instead. That was a
+  // race, not a property: `TmuxPipeBackend` puts its fifo in the process-global
+  // `tmpdir()`, which on this machine is shared with every live daemon worker
+  // (the emfile note above counts ~275 of them). Any unrelated worker that
+  // spawned a piped pane inside the window showed up as "a new fifo" and failed
+  // the run — observed as a stray `botmux-pipe-<hex>.fifo` this suite never
+  // created. Owning the namespace removes the flake mechanically; no retry, no
+  // tolerance window, and the assertion gets STRICTER (one exact path instead
+  // of "nothing new appeared").
   it('leaves no fifo behind after teardown', async () => {
-    const before = new Set(readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-')));
     const r = await runFixture('real');
     expect(r.timedOut).toBe(false);
-    const after = readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-'));
-    expect(after.filter((f) => !before.has(f))).toEqual([]);
+    // The child's own view at exit time…
+    expect(r.stdout).toContain('FIFO_LEFT=false');
+    // …and the parent's view after it is gone.
+    expect(existsSync(fifoPathOf(r.stdout))).toBe(false);
   }, EXIT_TIMEOUT_MS + 15_000);
 });

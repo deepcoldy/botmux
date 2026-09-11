@@ -41,6 +41,10 @@ describe('trigger request contract', () => {
     custom.presentation = { topicMessage: 'Build failed' };
     expect(validateTriggerRequest(custom).ok).toBe(true);
 
+    const titled = request();
+    titled.presentation = { title: 'Headless build' };
+    expect(validateTriggerRequest(titled).ok).toBe(true);
+
     const silent = request();
     silent.presentation = { topicMessage: null };
     expect(validateTriggerRequest(silent).ok).toBe(true);
@@ -50,6 +54,28 @@ describe('trigger request contract', () => {
       bad.presentation = { topicMessage };
       expect(validateTriggerRequest(bad).ok).toBe(false);
     }
+
+    for (const title of ['', 'x'.repeat(201), 42]) {
+      const bad = request() as any;
+      bad.presentation = { title };
+      expect(validateTriggerRequest(bad).ok).toBe(false);
+    }
+  });
+
+  it('accepts headless async turn triggers against an existing session', () => {
+    const req = request();
+    req.source = { type: 'headless', connectorId: 'botmux-headless-cli', requestId: 'hl_123' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    req.envelope = {
+      format: 'botmux.headless.v1',
+      sourceName: 'botmux headless',
+      trusted: false,
+      payload: { prompt: 'say hello' },
+      rawText: 'say hello',
+    };
+    req.instruction = 'say hello';
+    req.options = { asyncReturnSessionId: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
   });
 
   it('allows wait-mode turn triggers without a chatId or sessionId', () => {

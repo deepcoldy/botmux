@@ -12,6 +12,7 @@
  */
 
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
+import { newSessionCodexInstanceState, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import {
   V3_SUPPORTED_CLIS,
@@ -68,10 +69,12 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
       'has disableCliBypass=true. Use a workflow bot with bypass enabled, or remove/set this bot option to false',
     );
   }
+  const instance = newSessionCodexInstanceState(bot, 'workflow');
   return {
+    ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
     larkAppId: bot.larkAppId,
     cliId: bot.cliId,
-    ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
+    ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.sandbox === true ? { sandbox: true } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
@@ -134,6 +137,8 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
   }
   const allowed = new Set([
     'larkAppId',
+    'cliInstanceBinding',
+    'cliRuntime',
     'cliId',
     'cliPathOverride',
     'model',
@@ -203,7 +208,15 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       }
     }
     const parsedSandboxPaths = sandboxPathsSnapshot(obj.sandboxPaths as BotSnapshot['sandboxPaths']);
+    if (obj.cliInstanceBinding !== undefined) {
+      const b = obj.cliInstanceBinding as SessionCliInstanceBindingV1;
+      if (!b || b.version !== 1 || b.source !== 'default' || b.cliId !== 'codex' || obj.cliId !== 'codex'
+          || b.authMode !== 'isolated' || typeof b.instanceId !== 'string' || typeof b.codexHome !== 'string'
+          || !b.codexHome.startsWith('/')) throw new Error('invalid frozen workflow Codex instance binding');
+    }
     snapshots.set(key, {
+      ...(obj.cliInstanceBinding ? { cliInstanceBinding: obj.cliInstanceBinding as SessionCliInstanceBindingV1,
+        cliRuntime: obj.cliRuntime as BotSnapshot['cliRuntime'] } : {}),
       larkAppId: obj.larkAppId,
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),

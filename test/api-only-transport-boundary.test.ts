@@ -58,13 +58,15 @@ describe('larkTransportEnabled — central no-Feishu predicate', () => {
   it('disables transport for an HTTP virtual session even on a normal bot', () => {
     expect(larkTransportEnabled({ chatId: 'http_async_abc', apiOnly: false })).toBe(false);
     expect(larkTransportEnabled({ chatId: 'http_wait_abc', apiOnly: undefined })).toBe(false);
+    expect(larkTransportEnabled({ chatId: 'headless_hl_abc12345', apiOnly: false })).toBe(false);
   });
   it('enables transport for a normal bot in a real chat', () => {
     expect(larkTransportEnabled({ chatId: 'oc_real', apiOnly: false })).toBe(true);
   });
-  it('isHttpVirtualSession recognizes both synthetic prefixes only', () => {
+  it('isHttpVirtualSession recognizes synthetic no-transport prefixes only', () => {
     expect(isHttpVirtualSession('http_async_x')).toBe(true);
     expect(isHttpVirtualSession('http_wait_x')).toBe(true);
+    expect(isHttpVirtualSession('headless_hl_abc12345')).toBe(true);
     expect(isHttpVirtualSession('oc_real')).toBe(false);
     expect(isHttpVirtualSession('doc:tok')).toBe(false);
   });

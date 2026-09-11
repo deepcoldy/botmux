@@ -731,16 +731,24 @@ export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>):
 }
 
 /** A session created by the HTTP control API (`waitForFinalOutput` /
- * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
- * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*`,
+ * `http_wait_*`, or `headless_*` address, NOT a real Lark chat. Any Feishu chat API call
  * targeting it (sendMessage / card / reply / roster probe) would fail — these
  * sessions are request/response only and must never touch Lark transport.
  * Tolerates a nullish chatId (returns false — a missing surface is not an
  * HTTP virtual chat), so callers converging onto this predicate can pass an
  * optional chatId without a separate `?.` guard. */
+export const HEADLESS_CHAT_PREFIX = 'headless_';
+
+export function isHeadlessSessionChatId(chatId: string | undefined | null): boolean {
+  return !!chatId && chatId.startsWith(HEADLESS_CHAT_PREFIX);
+}
+
 export function isHttpVirtualSession(chatId: string | undefined | null): boolean {
   if (!chatId) return false;
-  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  return chatId.startsWith('http_async_')
+    || chatId.startsWith('http_wait_')
+    || isHeadlessSessionChatId(chatId);
 }
 
 /** Central Lark-transport capability gate for a live session. Returns false —

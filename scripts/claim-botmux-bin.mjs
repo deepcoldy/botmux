@@ -25,6 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, basename, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync, realpathSync, chmodSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { delimiter } from 'node:path';
 
 // 原子写（与 src/utils/atomic-write.ts 同构，.mjs 不依赖 dist 故内联）：
 // 这个 wrapper 随时被并发会话 exec，裸写半截会让它们的 `botmux send` 全体失败。
@@ -72,6 +74,81 @@ function defaultBinaryPath() {
   return join(repoRoot, 'dist-bin', `botmux-${plat}-${arch}`);
 }
 
+// ── 解释器选择：按【能力】而不是按名字 ────────────────────────────────────
+// wrapper 里必须写**绝对路径**的解释器，不能写裸 `node`：裸名由 exec 时的 PATH 解析，
+// 而那个环境不是写它的环境。2026-09-08 实测事故：某次 restart 的 PATH 把 /usr/bin 排在
+// fnm shim 之前，`node` 解析成 v18.20.4（无 `node:sqlite`），会话存储的硬闸在启动瞬间
+// 打死全部 55 个 bot daemon（各重启 10 次后 park 成 errored），飞书里所有话题看起来全丢，
+// 而 57 个 SQLite 库其实完好。supervisor 自己活着，于是「报成功、孩子全灭」。
+//
+// 但也不能天真地钉 `process.execPath`：`use:here` 本身就是被 `node` 拉起来的，如果那个
+// node 正是不合格的 v18，钉下去等于把事故固化成配置。所以这里**探测能力**：
+//   ① BOTMUX_INTERPRETER 显式指定（逃生阀 / CI 固定）
+//   ② 自己的 process.execPath（若合格）—— 最常见路径，零额外开销
+//   ③ PATH 上的 bun（自带 bun:sqlite，且能直接跑 dist/*.js）
+//   ④ PATH 上合格的 node
+// 全都不合格就硬失败：写一个注定崩 fleet 的 wrapper 比不写更坏。
+//
+// 「合格」= 能加载 sqlite 引擎。判据取自 src/services/sqlite-compat.ts 的同一条契约
+// （node:sqlite 或 bun:sqlite），而不是比版本号字符串 —— 版本号会漂，能力不会。
+// 全程不出现任何本机专有路径：候选一律从 PATH / execPath 现取，跨机可移植。
+function interpreterIsCapable(bin) {
+  // bun 有 bun:sqlite，node ≥22.13 有 node:sqlite。用 -e 真加载一次，别猜。
+  const probe = 'try{require("node:sqlite").DatabaseSync;console.log("OK")}catch(e){'
+    + 'try{require("bun:sqlite").Database;console.log("OK")}catch(e2){process.exit(3)}}';
+  try {
+    const out = execFileSync(bin, ['-e', probe], { encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.includes('OK');
+  } catch { return false; }
+}
+
+/** Look up a bare command on PATH without depending on `which`/`where`. */
+function whichOnPath(cmd) {
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const cand = join(dir, cmd + ext);
+      try { if (statSync(cand).isFile()) return cand; } catch { /* next */ }
+    }
+  }
+  return undefined;
+}
+
+function resolveCapableInterpreter() {
+  const tried = [];
+  const consider = (bin, label) => {
+    if (!bin) return undefined;
+    let abs;
+    try { abs = realpathSync(bin); } catch { return undefined; }
+    if (tried.some(t => t.abs === abs)) return undefined;
+    const ok = interpreterIsCapable(abs);
+    tried.push({ abs, label, ok });
+    return ok ? abs : undefined;
+  };
+
+  const explicit = process.env.BOTMUX_INTERPRETER;
+  if (explicit) {
+    const picked = consider(explicit, 'BOTMUX_INTERPRETER');
+    if (picked) return picked;
+    console.error(`❌ BOTMUX_INTERPRETER=${explicit} 加载不出 SQLite 引擎（node:sqlite / bun:sqlite），拒绝写入。`);
+    process.exit(1);
+  }
+
+  return consider(process.execPath, 'process.execPath')
+    ?? consider(whichOnPath('bun'), 'PATH bun')
+    ?? consider(whichOnPath('node'), 'PATH node')
+    ?? (() => {
+      console.error(
+        '❌ 找不到能加载 SQLite 引擎的解释器（需要 node ≥ 22.13 的 node:sqlite，或任意 bun 的 bun:sqlite）。\n'
+        + `   已试: ${tried.map(t => `${t.label}=${t.abs}`).join(', ') || '(无)'}\n`
+        + '   会话存储硬依赖它；写一个不合格的 wrapper 会让整个 fleet 启动即崩。\n'
+        + '   装 bun（https://bun.sh）或升级 node，或用 BOTMUX_INTERPRETER=<abs path> 显式指定。',
+      );
+      process.exit(1);
+    })();
+}
+
 let target;   // wrapper 里被 exec 的东西
 let content;  // wrapper 全文
 
@@ -102,7 +179,9 @@ if (useBinary) {
   content = `#!/bin/sh\nexec "${target}" "$@"\n`;
 } else {
   target = join(repoRoot, 'dist', 'cli.js');
-  content = `#!/bin/sh\nexec node "${target}" "$@"\n`;
+  const interpreter = resolveCapableInterpreter();
+  content = `#!/bin/sh\nexec "${interpreter}" "${target}" "$@"\n`;
+  console.log(`   解释器已钉死: ${interpreter}`);
   if (!existsSync(target)) {
     console.warn(`⚠️  ${target} 还不存在——先 \`bun run build\`（或用 \`bun run switch:here\`）。wrapper 仍按此路径写入。`);
   }

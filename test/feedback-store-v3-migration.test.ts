@@ -34,7 +34,7 @@ describe('SkillFeedbackStore v3 migration', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-v6-'));
     dirs.push(dataDir);
     const store = await SkillFeedbackStore.open(dataDir);
-    expect(store.schemaVersion()).toBe(7);
+    expect(store.schemaVersion()).toBe(8);
     store.close();
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
@@ -60,7 +60,7 @@ describe('SkillFeedbackStore v3 migration', () => {
     copyFileSync(join(fixtureDir, 'botmux-feedback.sqlite'), join(migratedDir, 'botmux-feedback.sqlite'));
 
     const store = await SkillFeedbackStore.open(migratedDir);
-    expect(store.schemaVersion()).toBe(7);
+    expect(store.schemaVersion()).toBe(8);
     const old = store.findDeliveryByPlatformMessage('lark', 'app_old', 'om_old');
     expect(old).toMatchObject({
       deliveryId: 'del_old', responseId: 'resp_old', requesterSubjectId: 'on_old',
