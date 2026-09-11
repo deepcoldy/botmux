@@ -1353,10 +1353,13 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
   };
 }
 
-/** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
- *  flips the worktree control between an instant single-select dropdown (false)
- *  and the inline multi-select form (true). */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+/** Render the repo selection card for an already-budgeted slice of the scan.
+ *  `multiPicker` (persisted per-bot via worktreeMultiPicker) flips the worktree
+ *  control between an instant single-select dropdown (false) and the inline
+ *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
+ *  many trailing projects to fit the card byte budget; the card then says so.
+ *  Callers go through buildRepoSelectCard, which owns the budget. */
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1551,6 +1554,18 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
+      // Over-budget scans lose their tail (see buildRepoSelectCard). Say so, and
+      // point at `/repo <path|name>` — that resolves against a fresh scan, so it
+      // reaches a dropped project regardless of what this dropdown lists.
+      ...(hiddenCount > 0 ? [{
+        tag: 'note',
+        elements: [
+          {
+            tag: 'lark_md',
+            content: t('card.repo.truncated_hint', { shown: projects.length, total: projects.length + hiddenCount }, locale),
+          },
+        ],
+      }] : []),
       {
         tag: 'note',
         elements: [
@@ -1564,6 +1579,53 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   };
 
   return JSON.stringify(card);
+}
+
+/** Byte budget for the repo picker card.
+ *
+ *  The Feishu card API rejects a payload past ~109 KB with error 230025 ("The
+ *  length of the message content reaches its limit."). Unlike the streaming
+ *  card there is no user-authored content to shorten here: the card carries one
+ *  select_static option per scanned project, so a broad scan root sets the size
+ *  on its own. A live 1174-project root (47 repos + 1127 worktrees) serialized
+ *  to 186 KB and the send threw — and because the picker is published after the
+ *  turn is durably admitted, the session was left waiting on a card that never
+ *  existed, with a restart rebuilding the same oversized card. Budgeting here is
+ *  what keeps that from being reachable at all.
+ *
+ *  Set below the observed cliff (~115 KB of card) rather than at it: the egress
+ *  stamp (stampBotmuxCallbackMarkers) grows the wire payload after this measures
+ *  it, the API envelope adds its own overhead, and non-ASCII project names cost
+ *  more bytes than characters. 80 KB still lists several hundred projects — far
+ *  past what anyone scrolls — and the overflow stays reachable by name. */
+export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
+
+/** Repo selection card, capped at REPO_SELECT_CARD_MAX_BYTES.
+ *
+ *  Truncation takes the head of `projects` and never reorders or renumbers it:
+ *  option labels stay 1-based over the caller's own list, which is the same list
+ *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
+ *  thing before and after a truncation. The scanner sorts repos ahead of
+ *  worktrees, so in practice the tail that goes is worktrees. */
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+  const render = (visible: number): string =>
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+  const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
+
+  const full = render(projects.length);
+  if (fits(full)) return full;
+
+  // Largest head slice that fits. Option size varies (name, branch, path), so
+  // search rather than divide by an assumed per-option cost. Floor at 1: an
+  // empty dropdown would be a worse card than an over-budget one, and the
+  // publish sites degrade gracefully when a send is rejected anyway.
+  let lo = 1;
+  let hi = projects.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(render(mid))) lo = mid; else hi = mid - 1;
+  }
+  return render(lo);
 }
 
 // ─── 群内授权卡片 ─────────────────────────────────────────────────────────────

@@ -93,6 +93,7 @@ export const messages: Record<string, string> = {
   'card.repo.current_active': '当前工作目录：',
   'card.repo.current_marker': ' ← 当前',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换（如 `/repo 1`），或直接 `/repo <路径|项目名>`（如 `/repo botmux`、`/repo ~/projects/foo`）跳过本卡片；`/repo wt <编号|项目名> [分支名]` 基于远端默认分支新建 worktree 打开',
+  'card.repo.truncated_hint': '⚠️ 项目过多，下拉框仅显示前 {shown} 个（共 {total} 个）。未列出的用 `/repo <路径|项目名>` 直接指定（如 `/repo botmux`、`/repo ~/projects/foo`）。',
   'card.repo.placeholder_worktree': '🌿 选仓库新建 worktree 打开',
   'card.repo.placeholder_worktree_multi': '🌿 选择一个或多个仓库新建 worktree',
   'card.repo.worktree_now_multi': '多仓库选择器已开启（本 bot 后续会话默认）',

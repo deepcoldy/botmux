@@ -90,6 +90,7 @@ export const messages: Record<string, string> = {
   'card.repo.current_active': 'Current working directory:',
   'card.repo.current_marker': ' ← current',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
+  'card.repo.truncated_hint': '⚠️ Too many projects — the dropdown lists only the first {shown} of {total}. For one that is not listed, use `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`).',
   'card.repo.placeholder_worktree': '🌿 Open a repo as a new worktree',
   'card.repo.placeholder_worktree_multi': '🌿 Select one or more repos for new worktrees',
   'card.repo.worktree_now_multi': 'Multi-repo picker on (default for this bot’s future sessions)',

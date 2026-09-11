@@ -17868,6 +17868,7 @@ async function startInitialPassthroughSession(args: {
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
+  let repoCardDegraded = false;
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
@@ -17875,11 +17876,26 @@ async function startInitialPassthroughSession(args: {
     //（重发会在 pendingRepo 缓冲里再入一份）。
     onDurablyAdmitted?.();
     const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
-    persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
-    announcePendingRepoSession(ds);
-    logger.info(`[${tag(ds)}] Waiting for repo selection before initial raw passthrough (${projects.length} projects)`);
-    return;
+    let repoCardMessageId: string | undefined;
+    try {
+      repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    } catch (err) {
+      // 卡片没发出去 ⟹ 没有任何 picker 可点，保持 pendingRepo 会把这条已 durable
+      // 接纳的开场永久挂死在一张不存在的卡片上（重启也只是重发同一张）。降级成
+      // 「无可选项目」那条路：清掉 pendingRepo 后 forkWorker 会清空 activation
+      // journal，用默认 cwd 直接开工，与 createSession 的降级语义一致。
+      repoCardDegraded = true;
+      logger.warn(`[${tag(ds)}] repo card publish failed (${err instanceof Error ? err.message : String(err)}); falling back to default cwd`);
+    }
+    if (repoCardMessageId) {
+      ds.repoCardMessageId = repoCardMessageId;
+      persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
+      announcePendingRepoSession(ds);
+      logger.info(`[${tag(ds)}] Waiting for repo selection before initial raw passthrough (${projects.length} projects)`);
+      return;
+    }
+    ds.repoCardMessageId = undefined;
+    // fall through to the no-card opening below
   }
 
   // 已 durable staging（picker，含 rawInput）且通过放弃闸：fork 失败后本条 raw
@@ -17894,7 +17910,7 @@ async function startInitialPassthroughSession(args: {
   });
   const availableBots = await getAvailableBots(larkAppId, chatId);
   forkReservedInitialRawSession(ds, availableBots);
-  logger.info(`[${tag(ds)}] No projects to select, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
+  logger.info(`[${tag(ds)}] ${repoCardDegraded ? 'Repo card unavailable' : 'No projects to select'}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
 
@@ -19067,6 +19083,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       projects = scanMultipleProjects(scanDirs, 3, repoPickerScanOptions());
     }
   }
+  let repoCardPublished = false;
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
@@ -19075,12 +19092,27 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     markIngressAdmitted(ctx);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
-    persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
-    announcePendingRepoSession(ds);
-    logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
-  } else {
-    // No projects found — skip repo selection, spawn directly.
+    let repoCardMessageId: string | undefined;
+    try {
+      repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    } catch (err) {
+      // 没有可点的卡片就不能保持 pendingRepo（详见 startInitialPassthroughSession
+      // 同款降级）：走下面的 no-card 分支，用默认 cwd 直接开工。
+      logger.warn(`[${tag(ds)}] repo card publish failed (${err instanceof Error ? err.message : String(err)}); falling back to default cwd`);
+    }
+    if (repoCardMessageId) {
+      repoCardPublished = true;
+      ds.repoCardMessageId = repoCardMessageId;
+      persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
+      announcePendingRepoSession(ds);
+      logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
+    } else {
+      ds.repoCardMessageId = undefined;
+    }
+  }
+  if (!repoCardPublished) {
+    // No projects found (or the picker could not be published) — skip repo
+    // selection, spawn directly.
     // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
     // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
     // 重复执行——先打接纳标。
@@ -19605,6 +19637,7 @@ async function handleBotAdded(
     }
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
+    let repoCardPublished = false;
     if (projects.length > 0) {
       ds.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(chatId, projects);
@@ -19613,8 +19646,16 @@ async function handleBotAdded(
       // immediately before its single network await; pendingRepo already makes
       // this a stable buffered state for normal inbound/scheduler paths.
       armSharedReplyTarget();
-      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
-      if (joinBootstrapWasTakenOver()) {
+      let repoCardMessageId: string | undefined;
+      try {
+        repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      } catch (err) {
+        // 卡片没发出去就没有 picker 可点，保持 pendingRepo 会把这个入群会话挂死。
+        // 落到下面「无可选项目」那条路直接开工——它自己会重跑 takeover 检查并
+        // 重新 armSharedReplyTarget，所以这里既不撤 seed 也不动 reply target。
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} repo 卡发送失败（${err instanceof Error ? err.message : String(err)}），改用默认目录直接开工`);
+      }
+      if (repoCardMessageId && joinBootstrapWasTakenOver()) {
         void deleteMessage(larkAppId, repoCardMessageId);
         // If another entry actually started this same ds, its output still owns
         // the shared seed we just armed. Preserve that root; closed/replaced
@@ -19622,11 +19663,17 @@ async function handleBotAdded(
         if (!ds.worker || ds.worker.killed) withdrawSharedReplySeed();
         return;
       }
-      ds.repoCardMessageId = repoCardMessageId;
-      persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
-      announcePendingRepoSession(ds);
-      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
-    } else {
+      if (repoCardMessageId) {
+        repoCardPublished = true;
+        ds.repoCardMessageId = repoCardMessageId;
+        persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
+        announcePendingRepoSession(ds);
+        logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
+      } else {
+        ds.repoCardMessageId = undefined;
+      }
+    }
+    if (!repoCardPublished) {
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
       const availableBots = await getAvailableBots(larkAppId, chatId);
@@ -19643,7 +19690,7 @@ async function handleBotAdded(
       forkReservedInitialSession(ds, availableBots);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
-      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录${projects.length > 0 ? '且 repo 卡不可用' : '且无可选项目'}，直接开工`);
     }
   } finally {
     joinReady?.settle();
@@ -20974,6 +21021,7 @@ async function handleThreadReplyAdmitted(
     if (scanDirs2.length > 0) {
       projects = scanMultipleProjects(scanDirs2, 3, repoPickerScanOptions());
     }
+    let repoCardPublished = false;
     if (projects.length > 0) {
       newDs.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(autoCreateChatId, projects);
@@ -20981,12 +21029,27 @@ async function handleThreadReplyAdmitted(
       markIngressAdmitted(ctx);
       const currentCwd = getSessionWorkingDir(newDs);
       const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
-      persistPendingRepoCardMessageId(newDs, newDs.repoCardMessageId);
-      announcePendingRepoSession(newDs);
-      logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
-    } else {
-      // No projects found — skip repo selection, spawn directly.
+      let repoCardMessageId: string | undefined;
+      try {
+        repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      } catch (err) {
+        // 没有可点的卡片就不能保持 pendingRepo（详见 handleNewTopicAdmitted 同款
+        // 降级）：走下面的 no-card 分支，用默认 cwd 直接开工。
+        logger.warn(`[${tag(newDs)}] repo card publish failed (${err instanceof Error ? err.message : String(err)}); falling back to default cwd`);
+      }
+      if (repoCardMessageId) {
+        repoCardPublished = true;
+        newDs.repoCardMessageId = repoCardMessageId;
+        persistPendingRepoCardMessageId(newDs, newDs.repoCardMessageId);
+        announcePendingRepoSession(newDs);
+        logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
+      } else {
+        newDs.repoCardMessageId = undefined;
+      }
+    }
+    if (!repoCardPublished) {
+      // No projects found (or the picker could not be published) — skip repo
+      // selection, spawn directly.
       // 已 durable staging（picker）：fork 失败后 opening 仍由会话 durable 持有，
       // 先打接纳标（同 handleNewTopicAdmitted 的 no-projects 分支）。
       markIngressAdmitted(ctx);
