@@ -3532,16 +3532,9 @@ export async function noteTurnReceived(
   // every bot, reordering concurrent turns that the single-flight paths depend
   // on. A feature that is off must not perturb timing at all, so the await only
   // happens once a bot has actually opted in.
-  const identityReady = prepareTurnCliIdentity(ds, _turnId ?? triggerMessageId);
-  if (identityReady) await identityReady;
-  await registerTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
-}
-
-async function registerTurnReceivedReaction(
-  ds: DaemonSession,
-  triggerMessageId: string,
-  receivedReactionEmoji?: string,
-): Promise<void> {
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3605,19 +3598,6 @@ async function registerTurnReceivedReaction(
 function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
   try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
   catch { return false; }
-}
-
-function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
-  return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
-}
-
-function trackTurnReactionRegistration(ds: DaemonSession, registration: Promise<void>): void {
-  const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-  registrations.add(registration);
-  void registration.finally(() => {
-    registrations.delete(registration);
-    if (registrations.size === 0) ds.pendingAckReactionRegistrations = undefined;
-  });
 }
 
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
@@ -5808,8 +5788,7 @@ const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
-  prepareTurn: (ds, messageId) => prepareTurnCliIdentity(ds, messageId),
-  noteTurnReceived: (ds, messageId) => registerTurnReceivedReaction(ds, messageId),
+  noteTurnReceived: (ds, messageId) => noteTurnReceived(ds, messageId),
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
   v3GateDeps: {
@@ -17179,8 +17158,6 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
     targetSubdir: args.targetSubdir,
     activeSessions,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
-    prepareTurn: (session, messageId) => prepareTurnCliIdentity(session, messageId),
-    noteTurnReceived: (session, messageId) => registerTurnReceivedReaction(session, messageId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
 }
@@ -17656,7 +17633,7 @@ function buildTurnParticipants(
 
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
-async function deliverPassthroughToExistingSession(
+function deliverPassthroughToExistingSession(
   ds: DaemonSession,
   cmd: string,
   commandContent: string,
@@ -17676,7 +17653,7 @@ async function deliverPassthroughToExistingSession(
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
     onDelivered?: () => void;
   },
-): Promise<void> {
+): void {
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
@@ -17709,8 +17686,6 @@ async function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    const identityReady = prepareTurnCliIdentity(ds, turn.messageId);
-    if (identityReady) await identityReady;
     const accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
@@ -17723,8 +17698,7 @@ async function deliverPassthroughToExistingSession(
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       return;
     }
-    const registration = registerTurnReceivedReaction(ds, turn.messageId);
-    trackTurnReactionRegistration(ds, registration);
+    void noteTurnReceived(ds, turn.messageId, commandContent, undefined, turn.messageId);
     beginNewTurn(ds, commandContent, turn.messageId);
     turn.onDelivered?.();
     markSessionActivity(ds);
@@ -20115,7 +20089,7 @@ async function handleThreadReplyAdmitted(
           await invocationDeps.sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
           return;
         }
-        await deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
+        deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
           messageId: parsed.messageId,
           replyRootId,
           senderOpenId: threadSenderOpenId,
@@ -22604,12 +22578,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
-    prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-    onRawInputAccepted: (ds, turnId) => {
-      const registration = registerTurnReceivedReaction(ds, turnId);
-      trackTurnReactionRegistration(ds, registration);
-      return registration;
-    },
+    onRawInputAccepted: (ds, turnId) => noteTurnReceived(ds, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,

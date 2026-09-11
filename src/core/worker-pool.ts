@@ -764,8 +764,6 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     activationToken: string,
   ) => boolean | void | Promise<boolean | void>;
-  /** Prepare per-turn credentials before delayed raw input reaches the worker. */
-  prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
   /** A delayed cold-start raw input crossed the worker IPC acceptance boundary. */
   onRawInputAccepted?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
 }
@@ -12165,13 +12163,16 @@ function setupWorkerHandlers(
         }
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
+          ds.pendingRawInput = undefined;
           const rawTurnId = ds.pendingRawTurnId;
+          ds.pendingRawTurnId = undefined;
           // Input buffered while the repo card was pending rides on the SAME
           // IPC: worker message handlers run concurrently (async handlers
           // don't serialize), so a separate `message` IPC could write into
           // the PTY during raw_input's 200ms text→Enter beat. The worker
           // enqueues followUpContent only after the Enter landed.
           const followUp = ds.pendingFollowUpInput;
+          ds.pendingFollowUpInput = undefined;
           const followUpCodexAppInput = followUp?.codexAppInputGateFrozen
             ? followUp.codexAppInput
             : codexAppInputForSession(ds, followUp?.codexAppInput);
@@ -12194,11 +12195,8 @@ function setupWorkerHandlers(
               ? { queuedActivationToken: ds.session.queuedActivationToken }
               : {}),
           });
-          if (accepted) {
-            ds.pendingRawInput = undefined;
-            ds.pendingRawTurnId = undefined;
-            ds.pendingFollowUpInput = undefined;
-            if (rawTurnId) void requireCallbacks().onRawInputAccepted?.(ds, rawTurnId);
+          if (accepted && rawTurnId) {
+            void requireCallbacks().onRawInputAccepted?.(ds, rawTurnId);
           }
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
@@ -14659,8 +14657,6 @@ function shouldDropMismatchedHermesFinalOutput(
  * must never throw into the status pipeline (callers invoke as `void`).
  */
 async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const registrations = [...(ds.pendingAckReactionRegistrations ?? [])];
-  if (registrations.length > 0) await Promise.allSettled(registrations);
   const list = ds.pendingAckReactions;
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
