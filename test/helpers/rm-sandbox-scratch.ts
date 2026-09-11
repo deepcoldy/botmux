@@ -11,9 +11,14 @@
  *
  * MEASURED — why it hid for so long: as root the delete succeeds, because
  * CAP_DAC_OVERRIDE bypasses the DAC check. It fails only for a normal uid, which
- * is exactly what a GitHub runner is. It fails identically under Node and Bun, so
- * this is a cleanup bug, NOT a runtime difference (do not "fix" it with a
- * bun-only skip).
+ * is exactly what a GitHub runner is. For a normal uid the two runtimes differ on
+ * an EMPTY mask dir, which is the shape these suites actually build:
+ *   empty 0o000 dir     → Node deletes it (rmdir needs no traversal); Bun EACCES
+ *   non-empty 0o000 dir → both EACCES (each must traverse before it can unlink)
+ * So today's CI symptom is Bun-specific, but the hazard is not: the moment a mask
+ * dir holds an entry, Node throws too. Hence a runtime-agnostic "reopen, then
+ * delete" — this is a cleanup bug, NOT a runtime difference, and it must NOT be
+ * "fixed" with a bun-only skip.
  *
  * It surfaces as a failing UNNAMED afterEach/afterAll hook while every real case
  * is green — a shape that reads like the suite is broken when only teardown is.

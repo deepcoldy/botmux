@@ -57,8 +57,12 @@ async function pollFor(predicate: () => boolean, what: string, timeoutMs = 10_00
  *   bun:sqlite  (Bun, = PRODUCTION) → `-wal` KEPT
  * `src/services/sqlite-compat.ts` deliberately uses `bun:sqlite` under Bun, so
  * the third line is what actually ships there. With the sidecar never deleted
- * there is no new inode, and the final `toBe('v2')` would pass VACUOUSLY — it
- * would stop testing the bind shape while still looking green.
+ * there is no new inode, so under Bun this test HARD-FAILS on its own premise —
+ * the `existsSync(<db>-wal) === false` assertion below, reached before any
+ * sandbox query ("1 expect() calls"). It never gets as far as `toBe('v2')`.
+ * That is the strongest reason to skip rather than relax: deleting the premise
+ * assertion to make Bun green would leave `toBe('v2')` passing VACUOUSLY, since
+ * without a reopen-inode the OLD single-file-bind shape reads v2 too.
  *
  * So this stays Node-only coverage instead of being weakened into an assertion
  * that cannot fail. The `bun-test` leg runs every OTHER case in this repo; the
