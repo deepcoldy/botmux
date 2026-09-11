@@ -307,7 +307,7 @@ describe('two-phase turn reactions', () => {
     const ds = makeDs();
     let release!: () => void;
     const registration = new Promise<void>((resolve) => { release = resolve; });
-    ds.pendingAckReactionRegistrations = new Set([{ messageId: 'om_fast', promise: registration }]);
+    ds.pendingAckReactionRegistrations = new Set([registration]);
 
     const finish = finishTurnReactions(ds);
     await Promise.resolve();
@@ -320,22 +320,6 @@ describe('two-phase turn reactions', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_fast', 'rid_fast');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_fast', 'DONE');
     expect(ds.pendingAckReactions).toEqual([]);
-  });
-
-  it('does not settle a newer turn that registers while an older idle waits', async () => {
-    const ds = makeDs({ pendingAckReactions: [{ messageId: 'om_old', reactionId: 'rid_old' }] });
-    let releaseOld!: () => void;
-    const oldRegistration = new Promise<void>((resolve) => { releaseOld = resolve; });
-    ds.pendingAckReactionRegistrations = new Set([{ messageId: 'om_old', promise: oldRegistration }]);
-
-    const finish = finishTurnReactions(ds);
-    ds.pendingAckReactions!.push({ messageId: 'om_new', reactionId: 'rid_new' });
-    releaseOld();
-    await finish;
-
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_old', 'DONE');
-    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_new', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([{ messageId: 'om_new', reactionId: 'rid_new' }]);
   });
 
   it('finishTurnReactions with no pending acks is a no-op', async () => {

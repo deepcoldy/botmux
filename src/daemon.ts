@@ -3611,12 +3611,11 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
   return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
 }
 
-function trackTurnReactionRegistration(ds: DaemonSession, messageId: string, registration: Promise<void>): void {
+function trackTurnReactionRegistration(ds: DaemonSession, registration: Promise<void>): void {
   const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-  const tracked = { messageId, promise: registration };
-  registrations.add(tracked);
+  registrations.add(registration);
   void registration.finally(() => {
-    registrations.delete(tracked);
+    registrations.delete(registration);
     if (registrations.size === 0) ds.pendingAckReactionRegistrations = undefined;
   });
 }
@@ -17725,7 +17724,7 @@ async function deliverPassthroughToExistingSession(
       return;
     }
     const registration = registerTurnReceivedReaction(ds, turn.messageId);
-    trackTurnReactionRegistration(ds, turn.messageId, registration);
+    trackTurnReactionRegistration(ds, registration);
     beginNewTurn(ds, commandContent, turn.messageId);
     turn.onDelivered?.();
     markSessionActivity(ds);
@@ -22608,7 +22607,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     onRawInputAccepted: (ds, turnId) => {
       const registration = registerTurnReceivedReaction(ds, turnId);
-      trackTurnReactionRegistration(ds, turnId, registration);
+      trackTurnReactionRegistration(ds, registration);
       return registration;
     },
     closeSession(ds: DaemonSession): Promise<boolean> {
