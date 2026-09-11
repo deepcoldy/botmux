@@ -231,6 +231,82 @@ describe('renameBotOnOpenPlatform', () => {
     expect(r).toMatchObject({ ok: false, reason: 'no_access' });
   });
 
+  // 飞书 console cookie 过期后再调 /developers/v1/* 返回 passport 登出信号，必须
+  // 归类为 session_expired（而非兜底 api_error），dashboard 才会弹重新扫码，而不
+  // 是把裸的 HTTP 400 甩给用户。判定复用 open-platform-automation 的统一 helper
+  // openPlatformWebSessionExpired（强信号：HTTP 401 / Code=4101 / 99991641+
+  // LogoutReason=40 / 「请重新登录」文案 / cause 链），本组用例锚定这些形态。
+  it('maps the real expired payload (code=99991641 + Code=4101 + "please log in again") to session_expired', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError(
+          'HTTP 400 /developers/v1/app/cli_x',
+          { code: 99991641, msg: 'Something went wrong, please log in again.', error: { Code: 4101, LogoutReason: 15 } },
+          400,
+        ),
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'session_expired' });
+    // 登录态失效在第一笔读（app/:id）就暴露：没有任何写发生。
+    expect(calls.every(c => !c.path.includes('/base_info/') && !c.path.includes('/app_version/create/'))).toBe(true);
+  });
+
+  it('maps HTTP 401 to session_expired', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError('HTTP 401', { msg: 'unauthorized' }, 401),
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'session_expired' });
+  });
+
+  it('maps a login-expired error wrapped in a cause chain (undici-style) to session_expired', async () => {
+    const calls: Call[] = [];
+    const inner = new OpenPlatformApiError('HTTP 400', { code: 99991641, error: { Code: 4101, LogoutReason: 40 } }, 400);
+    const wrapper = new Error('base_info write failed');
+    (wrapper as Error & { cause?: unknown }).cause = inner;
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': wrapper,
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'session_expired' });
+  });
+
+  // 顶层通用 code=99991641、没有任何登录失效强信号时，不应误判为过期弹扫码——
+  // 与 master 统一 helper 的反例语义（open-platform-redirect-repair.test.ts）一致，
+  // 避免一般 console 故障也把用户踢去重新扫码。
+  it('does NOT over-match: generic code=99991641 without a strong login-expired signal stays api_error', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError(
+          'HTTP 400 /developers/v1/app/cli_x: code=99991641 msg=Something went wrong.',
+          { code: 99991641, msg: 'Something went wrong.' },
+          400,
+        ),
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'api_error' });
+  });
+
+  it('still surfaces ordinary business errors as api_error', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError('code=1 msg=服务器开小差', { code: 1, msg: '服务器开小差' }, 500),
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'api_error' });
+  });
+
   it('surfaces mid-chain API failures as api_error (e.g. version create rejected)', async () => {
     const calls: Call[] = [];
     const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {

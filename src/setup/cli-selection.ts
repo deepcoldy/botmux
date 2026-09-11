@@ -292,6 +292,10 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
+    // 关闭 codex 低额度切 luna 的模型 nudge 弹窗（见 codex 适配器 buildArgs），
+    // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
+    // 否则 aiden 网关会拒收裸 `-c` 直接启动失败。
+    || value === 'notice.hide_rate_limit_model_nudge=true'
   );
 }
 
@@ -313,7 +317,8 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
 /**
  * 剥掉 aiden `aiden x <cli>` 网关拒收的、**botmux 注入的**底层 CLI config 覆盖参数：
  *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
- *   - botmux 自己注入的 Codex `-c`（session 环境，以及关闭启动更新选择器）；
+ *   - botmux 自己注入的 Codex `-c`（session 环境、关闭启动更新选择器，以及关闭低额度
+ *     切 luna 的模型 nudge 弹窗）；
  *     aiden 1.8.38+ 会直接报错拒收 `aiden x codex` 透传的 `-c`/`--config`。
  *   - `--dangerously-bypass-hook-trust`（codex 家族的 hook-trust 绕过 flag）：aiden 网关
  *     自身已管理底层 codex 的 hook-trust，botmux 再透传一份会让 codex 收到两次 →

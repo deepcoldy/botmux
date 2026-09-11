@@ -6,7 +6,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
-import { expandHome } from './working-dir.js';
+import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
@@ -94,6 +94,7 @@ import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -2099,6 +2100,7 @@ export async function restoreActiveSessions(
 ): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
+    if (session.headless) return 2;
     if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
     if (session.queued) return 1;
     return 0; // disposable daemon-command scratch
@@ -2586,7 +2588,9 @@ export async function restoreActiveSessions(
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: session.cliLaunchSnapshot?.state === 'pending'
+      hasHistory: session.headless && !session.cliId && !session.lastCliInput && !session.backendType
+        ? false
+        : session.cliLaunchSnapshot?.state === 'pending'
         ? false
         : session.queuedActivationPending
           ? (session.queuedActivationResume ?? false)
@@ -4286,6 +4290,84 @@ export async function spawnDashboardSession(
   // in_progress：立即开跑或弹 /repo 卡片（没钉目录时）。userContent 已按角色包装好。
   logger.info(`[createSession] spawned session ${session.sessionId.substring(0, 8)} (bot=${larkAppId}, chat=${chatId}, role=${role}, pendingRepo=${!!ds.pendingRepo})`);
   return { ok: true, sessionId: session.sessionId };
+}
+
+export interface CreateHeadlessSessionArgs {
+  larkAppId: string;
+  title?: string;
+  workingDir?: string;
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+}
+
+export async function createHeadlessSession(
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion | undefined,
+  args: CreateHeadlessSessionArgs,
+): Promise<{ ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }> {
+  const { larkAppId } = args;
+  let bot: ReturnType<typeof getBot>;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
+  const rawWorkingDir = args.workingDir ?? effectiveDefaultWorkingDir(bot.config) ?? process.cwd();
+  const wd = validateWorkingDir(rawWorkingDir, localeForBot(larkAppId));
+  if (!wd.ok) return { ok: false, error: wd.error };
+  refreshCliVersion?.(bot.config);
+
+  const headlessId = newHeadlessId();
+  const chatId = headlessChatId(headlessId);
+  const title = args.title?.trim() || 'Headless session';
+  const key = sessionKey(chatId, larkAppId);
+  const registered = await withActiveSessionKeyLock(activeSessions, key, () => {
+    if (activeSessions.has(key)) return undefined;
+    const session = sessionStore.createSession(chatId, chatId, title, 'group');
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    session.larkAppId = larkAppId;
+    session.scope = 'chat';
+    session.headless = {
+      id: headlessId,
+      createdAt: nowIso,
+      source: 'cli',
+    };
+    session.lastMessageAt = nowIso;
+    session.workingDir = wd.resolvedPath;
+    if (args.reasoningEffort) session.reasoningEffort = args.reasoningEffort;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(chatId);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.resolvedPath,
+      ownerOpenId: session.ownerOpenId,
+    };
+    if (args.model) ds.spawnModelOverride = args.model;
+    activeSessions.set(key, ds);
+    const record = createHeadlessRecord({
+      id: headlessId,
+      sessionId: session.sessionId,
+      larkAppId,
+      title,
+      workingDir: wd.resolvedPath,
+      model: args.model,
+      reasoningEffort: args.reasoningEffort,
+      now: new Date(now),
+    });
+    saveHeadlessSession(record);
+    dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+    return { sessionId: session.sessionId };
+  });
+  if (!registered) return { ok: false, error: 'session_exists' };
+  return { ok: true, headlessId, sessionId: registered.sessionId };
 }
 
 /** 激活一条 parked（待办池）会话：把暂存的 queuedPrompt 当首轮发给 CLI，清掉 queued

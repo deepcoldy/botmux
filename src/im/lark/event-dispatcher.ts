@@ -8,16 +8,17 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
-import { parseForceTopicInvocation, parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
@@ -1401,7 +1402,7 @@ export function updateBotOpenIdCrossRef(
 
 /** Command-position match: after stripping leading @mentions, the remaining
  *  text must begin with `/introduce` (optionally followed by whitespace).
- *  This is the same approach `parseForceTopicInvocation` takes for /t /topic.
+ *  This is the same approach `parseTopicHeader` takes for its /t /topic sentinel.
  *  Stricter than a bare token match — "please run /introduce" or similar
  *  quoted/explanatory text won't trigger. */
 const INTRODUCE_RE = /^\/introduce(?:\s|$)/i;
@@ -2279,6 +2280,9 @@ export interface RoutingContext {
    *  registered under this root so a later NON-@ message inside that topic
    *  folds back here instead of forking a new thread-scope session. */
   foldedRootId?: string;
+  /** 本次路由的 thread-scope 是 `/t` / 指令头翻出来的（maybeApplyForceTopicOverride），
+   *  不是消息本来的位置。handler 侧的授权闸靠它认出「这条路是命令挣来的」。 */
+  forceTopicApplied?: boolean;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2664,7 +2668,7 @@ export function extractMessageTextForRouting(message: any): string | null {
     // text shape: {"text":"..."}. Lark stuffs placeholder keys like "@_user_1"
     // into obj.text; the human name only lives in message.mentions[].name. We
     // must resolve keys → @${name} so stripLeadingMentions can strip them
-    // before parseForceTopicInvocation sees the content. Mirrors the
+    // before parseTopicHeader sees the content. Mirrors the
     // resolveMentions logic in parseEventMessage.
     if (typeof obj?.text === 'string') {
       let text: string = obj.text;
@@ -2699,6 +2703,26 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
+ * 路由侧判「这是不是指令头」时的 @ 剥离，必须与 daemon 侧**逐字同源**。
+ *
+ * daemon 走两道：先按位置剥前导 @（谁的都剥），再按身份剥本 bot 的 @（任意位置）。
+ * 路由这边曾经只做第一道，于是 `重构登录 /t /model @机器人` 在这里解析成「合法头部
+ *（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——路由已经把 scope 翻成
+ * 新话题，daemon 才回一句用法错误，错误提示落进一个凭空开出来的话题里。
+ *
+ * `getBotOpenId` 不抛（未注册的 app id 返回 undefined），而 `stripBotMentions` 认不出
+ * 本 bot 时原样返回，所以 botOpenId 尚未解析出来的窗口期最坏退化成改动前的行为。
+ */
+function stripHeaderMentions(rawText: string, message: any, larkAppId: string): string {
+  const mentions = message?.mentions ?? [];
+  return stripBotMentions(
+    stripLeadingMentions(rawText.trim(), mentions),
+    mentions,
+    { botOpenId: getBotOpenId(larkAppId), larkAppId },
+  );
+}
+
+/**
  * If the inbound message starts with `/t` / `/topic` AND the routing
  * currently lands on chat-scope, override to thread-scope anchored at
  * the inbound message_id. This makes "force topic mode" work even when
@@ -2710,17 +2734,27 @@ export function extractMessageTextForRouting(message: any): string | null {
  * the prefix is still stripped downstream by handleNewTopic.
  */
 export function maybeApplyForceTopicOverride(
-  routing: { scope: 'thread' | 'chat'; anchor: string },
+  routing: { scope: 'thread' | 'chat'; anchor: string; forceTopicApplied?: boolean },
   message: any,
   messageId: string,
+  larkAppId: string,
 ): boolean {
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
-  const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-  if (!parseForceTopicInvocation(stripped)) return false;
+  const stripped = stripHeaderMentions(rawText, message, larkAppId);
+  // 指令头（`[标题] /t …`）与裸 `/t` 走同一条判定。只认**解析成功**的头部：写错了的
+  // 头部要留在原地被拒绝（回一句用法错误），不能先把 scope 改成新话题——那已经是副作用。
+  // 这里只需要 yes/no，所以沿用按位置剥前导 @ 即可；daemon 侧会按身份重新精确解析。
+  if (!isTopicHeader(parseTopicHeader(stripped))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
+  // 把「这条路由是 `/t` 翻出来的」记在 ctx 上，让下游 handler 能对**它自己没做过的
+  // 决定**上闸。翻 scope 就是 `/t` 的核心语义（把消息从共享 chat 拎进隔离的新话题、
+  // 并在那里 auto-create 出一个新会话），所以它必须能被授权闸盖住；而 handler 里看
+  // 「这个 anchor 上有没有会话」是看不出这件事的——翻转把 anchor 设成了 messageId，
+  // 那个 anchor 上**永远**没有会话。
+  routing.forceTopicApplied = true;
   return true;
 }
 
@@ -2795,8 +2829,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
-    const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    if (parseForceTopicInvocation(stripped)) return undefined;
+    if (isTopicHeader(parseTopicHeader(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one
@@ -3794,7 +3827,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId);
+        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -4118,7 +4151,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /t / /topic in 普通群: flip routing to thread-scope so the bot's
       // first reply seeds a fresh Lark thread, even if a chat-scope session
       // is currently active in this chat.
-      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
+      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }

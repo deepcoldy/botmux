@@ -100,6 +100,10 @@ export interface RecordTurnTerminalInput {
 
 export interface TurnCompletionEventPayload {
   type: 'turn.completed'; version: 1; eventId: string; time: string;
+  /** True when `time` is the store's write time rather than a measured
+   *  completion instant (the emitter could not vouch for one). Absent means
+   *  `time` is the real native completion instant. */
+  completedAtEstimated?: true;
   status: Exclude<TurnDeliveryStatus, 'delivered'>; deliveryId: string;
   contentHash: string; contentRef?: string;
   platform: string; platformMessageId: string; platformAppId: string;
@@ -196,7 +200,17 @@ function feedbackCardTemplate(baseCard: Record<string, unknown> | undefined): Re
   return card as Record<string, unknown>;
 }
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
+
+/** v8: mark rows whose completed_at is the store's write time rather than a
+ *  measured completion instant. Pre-v8 rows are all estimates (nothing upstream
+ *  sent a real instant before this version), so the backfill defaults to 1 and
+ *  new rows carry the emitter's actual answer. Keeps existing readers working —
+ *  completed_at itself is unchanged — while letting a consumer that cares about
+ *  accuracy tell measured from approximated. */
+const TERMINAL_V8_SCHEMA = `
+  ALTER TABLE turn_terminals ADD COLUMN completed_at_estimated INTEGER NOT NULL DEFAULT 1;
+`;
 
 const DELIVERY_V7_SCHEMA = `
   ALTER TABLE deliveries ADD COLUMN correlation_discriminator TEXT NOT NULL DEFAULT '';
@@ -288,12 +302,12 @@ const DELIVERY_V3_COLUMNS = `
     WHERE bot_app_id IS NOT NULL AND session_id IS NOT NULL AND turn_id IS NOT NULL;
 `;
 
-/** Fresh-build DDL for a brand-new DB (version 0 → 7). No BEGIN/COMMIT/PRAGMA:
+/** Fresh-build DDL for a brand-new DB (version 0 → 8). No BEGIN/COMMIT/PRAGMA:
  *  migrateStep() owns the transaction and the user_version bump. Base tables use
  *  IF NOT EXISTS so a loser that somehow re-enters is a no-op on them; the later
  *  ${...} fragments (bare ALTER/CREATE) are guarded by migrateStep re-reading
  *  user_version under the write lock, so the loser never reaches this SQL. */
-const FRESH_V7_SCHEMA = `
+const FRESH_V8_SCHEMA = `
   CREATE TABLE IF NOT EXISTS interactions (
     interaction_id TEXT PRIMARY KEY,
     context_json TEXT,
@@ -349,6 +363,7 @@ const FRESH_V7_SCHEMA = `
   ${OUTBOX_V5_SCHEMA}
   ${ANALYTICS_V6_SCHEMA}
   ${DELIVERY_V7_SCHEMA}
+  ${TERMINAL_V8_SCHEMA}
 `;
 
 /** Legacy v1→v2 columns (no BEGIN/COMMIT/PRAGMA — migrateStep owns those). */
@@ -415,13 +430,14 @@ export class SkillFeedbackStore {
     // still within [from,to]; the fresh-build step (from 0) creates the full v7
     // schema, later steps are incremental ALTER/CREATE for legacy DBs.
     const steps: Array<{ from: number; to: number; target: number; sql: string }> = [
-      { from: 0, to: 0, target: 7, sql: FRESH_V7_SCHEMA },
+      { from: 0, to: 0, target: 8, sql: FRESH_V8_SCHEMA },
       { from: 1, to: 1, target: 2, sql: MIGRATE_V1_TO_V2 },
       { from: 1, to: 2, target: 3, sql: DELIVERY_V3_COLUMNS },
       { from: 1, to: 3, target: 4, sql: COMPLETION_V4_SCHEMA },
       { from: 1, to: 4, target: 5, sql: MIGRATE_V4_TO_V5 },
       { from: 1, to: 5, target: 6, sql: ANALYTICS_V6_SCHEMA },
       { from: 1, to: 6, target: 7, sql: DELIVERY_V7_SCHEMA },
+      { from: 1, to: 7, target: 8, sql: TERMINAL_V8_SCHEMA },
     ];
     for (const step of steps) {
       // Stop as soon as the DB is fully migrated: a loser that lost every race
@@ -660,6 +676,13 @@ export class SkillFeedbackStore {
   /** Shared turn-terminal transaction body (caller owns BEGIN/COMMIT/ROLLBACK). */
   private applyTurnTerminal(input: RecordTurnTerminalInput): TurnCompletionEventPayload | undefined {
     const attempt = input.dispatchAttempt ?? 0;
+    // completed_at is NOT NULL, so an emitter that could not vouch for a real
+    // completion instant still needs a value here. Write time is the closest
+    // available approximation — but it is an approximation (it includes however
+    // long this row waited behind the write lock), so flag it rather than let a
+    // consumer read it as a measured instant. Emitters that DO know the real
+    // instant send completedAt and land in the authoritative branch.
+    const completedAtEstimated = input.completedAt === undefined;
     const completedAt = input.completedAt ?? new Date().toISOString();
     const prior = this.db.prepare(`SELECT status FROM turn_terminals WHERE bot_app_id=? AND session_id=? AND turn_id=?
       AND dispatch_attempt=?`).get(
@@ -667,9 +690,10 @@ export class SkillFeedbackStore {
     ) as { status: string } | undefined;
     if (prior && prior.status !== input.status) throw new Error('turn_terminal_status_conflict');
     this.db.prepare(`INSERT OR IGNORE INTO turn_terminals(
-      bot_app_id,session_id,turn_id,dispatch_attempt,status,completed_at,duration_ms,usage_json
-    ) VALUES(?,?,?,?,?,?,?,?)`).run(
+      bot_app_id,session_id,turn_id,dispatch_attempt,status,completed_at,completed_at_estimated,duration_ms,usage_json
+    ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
       input.botAppId, input.sessionId, input.turnId, attempt, input.status, completedAt,
+      completedAtEstimated ? 1 : 0,
       input.durationMs ?? null, input.usage ? JSON.stringify(input.usage) : null,
     );
     const deliveries = this.db.prepare(`SELECT delivery_id FROM deliveries WHERE bot_app_id=? AND session_id=? AND turn_id=?
@@ -719,24 +743,71 @@ export class SkillFeedbackStore {
       this.db.exec('COMMIT');
       const wanted = new Set(ids);
       return this.listFeedbackOutbox().filter(row => wanted.has(row.outboxId) && row.claimToken === input.claimToken);
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* BEGIN may have failed before a transaction existed */ }
+      throw error;
+    }
+  }
+
+  /**
+   * Daemon-safe outbox claim. The shared feedback database is opened by every
+   * bot daemon, so a normal synchronous SQLite busy timeout can stall the whole
+   * event loop for seconds. Webhook polling is best-effort and recurring: fail
+   * fast on contention and let the next tick retry instead.
+   */
+  tryClaimFeedbackOutbox(input: { now: number; limit: number; claimToken: string }): { done: true; rows: Array<any> } | { done: false; busy: true } {
+    return this.withNonblockingBusy(() => this.claimFeedbackOutbox(input), rows => ({ done: true, rows }));
   }
 
   settleFeedbackOutboxDelivered(outboxId: string, claimToken: string, httpStatus: number, deliveredAt: string): boolean {
     return this.db.prepare(`UPDATE feedback_outbox SET status='delivered',last_http_status=?,delivered_at=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(httpStatus, deliveredAt, outboxId, claimToken).changes === 1;
   }
+  trySettleFeedbackOutboxDelivered(outboxId: string, claimToken: string, httpStatus: number, deliveredAt: string): { done: true; changed: boolean } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.settleFeedbackOutboxDelivered(outboxId, claimToken, httpStatus, deliveredAt),
+      changed => ({ done: true, changed }),
+    );
+  }
 
   rescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): boolean {
     return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=?,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
+  }
+  tryRescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): { done: true; changed: boolean } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.rescheduleFeedbackOutbox(outboxId, claimToken, input),
+      changed => ({ done: true, changed }),
+    );
   }
 
   resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): number {
     return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
   }
+  tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): { done: true; changed: number } | { done: false; busy: true } {
+    return this.withNonblockingBusy(
+      () => this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs),
+      changed => ({ done: true, changed }),
+    );
+  }
+
+  /** Borrow busy_timeout=0 for one fully synchronous operation. */
+  private withNonblockingBusy<T, R>(operation: () => T, success: (value: T) => R): R | { done: false; busy: true } {
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      try {
+        return success(operation());
+      } catch (error) {
+        if (isSqliteBusyError(error)) return { done: false, busy: true };
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000;');
+    }
+  }
 
   private reconcileTurnCompletion(deliveryId: string): TurnCompletionEventPayload | undefined {
     const row = this.db.prepare(`SELECT d.*,r.content_hash,r.content_ref,t.status AS terminal_status,
-      t.completed_at AS terminal_completed_at,t.duration_ms AS terminal_duration_ms,t.usage_json AS terminal_usage_json
+      t.completed_at AS terminal_completed_at,t.completed_at_estimated AS terminal_completed_at_estimated,
+      t.duration_ms AS terminal_duration_ms,t.usage_json AS terminal_usage_json
       FROM deliveries d JOIN responses r ON r.response_id=d.response_id
       JOIN turn_terminals t ON t.bot_app_id=d.bot_app_id AND t.session_id=d.session_id AND t.turn_id=d.turn_id
        AND t.dispatch_attempt=IFNULL(d.dispatch_attempt,0)
@@ -750,6 +821,9 @@ export class SkillFeedbackStore {
       status: row.terminal_status, deliveryId, contentHash: row.content_hash,
       platform: row.platform, platformMessageId: row.platform_message_id, platformAppId: row.platform_app_id,
       botAppId: row.bot_app_id, sessionId: row.session_id, turnId: row.turn_id,
+      // Only stated when true, so a consumer reading `time` as a measured
+      // instant is explicitly warned when it is really the store's write time.
+      ...(row.terminal_completed_at_estimated ? { completedAtEstimated: true as const } : {}),
       ...(row.content_ref ? { contentRef: row.content_ref } : {}),
       ...(row.native_session_id ? { nativeSessionId: row.native_session_id } : {}),
       ...(row.dispatch_attempt !== null ? { dispatchAttempt: row.dispatch_attempt } : {}),
@@ -762,10 +836,11 @@ export class SkillFeedbackStore {
       ...(row.workflow_id ? { workflowId: row.workflow_id } : {}), ...(row.task_id ? { taskId: row.task_id } : {}),
       ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
     };
-    // COALESCE so a terminal that carries no usage/duration (the turn-terminal
-    // path only records status) does not clobber the usage/duration_ms the
-    // delivery captured at send time. status/completed_at are authoritative from
-    // the terminal and intentionally overwrite.
+    // COALESCE so a terminal that carries no usage/duration (an emitter that
+    // could not measure the turn, or a legacy worker predating the timing
+    // fields) does not clobber the usage/duration_ms the delivery captured at
+    // send time. status/completed_at are authoritative from the terminal and
+    // intentionally overwrite.
     this.db.prepare('UPDATE deliveries SET status=?,duration_ms=COALESCE(?,duration_ms),usage_json=COALESCE(?,usage_json),completed_at=? WHERE delivery_id=?').run(
       row.terminal_status, row.terminal_duration_ms, row.terminal_usage_json, row.terminal_completed_at, deliveryId,
     );

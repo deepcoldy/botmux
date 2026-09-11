@@ -47,6 +47,7 @@ import {
 import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
+import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
@@ -303,94 +304,28 @@ const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
 // import without the daemon graph); re-exported here for existing callers.
 export { validateWorkingDir };
 
-/**
- * Resolve a non-numeric `/repo <arg>` into a concrete repo path + display name.
- * `arg` is either a path (absolute or relative) or a first-level project name
- * under one of the bot's scan dirs — letting the user skip the selection card.
- *
- * Resolution:
- *   1. Build candidate absolute paths — absolute / `~` taken as-is; relative or
- *      bare names resolved against each scan dir, then the daemon cwd (mirrors
- *      how the card's project list is rooted).
- *   2. Return the first directly existing candidate, describing its git ref
- *      without scanning unrelated roots. This is lenient like `/cd`, whose trust
- *      model is "owner explicitly chose a dir"; the CLI already runs with full
- *      FS access.
- *   3. Only for a bare name that did not directly resolve, scan projects and
- *      match by basename (covers projects nested deeper than the scan-dir top
- *      level).
- * Returns null when nothing resolves to an existing directory.
- */
-export function resolveRepoSelection(
-  repoArg: string,
-  scanDirs: string[],
-): { path: string; displayName: string } | null {
-  const isExplicitPath =
-    repoArg.startsWith('/') ||
-    repoArg.startsWith('~') ||
-    repoArg.startsWith('.') ||
-    repoArg.includes('/');
+// `resolveRepoSelection` now lives in ./repo-selection.js (leaf module the topic
+// header's spec resolver can import without the daemon graph); re-exported here
+// for existing callers, same as `validateWorkingDir` above.
+export { resolveRepoSelection } from './repo-selection.js';
 
-  const candidates: string[] = [];
-  if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
-    candidates.push(resolve(expandHome(repoArg)));
-  } else {
-    for (const d of scanDirs) candidates.push(resolve(d, repoArg));
-    candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
-  }
-
-  // Direct candidates must win before any recursive scan. Besides avoiding
-  // unnecessary traversal (especially a legacy HOME fallback), describing just
-  // the selected directory preserves the same "name (branch)" label for repos.
-  for (const cand of candidates) {
-    try {
-      if (!statSync(cand).isDirectory()) continue;
-    } catch {
-      continue; // missing / not a dir — try next candidate
-    }
-    const desc = describeProjectDir(cand);
-    return desc
-      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
-      : { path: cand, displayName: basename(cand) };
-  }
-
-  // Explicit and relative paths have no basename-search semantics: when their
-  // concrete candidates do not exist, a recursive project scan cannot resolve
-  // them. Bare names alone may refer to a repo nested below a scan root.
-  if (isExplicitPath) return null;
-
-  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
-  const byName = projects.find((p) => p.name === repoArg);
-  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
-
-  return null;
-}
-
-/**
- * Parse a force-topic invocation: `/t [prompt]` or `/topic [prompt]`.
- *
- * This is a routing meta-command, distinct from `parseSlashCommandInvocation`
- * (which routes to daemon command handlers). The match conditions are
- * deliberately tighter than the regular slash parser:
- *
- * - exact-prefix match (`/t` / `/topic`, case-insensitive); `/tea` / `/topical`
- *   must NOT match, otherwise we'd false-trigger on common /-prefixed words.
- * - tolerates leading whitespace (mention-stripping can leave a space).
- * - prompt is whatever follows the prefix (verbatim, including newlines).
- * - `/t` alone (no args) is allowed → empty prompt; the daemon treats it as
- *   topic setup, choosing either a repository picker or a visible thread that
- *   waits for the first real task according to the bot's cwd configuration.
- *
- * Returns null for anything else, so callers can fall through to the regular
- * `parseSlashCommandInvocation` / message-handling path.
- */
-export function parseForceTopicInvocation(content: string): { prompt: string } | null {
-  const trimmed = content.replace(/^\s+/, '');
-  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (!match) return null;
-  return { prompt: (match[2] ?? '').trim() };
-}
+// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
+// 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
+//
+// `parseForceTopicInvocation` 已由 `parseTopicHeader` 完全取代并删除：它只认「`/t` 必须
+// 在第 0 位」，认不出带标题的头部，留着会让两套判定在路由与 daemon 之间打架。
+export {
+  parseTopicHeader,
+  isTopicHeader,
+  isTopicHeaderError,
+  topicHeaderDeclaresSpec,
+  TOPIC_HEADER_DIRECTIVES,
+  type TopicHeader,
+  type TopicHeaderError,
+  type TopicHeaderErrorReason,
+  type TopicHeaderParse,
+  type TopicHeaderDirective,
+} from './topic-header.js';
 
 /** Parse a user-authored slash command after leading @mentions have already
  *  been stripped. Messages that look like command examples or command lists
