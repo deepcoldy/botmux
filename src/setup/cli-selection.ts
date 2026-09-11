@@ -292,6 +292,10 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
+    // 关闭 codex 低额度切 luna 的模型 nudge 弹窗（见 codex 适配器 buildArgs），
+    // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
+    // 否则 aiden 网关会拒收裸 `-c` 直接启动失败。
+    || value === 'notice.hide_rate_limit_model_nudge=true'
   );
 }
 
