@@ -700,7 +700,6 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
   return {
     activeSessions,
     sessionReply: vi.fn(async () => 'reply-msg-id'),
-    noteTurnReceived: vi.fn(async () => {}),
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
     prewarmDocCommentSession: vi.fn(async () => {}),
@@ -4548,7 +4547,6 @@ describe('handleCommand', () => {
         { content: 'WRAPPED:帮我看看这个 bug' },
         { turnId: 'om_buffered_first' },
       );
-      expect(deps.noteTurnReceived).toHaveBeenCalledWith(ds, 'om_buffered_first');
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
       expect(ds.pendingChatContext).toBeUndefined();

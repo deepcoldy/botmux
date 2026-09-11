@@ -521,7 +521,6 @@ describe('repo select card — plain switch', () => {
     expect(buildNewTopicCliInput).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(false);
     expect(ds.session.initialUserTurnPending).toBe(true);
-    expect(deps.noteTurnReceived).not.toHaveBeenCalled();
     expect(updateSession).toHaveBeenCalledWith(ds.session);
   });
 

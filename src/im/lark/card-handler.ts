@@ -452,6 +452,7 @@ export async function commitRepoSelection(
     operatorOpenId?: string;
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+    prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   },
   dirPath: string,
   dirLabel: string,
@@ -465,7 +466,7 @@ export async function commitRepoSelection(
     riffRepoDirs?: string[];
   },
 ): Promise<boolean> {
-  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
+  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -663,7 +664,6 @@ export async function commitRepoSelection(
       ds.pendingCodexAppFollowUpContexts = undefined;
       ds.pendingCodexAppFollowUpGateAccepted = undefined;
       ds.pendingTurnId = undefined;
-      ds.pendingReactionMessageId = undefined;
       return true;
       });
       if (!started) return false;
@@ -907,8 +907,9 @@ export async function runAutoWorktreeCommit(deps: {
   reuseExisting?: boolean;
   /** Relative directory inside a newly-created worktree to preserve as cwd. */
   targetSubdir?: string;
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, noteTurnReceived, force, worktreePath, branch, reuseExisting, targetSubdir } = deps;
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, force, worktreePath, branch, reuseExisting, targetSubdir } = deps;
   ds.worktreeCreating = true;
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
@@ -927,7 +928,7 @@ export async function runAutoWorktreeCommit(deps: {
       committedUnderTargetLock = await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
         {
           ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
-          sessionReply: async () => '', prepareTurn, noteTurnReceived,
+          sessionReply: async () => '', prepareTurn,
         },
         targetDir,
         pathBasename(targetDir),

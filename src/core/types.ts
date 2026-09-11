@@ -208,9 +208,6 @@ export interface DaemonSession {
    *  inbound event: restoring a session must never recover per-turn authority
    *  from an older persisted quote target. */
   pendingTurnId?: string;
-  /** Original inbound Lark message that should receive progress reactions when
-   *  pendingTurnId is a generated reply anchor (for example p2pMode=group). */
-  pendingReactionMessageId?: string;
   /** Clean Codex App text/context retained alongside pendingPrompt while repo
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */

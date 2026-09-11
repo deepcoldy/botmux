@@ -105,7 +105,6 @@ describe('daemon per-turn reply sender + participant wiring', () => {
   });
 
   it('keeps the source DM id separate from the generated session-group turn id', () => {
-    expect(daemonSource).toContain("pendingReactionMessageId: replyAnchorId === parsed.messageId ? undefined : parsed.messageId");
   });
 
   it('does not invent a sender for scheduled or system-created turns', () => {

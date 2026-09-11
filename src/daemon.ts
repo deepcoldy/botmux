@@ -18877,9 +18877,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
     pendingTurnId: replyAnchorId,
-    // A session-group birth runs the CLI turn under the generated in-group intro,
-    // but progress reactions belong on the original inbound DM message.
-    pendingReactionMessageId: replyAnchorId === parsed.messageId ? undefined : parsed.messageId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
