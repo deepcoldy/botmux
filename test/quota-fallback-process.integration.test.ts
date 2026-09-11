@@ -135,11 +135,19 @@ describe('quota fallback process boundaries', () => {
       supervisor.start(specs);
       const recovered = await waitFor(() => {
         const state = readFleetState(statePath);
-        const observations = join(observationDir, 'bot-0.ndjson');
-        return state?.procs.every(proc => proc.status === 'online') === true
+        // Supervisor 'online' means spawned, not that the child has loaded its
+        // config. Wait for every observation we read below, including slower
+        // unrelated bots, instead of treating bot-0's respawn as their readiness.
+        const observationsReady = [2, 1, 1].every((expectedRows, index) => {
+          const path = join(observationDir, `bot-${index}.ndjson`);
+          if (!existsSync(path)) return false;
+          const content = readFileSync(path, 'utf8');
+          return content.endsWith('\n') && content.trim().split('\n').length >= expectedRows;
+        });
+        return state?.procs.length === specs.length
+          && state.procs.every(proc => proc.status === 'online')
           && (state.procs.find(proc => proc.name === 'botmux-0')?.restarts ?? 0) >= 1
-          && existsSync(observations)
-          && readFileSync(observations, 'utf8').trim().split('\n').length >= 2;
+          && observationsReady;
       });
       expect(recovered).toBe(true);
 

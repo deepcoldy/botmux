@@ -192,6 +192,20 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: true });
   });
 
+  it.each([true, false])('persists hideCodexRateLimitModelNudge=%s', async (enabled) => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ hideCodexRateLimitModelNudge: enabled });
+  });
+
+  it('rejects malformed model-nudge settings without writing', async () => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: 'false' }, deps);
+    expect(result).toMatchObject({ ok: false, error: 'invalid_hideCodexRateLimitModelNudge' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({
