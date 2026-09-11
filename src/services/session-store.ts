@@ -2327,20 +2327,22 @@ export function listSessionsStrict(): Session[] {
 
 /** Read-only configuration-change guard; unlike display snapshots, malformed rows fail closed. */
 export function readBotSessionsStrict(appId: string, dataDir = config.session.dataDir): Session[] {
+  if (classifyStorePresence(appId, dataDir) === 'unmigrated') {
+    throw new SessionStoreUnmigratedError(
+      `会话库尚未迁移到 SQLite（${storeJsonFileName(appId)} 仍在，sessions.db 不存在）`,
+    );
+  }
   const result: Session[] = [];
-  for (const id of [undefined, appId]) {
+  const seen = new Set<string>();
+  // A+B still has the flat store; include it so pre-split rows for this bot stay visible.
+  for (const id of [undefined, appId] as const) {
     const ref = resolveStoreFile(id, dataDir);
-    if (!existsSync(ref.path)) continue;
-    if (ref.kind === 'json') {
-      const parsed = JSON.parse(readFileSync(ref.path, 'utf8')) as Record<string, Session>;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid session store');
-      result.push(...Object.values(parsed).filter(s => id === appId || s.larkAppId === appId));
-    } else {
-      const db = openDbForRead(ref.path);
-      try {
-        const rows = db.prepare('SELECT row FROM sessions').all() as { row: string }[];
-        result.push(...rows.map(row => JSON.parse(row.row) as Session).filter(s => id === appId || s.larkAppId === appId));
-      } finally { db.close(); }
+    if (!ref) continue;
+    for (const [, session] of readStoreEntries(ref)) {
+      if (!(id === appId || session.larkAppId === appId)) continue;
+      if (seen.has(session.sessionId)) continue;
+      seen.add(session.sessionId);
+      result.push(session);
     }
   }
   return result;
