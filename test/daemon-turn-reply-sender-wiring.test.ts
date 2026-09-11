@@ -7,6 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const daemonSource = readFileSync(join(__dirname, '..', 'src', 'daemon.ts'), 'utf8');
 
 describe('daemon per-turn reply sender + participant wiring', () => {
+  it('wires delayed raw-input credential preparation into worker-pool startup', () => {
+    expect(daemonSource).toContain(
+      'prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
+    );
+  });
+
   it('computes a turn window per path and binds participants + incomplete', () => {
     // passthrough (raw command → sender-only window)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined)');
