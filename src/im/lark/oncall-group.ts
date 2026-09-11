@@ -55,13 +55,13 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
   if (!data.operator?.open_id?.startsWith('ou_')) return { toast: { type: 'error', content: '无法确认点击者身份' } };
   let text: string;
   try {
-    const target = loadOncallGroupTarget(config.session.dataDir, appId);
-    const token = process.env.ONCALL_SERVICE_JWT;
-    if (!token) throw new Error('Oncall 服务账号 JWT 尚未配置，请联系机器人管理员');
-    const sender = await resolveSender(appId, data.operator.open_id, 'user');
-    const username = oncallUsername(sender?.email, target);
     let result = store.getRequest(source);
     if (!result || result.status === 'failed') {
+      const target = loadOncallGroupTarget(config.session.dataDir, appId);
+      const secret = process.env.ONCALL_SERVICE_SECRET?.trim();
+      if (!secret) throw new Error('Oncall 服务账号凭据尚未配置，请联系机器人管理员设置 ONCALL_SERVICE_SECRET');
+      const sender = await resolveSender(appId, data.operator.open_id, 'user');
+      const username = oncallUsername(sender?.email, target);
       let question = '';
       if (source.questionId.startsWith('om_')) {
         try {
@@ -73,10 +73,11 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
         `来源群：${chatAppLink(source.chatId, bot.brand)}\n原消息：${source.questionId}`].join('\n\n');
       if (store.claim(source)) {
         try {
-          const created = await createOncallGroup(target, token, username, message);
+          const created = await createOncallGroup(target, secret, username, message);
           store.finish(source, { status: 'succeeded', ...created });
         } catch (error) {
           store.finish(source, { status: error instanceof OncallGroupApiError && !error.uncertain ? 'failed' : 'unknown' });
+          if (error instanceof OncallGroupApiError) throw error;
         }
       }
       result = store.getRequest(source);

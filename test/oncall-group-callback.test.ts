@@ -28,9 +28,9 @@ beforeEach(() => {
   mocks.detail.mockResolvedValue({ body: { content: 'original question' } });
   mocks.sender.mockResolvedValue({ email: 'clicker@example.test' });
   mocks.reply.mockReset().mockResolvedValue('om_result');
+  vi.stubEnv('ONCALL_SERVICE_SECRET', 'service-secret');
   fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { oncall_flow_id: 123, open_chat_id: 'oc_created' } })));
   vi.stubGlobal('fetch', fetcher);
-  vi.stubEnv('ONCALL_SERVICE_JWT', 'test-token');
   writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { endpoint: 'https://oncall.example.test/chat', tenantId: 12, typeId: 34, region: 'nation', emailDomain: 'example.test' } }));
   const card = JSON.parse(attachOncallGroupButton(JSON.stringify({ schema: '2.0', body: { elements: [] } }), mocks.bot.config.oncallGroup, 'oc_source'));
   source = { appId: 'app', chatId: 'oc_source', messageId: 'om_reply', questionId: 'om_question', answer: 'answer' };
@@ -48,8 +48,14 @@ describe('Oncall card callback', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('uses the verified clicker account and replies with a link without changing the original card', async () => {
+    vi.stubEnv('ONCALL_SERVICE_SECRET', ' service-secret ');
+    vi.stubEnv('BYTEDCLI_USER_CLOUD_JWT', 'another-user-jwt');
     await expect(handleOncallGroupAction(event(), 'app')).resolves.toBeUndefined();
     expect(mocks.sender).toHaveBeenCalledWith('app', 'ou_clicker', 'user');
+    expect(process.env.BYTEDCLI_USER_CLOUD_JWT).toBe('another-user-jwt');
+    expect(mocks.bot.config).not.toHaveProperty('triggerUserAuth');
+    expect(fetcher.mock.calls[0][1].headers.Authorization).toBe('Bearer service-secret');
+    expect(fetcher.mock.calls[0][1].headers).not.toHaveProperty('x-jwt-token');
     expect(fetcher.mock.calls[0][1].headers['x-api-user']).toBe('clicker');
     expect(JSON.parse(fetcher.mock.calls[0][1].body).trigger_message).toContain('original question');
     expect(mocks.reply).toHaveBeenCalledWith('app', 'om_reply', expect.stringContaining('openChatId=oc_created'), 'text', true);
@@ -57,9 +63,21 @@ describe('Oncall card callback', () => {
     expect(existsSync(join(dir, 'botmux-feedback.sqlite'))).toBe(false);
     expect(new OncallGroupStore(dir).findSource('app', 'om_reply')).toEqual(source);
   });
+  it.each(['', '  '])('does not create or claim a group with an empty service secret %j', async secret => {
+    vi.stubEnv('ONCALL_SERVICE_SECRET', secret);
+    await handleOncallGroupAction(event(), 'app');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('设置 ONCALL_SERVICE_SECRET');
+    vi.stubEnv('ONCALL_SERVICE_SECRET', 'service-secret');
+    await handleOncallGroupAction(event(), 'app');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
+  });
   it('reuses the saved result after a reply failure, including for another clicker', async () => {
     mocks.reply.mockRejectedValueOnce(new Error('reply failed'));
     await expect(handleOncallGroupAction(event(), 'app')).rejects.toThrow('reply failed');
+    vi.stubEnv('ONCALL_SERVICE_SECRET', '');
     await handleOncallGroupAction(event('ou_another'), 'app');
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
@@ -77,12 +95,18 @@ describe('Oncall card callback', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('unknown');
   });
-  it('replies with confirmed failures and permits an explicit retry', async () => {
-    fetcher.mockResolvedValueOnce(new Response('', { status: 403 }));
+  it.each([[401, '凭据无效或已失效'], [403, '缺少接口或租户权限'], [422, '建群失败']])('explains HTTP %s and permits an explicit retry after fixing it', async (status, message) => {
+    fetcher.mockResolvedValueOnce(new Response('service-secret', { status }));
     await handleOncallGroupAction(event(), 'app');
-    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('可再次点击重试');
-    await handleOncallGroupAction(event(), 'app');
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain(message);
+    expect(mocks.reply.mock.calls.at(-1)![2]).not.toContain('service-secret');
+    expect(new OncallGroupStore(dir).getRequest(source)).toEqual({ status: 'failed' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    vi.stubEnv('ONCALL_SERVICE_SECRET', 'updated-secret');
+    mocks.sender.mockResolvedValueOnce({ email: 'another@example.test' });
+    await handleOncallGroupAction(event('ou_another'), 'app');
     expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1][1].headers).toMatchObject({ Authorization: 'Bearer updated-secret', 'x-api-user': 'another' });
     expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
   });
   it('does not call the platform when the clicker account cannot be verified', async () => {

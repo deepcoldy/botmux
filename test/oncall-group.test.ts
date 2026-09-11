@@ -74,32 +74,32 @@ describe('Oncall platform client', () => {
     writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { ...target, endpoint: 'http://unsafe.test' } }));
     expect(() => loadOncallGroupTarget(dir, 'app')).toThrow();
   });
-  it('calls BytedOncall directly with a service JWT and the verified clicker', async () => {
+  it('calls the Oncall gateway with a service secret and the verified clicker', async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { oncall_flow_id: 123, open_chat_id: 'oc_created' } })));
-    await expect(createOncallGroup(target, 'test-token', 'user', 'question + answer', fetcher)).resolves.toEqual({ flowId: '123', openChatId: 'oc_created' });
+    await expect(createOncallGroup(target, 'test-secret', 'user', 'question + answer', fetcher)).resolves.toEqual({ flowId: '123', openChatId: 'oc_created' });
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [url, request] = fetcher.mock.calls[0];
     expect(url).toBe(target.endpoint);
     expect(request.redirect).toBe('error');
-    expect(request.headers).toEqual({ 'content-type': 'application/json', 'x-jwt-token': 'test-token', 'x-api-user': 'user' });
+    expect(request.headers).toEqual({ 'content-type': 'application/json', Authorization: 'Bearer test-secret', 'x-api-user': 'user' });
     expect(JSON.parse(request.body)).toEqual({ tenant_id: 12, type_id: 34, region: 'nation', type: 'create_chat',
       priority: 'P2', source_type: 'open_api', source_location: 'botmux', trigger_message: 'question + answer' });
   });
   it('takes the platform endpoint and routing from each bot deployment', async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { oncall_flow_id: 456, open_chat_id: 'oc_other' } })));
     const other = { ...target, endpoint: 'https://other-oncall.example.test/api/inf/v1/chat/', tenantId: 56, typeId: 78, region: 'sg' };
-    await createOncallGroup(other, 'other-jwt', 'other.user', 'other question', fetcher);
+    await createOncallGroup(other, 'test-secret', 'other.user', 'other question', fetcher);
     const [url, request] = fetcher.mock.calls[0];
     expect(url).toBe(other.endpoint);
-    expect(request.headers['x-jwt-token']).toBe('other-jwt');
+    expect(request.headers.Authorization).toBe('Bearer test-secret');
     expect(JSON.parse(request.body)).toMatchObject({ tenant_id: 56, type_id: 78, region: 'sg' });
   });
   it.each([401, 403, 422])('reports HTTP %s as a confirmed rejection', async status => {
-    await expect(createOncallGroup(target, 'token', 'user', 'question', vi.fn().mockResolvedValue(new Response('', { status })))).rejects.toMatchObject({ uncertain: false });
+    await expect(createOncallGroup(target, 'secret', 'user', 'question', vi.fn().mockResolvedValue(new Response('', { status })))).rejects.toMatchObject({ uncertain: false });
   });
   it('marks timeout, malformed success, and server errors uncertain without retrying', async () => {
     for (const fetcher of [vi.fn().mockRejectedValue(new Error('timeout')), vi.fn().mockResolvedValue(new Response('{}')), vi.fn().mockResolvedValue(new Response('', { status: 500 }))]) {
-      await expect(createOncallGroup(target, 'token', 'user', 'question', fetcher)).rejects.toMatchObject({ uncertain: true });
+      await expect(createOncallGroup(target, 'secret', 'user', 'question', fetcher)).rejects.toMatchObject({ uncertain: true });
       expect(fetcher).toHaveBeenCalledTimes(1);
     }
   });

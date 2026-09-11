@@ -34,23 +34,25 @@ export function oncallUsername(email: string | undefined, target: OncallGroupTar
 }
 
 export class OncallGroupApiError extends Error {
-  constructor(readonly uncertain: boolean) {
-    super(uncertain ? '建群结果待确认，请联系管理员核对，勿重复创建' : '建群失败，请稍后重试或联系管理员');
+  constructor(readonly uncertain: boolean, status?: number) {
+    super(status === 401 ? 'Oncall 服务账号凭据无效或已失效，请联系管理员更新 ONCALL_SERVICE_SECRET'
+      : status === 403 ? 'Oncall 服务账号缺少接口或租户权限，请联系管理员授权'
+        : uncertain ? '建群结果待确认，请联系管理员核对，勿重复创建' : '建群失败，请稍后重试或联系管理员');
   }
 }
 
-export async function createOncallGroup(target: OncallGroupTarget, jwt: string, username: string, message: string,
+export async function createOncallGroup(target: OncallGroupTarget, secret: string, username: string, message: string,
   fetcher: typeof fetch = fetch): Promise<{ flowId: string; openChatId: string }> {
   let response: Response;
   try {
     response = await fetcher(target.endpoint, {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(20_000),
-      headers: { 'content-type': 'application/json', 'x-jwt-token': jwt, 'x-api-user': username },
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${secret}`, 'x-api-user': username },
       body: JSON.stringify({ tenant_id: target.tenantId, type_id: target.typeId, region: target.region,
         type: 'create_chat', priority: 'P2', source_type: 'open_api', source_location: 'botmux', trigger_message: message }),
     });
   } catch { throw new OncallGroupApiError(true); }
-  if (!response.ok) throw new OncallGroupApiError(![400, 401, 403, 404, 422, 429].includes(response.status));
+  if (!response.ok) throw new OncallGroupApiError(![400, 401, 403, 404, 422, 429].includes(response.status), response.status);
   let body: any;
   try { body = await response.json(); } catch { throw new OncallGroupApiError(true); }
   if (body?.code !== 0 || !/^oc_[a-zA-Z0-9]+$/.test(body?.data?.open_chat_id ?? '')

@@ -223,7 +223,7 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
-  'ONCALL_SERVICE_JWT',
+  'ONCALL_SERVICE_SECRET',
   // Startup-only private secret-file path. A session CLI is not the local
   // companion process and must not learn even the credential's location.
   // Kept as a literal because this boundary module is dependency-free.
