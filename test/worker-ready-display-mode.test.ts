@@ -233,7 +233,6 @@ function setupActiveWorkerHandlers(ds: DaemonSession, worker: any): void {
 describe('Worker ready: set_display_mode re-sync', () => {
   let sessionReplyMock: ReturnType<typeof vi.fn>;
   let closeSessionMock: ReturnType<typeof vi.fn>;
-  let onRawInputAcceptedMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -251,13 +250,11 @@ describe('Worker ready: set_display_mode re-sync', () => {
     } as any);
     sessionReplyMock = vi.fn(async () => 'om_new_card');
     closeSessionMock = vi.fn();
-    onRawInputAcceptedMock = vi.fn();
     initWorkerPool({
       sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: closeSessionMock,
-      onRawInputAccepted: onRawInputAcceptedMock,
     });
     setActiveSessionsRegistry(new Map());
   });
@@ -1488,26 +1485,6 @@ describe('Worker ready: set_display_mode re-sync', () => {
     });
     await flush();
     expect(submitted).toHaveBeenCalledWith(ds, 'raw-activation-token');
-  });
-
-  it('registers the original pending raw turn after prompt_ready accepts raw_input', async () => {
-    const fakeWorker = makeFakeWorker();
-    const ds = makeDs({
-      worker: fakeWorker,
-      pendingRawInput: '/goal ship it',
-      pendingRawTurnId: 'om_goal_turn',
-    } as Partial<DaemonSession>);
-
-    setupActiveWorkerHandlers(ds, fakeWorker);
-    fakeWorker.emit('message', { type: 'prompt_ready' });
-    await flush();
-
-    expect(fakeWorker.send).toHaveBeenCalledWith({
-      type: 'raw_input',
-      content: '/goal ship it',
-      turnId: 'om_goal_turn',
-    });
-    expect(onRawInputAcceptedMock).toHaveBeenCalledWith(ds, 'om_goal_turn');
   });
 
   it('prompt_ready bundles the buffered follow-up ONTO the raw_input IPC (single atomic message)', async () => {
