@@ -28,6 +28,7 @@ import {
   extractVersionId,
   nextAppVersion,
   OpenPlatformApiError,
+  openPlatformWebSessionExpired,
   readStoredCookiesFromSessionFile,
   safeErrorMessage,
   type OpenPlatformApiClient,
@@ -78,6 +79,17 @@ function failureFromError(err: unknown, fallbackReason: OpenPlatformRenameFailur
     if (code === 10003) {
       return { reason: 'no_access', message: '当前缓存的飞书账号不是该应用的协作者，开放平台拒绝访问（code=10003）' };
     }
+  }
+  // 飞书 console Web 登录态失效（cookie 过期后调 /developers/v1/* 会返回 passport
+  // 登出信号）——复用 open-platform-automation 的统一判定器：它综合 HTTP 401、
+  // Code/code=4101、code=99991641 且 LogoutReason=40、「请重新登录」文案和 cause
+  // 链，且刻意不把顶层通用 code=99991641 单独当登录失效（避免一般 console 故障
+  // 误弹扫码，见 automation.ts 注释与 redirect-repair 反例测试）。命中后归类
+  // session_expired，dashboard 引导重新扫码而不是把裸的 HTTP 400 甩给用户。
+  if (openPlatformWebSessionExpired(err)) {
+    return { reason: 'session_expired', message: '飞书开放平台登录态已失效，请重新扫码登录后重试' };
+  }
+  if (err instanceof OpenPlatformApiError) {
     return { reason: fallbackReason, message: err.message };
   }
   // 网络类错误（undici "fetch failed"）的真实原因在 cause 链里，safeErrorMessage 会带上。

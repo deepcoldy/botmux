@@ -502,7 +502,9 @@ describe('codex buildArgs', () => {
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      'thread-abc',
     ]);
     // the -c disable must land BEFORE the thread id (a resume-subcommand config)
     const cIdx = args.indexOf('-c');
@@ -568,6 +570,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -581,6 +585,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -593,6 +599,40 @@ describe('codex buildArgs', () => {
     const idx = args.indexOf('check_for_update_on_startup=false');
     expect(idx).toBeGreaterThan(0);
     expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('suppresses the low-usage luna model nudge for plain TUI launches', () => {
+    // Codex 0.151+ shows a "Switch to <luna> for lower credit usage?" popup at
+    // >=90% primary usage; its default item switches models, and the paste
+    // path's submit Enter would confirm it (#1281). Process-level -c only.
+    const fresh = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    const idx = fresh.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(fresh[idx - 1]).toBe('-c');
+
+    // Must survive resume as well, placed before the resumed session id.
+    const resumed = adapter.buildArgs({
+      sessionId: 'sess-4',
+      resume: true,
+      resumeSessionId: 'codex-session-id',
+    });
+    const resumeIdx = resumed.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(resumeIdx).toBeGreaterThan(0);
+    expect(resumeIdx).toBeLessThan(resumed.indexOf('codex-session-id'));
+  });
+
+  it('also suppresses the luna nudge popup on the pure --remote RPC viewer', () => {
+    // The viewer injects no keys (turns go through app-server JSON-RPC), but it
+    // is itself a TUI that renders the modal; keep the pane free of it like the
+    // startup update picker, before the resumed thread id.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    const idx = args.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+    expect(idx).toBeLessThan(args.indexOf('thread-abc'));
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {

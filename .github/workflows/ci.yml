@@ -121,12 +121,29 @@ jobs:
   # paths. Bun is what ships the single-file executable, so those paths need a
   # leg that actually runs on it.
   #
-  # Non-blocking on purpose (for now): the shim in test/bun-test-shim.ts
-  # deliberately does not fake `vi.doMock`/`resetModules`/`importOriginal`, and
-  # scripts/run-bun-tests.mjs excludes the files needing them, but the remaining
-  # population has not yet had a full green baseline established across a CI
-  # runner's environment. Flip `continue-on-error` off once it holds green — a
-  # gate that is red for environmental reasons trains people to ignore it.
+  # STILL ADVISORY, but the reason has narrowed. Three of the four flakes that
+  # kept this leg off a green baseline are now fixed at their cause rather than
+  # retried:
+  #   • a port-pair assumption (`base+1` was presumed free) → reserve both,
+  #   • a torn read of a marker file → write tmp + `renameSync`, plus a poll
+  #     predicate that THREW on a partial read, aborting the loop and reporting a
+  #     parse error instead of the timeout → fail soft,
+  #   • an env-leak guard whose transport was node-pty, which cannot fork/exec
+  #     reliably under Bun (see that file's comment for the measurements) → the
+  #     guard now runs over `child_process.spawn` on both legs, with the pty form
+  #     kept for Node only.
+  #
+  # The fourth is NOT fixed: test/tmux-startup-storm-recovery.test.ts wedged in
+  # run 34570428914 — one `(pass)` line, then 180s of silence and a SIGKILL, i.e.
+  # the second case never completed. Observed once in 28 completed master runs
+  # (~4%); not reproduced locally across ~50 attempts spanning core starvation,
+  # piped stdio, the runner's exact spawn shape and args, and its 4-way file
+  # concurrency. Since the test times out per-case at 15s and the file still went
+  # quiet for 180s, whatever blocks it is synchronous.
+  #
+  # A gate that is red for environmental reasons trains people to ignore it, so
+  # this flips to blocking when that cause is named and reproduced — not on a
+  # rerun, and not on the other three being green.
   #
   # The generous timeout is inherent to the design: the runner spawns ONE bun
   # process PER FILE, because `bun test` otherwise runs every file in a single
