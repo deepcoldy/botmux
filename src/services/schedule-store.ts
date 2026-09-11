@@ -829,15 +829,14 @@ export function appendOutputLog(taskId: string, content: string): string {
 }
 
 /**
- * Watch schedules.json for changes from external processes (e.g. `botmux
- * schedule add` running outside the daemon) and emit dashboard events for
- * the diff. Idempotent — calling twice is a no-op.
+ * Reconcile committed schedules.json changes into dashboard events, including
+ * writes made by this daemon. Idempotent — calling twice is a no-op.
  *
- * The existing `load()` already reloads when the on-disk file identity differs
- * from `cachedFileVersion`, so this watcher snapshots the in-memory map, calls
- * `load()` to refresh, then diffs and publishes. fs.watch can fire multiple
- * events for one logical write — the identity guard inside `load()` makes
- * redundant fires no-ops, and an unchanged diff produces no events anyway.
+ * Keep the publication baseline separate from the business cache: mutations
+ * and ordinary reads can refresh that cache before fs.watch runs. Comparing
+ * against it would consume changes without notifying dashboard subscribers.
+ * Reconcile on the watcher turn so synchronous compound writes/rollbacks have
+ * finished; repeated filesystem notifications produce no additional diff.
  */
 let watcherStarted = false;
 export function startExternalWriteWatcher(): void {
@@ -854,9 +853,16 @@ export function startExternalWriteWatcher(): void {
       mutateTasks(working => ({ result: undefined, changed: !existsSync(fp) && working.size === 0 }));
     } catch { /* best effort */ }
   }
-  // Prime the cached file identity so the first watcher fire is comparable.
   load();
-  const state = stateFor(fp);
+  // Serialized public rows are immutable even if a caller retains a task
+  // object, and never retain protected precondition references in events.
+  const snapshot = (): Map<string, string> => new Map(
+    [...stateFor(fp).tasks].map(([id, { preconditionRef, ...task }]) => [
+      id, JSON.stringify({ ...task, hasPrecondition: !!preconditionRef }),
+    ]),
+  );
+  let published = snapshot();
+  const announced = new Set(published.keys());
 
   try {
     // Watch the directory, not the file inode: every commit atomically replaces
@@ -866,38 +872,45 @@ export function startExternalWriteWatcher(): void {
       try {
         if (filename && filename.toString() !== basename(fp)) return;
         if (!existsSync(fp)) return;
-        if (fileVersion(fp) === state.version) return;
-
-        // Snapshot in-memory state, then let load() refresh from disk.
-        // load() compares file identity internally and updates the cache.
-        const before = new Map<string, ScheduledTask>();
-        for (const [k, v] of state.tasks) before.set(k, v);
         load();
+        const current = snapshot();
+        const before = published;
+        published = current;
 
-        // Diff and publish.
-        for (const [id, t] of state.tasks) {
-          const prev = before.get(id);
-          if (!prev) {
-            const { preconditionRef: _preconditionRef, ...schedule } = t;
-            dashboardEventBus.publish({
-              type: 'schedule.created',
-              body: { schedule: { ...schedule, hasPrecondition: !!t.preconditionRef } },
-            });
-          } else if (JSON.stringify(prev) !== JSON.stringify(t)) {
-            const { preconditionRef: _preconditionRef, ...patch } = t;
-            dashboardEventBus.publish({
-              type: 'schedule.updated',
-              body: { id, patch: { ...patch, hasPrecondition: !!t.preconditionRef } },
-            });
+        for (const [id, serialized] of current) {
+          const previous = before.get(id);
+          if (previous === serialized) continue;
+          const row = JSON.parse(serialized) as Record<string, unknown>;
+          if (!announced.has(id)) {
+            dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: row } });
+          } else {
+            // JSON omits undefined. Explicit nulls clear fields such as an old
+            // error or thread bookmark in the dashboard's merge-based cache.
+            const patch = { ...row };
+            for (const key of Object.keys(JSON.parse(previous ?? '{}'))) {
+              if (!(key in row)) patch[key] = null;
+            }
+            dashboardEventBus.publish({ type: 'schedule.updated', body: { id, patch } });
           }
         }
         for (const id of before.keys()) {
-          if (!state.tasks.has(id)) {
+          if (!current.has(id)) {
             dashboardEventBus.publish({ type: 'schedule.deleted', body: { id } });
           }
         }
       } catch (err) {
         logger.debug(`[schedule-store] watch handler error: ${err}`);
+      }
+    });
+    // Dashboard mutations can announce a richer row before fs.watch runs.
+    // Reconcile it with an update, not another create that would replace its
+    // presentation metadata. Track lifecycle only: a partial eager update
+    // must not consume other committed fields still awaiting publication.
+    dashboardEventBus.subscribe(event => {
+      if (event.type === 'schedule.created' && stateFor(fp).tasks.has(event.body.schedule.id)) {
+        announced.add(event.body.schedule.id);
+      } else if (event.type === 'schedule.deleted') {
+        announced.delete(event.body.id);
       }
     });
     logger.info(`[schedule-store] Watching ${fp} for external writes`);

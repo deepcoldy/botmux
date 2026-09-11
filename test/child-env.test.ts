@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
@@ -213,6 +215,7 @@ describe('redactChildEnv()', () => {
     // only when VAR is unset, distinguishing "unset" from "set to the string
     // 'undefined'". Run against the real bundled node-pty + /bin/sh.
     const pty = await import('node-pty');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-child-env-'));
     const prev = process.env.LARK_APP_ID;
     const prevSentinel = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
     process.env.LARK_APP_ID = 'cli_parent_must_not_leak';
@@ -221,57 +224,30 @@ describe('redactChildEnv()', () => {
     process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
     try {
       const env = redactChildEnv(process.env) as { [k: string]: string };
+      // This guard tests environment inheritance through a real PTY spawn.
+      // Read the child's report from a private file: terminal data and exit
+      // events can race, but the report is complete before the shell exits.
+      const reportPath = join(dir, 'env-report');
       const script =
-        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
-        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve, reject) => {
-        const p = pty.spawn('/bin/sh', ['-c', script], {
-          name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
+        '{ if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
+        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi; } > "$1"`;
+      const exitCode = await new Promise<number>((resolve, reject) => {
+        const p = pty.spawn('/bin/sh', ['-c', script, 'env-probe', reportPath], {
+          name: 'xterm-256color', cols: 80, rows: 24, cwd: dir, env,
         });
-        let buf = '';
-        let settled = false;
-        // node-pty delivers onData and onExit on independent paths: the child can
-        // be reaped before the pty's pending output has been drained, so
-        // resolving straight from onExit can hand back an empty string. That
-        // surfaces as `Expected to contain "R=UNSET" / Received: ""` under CI
-        // load, which reads like a real leak but is only a lost read.
-        //
-        // So settle on having BOTH answers, and let exit only START a short grace
-        // period rather than decide. If the grace period expires with the output
-        // still incomplete, REJECT with the raw buffer instead of resolving it:
-        // the whole point is that a lost read must never again be reported as a
-        // leak-shaped assertion failure. Resolving '' here would rebuild the very
-        // trap this guard exists to remove.
-        const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
-        const finish = (settle: () => void) => {
-          if (settled) return;
-          settled = true;
-          settle();
-        };
-        const fail = () => finish(() => reject(new Error(
-          'pty output incomplete — a lost read, not an env leak. '
-          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
-        )));
-        const guard = setTimeout(fail, 10_000);
-        guard.unref?.();
-        p.onData((d) => {
-          buf += d;
-          if (hasBothAnswers()) {
-            clearTimeout(guard);
-            finish(() => resolve(buf));
-          }
-        });
-        p.onExit(() => {
-          // Exit is a deadline, not the signal: give already-queued reads a
-          // moment to land, then decide — complete output resolves, incomplete
-          // output fails loudly as a fixture problem.
-          setTimeout(() => {
-            clearTimeout(guard);
-            if (hasBothAnswers()) finish(() => resolve(buf));
-            else fail();
-          }, 250);
+        const guard = setTimeout(() => {
+          exit.dispose();
+          try { p.kill(); } catch { /* already exited */ }
+          reject(new Error('pty environment probe timed out'));
+        }, 10_000);
+        const exit = p.onExit(({ exitCode }) => {
+          clearTimeout(guard);
+          exit.dispose();
+          resolve(exitCode);
         });
       });
+      expect(exitCode).toBe(0);
+      const out = readFileSync(reportPath, 'utf8');
       expect(out).toContain('R=UNSET');
       expect(out).toContain('S=UNSET');
       expect(out).not.toContain('undefined');
@@ -280,8 +256,9 @@ describe('redactChildEnv()', () => {
       else process.env.LARK_APP_ID = prev;
       if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
       else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
+      rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
 
 describe('stripDashboardH5Env()', () => {
