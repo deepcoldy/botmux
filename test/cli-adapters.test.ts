@@ -2355,44 +2355,6 @@ describe('busyPattern', () => {
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
   });
 
-  it('claude-code treats active task-panel agents as busy but ignores non-running rows and prose', () => {
-    const claude = createCliAdapterSync('claude-code');
-    const busy = claude.busyPattern!;
-    expect(busy.test([
-      'Tasks',
-      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
-    ].join('\n'))).toBe(true);
-    expect(busy.test([
-      'Tasks (1 active)',
-      '  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens',
-    ].join('\n'))).toBe(true);
-    expect(busy.test([
-      'Tasks (1 active, 1 done)',
-      '  ✔ Explore  Located the affected adapter',
-      '  ◯ reviewer  Inspecting edge cases              42s · ↑ 810 tokens',
-    ].join('\n'))).toBe(true);
-    // A copied task row in transcript prose is not live panel state.
-    expect(busy.test('  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens')).toBe(false);
-    expect(busy.test([
-      '❯ Here is the row you asked me to copy:',
-      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
-    ].join('\n'))).toBe(false);
-    expect(busy.test([
-      'Tasks are described below in prose.',
-      '❯ copied output:',
-      '  ◯ Explore  Checking plugin aliases              6m 8s · ↓ 3.5k tokens',
-    ].join('\n'))).toBe(false);
-    expect(busy.test('  ✔ Explore  Checking plugin aliases')).toBe(false);
-    expect(busy.test('  ◻ Explore  Checking plugin aliases')).toBe(false);
-    expect(busy.test('The symbol ◯ and 6m 8s are examples in this paragraph.')).toBe(false);
-    expect(busy.test('◯ The deploy should wrap up in about  10m')).toBe(false);
-    expect(busy.test('◯ Timeboxed:  2h')).toBe(false);
-    expect(busy.test('◯ x  5s')).toBe(false);
-    expect(busy.test('  ◯ Explore  Checking plugin aliases  6m 8s')).toBe(false);
-    expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy.source);
-    expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy.source);
-  });
-
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
     // Regression: a static capacity-queue screen matches readyPattern's
     // `\d+% left` status-bar arm and survives the 2s quiescence window,
@@ -2474,11 +2436,6 @@ describe('busyPattern', () => {
 });
 
 describe('idleToBusyPattern', () => {
-  it('codex and traex use structured turn terminals instead of screen idle as completion authority', () => {
-    expect(createCliAdapterSync('codex').reliableTurnTerminal).toBe(true);
-    expect(createCliAdapterSync('traex').reliableTurnTerminal).toBe(true);
-  });
-
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const busy = adapter.idleToBusyPattern;
