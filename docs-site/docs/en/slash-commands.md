@@ -31,7 +31,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
-| `/t [<text>]` `/topic [<text>]` | Force a new topic inside a regular group; text becomes the first task (starting after repository selection when needed), while the bare command opens topic setup |
+| `[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository, model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
@@ -41,12 +41,37 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 
 ![Current-group active topic sessions card](/img/sessions-command-card.png)
 
-See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`. You can also make `/repo` the new topic's first command:
+See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`.
 
-- `/t /repo <path|project name>`
-- `/t /repo wt <path|project name> [branch]`
+The three header directives:
 
-These forms create the topic and select a repository or create a worktree directly, without starting an empty session and switching it afterward. Send the task as the next message in the topic.
+- `/repo <path|project name>` — pin the repository directly, skipping the picker card. Note it takes **exactly one token**: quote a path containing spaces, as in `/repo "~/Code/my project"`.
+- `/repo` (no argument) — start right away in the default working directory, the same as the picker card's start-directly button.
+- `/model <model>` — the model to launch with this time. Only available on CLIs that can actually carry a model in their launch arguments; the rest reject it rather than ignoring it silently.
+- `/effort <level>` — reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`ultra`), validated against the model this launch will actually use.
+
+The whole message can be written on one line or split across lines — the result is identical:
+
+```text
+botmux ops /t /repo botmux /model sonnet check the restart records in the daemon log
+```
+
+```text
+botmux ops
+/t
+/repo botmux
+/model sonnet
+
+check the restart records in the daemon log
+```
+
+With no first task (e.g. `/t /repo botmux`), the CLI boots idle and waits for your next message instead of answering an empty turn.
+
+A few boundaries:
+
+- A header only takes effect on the **first message of a new topic**. To change repository/model/reasoning effort inside a running topic, send `/repo`, `/model` or `/effort` on their own; use `/rename` to change the title.
+- Creating a worktree cannot be expressed in the header (`/repo` takes a single token). Open the topic with `/t` first, then send `/repo wt <N|project name> [branch]` inside it.
+- A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
 ## 💬 Reply Mode (`/reply-mode`)
 

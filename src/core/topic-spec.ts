@@ -39,6 +39,8 @@ export type TopicSpecError =
   | { kind: 'repo_numeric'; arg: string }
   /** `/repo X` 没解析出任何存在的目录。 */
   | { kind: 'repo_not_found'; arg: string }
+  /** `/repo wt …` —— 建 worktree 是会话内的 `/repo wt` 子命令，头部里吃不下它的多个参数。 */
+  | { kind: 'repo_worktree_unsupported'; arg: string }
   /** 模型名不像模型名（含空白/非 ASCII/超长）。 */
   | { kind: 'model_invalid'; arg: string }
   /** 这个 bot 的启动路径根本带不动模型（见 launch-model-capability）。 */
@@ -94,6 +96,12 @@ export function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContext): To
   if (repoArg) {
     if (/^\d+$/.test(repoArg)) {
       errors.push({ kind: 'repo_numeric', arg: repoArg });
+    } else if (/^wt$/i.test(repoArg)) {
+      // 会话中途的 `/repo wt <编号|项目名> [分支]` 吃整行；头部里的 `/repo` 只吃一个
+      // token（D4/D7），于是 `wt` 会被当成仓库名。多数情况报「找不到仓库 wt」还算能懂，
+      // 但只要扫描根下恰好有个叫 `wt` 的目录，它就会**静默开在错误的目录里**。
+      // 显式拒绝，并告诉用户先开话题、再在话题内发 `/repo wt …`。
+      errors.push({ kind: 'repo_worktree_unsupported', arg: repoArg });
     } else {
       const resolved = resolveRepoSelection(repoArg, ctx.scanDirs);
       if (!resolved) errors.push({ kind: 'repo_not_found', arg: repoArg });

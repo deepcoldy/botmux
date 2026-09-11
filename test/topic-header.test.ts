@@ -246,6 +246,30 @@ describe('parseTopicHeader —— 指令参数细节', () => {
     });
   });
 
+  it('参数是空的/纯空白的双引号 → 判缺参数，不当成裸形式', () => {
+    // `/repo ""` 多半来自模板或复制粘贴事故。此前它被静默当成「没写 /repo」，于是
+    // 既不是 `/repo X`（钉仓库）也不是裸 `/repo`（默认目录开工），而是第三种没人定义过
+    // 的结果。三条指令统一落到 missing_arg。
+    for (const directive of ['repo', 'model', 'effort'] as const) {
+      expect(shape(parseTopicHeader(`/t /${directive} "" 干活`))).toEqual({
+        ok: false, kind: 'missing_arg', directive,
+      });
+      expect(shape(parseTopicHeader(`/t /${directive} "   " 干活`))).toEqual({
+        ok: false, kind: 'missing_arg', directive,
+      });
+    }
+  });
+
+  it('/repo wt 只吃得下 wt 这一个 token（拒绝发生在语义层）', () => {
+    // 会话中途的 `/repo wt <编号|项目名> [分支]` 吃整行；头部里只吃一个 token，
+    // 所以 `wt` 会落到仓库名位置。语义层显式拒绝，见 topic-spec 的用例。
+    expect(shape(parseTopicHeader('/t /repo wt botmux feat/x'))).toEqual({
+      title: undefined,
+      directives: { repo: 'wt' },
+      prompt: 'botmux feat/x',
+    });
+  });
+
   it('引号包裹的参数可以长得像指令', () => {
     expect(shape(parseTopicHeader('/t /repo "/model" 干活'))).toEqual({
       title: undefined,

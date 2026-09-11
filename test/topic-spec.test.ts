@@ -80,6 +80,13 @@ describe('resolveTopicSpec —— /repo 的拒绝分支', () => {
     expect(errorKinds(result)).toEqual(['repo_numeric']);
   });
 
+  it('worktree 子命令：头部吃不下它的多个参数，显式拒绝而不是静默开错目录', () => {
+    // `/t /repo wt botmux feat/x` 会把 `wt` 当仓库名。多数情况报「找不到仓库 wt」还算
+    // 能懂，但扫描根下只要恰好有个叫 wt 的目录，就会**静默开在错误的目录里**。
+    const result = resolve('/t /repo wt botmux feat/x', CLAUDE);
+    expect(errorKinds(result)).toEqual(['repo_worktree_unsupported']);
+  });
+
   it('解析不到任何存在的目录', () => {
     const result = resolve('/t /repo 并不存在的仓库 干活', CLAUDE);
     expect(errorKinds(result)).toEqual(['repo_not_found']);

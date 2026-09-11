@@ -81,13 +81,23 @@ export function isTopicHeaderError(parsed: TopicHeaderParse): parsed is TopicHea
 }
 
 /**
- * 这个头部有没有真的交代会话规格（标题或任一指令）。
+ * 在**已有会话**的话题里，这个头部是不是真的在声明会话规格（决策 D6 的边界）。
  *
- * 裸 `/t` 与 `/t 文案` 返回 false —— 它们不携带任何只能在会话诞生那一刻落地的状态，
- * 所以在「已有会话」的场景里可以继续按今天的方式处理，不必拒绝（决策 D6 的边界）。
+ * 三种情况分别对待：
+ *   - 带任一指令（`/repo` `/model` `/effort`）→ true。这些状态只能在会话诞生那一刻落地，
+ *     进行中的话题里半截生效（换了模型却没换仓库）比直接报错难查得多。
+ *   - 只有标题、正文为空（`新标题 /t`）→ true。没有别的解释，用户就是想改标题，
+ *     该告诉他这里不生效（改标题用 `/rename`）。
+ *   - 只有标题、正文非空、零指令（`关于 /t 这个命令`）→ **false**，放行给 CLI。
+ *     这种形状绝大多数是在聊天里提到 `/t` 这个命令本身；把它整条吞掉（用户看到一句
+ *     「只在新话题第一条生效」而 CLI 什么都没收到）比漏判一次改标题意图糟得多，
+ *     何况改标题本来就有 `/rename`。裸 `/t` 与 `/t 文案` 同样返回 false，行为不变。
+ *
+ * 只有 thread 路径用它。新话题路径不看这个谓词——那里任何解析成功的头部都照常生效。
  */
-export function topicHeaderCarriesSpec(header: TopicHeader): boolean {
-  return header.title !== undefined || Object.keys(header.directives).length > 0;
+export function topicHeaderDeclaresSpec(header: TopicHeader): boolean {
+  if (Object.keys(header.directives).length > 0) return true;
+  return header.title !== undefined && header.prompt === '';
 }
 
 interface Token {
@@ -200,6 +210,13 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       }
       directives[directive] = null;
       continue;
+    }
+    // 显式写了参数、里面却是空的（`/repo ""`、`/model "   "`）——这是写错了，不是裸形式。
+    // 必须放在裸形式分支**之后**：折进上面那个条件会把 `/repo ""` 悄悄重定义成「默认目录
+    // 开会话」，给一个多半来自模板/复制粘贴事故的 token 编一个意思出来。放在这里，三条
+    // 指令都落到同一个 missing_arg，不必新增错误种类与文案。
+    if (arg.text.trim() === '') {
+      return { ok: false, sentinel, kind: 'missing_arg', directive };
     }
     directives[directive] = arg.text;
     i += 1;

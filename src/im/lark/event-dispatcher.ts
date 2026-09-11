@@ -8,7 +8,7 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -18,7 +18,7 @@ import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../c
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
@@ -2700,6 +2700,26 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
+ * 路由侧判「这是不是指令头」时的 @ 剥离，必须与 daemon 侧**逐字同源**。
+ *
+ * daemon 走两道：先按位置剥前导 @（谁的都剥），再按身份剥本 bot 的 @（任意位置）。
+ * 路由这边曾经只做第一道，于是 `重构登录 /t /model @机器人` 在这里解析成「合法头部
+ *（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——路由已经把 scope 翻成
+ * 新话题，daemon 才回一句用法错误，错误提示落进一个凭空开出来的话题里。
+ *
+ * `getBotOpenId` 不抛（未注册的 app id 返回 undefined），而 `stripBotMentions` 认不出
+ * 本 bot 时原样返回，所以 botOpenId 尚未解析出来的窗口期最坏退化成改动前的行为。
+ */
+function stripHeaderMentions(rawText: string, message: any, larkAppId: string): string {
+  const mentions = message?.mentions ?? [];
+  return stripBotMentions(
+    stripLeadingMentions(rawText.trim(), mentions),
+    mentions,
+    { botOpenId: getBotOpenId(larkAppId), larkAppId },
+  );
+}
+
+/**
  * If the inbound message starts with `/t` / `/topic` AND the routing
  * currently lands on chat-scope, override to thread-scope anchored at
  * the inbound message_id. This makes "force topic mode" work even when
@@ -2714,11 +2734,12 @@ export function maybeApplyForceTopicOverride(
   routing: { scope: 'thread' | 'chat'; anchor: string },
   message: any,
   messageId: string,
+  larkAppId: string,
 ): boolean {
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
-  const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
+  const stripped = stripHeaderMentions(rawText, message, larkAppId);
   // 指令头（`[标题] /t …`）与裸 `/t` 走同一条判定。只认**解析成功**的头部：写错了的
   // 头部要留在原地被拒绝（回一句用法错误），不能先把 scope 改成新话题——那已经是副作用。
   // 这里只需要 yes/no，所以沿用按位置剥前导 @ 即可；daemon 侧会按身份重新精确解析。
@@ -2799,8 +2820,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
-    const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    if (isTopicHeader(parseTopicHeader(stripped))) return undefined;
+    if (isTopicHeader(parseTopicHeader(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one
@@ -3798,7 +3818,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId);
+        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -4122,7 +4142,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /t / /topic in 普通群: flip routing to thread-scope so the bot's
       // first reply seeds a fresh Lark thread, even if a chat-scope session
       // is currently active in this chat.
-      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
+      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }

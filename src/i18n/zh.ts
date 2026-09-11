@@ -1125,6 +1125,7 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_unknown_directive': '`{token}` 不是可用的头部指令（只支持 /repo、/model、/effort）',
   'daemon.topic_header_repo_numeric': '`/repo {arg}`：编号是选仓卡片上的形式，指令头里请写路径或项目名',
   'daemon.topic_header_repo_not_found': '找不到仓库 `{arg}`（可写绝对路径，或工作目录下的项目名）',
+  'daemon.topic_header_repo_worktree': '头部里的 `/repo` 只吃一个参数，装不下 `wt <编号|项目名> [分支]`。请先发 `/t` 开话题，再在话题内发 `/repo wt …` 建 worktree',
   'daemon.topic_header_model_invalid': '`{arg}` 不像模型名——`/model` 只吃一个 token，正文请写在指令之后',
   'daemon.topic_header_model_unsupported': '当前 CLI（{cli}）启动时带不了模型，`/model` 在指令头里用不了',
   'daemon.topic_header_effort_invalid': '`{arg}` 不是合法的推理档位（可选：{allowed}）',

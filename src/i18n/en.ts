@@ -1127,6 +1127,7 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_unknown_directive': '`{token}` is not a header directive (only /repo, /model and /effort are supported)',
   'daemon.topic_header_repo_numeric': '`/repo {arg}`: numbers only mean something on the repo picker card — use a path or project name in the header',
   'daemon.topic_header_repo_not_found': 'No repo named `{arg}` (use an absolute path, or a project name under the working dir)',
+  'daemon.topic_header_repo_worktree': '`/repo` inside the header takes a single argument and cannot carry `wt <N|name> [branch]`. Open the topic with `/t` first, then send `/repo wt …` inside it to create a worktree',
   'daemon.topic_header_model_invalid': '`{arg}` does not look like a model name — `/model` takes a single token; put the task text after the directives',
   'daemon.topic_header_model_unsupported': 'This CLI ({cli}) cannot be given a model at launch, so `/model` is unavailable in the header',
   'daemon.topic_header_effort_invalid': '`{arg}` is not a valid reasoning effort (one of: {allowed})',

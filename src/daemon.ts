@@ -306,7 +306,7 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
-import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderCarriesSpec } from './core/topic-header.js';
+import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -19025,8 +19025,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
-      markIngressAdmitted(ctx);
       forkReservedIdleSession(ds);
+      // 与下面常规 pinned 分支同序，刻意不提前打标：这条路没有 pendingRepo 那种 durable
+      // staging，fork 抛错时 forkWorker 的 pre-init 补偿已经杀掉子进程并回滚，本轮既没进
+      // worker 也没有兜底，应当保持「请重发」。空跑成功之后 ready 回复失败才是「已接收，
+      // 勿重发」——所以标要打在 fork 之后、回复之前。
+      markIngressAdmitted(ctx);
       await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId), ds.workingDir), 'text', larkAppId);
       logger.info(`[${tag(ds)}] topic header → idle start in ${ds.workingDir}, waiting for the first task`);
       return;
@@ -19928,21 +19932,35 @@ async function handleThreadReplyAdmitted(
     parsed.mentions,
     { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
   ));
-  if (threadHeaderParse !== null) {
-    if (await replyGrantRestrictionIfNeeded(
-      larkAppId,
-      threadChatId,
-      threadSenderOpenId,
-      anchor,
-      threadHeaderParse.sentinel,
-    )) {
-      return;
-    }
-    // 指令头只在**尚无会话**的场景生效（D6）。标题/仓库/模型/推理强度都只能在会话诞生
-    // 那一刻落地，进行中的话题里让它半截生效（换了模型却没换仓库）比直接报错难查得多。
-    // 裸 `/t` 与 `/t 文案` 不带这类状态，照旧当普通文字交给 CLI，行为不变。
-    // 写错的头部同样拒绝：解析器只在用户已经写了标题或指令时才报错，意图是明确的。
-    if (isTopicHeaderError(threadHeaderParse) || topicHeaderCarriesSpec(threadHeaderParse)) {
+  // 指令头只在**尚无会话**的场景生效（D6）—— 判据是「这个 anchor 上有没有会话」，
+  // **不是**「消息长什么样」。这条区别是必须的：机器人发送方不过 dispatcher 的
+  // isSessionOwner 分叉（event-dispatcher 的 bot-to-bot @mention 分支无条件走
+  // handleThreadReply），全新话题的第一条也会落到这里，靠本函数末尾的「无会话则
+  // auto-create」兜底建会话。按消息形状拒绝会把那一条整个丢掉，而回复还说「只在新话题
+  // 第一条生效」——它恰恰就是新话题第一条。
+  //
+  // 没有会话时保持本 PR 之前的行为：不拦、不改写，交给下面的 auto-create。指令头对
+  // 机器人发送方因此仍然不生效（与改动前一致），要让它生效得改 dispatcher 的分叉，
+  // 那是另一件事，见 PR 描述的后续项。
+  const threadHeaderSessionExists = !!activeSessions.get(sessionKey(anchor, larkAppId));
+  if (threadHeaderParse !== null && threadHeaderSessionExists) {
+    // 授权闸放在**收窄之后**：`关于 /t 这个命令` 这种聊天文本已经判定不是指令头，
+    // 再回一句「你没权限用 /t」并吞掉整条，是换了层皮的同一个误拒。
+    const declaresSpec = isTopicHeaderError(threadHeaderParse)
+      || topicHeaderDeclaresSpec(threadHeaderParse);
+    if (declaresSpec) {
+      if (await replyGrantRestrictionIfNeeded(
+        larkAppId,
+        threadChatId,
+        threadSenderOpenId,
+        anchor,
+        threadHeaderParse.sentinel,
+      )) {
+        return;
+      }
+      // 标题/仓库/模型/推理强度都只能在会话诞生那一刻落地，进行中的话题里半截生效
+      //（换了模型却没换仓库）比直接报错难查得多。写错的头部同样拒绝：解析器只在用户
+      // 已经写了标题或指令时才报错，意图是明确的。
       await sessionReply(
         anchor,
         tr('daemon.topic_header_needs_new_topic', undefined, localeForBot(larkAppId)),

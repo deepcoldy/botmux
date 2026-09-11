@@ -301,6 +301,8 @@ describe('指令头：拒绝路径零副作用', () => {
     { name: '未知头部指令', text: '日常运维 /t /repo botmux /clear' },
     { name: '指令缺参数', text: '日常运维 /t /model' },
     { name: '同一指令重复', text: '/t /repo botmux /repo homelab 干活' },
+    { name: 'worktree 子命令（头部吃不下它的多个参数）', text: '/t /repo wt botmux feat/x' },
+    { name: '参数是空的双引号', text: '/t /repo "" 干活' },
   ];
 
   for (const { name, text } of rejected) {
@@ -379,6 +381,31 @@ describe('指令头：向后兼容（D9）', () => {
     expect(ds.workingDir).toBe(botmuxRepo);
     expect(ds.session.workingDir).toBeUndefined();
     // 空 prompt fork + 「下一条真消息才是开场」标记。
+    expect(mocks.forkWorker.mock.calls[0][1]).toBe('');
+    expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('裸 /repo 在开了 auto-worktree 的 bot 上也不建 worktree', async () => {
+    // bot 开了「仅默认目录 + 自动 worktree」，但裸 /repo 是用户显式说「就在默认目录开」。
+    // 今天 `/t /repo` 走 command-handler 的 `!repoArg && ds.pendingRepo` 分支，那条路
+    // 根本不算 willAutoWorktree，同样不建 —— 必须用 defaultWorkingDir 而不是 workingDir
+    // 注册，否则 botAutoWorktreeEnabled 为假，这条断言就是空的。
+    registerAppBot({ defaultWorkingDir: botmuxRepo, defaultWorkingDirAutoWorktree: true });
+
+    await handleNewTopic(
+      groupEvent('日常运维 /t /repo', 'om_bare_repo_autowt'),
+      groupCtx('om_bare_repo_autowt'),
+    );
+
+    const ds = forkedSession();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(sentCardCount()).toBe(0);
+    expect(ds.workingDir).toBe(botmuxRepo);
+    // 分层解析出的 pinned 目录照旧写进会话记录（与今天 `/t /repo` 冷启动那条
+    // `if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir` 逐字一致）；
+    // 上一条用例里之所以是 undefined，是因为那个 bot 只配了 workingDir、没有 pinned 目录。
+    expect(ds.session.workingDir).toBe(botmuxRepo);
+    expect(ds.session.title).toBe('日常运维');
     expect(mocks.forkWorker.mock.calls[0][1]).toBe('');
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
@@ -530,8 +557,8 @@ describe('指令头：已有会话的话题里一律拒绝（D6）', () => {
   const refused: Array<{ name: string; text: string }> = [
     { name: '带仓库指令', text: '/t /repo homelab 换个仓库' },
     { name: '带模型指令', text: '/t /model sonnet 换个模型' },
-    { name: '带标题', text: '新标题 /t 继续干活' },
-    { name: '写错的头部', text: '新标题 /t /repo' },
+    { name: '只有标题、正文为空（像是想改标题）', text: '新标题 /t' },
+    { name: '写错的头部', text: '新标题 /t /model' },
   ];
 
   for (const { name, text } of refused) {
@@ -559,6 +586,24 @@ describe('指令头：已有会话的话题里一律拒绝（D6）', () => {
     expect(mocks.sendWorkerInput).toHaveBeenCalled();
   });
 
+  it('话题里聊到 /t 这个命令本身不算指令头：原文照常进 CLI', async () => {
+    // `关于 /t 这个命令` 语法上确实解析成 title=关于 / prompt=这个命令，但这种形状
+    // 绝大多数是在讨论命令本身。整条吞掉（用户只看到一句「只在新话题第一条生效」、
+    // CLI 什么都没收到）比漏判一次改标题意图糟得多，何况改标题本来就有 /rename。
+    seedThreadSession();
+
+    await handleThreadReply(
+      threadEvent('关于 /t 这个命令', 'om_thread_discussion'),
+      threadCtx('om_thread_discussion'),
+    );
+
+    expect(sentContents().join('\n')).not.toContain('只在开新话题的第一条消息里生效');
+    expect(mocks.sendWorkerInput).toHaveBeenCalled();
+    // 原文一字未动地交给 CLI —— 守卫只是解析了一份丢弃的结果，没有改写 content。
+    const delivered = mocks.sendWorkerInput.mock.calls.map(c => JSON.stringify(c)).join('\n');
+    expect(delivered).toContain('关于 /t 这个命令');
+  });
+
   it('非 Claude 的 CLI（codex）上同样拒绝', async () => {
     registerAppBot({ cliId: 'codex' });
     const ds = seedThreadSession();
@@ -571,6 +616,54 @@ describe('指令头：已有会话的话题里一律拒绝（D6）', () => {
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
     expect(ds.spawnModelOverride).toBeUndefined();
     expect(sentContents()[0]).toContain('只在开新话题的第一条消息里生效');
+  });
+});
+
+describe('指令头：机器人发送方在全新话题里不被误拒', () => {
+  const PEER_BOT = 'ou_peer_bot';
+
+  /** 机器人发来的话题内消息（bot sender 走 dispatcher 的 bot-to-bot 分支，
+   *  不过 isSessionOwner 分叉，全新 anchor 也会落到 handleThreadReply）。 */
+  function botThreadEvent(text: string, messageId: string): any {
+    const ev = threadEvent(text, messageId);
+    ev.sender = { sender_id: { open_id: PEER_BOT }, sender_type: 'app' };
+    return ev;
+  }
+
+  beforeEach(() => {
+    // 让这个 peer bot 过得了对话闸——否则它会在配额/talk 检查那里就被挡掉，
+    // 测的就不是「指令头守卫有没有误拒」了。
+    registerAppBot({ allowedUsers: [OWNER, PEER_BOT] });
+    getBot(APP).resolvedAllowedUsers = [OWNER, PEER_BOT];
+  });
+
+  it('全新 anchor 上带指令的头部不再被当成「已有话题」拒绝，任务不丢', async () => {
+    // 守卫一度按**消息形状**判，于是机器人在全新 anchor 上发任何带标题或指令的头部
+    // 都会被拒，回复还说「只在开新话题的第一条消息里生效」—— 它恰恰就是新话题第一条。
+    // 现在按**会话是否存在**判：没有会话就不拦，交给函数末尾的 auto-create。
+    expect(activeSessions.size).toBe(0);
+
+    await handleThreadReply(
+      botThreadEvent('协作标题 /t /repo botmux 干活', 'om_bot_newanchor'),
+      threadCtx('om_bot_newanchor'),
+    );
+
+    expect(sentContents().join('\n')).not.toContain('只在开新话题的第一条消息里生效');
+    // auto-create 兜底：会话建出来了，这一轮没有被丢掉。
+    expect(mocks.createdSessions.length).toBeGreaterThan(0);
+  });
+
+  it('同一个机器人在**已有**会话的话题里发指令头，仍然被拒', async () => {
+    const ds = seedThreadSession();
+
+    await handleThreadReply(
+      botThreadEvent('协作标题 /t /repo homelab 换个仓库', 'om_bot_existing'),
+      threadCtx('om_bot_existing'),
+    );
+
+    expect(sentContents()[0]).toContain('只在开新话题的第一条消息里生效');
+    expect(ds.workingDir).toBe(botmuxRepo);
+    expect(ds.session.title).toBe('原标题');
   });
 });
 

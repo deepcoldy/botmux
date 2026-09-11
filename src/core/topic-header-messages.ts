@@ -38,6 +38,8 @@ export function topicSpecErrorText(errors: readonly TopicSpecError[], locale: Lo
         return t('daemon.topic_header_repo_numeric', { arg: error.arg }, locale);
       case 'repo_not_found':
         return t('daemon.topic_header_repo_not_found', { arg: error.arg }, locale);
+      case 'repo_worktree_unsupported':
+        return t('daemon.topic_header_repo_worktree', undefined, locale);
       case 'model_invalid':
         return t('daemon.topic_header_model_invalid', { arg: error.arg }, locale);
       case 'model_unsupported_cli':

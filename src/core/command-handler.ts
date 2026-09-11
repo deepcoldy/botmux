@@ -318,7 +318,7 @@ export {
   parseTopicHeader,
   isTopicHeader,
   isTopicHeaderError,
-  topicHeaderCarriesSpec,
+  topicHeaderDeclaresSpec,
   TOPIC_HEADER_DIRECTIVES,
   type TopicHeader,
   type TopicHeaderError,
