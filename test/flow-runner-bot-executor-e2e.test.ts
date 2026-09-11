@@ -2,14 +2,15 @@
  * flow `bot` 执行器的 runner 级 e2e：真实 FlowRunner（进程内）+ 真实 script host 子进程 +
  * 一个进程内的假「bot daemon」（实现 agent-turn / trigger-result / close 三条路）。
  *
- * 覆盖：cli → bot 解析与 started 行、attempt.state ready 带 sessionId、send.intent / send.confirmed、
+ * 覆盖：`bot` 点名解析（存在 / 在线 / cli 断言）与 started 行、attempt.state ready 带 sessionId、send.intent / send.confirmed、
  * result 证据来源 daemon、结算后关会话、schema 修复回到同一会话、超时关会话、daemon 侧失败进决策、
- * 选不到 bot 的 setup_required、取消关会话、接管时关掉上一代会话、run.json 记录 executor。
+ * bot 不存在 / 配了但离线 / cli 与本 bot 不符的 setup_required、取消关会话、接管时关掉上一代会话、run.json 记录 executor。
  */
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { FlowRunner, readRunJson } from '../src/flow/runner.js';
 import type { BotExecutorDeps, BotHttpResponse } from '../src/flow/bot-executor.js';
+import type { ConfiguredBot } from '../src/flow/configured-bots.js';
 import type { AttemptStateRow, FlowAgentTurnRequest, JournalRow, ResultRow, RunBinding, StartedRow } from '../src/flow/types.js';
 import type { OnlineDaemonInfo } from '../src/utils/daemon-discovery.js';
 import { SRC_DIR, control, harness, rows, type Harness } from './helpers/flow-e2e.js';
@@ -17,6 +18,12 @@ import { SRC_DIR, control, harness, rows, type Harness } from './helpers/flow-e2
 const DAEMONS: OnlineDaemonInfo[] = [
   { larkAppId: 'cli_own', ipcPort: 4001, botName: 'Owner Bot', cliId: 'claude-code' },
   { larkAppId: 'cli_codex', ipcPort: 4002, botName: 'Codex Bot', cliId: 'codex' },
+];
+/** bots.json 视角：两个在线的之外还配了一个没起 daemon 的 gemini bot。 */
+const CONFIGURED: ConfiguredBot[] = [
+  { larkAppId: 'cli_own', displayName: 'Owner Bot', cliId: 'claude-code' },
+  { larkAppId: 'cli_codex', displayName: 'Codex Bot', cliId: 'codex' },
+  { larkAppId: 'cli_gemini', displayName: 'Gemini Bot', cliId: 'gemini' },
 ];
 
 interface FakeTurn {
@@ -47,7 +54,7 @@ class FakeDaemon {
   readonly deps: BotExecutorDeps;
 
   constructor(private readonly behave: Behaviour, private readonly online: OnlineDaemonInfo[] = DAEMONS) {
-    this.deps = { listDaemons: () => this.online, pollIntervalMs: 10, fetch: (port, path, init) => this.handle(port, path, init) };
+    this.deps = { listDaemons: () => this.online, listConfiguredBots: () => CONFIGURED, pollIntervalMs: 10, fetch: (port, path, init) => this.handle(port, path, init) };
   }
 
   private async handle(port: number, path: string, init?: { method?: string; body?: string }): Promise<BotHttpResponse> {
@@ -142,11 +149,11 @@ describe('flow runner · bot executor', () => {
     delete process.env.BOTMUX_FLOW_FAKE_AGENT;
   });
 
-  it('cli → bot 解析、headless 会话、journal 行与证据、结算后关会话', async () => {
+  it('bot 点名解析、headless 会话、journal 行与证据、结算后关会话', async () => {
     const h = harness(`export default async (ctx) => {
-      const a = await ctx.agent({ cli: 'claude-code', prompt: 'say A' });
-      const b = await ctx.agent({ cli: 'codex', prompt: 'say B' });
-      const c = await ctx.agent({ prompt: 'say C' });
+      const a = await ctx.agent({ cli: 'claude-code', prompt: 'say A' });   // 本 bot，cli 只是断言
+      const b = await ctx.agent({ bot: 'Codex Bot', prompt: 'say B' });     // 点名别的 bot
+      const c = await ctx.agent({ prompt: 'say C' });                        // 本 bot
       return [a.value, b.value, c.value];
     }`);
     const fake = new FakeDaemon((req) => ({ content: `${req.prompt.slice(-1)}!` }));
@@ -185,7 +192,7 @@ describe('flow runner · bot executor', () => {
 
   it('schema 修复回到同一个会话（turn 2），值是解析后的 JSON；快照带 botName', async () => {
     const h = harness(`export default async (ctx) => {
-      const r = await ctx.agent({ cli: 'codex', prompt: 'give json', schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });
+      const r = await ctx.agent({ bot: 'cli_codex', prompt: 'give json', schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });
       return r.value;
     }`);
     const fake = new FakeDaemon((req) => (req.turn === 1 ? { content: 'not json at all' } : { content: 'ok:\n```json\n{"n": 7}\n```' }));
@@ -200,11 +207,13 @@ describe('flow runner · bot executor', () => {
     expect(r.snapshot().attempts).toEqual([expect.objectContaining({ identity: '#0', cli: 'codex', botName: 'Codex Bot', state: 'result' })]);
   }, 60_000);
 
-  it('超时 → timeout（uncertain）并关掉会话；选不到 bot → setup_required', async () => {
+  it('超时 → timeout（uncertain）并关掉会话；bot 不存在 / 配了但离线 / cli 与本 bot 不符 → setup_required', async () => {
     const h = harness(`export default async (ctx) => {
-      const slow = await ctx.agent({ cli: 'codex', prompt: 'hang', timeoutMs: 400 });
-      const none = await ctx.agent({ cli: 'gemini', prompt: 'nobody' });
-      return [slow.ok, slow.error, none.ok, none.error];
+      const slow = await ctx.agent({ bot: 'Codex Bot', prompt: 'hang', timeoutMs: 400 });
+      const unknown = await ctx.agent({ bot: 'Nobody Bot', prompt: 'nobody' });
+      const offline = await ctx.agent({ bot: 'Gemini Bot', prompt: 'asleep' });
+      const wrongCli = await ctx.agent({ cli: 'codex', prompt: 'no bot named' });
+      return [slow.ok, slow.error, unknown.error, offline.error, wrongCli.error];
     }`);
     const fake = new FakeDaemon(() => ({ hang: true }));
     const r = runner(h, fake);
@@ -214,13 +223,19 @@ describe('flow runner · bot executor', () => {
     expect(failed.map((f) => [f.identity, f.category, f.retry, f.effects])).toEqual([
       ['#0', 'timeout', 'auto', 'uncertain'],
       ['#1', 'setup_required', 'manual', 'none'],
+      ['#2', 'setup_required', 'manual', 'none'],
+      ['#3', 'setup_required', 'manual', 'none'],
     ]);
     expect(failed[0]!.error).toMatch(/Codex Bot did not finish the turn within 400ms/);
-    expect(failed[1]!.error).toMatch(/no online bot runs cli "gemini"/);
-    // 超时关了会话；gemini 根本没派发
-    expect(fake.closes.map((c) => c.sessionId)).toEqual(['sess_1']);
+    expect(failed[1]!.error).toMatch(/bot "Nobody Bot" is not a known bot .*known bots: Owner Bot=claude-code \[online\], Codex Bot=codex \[online\], Gemini Bot=gemini \[offline\]/);
+    expect(failed[2]!.error).toMatch(/bot "Gemini Bot" \(cli_gemini, gemini\) is configured but its daemon is not online/);
+    expect(failed[3]!.error).toMatch(/agent cli "codex" does not match this run's bot Owner Bot \(claude-code\); name the executing bot with `bot` \(codex bots: Codex Bot \[online\]\)/);
+    // 选不到 bot 的三个 attempt 没有 started 行里的 bot，也根本没派发
+    expect(started(h).map((s) => [s.identity, s.bot ?? null])).toEqual([['#0', 'cli_codex'], ['#1', null], ['#2', null], ['#3', null]]);
     expect(fake.dispatches).toHaveLength(1);
-    expect(summary.returned).toEqual([false, expect.stringMatching(/did not finish/), false, expect.stringMatching(/gemini/)]);
+    // 超时关了会话
+    expect(fake.closes.map((c) => c.sessionId)).toEqual(['sess_1']);
+    expect(summary.returned).toEqual([false, expect.stringMatching(/did not finish/), expect.stringMatching(/not a known bot/), expect.stringMatching(/not online/), expect.stringMatching(/name the executing bot/)]);
   }, 60_000);
 
   it('daemon 侧会话失败 → crashed/uncertain 返回脚本；resume 时进决策，retry 后第二次 attempt 成功', async () => {
@@ -260,7 +275,7 @@ describe('flow runner · bot executor', () => {
 
   it('取消 run：在途会话被关掉，attempt 结算成 canceled', async () => {
     const h = harness(`export default async (ctx) => {
-      const r = await ctx.agent({ cli: 'codex', prompt: 'forever' });
+      const r = await ctx.agent({ bot: 'Codex Bot', prompt: 'forever' });
       return r.ok;
     }`);
     const fake = new FakeDaemon(() => ({ hang: true }));
@@ -282,7 +297,7 @@ describe('flow runner · bot executor', () => {
 
   it('接管：上一代在途 attempt 的会话按 journal 记录关掉，然后诚实结算并重跑', async () => {
     const h = harness(`export default async (ctx) => {
-      const r = await ctx.agent({ cli: 'codex', prompt: 'takeover' });
+      const r = await ctx.agent({ bot: 'Codex Bot', prompt: 'takeover' });
       return r.value;
     }`);
     // 第一代：派发后 runner 被「打断」（interrupt），会话留在 daemon 里

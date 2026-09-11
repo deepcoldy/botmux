@@ -134,8 +134,8 @@ function requireTimeout(spec: Record<string, unknown>): number | undefined {
 function normalizeAgentSpec(raw: unknown): AgentSpec {
   if (!raw || typeof raw !== 'object') throw new ScriptHardError('invalid_spec', 'agent(spec) needs an object');
   const spec = raw as Record<string, unknown>;
-  // `cli` 与 `bot` 至少一个（bot 执行器下都不给也行：落到本 run 所属 bot；pty 执行器要 `cli`，
-  // 缺了在 runner 侧以 setup_required 结算，这里不预判执行器）。
+  // bot 执行器：`bot` 选执行 bot（不给就是本 run 所属 bot），`cli` 只是对落到的 bot 的断言；
+  // pty 执行器要 `cli`。存在性 / 在线 / CLI 一致都在 runner 侧以 setup_required 结算，这里不预判执行器。
   const out: AgentSpec = { prompt: requireString(spec, 'prompt', true)! };
   const cli = requireString(spec, 'cli', false);
   const bot = requireString(spec, 'bot', false);

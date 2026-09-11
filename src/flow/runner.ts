@@ -889,9 +889,12 @@ export class FlowRunner {
     const container = containerName(self.gen, n);
     const attemptDir = join(this.opts.runDir, 'agents', identityDirName(identity), 'attempts', `${self.gen}-${attempt}`);
     mkdirSync(attemptDir, { recursive: true });
-    // bot 执行器：先选执行 bot，started 行就带上它（卡片 / inspect 从一开始就能显示「谁在跑」）。
+    // bot 执行器：先选执行 bot（`bot` 点名 → 校验它在 bots.json / 在线名单里存在且在线），started 行就带上它
+    // （卡片 / inspect 从一开始就能显示「谁在跑」）。bots.json 每次现读：run 等决策期间加了 bot，retry 就能用上。
     // 选不到不在这里抛：照样登记 attempt，再以 setup_required 结算，让失败进 journal、进决策卡。
-    const resolved = this.executor === 'bot' ? resolveAgentBot(spec, this.binding?.larkAppId ?? null, this.botDeps.listDaemons()) : null;
+    const resolved = this.executor === 'bot'
+      ? resolveAgentBot(spec, this.binding?.larkAppId ?? null, this.botDeps.listDaemons(), this.botDeps.listConfiguredBots?.() ?? null)
+      : null;
     const bot = resolved?.ok ? resolved.bot : null;
     const rows: JournalRow[] = [];
     if (disposition.divergence) rows.push({ t: 'divergence', gen: self.gen, ts: nowMs(), identity, expected: disposition.divergence.expected, actual: disposition.divergence.actual });

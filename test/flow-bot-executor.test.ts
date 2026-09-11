@@ -3,7 +3,8 @@
  * 全部经注入的 fetch / listDaemons，不起 daemon。
  */
 import { describe, expect, it } from 'vitest';
-import { closeBotSession, dispatchTurn, pollTurn, resolveAgentBot, type BotExecutorDeps, type BotHttpResponse, type ResolvedBot } from '../src/flow/bot-executor.js';
+import { closeBotSession, dispatchTurn, knownBots, pollTurn, resolveAgentBot, type BotExecutorDeps, type BotHttpResponse, type ResolvedBot } from '../src/flow/bot-executor.js';
+import type { ConfiguredBot } from '../src/flow/configured-bots.js';
 import { FLOW_AGENT_TURN_ROUTE, type FlowAgentTurnRequest } from '../src/flow/types.js';
 import type { OnlineDaemonInfo } from '../src/utils/daemon-discovery.js';
 
@@ -24,31 +25,79 @@ function deps(fetch: BotExecutorDeps['fetch'], extra: Partial<BotExecutorDeps> =
   return { listDaemons: () => daemons, fetch, pollIntervalMs: 5, ...extra };
 }
 
+/** bots.json 视角：比在线名单多一个离线的 gemini bot，少 cli_claude2 的 displayName（它只有在线 botName）。 */
+const configured: ConfiguredBot[] = [
+  { larkAppId: 'cli_own', displayName: 'Owner Bot', cliId: 'claude-code' },
+  { larkAppId: 'cli_codex', displayName: 'Codex 小助手', cliId: 'codex' },
+  { larkAppId: 'cli_claude2', cliId: 'claude-code' },
+  { larkAppId: 'cli_gemini', displayName: 'Gemini 帮手', cliId: 'gemini' },
+];
+
+describe('knownBots', () => {
+  it('bots.json 与在线描述符按 larkAppId 合并：在线的带 daemon，只配置的标 offline，只在线的标未配置', () => {
+    const known = knownBots(configured, daemons);
+    expect(known.map((b) => [b.larkAppId, b.name, b.cliId, !!b.online, b.configured])).toEqual([
+      ['cli_own', 'Owner Bot', 'claude-code', true, true],
+      ['cli_codex', 'Codex 小助手', 'codex', true, true],
+      ['cli_claude2', 'Claude Two', 'claude-code', true, true],
+      ['cli_gemini', 'Gemini 帮手', 'gemini', false, true],
+    ]);
+    expect(known[2]!.aliases).toEqual(['cli_claude2', 'claude two']);
+    expect(knownBots(null, [daemons[1]!]).map((b) => [b.larkAppId, b.configured, b.aliases])).toEqual([['cli_codex', false, ['cli_codex', 'codex 小助手']]]);
+    // 端口非法的描述符不算在线
+    expect(knownBots(null, [{ larkAppId: 'x', ipcPort: 0 }])).toEqual([]);
+  });
+});
+
 describe('resolveAgentBot', () => {
-  it('显式 bot：按 larkAppId 或 displayName（忽略大小写）在线上找；cli 冲突拒绝', () => {
-    expect(resolveAgentBot({ bot: 'cli_codex' }, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex', ipcPort: 4002 } });
-    expect(resolveAgentBot({ bot: 'claude two' }, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_claude2' } });
-    expect(resolveAgentBot({ bot: 'Codex 小助手', cli: 'codex' }, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
-    expect(resolveAgentBot({ bot: 'Codex 小助手', cli: 'claude-code' }, 'cli_own', daemons)).toMatchObject({ ok: false, error: /runs codex, not claude-code/ });
-    expect(resolveAgentBot({ bot: 'nobody' }, 'cli_own', daemons)).toMatchObject({ ok: false, error: /not online/ });
-    expect(resolveAgentBot({ bot: '  ' }, 'cli_own', daemons)).toMatchObject({ ok: false, error: /must not be empty/ });
+  it('显式 bot：按 larkAppId / displayName / 在线 botName（忽略大小写）找；必须存在且在线；cli 只做断言', () => {
+    expect(resolveAgentBot({ bot: 'cli_codex' }, 'cli_own', daemons, configured)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex', ipcPort: 4002, botName: 'Codex 小助手' } });
+    expect(resolveAgentBot({ bot: 'claude two' }, 'cli_own', daemons, configured)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_claude2' } });
+    expect(resolveAgentBot({ bot: 'Codex 小助手', cli: 'codex' }, 'cli_own', daemons, configured)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
+    expect(resolveAgentBot({ bot: 'Codex 小助手', cli: 'claude-code' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /bot "Codex 小助手" runs codex, not claude-code/ });
+    // 配了但 daemon 没起：明确说是离线，而不是「不存在」
+    expect(resolveAgentBot({ bot: 'Gemini 帮手' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /bot "Gemini 帮手" \(cli_gemini, gemini\) is configured but its daemon is not online/ });
+    // 既不在 bots.json 也没有在线 daemon 叫这个名：不存在，并列出已知 bot（含在线状态）
+    expect(resolveAgentBot({ bot: 'nobody' }, 'cli_own', daemons, configured)).toMatchObject({
+      ok: false,
+      error: /bot "nobody" is not a known bot \(not in bots\.json, and no online daemon has that name\); known bots: Owner Bot=claude-code \[online\], Codex 小助手=codex \[online\], Claude Two=claude-code \[online\], Gemini 帮手=gemini \[offline\]/,
+    });
+    // bots.json 读不到：只能按在线名单校验
+    expect(resolveAgentBot({ bot: 'Gemini 帮手' }, 'cli_own', daemons, null)).toMatchObject({ ok: false, error: /not a known bot .*known bots: Owner Bot=claude-code \[online\], Codex 小助手=codex \[online\], Claude Two=claude-code \[online\]$/ });
+    expect(resolveAgentBot({ bot: 'nobody' }, 'cli_own', [], [])).toMatchObject({ ok: false, error: /no bot is configured and no daemon is online/ });
+    expect(resolveAgentBot({ bot: '  ' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /must not be empty/ });
+    // 同一个 displayName 配给了两个 bot：不猜，要 larkAppId
+    const dup: ConfiguredBot[] = [...configured, { larkAppId: 'cli_codex2', displayName: 'Codex 小助手', cliId: 'codex' }];
+    expect(resolveAgentBot({ bot: 'codex 小助手' }, 'cli_own', daemons, dup)).toMatchObject({ ok: false, error: /matches more than one bot \(cli_codex, cli_codex2\); use its larkAppId/ });
   });
 
-  it('按 cli：本 run 所属 bot 的 CLI 相同时优先它，否则第一个在线的同 CLI bot；没有就报在线清单', () => {
-    expect(resolveAgentBot({ cli: 'claude-code' }, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_own' } });
-    expect(resolveAgentBot({ cli: 'claude-code' }, 'cli_codex', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_own' } });
-    expect(resolveAgentBot({ cli: 'codex' }, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
-    expect(resolveAgentBot({ cli: 'gemini' }, 'cli_own', daemons)).toMatchObject({ ok: false, error: /no online bot runs cli "gemini" \(online: Owner Bot=claude-code, Codex 小助手=codex, Claude Two=claude-code\)/ });
-    expect(resolveAgentBot({ cli: 'gemini' }, 'cli_own', [])).toMatchObject({ ok: false, error: /no daemon is online/ });
+  it('cli 不选人：本 run 所属 bot 的 CLI 一致就用它，不一致直接拒绝并提示点名，绝不改挑别的同 CLI bot', () => {
+    expect(resolveAgentBot({ cli: 'claude-code' }, 'cli_own', daemons, configured)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_own' } });
+    // 从 codex bot 的话题里要 claude-code：有两个在线的 claude-code bot，不能替脚本挑
+    expect(resolveAgentBot({ cli: 'claude-code' }, 'cli_codex', daemons, configured)).toMatchObject({
+      ok: false,
+      error: /agent cli "claude-code" does not match this run's bot Codex 小助手 \(codex\); name the executing bot with `bot` \(claude-code bots: Owner Bot \[online\], Claude Two \[online\]\)/,
+    });
+    // 哪怕同 CLI 的 bot 只有一个也不自动选：脚本要写 bot
+    expect(resolveAgentBot({ cli: 'codex' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /does not match this run's bot Owner Bot \(claude-code\); .*\(codex bots: Codex 小助手 \[online\]\)/ });
+    expect(resolveAgentBot({ cli: 'gemini' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /\(gemini bots: Gemini 帮手 \[offline\]\)/ });
+    expect(resolveAgentBot({ cli: 'opencode' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /\(no known bot runs opencode\)/ });
+    expect(resolveAgentBot({ cli: ' ' }, 'cli_own', daemons, configured)).toMatchObject({ ok: false, error: /`cli` must not be empty/ });
   });
 
   it('都不给：本 run 所属 bot；它离线或 run 无绑定时明确报错', () => {
-    expect(resolveAgentBot({}, 'cli_own', daemons)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_own', botName: 'Owner Bot', cliId: 'claude-code' } });
-    expect(resolveAgentBot({}, 'cli_gone', daemons)).toMatchObject({ ok: false, error: /cli_gone is not online/ });
-    expect(resolveAgentBot({}, null, daemons)).toMatchObject({ ok: false, error: /needs `bot` or `cli` \(this run is not bound to a bot; online: Owner Bot=claude-code, / });
-    // 终端 run + 只有一个 bot 在线：不必点名
-    expect(resolveAgentBot({}, null, [daemons[1]!])).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
-    expect(resolveAgentBot({}, null, [])).toMatchObject({ ok: false, error: /no daemon is online/ });
+    expect(resolveAgentBot({}, 'cli_own', daemons, configured)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_own', botName: 'Owner Bot', cliId: 'claude-code' } });
+    expect(resolveAgentBot({}, 'cli_gemini', daemons, configured)).toMatchObject({ ok: false, error: /this run's bot cli_gemini is not online; start it, or name another bot with `bot`/ });
+    expect(resolveAgentBot({}, 'cli_gone', daemons, configured)).toMatchObject({ ok: false, error: /cli_gone is not online/ });
+    expect(resolveAgentBot({}, null, daemons, configured)).toMatchObject({ ok: false, error: /agent needs `bot` \(this run is not bound to a bot; known bots: Owner Bot=claude-code \[online\], / });
+    // 终端 run：已知 bot 恰好一个才不必点名——按 bots.json 算，不按「谁在线」猜
+    expect(resolveAgentBot({}, null, [daemons[1]!], [configured[1]!])).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
+    expect(resolveAgentBot({ cli: 'claude-code' }, null, [daemons[1]!], [configured[1]!])).toMatchObject({ ok: false, error: /bot Codex 小助手 runs codex, not claude-code/ });
+    expect(resolveAgentBot({}, null, [daemons[1]!], configured)).toMatchObject({ ok: false, error: /agent needs `bot` \(this run is not bound to a bot; known bots: .*Gemini 帮手=gemini \[offline\]\)/ });
+    expect(resolveAgentBot({}, null, [], [configured[3]!])).toMatchObject({ ok: false, error: /bot Gemini 帮手 \(cli_gemini, gemini\) is configured but its daemon is not online/ });
+    // bots.json 读不到时退回在线名单：只有一个在线就用它
+    expect(resolveAgentBot({}, null, [daemons[1]!], null)).toMatchObject({ ok: true, bot: { larkAppId: 'cli_codex' } });
+    expect(resolveAgentBot({}, null, [], null)).toMatchObject({ ok: false, error: /no bot is configured and no daemon is online/ });
   });
 });
 

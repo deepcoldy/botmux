@@ -100,9 +100,9 @@ export default async function (ctx) {
 - **生命周期**：分支 thunk 返回时其 ctx 被撤销；之后任何调用是硬错误 `ctx_revoked`。thunk 返回时该 ctx 仍有在途副作用（未 `await`）是硬错误 `unawaited_effect`，runner 取消该 attempt（成为 `interrupted / uncertain`）后终止脚本。根 ctx 在脚本返回后同样撤销。
 - 这些检查由 script host 在调用时刻执行，不依赖 AsyncLocalStorage。
 
-`agent(spec)`：`prompt` 必填；`bot`（执行 bot：bots.json 的 `displayName` 或 larkAppId）、`cli`、`schema`（§4.7）、`session`、`model`、`cwd`（默认触发时 cwd）、`timeoutMs`（默认 30 分钟）可选。`signal(spec)`：`prompt`、`schema` 必填；`timeoutMs` 默认 7 天。
+`agent(spec)`：`prompt` 必填；`bot`（执行 bot：bots.json 的 `displayName` 或 larkAppId）、`cli`（对执行 bot 的 CLI 的断言，不选人）、`schema`（§4.7）、`session`、`model`、`cwd`（默认触发时 cwd）、`timeoutMs`（默认 30 分钟）可选。`signal(spec)`：`prompt`、`schema` 必填；`timeoutMs` 默认 7 天。
 
-**执行 bot 的解析**（`bot` 执行器，§6.1）：显式 `bot` → 就它（给了 `cli` 还要一致）；否则按 `cli` 找在线 bot——本 run 所属 bot（触发话题的那个）的 CLI 相同就用它，否则第一个在线的同 CLI bot；都没给就是本 run 所属 bot（终端起的 run 没有所属 bot：只有一个 bot 在线时用它，否则必须点名）。只在**在线** daemon 里找（`dashboard-daemons/` 描述符）——离线的 bot 本来就跑不了，找不到以 `setup_required / manual` 结算。`bot` 进 content hash（§5.2），按 `cli` 解析出来的 bot 不进：换台同 CLI 的机器结果仍可复用。
+**执行 bot 的解析**（`bot` 执行器，§6.1）：**只有 `bot` 能选人。** 写了 `bot` → 就它；没写 → 本 run 所属 bot（触发话题的那个；终端起的 run 没有所属 bot，已知 bot 恰好一个时用它，否则必须点名）。`cli` 不参与选人，只做断言：落到的 bot 跑的不是这个 CLI 就以 `setup_required` 拒绝，**绝不改去找别的同 CLI bot**——多个同 CLI 的 bot 通常是不同角色（工作目录 / skills / 沙箱 / 群各不相同），按 CLI 挑等于把角色抹掉，且「第一个」只是描述符目录的读取顺序。每次 `agent()` 调用都校验 bot **存在且在线**：存在 = 在 bots.json 里（`src/flow/configured-bots.ts` 轻量读取，不拖 registry；核心态只有 env 合成的那一个）或有在线 daemon 描述符叫这个名（点名可用 larkAppId、`displayName`、在线 botName，忽略大小写）；三种失败分开报——不存在（列出已知 bot 及在线状态）、配了但 daemon 没起、CLI 不符（列出该 CLI 的已知 bot）——都以 `setup_required / manual` 结算，bots.json 每次现读，等决策期间补上配置 / 起 daemon 后 retry 即可。bots.json 读不到（沙箱只读隔离、文件缺失）时退回只按在线名单校验。`bot` 与 `cli` 都进 content hash（§5.2）。
 
 ### 4.3 Outcome
 
@@ -272,7 +272,7 @@ daemon ──resolveEntrySpawn('flow-runner')──▶ runner（特权，一个 
 
 三个入口都是新增 `BotmuxEntry`。两层子进程都经 `applySessionOwnerEnv`。总时限与取消由 runner 在进程外执行。runner 与 daemon 的 IPC 携带 `runId` 与 `gen`。
 
-**两种执行器。** `agent()` 默认走 **`bot` 执行器**：一个 attempt = 执行 bot 的 daemon 上一个 headless 虚拟会话里的一回合（`triggerSessionTurn` 的 `asyncReturnSessionId` 路径，内部 `promptMode: 'task'` 只渲染任务本身、不带「外部事件」包装），bot 用的是它自己已配好的 CLI、模型、沙箱、工作目录规则与 hooks——**bot 就是执行者，flow 只负责编排**；bot 不需要在任何群里，run 里也看不到它「露脸」。runner 与该 daemon 之间只有三条 HTTP 路由：`POST /api/flow/agent-turn`（新增，开会话/续会话并投递 prompt）、`GET /api/sessions/:id/trigger-result`（既有，轮询）、`POST /api/sessions/:id/close`（既有，attempt 结算后关闭；runner 接管时先关上一代次遗留的会话）。本 bot 与其它 bot 走同一条路径，终端 `botmux flow run` 也一样。虚拟会话是 **ownerless** 的（不跨 daemon 传 `ou_`，见 CLAUDE.md 的 owner 身份边界）。`--executor pty`（或 `RunnerOptions.executor`）切回自起裸 CLI 的旧路径，测试与调试用；注入 `spawnAgentWorker` 或设 `BOTMUX_FLOW_FAKE_AGENT` 时隐式为 `pty`。执行器记在 `run.json.execConfig.executor`，resume 沿用，但**不进** `execConfigDigest`（换执行器不该让已有结果失效）。
+**两种执行器。** `agent()` 默认走 **`bot` 执行器**：一个 attempt = 执行 bot 的 daemon 上一个 headless 虚拟会话里的一回合（`triggerSessionTurn` 的 `asyncReturnSessionId` 路径，内部 `promptMode: 'task'` 只渲染任务本身、不带「外部事件」包装），bot 用的是它自己已配好的 CLI、模型、沙箱、工作目录规则与 hooks——**bot 就是执行者，flow 只负责编排**；bot 不需要在任何群里，run 里也看不到它「露脸」。runner 与该 daemon 之间只有三条 HTTP 路由：`POST /api/flow/agent-turn`（新增，开会话/续会话并投递 prompt）、`GET /api/sessions/:id/trigger-result`（既有，轮询）、`POST /api/sessions/:id/close`（既有，attempt 结算后关闭；runner 接管时先关上一代次遗留的会话）。本 bot 与其它 bot 走同一条路径，终端 `botmux flow run` 也一样。虚拟会话是 **ownerless** 的（不跨 daemon 传 `ou_`，见 CLAUDE.md 的 owner 身份边界）。选执行 bot 的规则见 §4.2「执行 bot 的解析」：`bot` 点名、`cli` 只断言、每次调用校验存在且在线。`--executor pty`（或 `RunnerOptions.executor`）切回自起裸 CLI 的旧路径，测试与调试用；注入 `spawnAgentWorker` 或设 `BOTMUX_FLOW_FAKE_AGENT` 时隐式为 `pty`。执行器记在 `run.json.execConfig.executor`，resume 沿用，但**不进** `execConfigDigest`（换执行器不该让已有结果失效）。
 
 ### 6.2 lease、代次、接管与「写即核对」
 
