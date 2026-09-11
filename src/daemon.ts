@@ -19942,6 +19942,15 @@ async function handleThreadReplyAdmitted(
   // 没有会话时保持本 PR 之前的行为：不拦、不改写，交给下面的 auto-create。指令头对
   // 机器人发送方因此仍然不生效（与改动前一致），要让它生效得改 dispatcher 的分叉，
   // 那是另一件事，见 PR 描述的后续项。
+  //
+  // 因此**这里没有授权闸不是漏了闸**：没有会话时头部不生效，这条消息拿到的东西与它发
+  // 纯文本时逐字相同，而普通对话正是 grant 明确放开的（真正的 `/t` 仍被下方通用斜杠闸
+  // 拦住）。已按 restrictGrantCommands=true 的访客 bot 实测对照过 master：标题式写法与
+  // 纯文本在两个分支上结果一致，没有多出任何能力。
+  //
+  // 这条不变量是本处闸位的**全部前提**：哪天让指令头在这条路径上生效，授权闸必须同时
+  // 挪到会话判断之外。test/topic-directive-header.test.ts「thread 路径上头部对受限发送方
+  // 不产生任何效果」那条会在那一刻变红。
   const threadHeaderSessionExists = !!activeSessions.get(sessionKey(anchor, larkAppId));
   if (threadHeaderParse !== null && threadHeaderSessionExists) {
     // 授权闸放在**收窄之后**：`关于 /t 这个命令` 这种聊天文本已经判定不是指令头，

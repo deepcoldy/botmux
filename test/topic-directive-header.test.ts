@@ -112,7 +112,7 @@ vi.mock('../src/core/session-manager.js', async () => {
   return { ...actual, downloadResources: (...args: any[]) => mocks.downloadResources(...args) };
 });
 
-import { registerBot, getBot } from '../src/bot-registry.js';
+import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
@@ -716,5 +716,90 @@ describe('指令头：远端后端的 /model 能力门', () => {
 
     const ds = forkedSession();
     expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('glm-5-turbo');
+  });
+});
+
+describe('指令头与授权闸（restrictGrantCommands）', () => {
+  const GUEST = 'ou_topic_header_guest';
+  const GUEST_BOT = 'ou_topic_header_guest_bot';
+
+  /**
+   * 注册一个「只放开普通对话、不放开命令」的 bot，并让访客只靠 globalGrants 过对话闸
+   *（evaluateTalk 判成 globalGrant，正是 grantCommandRestriction 认的那两种之一）。
+   *
+   * 额度层必须真的能落盘：globalGrant 会挂 quotaKey，而 consumeQuota 拿不到已加载的
+   * bots.json 路径时会抛错并**静默丢消息**——那样下面「零副作用」的断言会因为错误的
+   * 原因变绿。所以这里写一份真的配置再 loadBotConfigs() 把路径钉上。
+   */
+  function registerRestrictedBot(): void {
+    const entry = {
+      larkAppId: APP,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      workingDirs: [scanRoot],
+      defaultWorkingDir: botmuxRepo,
+      restrictGrantCommands: true,
+      globalGrants: [GUEST, GUEST_BOT],
+    };
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([entry]));
+    loadBotConfigs();
+    registerAppBot(entry);
+  }
+
+  /** 受限**真人**在普通群发的一条新消息（无会话 → 走 handleNewTopic）。 */
+  function guestGroupEvent(text: string, messageId: string): any {
+    const ev = groupEvent(text, messageId);
+    ev.sender = { sender_id: { open_id: GUEST }, sender_type: 'user' };
+    return ev;
+  }
+
+  /** 受限**机器人**发的话题内消息（无条件走 handleThreadReply）。 */
+  function guestBotThreadEvent(text: string, messageId: string): any {
+    const ev = threadEvent(text, messageId);
+    ev.sender = { sender_id: { open_id: GUEST_BOT }, sender_type: 'app' };
+    return ev;
+  }
+
+  beforeEach(() => { registerRestrictedBot(); });
+
+  it('新话题路径：标题式指令头与行首 /t 一样被授权闸拦下，零副作用', async () => {
+    // 标题式写法在这条路径上**真的生效**（翻 scope、落标题、落仓库/模型），所以它就是
+    // `/t` 本身，必须和行首写法同闸。断言的是拒绝**文案**而不只是「没建会话」：额度层
+    // 丢消息同样是零副作用，只看副作用的话这条测试会因为错误的原因变绿。
+    await handleNewTopic(
+      guestGroupEvent('协作标题 /t /repo botmux 干活', 'om_guest_header'),
+      groupCtx('om_guest_header'),
+    );
+
+    expect(sentContents()[0]).toContain('不能使用 /t');
+    expect(mocks.createdSessions).toHaveLength(0);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(sentCardCount()).toBe(0);
+  });
+
+  it('新话题路径：同一个访客发纯文本照常放行（闸拦的是命令，不是对话）', async () => {
+    await handleNewTopic(guestGroupEvent('干活', 'om_guest_plain'), groupCtx('om_guest_plain'));
+
+    expect(forkedSession().workingDir).toBe(botmuxRepo);
+  });
+
+  it('thread 路径上头部对受限发送方不产生任何效果——与纯文本逐字同路', async () => {
+    // 这条不变量是「thread 路径的授权闸挂在会话判断之内」之所以安全的**全部理由**：
+    // 全新 anchor 上没有会话，头部不生效，于是这条消息拿到的东西与它发纯文本时一模一样
+    // ——普通对话正是 grant 明确放开的（行首 /t 仍然被 20031 的通用斜杠闸拦住）。
+    //
+    // 真正的风险在未来：一旦让指令头在这条路径上对机器人发送方生效（dispatcher 分叉那件
+    // 后续事），它就变成一条没上闸的命令入口。那时这条断言会红，提醒把授权闸一并挪到
+    // 会话判断之外。
+    await handleThreadReply(
+      guestBotThreadEvent('协作标题 /t /repo homelab 干活', 'om_guest_bot_header'),
+      threadCtx('om_guest_bot_header'),
+    );
+
+    const ds = forkedSession();
+    expect(ds.workingDir).toBe(botmuxRepo);       // /repo homelab 没有落地
+    expect(ds.session.title).not.toBe('协作标题'); // 标题没有落地
+    expect(ds.spawnModelOverride).toBeUndefined();
   });
 });
