@@ -5140,7 +5140,6 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-  noteTurnReceived: (ds, messageId) => registerTurnReceivedReaction(ds, messageId),
   prewarmDocCommentSession,
 };
 
