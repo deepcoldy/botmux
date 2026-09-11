@@ -33822,7 +33822,7 @@ a.card-menu-item {
 .bd-oncall-secret { display: grid; gap: 8px; margin-top: 16px; max-width: 480px; }
 .bd-oncall-secret > label { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13px; }
 .bd-oncall-secret-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-.bd-oncall-secret-input > input { min-width: 0; width: 100%; height: var(--button-height); box-sizing: border-box; padding: 0 var(--button-padding-x); border: 1px solid var(--border-soft); border-radius: 6px; background: var(--surface); color: var(--fg); }
+.bd-oncall-secret-input > input { min-width: 0; width: 100%; height: var(--button-height); box-sizing: border-box; padding: 0 var(--button-padding-x); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface); color: var(--fg); }
 .bd-oncall-secret-input > input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .bd-oncall-secret-input > button { min-width: 64px; }
 .bd-oncall-secret > small { font-size: 12px; }
