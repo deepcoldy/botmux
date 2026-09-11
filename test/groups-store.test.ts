@@ -12,6 +12,7 @@ const chatCreateStub = vi.fn();
 const chatUpdateStub = vi.fn();
 // chat.link mocks the share-link fetch.
 const chatLinkStub = vi.fn();
+let chatListItems: Array<Record<string, unknown>>;
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
 // Read-only GETs (listChats / isInChat / getChatOwner) now go through
@@ -27,16 +28,7 @@ vi.mock('../src/bot-registry.js', () => ({
         return {
           code: 0,
           data: {
-            items: [
-              {
-                chat_id: 'c1',
-                name: 'one',
-                description: 'first chat',
-                chat_mode: 'group',
-                owner_id: 'ou_owner',
-                avatar: 'https://avatar.example/c1.png',
-              },
-            ],
+            items: chatListItems,
             has_more: false,
           },
         };
@@ -76,7 +68,20 @@ import {
 } from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
-  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); chatLinkStub.mockReset(); });
+  beforeEach(() => {
+    chatCreateStub.mockClear();
+    chatUpdateStub.mockClear();
+    chatLinkStub.mockReset();
+    chatListItems = [{
+      chat_id: 'c1',
+      name: 'one',
+      description: 'first chat',
+      chat_mode: 'group',
+      chat_status: 'normal',
+      owner_id: 'ou_owner',
+      avatar: 'https://avatar.example/c1.png',
+    }];
+  });
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
@@ -85,8 +90,21 @@ describe('groups-store wrappers', () => {
     expect(out[0].name).toBe('one');
     expect(out[0].description).toBe('first chat');
     expect(out[0].chatMode).toBe('group');
+    expect(out[0].chatStatus).toBe('normal');
     expect(out[0].ownerId).toBe('ou_owner');
     expect(out[0].avatar).toBe('https://avatar.example/c1.png');
+  });
+
+  it('listChats only returns chats that Feishu explicitly reports as normal', async () => {
+    chatListItems.push(
+      { chat_id: 'c2', name: 'dissolved', chat_status: 'dissolved' },
+      { chat_id: 'c3', name: 'retained history', chat_status: 'dissolved_save' },
+      { chat_id: 'c4', name: 'unknown legacy state' },
+    );
+
+    await expect(listChats('appA')).resolves.toEqual([
+      expect.objectContaining({ chatId: 'c1', chatStatus: 'normal' }),
+    ]);
   });
 
   it('isInChat returns boolean', async () => {

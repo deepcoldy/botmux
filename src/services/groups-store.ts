@@ -18,6 +18,7 @@ export interface ChatBrief {
   name?: string;
   description?: string;
   chatMode?: string;
+  chatStatus?: string;
   ownerId?: string;
   /** 群头像 URL（/open-apis/im/v1/chats 的 avatar 字段）。 */
   avatar?: string;
@@ -41,11 +42,19 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
       throw new Error(`Failed to list chats: ${res.msg} (code: ${res.code})`);
     }
     for (const c of res.data?.items ?? []) {
+      const chatStatus = typeof c.chat_status === 'string' ? c.chat_status : undefined;
+      // Feishu keeps dissolved_save chats in /im/v1/chats so users can retain
+      // their history. They are no longer manageable groups, though: member
+      // APIs reject them with 232009 even while is_in_chat may still say true.
+      // Fail closed for missing/future states as well: the groups board offers
+      // mutating controls, so only an explicit normal status is manageable.
+      if (chatStatus !== 'normal') continue;
       out.push({
         chatId: c.chat_id,
         name: c.name,
         description: c.description,
         chatMode: c.chat_mode,
+        chatStatus,
         ownerId: c.owner_id,
         avatar: c.avatar,
       });
