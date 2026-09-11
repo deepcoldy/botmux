@@ -552,7 +552,7 @@ describe('repo select card — plain switch', () => {
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
 
-    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_original_turn', 'om_original_turn');
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_original_turn');
   });
 
   it('reacts on the source DM when a p2p-group intro owns the worker turn', async () => {
@@ -572,7 +572,7 @@ describe('repo select card — plain switch', () => {
       { content: 'mock-prompt' },
       { turnId: 'om_group_intro' },
     );
-    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_source_dm', 'om_group_intro');
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_source_dm');
     expect(ds.pendingReactionMessageId).toBeUndefined();
   });
 
@@ -2110,7 +2110,7 @@ describe('auto-worktree detached commit admission', () => {
     finishMutation.resolve();
     await Promise.all([mutation, detached]);
     expect(forkWorker).toHaveBeenCalledOnce();
-    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_auto_worktree_turn', 'om_auto_worktree_turn');
+    expect(noteTurnReceived).toHaveBeenCalledWith(ds, 'om_auto_worktree_turn');
     expect(ds.workingDir).toBe('/repos/alpha-wt');
   });
 });

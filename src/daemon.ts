@@ -3537,12 +3537,7 @@ export function noteTurnReceived(
   if (!identityReady && !reactionEligible) return undefined;
   return (async () => {
     if (identityReady) await identityReady;
-    if (reactionEligible) await registerTurnReceivedReaction(
-      ds,
-      triggerMessageId,
-      receivedReactionEmoji,
-      _turnId ?? triggerMessageId,
-    );
+    if (reactionEligible) await registerTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
   })();
 }
 
@@ -3558,7 +3553,6 @@ async function registerTurnReceivedReaction(
   ds: DaemonSession,
   triggerMessageId: string,
   receivedReactionEmoji?: string,
-  turnId: string = triggerMessageId,
 ): Promise<void> {
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
@@ -3596,7 +3590,7 @@ async function registerTurnReceivedReaction(
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId, turnId });
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
 
 /**
@@ -3622,14 +3616,9 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
   return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
 }
 
-function trackTurnReactionRegistration(
-  ds: DaemonSession,
-  messageId: string,
-  registration: Promise<void>,
-  turnId: string = messageId,
-): void {
+function trackTurnReactionRegistration(ds: DaemonSession, messageId: string, registration: Promise<void>): void {
   const registrations = (ds.pendingAckReactionRegistrations ??= new Set());
-  const tracked = { messageId, turnId, promise: registration };
+  const tracked = { messageId, promise: registration };
   registrations.add(tracked);
   void registration.finally(() => {
     registrations.delete(tracked);
@@ -5177,7 +5166,7 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-  noteTurnReceived: (ds, messageId, turnId) => registerTurnReceivedReaction(ds, messageId, undefined, turnId),
+  noteTurnReceived: (ds, messageId) => registerTurnReceivedReaction(ds, messageId),
   prewarmDocCommentSession,
 };
 
@@ -5826,7 +5815,7 @@ const cardDeps: CardHandlerDeps = {
   sessionReply,
   lastRepoScan,
   prepareTurn: (ds, messageId) => prepareTurnCliIdentity(ds, messageId),
-  noteTurnReceived: (ds, messageId, turnId) => registerTurnReceivedReaction(ds, messageId, undefined, turnId),
+  noteTurnReceived: (ds, messageId) => registerTurnReceivedReaction(ds, messageId),
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
   v3GateDeps: {
@@ -17197,7 +17186,7 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
     activeSessions,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
     prepareTurn: (session, messageId) => prepareTurnCliIdentity(session, messageId),
-    noteTurnReceived: (session, messageId, turnId) => registerTurnReceivedReaction(session, messageId, undefined, turnId),
+    noteTurnReceived: (session, messageId) => registerTurnReceivedReaction(session, messageId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
 }

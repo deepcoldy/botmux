@@ -700,7 +700,7 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
-  noteTurnReceived?: (ds: DaemonSession, messageId: string, turnId?: string) => Promise<void>;
+  noteTurnReceived?: (ds: DaemonSession, messageId: string) => Promise<void>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -2637,10 +2637,10 @@ export async function handleCommand(
             );
             if (!emptyStart && !pendingRawInput && pendingTurnId) {
               const reactionMessageId = current.pendingReactionMessageId ?? pendingTurnId;
-              const registration = deps.noteTurnReceived?.(current, reactionMessageId, pendingTurnId);
+              const registration = deps.noteTurnReceived?.(current, reactionMessageId);
               if (registration) {
                 const registrations = (current.pendingAckReactionRegistrations ??= new Set());
-                const tracked = { messageId: reactionMessageId, turnId: pendingTurnId, promise: registration };
+                const tracked = { messageId: reactionMessageId, promise: registration };
                 registrations.add(tracked);
                 void registration.finally(() => {
                   registrations.delete(tracked);

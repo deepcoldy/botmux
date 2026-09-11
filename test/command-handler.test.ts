@@ -4548,7 +4548,7 @@ describe('handleCommand', () => {
         { content: 'WRAPPED:帮我看看这个 bug' },
         { turnId: 'om_buffered_first' },
       );
-      expect(deps.noteTurnReceived).toHaveBeenCalledWith(ds, 'om_buffered_first', 'om_buffered_first');
+      expect(deps.noteTurnReceived).toHaveBeenCalledWith(ds, 'om_buffered_first');
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
       expect(ds.pendingChatContext).toBeUndefined();

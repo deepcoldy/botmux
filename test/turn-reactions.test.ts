@@ -110,7 +110,7 @@ describe('two-phase turn reactions', () => {
     };
 
     await noteTurnReceived(ds, 'om_new');
-    await finishTurnReactions(ds, 'om_new');
+    await finishTurnReactions(ds);
 
     // ✋ added on the new user message; the stale + new pending entries settle.
     expect(mocks.addReaction).toHaveBeenCalled();
@@ -237,27 +237,6 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
-  it('does not DONE a topic root on another turn idle edge, then settles on its own turn', async () => {
-    registerWith(true);
-    const ds = makeDs({
-      pendingAckReactions: [{ messageId: 'om_topic_root', reactionId: 'rid_root', turnId: 'turn-child' }],
-    });
-
-    await finishTurnReactions(ds, 'startup-or-other');
-
-    expect(mocks.removeReaction).not.toHaveBeenCalled();
-    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_topic_root', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([
-      { messageId: 'om_topic_root', reactionId: 'rid_root', turnId: 'turn-child' },
-    ]);
-
-    await finishTurnReactions(ds, 'turn-child');
-
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_topic_root', 'rid_root');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_topic_root', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
-  });
-
   it('type-ahead: two messages while busy each get 冲! then both flip to ✅ at idle', async () => {
     registerWith(true);
     const ds = makeDs();
@@ -268,8 +247,7 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledTimes(2);
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds, 'om_a');
-    await finishTurnReactions(ds, 'om_b');
+    await finishTurnReactions(ds);
 
     // Each ✋ removed and replaced with ✅ DONE — neither message is left behind.
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
@@ -319,7 +297,7 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions?.map((a) => a.messageId)).toEqual(['om_b']);
 
     // om_b's own idle now flips it to ✅ exactly once.
-    await finishTurnReactions(ds, 'om_b');
+    await finishTurnReactions(ds);
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
     expect(ds.pendingAckReactions).toEqual([]);
@@ -363,7 +341,7 @@ describe('two-phase turn reactions', () => {
 
   it('finishTurnReactions with no pending acks is a no-op', async () => {
     const ds = makeDs();
-    await finishTurnReactions(ds, 'om_a');
+    await finishTurnReactions(ds);
     expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalled();
   });
@@ -376,7 +354,7 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'OK');
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds, 'om_a');
+    await finishTurnReactions(ds);
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'Thumbsup');
   });
 
@@ -390,7 +368,7 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds, 'om_a');
+    await finishTurnReactions(ds);
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
@@ -421,7 +399,7 @@ describe('turn reaction idle edge gate (source)', () => {
     // limited settles, so the condition line carries the extra idle check.
     const block = source.slice(blockStart, blockStart + 1400);
     expect(block).toContain("prevStatus === 'working' || prevStatus === 'analyzing'");
-    expect(block).toContain('void finishTurnReactions(ds, msg.turnId)');
+    expect(block).toContain('void finishTurnReactions(ds)');
     // Must NOT call finishTurnReactions on every idle/limited edge unconditionally.
     expect(block).not.toMatch(
       /if \(ds\.lastScreenStatus === 'idle' \|\| ds\.lastScreenStatus === 'limited'\) \{\s*recordUsageForDaemonSession\(ds\);\s*void finishTurnReactions\(ds\);/,
