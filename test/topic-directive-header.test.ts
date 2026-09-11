@@ -120,7 +120,7 @@ import {
 } from '../src/daemon.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import { __testOnly_sessionAgentConfig as sessionAgentConfig } from '../src/core/worker-pool.js';
-import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
+import { maybeApplyForceTopicOverride, type RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 const APP = 'topic_header_app';
 const GROUP = 'oc_topic_header_group';
@@ -731,7 +731,7 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
    * bots.json 路径时会抛错并**静默丢消息**——那样下面「零副作用」的断言会因为错误的
    * 原因变绿。所以这里写一份真的配置再 loadBotConfigs() 把路径钉上。
    */
-  function registerRestrictedBot(): void {
+  function registerRestrictedBot(overrides: Record<string, unknown> = {}): void {
     const entry = {
       larkAppId: APP,
       larkAppSecret: 'secret',
@@ -741,6 +741,7 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
       defaultWorkingDir: botmuxRepo,
       restrictGrantCommands: true,
       globalGrants: [GUEST, GUEST_BOT],
+      ...overrides,
     };
     writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([entry]));
     loadBotConfigs();
@@ -754,11 +755,45 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
     return ev;
   }
 
-  /** 受限**机器人**发的话题内消息（无条件走 handleThreadReply）。 */
-  function guestBotThreadEvent(text: string, messageId: string): any {
-    const ev = threadEvent(text, messageId);
+  /** 受限**机器人**发的消息（bot sender 无条件走 handleThreadReply）。 */
+  function guestBotEvent(text: string, messageId: string): any {
+    const ev = groupEvent(text, messageId);
     ev.sender = { sender_id: { open_id: GUEST_BOT }, sender_type: 'app' };
     return ev;
+  }
+
+  /** 群里已经有一个 chat-scope 会话在跑——`/t` 的作用正是把消息从它里面拎出去。 */
+  function seedChatSession(): DaemonSession {
+    const session: any = {
+      sessionId: 'sess-chat-existing', chatId: GROUP, rootMessageId: GROUP,
+      title: '群共享会话', status: 'active', createdAt: new Date().toISOString(),
+      chatType: 'group', larkAppId: APP, ownerOpenId: OWNER, workingDir: botmuxRepo, scope: 'chat',
+    };
+    const ds = {
+      session, worker: { killed: false }, workerPort: null, workerToken: null,
+      larkAppId: APP, chatId: GROUP, chatType: 'group', scope: 'chat',
+      spawnedAt: Date.now(), cliVersion: '1.0.0', lastMessageAt: Date.now(),
+      hasHistory: true, workingDir: botmuxRepo,
+    } as unknown as DaemonSession;
+    activeSessions.set(sessionKey(GROUP, APP), ds);
+    return ds;
+  }
+
+  /**
+   * 走**真实链路的两步**：先让 dispatcher 定 scope，再把它定出来的 ctx 交给 handler。
+   *
+   * 这两步必须一起跑。只调 handler 并手工给一个 thread ctx，等于把 dispatcher 的翻转
+   * 结论当成前提塞进去——而那个翻转恰恰就是 `/t` 发出去的那份能力，于是最关键的一环
+   * 被旁路掉，测试会显得一切正常。
+   */
+  async function routeAsBot(text: string, messageId: string): Promise<{ flipped: boolean }> {
+    const ev = guestBotEvent(text, messageId);
+    const ctx: any = {
+      chatId: GROUP, messageId, chatType: 'group', scope: 'chat', anchor: GROUP, larkAppId: APP,
+    };
+    const flipped = maybeApplyForceTopicOverride(ctx, ev.message, messageId, APP);
+    await handleThreadReply(ev, ctx as RoutingContext);
+    return { flipped };
   }
 
   beforeEach(() => { registerRestrictedBot(); });
@@ -784,22 +819,86 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
     expect(forkedSession().workingDir).toBe(botmuxRepo);
   });
 
-  it('thread 路径上头部对受限发送方不产生任何效果——与纯文本逐字同路', async () => {
-    // 这条不变量是「thread 路径的授权闸挂在会话判断之内」之所以安全的**全部理由**：
-    // 全新 anchor 上没有会话，头部不生效，于是这条消息拿到的东西与它发纯文本时一模一样
-    // ——普通对话正是 grant 明确放开的（行首 /t 仍然被 20031 的通用斜杠闸拦住）。
-    //
-    // 真正的风险在未来：一旦让指令头在这条路径上对机器人发送方生效（dispatcher 分叉那件
-    // 后续事），它就变成一条没上闸的命令入口。那时这条断言会红，提醒把授权闸一并挪到
-    // 会话判断之外。
+  it('机器人发送方：标题式指令头翻出来的新话题同样过闸，不建会话', async () => {
+    // 本条盯的是 `/t` 真正的能力：**把消息从群共享会话拎进一个隔离的新话题并在那里
+    // 开会话**。机器人发送方不过 dispatcher 的 isSessionOwner 分叉，且翻转发生在 bot
+    // 的 talk 闸之前（grant 访客过得了 talk 闸），所以这条路必须自己上闸——翻转后
+    // anchor 是个全新 messageId，「这个 anchor 上有没有会话」永远是否，看不出能力已
+    // 经发出去了。
+    const existing = seedChatSession();
+
+    const { flipped } = await routeAsBot('协作标题 /t 干活', 'om_guest_bot_forced');
+
+    expect(flipped).toBe(true);                       // dispatcher 确实翻了
+    expect(sentContents()[0]).toContain('不能使用 /t'); // 但 handler 把它拦住了
+    expect(mocks.createdSessions).toHaveLength(0);     // 没有隔离出新会话
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalledWith(existing, expect.anything(), expect.anything());
+  });
+
+  it('机器人发送方：零指令、只是聊到 /t 的形状同样过闸（它一样会被翻进新话题）', async () => {
+    // 这个形状 topicHeaderDeclaresSpec 为 false，但 dispatcher 只看 isTopicHeader 就翻，
+    // 照样能挣到一个隔离的新会话。所以闸的判据不能用 declaresSpec 收窄。
+    const { flipped } = await routeAsBot('关于 /t 这个命令 我想问问', 'om_guest_bot_mention');
+
+    expect(flipped).toBe(true);
+    expect(sentContents()[0]).toContain('不能使用 /t');
+    expect(mocks.createdSessions).toHaveLength(0);
+  });
+
+  it('未受限的发送方：同一条消息照常翻出新话题并开会话（闸只拦受限的人）', async () => {
+    registerRestrictedBot({ restrictGrantCommands: false });
+
+    const { flipped } = await routeAsBot('协作标题 /t 干活', 'om_open_bot_forced');
+
+    expect(flipped).toBe(true);
+    expect(sentContents().join('\n')).not.toContain('不能使用 /t');
+    expect(forkedSession().workingDir).toBe(botmuxRepo);
+  });
+
+  it('没有翻转的 thread：真话题里的第一条不被拦（闸盯的是翻转，不是「没有会话」）', async () => {
+    // 真话题的首条消息本来就落在这个话题里，`/t` 没给它任何东西（头部在 thread 路径
+    // 不生效），拦它只是误拒。判据取 ctx.forceTopicApplied 而不是「没有会话」，差别
+    // 正在这里。
     await handleThreadReply(
-      guestBotThreadEvent('协作标题 /t /repo homelab 干活', 'om_guest_bot_header'),
-      threadCtx('om_guest_bot_header'),
+      { ...guestBotEvent('协作标题 /t 干活', 'om_guest_bot_real_thread'),
+        message: { ...guestBotEvent('协作标题 /t 干活', 'om_guest_bot_real_thread').message,
+          root_id: THREAD_ROOT, thread_id: 'omt_thread_1' } },
+      threadCtx('om_guest_bot_real_thread'),
+    );
+
+    expect(sentContents().join('\n')).not.toContain('不能使用 /t');
+    expect(mocks.createdSessions.length).toBeGreaterThan(0);
+  });
+
+  it('已有会话的话题里聊到 /t：原文照常进 CLI，不被授权闸吞掉', async () => {
+    const ds = seedThreadSession();
+
+    await handleThreadReply(
+      { ...guestBotEvent('关于 /t 这个命令 我想问问', 'om_guest_bot_live'),
+        message: { ...guestBotEvent('关于 /t 这个命令 我想问问', 'om_guest_bot_live').message,
+          root_id: THREAD_ROOT, thread_id: 'omt_thread_1' } },
+      threadCtx('om_guest_bot_live'),
+    );
+
+    expect(sentContents().join('\n')).not.toContain('不能使用 /t');
+    expect(mocks.sendWorkerInput).toHaveBeenCalled();
+    expect(mocks.sendWorkerInput.mock.calls[0][0]).toBe(ds);
+  });
+
+  it('thread 路径上头部的规格不落地（与纯文本同路，能力只来自翻转）', async () => {
+    // 与上面几条互补：翻转之外，头部本身在这条路径上什么都不落。两件事分开钉住，
+    // 哪天让头部在这里生效，这条会红，提醒连同授权闸一起重新评估。
+    await handleThreadReply(
+      { ...guestBotEvent('协作标题 /t /repo homelab 干活', 'om_guest_bot_inert'),
+        message: { ...guestBotEvent('协作标题 /t /repo homelab 干活', 'om_guest_bot_inert').message,
+          root_id: THREAD_ROOT, thread_id: 'omt_thread_1' } },
+      threadCtx('om_guest_bot_inert'),
     );
 
     const ds = forkedSession();
-    expect(ds.workingDir).toBe(botmuxRepo);       // /repo homelab 没有落地
-    expect(ds.session.title).not.toBe('协作标题'); // 标题没有落地
+    expect(ds.workingDir).toBe(botmuxRepo);        // /repo homelab 没有落地
+    expect(ds.session.title).not.toBe('协作标题');  // 标题没有落地
     expect(ds.spawnModelOverride).toBeUndefined();
   });
 });

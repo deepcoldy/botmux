@@ -2678,7 +2678,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
 
     expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(true);
-    expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound' });
+    // forceTopicApplied 只在**真翻了**的时候置位（上一条没翻的用例里不出现），下游的
+    // 授权闸靠它认出「这条 thread 路是 `/t` 挣来的」。
+    expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
   });
 
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {

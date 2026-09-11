@@ -2280,6 +2280,9 @@ export interface RoutingContext {
    *  registered under this root so a later NON-@ message inside that topic
    *  folds back here instead of forking a new thread-scope session. */
   foldedRootId?: string;
+  /** 本次路由的 thread-scope 是 `/t` / 指令头翻出来的（maybeApplyForceTopicOverride），
+   *  不是消息本来的位置。handler 侧的授权闸靠它认出「这条路是命令挣来的」。 */
+  forceTopicApplied?: boolean;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2731,7 +2734,7 @@ function stripHeaderMentions(rawText: string, message: any, larkAppId: string): 
  * the prefix is still stripped downstream by handleNewTopic.
  */
 export function maybeApplyForceTopicOverride(
-  routing: { scope: 'thread' | 'chat'; anchor: string },
+  routing: { scope: 'thread' | 'chat'; anchor: string; forceTopicApplied?: boolean },
   message: any,
   messageId: string,
   larkAppId: string,
@@ -2746,6 +2749,12 @@ export function maybeApplyForceTopicOverride(
   if (!isTopicHeader(parseTopicHeader(stripped))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
+  // 把「这条路由是 `/t` 翻出来的」记在 ctx 上，让下游 handler 能对**它自己没做过的
+  // 决定**上闸。翻 scope 就是 `/t` 的核心语义（把消息从共享 chat 拎进隔离的新话题、
+  // 并在那里 auto-create 出一个新会话），所以它必须能被授权闸盖住；而 handler 里看
+  // 「这个 anchor 上有没有会话」是看不出这件事的——翻转把 anchor 设成了 messageId，
+  // 那个 anchor 上**永远**没有会话。
+  routing.forceTopicApplied = true;
   return true;
 }
 

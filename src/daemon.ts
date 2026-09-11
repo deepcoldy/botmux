@@ -19939,19 +19939,35 @@ async function handleThreadReplyAdmitted(
   // auto-create」兜底建会话。按消息形状拒绝会把那一条整个丢掉，而回复还说「只在新话题
   // 第一条生效」——它恰恰就是新话题第一条。
   //
-  // 没有会话时保持本 PR 之前的行为：不拦、不改写，交给下面的 auto-create。指令头对
-  // 机器人发送方因此仍然不生效（与改动前一致），要让它生效得改 dispatcher 的分叉，
+  // 没有会话时保持本 PR 之前的行为：不拦、不改写，交给下面的 auto-create。指令头本身
+  // 对机器人发送方因此仍然不生效（与改动前一致），要让它生效得改 dispatcher 的分叉，
   // 那是另一件事，见 PR 描述的后续项。
-  //
-  // 因此**这里没有授权闸不是漏了闸**：没有会话时头部不生效，这条消息拿到的东西与它发
-  // 纯文本时逐字相同，而普通对话正是 grant 明确放开的（真正的 `/t` 仍被下方通用斜杠闸
-  // 拦住）。已按 restrictGrantCommands=true 的访客 bot 实测对照过 master：标题式写法与
-  // 纯文本在两个分支上结果一致，没有多出任何能力。
-  //
-  // 这条不变量是本处闸位的**全部前提**：哪天让指令头在这条路径上生效，授权闸必须同时
-  // 挪到会话判断之外。test/topic-directive-header.test.ts「thread 路径上头部对受限发送方
-  // 不产生任何效果」那条会在那一刻变红。
   const threadHeaderSessionExists = !!activeSessions.get(sessionKey(anchor, larkAppId));
+
+  // 授权闸：盖住 dispatcher **替这条消息做过的那个决定**。
+  //
+  // 指令头在本函数里确实不生效，但 `/t` 的能力不止「落仓库/模型」——把消息从群共享
+  // 会话拎进一个隔离的新话题、并在那里 auto-create 出独立会话，本身就是保留命令 `/t`
+  // 的核心语义。这件事发生在更上游：event-dispatcher 的 maybeApplyForceTopicOverride
+  // 只看 isTopicHeader 就翻 scope，且翻转在 bot 的 talk 闸**之前**（grant 访客过得了
+  // talk 闸），翻完 anchor 变成一个全新 messageId，于是这里「有没有会话」恒为否 ——
+  // 光看会话存在与否，是看不见这份能力已经发出去了的。
+  //
+  // 所以判据取 ctx.forceTopicApplied：它精确等于「这条 thread 路是 `/t` 挣来的」。
+  // 用它而不是「没有会话」，是因为后者还包含真话题里的第一条消息 —— 那种消息本来
+  // 就该落在这个话题里，头部不生效，拦它只是误拒。
+  if (threadHeaderParse !== null && ctx.forceTopicApplied && !threadHeaderSessionExists) {
+    if (await replyGrantRestrictionIfNeeded(
+      larkAppId,
+      threadChatId,
+      threadSenderOpenId,
+      anchor,
+      threadHeaderParse.sentinel,
+    )) {
+      return;
+    }
+  }
+
   if (threadHeaderParse !== null && threadHeaderSessionExists) {
     // 授权闸放在**收窄之后**：`关于 /t 这个命令` 这种聊天文本已经判定不是指令头，
     // 再回一句「你没权限用 /t」并吞掉整条，是换了层皮的同一个误拒。
