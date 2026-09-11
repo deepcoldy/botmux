@@ -87,6 +87,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),

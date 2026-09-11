@@ -262,7 +262,7 @@ describe('persistent-backend filesystem-isolation gate', () => {
     expect(gate).not.toContain('effectiveReadIsolationRequested: cfg.readIsolation');
     expect(gate).not.toContain("type: 'user_notify'");
     const compatibilityCheck = gate.indexOf('backendSandboxCompatibilityError({');
-    const failure = gate.indexOf('throw new Error');
+    const failure = gate.indexOf('throw new Error(backendSandboxCompatibilityUserMessage(backendIsolationGate))');
     expect(compatibilityCheck).toBeGreaterThan(-1);
     expect(failure).toBeGreaterThan(compatibilityCheck);
     expect(gate).toContain(

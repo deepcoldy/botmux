@@ -166,6 +166,7 @@ describe('global dashboard config', () => {
   it('validates worker memory policy and preserves future sibling keys on update', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       worker: {
+        memoryAdmissionEnabled: false,
         minAvailableMemoryBytes: 4 * 1024 ** 3,
         maxMemoryFullAvg10: 15.5,
         sessionMemoryMaxBytes: 8 * 1024 ** 3,
@@ -173,6 +174,7 @@ describe('global dashboard config', () => {
       },
     }));
     expect(readGlobalConfig().worker).toEqual({
+      memoryAdmissionEnabled: false,
       minAvailableMemoryBytes: 4 * 1024 ** 3,
       maxMemoryFullAvg10: 15.5,
       sessionMemoryMaxBytes: 8 * 1024 ** 3,
@@ -181,6 +183,7 @@ describe('global dashboard config', () => {
     const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
     expect(raw.worker.futurePolicy).toEqual({ version: 2 });
     expect(readGlobalConfig().worker?.maxMemoryFullAvg10).toBe(25);
+    expect(readGlobalConfig().worker?.memoryAdmissionEnabled).toBe(false);
 
     clearWorkerConfig();
     const cleared = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));

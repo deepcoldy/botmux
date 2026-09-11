@@ -455,6 +455,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Per-bot isolated data roots for Claude/Codex.
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  'BOTMUX_CODEX_INSTANCE_BINDING',
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',

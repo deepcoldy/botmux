@@ -19,7 +19,7 @@ export interface SkillDef {
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
-description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 会在原话题自动续一条消息并触发新 CLI 会话。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
+description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；群内默认发到群顶层，要继续当前话题必须显式传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
 ---
 
 # botmux-schedule — 定时任务
@@ -29,7 +29,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ## 核心原则
 
 1. **创建前必须跟用户确认** schedule 和 prompt 的具体内容，避免误加
-2. **默认不传 --chat-id / --root-msg-id** —— 在 Lark 话题的 CLI 会话内运行时 botmux 会自动推断
+2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
 
@@ -53,7 +53,7 @@ botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --top
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
 
 ### 查看
@@ -80,13 +80,13 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 用户确认后执行：
 
 \`\`\`bash
-botmux schedule add "每日9:00" "生成昨天的 GitHub PR 汇总（合并的 / 待 review 的），按 repo 分组"
+botmux schedule add "每日9:00" "生成昨天的 GitHub PR 汇总（合并的 / 待 review 的），按 repo 分组" --topic
 \`\`\`
 
 **用户**："30 分钟后提醒我检查一下部署状态"
 
 \`\`\`bash
-botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看有无 CrashLoop）"
+botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看有无 CrashLoop）" --topic
 \`\`\`
 
 ## 到点会发生什么
@@ -97,7 +97,7 @@ botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看�
 
 ## 跨群发布场景（changelog 群、动态频道等）
 
-如果定时任务的目的是"把内容发到另一个群作为顶层消息"（而不是回复到当前话题），让 prompt 内部用 \`botmux send --top-level --chat-id <目标群>\` 即可。任务本身仍然创建在当前话题里——这样：
+如果定时任务的目的是"把内容发到另一个群作为顶层消息"（而不是回复到当前话题），让 prompt 内部用 \`botmux send --top-level --chat-id <目标群>\` 即可。任务本身用 \`--topic\` 创建在当前话题里——这样：
 
 - "🕐 task 开始执行" + 流式卡片留在你当前话题，方便监控
 - 实际内容作为顶层消息发到目标群，不绑定话题、不 @ 你
@@ -106,7 +106,7 @@ botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看�
 botmux schedule add "每日11:00" "
 1. <做事>
 2. botmux send --top-level --chat-id oc_xxxxxxxxxxxx '推送内容...'
-"
+" --topic
 \`\`\`
 
 详见 \`botmux-send\` 技能的"顶层广播 / 跨群发布"章节。

@@ -67,7 +67,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -296,6 +296,8 @@ import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
+import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
+import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
@@ -360,6 +362,7 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
+import { busyProbeRegion } from './utils/busy-probe.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -1216,6 +1219,9 @@ async function bridgeTraexUserInput(
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   stopCodexRpcEngine();
@@ -1264,6 +1270,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
@@ -1666,6 +1673,22 @@ async function prepareCliPluginGenerationAndGateway(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): Promise<SessionMcpRuntimeManifest | null> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    // RPC calls this before spawnCli. Fence the surviving pane before changing
+    // its gateway/catalog, and install the config before either CLI process
+    // (app-server or TUI) has a chance to read it.
+    if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
+      TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+    }
+    if (adapter.mcpGateway) {
+      const gateway = adapter.mcpGateway;
+      const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
+      const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
+        id: adapter.id, mcpGateway: { ...gateway, configPath: instanceConfig },
+      }));
+      if (report.warning) throw new Error('Codex instance MCP configuration could not be initialized safely');
+    }
+  }
   refreshCliPluginGeneration(cfg, adapter);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
@@ -4668,7 +4691,7 @@ function emptyCompletedBridgeFallbackContent(): string {
   return t('worker.empty_final_completed', { cliName: cliName() });
 }
 
-function failedBridgeFallbackContent(errorCode?: string, summary?: string, partialText?: string): string {
+function failedBridgeFailureText(errorCode?: string, summary?: string): string {
   const reason = summary || t('worker.failed_reason_unavailable');
   const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
     ? 'worker.empty_final_failed_invalid_request'
@@ -4680,8 +4703,7 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
           ? 'worker.empty_final_failed_upstream'
           : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
-  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
+  return failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -7782,7 +7804,13 @@ function emitReadyCodexTurns(): void {
       gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
     );
     const content = fallbackKind === 'failed'
-      ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
+      ? composeFailedBridgeFallbackContent(
+          failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+          gateInput,
+          nextBoundaryMs,
+          markers,
+          adoptMode,
+        )
       : fallbackKind === 'final'
         ? turn.finalText ?? ''
         : fallbackKind === 'empty_completed'
@@ -7799,11 +7827,11 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode)) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -12730,12 +12758,6 @@ function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScr
   return !!(be.captureCurrentScreen || be.captureViewport || renderer);
 }
 
-function busyProbeRegion(content: string): string {
-  const lines = content.split(/\r?\n/);
-  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
-  return lines.slice(-tailLineCount).join('\n');
-}
-
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
@@ -12879,6 +12901,9 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
   submitFailureChains.clear();
@@ -13461,6 +13486,9 @@ async function spawnCli(
   }
   const sandboxRequested = !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  if (cfg.cliInstanceBinding?.source !== 'legacy' && cfg.cliInstanceBinding && sandboxRequested) {
+    throw new Error('Codex instance routing does not support sandbox/readIsolation');
+  }
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,
@@ -13624,8 +13652,9 @@ async function spawnCli(
   // sandbox itself still applies). Decided EARLY so every JSONL/bridge/resume
   // path below already targets the right dir. wrapperCli strips spawn args, so
   // the redirect (and its env) can't be guaranteed there → not redirected.
-  const isolatedCodexHomeRequested = cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
-  const willRedirectCliData = shouldRedirectCliData({
+  const legacyHomePolicy = !cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy';
+  const isolatedCodexHomeRequested = legacyHomePolicy && cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
+  const willRedirectCliData = legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
     forcePerBotHome: isolatedCodexHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
@@ -14275,6 +14304,9 @@ async function spawnCli(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
+  if (fallBackToFresh && cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    throw new Error(`Codex instance ${cfg.cliInstanceBinding.instanceId}: exact resume target unavailable; refusing fresh-session fallback`);
+  }
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -14472,12 +14504,14 @@ async function spawnCli(
   // buildArgs runs first; these are pure path derivations, so naming them early
   // is safe, and the block below is still what actually writes the files.
   //
-  // Only the shim vars: the wrapper reads the identity file itself, keyed by
-  // SESSION_DATA_DIR + BOTMUX_SESSION_ID, which the pane already carries. No
-  // credential is passed through this channel.
+  // Shim paths and the identity-file locator must reach the tool shell together.
+  // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
+  // identity under the Botmux session id. No credential is passed here.
   const identityShellEnv: Record<string, string> = {};
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    identityShellEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+    identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
     identityShellEnv.ZDOTDIR = join(dir, 'shell');
     identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
@@ -14516,8 +14550,8 @@ async function spawnCli(
     // agent from reading another person's token file today, and the likeliest
     // way that happens is an agent grepping the data dir to debug an auth error.
     triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
-    // Adapters whose CLI filters the environment of the shell commands it runs
-    // (codex) re-declare these; the rest ignore them and inherit normally.
+    // Codex and TraeX explicitly set these in tool shells instead of depending
+    // on the CLI's default inheritance policy; other adapters inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
@@ -14911,6 +14945,8 @@ async function spawnCli(
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = canonicalizeForSandbox(claudeDataDir); // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = canonicalizeForSandbox(isolatedCodexHome!);
   }
+  applyCodexInstanceEnv(childEnv, cfg.cliInstanceBinding);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') childEnv.BOTMUX_CODEX_INSTANCE_BINDING = codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime);
   // Sandboxed Codex cannot discover a trust store inside Seatbelt (see
   // utils/darwin-ca-bundle for why, and for why realpath matters). `codex-app`
   // needs this too: its outer child is a Node runner that spawns the same Codex
@@ -19455,6 +19491,10 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      if (msg.cliInstanceBinding && (msg.cliId !== 'codex' || msg.adoptMode || msg.existingAppServerEndpoint)) {
+        throw new Error('Codex instance binding is incompatible with this worker init');
+      }
+      applyCodexInstanceEnv(process.env, msg.cliInstanceBinding);
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;

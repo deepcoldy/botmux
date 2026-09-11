@@ -7,9 +7,11 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
   bridgePostText,
+  composeFailedBridgeFallbackContent,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
+  shouldSuppressStructuredFallback,
   shouldSuppressBridgeEmit,
   structuredFallbackKind,
   stripTrailingBridgeSentinelLine,
@@ -714,13 +716,16 @@ describe('shouldEmitFailedBridgeFallback', () => {
     )).toBe(true);
   });
 
-  it('does not duplicate a send or affect completed, local, and adopt turns', () => {
+  it('keeps the failure visible after an explicit progress send', () => {
     expect(shouldEmitFailedBridgeFallback(
       { ...turn(100), finalText: '', terminalStatus: 'failed' },
       200,
       [markerForContent(150, 'already reported')],
       false,
-    )).toBe(false);
+    )).toBe(true);
+  });
+
+  it('does not affect completed, local, and adopt turns', () => {
     expect(shouldEmitFailedBridgeFallback(
       { ...turn(100), finalText: '', terminalStatus: 'completed' },
       undefined,
@@ -748,6 +753,83 @@ describe('shouldEmitFailedBridgeFallback', () => {
       [],
       false,
     )).toBe(true);
+  });
+
+  it('preserves deliberate silence for a failed turn with only the sentinel', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: 'BOTMUX_NOTHING_TO_SEND', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+});
+
+describe('shouldSuppressStructuredFallback', () => {
+  const progress = [markerForContent(150, 'still working')];
+  const failed = { ...turn(100), finalText: '', terminalStatus: 'failed' as const };
+
+  it('never lets a progress marker suppress a terminal failure fallback', () => {
+    expect(shouldSuppressStructuredFallback('failed', failed, 200, progress, false)).toBe(false);
+  });
+
+  it('still suppresses a failed turn whose final is only the silence sentinel', () => {
+    const sentinelFailure = {
+      ...turn(100),
+      finalText: 'BOTMUX_NOTHING_TO_SEND',
+      terminalStatus: 'failed' as const,
+    };
+    expect(shouldSuppressStructuredFallback('failed', sentinelFailure, undefined, [], false)).toBe(true);
+    expect(shouldSuppressStructuredFallback('failed', sentinelFailure, 200, progress, false)).toBe(true);
+  });
+
+  it('retains local and adopt ownership gates for failure fallbacks', () => {
+    expect(shouldSuppressStructuredFallback('failed', { ...failed, isLocal: true }, undefined, [], false)).toBe(true);
+    expect(shouldSuppressStructuredFallback('failed', failed, undefined, [], true)).toBe(true);
+  });
+
+  it('preserves ordinary marker dedup for non-failure output', () => {
+    expect(shouldSuppressStructuredFallback('final', turn(100), 200, progress, false)).toBe(true);
+    expect(shouldSuppressStructuredFallback('empty_completed', turn(100), 200, progress, false)).toBe(true);
+  });
+});
+
+describe('composeFailedBridgeFallbackContent', () => {
+  it('shows the failure but drops marker-suppressed narration and its trailing sentinel', () => {
+    const narration = 'Internal narration that was deliberately kept out of chat.';
+    const failed = {
+      ...turn(100),
+      finalText: `${narration}\n\nBOTMUX_NOTHING_TO_SEND`,
+      terminalStatus: 'failed' as const,
+    };
+
+    const content = composeFailedBridgeFallbackContent(
+      'FAILURE',
+      failed,
+      200,
+      [markerForContent(150, 'still working')],
+      false,
+    );
+
+    expect(content).toBe('FAILURE');
+    expect(content).not.toContain(narration);
+    expect(content).not.toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
+  it('keeps an unsent partial answer but strips its trailing sentinel before the failure', () => {
+    const failed = {
+      ...turn(100),
+      finalText: 'Partial answer\n\nBOTMUX_NOTHING_TO_SEND',
+      terminalStatus: 'failed' as const,
+    };
+
+    expect(composeFailedBridgeFallbackContent(
+      'FAILURE',
+      failed,
+      undefined,
+      [],
+      false,
+    )).toBe('Partial answer\n\nFAILURE');
   });
 });
 
@@ -787,6 +869,39 @@ describe('structuredFallbackKind', () => {
         hasChain,
       )).toBe('failed');
     }
+  });
+
+  it('a progress marker cannot suppress an empty structured failure', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE },
+      200,
+      [markerForContent(150, 'still working')],
+      false,
+      false,
+    )).toBe('failed');
+  });
+
+  it('a pure sentinel never becomes a failure fallback, with or without a progress marker', () => {
+    const sentinelFailure = {
+      ...turn(100),
+      finalText: 'BOTMUX_NOTHING_TO_SEND',
+      terminalStatus: 'failed' as const,
+      terminalErrorCode: CODEX_CONNECTION_ERROR_CODE,
+    };
+    expect(structuredFallbackKind(
+      sentinelFailure,
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('final');
+    expect(structuredFallbackKind(
+      sentinelFailure,
+      200,
+      [markerForContent(150, 'still working')],
+      false,
+      false,
+    )).toBe('final');
   });
 
   it('a non-empty final maps to final', () => {

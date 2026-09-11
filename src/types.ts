@@ -691,6 +691,9 @@ export interface Session {
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
+  /** Durable account-directory routing, independent of the live bot defaults. */
+  cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  creationSource?: import('./services/codex-instance-pool.js').SessionCreationSource;
   /** Concrete CLI distribution frozen with cliId. New sessions carry this
    * structured snapshot while cliPathOverride remains shadow-written for
    * downgrade compatibility with older botmux builds. */
@@ -1407,7 +1410,7 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy }
+    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
     : Message
   : never;
 

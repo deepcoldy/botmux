@@ -3419,6 +3419,23 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     }));
     expect(init.turnId).toBeUndefined();
   });
+
+  it('refuses external adoption when the session carries a pinned Codex instance binding', () => {
+    const ds = makeAdoptDs();
+    ds.session.cliInstanceBinding = {
+      version: 1,
+      source: 'default',
+      instanceId: 'a',
+      cliId: 'codex',
+      codexHome: '/tmp/codex-a',
+      authMode: 'isolated',
+    };
+
+    expect(() => forkAdoptWorker(ds)).toThrow(
+      'External adoption cannot carry a Codex instance binding',
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('session.start lifecycle integration', () => {

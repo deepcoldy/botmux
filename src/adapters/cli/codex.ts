@@ -149,7 +149,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     mcpGateway: {
-      configPath: '~/.codex/config.toml',
+      get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
     },
     // codex 0.137's own filesystem profile can't express a read blocklist, so

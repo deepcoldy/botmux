@@ -24,6 +24,9 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  cliInstanceId?: string;
+  cliInstanceSource?: string;
+  creationSource?: string;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -241,6 +244,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: ds.session.cliInstanceBinding?.source,
+    creationSource: ds.session.creationSource,
     ...sessionRuntimeFields(ds.session),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
@@ -310,6 +316,9 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
@@ -357,6 +366,9 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,

@@ -777,6 +777,27 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it.each(['exists', 'missing', 'unknown'] as const)('restores a legacy-bound Codex session after the bot switched CLI with backing %s', async (backing) => {
+    probe.result = backing;
+    const s = makeActivePersistentSession('om_legacy_bound');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: '/private/legacy-home', authMode: 'global' };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    bot.cliId = 'traex';
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'active', cliId: 'codex', cliInstanceBinding: s.cliInstanceBinding });
+    expect(map.get(sessionKey(s.rootMessageId, 'app_test'))?.session.cliInstanceBinding).toEqual(s.cliInstanceBinding);
+    if (backing === 'exists') expect(forkWorker).toHaveBeenCalled();
+    else expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
     probe.result = 'exists';
     const s = makeActivePersistentSession('om_cli_mismatch_pending');
@@ -1350,6 +1371,22 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(wp.registry!.get(sessionKey('om_rt_stale', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(fresh.sessionId)!.status).toBe('active');
     expect(wp.registry!.get(sessionKey('om_rt_fresh', 'app_test'))).toBeDefined();
+  });
+
+  it.each(['pool', 'default', 'legacy'] as const)('keeps %s-bound Codex sessions across a different bot CLI/runtime default without a pool', async (source) => {
+    const s = makeActivePersistentSession('om_instance_sticky');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source, instanceId: source === 'legacy' ? null : 'a', cliId: 'codex', codexHome: '/private/instance-a', authMode: source === 'legacy' ? 'global' : 'isolated' };
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    bot.cliId = 'traex';
+    bot.cliPathOverride = '/different/runtime';
+    const outcome = await closeCliMismatchedSessionsForBot('app_test');
+    expect(outcome).toMatchObject({ closed: 0 });
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(wp.registry!.get(sessionKey(s.rootMessageId, 'app_test'))).toBe(ds);
+    expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
   });
 
   it('closes wrapper-axis mismatches for frozen sessions', async () => {

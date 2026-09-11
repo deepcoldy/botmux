@@ -2351,6 +2351,7 @@ export async function handleCommand(
                   displayName,
                   current.chatType,
                   current.scope,
+                  { source: 'ordinary-feishu' },
                 );
                 current.session = session;
                 current.lastUserPrompt = undefined;
@@ -2726,6 +2727,7 @@ export async function handleCommand(
           }));
           const lines = [
             `Session: ${ds.session.sessionId}`,
+            ...(ds.session.cliInstanceBinding ? [`Codex instance: ${ds.session.cliInstanceBinding.instanceId ?? 'legacy'} (${ds.session.cliInstanceBinding.source}; ${ds.session.creationSource ?? 'legacy'})`] : []),
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
@@ -5166,6 +5168,7 @@ export async function startCodexAppThreadSession(
   deps: CommandHandlerDeps,
   larkAppId?: string,
 ): Promise<void> {
+  if (ds.session.cliInstanceBinding) throw new Error('A bound Codex instance session cannot adopt an external App thread; use a new session');
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
@@ -5250,6 +5253,7 @@ export async function startAdoptSession(
   deps: CommandHandlerDeps,
   larkAppId?: string,
 ): Promise<void> {
+  if (ds.session.cliInstanceBinding) throw new Error('A bound Codex instance session cannot adopt an external process; use a new session');
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);

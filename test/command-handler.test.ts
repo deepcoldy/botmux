@@ -3331,6 +3331,7 @@ describe('handleCommand', () => {
       expect(closeWorkerPoolSession).toHaveBeenCalledWith('sess-001');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'project-b (dev)', 'group', undefined,
+        { source: 'ordinary-feishu' },
       );
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
@@ -3402,6 +3403,7 @@ describe('handleCommand', () => {
 
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, originalRoot, 'project-a (main)', 'group', 'chat',
+        { source: 'ordinary-feishu' },
       );
       expect(ds.session.scope).toBe('chat');
       expect(ds.session.rootMessageId).toBe(originalRoot);
@@ -3574,6 +3576,7 @@ describe('handleCommand', () => {
       expect(ds.workingDir).toBe('/home/testuser/payments');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'payments (main)', 'group', undefined,
+        { source: 'ordinary-feishu' },
       );
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       // the pending repo-selection card must be withdrawn after resolving

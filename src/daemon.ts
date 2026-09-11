@@ -65,6 +65,7 @@ import {
   registerBot,
   getBot,
   getAllBots,
+  getConfiguredOwnerOpenId,
   getOwnerOpenId,
   getDashboardAdminOpenIds,
   findOncallChat,
@@ -4330,10 +4331,7 @@ function notifyAllowedUsersResolveFailure(
   // captured at setup — a raw ou_ that never needs resolving, so it survives
   // the contact-API outage. Appended (not replacing) so a partial resolve still
   // reaches every recovered owner too.
-  let staticOwner: string | undefined;
-  try {
-    staticOwner = getBot(larkAppId).config.ownerOpenId;
-  } catch { /* bot gone mid-flight — nothing to fall back to */ }
+  const staticOwner = getConfiguredOwnerOpenId(larkAppId);
   if (staticOwner && staticOwner.startsWith('ou_') && !unique.includes(staticOwner)) {
     unique.push(staticOwner);
   }
@@ -5576,7 +5574,7 @@ async function adoptCodexNotifierEvent(
   if (!ds) {
     const fallbackTitle = event.cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'Codex App';
     const title = (event.title || `Codex App: ${fallbackTitle}`).slice(0, 50);
-    const session = sessionStore.createSession(chatId, cardMessageId, title, 'p2p');
+    const session = sessionStore.createSession(chatId, cardMessageId, title, 'p2p', undefined, { source: 'external' });
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = scope;
@@ -5625,6 +5623,7 @@ async function adoptCodexNotifierEvent(
   // below. If the session is closed, swapped, or re-created under this active
   // key while we await, the post-await revalidation must detect the drift.
   const adoptGenSessionId = ds.session.sessionId;
+  if (ds.session.cliInstanceBinding) throw new Error('该会话已绑定 Codex 实例；请在新的会话中接管外部 Codex App 线程');
   if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
     // Do the two throwable, deadline-sensitive steps FIRST, before mutating any
     // session/pending state: the dynamic import and the 2.2s AbortSignal check.
@@ -5732,8 +5731,9 @@ export const __testOnly_clearPendingRepoStateForNotifierAdopt = clearPendingRepo
 export const __testOnly_adoptCodexNotifierEvent = adoptCodexNotifierEvent;
 
 const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
-  getExpectedOwnerOpenId: larkAppId =>
-    getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId),
+  // Authorization must use the resolved runtime owner only. The raw fallback
+  // used by notification delivery is intentionally not available here.
+  getExpectedOwnerOpenId: getOwnerOpenId,
   getEventRecord: (larkAppId, eventId) => codexNotifierStore(larkAppId).get(eventId),
   readConfig: () => readGlobalConfig().codexNotifier,
   openAppThread: openCodexAppThread,
@@ -6436,6 +6436,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           const hasAllowlist = (bot.config.allowedUsers?.length ?? 0) > 0
             || (bot.config.allowedChatGroups?.length ?? 0) > 0
             || (bot.config.globalGrants?.length ?? 0) > 0
+            || !!bot.config.ownerOpenId
             || bot.config.p2pOpen === true;
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
@@ -18437,7 +18438,7 @@ async function startInitialPassthroughSession(args: {
     }
     : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
-  const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
+  const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType, undefined, { source: 'ordinary-feishu' });
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, directChatSender);
   session.larkAppId = larkAppId;
@@ -18649,6 +18650,16 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   ctx.ingressAdmission ??= { admitted: false };
+  if (getBot(ctx.larkAppId).config.codexInstancePool) {
+    const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.anchor}`;
+    return withActiveSessionKeyLock(activeSessions, deliveryKey, () => withBotTurnAdmission(ctx.larkAppId, () => {
+      // Dispatcher classification preceded this FIFO. Recheck before any
+      // createSession (and hence before drawing an instance), not after it.
+      return activeSessions.has(sessionKey(ctx.anchor, ctx.larkAppId))
+        ? handleThreadReplyAdmitted(data, ctx)
+        : handleNewTopicAdmitted(data, ctx);
+    })).catch(err => notifyOrdinaryIngressFailure(ctx, err));
+  }
   return withBotTurnAdmission(
     ctx.larkAppId,
     () => handleNewTopicAdmitted(data, ctx),
@@ -19203,7 +19214,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // disagree with activeSessions's key and downstream card buttons silently
       // break. Chat-scope keeps the inbound messageId as audit only.
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
-      const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType);
+      const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
       const now = Date.now();
       if (chatType === 'p2p') {
         setDirectChatDisplayNameFromSender(
@@ -19425,7 +19436,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // audit trail points at a message that actually lives in the session's chat.
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
-  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
   // Session-group registry: point the group at its (new) resident session so
   // same-group resume and the async AI title can find it.
   if (chatType === 'group' && isSessionGroup(chatId)) {
@@ -20734,7 +20745,7 @@ async function handleThreadReplyAdmitted(
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)
         && !EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
-        const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
+        const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
         const now = Date.now();
         if (ctxChatType === 'p2p') {
           setDirectChatDisplayNameFromSender(
@@ -21325,7 +21336,7 @@ async function handleThreadReplyAdmitted(
     // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
     //                   (used as audit trail; routing key is chatId).
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
-    const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType);
+    const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
     const now = Date.now();
     // Bot-started handoff sessions have no human owner; keeping the bot as
     // owner makes daemon-generated footers wake that bot again.
@@ -22606,7 +22617,8 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
     const bot = getBot(larkAppId);
     const resolved = (bot.resolvedAllowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
     if (resolved) return resolved;
-    return (bot.config.allowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
+    return getConfiguredOwnerOpenId(larkAppId)
+      ?? (bot.config.allowedUsers ?? []).find(u => typeof u === 'string' && u.startsWith('ou_'));
   } catch {
     return undefined;
   }
@@ -22798,7 +22810,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!budget) return;
       const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
       if (alert) {
-        const ownerOpenId = bot?.config?.ownerOpenId;
+        const ownerOpenId = getConfiguredOwnerOpenId(record.larkAppId);
         if (ownerOpenId) {
           sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
             .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));
