@@ -25,6 +25,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -2353,6 +2354,52 @@ describe('busyPattern', () => {
     // Shared def: seed/relay render the same Claude Code footer.
     expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy!.source);
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
+  });
+
+  it('claude-code busy footer matches through the SGR color codes tmux capture-pane -e emits at line starts', () => {
+    // Regression: the worker's viewport busy probe reads captureViewport() =
+    // `tmux capture-pane -e -p`, whose rows carry SGR/control codes. A live
+    // busy footer is literally (verbatim bytes from a busy pane):
+    //   \x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m
+    // The pattern anchors on `^\s*[⏵⏸]`, but the line STARTS with an ESC
+    // sequence, so the anchor never binds and the pre-idle veto never fires —
+    // the card flips green while Claude works. Assertions go through the REAL
+    // worker entry (busyProbeRegion, which strips ANSI before region/slice),
+    // so reverting the worker fix makes these fail.
+    const busy = createCliAdapterSync('claude-code').busyPattern!;
+    const ansiBusyFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m';
+    const ansiIdleFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · ← for agents\x1b[39m';
+    // Raw ANSI rows do NOT match the bare pattern — that is the production
+    // bug; busyProbeRegion must repair them.
+    expect(busy.test(ansiBusyFooter)).toBe(false);
+    expect(busy.test(ansiIdleFooter)).toBe(false);
+    // Through the real viewport entry: busy resolves busy, idle stays idle.
+    expect(busy.test(busyProbeRegion(ansiBusyFooter))).toBe(true);
+    expect(busy.test(busyProbeRegion(ansiIdleFooter))).toBe(false);
+    // Multi-line region (tail slice + strip): colored prose above + colored
+    // busy footer at the bottom resolves busy; the same with the interrupt
+    // segment removed stays idle.
+    const region = (footer: string) => [
+      '\x1b[36m● docs say esc to interrupt works\x1b[39m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      '\x1b[1m❯\x1b[22m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      footer,
+    ].join('\n');
+    expect(busy.test(busyProbeRegion(region(ansiBusyFooter)))).toBe(true);
+    expect(busy.test(busyProbeRegion(region(ansiIdleFooter)))).toBe(false);
+    // Control sequences tmux capture-pane can emit that a narrower stripper
+    // misses (Codex review): CSI with ':' subparameter, ST-terminated OSC 8
+    // hyperlink, and bare SO/SI charset-shift bytes at the line start. Each
+    // must be removed so the `^` anchor still binds; all must resolve busy.
+    const plainBusy = '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents';
+    expect(busy.test(busyProbeRegion('\x1b[4:3m' + plainBusy))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x1b]8;;http://x\x1b\\' + plainBusy + '\x1b]8;;\x1b\\'))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x0f' + plainBusy))).toBe(true);
+    // Cursor-forward (ESC[nC) renders as real gaps and is preserved as spaces.
+    expect(busy.test(busyProbeRegion('\x1b[5C' + plainBusy))).toBe(true);
   });
 
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
