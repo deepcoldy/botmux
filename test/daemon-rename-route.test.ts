@@ -601,6 +601,39 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain('没有活跃的会话');
   });
 
+  it('serializes pool creation before drawing or persisting a second same-topic binding', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const home = mkdtempSync(join(mocks.dataDir, 'instance-'));
+    writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake' } }), { mode: 0o600 });
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex', backendType: 'tmux',
+      allowedUsers: [OWNER], workingDir: '/tmp', codexInstancePool: { enabled: true, defaultInstanceId: 'a', scope: 'ordinary-feishu', strategy: 'random', instances: [{ id: 'a', codexHome: home }] } });
+    bot.resolvedAllowedUsers = [OWNER];
+    const actual = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    actual.init(APP);
+    const original = mocks.createSession.getMockImplementation();
+    mocks.createSession.mockImplementation((...args: any[]) => {
+      const row = actual.createSession(...args as Parameters<typeof actual.createSession>);
+      mocks.sessions.set(row.sessionId, row);
+      return row;
+    });
+    try {
+      await Promise.all([
+        handleNewTopic(makeEventData('om_pool_a', '/status'), makeCtx('om_pool_same', 'om_pool_a')),
+        handleNewTopic(makeEventData('om_pool_b', '/status'), makeCtx('om_pool_same', 'om_pool_b')),
+      ]);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(actual.listSessions().filter(s => s.rootMessageId === 'om_pool_same')).toHaveLength(1);
+      const owner = activeSessions.get(sessionKey('om_pool_same', APP));
+      expect(owner?.session.cliInstanceBinding).toMatchObject({ instanceId: 'a', source: 'pool' });
+      expect(mocks.closeSession).not.toHaveBeenCalled();
+    } finally {
+      mocks.createSession.mockImplementation(original!);
+      actual.init();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('thread reply with no existing session: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
     await handleThreadReply(
       makeEventData('om_reply_1', '/rename Foo', 'om_root_1'),

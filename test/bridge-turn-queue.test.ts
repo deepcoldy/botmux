@@ -608,6 +608,117 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
+  describe('synthetic no-model-reply assistant records', () => {
+    // Claude Code bridge-resume placeholder (see isSyntheticNoModelReplyEvent):
+    // visible text, terminal stop_reason, isApiErrorMessage:false — every
+    // attribute the queue used to read as "the model's final answer", but no
+    // model call happened and the Lark message was never answered.
+    function metaContinue(uuid: string): TranscriptEvent {
+      return {
+        type: 'user', uuid, isMeta: true,
+        message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
+      } as TranscriptEvent;
+    }
+    function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model, stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] },
+      } as TranscriptEvent;
+    }
+
+    it('closes the pending Lark turn as a retryable failure instead of attributing the placeholder text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].assistantUuids).toEqual([]);
+      expect(ready[0].terminalObserved).toBe(true);
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+    });
+
+    it('control: the same record served by a real model is the completed reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['s1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    it('does not synthesise a headless local turn out of the placeholder', () => {
+      const q = new BridgeTurnQueue();
+      q.ingest([metaContinue('m1'), syntheticNoReply('s1')]);
+      expect(q.size()).toBe(0);
+      // control: a real headless reply still gets its local turn
+      const q2 = new BridgeTurnQueue();
+      q2.ingest([metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      expect(q2.size()).toBe(1);
+      expect(q2.peek()[0].isLocal).toBe(true);
+    });
+
+    // The placeholder is the WEAKEST terminal signal there is: it says "no model
+    // call happened". It must never overwrite a stronger outcome the same turn
+    // already carries, because worker.ts (`terminalOutcome.status !== 'completed'
+    // → continue`) would then withhold the real answer text AND let the daemon
+    // post a failure card for a turn that was in fact answered.
+    function realReply(uuid: string, text: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+      } as TranscriptEvent;
+    }
+    function apiErrorLine(uuid: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 500,
+        message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 500' }] },
+      } as TranscriptEvent;
+    }
+
+    it('does not downgrade a turn that already completed with a real reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    // The API-error arm does NOT share that rule: an error line is authoritative
+    // execution metadata, and the `end_turn` before it is, in the connection-lost
+    // case, a force-closed half sentence. The error must win so the turn stays
+    // `failed` + retryable - the only shape ordinary-turn-recovery acts on
+    // (ordinary-turn-recovery.ts: `status !== 'failed' || retryable !== true`
+    // → no continuation). Maintainer ruling on PR #1330.
+    it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      });
+    });
+
+    it('still records the failure when the turn has no earlier terminal', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+      expect(ready[0].terminalObserved).toBe(true);
+    });
+  });
+
   describe('synthetic / non-meaningful user events', () => {
     function syntheticUser(content: string, extra: Record<string, unknown> = {}): TranscriptEvent {
       return { type: 'user', uuid: `sx-${content.slice(0, 10)}`, message: { role: 'user', content }, ...extra } as TranscriptEvent;

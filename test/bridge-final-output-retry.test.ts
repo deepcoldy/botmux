@@ -87,6 +87,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -373,7 +374,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
-    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
+    expect(delivery).toMatchObject({ cardMode: 'card' });
+    expect(delivery?.policy).toBeUndefined();
+    expect(delivery?.baseCard).toBeUndefined();
   });
 
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
@@ -524,15 +530,23 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
   });
 
-  it('keeps feedback disabled by default and does not open the store', async () => {
+  it('keeps feedback disabled by default but still records the turn-completion delivery', async () => {
     const sessionReply = vi.fn(async () => 'om_plain_answer');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
+    // No feedback control on the card itself.
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
-    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+    // But the delivery is still recorded so a later turn_terminal correlates to
+    // a turn.completed event — feedback is independent of completion bookkeeping.
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
+    expect(delivery).toMatchObject({ cardMode: 'card' });
+    expect(delivery?.policy).toBeUndefined();
+    expect(delivery?.baseCard).toBeUndefined();
   });
 
   it('keeps feedback controls on ordinary local-turn output', async () => {

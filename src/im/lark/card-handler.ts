@@ -791,6 +791,7 @@ export async function commitRepoSelection(
           dirLabel,
           current.chatType,
           current.scope,
+          { source: 'ordinary-feishu' },
         );
         current.session = session;
         current.lastUserPrompt = undefined;

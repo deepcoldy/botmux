@@ -1608,7 +1608,7 @@ async function triggerSessionTurnAdmitted(
     const current = deps.activeSessions.get(key);
     if (current) return { kind: 'existing' as const, ds: current };
 
-    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, { source: 'http' });
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = scope;

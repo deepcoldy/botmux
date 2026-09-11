@@ -630,15 +630,20 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('limits busy-pattern idle probes to the active status region', () => {
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const helperStart = source.indexOf('function busyProbeRegion(content: string): string');
-    const probeStart = source.indexOf('function probeBusyPatternIdle');
-    const probeEnd = source.indexOf('function scheduleReattachIdleProbe');
-    const helper = source.slice(helperStart, probeEnd);
-    const probe = source.slice(probeStart, probeEnd);
+    // The region helper lives in src/utils/busy-probe.ts (it must strip ANSI
+    // before slicing — tmux capture-pane -e emits SGR codes at line starts
+    // that break the claude busyPattern's ^ anchor); the probe that calls it
+    // stays in worker.ts.
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperSource = readFileSync(join(process.cwd(), 'src/utils/busy-probe.ts'), 'utf8');
+    const probeStart = workerSource.indexOf('function probeBusyPatternIdle');
+    const probeEnd = workerSource.indexOf('function scheduleReattachIdleProbe');
+    const probe = workerSource.slice(probeStart, probeEnd);
 
-    expect(helperStart).toBeGreaterThan(-1);
-    expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(helperSource).toContain('export function busyProbeRegion(content: string): string');
+    expect(helperSource).toContain('stripAnsiScreenText(content).split(/\\r?\\n/)');
+    expect(helperSource).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(probeStart).toBeGreaterThan(-1);
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
   });

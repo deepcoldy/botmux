@@ -1,11 +1,19 @@
 # Scheduled Tasks
 
-Supports three schedule types plus natural-language input, posting a follow-up message in **the original topic where the task was created** and executing it when due (no separate thread is opened; the working directory matches the one at creation time).
+Supports three schedule types plus natural-language input. Tasks run at their configured execution position when due. **In group chats, the default is chat top level, even when the task is created inside a topic.** To continue in the current topic, explicitly pass `--topic` when creating the task through the CLI, or select the original topic under **Execution position** in the Dashboard.
 
 ## Two Ways to Create
 
 - **Slash command** (quick): `/schedule 每日17:50 帮我看看AI圈有什么新闻`
 - **Conversational trigger** (flexible): just tell the agent "add me a scheduled task to check deployment every day at 18:00", which automatically triggers the `botmux-schedule` skill.
+
+To create a task that stays in the current topic, run this inside its topic session:
+
+```bash
+botmux schedule add "0 18 * * *" "check deployment status" --topic
+```
+
+`--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
 ## Supported Formats
 
@@ -83,7 +91,7 @@ Click **Test precondition** to execute the current **unsaved** form content for 
 
 ## A New Topic Per Run
 
-By default every fire continues in **the original topic where the task was created**. To make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
+For chat-top-level execution, the bot/chat session mode determines how messages are organized. To explicitly make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
 
 ```bash
 # Slash command: prefix the prompt with the 新话题 ("new topic") keyword
@@ -100,7 +108,7 @@ You can also edit a task on the Dashboard's **Schedules** page and use **Executi
 
 ## Follow the Active Topic
 
-A topic-pinned task keeps firing into the topic it was created in; once that topic is closed and the conversation has moved on, reminders land where nobody is looking — and re-lighting a closed topic is one more topic session to carry. `--follow-active` makes the task re-resolve its target **at every fire**.
+A task explicitly pinned with `--topic` keeps firing into its specified topic; once that topic is closed and the conversation has moved on, reminders land where nobody is looking — and re-lighting a closed topic is one more topic session to carry. `--follow-active` makes the task re-resolve its target **at every fire**.
 
 ```bash
 # Created from inside a topic session: that topic is the starting point
@@ -157,4 +165,4 @@ Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trig
 /schedule remove|enable|disable|run <id>
 ```
 
-> Execution behavior: when due, if the session in the original topic is still alive, the prompt is injected directly into the existing session (no new worker is started); otherwise a new worker is spun up to execute in the original working directory. A `--new-topic` task always opens a fresh topic + new session and never reuses a prior one.
+> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content.

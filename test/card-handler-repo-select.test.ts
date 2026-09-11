@@ -1136,7 +1136,7 @@ describe('repo select card — plain switch', () => {
 
     await handleCardAction(event, deps, APP_ID);
 
-    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
+    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat', { source: 'ordinary-feishu' });
     expect(ds.session.scope).toBe('chat');
     expect(ds.session.rootMessageId).toBe(originalRoot);
     expect(ds.currentReplyTarget).toBeUndefined();

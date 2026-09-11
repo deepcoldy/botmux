@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,8 @@ import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND } from '../src/work
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
+import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
+import type { BotConfig } from '../src/bot-registry.js';
 
 let dir: string;
 
@@ -38,6 +40,37 @@ afterEach(async () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
+    const home = join(dir, 'codex-a');
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake-token' } }), { mode: 0o600 });
+    const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'not-persisted', cliId: 'codex', backendType: 'tmux',
+      codexInstancePool: { enabled: true, scope: 'ordinary-feishu', strategy: 'random', defaultInstanceId: 'a',
+        instances: [{ id: 'a', codexHome: home, enabled: false }] } };
+    const frozen = botToSnapshot(bot, '/work/repo');
+    const path = join(dir, 'bots.snapshot.json');
+    writeFileSync(path, JSON.stringify({ '': frozen }));
+    bot.codexInstancePool!.instances[0]!.codexHome = '/changed-after-freeze';
+    const restored = parseFrozenBotSnapshots(JSON.parse(readFileSync(path, 'utf8'))).get('')!;
+    expect(restored.cliInstanceBinding).toMatchObject({ source: 'default', instanceId: 'a', codexHome: realpathSync(home) });
+    expect(restored.cliRuntime).toEqual(frozen.cliRuntime);
+    expect(readFileSync(path, 'utf8')).not.toContain('not-persisted');
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = { ...request(), botSnapshot: restored };
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init).toMatchObject({ backendType: 'pty', cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+  });
+
   it('honors the host-neutral attempt lease before resolving credentials or spawning', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

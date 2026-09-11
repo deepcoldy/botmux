@@ -284,6 +284,9 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  // Includes legacy: migration pins the original runtime/home, not just pool IDs.
+  // Removing the pool changes new-session defaults; it does not unbind old rows.
+  if (ds.session.cliInstanceBinding) return null;
   if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
@@ -3814,7 +3817,7 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
+    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;

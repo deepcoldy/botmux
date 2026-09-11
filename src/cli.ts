@@ -217,6 +217,7 @@ import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
+import { linuxIsolationDetected } from './core/linux-isolation.js';
 import {
   hasManagedOriginIsolationMarker,
   isIsolatedCliProcess,
@@ -292,6 +293,7 @@ import {
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot } from './services/session-store.js';
+import { sqliteEngineAvailable } from './services/sqlite-compat.js';
 import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
 import { bindSessionWhiteboard as persistThenRememberWhiteboard, whiteboardBindFailedMessage } from './services/session-whiteboard-bind.js';
 import type { HostSessionCommand } from './services/session-commands.js';
@@ -2433,6 +2435,35 @@ async function cmdSetup(): Promise<void> {
  * workers via process.execPath, which would ENOENT under a removed Node).
  */
 function preflightNodeSanity(): void {
+  // SQLite capability gate, BEFORE the old fleet is torn down.
+  //
+  // `startDaemon` already calls `sessionStore.assertSqliteSupported()`, but that
+  // runs inside each bot daemon — i.e. AFTER restart has killed the previous
+  // supervisor. MEASURED failure (2026-09-08): a restart whose PATH resolved
+  // `node` to v18.20.4 (no `node:sqlite`) tore down a healthy 56-member fleet,
+  // then every one of the 55 bot daemons died at boot on that gate, hit the
+  // 10-restart budget and parked `errored`. The supervisor itself needs no SQLite,
+  // so it stayed online and `restart` printed "✅ daemon 已重启" while every bot
+  // was dead and all Lark topics looked wiped (the 57 SQLite stores were intact).
+  //
+  // Checking here — the shared preflight for both `start` and `restart`, run
+  // before teardown — converts that silent fleet-wide outage into an actionable
+  // refusal with the live fleet still serving.
+  if (!sqliteEngineAvailable()) {
+    console.error(`❌ 当前运行时加载不出 SQLite 引擎，会话存储无法工作 (runtime: ${process.version})`);
+    console.error(`     解释器: ${process.execPath}`);
+    console.error(`   botmux 的会话存储需要 node:sqlite (Node ≥ 22.13.0；23.x 需 ≥ 23.4.0) 或 bun:sqlite。`);
+    console.error(``);
+    console.error(`   已拒绝启动，现有 fleet 未被停止 —— 若继续，全部 bot daemon 会在启动瞬间崩溃，`);
+    console.error(`   而 supervisor 仍会显示成功（历史事故：55 个 bot 全灭、飞书话题看似全部丢失）。`);
+    console.error(``);
+    console.error(`   用合格的解释器重跑，例如:`);
+    console.error(`     bun dist/cli.js restart          # bun 自带 bun:sqlite`);
+    console.error(`     <abs path to node≥22.13> dist/cli.js restart`);
+    console.error(`   注意别用裸 \`node\`/\`botmux\`：它由 PATH 解析，可能又落到不合格的版本。`);
+    process.exit(1);
+  }
+
   // botmux installed under a dead nvm Node version → fork/spawn would ENOENT.
   const nvmMatch = PKG_ROOT.match(/\/\.nvm\/versions\/node\/([^/]+)\//);
   if (nvmMatch) {
@@ -6309,9 +6340,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-  worker-budget status 查看主机内存准入阈值与 session scope 能力
-       set             设置 --min-available-mib / --max-memory-full-avg10 / --session-memory-max-mib
-       unset           清除主机 worker 内存策略覆盖
+  worker-budget status 查看 worker 内存准入来源、阈值与 session scope 能力
+       set             设置 --memory-admission-enabled true|false / --min-available-mib /
+                       --max-memory-full-avg10 / --session-memory-max-mib
+       unset           清除 worker 内存策略覆盖
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
        --unset         清除（global 或 --bot N 配合）
@@ -6546,14 +6578,51 @@ function positiveNumber(value: string | undefined, label: string): number {
   return parsed;
 }
 
+function positiveMibBytes(value: string | undefined, label: string): number {
+  const bytes = Math.round(positiveNumber(value, label) * 1024 ** 2);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error(`${label} must resolve to a positive safe byte count`);
+  return bytes;
+}
+
+function strictBoolean(value: string | undefined, label: string): boolean {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${label} must be true or false`);
+}
+
+function validateWorkerBudgetSetArgs(args: string[]): void {
+  const flags = new Set([
+    '--memory-admission-enabled',
+    '--min-available-mib',
+    '--max-memory-full-avg10',
+    '--session-memory-max-mib',
+  ]);
+  const seen = new Set<string>();
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+    if (!flags.has(flag)) throw new Error(`unknown worker-budget flag: ${token}`);
+    if (seen.has(flag)) throw new Error(`duplicate worker-budget flag: ${flag}`);
+    seen.add(flag);
+    if (token === flag) {
+      const value = args[++i];
+      if (value === undefined || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    } else if (token.slice(token.indexOf('=') + 1) === '') {
+      throw new Error(`${flag} requires a value`);
+    }
+  }
+}
+
 function cmdWorkerBudget(args: string[]): void {
   const sub = (args[0] ?? 'status').toLowerCase();
   if (sub === 'status') {
-    const pressure = readHostMemoryPressure();
-    const decision = evaluateWorkerAdmission(pressure, readGlobalConfig().worker);
+    if (args.length > 1) throw new Error('worker-budget status does not accept arguments');
+    const sampledPressure = readHostMemoryPressure();
+    const decision = evaluateWorkerAdmission(sampledPressure, readGlobalConfig().worker);
+    const pressure = decision.pressure;
     const scope = sessionScopeCapabilities();
     const bots = loadBotsJson();
-    console.log('Worker host protection');
+    console.log('Worker memory protection');
     console.log(`  resident ceiling policy: unchanged (per-bot maxLiveWorkers; default ${DEFAULT_MAX_LIVE_WORKERS})`);
     if (bots.length === 0) {
       console.log(`  effective resident ceiling: ${DEFAULT_MAX_LIVE_WORKERS} (default; no configured bots)`);
@@ -6575,11 +6644,13 @@ function cmdWorkerBudget(args: string[]): void {
         );
       });
     }
-    console.log(`  MemAvailable: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)}`);
+    console.log(`  memory admission: ${decision.policy.memoryAdmissionEnabled ? 'enabled' : 'disabled'} (${decision.policy.memoryAdmissionEnabledSource})`);
+    console.log(`  effective total memory: ${formatMemoryBytes(pressure.totalMemoryBytes)} (${pressure.totalMemorySource})`);
+    console.log(`  available memory: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)} (${pressure.availableMemorySource})`);
     console.log(`  reserve: ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)} (${decision.policy.minAvailableMemorySource})`);
-    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`}`);
+    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`} (${pressure.memoryFullAvg10Source})`);
     console.log(`  PSI limit: ${decision.policy.maxMemoryFullAvg10.toFixed(2)}% (${decision.policy.maxMemoryFullAvg10Source})`);
-    console.log(`  admission: ${decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`}`);
+    console.log(`  admission: ${decision.policy.memoryAdmissionEnabled ? (decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`) : 'disabled'}`);
     console.log(`  session scope cleanup: ${scope.cleanupSupported ? 'supported' : 'unsupported'}`);
     console.log(`  MemoryMax enforceable: ${scope.memoryControllerSupported ? 'yes' : 'no'}`);
     console.log(`  configured session MemoryMax: ${decision.policy.sessionMemoryMaxBytes === undefined ? 'unset' : formatMemoryBytes(decision.policy.sessionMemoryMaxBytes)}`);
@@ -6590,29 +6661,33 @@ function cmdWorkerBudget(args: string[]): void {
   }
   if (sub === 'set') {
     const rest = args.slice(1);
+    validateWorkerBudgetSetArgs(rest);
+    const enabled = argValue(rest, '--memory-admission-enabled');
     const minMib = argValue(rest, '--min-available-mib');
     const psi = argValue(rest, '--max-memory-full-avg10');
     const memoryMaxMib = argValue(rest, '--session-memory-max-mib');
-    if (minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
+    if (enabled === undefined && minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
       throw new Error('worker-budget set requires at least one policy flag');
     }
     const patch: WorkerConfig = {};
-    if (minMib !== undefined) patch.minAvailableMemoryBytes = Math.round(positiveNumber(minMib, '--min-available-mib') * 1024 ** 2);
+    if (enabled !== undefined) patch.memoryAdmissionEnabled = strictBoolean(enabled, '--memory-admission-enabled');
+    if (minMib !== undefined) patch.minAvailableMemoryBytes = positiveMibBytes(minMib, '--min-available-mib');
     if (psi !== undefined) {
       const value = positiveNumber(psi, '--max-memory-full-avg10');
       if (value > 100) throw new Error('--max-memory-full-avg10 must be <= 100');
       patch.maxMemoryFullAvg10 = value;
     }
-    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = Math.round(positiveNumber(memoryMaxMib, '--session-memory-max-mib') * 1024 ** 2);
+    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = positiveMibBytes(memoryMaxMib, '--session-memory-max-mib');
     const resolved = mergeWorkerConfig(patch);
-    console.log('Updated worker host protection policy.');
+    console.log('Updated worker memory protection policy.');
     console.log(JSON.stringify(resolved, null, 2));
     console.log('New worker admissions use this policy without changing resident-session ceilings.');
     return;
   }
   if (sub === 'unset' || sub === 'clear') {
+    if (args.length > 1) throw new Error(`worker-budget ${sub} does not accept arguments`);
     clearWorkerConfig();
-    console.log('Cleared worker host protection overrides; defaults apply.');
+    console.log('Cleared worker memory protection overrides; defaults apply.');
     return;
   }
   console.error('Usage: botmux worker-budget [status|set|unset]');
@@ -8234,8 +8309,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   const replyLayoutRequest = parseReplyLayoutRequest(rest);
   if (replyLayoutRequest.warning) console.error(replyLayoutRequest.warning);
   let replyLayout = replyLayoutRequest.layout;
-  // Resolve isolation marker-first. A visible host marker always wins over a
-  // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
+  // A kernel isolation stamp wins over process markers in a child-selected
+  // data root. Otherwise a visible host marker wins over a leftover capability.
+  // Linux bwrap keeps its host-execution outbox; macOS
   // read isolation instead challenges the owning daemon and trusts only the
   // matching host-written read-only proof sidecar. The capability file itself
   // may survive worker SIGKILL and is never direct-send authority.
@@ -8267,7 +8343,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send refused: OS account home unavailable for isolation classification');
     process.exit(2);
   }
-  const kernelReadIsolationDetected = managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
+  const linuxKernelIsolationDetected = linuxIsolationDetected();
+  const kernelReadIsolationDetected = linuxKernelIsolationDetected
+    || managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
     === 'sandbox_denied'
     || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
   const isolatedSendRequired = !relayDir
@@ -8310,7 +8388,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.env.SESSION_DATA_DIR = sendDataDir;
     liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
   }
-  const isolatedCapabilityCtx = !isolatedSendRequired && liveMarkerCtx?.sessionId
+  const isolatedCapabilityCtx = !isolatedSendRequired && !linuxKernelIsolationDetected && liveMarkerCtx?.sessionId
     ? null
     : readWorkflowSessionRelayContext({
         env: process.env,
@@ -8318,7 +8396,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         // Keep one marker snapshot for the whole decision. In particular, do
         // not let resolveSessionContext's protected-capability fallback get
         // mislabeled as a live process marker.
-        findMarker: () => isolatedSendRequired ? null : liveMarkerCtx,
+        findMarker: () => isolatedSendRequired || linuxKernelIsolationDetected ? null : liveMarkerCtx,
       });
   if (isolatedSendRequired
     && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
@@ -8354,7 +8432,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     await relaySend(rest, relayDir, replyLayout);
     return;
   }
-  if (relayDir && !liveMarkerCtx?.sessionId) {
+  if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
     // The child may delete or replace its writable outbox capability, while
     // the immutable default snapshot remains visible. That snapshot is only a
     // routing hint and can survive worker death; never fall through to direct
@@ -10293,7 +10371,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         answer: text, card: oncallGroupCard });
     }
 
-    if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    // Turn-completion bookkeeping is INDEPENDENT of the feedback card. A
+    // delivery row is what a later `turn_terminal` correlates against to emit
+    // `turn.completed` (with the real completion time and native duration), so
+    // gating it on `feedbackPolicy` used to mean "feedback off → no completion
+    // record at all". Record every canonical in-session final answer; the
+    // feedback policy/card only decides whether a *control* rides along.
+    // The excluded shapes (custom card, pure video, managed VC send) are not
+    // canonical final-answer cards — and they are exactly the shapes the
+    // feedback gate above rejects outright, so the recorded set stays identical
+    // whether feedback is on or off.
+    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+      const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
       try {
@@ -10313,17 +10402,23 @@ async function cmdSend(rest: string[]): Promise<void> {
           dispatchAttempt: originDispatchAttempt,
           content: text,
           cliId: s.cliId,
-          cardMode: 'feedback',
+          // 'card' records a canonical final answer that carries no feedback
+          // control, so analytics can tell the two apart.
+          cardMode: carriesFeedbackControl ? 'feedback' : 'card',
           status: 'delivered',
-          policy: feedbackPolicy,
-          baseCard: feedbackBaseCard,
-          requesterSubjectId: feedbackRequesterSubjectId,
+          // Only a card that actually shows the control persists a policy and a
+          // replayable base card; without them the callback path fails closed.
+          ...(carriesFeedbackControl ? { policy: feedbackPolicy } : {}),
+          ...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {}),
+          ...(carriesFeedbackControl ? { requesterSubjectId: feedbackRequesterSubjectId } : {}),
+          // turn.completed webhooks are a completion concern, not a feedback
+          // one: they must keep firing with the card turned off.
           webhookDestinations: feedbackWebhookDestinations,
           context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
         });
       } catch (error) {
         console.error(
-          `botmux send: feedback indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+          `botmux send: turn delivery indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }
@@ -14762,6 +14857,11 @@ switch (command) {
   case 'restart': await cmdRestart(); break;
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
+  case 'codex-instances': {
+    const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
+    await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
   case 'upgrade':
   case 'update':  await cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;

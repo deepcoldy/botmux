@@ -8703,6 +8703,7 @@ export async function forkSession(
     childTitle,
     targetChatType,
     targetScope,
+    { source: 'fork', inherit: ds.session },
   );
   // Provenance + fork wiring. cliSessionId points at the SOURCE's CLI id: the
   // child's first spawn resumes it and forks forward (pendingForkSession), then
@@ -10333,12 +10334,12 @@ export function forkWorker(
   for (const warning of admission.pressure.warnings) {
     if (hostPressureWarningsLogged.has(warning)) continue;
     hostPressureWarningsLogged.add(warning);
-    logger.warn(`[${tag(ds)}] Host memory pressure check degraded (fail-open): ${warning}`);
+    logger.warn(`[${tag(ds)}] Memory pressure check degraded (fail-open): ${warning}`);
   }
   if (!admission.allowed) {
     const reason = admission.reasons.join('; ');
-    logger.warn(`[${tag(ds)}] Worker admission blocked by host memory pressure: ${reason}`);
-    const retry = `Host memory pressure is critical: ${reason}. `
+    logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
+    const retry = `Memory pressure is critical: ${reason}. `
       + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
       + `(reserve ${formatMemoryBytes(admission.policy.minAvailableMemoryBytes)}, `
       + `PSI limit ${admission.policy.maxMemoryFullAvg10.toFixed(2)}%).`;
@@ -10897,7 +10898,10 @@ export function forkWorker(
       ? false
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
-    codexAuthSync: botCfg.codexAuthSync ?? 'shared',
+    codexAuthSync: ds.session.cliInstanceBinding
+      ? (ds.session.cliInstanceBinding.authMode === 'isolated' ? 'isolated' : 'shared')
+      : botCfg.codexAuthSync ?? 'shared',
+    cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
@@ -10908,7 +10912,7 @@ export function forkWorker(
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
+    env: ds.session.cliLaunchSnapshot || ds.session.cliInstanceBinding ? undefined : botCfg.env,
     // Freeze the normalized sparse reply style at worker spawn. Both the
     // session-rendered botmux-send guide and the CLI card renderer consume the
     // same env snapshot, so a dashboard edit cannot split their behavior inside
@@ -14277,6 +14281,16 @@ function setupWorkerHandlers(
                     turnId: msg.turnId,
                     dispatchAttempt: msg.dispatchAttempt,
                     status: 'completed',
+                    // The worker measured this turn; carry its numbers onto the
+                    // synthesized terminal. This row is written FIRST and the
+                    // store's INSERT OR IGNORE keeps it, so omitting the timing
+                    // here would permanently shadow the worker's real terminal.
+                    ...(settlement.completedAtMs !== undefined
+                      ? { completedAtMs: settlement.completedAtMs }
+                      : {}),
+                    ...(settlement.durationMs !== undefined
+                      ? { durationMs: settlement.durationMs }
+                      : {}),
                   }, { workerGeneration });
                 } catch (err) {
                   logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
@@ -14684,18 +14698,32 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
-async function persistFinalOutputFeedback(
+/** Record the canonical final-answer delivery for this turn.
+ *
+ * This is turn-completion bookkeeping, NOT a feedback side effect: the row is
+ * what a later `turn_terminal` correlates against to emit `turn.completed` with
+ * the real completion time and native duration. It is therefore written whether
+ * or not a feedback control rides on the card — `policy`/`baseCard` are the only
+ * parts that depend on the feedback policy, and their absence simply means the
+ * card has no clickable control.
+ *
+ * Best-effort: the answer is already delivered, so a persistence failure is
+ * logged, never thrown. */
+async function persistFinalOutputDelivery(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   content: string,
   effectiveCliId: string,
   messageId: string,
-  policy: import('../services/feedback-policy.js').FeedbackPolicy,
-  baseCard: Record<string, unknown>,
+  policy: import('../services/feedback-policy.js').FeedbackPolicy | undefined,
+  baseCard: Record<string, unknown> | undefined,
   requesterSubjectId: string | undefined,
   webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
 ): Promise<void> {
+  // A control needs BOTH the policy and the card snapshot to stay clickable
+  // after a restart; either one missing means "record the delivery, no control".
+  const carriesFeedbackControl = !!policy && !!baseCard;
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
@@ -14715,18 +14743,18 @@ async function persistFinalOutputFeedback(
       cliVersion: ds.cliVersion,
       model: ds.session.model,
       reasoningEffort: ds.session.reasoningEffort,
-      cardMode: 'feedback',
+      cardMode: carriesFeedbackControl ? 'feedback' : 'card',
       status: 'delivered',
       usage: msg.usage,
-      policy,
-      baseCard,
-      requesterSubjectId,
+      ...(carriesFeedbackControl ? { policy, baseCard, requesterSubjectId } : {}),
+      // turn.completed webhooks are a completion concern, not a feedback one:
+      // they must keep firing with the feedback card turned off.
       webhookDestinations,
       context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
     });
   } catch (error) {
     logger.warn(
-      `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
+      `[${logTag}] Failed to persist final-output turn delivery: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -15163,8 +15191,11 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
-        if (feedbackPolicy && baseFeedbackCard) {
-          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        // Managed VC receivers are accounted in their own delivery store and
+        // never correlate to a feedback turn_terminal; skip them. Every other
+        // fallback final is recorded regardless of the feedback policy.
+        if (!managedReceiver) {
+          await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
@@ -15228,8 +15259,10 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
-      if (feedbackPolicy && baseFeedbackCard && messageId) {
-        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+      if (messageId && !managedReceiver) {
+        // Normal fallback final only; managed VC receivers have their own
+        // delivery accounting and no feedback turn_terminal to correlate to.
+        await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
       }
       onComplete?.(true);
     } catch (err: any) {
@@ -15351,6 +15384,7 @@ export function adoptSandboxBlocked(
 }
 
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
+  if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);
     return;
@@ -15953,7 +15987,7 @@ function cleanupPersistentBackendSessions(
       .map(s => backend.sessionName(s.sessionId)),
   );
   const runtimeNames = new Set(
-    runtimeSessionRows.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
   );
   const ownedSessions = [
     ...storedSessions.filter(belongsToBackend),
@@ -16102,6 +16136,7 @@ function cleanupPersistentBackendSessions(
     killManagedExactHerdrTargets(true);
     for (const session of activeSessions_) {
       if (!belongsToBackend(session)) continue;
+      if (session.cliInstanceBinding) continue;
       // The remote TUI deliberately uses cliId=codex even when the Bot's
       // default/new-session runtime remains codex-app. This is a shared-adopt
       // binding, not a stale CLI selection, so keep its bmx-* client alive for
