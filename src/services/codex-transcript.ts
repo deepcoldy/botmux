@@ -207,10 +207,12 @@ export interface CodexBridgeEvent {
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
    *   - 'assistant_final' closes the currently-collecting turn with output
    *   - 'turn_aborted' closes it without producing fallback output
+   *   - 'turn_bind' adds a provider turn id to an already-started turn
+   *     without starting, closing, or otherwise advancing the queue
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
    *     never starts or closes a turn */
-  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot';
+  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -226,6 +228,13 @@ export interface CodexBridgeEvent {
    *  Raw provider payloads stay in the rollout/Web terminal. */
   terminalErrorSummary?: string;
   sourceSessionId?: string;
+  /** Native provider turn id when the transcript format exposes one. Bridges
+   *  can use it to bind cosmetic/terminal events to the exact started turn
+   *  instead of relying solely on whichever turn is currently collecting. */
+  sourceTurnId?: string;
+  /** The transcript parser has positive evidence that this user record starts
+   * a distinct native turn while an older id-less turn remains open. */
+  preserveCollecting?: boolean;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
@@ -564,7 +573,7 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot'; text: string }[],
+  events: readonly Pick<CodexBridgeEvent, 'kind' | 'text'>[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {

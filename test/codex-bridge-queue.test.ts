@@ -56,6 +56,166 @@ function emitDecisions(
 }
 
 describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
+  it('rejects CoT from a different native provider turn', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'prompt', 100);
+    q.ingest([{ ...userEv('prompt', 'u-native', 200), sourceTurnId: 'native-1' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'wrong' }], 'c-wrong', 300), sourceTurnId: 'native-2' }]);
+    q.ingest([{ ...cotEv([{ kind: 'thinking', text: 'right' }], 'c-right', 301), sourceTurnId: 'native-1' }]);
+    expect(seen).toEqual(['t1']);
+  });
+
+  it('rejects late native CoT and terminals after their turn has closed and drained', () => {
+    const q = new CodexBridgeQueue();
+    const seen: string[] = [];
+    q.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([
+      { ...userEv('first', 'u-first', 200), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+      { ...asstEv('answer-a', 'a-first', 300), sourceSessionId: 'session-1', sourceTurnId: 'native-a' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-a' }),
+    ]);
+
+    q.ingest([userEv('second', 'u-second', 400)]);
+    q.ingest([
+      {
+        ...cotEv([{ kind: 'thinking', text: 'late-a-cot' }], 'c-late-a', 500),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...asstEv('late-a-final', 'a-late-a', 501),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-a',
+      },
+      {
+        ...abortEv('late-a-abort', 'x-late-a', 502, 'session-1'),
+        sourceTurnId: 'native-a',
+      },
+    ]);
+
+    expect(seen).toEqual([]);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 't2', started: true })]);
+    expect(q.peek()[0]).not.toHaveProperty('finalText');
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('answer-b', 'a-second', 600), sourceSessionId: 'session-1', sourceTurnId: 'native-b',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 't2', finalText: 'answer-b', sourceTurnId: 'native-b',
+    })]);
+  });
+
+  it('keeps the start-time replay guard after a closed-turn tombstone is evicted', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('old', 'old', 1);
+    q.ingest([
+      { ...userEv('old', 'u-old', 2), sourceSessionId: 'session-1', sourceTurnId: 'native-0' },
+      { ...asstEv('old answer', 'a-old', 3), sourceSessionId: 'session-1', sourceTurnId: 'native-0' },
+    ]);
+    q.drainEmittable();
+
+    for (let index = 1; index <= 4_096; index++) {
+      const timestampMs = 10 + index * 2;
+      q.mark(`closed-${index}`, `prompt-${index}`, timestampMs);
+      q.ingest([
+        {
+          ...userEv(`prompt-${index}`, `u-closed-${index}`, timestampMs),
+          sourceSessionId: 'session-1', sourceTurnId: `native-${index}`,
+        },
+        {
+          ...asstEv(`answer-${index}`, `a-closed-${index}`, timestampMs + 1),
+          sourceSessionId: 'session-1', sourceTurnId: `native-${index}`,
+        },
+      ]);
+      q.drainEmittable();
+    }
+
+    q.mark('current', 'current', 20_000);
+    q.ingest([userEv('current', 'u-current', 20_001)]);
+    q.ingest([
+      {
+        ...cotEv([{ kind: 'thinking', text: 'evicted late cot' }], 'c-old-evicted', 3),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-0',
+      },
+      {
+        ...asstEv('evicted late final', 'a-old-evicted', 3),
+        sourceSessionId: 'session-1', sourceTurnId: 'native-0',
+      },
+      {
+        ...abortEv('evicted late abort', 'x-old-evicted', 3, 'session-1'),
+        sourceTurnId: 'native-0',
+      },
+    ]);
+    expect(q.peek()[0]?.finalText).toBeUndefined();
+    expect(q.peek()[0]?.sourceTurnId).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('current answer', 'a-current', 20_002),
+      sourceSessionId: 'session-1', sourceTurnId: 'native-current',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'current', finalText: 'current answer', sourceTurnId: 'native-current',
+    })]);
+  });
+
+  it('matches closed native turns conservatively when session identity is absent', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('closed', 'closed', 1);
+    q.ingest([
+      { ...userEv('closed', 'u-closed-session', 2), sourceSessionId: 'session-1', sourceTurnId: 'native-shared' },
+      { ...asstEv('done', 'a-closed-session', 3), sourceSessionId: 'session-1', sourceTurnId: 'native-shared' },
+    ]);
+    q.drainEmittable();
+
+    q.mark('no-session', 'no session', 4);
+    q.ingest([userEv('no session', 'u-no-session', 5)]);
+    q.ingest([{ ...asstEv('late', 'a-no-session', 6), sourceTurnId: 'native-shared' }]);
+    expect(q.peek()[0]?.finalText).toBeUndefined();
+
+    q.ingest([{
+      ...asstEv('other session answer', 'a-other-session', 7),
+      sourceSessionId: 'session-2', sourceTurnId: 'native-shared',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'no-session', finalText: 'other session answer', sourceTurnId: 'native-shared',
+    })]);
+  });
+
+  it('keeps distinct native turns instead of treating them as a steer merge', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'same', 100);
+    q.mark('t2', 'same', 101);
+    q.ingest([
+      { ...userEv('same', 'u1', 200), sourceTurnId: 'native-1' },
+      { ...userEv('same', 'u2', 201), sourceTurnId: 'native-2' },
+      { ...asstEv('answer-1', 'a1', 300), sourceTurnId: 'native-1' },
+      { ...asstEv('answer-2', 'a2', 301), sourceTurnId: 'native-2' },
+    ]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't1', finalText: 'answer-1', sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', finalText: 'answer-2', sourceTurnId: 'native-2' }),
+    ]);
+  });
+
+  it('binds a native id onto an id-less collecting turn without advancing the queue', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first', 100);
+    q.mark('t2', 'second', 101);
+    q.ingest([userEv('first', 'u1', 200)]);
+    q.ingest([{ uuid: 'bind1', timestampMs: 201, kind: 'turn_bind', text: '', sourceTurnId: 'native-1' }]);
+
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 't1', started: true, sourceTurnId: 'native-1' }),
+      expect.objectContaining({ turnId: 't2', started: false }),
+    ]);
+  });
+
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
     const q = new CodexBridgeQueue();
     const seen: { turnId: string; entries: readonly unknown[] }[] = [];
@@ -543,6 +703,23 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('uses transcript start rather than a later worker mark for native terminal fallback', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('clock-skewed', 'prompt', 10_000);
+    q.ingest([userEv('prompt', 'u-clock-skewed', 8_000)]);
+
+    expect(q.peek()[0]).toMatchObject({
+      markTimeMs: 10_000,
+      transcriptStartTimeMs: 8_000,
+    });
+    q.ingest([{
+      ...asstEv('done', 'a-clock-skewed', 8_001), sourceTurnId: 'native-clock-skewed',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'clock-skewed', finalText: 'done', sourceTurnId: 'native-clock-skewed',
+    })]);
+  });
+
   it('accepts a matching late user event for an expired attribution-only head before pruning', () => {
     let now = STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
     const q = new CodexBridgeQueue(() => now);
@@ -678,6 +855,24 @@ describe('CodexBridgeQueue', () => {
     expect(ready).toHaveLength(1);
     expect(ready[0].turnId).toBe('t1');
     expect(ready[0].finalText).toBe('Hi，收到。');
+  });
+
+  it('records the original transcript start time during buffered late-attach replay', () => {
+    const q = new CodexBridgeQueue();
+    q.ingest([userEv('buffered prompt', 'u-buffered-clock', 8_000)]);
+    q.mark('buffered-clock', 'buffered prompt', 10_000);
+
+    expect(q.peek()[0]).toMatchObject({
+      markTimeMs: 10_000,
+      transcriptStartTimeMs: 8_000,
+    });
+    q.ingest([{
+      ...asstEv('buffered done', 'a-buffered-clock', 8_001),
+      sourceTurnId: 'native-buffered-clock',
+    }]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'buffered-clock', finalText: 'buffered done', sourceTurnId: 'native-buffered-clock',
+    })]);
   });
 
   it('does not replay buffered events older than the 5s skew window', () => {
