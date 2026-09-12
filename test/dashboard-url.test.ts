@@ -396,7 +396,7 @@ describe('workbench entry URL shapes', () => {
   });
 
   it('workbenchSpaUrl keeps the ?t= token and adds the SPA hash route', () => {
-    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench');
+    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
   });
 
   it('workbenchEntryUrl swaps the path and drops the fragment', () => {
@@ -410,12 +410,12 @@ describe('workbench entry URL shapes', () => {
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
     const { url } = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
-    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench');
+    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
     expect(workbenchEntryUrl(url)).toBe('https://m-deadbeef.botmux.example/workbench?t=abc');
   });
 
   it('tolerates a token-less dashboard URL (user logs in on arrival)', () => {
-    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench');
+    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench?botmuxWorkbenchShell=immersive');
     expect(workbenchEntryUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/workbench');
   });
 

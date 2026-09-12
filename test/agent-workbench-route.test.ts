@@ -29,6 +29,24 @@ describe('Agent Workbench route and surface integration', () => {
     expect(app).toContain('data-workbench-surface');
   });
 
+  // 直达入口（/workbench 跳板、?t= 登录跳转、短票兑换、CLI / 卡片链接）落沉浸式
+  // 无边框壳，靠 hash 里的 botmuxWorkbenchShell=immersive 标记；侧栏进入不带标记、
+  // 保持正常壳。钉死三处服务端目标都取自同一份常量，前端壳判定认这个标记。
+  it('direct entries land on the immersive surface; the sidebar keeps the shell', () => {
+    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
+    expect(app).toContain('(readDashboardClientShell() || readDashboardWorkbenchShell())');
+
+    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
+    expect(dashboard).toContain(
+      "url.pathname === '/workbench/dock' ? WORKBENCH_DOCK_IMMERSIVE_HASH : WORKBENCH_IMMERSIVE_HASH",
+    );
+    const auth = readFileSync(join(process.cwd(), 'src/dashboard/auth.ts'), 'utf8');
+    expect(auth).toContain('? WORKBENCH_IMMERSIVE_ENTRY');
+    expect(auth).toContain('? WORKBENCH_DOCK_IMMERSIVE_ENTRY');
+    const ticket = readFileSync(join(process.cwd(), 'src/dashboard/workbench-ticket.ts'), 'utf8');
+    expect(ticket).toContain('location: WORKBENCH_IMMERSIVE_ENTRY');
+  });
+
   // 工作台是无边框壳（没有 topbar/侧栏），登录态失效时 AuthExpiredOverlay 是它
   // **唯一**的自救出口。普通壳一直传着 loginUrl，工作台壳漏传 → 浮层退化成
   // 「访问链接已失效，知道了」的死胡同，一键登录按钮根本不渲染。两处必须一致。

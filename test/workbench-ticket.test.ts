@@ -223,13 +223,13 @@ async function startRedemptionServer(
 }
 
 describe('GET /workbench-ticket/<ticket>', () => {
-  it('valid ticket → same legacy cookie as the ?t= flow + 302 into the workbench, no-store', async () => {
+  it('valid ticket → same legacy cookie as the ?t= flow + 302 into the immersive workbench, no-store', async () => {
     const ticket = mintWorkbenchTicket();
     const base = await startRedemptionServer(ACTIVE_TOKEN);
     const res = await fetch(`${base}/workbench-ticket/${ticket}`, { redirect: 'manual' });
 
     expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/#/agent-workbench');
+    expect(res.headers.get('location')).toBe('/#/agent-workbench?botmuxWorkbenchShell=immersive');
     // 与 ?t= 流程逐字同款的 cookie（HttpOnly / SameSite=Lax / Path=/）。
     expect(res.headers.get('set-cookie')).toBe(buildSetCookie(ACTIVE_TOKEN));
     expect(res.headers.get('cache-control')).toBe('no-store');
@@ -270,7 +270,7 @@ describe('GET /workbench-ticket/<ticket>', () => {
     const base = await startRedemptionServer(null);
     const res = await fetch(`${base}/workbench-ticket/${ticket}`, { redirect: 'manual' });
     expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/#/agent-workbench');
+    expect(res.headers.get('location')).toBe('/#/agent-workbench?botmuxWorkbenchShell=immersive');
     expect(res.headers.get('set-cookie')).toBeNull();
   });
 

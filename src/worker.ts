@@ -17771,6 +17771,20 @@ body{display:flex;flex-direction:column;height:100vh;height:100dvh}
    and momentum here (not just on body), and reserve gestures for pinch-zoom so
    single-finger drag is driven manually by the touch handler below. */
 #terminal .xterm-viewport{overscroll-behavior:none;-webkit-overflow-scrolling:auto;touch-action:pinch-zoom}
+/* Scrollbar: Feishu's embedded webview (and any desktop with classic, non-overlay
+   scrollbars) paints the viewport's native bar as a wide light track that glares
+   against the dark terminal. Thin translucent thumb on a transparent track instead,
+   darker on hover. Standard scrollbar-* covers Firefox and Chromium 121+ (where
+   they take precedence); ::-webkit-scrollbar covers older Chromium and WebKit. The
+   viewport is xterm's real scroll container, so this is the only bar to style.
+   Neutral gray so it reads on both dark and light terminal themes. */
+#terminal .xterm-viewport{scrollbar-width:thin;scrollbar-color:rgba(140,148,170,.38) transparent}
+#terminal .xterm-viewport::-webkit-scrollbar{width:8px;height:8px}
+#terminal .xterm-viewport::-webkit-scrollbar-track{background:transparent}
+#terminal .xterm-viewport::-webkit-scrollbar-thumb{min-height:36px;border:2px solid transparent;border-radius:8px;
+  background:rgba(140,148,170,.38);background-clip:padding-box}
+#terminal .xterm-viewport::-webkit-scrollbar-thumb:hover{background:rgba(140,148,170,.6);background-clip:padding-box}
+#terminal .xterm-viewport::-webkit-scrollbar-corner{background:transparent}
 /* On touch, glyph cells are selectable text — a finger-drag over text starts
    native text selection (and the long-press callout) instead of scrolling,
    which is why blank areas scroll fine but text areas stall/won't move.
