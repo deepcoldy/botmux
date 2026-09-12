@@ -510,7 +510,7 @@ describe('repo select card — plain switch', () => {
   // next real message gets the full new-topic opening context.
 
   it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', pendingTurnId: 'om_bare_worktree', worker: null });
     const { deps } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
@@ -1883,6 +1883,49 @@ describe('repo select card — worktree open', () => {
     expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
   });
 
+  it('close_worktree_confirm rejects a non-operator before running the destructive command', async () => {
+    const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+
+    const res = await handleCardAction({
+      operator: { open_id: 'ou_stranger' },
+      action: { value: {
+        action: 'close_worktree_confirm',
+        root_id: ROOT_ID,
+        session_id: ds.session.sessionId,
+        invoker_open_id: OWNER,
+      } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('操作员');
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
+  it('close_worktree_confirm is pinned to the operator who requested the confirmation', async () => {
+    const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: {
+        action: 'close_worktree_confirm',
+        root_id: ROOT_ID,
+        session_id: ds.session.sessionId,
+        invoker_open_id: 'ou_other_operator',
+      } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('发起本次确认');
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
   it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {
     // 与上面的 worktree_toggle_mode 对照：敏感门控默认静默 block（仅日志），但
     //「获取操作链接」是用户主动点的取权动作，静默会让人以为按钮坏了 —— 破例给提示。
@@ -1925,6 +1968,52 @@ describe('repo select card — worktree open', () => {
 });
 
 describe('auto-worktree detached commit admission', () => {
+  it('fails closed when the preserved target subdirectory is absent', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockResolvedValueOnce({ dir: '/repos/alpha-wt' });
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha/packages/app',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+      targetSubdir: 'packages/app',
+    });
+
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('packages/app'));
+  });
+
+  it('keeps an explicit failed worktree start actionable while pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(new Error('cannot create worktree'));
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+    });
+
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.worker).toBeNull();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/repo'));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/tw'));
+  });
+
   it('holds the delayed commit/fork behind a same-bot mutation after the caller lease ended', async () => {
     const ds = makeDs({
       pendingRepo: true,

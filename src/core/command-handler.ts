@@ -3,6 +3,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -11,12 +12,12 @@ import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trig
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
@@ -58,7 +59,7 @@ import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import {
@@ -105,6 +106,7 @@ import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -120,7 +122,11 @@ import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { readProjectGroup } from '../services/project-group-store.js';
+import { getBotUnionId } from '../services/bot-union-ids-store.js';
+import { isTeamBot } from '../services/team-bots-store.js';
+import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
+import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
@@ -141,7 +147,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -304,6 +310,169 @@ const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
 // import without the daemon graph); re-exported here for existing callers.
 export { validateWorkingDir };
 
+function resolveCurrentChatWorkingDirForRepo(ds: DaemonSession | undefined, loc: ReturnType<typeof localeForBot>): string | undefined {
+  const current = ds?.workingDir ? validateWorkingDir(ds.workingDir, loc) : undefined;
+  if (current?.ok) return current.resolvedPath;
+  const oncall = ds ? findOncallChat(ds.larkAppId, ds.chatId)?.workingDir : undefined;
+  const resolvedOncall = oncall ? validateWorkingDir(oncall, loc) : undefined;
+  if (resolvedOncall?.ok) return resolvedOncall.resolvedPath;
+  if (!ds) return undefined;
+  const peers = sessionStore.findActiveChatScopeSessionsByChat(ds.chatId);
+  for (const peer of peers) {
+    if (!peer.workingDir) continue;
+    const resolved = validateWorkingDir(peer.workingDir, loc);
+    if (resolved.ok) return resolved.resolvedPath;
+  }
+  return undefined;
+}
+
+
+/** One row per session for the confirm-card table. Reuses botDisplayName so the
+ *  peer-name fallback (own config → bots-info.json → appId) still applies; the
+ *  current session is tagged so the user can tell it apart. */
+function closeWorktreeSessionRow(
+  s: import('../types.js').Session,
+  isCurrent: boolean,
+  loc: Locale,
+): { bot: string; task: string } {
+  const botName = s.larkAppId ? botDisplayName(s.larkAppId) : t('cmd.close.worktree_bot_unknown', undefined, loc);
+  const preview = (s.currentTurnTitle || s.lastUserPrompt || s.title || s.sessionId || '—')
+    .replace(/\s*\n+\s*/g, ' ')
+    .slice(0, 60) || '—';
+  return {
+    bot: isCurrent ? `${botName} ${t('cmd.close.worktree_current_tag', undefined, loc)}` : botName,
+    task: preview,
+  };
+}
+
+/** Compact inline detail cell for dirty files / unpushed commits (backticked,
+ *  space-separated, clipped). Only rendered when the list is non-empty. */
+function closeWorktreeInlineDetail(items: string[], limit = 6): string {
+  const visible = items.slice(0, limit).map(item => `\`${item}\``);
+  if (items.length > limit) visible.push(`… +${items.length - limit}`);
+  return `　${visible.join('　')}`;
+}
+
+function trustedTeamBotApp(larkAppId: string): boolean {
+  const unionId = getBotUnionId(config.session.dataDir, larkAppId);
+  return !!unionId && (
+    isTeamBot(config.session.dataDir, unionId)
+    || isPlatformTeamBot(config.session.dataDir, unionId)
+  );
+}
+
+function closeWorktreeConfirmationState(args: {
+  sessionId: string;
+  worktreeDir: string;
+  siblingSessionIds: string[];
+  safetyFingerprint: string;
+  invokerOpenId: string;
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      sessionId: args.sessionId,
+      worktreeDir: resolve(args.worktreeDir),
+      siblingSessionIds: [...args.siblingSessionIds].sort(),
+      safetyFingerprint: args.safetyFingerprint,
+      invokerOpenId: args.invokerOpenId,
+    }))
+    .digest('hex');
+}
+
+function buildCloseWorktreeConfirmCard(args: {
+  rootId: string;
+  sessionId: string;
+  worktreeDir: string;
+  sessions: import('../types.js').Session[];
+  dirty: boolean;
+  dirtyCount: number;
+  dirtyFiles: string[];
+  ahead: number;
+  unpushedCommits: string[];
+  invokerOpenId: string;
+  confirmationState: string;
+  loc: Locale;
+}): string {
+  const { loc } = args;
+  const hasRisk = args.dirty || args.ahead > 0;
+
+  const rows = args.sessions.map((s, i) => closeWorktreeSessionRow(s, i === 0, loc));
+
+  // Safety checks: one compact line each; a detail line follows only when the
+  // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
+  const checkLines: string[] = [
+    args.dirty
+      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyCount) }, loc)
+      : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
+  ];
+  if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
+  checkLines.push(
+    args.ahead > 0
+      ? t('cmd.close.worktree_check_ahead_warn', { n: String(args.ahead) }, loc)
+      : t('cmd.close.worktree_check_ahead_ok', undefined, loc),
+  );
+  if (args.ahead > 0 && args.unpushedCommits.length) checkLines.push(closeWorktreeInlineDetail(args.unpushedCommits));
+
+  const elements = [
+    {
+      tag: 'markdown',
+      content: `**🗂️ ${t('cmd.close.worktree_confirm_path_label', undefined, loc)}**\n\`${args.worktreeDir}\``,
+    },
+    {
+      tag: 'markdown',
+      content: `**💬 ${t('cmd.close.worktree_confirm_sessions', { count: String(args.sessions.length) }, loc)}**`,
+    },
+    {
+      tag: 'table',
+      page_size: 10,
+      row_height: 'low',
+      header_style: {
+        text_align: 'left', text_size: 'normal', background_style: 'grey',
+        text_color: 'default', bold: true, lines: 1,
+      },
+      columns: [
+        { name: 'bot', display_name: t('cmd.close.worktree_col_bot', undefined, loc), data_type: 'text', width: '140px' },
+        { name: 'task', display_name: t('cmd.close.worktree_col_task', undefined, loc), data_type: 'text', width: 'auto' },
+      ],
+      rows,
+    },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**🔎 ${t('cmd.close.worktree_checks_label', undefined, loc)}**\n${checkLines.join('\n')}`,
+    },
+    {
+      tag: 'markdown',
+      content: `<font color='grey'>${t(hasRisk ? 'cmd.close.worktree_confirm_effect' : 'cmd.close.worktree_effect_safe', undefined, loc)}</font>`,
+    },
+    {
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
+        type: 'danger',
+        value: {
+          action: 'close_worktree_confirm',
+          root_id: args.rootId,
+          session_id: args.sessionId,
+          invoker_open_id: args.invokerOpenId,
+          confirmation_state: args.confirmationState,
+        },
+      }],
+    },
+  ];
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `⚠️ ${t('cmd.close.worktree_confirm_title', undefined, loc)}` },
+      template: hasRisk ? 'red' : 'orange',
+    },
+    body: { direction: 'vertical', elements },
+  });
+}
+
 // `resolveRepoSelection` now lives in ./repo-selection.js (leaf module the topic
 // header's spec resolver can import without the daemon graph); re-exported here
 // for existing callers, same as `validateWorkingDir` above.
@@ -312,8 +481,8 @@ export { resolveRepoSelection } from './repo-selection.js';
 // 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
 // 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
 //
-// `parseForceTopicInvocation` 已由 `parseTopicHeader` 完全取代并删除：它只认「`/t` 必须
-// 在第 0 位」，认不出带标题的头部，留着会让两套判定在路由与 daemon 之间打架。
+// 主路由由 `parseTopicHeader` 负责可读标题与指令头；旧解析器只保留为
+// `/th`、`/tw`、`/t here|worktree` 生命周期兼容面的纯函数与测试入口。
 export {
   parseTopicHeader,
   isTopicHeader,
@@ -326,6 +495,28 @@ export {
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
+
+export type ForceTopicMode = 'default' | 'here' | 'worktree';
+
+/** Parse lifecycle aliases retained by the worktree command surface. */
+export function parseForceTopicInvocation(content: string): { prompt: string; mode: ForceTopicMode } | null {
+  const trimmed = content.trimStart();
+  const alias = /^\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (alias) return {
+    prompt: (alias[2] ?? '').trim(),
+    mode: alias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here',
+  };
+  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (!match) return null;
+  const rawPrompt = (match[2] ?? '').trim();
+  const variant = /^(here|worktree)(?:\s+([\s\S]*))?$/i.exec(rawPrompt);
+  return variant
+    ? {
+        prompt: (variant[2] ?? '').trim(),
+        mode: variant[1]!.toLowerCase() === 'worktree' ? 'worktree' : 'here',
+      }
+    : { prompt: rawPrompt, mode: 'default' };
+}
 
 /** Parse a user-authored slash command after leading @mentions have already
  *  been stripped. Messages that look like command examples or command lists
@@ -390,6 +581,14 @@ function botDisplayName(larkAppId: string): string {
     const bot = getBot(larkAppId);
     return bot.botName ?? getCliDisplayName(bot.config.cliId) ?? larkAppId;
   } catch {
+    try {
+      const p = join(config.session.dataDir, 'bots-info.json');
+      if (existsSync(p)) {
+        const entries: Array<{ larkAppId?: string; botName?: string | null; cliId?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
+        const found = entries.find(e => e.larkAppId === larkAppId);
+        return found?.botName || found?.cliId || larkAppId;
+      }
+    } catch { /* fall through */ }
     return larkAppId;
   }
 }
@@ -438,6 +637,7 @@ export interface CommandHandlerDeps {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -1614,11 +1814,75 @@ export async function handleCommand(
         }
         break;
       }
+      case '/cleanup-wt': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const cleanupId = message.content.replace(/^\/cleanup-wt\s*/i, '').trim();
+        if (!appId || !cleanupId) {
+          await sessionReply(rootId, '用法：`/cleanup-wt <id>`');
+          break;
+        }
+        if (!canOperate(appId, message.chatId ?? ds?.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
+          break;
+        }
+        let job;
+        try {
+          job = getWorktreeCleanupJob(config.session.dataDir, cleanupId);
+        } catch (err) {
+          await sessionReply(rootId, `⚠️ 无法读取 worktree 清理任务：${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
+        if (!job || job.larkAppId !== appId) {
+          await sessionReply(rootId, '未找到该 worktree 清理任务。');
+          break;
+        }
+        try {
+          const containingRoot = await worktreeRootFor(job.worktreeDir);
+          const main = containingRoot ? await mainWorktreeFor(containingRoot) : undefined;
+          if (!containingRoot || resolve(containingRoot) !== resolve(job.worktreeDir)
+            || resolve(main ?? '') !== resolve(job.worktreeMain)
+            || !(await isLinkedWorktree(containingRoot))) {
+            await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
+            break;
+          }
+          const refusal = await withWorktreeTargetLock(job.worktreeDir, async () => {
+            const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
+            if (active.length > 0) {
+              return `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`;
+            }
+            const safety = await worktreeSafetyStatus(job.worktreeDir);
+            if (safety.fingerprint !== job.safetyFingerprint) {
+              return '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。';
+            }
+            await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
+            deleteWorktreeCleanupJob(config.session.dataDir, job.id);
+            return undefined;
+          });
+          if (refusal) {
+            await sessionReply(rootId, refusal);
+            break;
+          }
+        } catch (err) {
+          await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
+        await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
+        break;
+      }
+
       case '/close': {
+        const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
+        const closeTokens = closeArg.split(/\s+/).filter(Boolean);
+        const removeWorktree = /^(wt|worktree)$/i.test(closeTokens[0] ?? '');
+        const confirmedWorktreeCleanup = removeWorktree && closeTokens.includes('--yes');
+        const expectedWorktreeState = closeTokens.find(token => token.startsWith('--state='))?.slice('--state='.length);
         if (ds) {
           // Shared adopts never own the source conversation. Keep /close
           // backwards-compatible as the quick "leave this BotMux share" action,
           // but never present it as terminating the source App Server / tmux CLI.
+          // This also deliberately takes precedence over `/close wt`: an adopted
+          // source may still be using that worktree after BotMux disconnects, so
+          // deleting it would be unsafe.
           if (isSharedAdoptSession(ds)) {
             const targetSessionId = ds.session.sessionId;
             const detached = await withBotTurnMutation(ds.larkAppId, async () => {
@@ -1658,6 +1922,72 @@ export async function handleCommand(
             );
             logger.info(`[${logTag}] /close treated as shared-adopt disconnect`);
             break;
+          }
+          let worktreeDir = ds.workingDir ?? ds.session.workingDir;
+          let worktreeMain: string | undefined;
+          let initialWorktreeFingerprint: string | undefined;
+          let siblingSessions: import('../types.js').Session[] = [];
+          if (removeWorktree) {
+            if (ds.scope !== 'thread') {
+              await sessionReply(rootId, t('cmd.close.worktree_thread_only', undefined, loc));
+              break;
+            }
+            const containingRoot = worktreeDir ? await worktreeRootFor(worktreeDir) : null;
+            if (!containingRoot || !(await isLinkedWorktree(containingRoot))) {
+              await sessionReply(rootId, t('cmd.close.worktree_not_linked', undefined, loc));
+              break;
+            }
+            worktreeDir = containingRoot;
+            worktreeMain = await mainWorktreeFor(worktreeDir);
+            try {
+              siblingSessions = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir)
+                .filter(s => s.sessionId !== ds.session.sessionId);
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              logger.warn(`[${logTag}] worktree cleanup inventory unavailable: ${reason}`);
+              await sessionReply(rootId, `⚠️ 无法完整读取同 worktree 会话清单，已取消删除：${reason}`);
+              break;
+            }
+            const untrustedSibling = siblingSessions.find(sibling =>
+              sibling.larkAppId
+              && sibling.larkAppId !== ds.larkAppId
+              && !trustedTeamBotApp(sibling.larkAppId));
+            if (untrustedSibling) {
+              logger.warn(
+                `[${logTag}] refusing worktree cleanup across untrusted bot app ${untrustedSibling.larkAppId}`,
+              );
+              await sessionReply(rootId, '⚠️ 同 worktree 中存在不属于可信团队的 Bot 会话，已取消删除。');
+              break;
+            }
+            const safety = await worktreeSafetyStatus(worktreeDir);
+            initialWorktreeFingerprint = safety.fingerprint;
+            const confirmationState = closeWorktreeConfirmationState({
+              sessionId: ds.session.sessionId,
+              worktreeDir,
+              siblingSessionIds: siblingSessions.map(s => s.sessionId),
+              safetyFingerprint: safety.fingerprint,
+              invokerOpenId: message.senderId,
+            });
+            if (!confirmedWorktreeCleanup || expectedWorktreeState !== confirmationState) {
+              if (confirmedWorktreeCleanup) {
+                await sessionReply(rootId, t('cmd.close.worktree_state_changed', undefined, loc));
+              }
+              await sessionReply(rootId, buildCloseWorktreeConfirmCard({
+                rootId,
+                sessionId: ds.session.sessionId,
+                worktreeDir,
+                sessions: [ds.session, ...siblingSessions],
+                dirty: safety.dirty,
+                dirtyCount: safety.dirtyCount,
+                dirtyFiles: safety.dirtyFiles,
+                ahead: safety.ahead,
+                unpushedCommits: safety.unpushedCommits,
+                invokerOpenId: message.senderId,
+                confirmationState,
+                loc,
+              }), 'interactive');
+              break;
+            }
           }
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
@@ -1755,15 +2085,126 @@ export async function handleCommand(
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
           // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
-          await deliverEphemeralOrReply(
-            closed.current,
-            message.senderId,
-            closed.card,
-            'interactive',
-            () => sessionReply(rootId, closed.card, 'interactive'),
-            deps.invocationReplyTarget,
-          );
-          logger.info(`[${logTag}] Session closed by /close command`);
+          try {
+            await deliverEphemeralOrReply(
+              closed.current,
+              message.senderId,
+              closed.card,
+              'interactive',
+              () => sessionReply(rootId, closed.card, 'interactive'),
+              deps.invocationReplyTarget,
+            );
+          } catch (err) {
+            if (!removeWorktree) throw err;
+            // The session is already durably closed. For an explicitly confirmed
+            // worktree cleanup, notification delivery must not strand sibling
+            // sessions or the owned worktree; ordinary /close retains its existing
+            // outer error handling.
+            logger.warn(`[${logTag}] closed-session card delivery failed after close: ${err instanceof Error ? err.message : err}`);
+          }
+          if (removeWorktree && worktreeMain && worktreeDir) {
+            let closedSiblings = 0;
+            const siblingCloseFailures: string[] = [];
+            for (const sibling of siblingSessions) {
+              if (!sibling.larkAppId) {
+                logger.warn(`[${logTag}] sibling session ${sibling.sessionId} has no owning app; blocking worktree removal`);
+                siblingCloseFailures.push(sibling.sessionId);
+                continue;
+              }
+              if (sibling.larkAppId === ds.larkAppId) {
+                try {
+                  const result = await closeWorkerPoolSession(sibling.sessionId);
+                  if (result.ok && result.outcome === 'closed') closedSiblings++;
+                  else siblingCloseFailures.push(sibling.sessionId);
+                } catch (err) {
+                  logger.warn(`[${logTag}] failed to close sibling session ${sibling.sessionId}: ${err instanceof Error ? err.message : err}`);
+                  siblingCloseFailures.push(sibling.sessionId);
+                }
+                continue;
+              }
+              const daemon = findOnlineDaemon(sibling.larkAppId);
+              if (!daemon) {
+                logger.warn(`[${logTag}] sibling session ${sibling.sessionId} owner daemon offline (app=${sibling.larkAppId})`);
+                siblingCloseFailures.push(sibling.sessionId);
+                continue;
+              }
+              try {
+                const res = await fetchDaemonIpc(daemon.ipcPort, `/api/sessions/${encodeURIComponent(sibling.sessionId)}/close`, { method: 'POST' });
+                const body = await res.json().catch(() => undefined);
+                const residual = res.ok ? parseCloseResidual(body) : undefined;
+                if (res.ok && !residual) closedSiblings++;
+                else {
+                  const reason = residual ? `residual=${describeCloseResidual(residual)}` : `http_${res.status}`;
+                  logger.warn(`[${logTag}] sibling close ${sibling.sessionId} not fully closed: ${reason}`);
+                  siblingCloseFailures.push(sibling.sessionId);
+                }
+              } catch (err) {
+                logger.warn(`[${logTag}] sibling close ${sibling.sessionId} threw: ${err instanceof Error ? err.message : err}`);
+                siblingCloseFailures.push(sibling.sessionId);
+              }
+            }
+            if (siblingCloseFailures.length > 0) {
+              await sessionReply(rootId, t('cmd.close.worktree_sibling_close_failed', {
+                path: worktreeDir,
+                count: String(siblingCloseFailures.length),
+              }, loc));
+              break;
+            }
+            const removal = await withWorktreeTargetLock(worktreeDir, async () => {
+              const finalSafety = await worktreeSafetyStatus(worktreeDir);
+              const finalInventory = sessionStore.findActiveSessionsByWorkingDirStrict(worktreeDir);
+              if (finalSafety.fingerprint !== initialWorktreeFingerprint || finalInventory.length > 0) {
+                return {
+                  status: 'changed' as const,
+                  contentChanged: finalSafety.fingerprint !== initialWorktreeFingerprint,
+                  safetyFingerprint: finalSafety.fingerprint,
+                };
+              }
+              try {
+                await removeRepoWorktree(worktreeMain, worktreeDir);
+                return { status: 'removed' as const };
+              } catch (error) {
+                return { status: 'failed' as const, error, safetyFingerprint: finalSafety.fingerprint };
+              }
+            });
+            if (removal.status === 'changed') {
+              if (removal.contentChanged) {
+                const job = putWorktreeCleanupJob(config.session.dataDir, {
+                  larkAppId: ds.larkAppId,
+                  worktreeMain,
+                  worktreeDir,
+                  safetyFingerprint: removal.safetyFingerprint,
+                  error: 'worktree content changed after sessions closed',
+                });
+                await sessionReply(
+                  rootId,
+                  '⚠️ 关闭会话后 worktree 内容发生变化，已取消删除。'
+                  + `请检查后发送 \`/cleanup-wt ${job.id}\` 重试。`,
+                );
+              } else {
+                await sessionReply(rootId, '⚠️ 关闭会话后仍检测到活动会话，已取消删除。请稍后重试 `/close wt`。');
+              }
+              break;
+            }
+            if (removal.status === 'failed') {
+              const error = removal.error instanceof Error ? removal.error.message : String(removal.error);
+              const job = putWorktreeCleanupJob(config.session.dataDir, {
+                larkAppId: ds.larkAppId,
+                worktreeMain,
+                worktreeDir,
+                safetyFingerprint: removal.safetyFingerprint,
+                error,
+              });
+              await sessionReply(
+                rootId,
+                `${t('cmd.close.worktree_remove_failed', { path: worktreeDir, error }, loc)}\n`
+                + `已保存清理任务，可稍后发送 \`/cleanup-wt ${job.id}\` 重试。`,
+              );
+            } else {
+              await sessionReply(rootId, t('cmd.close.worktree_removed', { path: worktreeDir, count: closedSiblings }, loc));
+            }
+          }
+          logger.info(`[${logTag}] Session closed by /close command${removeWorktree ? ' with worktree cleanup' : ''}`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
@@ -2125,10 +2566,11 @@ export async function handleCommand(
             // its first turn and must carry the full new-topic opening — see
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
+            if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -2485,6 +2927,16 @@ export async function handleCommand(
         // harmless, so it stays open.)
         if ((ds?.worktreeCreating || ds?.pendingRepoCommitInFlight) && (repoArg || ds?.pendingRepo)) {
           await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+          break;
+        }
+
+        if (repoArg && /^here$/i.test(repoArg)) {
+          const currentDir = resolveCurrentChatWorkingDirForRepo(ds, loc);
+          if (!currentDir) {
+            await sessionReply(rootId, t('cmd.repo.here_missing', undefined, loc));
+            break;
+          }
+          await commitRepoSelection(currentDir, basename(currentDir), '/repo here');
           break;
         }
 
@@ -3154,7 +3606,7 @@ export async function handleCommand(
           const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
           const mode: CommentTriggerMode = request.requestedMode
             ?? (botCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
-          const anchor = ds ? sessionAnchorId(ds) : `doc:${file.fileToken}`;
+          const anchor = ds ? sessionAnchorId(ds) : docWatchAnchor(file.fileToken);
           // Existing chat/thread sessions own their project binding. A watch
           // without an explicit --dir inherits that binding; session-less
           // document watches keep their own stored/mapped directory fallback.
@@ -3191,7 +3643,7 @@ export async function handleCommand(
             sessionAnchor: anchor,
             sessionId: ds?.session.sessionId,
             scope: ds?.scope ?? 'chat',
-            chatId: ds?.chatId ?? `doc:${file.fileToken}`,
+            chatId: ds?.chatId ?? anchor,
             commentTriggerMode: mode,
             managedBy: 'watch-comment',
             ownerOpenId: message.senderId,
@@ -4880,6 +5332,7 @@ export async function handleCommand(
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
+          t('help.cleanup_wt', undefined, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),

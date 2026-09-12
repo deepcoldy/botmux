@@ -113,6 +113,7 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
 async function resumeRestoredPendingRepoSetup(
   ds: DaemonSession,
   activeSessions: Map<string, DaemonSession>,
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined,
 ): Promise<void> {
   const setup = ds.session.pendingRepoSetup;
   if (!setup || ds.session.queuedActivationPending || !ds.pendingRepo) return;
@@ -136,6 +137,12 @@ async function resumeRestoredPendingRepoSetup(
       operatorOpenId: ds.session.ownerOpenId,
       activeSessions,
       notify,
+      force: setup.force,
+      worktreePath: setup.worktreePath,
+      branch: setup.branch,
+      reuseExisting: setup.reuseExisting,
+      targetSubdir: setup.targetSubdir,
+      prepareTurn,
     }).catch((err) => {
       // Git/worktree recovery is deliberately detached. A failed publish or
       // build may not reject daemon startup or erase this durable setup owner.
@@ -2097,6 +2104,7 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
+  options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
 ): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
@@ -2556,7 +2564,7 @@ export async function restoreActiveSessions(
       announceSessionRow(ds);
       if (restoredPendingRepo) {
         try {
-          await resumeRestoredPendingRepoSetup(ds, activeSessions);
+          await resumeRestoredPendingRepoSetup(ds, activeSessions, options.prepareTurn);
         } catch (err) {
           // One unavailable scan/Lark send/worktree import must not abort the
           // entire daemon restore. Rebuild volatile buffers from the retained

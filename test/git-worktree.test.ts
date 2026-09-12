@@ -8,11 +8,11 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -154,6 +154,36 @@ describe('createRepoWorktree', () => {
     expect(git(target, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/group');
   });
 
+  it('reuses an existing explicit worktree only when its repo and branch match', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'shared-topic', 'proj');
+    const first = await createRepoWorktree(repo, { branch: 'feat/shared', worktreePath: target });
+
+    const reused = await createRepoWorktree(repo, {
+      branch: 'feat/shared',
+      worktreePath: target,
+      reuseExisting: true,
+    });
+
+    expect(reused).toEqual({ path: target, branch: 'feat/shared', baseRef: 'feat/shared' });
+    expect(git(repo, 'worktree', 'list').split('\n').filter(line => line.includes(target))).toHaveLength(1);
+    expect(first.path).toBe(reused.path);
+  });
+
+  it('refuses to reuse an explicit path checked out on a different branch', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const target = join(tempRoot, 'shared-topic', 'proj');
+    await createRepoWorktree(repo, { branch: 'feat/other', worktreePath: target });
+
+    await expect(createRepoWorktree(repo, {
+      branch: 'feat/shared',
+      worktreePath: target,
+      reuseExisting: true,
+    })).rejects.toThrow('not feat/shared in the expected repository');
+  });
+
   it('removeRepoWorktree detaches the worktree dir so the slot is reusable (rollback)', async () => {
     const upstream = makeUpstream('upstream');
     const repo = makeClone(upstream, 'proj');
@@ -250,6 +280,224 @@ describe('createRepoWorktree', () => {
     mkdirSync(plain);
 
     await expect(createRepoWorktree(plain)).rejects.toThrow();
+  });
+});
+
+describe('worktreeRootFor', () => {
+  it('resolves a nested directory to its containing linked worktree root', async () => {
+    const upstream = makeUpstream('root-upstream');
+    const repo = makeClone(upstream, 'root-proj');
+    const wt = await createRepoWorktree(repo);
+    const nested = join(wt.path, 'nested', 'deep');
+    mkdirSync(nested, { recursive: true });
+
+    expect(await worktreeRootFor(nested)).toBe(wt.path);
+    expect(await worktreeRootFor(wt.path)).toBe(wt.path);
+    expect(await worktreeRootFor(repo)).toBe(repo);
+  });
+});
+
+describe('worktreeSafetyStatus', () => {
+  it('detects ignored files without recursively enumerating ignored directories', async () => {
+    const repo = makeUpstream('ignored-safety');
+    writeFileSync(join(repo, '.gitignore'), 'secret.env\ncache/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore local data');
+    writeFileSync(join(repo, 'secret.env'), 'secret\n');
+    mkdirSync(join(repo, 'cache'));
+    writeFileSync(join(repo, 'cache', 'a.txt'), 'a\n');
+    writeFileSync(join(repo, 'cache', 'b.txt'), 'b\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles).toContain('secret.env');
+    expect(status.dirtyFiles).toContain('cache/');
+    expect(status.dirtyFiles).not.toContain('cache/a.txt');
+  });
+
+  it('detects untracked files even when git config hides them', async () => {
+    const repo = makeUpstream('untracked-safety');
+    git(repo, 'config', 'status.showUntrackedFiles', 'no');
+    writeFileSync(join(repo, 'new.txt'), 'new\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toContain('new.txt');
+  });
+
+  it('reports the full dirty count while bounding file examples', async () => {
+    const repo = makeUpstream('many-dirty-files');
+    for (let i = 0; i < 25; i++) writeFileSync(join(repo, `dirty-${i}.txt`), `${i}\n`);
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyCount).toBe(25);
+    expect(status.dirtyFiles).toHaveLength(20);
+  });
+
+  it('preserves the full path for an unstaged modification', async () => {
+    const repo = makeUpstream('safety-status');
+    const file = join(repo, 'first-character.ts');
+    writeFileSync(file, 'initial\n');
+    git(repo, 'add', 'first-character.ts');
+    git(repo, 'commit', '-m', 'add file');
+    writeFileSync(file, 'changed\n');
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toEqual(['first-character.ts']);
+  });
+
+  it('fingerprints a tracked deletion without treating the missing path as a scan error', async () => {
+    const repo = makeUpstream('deleted-fingerprint');
+    const file = join(repo, 'deleted.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'deleted.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    rmSync(file);
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toEqual(['deleted.txt']);
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('changes the fingerprint when staged content changes but the worktree bytes stay the same', async () => {
+    const repo = makeUpstream('index-fingerprint');
+    const file = join(repo, 'staged.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'staged.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    writeFileSync(file, 'first staged value\n');
+    git(repo, 'add', 'staged.txt');
+    writeFileSync(file, 'same worktree value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second staged value\n');
+    git(repo, 'add', 'staged.txt');
+    writeFileSync(file, 'same worktree value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('handles porcelain-quoted non-ASCII paths and fingerprints their content', async () => {
+    const repo = makeUpstream('quoted-path-fingerprint');
+    const file = join(repo, '中文.txt');
+    writeFileSync(file, 'first\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('中文.txt');
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('fingerprints a conflicted index without requiring write-tree', async () => {
+    const repo = makeUpstream('conflicted-index');
+    const file = join(repo, 'conflict.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'conflict.txt');
+    git(repo, 'commit', '-m', 'add conflict file');
+    git(repo, 'checkout', '-b', 'other');
+    writeFileSync(file, 'other\n');
+    git(repo, 'commit', '-am', 'other change');
+    git(repo, 'checkout', 'master');
+    writeFileSync(file, 'master\n');
+    git(repo, 'commit', '-am', 'master change');
+    try { git(repo, 'merge', 'other'); } catch { /* expected conflict */ }
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirtyFiles).toContain('conflict.txt');
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('changes the fingerprint when an already-dirty file content changes', async () => {
+    const repo = makeUpstream('content-fingerprint');
+    const file = join(repo, 'dirty.txt');
+    writeFileSync(file, 'base\n');
+    git(repo, 'add', 'dirty.txt');
+    git(repo, 'commit', '-m', 'add tracked file');
+    writeFileSync(file, 'first value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(file, 'second value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('changes the fingerprint when a submodule index changes but its worktree bytes stay the same', async () => {
+    const subOrigin = makeUpstream('submodule-index-origin');
+    const tracked = join(subOrigin, 'tracked.txt');
+    writeFileSync(tracked, 'base\n');
+    git(subOrigin, 'add', 'tracked.txt');
+    git(subOrigin, 'commit', '-m', 'add tracked file');
+
+    const repo = makeUpstream('submodule-index-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const nestedFile = join(repo, 'vendor/sub/tracked.txt');
+    writeFileSync(nestedFile, 'first staged value\n');
+    git(join(repo, 'vendor/sub'), 'add', 'tracked.txt');
+    writeFileSync(nestedFile, 'same worktree value\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(nestedFile, 'second staged value\n');
+    git(join(repo, 'vendor/sub'), 'add', 'tracked.txt');
+    writeFileSync(nestedFile, 'same worktree value\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(second.dirtyFiles).toEqual(first.dirtyFiles);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('changes the fingerprint when an ignored directory file changes inside an initialized submodule', async () => {
+    const subOrigin = makeUpstream('submodule-ignored-dir-origin');
+    writeFileSync(join(subOrigin, '.gitignore'), 'cache/\n');
+    git(subOrigin, 'add', '.gitignore');
+    git(subOrigin, 'commit', '-m', 'ignore local cache');
+
+    const repo = makeUpstream('submodule-ignored-dir-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const cache = join(repo, 'vendor/sub/cache');
+    mkdirSync(cache);
+    const cached = join(cache, 'state.json');
+    writeFileSync(cached, '{"value":1}\n');
+    const first = await worktreeSafetyStatus(repo);
+
+    writeFileSync(cached, '{"value":2}\n');
+    const second = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('vendor/sub/cache/');
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+  });
+
+  it('detects ignored files inside an initialized submodule', async () => {
+    const subOrigin = makeUpstream('submodule-origin');
+    writeFileSync(join(subOrigin, '.gitignore'), 'secret.env\n');
+    git(subOrigin, 'add', '.gitignore');
+    git(subOrigin, 'commit', '-m', 'ignore local secret');
+
+    const repo = makeUpstream('submodule-parent');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/sub');
+    git(repo, 'commit', '-m', 'add submodule');
+    const secret = join(repo, 'vendor/sub/secret.env');
+    writeFileSync(secret, 'local\n');
+    const status = await worktreeSafetyStatus(repo);
+
+    writeFileSync(secret, 'changed\n');
+    const changed = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles).toContain('vendor/sub/secret.env');
+    expect(changed.fingerprint).not.toBe(status.fingerprint);
   });
 });
 

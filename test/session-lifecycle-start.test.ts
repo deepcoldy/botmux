@@ -186,9 +186,15 @@ import {
   initWorkerPool,
   promoteQueuedActivationTail,
   restartCounts,
+  setActiveSessionsRegistry,
   sendWorkerInput,
   suspendWorker,
 } from '../src/core/worker-pool.js';
+import {
+  acquireDeviceIsolationFreeze,
+  releaseDeviceIsolationFreeze,
+  resetDeviceIsolationActivationForTest,
+} from '../src/core/device-isolation-activation.js';
 import {
   managedOriginCapabilityDirectory,
   readManagedOriginCapability,
@@ -263,6 +269,7 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+  vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
   __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
@@ -314,11 +321,15 @@ describe('host memory pressure worker admission', () => {
     });
     const ds = makeDs({ hasHistory: true });
 
-    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' })).toBe(true);
+    const admissions: string[] = [];
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' }, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
     await Promise.resolve();
 
     expect(forkMock).not.toHaveBeenCalled();
     expect(ds.worker).toBeNull();
+    expect(admissions).toEqual(['rejected']);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringMatching(/memory pressure.*retry/i),
@@ -327,6 +338,45 @@ describe('host memory pressure worker admission', () => {
       'om_retry',
       undefined,
     );
+  });
+
+  it('reports accepted after a worker receives its init message', () => {
+    const ds = makeDs();
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'hello', false, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['accepted']);
+  });
+
+  it('leaves explicit retry ownership with the caller during device isolation', async () => {
+    const ds = makeDs({ hasHistory: true });
+    setActiveSessionsRegistry(new Map([['active', ds]]));
+    acquireDeviceIsolationFreeze({
+      nonce: 'n'.repeat(32),
+      inventoryGeneration: 'g1',
+      leaseIdFactory: () => 'lease-1',
+    });
+    const admissions: string[] = [];
+
+    try {
+      expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_deferred' }, {
+        onAdmission: admission => admissions.push(admission),
+        deferDuringDeviceIsolation: false,
+      })).toBe(true);
+      expect(admissions).toEqual(['rejected']);
+      releaseDeviceIsolationFreeze({ nonce: 'n'.repeat(32), leaseId: 'lease-1' });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(admissions).toEqual(['rejected']);
+    } finally {
+      setActiveSessionsRegistry(undefined);
+      resetDeviceIsolationActivationForTest();
+    }
   });
 });
 
@@ -3436,6 +3486,44 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     );
     expect(forkMock).not.toHaveBeenCalled();
   });
+
+  it('keeps an adopted turn accepted when post-init pid persistence fails', () => {
+    const ds = makeAdoptDs();
+    vi.mocked(sessionStore.updateSessionPid).mockImplementationOnce(() => {
+      throw new Error('pid persistence failed');
+    });
+
+    expect(forkAdoptWorker(ds, {
+      prompt: '<bridge>accepted once</bridge>',
+      turnId: 'om_adopt_pid_failure',
+    })).toBe('accepted');
+
+    const worker = ds.worker as any;
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      prompt: '<bridge>accepted once</bridge>',
+      turnId: 'om_adopt_pid_failure',
+    }));
+  });
+
+  it('cleans up and reports a synchronous adopt init send failure', () => {
+    const ds = makeAdoptDs();
+    const worker = makeFakeWorker();
+    worker.send.mockImplementationOnce(() => {
+      throw new Error('init send failed');
+    });
+    forkMock.mockReturnValueOnce(worker);
+
+    expect(() => forkAdoptWorker(ds, {
+      prompt: '<bridge>not accepted</bridge>',
+      turnId: 'om_adopt_send_failure',
+    })).toThrow('init send failed');
+
+    expect(ds.worker).toBeNull();
+    expect(ds.initConfig).toBeUndefined();
+    expect(worker.kill).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('session.start lifecycle integration', () => {
@@ -4017,7 +4105,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
     const ds = adopt();
     ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
-    forkAdoptWorker(ds);
+    expect(forkAdoptWorker(ds)).toBe('rejected');
     expect(forkMock).not.toHaveBeenCalled();
     expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
     expect(ds.adoptedFrom).toBeUndefined();
@@ -4035,7 +4123,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 
   it('no sandbox anywhere → adopt proceeds (fork + session.start)', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot());
-    forkAdoptWorker(adopt());
+    expect(forkAdoptWorker(adopt())).toBe('accepted');
     expect(forkMock).toHaveBeenCalled();
     expect(emitHookEventMock).toHaveBeenCalledWith('session.start', expect.objectContaining({
       reason: 'adopt',

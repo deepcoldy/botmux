@@ -14,6 +14,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
+| `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family / Codex terminal only) |
 | `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |
 | `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |

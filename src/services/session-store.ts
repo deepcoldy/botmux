@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
+import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -546,11 +546,25 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
+  opts: { strict?: boolean } = {},
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (opts.strict) throw new Error(`malformed active session store in ${ref.path}`);
+      return [];
+    }
+    const out: Session[] = [];
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object' || (value as { status?: unknown }).status !== 'active') continue;
+      const session = value as Partial<Session>;
+      if (typeof session.sessionId !== 'string') {
+        if (opts.strict) throw new Error(`malformed active session row in ${ref.path}: invalid session object`);
+        continue;
+      }
+      out.push(session as Session);
+    }
+    return out;
   }
   const db = openDbForRead(ref.path);
   try {
@@ -571,7 +585,17 @@ function readStoreActiveRows(
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
     for (const r of rows) {
-      try { out.push(JSON.parse(r.row) as Session); } catch { /* skip unparseable row */ }
+      try {
+        const session = JSON.parse(r.row) as Session;
+        if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
+          throw new Error('invalid session object');
+        }
+        out.push(session);
+      } catch (err) {
+        if (opts.strict) {
+          throw new Error(`malformed active session row in ${ref.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
     return out;
   } finally {
@@ -2422,6 +2446,35 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
+}
+
+export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
+  return findActiveSessionsMatching(s => s.workingDir === workingDir);
+}
+
+/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
+export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const target = resolve(workingDir);
+  const matches: Session[] = [];
+  const targetReal = realpathSync(target);
+  const matchesDir = (session: Session) => {
+    if (session.status !== 'active' || !session.workingDir) return false;
+    let candidate: string;
+    try { candidate = realpathSync(resolve(session.workingDir)); }
+    catch { candidate = resolve(session.workingDir); }
+    const rel = relative(targetReal, candidate);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  };
+  for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
+  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
+    if (ref.appId === currentAppId) continue;
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      if (matchesDir(session)) matches.push(session);
+    }
+  }
+  return matches;
 }
 
 /**

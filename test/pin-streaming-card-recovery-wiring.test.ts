@@ -131,7 +131,8 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
       'if (selfDaemonLarkAppId) {',
     );
 
-    expect(block).toContain('restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),');
+    expect(block).toContain('restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {');
+    expect(block).toContain('prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),');
     expect(block).toContain('larkAppId: cfg.larkAppId,');
     expect(block).toContain('sessionsRestored = true;');
   });

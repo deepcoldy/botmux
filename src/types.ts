@@ -1321,6 +1321,11 @@ export interface PendingRepoSetup {
   rawInput?: string;
   turnId?: string;
   baseDir?: string;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
+  targetSubdir?: string;
   repoCardMessageId?: string;
   codexAppText?: string;
   codexAppApplicationContext?: string;

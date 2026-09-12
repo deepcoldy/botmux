@@ -10,13 +10,15 @@ import { resolve } from 'node:path';
  * runner tolerated the bad signature and ran the binary anyway; macOS 27 SIGKILLs
  * it before main(), which is all `botmux upgrade` saw (exit 137).
  *
- * Two gates now exist, and this suite is what keeps them from quietly vanishing —
+ * These release guarantees are what this suite keeps from quietly vanishing —
  * the repo has no workflow lint, so a deleted step is first noticed after a tag
  * has already published (see ci-musl-gate.test.ts for the same reasoning):
  *   • release.yml verifies EVERY darwin binary with `codesign --verify --strict`
  *     (the smoke step only executes the host arch; the cross-built one is not run)
  *   • scripts/smoke-bun-binary.mjs checks the signature before anything else on
  *     darwin, so the PR gate and the release gate agree
+ *   • stable releases replace the preliminary ad-hoc signature with one Developer
+ *     ID designated requirement before npm or GitHub publishes the CLI
  *   • the build Bun is pinned to a version that carries the fix, and every pin in
  *     the repo agrees with package.json's `packageManager`
  *
@@ -42,6 +44,12 @@ const CI = stripHashComments(read('.github/workflows/ci.yml'));
 const GLIBC_SH = stripHashComments(read('scripts/build-linux-glibc-baseline.sh'));
 const SMOKE = stripJsComments(read('scripts/smoke-bun-binary.mjs'));
 const BUILD = stripJsComments(read('scripts/build-bun-binary.mjs'));
+const STABLE_SIGN = stripHashComments(read('scripts/sign-macos-cli-binaries.sh'));
+const EMBED_PLUGIN = stripJsComments(read('scripts/bun-native-embed-plugin.mjs'));
+const PTY_SMOKE = stripJsComments(read('src/cli/pty-smoke.ts'));
+const CLI = stripJsComments(read('src/cli.ts'));
+const CLI_ENTITLEMENTS = read('build/entitlements.mac.plist');
+const STALE_APPROVAL = stripHashComments(read('.github/workflows/cancel-stale-release-approvals.yml'));
 const PKG = JSON.parse(read('package.json')) as { packageManager?: string };
 
 /** The step body from its `- name:` line up to the next step. */
@@ -191,6 +199,92 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
   it('re-signs both darwin arches rather than special-casing x64', () => {
     // Idempotent, and keeps working if the arch-conditional upstream bug moves.
     expect(BUILD).not.toMatch(/=== 'x64'[\s\S]{0,80}codesign/);
+  });
+});
+
+describe('stable releases — Developer ID identity survives CLI binary replacement', () => {
+  const signJobStart = RELEASE.indexOf('\n  sign-darwin-binaries:');
+  const subpackagesStart = RELEASE.indexOf('\n  binary-subpackages:');
+  const signJob = signJobStart < 0 || subpackagesStart < 0
+    ? ''
+    : RELEASE.slice(signJobStart, subpackagesStart);
+  const subpackages = subpackagesStart < 0
+    ? ''
+    : RELEASE.slice(subpackagesStart, RELEASE.indexOf('\n  attach-bun-binaries:'));
+
+  it('uses the protected macos-signing environment only for stable tags', () => {
+    expect(signJob).not.toBe('');
+    expect(signJob).toMatch(/environment:\s*macos-signing/);
+    expect(signJob).toContain("needs.preflight.outputs.tag == 'latest'");
+    expect(signJob).toContain('MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}');
+    expect(signJob).toContain('MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}');
+  });
+
+  it('replaces the darwin artifact only after both binaries are signed and smoked', () => {
+    const sign = signJob.indexOf('scripts/sign-macos-cli-binaries.sh dist-bin');
+    const generalSmoke = signJob.indexOf('node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64');
+    const ptySmoke = signJob.indexOf('dist-bin/botmux-darwin-arm64 __pty-smoke');
+    const replace = signJob.indexOf('overwrite: true');
+    expect(sign).toBeGreaterThan(-1);
+    expect(generalSmoke).toBeGreaterThan(sign);
+    expect(ptySmoke).toBeGreaterThan(generalSmoke);
+    expect(replace).toBeGreaterThan(ptySmoke);
+    expect(signJob).toContain('name: bun-binaries-darwin');
+    expect(signJob).toMatch(/overwrite:\s*true/);
+  });
+
+  it('fails stable npm publication closed when signing was skipped or failed', () => {
+    expect(subpackages).toContain('sign-darwin-binaries');
+    expect(subpackages).toContain("needs.preflight.outputs.tag != 'latest'");
+    expect(subpackages).toContain("needs.sign-darwin-binaries.result == 'success'");
+    for (const prerequisite of ['preflight', 'bun-binaries', 'bun-binaries-musl']) {
+      expect(subpackages).toContain(`needs.${prerequisite}.result == 'success'`);
+    }
+  });
+
+  it('signs x64 and arm64 with one explicit non-ad-hoc identity', () => {
+    expect(STABLE_SIGN).toMatch(/for arch in x64 arm64/);
+    expect(STABLE_SIGN).toContain('--sign "$IDENTITY"');
+    expect(STABLE_SIGN).toContain('--identifier "$IDENTIFIER"');
+    expect(STABLE_SIGN).toContain('--options runtime');
+    expect(STABLE_SIGN).toContain('--timestamp');
+    expect(STABLE_SIGN).toContain('--entitlements "$ENTITLEMENTS"');
+    expect(STABLE_SIGN).toContain('build/entitlements.mac.plist');
+    expect(CLI_ENTITLEMENTS).toContain('com.apple.security.cs.disable-library-validation');
+    expect(STABLE_SIGN).not.toMatch(/--sign\s+['"]?-['"]?/);
+  });
+
+  it('rejects an unstable identity and pins one designated requirement across arches', () => {
+    expect(STABLE_SIGN).toContain('Developer ID Application:');
+    expect(STABLE_SIGN).toContain('TeamIdentifier');
+    expect(STABLE_SIGN).toContain('*cdhash*');
+    expect(STABLE_SIGN).toContain('darwin x64 and arm64 designated requirements differ');
+    expect(STABLE_SIGN).toContain('cd "$DIST_DIR"');
+    expect(STABLE_SIGN).toContain('shasum -a 256 "$binary_name" > "$binary_name.sha256"');
+  });
+
+  it('uses a native PTY probe that reaches the embedded spawn-helper without tty.ReadStream', () => {
+    expect(CLI).toContain("case '__pty-smoke'");
+    expect(PTY_SMOKE).toContain("loadNativeModule('pty')");
+    expect(PTY_SMOKE).toContain('loaded.module.fork(');
+    expect(PTY_SMOKE).not.toMatch(/\bpty\.spawn\(/);
+    expect(PTY_SMOKE).not.toContain('createRequire');
+    expect(PTY_SMOKE).not.toMatch(/resolve\(['"]node-pty\/lib\/utils\.js/);
+    expect(EMBED_PLUGIN).toContain('materializeSpawnHelper()');
+    expect(EMBED_PLUGIN).toContain('ensurePrivateDirectory(root, uid)');
+    expect(EMBED_PLUGIN).toContain("writeFileSync(temp, bytes, { mode: 0o700 })");
+    expect(EMBED_PLUGIN).toContain('return { dir, helperPath, module: ptyNative }');
+  });
+
+  it('never lets the stale-approval sweep cancel a release-blocking stable signing run', () => {
+    expect(STALE_APPROVAL).toContain('databaseId,createdAt,displayTitle,event,headBranch,url');
+    expect(STALE_APPROVAL).toContain('[ "$event" = "push" ]');
+    expect(STALE_APPROVAL).toContain('[[ "$ref" == v* ]]');
+    expect(STALE_APPROVAL).toContain('[[ "$version" != *"-"* ]]');
+    const exemption = STALE_APPROVAL.indexOf('keep stable release run');
+    const cancellation = STALE_APPROVAL.indexOf('gh run cancel "$id"');
+    expect(exemption).toBeGreaterThan(-1);
+    expect(cancellation).toBeGreaterThan(exemption);
   });
 });
 

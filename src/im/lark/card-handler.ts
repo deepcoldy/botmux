@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
@@ -110,6 +111,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
+import { handleCommand } from '../../core/command-handler.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -450,6 +452,7 @@ export async function commitRepoSelection(
     operatorOpenId?: string;
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+    prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   },
   dirPath: string,
   dirLabel: string,
@@ -463,7 +466,7 @@ export async function commitRepoSelection(
     riffRepoDirs?: string[];
   },
 ): Promise<boolean> {
-  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
+  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply, prepareTurn } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -629,10 +632,11 @@ export async function commitRepoSelection(
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+      if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
       forkWorker(
         ds,
         prompt,
-        !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+        !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
       );
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
@@ -898,8 +902,15 @@ export async function runAutoWorktreeCommit(deps: {
   operatorOpenId?: string;
   activeSessions: Map<string, DaemonSession>;
   notify: (message: string) => Promise<unknown> | void;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
+  /** Relative directory inside a newly-created worktree to preserve as cwd. */
+  targetSubdir?: string;
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify } = deps;
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, prepareTurn, force, worktreePath, branch, reuseExisting, targetSubdir } = deps;
   ds.worktreeCreating = true;
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
@@ -908,8 +919,26 @@ export async function runAutoWorktreeCommit(deps: {
   announcePendingRepoSession(ds);
   try {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
+    let committedUnderTargetLock = false;
+    const commitCreated = async (creation: { path: string }) => {
+      if (!ds.pendingRepo) return;
+      const targetDir = targetSubdir ? join(creation.path, targetSubdir) : creation.path;
+      if (targetSubdir && !existsSync(targetDir)) {
+        throw new Error(`worktree 中不存在原工作目录对应的子目录：${targetSubdir}`);
+      }
+      committedUnderTargetLock = await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
+        {
+          ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
+          sessionReply: async () => '', prepareTurn,
+        },
+        targetDir,
+        pathBasename(targetDir),
+        { suppressConfirmReply: true },
+      ));
+    };
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
-      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
+      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify, force, worktreePath, branch, reuseExisting,
+      ...(reuseExisting && worktreePath ? { commitCreated } : {}),
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
@@ -919,6 +948,7 @@ export async function runAutoWorktreeCommit(deps: {
     // session. Bail on the late result instead: the takeover already owns the
     // session. (commitRepoSelection also re-checks pendingRepo under its claim,
     // but that check runs after an await — fence here before any mutation.)
+    if (committedUnderTargetLock) return;
     if (!ds.pendingRepo) {
       logger.info(`[${tag(ds)}] auto-worktree completion ignored — pendingRepo already consumed (session taken over)`);
       return;
@@ -932,23 +962,30 @@ export async function runAutoWorktreeCommit(deps: {
     // admission. Re-enter with a fresh lease at the delayed commit/fork edge;
     // the outer lease may have ended minutes ago and must not authorize this
     // descendant across a bot-wide config mutation.
+    const targetDir = targetSubdir ? join(wt.dir, targetSubdir) : wt.dir;
+    if (targetSubdir && !existsSync(targetDir)) {
+      throw new Error(`worktree 中不存在原工作目录对应的子目录：${targetSubdir}`);
+    }
     await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
       {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
       },
-      wt.dir,
-      pathBasename(wt.dir),
+      targetDir,
+      pathBasename(targetDir),
       { suppressConfirmReply: true },
     ));
   } catch (e) {
     // No recovery fork here: forking with an empty prompt would DROP the buffered
     // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
-    // the session as commitRepoSelection left it — the inbound router's worker=null
-    // branch re-forks (with the pinned dir) on the user's next message, and a still-
-    // pending session keeps buffering. Loud log so the rare mid-commit throw is seen.
-    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${e instanceof Error ? e.message : e}`);
+    // the session pending and give the user explicit command-based recovery even
+    // when the forced /tw flow never had a repo picker card.
+    const error = e instanceof Error ? e.message : String(e);
+    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${error}`);
+    if (force && ds.pendingRepo) {
+      await notify(`⚠️ worktree 创建失败，任务仍在等待中。可发送 \`/tw\` 重试，或发送 \`/repo\` 选择/直接启动仓库。\n${error}`);
+    }
   } finally {
     ds.worktreeCreating = false;
   }
@@ -1370,6 +1407,42 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
     return resultCardBody;
+  }
+
+
+  if (value?.action === 'close_worktree_confirm') {
+    const rootId = String(value.root_id ?? '');
+    const sessionId = String(value.session_id ?? '');
+    if (!rootId || !sessionId || !larkAppId || !operatorOpenId) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+    }
+    const target = activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!target || target.session.sessionId !== sessionId) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+    }
+    if (!canOperate(target.larkAppId, target.chatId, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_no_perm', undefined, localeForBot(larkAppId)) } };
+    }
+    const invokerOpenId = String(value.invoker_open_id ?? '');
+    if (invokerOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_not_invoker', undefined, localeForBot(larkAppId)) } };
+    }
+    const confirmationState = String(value.confirmation_state ?? '');
+    await handleCommand('/close', rootId, {
+      messageId: cardMessageId ?? `close-wt-confirm-${sessionId}`,
+      rootId,
+      senderId: operatorOpenId,
+      senderType: 'user',
+      msgType: 'interactive',
+      content: `/close wt --yes${confirmationState ? ` --state=${confirmationState}` : ''}`,
+      createTime: String(Date.now()),
+    }, {
+      activeSessions,
+      sessionReply: deps.sessionReply,
+      lastRepoScan,
+      getActiveCount: () => activeSessions.size,
+    }, larkAppId);
+    return { toast: { type: 'success', content: t('cmd.close.worktree_confirm_received', undefined, localeForBot(larkAppId)) } };
   }
 
   if (isAskCardAction(value?.action)) {

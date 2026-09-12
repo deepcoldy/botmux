@@ -186,8 +186,10 @@ function runTool(argv) {
  *
  * Signing needs macOS (`codesign` is an Apple tool), so a darwin binary
  * cross-built from Linux stays unsigned — warn loudly rather than fail, since
- * release.yml builds darwin only on macOS (so the shipped path is always
- * signed) while `--all` on a Linux dev box is a legitimate workflow.
+ * release.yml builds darwin only on macOS while `--all` on a Linux dev box is a
+ * legitimate workflow. This function establishes a structurally valid
+ * preliminary signature. Stable releases replace it with the repository's
+ * Developer ID identity in `sign-darwin-binaries`; prereleases keep it ad-hoc.
  */
 function adhocResignDarwin(outfile) {
   if (process.platform !== 'darwin') {

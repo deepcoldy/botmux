@@ -271,12 +271,13 @@ jobs:
   # satisfiable.
   #
   # ACCEPTED COST: this gives up the previous "npm-first" property, where npm
-  # publish did not wait on the binary build. npm publish now waits for the
-  # `bun-binaries` compile matrix — a few minutes. That is deliberate, and it is
-  # far cheaper than the one thing we still refuse to block on: the macOS
-  # signing manual-approval gate, which can sit for up to 30 days. Signing stays
-  # fully asynchronous — `desktop` and `attach-desktop-assets` are NOT in this
-  # job's `needs`, and only the bun binary COMPILE became a prerequisite.
+  # publish did not wait on binary production. npm now waits for the compile
+  # matrix and, for stable releases, Developer ID signing of the standalone
+  # macOS binaries. That manual approval may delay a stable release, but
+  # publishing ad-hoc-signed CLI binaries would make macOS TCC permissions
+  # version-specific and prompt users again after every update. Desktop asset
+  # packaging/notarization remains asynchronous; only the two CLI executables
+  # are a prerequisite for npm and the GitHub Release.
   #
   # NOTE ON `needs` vs `if` (do not "tidy" this): this job intentionally has NO
   # `if:`. GitHub applies the implicit "all needs succeeded" gate only to jobs
@@ -287,6 +288,9 @@ jobs:
   # tag-push-only restriction is inherited through `preflight`, which carries
   # `if: github.event_name == 'push'`. If you ever add an `if:` here you MUST
   # also re-assert `needs.<each>.result == 'success'` for every entry in `needs`.
+  # `binary-subpackages` below is the deliberate counterpart: it needs an `if:`
+  # to admit a skipped signing job on prereleases, so it explicitly re-asserts
+  # success for every other prerequisite and for stable signing.
   release:
     needs: [preflight, bun-binaries, bun-binaries-musl, binary-subpackages]
     runs-on: ubuntu-latest
@@ -629,7 +633,7 @@ jobs:
         run: |
           echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
           echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
-          echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
+          echo "If Desktop signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach Desktop assets."
   bun-binaries:
     # Build the self-contained Bun single-file executables (see
     # scripts/build-bun-binary.mjs). These let users run botmux with NO Node on
@@ -963,6 +967,54 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  sign-darwin-binaries:
+    # Stable CLI releases need a stable code identity, not merely a structurally
+    # valid ad-hoc signature. macOS TCC records an ad-hoc executable by cdhash;
+    # replacing the binary on upgrade changes that hash and invalidates Full Disk
+    # Access / App Data grants. The Developer ID identity already used by the
+    # desktop release gives both architectures one durable designated requirement.
+    #
+    # This intentionally gates stable publication on the protected environment's
+    # manual approval. Prereleases remain ad-hoc signed so contributors can publish
+    # canary/beta/rc builds without access to the repository owner's certificate.
+    if: github.event_name == 'push' && needs.preflight.outputs.tag == 'latest'
+    needs: [preflight, bun-binaries]
+    runs-on: macos-14
+    environment: macos-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ad-hoc signed darwin binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bun-binaries-darwin
+          path: dist-bin
+
+      - name: Developer ID sign darwin CLI binaries
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: scripts/sign-macos-cli-binaries.sh dist-bin
+
+      - name: Smoke-test the signed host-arch binary
+        run: |
+          chmod +x dist-bin/botmux-darwin-arm64
+          node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64
+
+      - name: Smoke-test the signed darwin native PTY path
+        run: dist-bin/botmux-darwin-arm64 __pty-smoke
+
+      - name: Replace darwin artifact with Developer ID signed binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-binaries-darwin
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
   binary-subpackages:
     # Publish the four platform subpackages — `botmux-linux-x64`,
     # `botmux-linux-arm64`, `botmux-darwin-x64`, `botmux-darwin-arm64` — each
@@ -977,7 +1029,20 @@ jobs:
     #
     # Single runner, not a matrix: publishing is pure npm I/O with no native
     # build, so both OSes' binaries are packed here from the artifacts.
-    needs: [preflight, bun-binaries, bun-binaries-musl]
+    # A skipped sign job is valid only for prereleases. Stable releases fail
+    # closed unless both darwin binaries were Developer ID signed first.
+    if: >-
+      ${{
+        always() &&
+        needs.preflight.result == 'success' &&
+        needs.bun-binaries.result == 'success' &&
+        needs.bun-binaries-musl.result == 'success' &&
+        (
+          needs.preflight.outputs.tag != 'latest' ||
+          needs.sign-darwin-binaries.result == 'success'
+        )
+      }}
+    needs: [preflight, bun-binaries, bun-binaries-musl, sign-darwin-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read

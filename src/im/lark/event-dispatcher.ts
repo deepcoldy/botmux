@@ -25,7 +25,7 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, settleDocCommentWsDelivery, type DocSubscription } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
@@ -3102,9 +3102,10 @@ function handleVcMeetingPushEventAckSafe(
 /**
  * 在被丢弃的触发回复上打一个 ❌，让「这条 @ 我没能处理」在文档里**看得见**。
  *
- * 为什么需要：文档评论事件被丢弃后，飞书不会重投（事件已 ACK），而 mention-only
- * 订阅**不进轮询**（poller 只收 commentTriggerMode==='all'），所以事件链路失败
- * 就是终点。用户侧原本只能看到「bot 不理我」，与「bot 正在忙」无法区分——doc
+ * 为什么需要：文档评论事件被丢弃后，飞书不会重投（事件已 ACK）。已经读到正文、
+ * 通过 @ 与审计门的投递会进入持久 pending 重试；但本 helper 处理的是更早的失败
+ * （正文/回复都没读全，无法构造安全投递上下文），所以仍是终点。用户侧原本只能
+ * 看到「bot 不理我」，与「bot 正在忙」无法区分——doc
  * 发起的会话在飞书上整个不可见，只能去 dashboard 翻 terminal 才知道发生了什么。
  *
  * 只在**明确知道该怪谁**、且非预期的丢弃点上打：
@@ -3278,13 +3279,14 @@ async function processCommentEvent(
     const operatorOpenId = parsed.operatorOpenId;
     const botCfg = getBot(larkAppId).config;
     const mappedDir = botCfg.docRepoMap?.[fileToken];
+    const watchAnchor = docWatchAnchor(fileToken);
     const autoSub: DocSubscription = {
       fileToken,
       fileType: parsed.fileType || 'docx',
-      sessionAnchor: `doc:${fileToken}`,
+      sessionAnchor: watchAnchor,
       sessionId: undefined,
       scope: 'chat',
-      chatId: `doc:${fileToken}`,
+      chatId: watchAnchor,
       commentTriggerMode: 'mention-only',
       managedBy: 'watch-comment',
       ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
@@ -3309,10 +3311,10 @@ async function processCommentEvent(
   // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
   // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
   //
-  //  ① 只在 mention-only 下打。这是唯一没有兜底的模式：poller
-  //     （daemon.ts:pollWatchedDocComments）只轮 `commentTriggerMode === 'all'`，
-  //     且直接调 handleDocComment、不经过本函数。所以 'all' 恰恰**有**轮询兜底
-  //     —— push 链路这次拉取失败的评论，下一轮 poll 很可能被正常处理，而 ❌ 是
+  //  ① 只在 mention-only 下打。它没有评论列表轮询；持久 pending 又只在正文、
+  //     @ 与审计门都已通过后才建立，所以这里这种「正文尚不可读」的失败没有恢复
+  //     上下文。'all' 则有列表轮询兜底 —— push 链路这次拉取失败的评论，下一轮
+  //     poll 很可能被正常处理，而 ❌ 是
   //     终态、不会被摘掉，结果就是永久挂在一条根本没丢的评论上。
   //     （早先注释写的「'all' 拉不到就是真丢了」是反的，PR 描述里「不进轮询 ⇒
   //     没兜底 ⇒ 终点」那条论证**只对 mention-only 成立**。）
@@ -3443,8 +3445,7 @@ async function processCommentEvent(
   // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
   if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) return;
 
-  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
-  await handlers.handleDocComment({
+  const delivery: DocCommentContext = {
     larkAppId,
     sub,
     commentId,
@@ -3457,7 +3458,38 @@ async function processCommentEvent(
     })).filter(reply => reply.text.length > 0),
     isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
-  });
+  };
+  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  let accepted = false;
+  let deliveryError: unknown;
+  try {
+    accepted = await handlers.handleDocComment(delivery);
+  } catch (err) {
+    deliveryError = err;
+  }
+  const retryOutcome = settleDocCommentWsDelivery(
+    config.session.dataDir,
+    larkAppId,
+    fileToken,
+    {
+      commentId: delivery.commentId,
+      replyId: delivery.replyId,
+      text: delivery.text,
+      selectedText: delivery.selectedText,
+      priorReplies: delivery.priorReplies,
+      isWhole: delivery.isWhole,
+      authorOpenId: delivery.authorOpenId,
+      queuedAt: Date.now(),
+    },
+    accepted,
+  );
+  if (!accepted) {
+    logger.warn(
+      `[doc-comment] WS delivery not accepted; retry outcome=${retryOutcome} `
+      + `file=${fileToken.slice(0, 12)} reply=${(delivery.replyId ?? delivery.commentId).slice(0, 12)}`,
+    );
+  }
+  if (deliveryError) throw deliveryError;
 }
 
 const LARK_WS_PROXY_ENV_KEYS = [

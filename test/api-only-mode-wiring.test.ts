@@ -119,6 +119,14 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     expect(block).toContain('.filter(notApiOnly)');
   });
 
+  it('normalizes legacy document watches before restoring sessions can close them', () => {
+    const block = region(daemonSource, 'reapOrphanWorkers();', '// Close CoT thinking bubbles');
+    expect(block).toContain('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)');
+    expect(block).toContain('restoreSessionsAndScheduleStartupRecovery({');
+    expect(block.indexOf('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)'))
+      .toBeLessThan(block.indexOf('restoreSessionsAndScheduleStartupRecovery({'));
+  });
+
   it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
     const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
     expect(block).toContain('if (!cfg.apiOnly) {');
@@ -802,7 +810,10 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
     );
     expect(helperCall).toContain(
-      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),',
+      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
+    );
+    expect(helperCall).toContain(
+      'prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
     );
     expect(helperCall).toContain('markSessionsRestored: () => {');
     expect(helperCall).toContain('sessionsRestored = true;');

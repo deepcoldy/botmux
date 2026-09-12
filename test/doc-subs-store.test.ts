@@ -10,6 +10,11 @@ import {
   listDocSubscriptionsForSession,
   listAllDocSubscriptions,
   setCommentTriggerMode,
+  docCommentThreadAnchor,
+  isDocNativeWatchSubscription,
+  commitDocCommentPollCursor,
+  normalizeDocNativeWatchSubscription,
+  settleDocCommentWsDelivery,
   type DocSubscription,
 } from '../src/services/doc-subs-store.js';
 
@@ -81,5 +86,104 @@ describe('doc-subs-store', () => {
     putDocSubscription(dataDir, APP_A, sub());
     expect(getDocSubscription(dataDir, APP_B, 'doccnFILE1')).toBeNull();
     expect(listAllDocSubscriptions(dataDir, APP_B)).toEqual([]);
+  });
+
+  it('derives one virtual session anchor per document comment thread', () => {
+    expect(docCommentThreadAnchor('doccnFILE1', 'comment-1')).toBe('doc:doccnFILE1:comment-1');
+    expect(docCommentThreadAnchor('doccnFILE1', 'comment-2')).toBe('doc:doccnFILE1:comment-2');
+  });
+
+  it('persists rejected mention-only WS delivery and clears it after acceptance', () => {
+    putDocSubscription(dataDir, APP_A, sub({
+      managedBy: 'watch-comment',
+      commentTriggerMode: 'mention-only',
+    }));
+    const delivery = {
+      commentId: 'comment-1',
+      replyId: 'reply-1',
+      text: 'question',
+      authorOpenId: 'ou_author',
+      queuedAt: 1,
+    };
+
+    expect(settleDocCommentWsDelivery(dataDir, APP_A, 'doccnFILE1', delivery, false)).toBe('queued');
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toEqual([delivery]);
+
+    // A later explicit rebind must not erase the unaccepted WS turn.
+    putDocSubscription(dataDir, APP_A, sub({ sessionAnchor: 'om_rebound' }));
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toEqual([delivery]);
+
+    expect(settleDocCommentWsDelivery(dataDir, APP_A, 'doccnFILE1', delivery, true)).toBe('accepted');
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toBeUndefined();
+  });
+
+  it('preserves pending retry ownership when mode switches to all', () => {
+    const delivery = {
+      commentId: 'comment-1', replyId: 'reply-1', text: 'question', queuedAt: 1,
+    };
+    putDocSubscription(dataDir, APP_A, sub({
+      managedBy: 'watch-comment',
+      commentTriggerMode: 'mention-only',
+      pendingDocCommentDeliveries: [delivery],
+    }));
+
+    expect(setCommentTriggerMode(dataDir, APP_A, 'doccnFILE1', 'all')).toBe(true);
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toEqual([delivery]);
+  });
+
+  it('persists rejected --all WS delivery until the retry loop or list cursor accepts it', () => {
+    putDocSubscription(dataDir, APP_A, sub({
+      managedBy: 'watch-comment',
+      commentTriggerMode: 'all',
+    }));
+    const delivery = { commentId: 'comment-1', replyId: 'reply-1', text: 'question', queuedAt: 1 };
+
+    expect(settleDocCommentWsDelivery(dataDir, APP_A, 'doccnFILE1', delivery, false)).toBe('queued');
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toEqual([delivery]);
+  });
+
+  it('keeps an accepted --all marker across restart until cursor commit retires it atomically', () => {
+    putDocSubscription(dataDir, APP_A, sub({
+      managedBy: 'watch-comment',
+      commentTriggerMode: 'all',
+      pollBaselineReady: true,
+      pollCursorAt: 10,
+      pollCursorReplyId: '100',
+    }));
+    const delivery = { commentId: 'comment-1', replyId: '101', text: 'question', queuedAt: 1 };
+    // First-attempt success has no pre-existing pending row; it must still
+    // create a durable accepted marker until the cursor commits.
+    expect(settleDocCommentWsDelivery(dataDir, APP_A, 'doccnFILE1', delivery, true)).toBe('accepted');
+
+    const accepted = getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries?.[0];
+    expect(accepted).toMatchObject({ replyId: '101', acceptedAt: expect.any(Number) });
+
+    expect(commitDocCommentPollCursor(
+      dataDir, APP_A, 'doccnFILE1', { createdAt: 11, replyId: '101' },
+    )).toBe(true);
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')).toMatchObject({
+      pollCursorAt: 11,
+      pollCursorReplyId: '101',
+      pollBaselineReady: true,
+    });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.pendingDocCommentDeliveries).toBeUndefined();
+  });
+
+  it('normalizes legacy document-native watches without retaining one session binding', () => {
+    const legacy = sub({
+      sessionAnchor: 'doc:doccnFILE1',
+      sessionId: 'legacy-session',
+      scope: 'chat',
+      chatId: 'doc:doccnFILE1',
+      managedBy: 'watch-comment',
+    });
+
+    expect(isDocNativeWatchSubscription(legacy)).toBe(true);
+    expect(normalizeDocNativeWatchSubscription(legacy)).toEqual({
+      ...legacy,
+      sessionAnchor: 'doc:doccnFILE1:watch',
+      sessionId: undefined,
+      chatId: 'doc:doccnFILE1:watch',
+    });
   });
 });

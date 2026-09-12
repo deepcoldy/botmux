@@ -121,12 +121,29 @@ jobs:
   # paths. Bun is what ships the single-file executable, so those paths need a
   # leg that actually runs on it.
   #
-  # Non-blocking on purpose (for now): the shim in test/bun-test-shim.ts
-  # deliberately does not fake `vi.doMock`/`resetModules`/`importOriginal`, and
-  # scripts/run-bun-tests.mjs excludes the files needing them, but the remaining
-  # population has not yet had a full green baseline established across a CI
-  # runner's environment. Flip `continue-on-error` off once it holds green — a
-  # gate that is red for environmental reasons trains people to ignore it.
+  # STILL ADVISORY, but the reason has narrowed. Three of the four flakes that
+  # kept this leg off a green baseline are now fixed at their cause rather than
+  # retried:
+  #   • a port-pair assumption (`base+1` was presumed free) → reserve both,
+  #   • a torn read of a marker file → write tmp + `renameSync`, plus a poll
+  #     predicate that THREW on a partial read, aborting the loop and reporting a
+  #     parse error instead of the timeout → fail soft,
+  #   • an env-leak guard whose transport was node-pty, which cannot fork/exec
+  #     reliably under Bun (see that file's comment for the measurements) → the
+  #     guard now runs over `child_process.spawn` on both legs, with the pty form
+  #     kept for Node only.
+  #
+  # The fourth is NOT fixed: test/tmux-startup-storm-recovery.test.ts wedged in
+  # run 34570428914 — one `(pass)` line, then 180s of silence and a SIGKILL, i.e.
+  # the second case never completed. Observed once in 28 completed master runs
+  # (~4%); not reproduced locally across ~50 attempts spanning core starvation,
+  # piped stdio, the runner's exact spawn shape and args, and its 4-way file
+  # concurrency. Since the test times out per-case at 15s and the file still went
+  # quiet for 180s, whatever blocks it is synchronous.
+  #
+  # A gate that is red for environmental reasons trains people to ignore it, so
+  # this flips to blocking when that cause is named and reproduced — not on a
+  # rerun, and not on the other three being green.
   #
   # The generous timeout is inherent to the design: the runner spawns ONE bun
   # process PER FILE, because `bun test` otherwise runs every file in a single
@@ -143,6 +160,30 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+
+      # Same step as the `test` job above (it moved there with the 3-way unit
+      # shard, #1288), repeated because jobs share no filesystem. WITHOUT IT this
+      # leg is a runner lottery: `prepareDirectSandbox()`
+      # returns null when bwrap is missing, so `overlayTargets()` in
+      # test/sandbox-shim-compiled-form.test.ts yields [] and 4 cases fail on an
+      # image that happens not to ship bubblewrap — MEASURED on two runs of the
+      # same commit range, one printing `bwrap missing` 5 times and failing, the
+      # other printing it 0 times and passing. The failures look like a code
+      # regression and are not one, which is the expensive part.
+      #
+      # ⚠️ Unlike vitest, `bun test` has no host-level skip gate here: the suite
+      # under `describe.skipIf(process.platform !== 'linux')` DOES run on this
+      # linux runner and can only fail once bwrap is absent. Keep this step in
+      # sync with the `test` job's copy.
+      - name: Enable bwrap sandbox for integration tests (best-effort)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+            echo "bwrap userns OK — sandbox integration tests will run for real"
+          else
+            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
+          fi
 
       - uses: oven-sh/setup-bun@v2
         with:
