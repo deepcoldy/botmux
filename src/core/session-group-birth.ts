@@ -41,7 +41,7 @@ import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
-import { sendMessage, replyMessage } from '../im/lark/client.js';
+import { sendMessage, replyMessage, forwardMessage } from '../im/lark/client.js';
 import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -182,19 +182,44 @@ export async function maybeBirthSessionGroup(
       originChatId: dmChatId,
     });
 
-    // Intro message: quote the user's DM text so the group is self-explaining.
-    // Its message_id becomes the turn's IN-GROUP anchor (ctx.messageId below):
-    // the streaming card / replies quote THIS message, keeping every output in
-    // the group — anchoring on the original DM message would leak them to the DM.
-    const excerpt = trimmed
-      ? Array.from(trimmed).slice(0, 500).join('')
-      : t('sg.intro_no_text', undefined, locale);
+    // Origin forward (default on): replay the DM that spawned this group as the
+    // group's own first message. An excerpt can only ever quote TEXT, so an
+    // image / file / 合并转发消息 seed degraded to a bare「（非文本消息）」 and the
+    // group lost every trace of why it exists. Forwarding carries the original
+    // body over verbatim — attachments and forward trees included — which is
+    // the only faithful way to replay a non-text seed into another chat.
+    //
+    // The copy is sent BY THE BOT, so its echo comes back as a self-message and
+    // the dispatcher drops it (only `/close` is routed for self senders): it
+    // can never re-trigger a turn.
+    let forwardedMessageId: string | undefined;
+    if (sg.forwardOrigin !== false) {
+      try {
+        forwardedMessageId = await forwardMessage(larkAppId, messageId, newChatId);
+      } catch (err) {
+        logger.info(`[session-group] origin forward failed for ${newChatId.substring(0, 12)}; falling back to an inline excerpt: ${err}`);
+      }
+    }
+
+    // Intro message: says who started this and where it came from. Its
+    // message_id becomes the turn's IN-GROUP anchor (see replyAnchorMessageId
+    // below) so the streaming card / replies quote a message that lives in the
+    // group — anchoring on the original DM message would leak them to the DM.
+    //
+    // With the origin forward above it is a one-liner pointing at that message;
+    // without it (disabled, or the forward failed) it keeps the legacy shape
+    // and quotes the DM text inline so text seeds never lose their context.
+    const introBody = forwardedMessageId
+      ? t('sg.intro_forwarded', undefined, locale)
+      : `${t('sg.intro', undefined, locale)}\n${trimmed
+        ? Array.from(trimmed).slice(0, 500).join('')
+        : t('sg.intro_no_text', undefined, locale)}`;
     let introMessageId: string | undefined;
     try {
       introMessageId = await sendMessage(
         larkAppId,
         newChatId,
-        `📥 <at user_id="${senderOpenId}"></at> ${t('sg.intro', undefined, locale)}\n${excerpt}`,
+        `📥 <at user_id="${senderOpenId}"></at> ${introBody}`,
         'text',
       );
     } catch (err) {
@@ -224,11 +249,26 @@ export async function maybeBirthSessionGroup(
     void applySessionGroupAvatar(larkAppId, newChatId);
 
     // T1 of two-phase naming: async AI title → rename (fire-and-forget).
-    scheduleSessionGroupTitle({ larkAppId, chatId: newChatId, userText: trimmed });
+    //
+    // ONLY when the routing peek actually produced text. That peek understands
+    // text/post and nothing else, so an image / file / 合并转发消息 seed reaches
+    // here with an empty string — and scheduling on '' is NOT a harmless no-op:
+    // the title service bails inside its async body, i.e. AFTER the attempt is
+    // registered, so the empty call burns one of the three bounded rounds and
+    // arms a 30s backoff. That is exactly why forwarded-message groups used to
+    // sit on「新会话」 and never reach the rename logic.
+    //
+    // Non-text seeds are titled by the recursed handleNewTopic instead, right
+    // after it parses (and, for 合并转发, expands) the message: that path holds
+    // the real content, so the title is summarised from the forwarded
+    // conversation itself rather than from an empty string.
+    const titleScheduled = !!trimmed;
+    if (titleScheduled) scheduleSessionGroupTitle({ larkAppId, chatId: newChatId, userText: trimmed });
 
     logger.info(
       `[session-group] born chat=${newChatId.substring(0, 12)} for dm=${dmChatId.substring(0, 12)} ` +
-      `msg=${messageId.substring(0, 12)} intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
+      `msg=${messageId.substring(0, 12)} fwd=${forwardedMessageId?.substring(0, 12) ?? '-'} ` +
+      `intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
       `name="${placeholder}" workingDir=${workingDir ?? '-'} origin=${originEv.reason}`,
     );
 
@@ -240,12 +280,16 @@ export async function maybeBirthSessionGroup(
       anchor: newChatId,
       // `messageId` stays the ORIGINAL DM message id: resource keys /
       // merge-forward sub-messages belong to it, so downloads must keep using
-      // it. The in-group intro message rides separately as the REPLY anchor
-      // (quote target / session rootMessageId) so the first turn's outputs
-      // land in the group. When the intro failed to send the anchor is left
-      // unset and replies degrade to the DM, but the session still lives in
-      // the group.
-      replyAnchorMessageId: introMessageId,
+      // it. An IN-GROUP message rides separately as the REPLY anchor (quote
+      // target / session rootMessageId) so the first turn's outputs land in
+      // the group: the intro line first, else the forwarded original — both
+      // live in the new chat. Only when BOTH failed is the anchor left unset
+      // and replies degrade to the DM, while the session still lives in the
+      // group.
+      replyAnchorMessageId: introMessageId ?? forwardedMessageId,
+      // Tells the recursed handleNewTopic whether the AI title still needs
+      // scheduling from the fully parsed content (non-text seeds only).
+      sessionGroupTitleScheduled: titleScheduled,
       replyRootId: undefined,
       sessionGroupBirth: true,
     };
