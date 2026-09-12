@@ -6819,9 +6819,13 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
 });
 
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
-// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
-// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
-// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+// `{ triggerUserAuth: object | null }`：null / undefined → 清除（关闭）。
+// 与 /botconfig set 共用 coerceConfigValue + applyConfigField，因此两个门的校验
+// 完全一致：拒绝原因（比如「fallback 不能是 device」）原样透出，不在这里另写一套
+// 判断。applyConfigField 只接受「已解析」的值——跳过 coerce 直接喂字符串会把
+// stringified JSON / 空串原样写进 bots.json，daemon 下次启动在
+// parseTriggerUserAuthConfig 处 fatal（triggerUserAuth must be an object），
+// 所有 bot 进程崩溃循环（见 test/dashboard-ipc.test.ts 回归用例）。
 ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { triggerUserAuth?: unknown };
@@ -6829,13 +6833,16 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
-  // '' is the store's "clear" sentinel; anything else goes through the shared
-  // JSON coercion so a malformed policy is rejected the same way here as it is
-  // from chat.
-  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
-    ? ''
-    : JSON.stringify(body.triggerUserAuth);
-  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  // null/undefined → null（applyConfigField 的清除哨兵）；其余先 JSON.stringify
+  // 成文本，再走共享 coerceConfigValue 解析校验（kind: 'json'），与 /botconfig
+  // set、/api/bot-riff、/api/bot-env 同一条路。
+  let value: unknown = null;
+  if (body.triggerUserAuth !== null && body.triggerUserAuth !== undefined) {
+    const coerced = coerceConfigValue(spec, JSON.stringify(body.triggerUserAuth));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true });
 });

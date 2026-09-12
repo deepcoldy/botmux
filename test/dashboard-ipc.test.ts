@@ -7034,6 +7034,97 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
   });
 });
 
+describe('PUT /api/bot-trigger-user-auth persisted shape', () => {
+  async function withTriggerUserAuthBot(
+    fn: (base: string, configPath: string) => Promise<void>,
+  ): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-tua-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-tua-cfg-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'opencode',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await fn(`http://127.0.0.1:${handle.port}`, configPath);
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('persists the policy as an object, not a stringified JSON scalar', async () => {
+    await withTriggerUserAuthBot(async (base, configPath) => {
+      const res = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true });
+
+      // 回归断言：applyConfigField 只接受「已解析」的值。这里若是字符串，daemon
+      // 下次启动会在 parseTriggerUserAuthConfig 处 fatal（must be an object），
+      // 所有 bot 进程进入崩溃循环——正是线上踩过的坑。
+      const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0].triggerUserAuth;
+      expect(stored).toEqual({
+        enabled: true,
+        tools: ['lark-cli', 'bytedcli'],
+        fallback: 'bot-identity',
+      });
+    });
+  });
+
+  it('rejects an invalid policy with the shared parser reason and leaves disk untouched', async () => {
+    await withTriggerUserAuthBot(async (base, configPath) => {
+      const before = readFileSync(configPath, 'utf8');
+      const res = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          triggerUserAuth: { enabled: true, fallback: 'device' },
+        }),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.ok).toBe(false);
+      expect(String(body.error)).toContain('invalid_trigger_user_auth');
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+    });
+  });
+
+  it('null clears the key instead of persisting an empty string', async () => {
+    await withTriggerUserAuthBot(async (base, configPath) => {
+      const saved = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+        }),
+      });
+      expect(saved.status).toBe(200);
+
+      const cleared = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: null }),
+      });
+      expect(cleared.status).toBe(200);
+      const entry = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect('triggerUserAuth' in entry).toBe(false);
+    });
+  });
+});
+
 describe('PUT /api/bot-agent riff backend pairing', () => {
   it('reports a mismatch close that left a REMOTE session behind', async () => {
     // mojo / riff sessions live off-box: the local row can close while the remote
