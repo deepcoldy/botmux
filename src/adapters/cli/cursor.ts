@@ -97,9 +97,10 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       //     backslash-before-CR as a soft-newline (not part of the submitted
       //     text) and no LF byte hits the stream, making it fold-immune. Costs a
       //     cosmetic trailing `\` in the local TUI render only.
-      // Submit is always a bare Enter (\r). No on-disk submit verification —
-      // cursor's transcript path isn't documented, so the worker relies on
-      // idle detection + the bridge fallback timer.
+      // Submit is always a bare Enter (\r). No adapter-side on-disk submit
+      // verification; the worker relies on idle detection plus the structured
+      // transcript bridge (agent-transcripts JSONL, see cursor-transcript.ts)
+      // for turn attribution and the send-less fallback.
       const useKeys = !!(pty.sendText && pty.sendSpecialKeys);
       const emitText = (s: string) => (useKeys ? pty.sendText!(s) : pty.write(s));
       const emitSoftNewline = () => {
