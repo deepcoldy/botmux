@@ -5,6 +5,7 @@ import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-b
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 
@@ -49,6 +50,19 @@ export function brandMapByAppId(
   } catch {
     return new Map();
   }
+}
+
+/**
+ * Trigger-user CLI auth policy for the private Bot Defaults payload.
+ *
+ * A daemon that predates the field simply omits it, and an unregistered bot
+ * reports null — both mean "off", which is what the dashboard toggle renders as
+ * unchecked. A malformed value (hand-edited bots.json reaching an older daemon
+ * that echoed it verbatim) degrades to off rather than throwing: this aggregate
+ * builds every bot row, so one bad policy must not take the whole page down.
+ */
+function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
+  try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
 }
 
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
@@ -163,11 +177,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
-    // Trigger-user CLI auth policy, verbatim (no secrets in it — just which
-    // tools and what to do when the sender has not authorized).
-    triggerUserAuth: (j?.triggerUserAuth && typeof j.triggerUserAuth === 'object')
-      ? j.triggerUserAuth
-      : null,
+    // Trigger-user CLI auth policy. No secrets in it — just which tools it
+    // covers and what to do when the sender has not authorized. Run through the
+    // SHARED parser so this door cannot drift from bots.json / /botconfig: a
+    // malformed hand edit degrades to null (feature off) instead of reaching
+    // form state as a half-shaped policy the toggle would misrender.
+    triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
