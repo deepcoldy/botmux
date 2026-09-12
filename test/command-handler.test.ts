@@ -430,6 +430,13 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
     listDocComments: vi.fn(async () => []),
     subscribeDocFile: vi.fn(async () => {}),
     unsubscribeDocFile: vi.fn(async () => {}),
+    // 标题快照（best-effort）。默认返回 undefined = 「取不到标题」，这样这些用例
+    // 断言的是**与标题无关**的那条主路径；标题本身的行为在 doc-subs-store /
+    // doc-watches-ipc 两组里测。
+    // ⚠️ 这个工厂是**穷举式白名单**：被测模块新 import 一个具名导出，这里不补就
+    // 会解析成 undefined 并在调用点抛 —— 症状是「一堆无关断言 Number of calls: 0」，
+    // 完全看不出是 mock 缺项。加 doc-comment.ts 的新导出时记得同步这里。
+    fetchDocTitle: vi.fn(async () => undefined),
   };
 });
 
@@ -2002,6 +2009,8 @@ describe('handleCommand', () => {
           workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2049,6 +2058,8 @@ describe('handleCommand', () => {
         expect.any(String),
         LARK_APP_ID,
         expect.objectContaining({ workingDir: undefined }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2086,6 +2097,8 @@ describe('handleCommand', () => {
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
+        // 重新登记要延续投递计数/最近结局；溯源刻意不继承（见 doc-subs-store 顶注）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,

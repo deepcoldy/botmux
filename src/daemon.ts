@@ -515,7 +515,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
+import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, recordDocWatchActivity, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
@@ -22022,13 +22022,24 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
             });
             if (!ok) {
               logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false; stopping this round, will retry next poll)`);
+            } else {
+              // 只在真投出去时记 'dispatched'。失败那条不记 —— 它会在下一轮重试，
+              // 记成失败会让界面在重试成功后仍显示一个已经不成立的错误结局。
+              recordDocWatchActivity(config.session.dataDir, larkAppId, current.fileToken, { outcome: 'dispatched' });
             }
             return ok;
           },
           (reply) => { setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
-        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
+        // 轮询读不到这篇文档（权限撤销 / 文档被删 / 网络）——这是 owner 最需要看见
+        // 的一类静默故障：功能「配着」但从此一条都不会触发，而日志没人天天翻。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, {
+          outcome: 'poll-failed',
+          error: message,
+        });
       }
     }
   } finally {

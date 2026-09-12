@@ -53,7 +53,7 @@ import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSe
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
@@ -3201,7 +3201,16 @@ export async function handleCommand(
             pollBaselineReady,
             createdAt: existing?.createdAt ?? Date.now(),
           };
-          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          // 标题快照：best-effort，取不到就留 undefined（列表回退显示 token）。
+          // 放在 put 之前一起写，省掉一次「先写再改」的盘写。
+          const fetchedTitle = await fetchDocTitle(larkAppId, file);
+          if (fetchedTitle) subscription.docTitle = fetchedTitle;
+          else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
+          // inheritRuntime：重新登记同一篇文档时延续投递计数/最近结局，否则每次
+          // 重登记都把运行态清零，界面上看起来像从没触发过。
+          // ⚠️ 溯源三字段刻意不传：owner 主动 /watch-comment 就意味着这条不再是
+          // 「陌生人 @ 出来的 auto-sub」，继承会让界面挂着已经不成立的审计结论。
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription, { inheritRuntime: true });
           const rebound = previous && previous.sessionAnchor !== anchor;
           let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
             title: file.fileToken.slice(0, 12),

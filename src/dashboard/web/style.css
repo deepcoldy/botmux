@@ -33812,3 +33812,190 @@ a.card-menu-item {
     width: min(400px, calc(100vw - 24px));
   }
 }
+
+/* ─── 文档评论监听（#/doc-watches） ──────────────────────────────────────── */
+
+.dw-add {
+  display: grid;
+  gap: 10px;
+}
+
+.dw-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.dw-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.dw-field > span {
+  color: var(--fg-3);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-m);
+}
+
+.dw-field-wide {
+  width: 100%;
+}
+
+.dw-field-wide input {
+  width: 100%;
+  min-width: 0;
+}
+
+.dw-count {
+  margin-left: 8px;
+  color: var(--fg-3);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-r);
+}
+
+.dw-list {
+  display: grid;
+  gap: 10px;
+}
+
+.dw-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  min-width: 0;
+}
+
+.dw-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dw-title {
+  flex: 1 1 240px;
+  min-width: 0;
+  font-size: var(--fs-14);
+  font-weight: var(--fw-s);
+}
+
+.dw-title a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.dw-title a:hover {
+  text-decoration: underline;
+}
+
+.dw-pill {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  color: var(--fg-3);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-m);
+  white-space: nowrap;
+}
+
+.dw-pill-auto {
+  border-color: color-mix(in srgb, var(--info) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--info) 8%, var(--surface));
+  color: var(--info);
+}
+
+.dw-meta,
+.dw-runtime {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  min-width: 0;
+  color: var(--fg-3);
+  font-size: var(--fs-12);
+}
+
+.dw-meta code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+}
+
+.dw-wd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.dw-muted {
+  color: var(--fg-4);
+}
+
+.dw-warn {
+  color: var(--warning);
+}
+
+/* 结局色带。刻意区分 normal 与 warn：mention-only 下绝大多数事件都是
+   「未 @ 本 bot」这种**正常**丢弃，把它标红会让健康看板一片红、真故障被淹掉。 */
+.dw-outcome {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-m);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.dw-outcome-ok {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 9%, var(--surface));
+  color: var(--success);
+}
+
+.dw-outcome-normal {
+  color: var(--fg-3);
+}
+
+.dw-outcome-warn {
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+  color: var(--warning);
+}
+
+.dw-outcome-error {
+  border-color: color-mix(in srgb, var(--danger) 36%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
+  color: var(--danger);
+}
+
+.dw-error {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--danger);
+  font-size: var(--fs-12);
+}
+
+.dw-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dw-bot-errors {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--fg-3);
+  font-size: var(--fs-12);
+}
