@@ -28,6 +28,11 @@ const owner = (turnId: string, dispatchAttempt?: number) => ({
   turnId,
   ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
 });
+const readonlyOwner = (turnId: string, dispatchAttempt: number) => ({
+  turnId,
+  dispatchAttempt,
+  readonlyContinuation: true as const,
+});
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
   it('passes exact argv and env to the model-owning app-server through a portable spawn seam', async () => {
@@ -68,6 +73,161 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     } finally {
       engine.stop();
     }
+  }, 20_000);
+
+  it('does not weaken ordinary turns with process-wide multi-agent overrides', async () => {
+    const launches: Array<{ args: string[] }> = [];
+    const engine = makeEngine({ readonlyContinuationHardened: true }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        launches.push({ args: [...args] });
+        return spawn(command, args, options);
+      },
+    });
+    try {
+      await engine.start();
+      expect(launches[0]?.args).not.toContain('features.multi_agent=false');
+      expect(launches[0]?.args).not.toContain('features.multi_agent_v2=false');
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('uses turn-scoped read-only restrictions without changing thread capability selections', async () => {
+    const turnFile = join(tmpdir(), `fake-turn-cfg-${Math.round(performance.now())}.jsonl`);
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: { ...process.env, FAKE_TURN_CONFIG_FILE: turnFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('continue safely', readonlyOwner('readonly-1', 1));
+    await engine.sendTurn('ordinary user turn', owner('ordinary-2', 2));
+    engine.stop();
+    const turns = readFileSync(turnFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    rmSync(turnFile, { force: true });
+    expect(turns[0]).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      environments: [],
+      runtimeWorkspaceRoots: [],
+    });
+    expect(turns[0].capabilities).toBeUndefined();
+    expect(turns[0].multiAgentMode).toBeUndefined();
+    expect(turns[1]).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+    expect(turns[1].environments).toBeUndefined();
+    expect(turns[1].runtimeWorkspaceRoots).toBeUndefined();
+    expect(turns[1].capabilities).toBeUndefined();
+    expect(turns[1].multiAgentMode).toBeUndefined();
+  }, 20_000);
+
+  it('fails capability proof closed for external MCP, enabled tool skills, or unhardened runtime', async () => {
+    const unhardened = makeEngine();
+    expect(await unhardened.checkReadonlyContinuationCapabilities()).toEqual({
+      ok: false, reason: 'readonly_continuation_runtime_not_hardened',
+    });
+    unhardened.stop();
+
+    for (const [env, reason] of [
+      [{ FAKE_MCP_CAPABILITY: 'tools' }, 'readonly_continuation_external_mcp_capability'],
+      [{ FAKE_MCP_CAPABILITY: 'empty' }, 'readonly_continuation_external_mcp_capability'],
+      [{ FAKE_SKILL_TOOL_DEPENDENCY: '1' }, 'readonly_continuation_skill_tool_dependency'],
+    ] as const) {
+      const engine = makeEngine({
+        readonlyContinuationHardened: true,
+        env: { ...process.env, ...env },
+      });
+      await engine.start();
+      await engine.startThread();
+      expect(await engine.checkReadonlyContinuationCapabilities()).toEqual({ ok: false, reason });
+      engine.stop();
+    }
+
+    const eligible = makeEngine({ readonlyContinuationHardened: true });
+    await eligible.start();
+    await eligible.startThread();
+    expect(await eligible.checkReadonlyContinuationCapabilities()).toEqual({ ok: true });
+    eligible.stop();
+  }, 20_000);
+
+  it.each([
+    { FAKE_MCP_RESPONSE: 'missing-data' },
+    { FAKE_MCP_RESPONSE: 'malformed-data' },
+    { FAKE_MCP_RESPONSE: 'malformed-cursor' },
+    { FAKE_SKILLS_RESPONSE: 'missing-data' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-data' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-entry' },
+    { FAKE_SKILLS_RESPONSE: 'errors' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-skill' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-dependencies' },
+    { FAKE_SKILLS_RESPONSE: 'malformed-tool-dependency' },
+  ])('fails malformed capability inventory closed: %o', async env => {
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: { ...process.env, ...env },
+    });
+    try {
+      await engine.start();
+      await engine.startThread();
+      expect(await engine.checkReadonlyContinuationCapabilities()).toEqual({
+        ok: false, reason: 'readonly_continuation_capability_probe_failed',
+      });
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('fails every restricted server request closed even when it precedes turn/start ack', async () => {
+    const methods = [
+      'item/commandExecution/requestApproval',
+      'item/fileChange/requestApproval',
+      'execCommandApproval',
+      'applyPatchApproval',
+      'mcpServer/elicitation/request',
+      'item/tool/call',
+      'item/tool/requestUserInput',
+      'item/permissions/requestApproval',
+      'future/unknown/request',
+    ];
+    const responseFile = join(tmpdir(), `fake-server-response-${Math.round(performance.now())}.jsonl`);
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      readonlyContinuationHardened: true,
+      env: {
+        ...process.env,
+        FAKE_SERVER_REQUEST_METHODS: methods.join(','),
+        FAKE_SERVER_RESPONSE_FILE: responseFile,
+      },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    for (let index = 0; index < methods.length; index++) {
+      await engine.sendTurn(`restricted ${index}`, readonlyOwner(`restricted-${index}`, index + 1));
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+    engine.stop();
+    const responses = readFileSync(responseFile, 'utf8').trim().split('\n')
+      .filter(Boolean).map(line => JSON.parse(line));
+    rmSync(responseFile, { force: true });
+    expect(responses.map(response => response.result ?? response.error)).toEqual([
+      { decision: 'cancel' },
+      { decision: 'cancel' },
+      { decision: 'abort' },
+      { decision: 'abort' },
+      { action: 'cancel', content: null, _meta: null },
+      { contentItems: [], success: false },
+      // requestUserInput is cancelled by turn/interrupt without a direct reply.
+      { code: -32000, message: 'server request denied in read-only continuation: item/permissions/requestApproval' },
+      { code: -32000, message: 'server request denied in read-only continuation: future/unknown/request' },
+    ]);
+    expect(terminals).toHaveLength(methods.length);
+    expect(terminals.every(terminal => terminal.status === 'aborted')).toBe(true);
+    expect((engine as any).readonlyNativeTurns.size).toBe(0);
+    expect((engine as any).pendingReadonlyTurnOwners.size).toBe(0);
+    expect((engine as any).deferredPreResponseServerRequests.size).toBe(0);
   }, 20_000);
 
   it('start (spawn → /readyz → connect → initialize) then startThread → sendTurn → stop', async () => {
@@ -604,6 +764,30 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       identity: { turnId: `turn-${nativeStatus}`, dispatchAttempt: 6 },
       status: expectedStatus,
       ...(errorCode ? { errorCode } : {}),
+    })]);
+    engine.stop();
+  }, 20_000);
+
+  it('recognises the exact output-limit message even when a generic code is also present', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-output-limit',
+      env: {
+        ...process.env,
+        FAKE_TURN_STATUS: 'failed',
+        FAKE_TURN_ERROR_CODE: 'generic_turn_failed',
+        FAKE_TURN_ERROR_MESSAGE: 'model output limit exceeded: max_output_tokens',
+      },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('output limit', owner('turn-output-limit', 7));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'turn-output-limit', dispatchAttempt: 7 },
+      status: 'failed',
+      errorCode: 'codex_output_limit_exceeded',
     })]);
     engine.stop();
   }, 20_000);

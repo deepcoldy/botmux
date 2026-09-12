@@ -471,6 +471,22 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(overloaded.stderr).toContain('policy service overloaded; denying spawn');
   });
 
+  it('denies spawn when the authenticated daemon binds the turn to read-only continuation', async () => {
+    const denied = await runHook(JSON.stringify(spawnPayload), {
+      response: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
+    });
+
+    expect(denied.status).toBe(0);
+    expect(JSON.parse(denied.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'read-only continuation forbids subagents',
+      },
+    });
+    expect(denied.stderr).toContain('daemon denied spawn for read-only continuation');
+  });
+
   it('cancels oversized and timed-out never-ending response streams', async () => {
     const oversized = await runHook(JSON.stringify(spawnPayload), {
       responseMode: 'oversized-never-ending',

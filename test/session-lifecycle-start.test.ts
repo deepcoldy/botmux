@@ -43,6 +43,8 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
+  buildCanonicalFinalReplyCard: vi.fn(() => '{"type":"final"}'),
+  buildContextualReplyCard: vi.fn(() => '{"type":"contextual"}'),
   getCliDisplayName: vi.fn(() => 'Codex'),
   // Echo the inputs the failure-notice assertions care about (error code +
   // retry action) rather than a fixed blob, so those assertions test the
@@ -70,6 +72,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botOpenId: 'ou_bot',
     botName: 'TestBot',
   })),
+  resolveBrandLabel: vi.fn(() => 'TestBot'),
   getAllBots: vi.fn(() => []),
   getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
   // Provenance travels with the path (see core/config-dir.ts): 'loaded' = the
@@ -184,11 +187,17 @@ import {
   forkWorker,
   getDaemonBootId,
   initWorkerPool,
+  ensureReadonlyTaskContinuationAttached,
   promoteQueuedActivationTail,
   restartCounts,
   sendWorkerInput,
+  setActiveSessionsRegistry,
   suspendWorker,
 } from '../src/core/worker-pool.js';
+import {
+  disposeReadonlyTaskContinuation,
+  startReadonlyTaskContinuation,
+} from '../src/services/readonly-task-continuation.js';
 import {
   managedOriginCapabilityDirectory,
   readManagedOriginCapability,
@@ -262,6 +271,7 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
@@ -285,6 +295,13 @@ beforeEach(() => {
     getActiveCount: () => 1,
     closeSession: vi.fn(),
   });
+  setActiveSessionsRegistry(undefined);
+});
+
+afterEach(() => {
+  delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
+  disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
+  setActiveSessionsRegistry(undefined);
 });
 
 describe('host memory pressure worker admission', () => {
@@ -1204,6 +1221,671 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
     expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
     expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认');
+  });
+});
+
+describe('TraeX opt-in read-only task continuation', () => {
+  function startTraexLease() {
+    vi.useFakeTimers();
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.workerReady = true;
+    worker.emit('message', {
+      type: 'readonly_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(startReadonlyTaskContinuation(ds.session, {
+      turnId: 'om_original',
+      workerGeneration: ds.workerGeneration!,
+      ttlMs: 60_000,
+      maxContinuations: 2,
+    })).toMatchObject({ status: 'active', continuationsStarted: 0 });
+    return { ds, worker };
+  }
+
+  it('continues a completed turn and the exact output-limit failure without replaying the task', async () => {
+    const { ds, worker } = startTraexLease();
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({ status: 'backoff' });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const first = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(first).toEqual(expect.objectContaining({
+      content: expect.stringContaining('[BOTMUX_READONLY_CONTINUATION]'),
+    }));
+    expect(first.content).not.toContain('original task');
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: first.turnId,
+      dispatchAttempt: first.dispatchAttempt,
+      status: 'failed',
+      errorCode: 'codex_output_limit_exceeded',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const continuations = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(continuations).toHaveLength(2);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      continuationsStarted: 2,
+      currentTurnId: continuations[1].turnId,
+    });
+  });
+
+  it('ignores the MR1 failed-turn fallback and lets the exact output-limit terminal continue', async () => {
+    const { ds, worker } = startTraexLease();
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const first = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(first).toEqual(expect.objectContaining({ dispatchAttempt: 1 }));
+
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: first.turnId,
+      dispatchAttempt: first.dispatchAttempt,
+      lastUuid: 'mr1-failed-turn-fallback',
+      content: 'model output limit exceeded: max_output_tokens',
+      turnFailed: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      currentTurnId: first.turnId,
+      continuationsStarted: 1,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: first.turnId,
+      dispatchAttempt: first.dispatchAttempt,
+      status: 'failed',
+      errorCode: 'codex_output_limit_exceeded',
+    });
+    await Promise.resolve();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      continuationsStarted: 1,
+    });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const continuations = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(continuations).toHaveLength(2);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      continuationsStarted: 2,
+      currentTurnId: continuations[1].turnId,
+    });
+  });
+
+  it('does not mistake the original turn MR1 failed fallback for business-final proof', async () => {
+    const { ds, worker } = startTraexLease();
+
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      lastUuid: 'mr1-original-failed-turn-fallback',
+      content: 'model output limit exceeded: max_output_tokens',
+      turnFailed: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      currentTurnId: 'om_original',
+      continuationsStarted: 0,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'codex_output_limit_exceeded',
+    });
+    await Promise.resolve();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      continuationsStarted: 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const continuations = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(continuations).toHaveLength(1);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      continuationsStarted: 1,
+      currentTurnId: continuations[0].turnId,
+    });
+  });
+
+  it('keeps an overdue restored backoff waiting for the live worker RPC proof', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const now = Date.now();
+    const ds = makeDs();
+    ds.session.cliId = 'traex';
+    ds.session.workerGeneration = 7;
+    ds.session.readonlyTaskContinuation = {
+      leaseId: 'readonly-cold-backoff',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: now - 10_000,
+      expiresAt: now + 60_000,
+      maxContinuations: 2,
+      continuationsStarted: 0,
+      status: 'backoff',
+      nextAttemptAt: now - 1,
+    };
+
+    forkWorker(ds, '', { resume: true });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      continuationsStarted: 0,
+    });
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', {
+      type: 'readonly_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-after-restore',
+      eligible: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const continuations = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(continuations).toHaveLength(1);
+    expect(continuations[0]).toEqual(expect.objectContaining({
+      dispatchAttempt: 1,
+      readonlyContinuation: {
+        leaseId: 'readonly-cold-backoff',
+        rpcGeneration: 'rpc-proof-after-restore',
+      },
+    }));
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      continuationsStarted: 1,
+      currentTurnId: continuations[0].turnId,
+      currentWorkerGeneration: 8,
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(1);
+  });
+
+  it('does not continue another failure code', async () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'codex_connection_failed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'failed',
+      lastErrorCode: 'codex_connection_failed',
+    });
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+  });
+
+  it('settles an original turn only on an explicit final send marker', async () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_original',
+      messageId: 'om_final_reply',
+      responseKind: 'final',
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_final_reply',
+    });
+  });
+
+  it('does not settle on progress or a final marker from another turn', () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_original',
+      messageId: 'om_progress',
+      responseKind: 'progress',
+    });
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_other',
+      messageId: 'om_other_final',
+      responseKind: 'final',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      currentTurnId: 'om_original',
+    });
+  });
+
+  it('keeps a continuation live for its exact synthetic turn and cancels it for any other admitted turn', async () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const continuation = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    expect(continuation).toEqual(expect.objectContaining({ dispatchAttempt: 1 }));
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      currentTurnId: continuation.turnId,
+      currentDispatchAttempt: 1,
+    });
+
+    expect(sendWorkerInput(ds, 'same continuation', continuation.turnId, {
+      dispatchAttempt: 1,
+    })).toBe(true);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({ status: 'active' });
+
+    expect(sendWorkerInput(ds, 'scheduled side turn', 'schedule-other-turn')).toBe(true);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'cancelled',
+      cancelledByTurnId: 'schedule-other-turn',
+    });
+  });
+
+  it('treats the original leased turn final output as business-final proof', () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      lastUuid: 'original-final',
+      content: '{"status":"completed","content":"ordinary output"}',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      currentTurnId: 'om_original',
+      completedMessageId: 'original-final',
+    });
+    expect(ds.session.readonlyTaskContinuation?.currentDispatchAttempt).toBeUndefined();
+    expect(ds.session.readonlyTaskContinuation?.pendingDelivery).toBeUndefined();
+  });
+
+  it('keeps a local failed fence when cancelling for new input cannot persist', () => {
+    const { ds, worker } = startTraexLease();
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => {
+      throw new Error('session store unavailable');
+    });
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_interrupt')).toBe(true);
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'failed',
+      currentTurnId: 'om_original',
+      lastErrorCode: 'readonly_continuation_user_cancel_persist_failed',
+    });
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+  });
+
+  it('settles a synthetic continuation only for the exact dispatch attempt', async () => {
+    const sessionReply = vi.fn(async () => 'om_readonly_final');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const { ds, worker } = startTraexLease();
+    setActiveSessionsRegistry(new Map([['om_root::app_test', ds]]));
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const continuation = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-readonly-'));
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: continuation.turnId,
+      dispatchAttempt: 2,
+      lastUuid: 'wrong-attempt',
+      content: '{"status":"completed","content":"wrong"}',
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({ status: 'active' });
+
+    vi.useRealTimers();
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      turnId: continuation.turnId,
+      dispatchAttempt: 1,
+      lastUuid: 'exact-attempt',
+      content: '{"status":"completed","content":"done"}',
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({ status: 'delivering' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    expect(ds.session.readonlyTaskContinuation?.lastErrorCode).toBeUndefined();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_readonly_final',
+      pendingDelivery: undefined,
+    });
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.any(String),
+      'interactive',
+      'app_test',
+      continuation.turnId,
+      expect.objectContaining({ uuid: expect.stringMatching(/^bf_/) }),
+    );
+    setActiveSessionsRegistry(undefined);
+  });
+
+  it('replays one recent persisted daemon-owned delivery after daemon restore', async () => {
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_recovered_final');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.cliId = 'traex';
+    ds.session.workerGeneration = 7;
+    ds.session.readonlyTaskContinuation = {
+      leaseId: 'readonly-restored',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-readonly-restored',
+      currentDispatchAttempt: 2,
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 3,
+      continuationsStarted: 2,
+      status: 'delivering',
+      pendingDelivery: {
+        kind: 'completed',
+        content: 'restored result',
+        startedAt: Date.now() - 1_000,
+      },
+    };
+    setActiveSessionsRegistry(new Map([['om_root::app_test', ds]]));
+
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    expect(ds.session.readonlyTaskContinuation?.lastErrorCode).toBeUndefined();
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_recovered_final',
+    });
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    setActiveSessionsRegistry(undefined);
+  });
+
+  it('keeps a rejected warning pending and replays it with one stable UUID after restore', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    let reject = true;
+    const sessionReply = vi.fn(async () => {
+      if (reject) throw new Error('lark unavailable');
+      return 'om_recovered_warning';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.cliId = 'traex';
+    ds.session.readonlyTaskContinuation = {
+      leaseId: 'readonly-warning-restored',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-readonly-failed',
+      currentDispatchAttempt: 2,
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 3,
+      continuationsStarted: 2,
+      status: 'failed',
+      lastErrorCode: 'readonly_continuation_enqueue_failed',
+      pendingWarning: { startedAt: Date.now() - 1_000, deliveryAttempts: 0 },
+    };
+    setActiveSessionsRegistry(new Map([['om_root::app_test', ds]]));
+
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'failed',
+      pendingWarning: expect.any(Object),
+    });
+    expect(ds.session.readonlyTaskContinuation?.warningDispatched).toBeUndefined();
+    const firstUuid = sessionReply.mock.calls[0]?.[5]?.uuid;
+    expect(firstUuid).toMatch(/^bf_/);
+    expect(sessionReply.mock.calls.every(call => call[5]?.uuid === firstUuid)).toBe(true);
+
+    reject = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sessionReply).toHaveBeenCalledTimes(4);
+    expect(sessionReply.mock.calls[3]?.[5]?.uuid).toBe(firstUuid);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      warningDispatched: true,
+      warningMessageId: 'om_recovered_warning',
+      pendingWarning: undefined,
+    });
+    setActiveSessionsRegistry(undefined);
+  });
+
+  it('expires a stale warning outbox without replaying it and restores dashboard attention', () => {
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_unexpected');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.cliId = 'traex';
+    ds.session.readonlyTaskContinuation = {
+      leaseId: 'readonly-warning-expired',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-readonly-failed',
+      currentDispatchAttempt: 2,
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 60 * 60_000,
+      expiresAt: Date.now() - 1,
+      maxContinuations: 3,
+      continuationsStarted: 2,
+      status: 'failed',
+      lastErrorCode: 'readonly_continuation_enqueue_failed',
+      pendingWarning: {
+        startedAt: Date.now() - 55 * 60_000,
+        deliveryAttempts: 4,
+        nextAttemptAt: Date.now() - 1,
+      },
+    };
+
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'failed',
+      lastErrorCode: 'readonly_continuation_warning_delivery_expired',
+      pendingWarning: undefined,
+    });
+  });
+
+  it('settles a persisted warning after cold restore even when the kill switch is off', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_disabled_recovered_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.cliId = 'traex';
+    ds.session.readonlyTaskContinuation = {
+      leaseId: 'readonly-warning-disabled',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-readonly-failed',
+      currentDispatchAttempt: 1,
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 3,
+      continuationsStarted: 1,
+      status: 'failed',
+      lastErrorCode: 'readonly_continuation_enqueue_failed',
+      pendingWarning: { startedAt: Date.now() - 1_000, deliveryAttempts: 0 },
+    };
+
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      warningDispatched: true,
+      warningMessageId: 'om_disabled_recovered_warning',
+      pendingWarning: undefined,
+    });
+    expect(vi.mocked(forkMock)).not.toHaveBeenCalled();
+  });
+
+  it('cancels a restored live lease when the feature becomes ineligible', () => {
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
+    startReadonlyTaskContinuation(ds.session, {
+      turnId: 'om_original', workerGeneration: ds.workerGeneration ?? 1,
+    });
+
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    ds.session.cliId = 'codex';
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(false);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'cancelled',
+      lastErrorCode: 'readonly_continuation_ineligible',
+    });
+  });
+
+  it.each([
+    ['non-TraeX', defaultBot({ cliId: 'codex' }), {}],
+    ['adopt', defaultBot({ cliId: 'traex' }), { adoptedFrom: { sessionId: 'external' } }],
+    ['VC receiver', defaultBot({ cliId: 'traex' }), {
+      session: { vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 } },
+    }],
+    ['deferred schedule', defaultBot({ cliId: 'traex' }), {
+      session: { deferredScheduleRun: { turnId: 'schedule-turn' } },
+    }],
+    ['external topicless trigger', defaultBot({ cliId: 'traex' }), {
+      session: { externalTriggerTopicless: true },
+    }],
+    ['no Lark transport', defaultBot({ cliId: 'traex' }), { chatId: 'http_async_test' }],
+  ])('does not attach for %s sessions', (_label, bot, shape) => {
+    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => bot as any);
+    const { session: sessionShape, ...daemonShape } = shape as any;
+    const ds = makeDs(daemonShape);
+    if (sessionShape) Object.assign(ds.session, sessionShape);
+
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(false);
+    expect(startReadonlyTaskContinuation(ds.session, {
+      turnId: 'om_original', workerGeneration: ds.workerGeneration ?? 1,
+    })).toBeUndefined();
+  });
+
+  it('stays disabled unless the machine-wide switch is explicitly true', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(false);
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
   });
 });
 
