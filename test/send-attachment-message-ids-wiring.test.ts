@@ -103,4 +103,22 @@ describe('send 附件消息 id 的接线（helper 返回 ≠ cmdSend 输出）',
     expect(block).toMatch(/attachmentMessageIds\.length > 0 \? \{ attachmentMessageIds \}/);
     expect(block).toMatch(/videoMessageIds\.length > 0 \? \{ videoMessageIds \}/);
   });
+
+  it('stderr 提示排除掉「就是主消息」的那一条，JSON 侧不受影响', () => {
+    // 纯视频路径下 `messageId = videoResult.sent[0]`，于是 videoMessageIds[0] === messageId。
+    // 提示行若不过滤就会打印「附件消息: om_X（附件是独立消息，主消息 om_X 上查不到它们）」——
+    // 列出的那个 id 就是主消息自己。单视频无正文是该路径最常见的用法，会稳定触发。
+    const code = cliSource.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    // ① 过滤集合确实是「两个 id 数组减去主消息 id」
+    expect(code).toMatch(
+      /const separateAttachmentMessageIds = \[\.\.\.attachmentMessageIds, \.\.\.videoMessageIds\]\s*\.filter\(id => id !== messageId\);/,
+    );
+    // ② 提示行用的是过滤后的集合，不是原始拼接（回到原形态即红）
+    const hint = blockFrom('separateAttachmentMessageIds.length > 0');
+    expect(hint).toContain('separateAttachmentMessageIds.join');
+    expect(hint).not.toContain('...attachmentMessageIds, ...videoMessageIds');
+    // ③ JSON 侧必须仍输出**未过滤**的完整数组，否则调用方「要几个附件就该有几个 id」
+    //    这条核验判据会在纯视频路径下少一个而误判成上传失败。
+    expect(successJsonBlock()).not.toContain('separateAttachmentMessageIds');
+  });
 });

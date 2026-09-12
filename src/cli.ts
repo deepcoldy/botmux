@@ -10206,9 +10206,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --mention 的 open_id 解析（在上方 mentions 数组里完成）仍然必要，它让
     // Lark 在消息里渲染真正的 @at 元素，从而触发对方 bot 的 WS 事件投递。
 
-    if (attachmentMessageIds.length > 0 || videoMessageIds.length > 0) {
+    // On the pure-video path the first video IS the primary message
+    // (`messageId = videoResult.sent[0]` above), so listing it here would print
+    // the primary id while claiming the primary message cannot carry it.
+    // Filtering by id keeps one wording correct on every path instead of
+    // branching on `pureVideoSend`; the JSON fields stay unfiltered so the
+    // caller's "one id per requested attachment" check is unaffected.
+    const separateAttachmentMessageIds = [...attachmentMessageIds, ...videoMessageIds]
+      .filter(id => id !== messageId);
+    if (separateAttachmentMessageIds.length > 0) {
       console.error(
-        `   附件消息: ${[...attachmentMessageIds, ...videoMessageIds].join(', ')}`
+        `   附件消息: ${separateAttachmentMessageIds.join(', ')}`
         + `（附件是独立消息，主消息 ${messageId} 上查不到它们）`,
       );
     }
