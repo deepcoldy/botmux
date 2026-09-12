@@ -6819,8 +6819,8 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
 });
 
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
-// `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
-// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
+// `{ triggerUserAuth?: object | null }`：省略 / null / 空对象 → 清除（关闭）。
+// 与 /botconfig set 共用 coerceConfigValue → applyConfigField：拒绝原因
 // （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
 ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -6829,13 +6829,17 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
-  // '' is the store's "clear" sentinel; anything else goes through the shared
-  // JSON coercion so a malformed policy is rejected the same way here as it is
-  // from chat.
-  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
-    ? ''
-    : JSON.stringify(body.triggerUserAuth);
-  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  const policy = body.triggerUserAuth;
+  const clear = policy === null || policy === undefined
+    || (typeof policy === 'object' && !Array.isArray(policy) && Object.keys(policy).length === 0);
+  // The store accepts parsed values and null for clearing, never JSON text.
+  let value: unknown = null;
+  if (!clear) {
+    const coerced = coerceConfigValue(spec, JSON.stringify(policy));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true });
 });
