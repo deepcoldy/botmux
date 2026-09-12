@@ -1,5 +1,6 @@
 import type React from 'react';
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -498,12 +499,11 @@ function RenameInput(props: {
   );
 }
 
-function KanbanCard(props: {
+function KanbanCardBase(props: {
   row: any;
   dragId: string | null;
   dropBeforeId: string | null;
   editingId: string | null;
-  groupBy: KanbanGroupBy;
   callbacks: SessionsKanbanCallbacks;
   cancelOpen: () => void;
   onBeginEdit: (row: any) => void;
@@ -672,7 +672,50 @@ function KanbanCard(props: {
   );
 }
 
-function ClusterView(props: {
+/**
+ * 卡片是看板里唯一按会话数量线性增长的东西（bot 分组下实测 1406 张），而每张卡片
+ * 渲染一次要跑 rowTitle/botDisplayName/chatDisplayTitle/sessionExchangePreview/
+ * deriveSessionBoardColumn + 一串 t()。选中一张卡片只改一个 id，却会让所有卡片
+ * 重算一遍——实测单次点选主线程阻塞约 2s。
+ *
+ * 这里按「这张卡片会不会长得不一样」做等价判断：只有它自己的 row、它自己的选中
+ * 态、以及真正作用到它身上的拖拽/重命名标记变化时才重渲染。dragId/dropBeforeId/
+ * editingId 都先折叠成布尔再比，于是拖动或改名时只有相关的那一两张卡片重渲染，
+ * 而不是整列。
+ */
+const KanbanCard = memo(KanbanCardBase, (prev, next) => {
+  if (prev.row !== next.row) return false;
+  const id = next.row.sessionId;
+  // callbacks 是整个 props 对象：selectedSessionIds 每次选中都是新 Set，onXxx 现在已在
+  // 页面侧固定。所以不能拿它的引用当判据（那等于 memo 永不命中），要逐个比卡片真正
+  // 渲染时读到的字段。
+  const a = prev.callbacks;
+  const b = next.callbacks;
+  if (a.icons !== b.icons
+    || a.canRestartSession !== b.canRestartSession
+    || a.lockActionLabel !== b.lockActionLabel
+    || a.sessionStatusText !== b.sessionStatusText
+    || a.onClose !== b.onClose
+    || a.onDetails !== b.onDetails
+    || a.onHistory !== b.onHistory
+    || a.onOpenTerminal !== b.onOpenTerminal
+    || a.onOpenWritableTerminal !== b.onOpenWritableTerminal
+    || a.onRename !== b.onRename
+    || a.onRestart !== b.onRestart
+    || a.onToggleLock !== b.onToggleLock) return false;
+  if ((prev.dragId === prev.row.sessionId) !== (next.dragId === id)) return false;
+  if ((prev.dropBeforeId === prev.row.sessionId) !== (next.dropBeforeId === id)) return false;
+  if ((prev.editingId === prev.row.sessionId) !== (next.editingId === id)) return false;
+  if (a.selectedSessionIds.has(String(id)) !== b.selectedSessionIds.has(String(id))) return false;
+  return prev.cancelOpen === next.cancelOpen
+    && prev.onBeginEdit === next.onBeginEdit
+    && prev.onCardClick === next.onCardClick
+    && prev.onCardKeyDown === next.onCardKeyDown
+    && prev.onDragStartCard === next.onDragStartCard
+    && prev.onEditDone === next.onEditDone;
+});
+
+function ClusterViewBase(props: {
   item: ClusterItem;
   columnId?: SessionKanbanColumn;
   dragCluster: { chatId: string; col: SessionKanbanColumn } | null;
@@ -715,6 +758,8 @@ function ClusterView(props: {
     </div>
   );
 }
+
+const ClusterView = memo(ClusterViewBase);
 
 export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Element {
   const [display, setDisplay] = useState<SessionsKanbanProps>(props);
@@ -811,6 +856,9 @@ export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Elemen
     setEditingId(row.sessionId);
   }, [cancelOpen]);
 
+  // 只依赖 onToggleSelect，不依赖整个 display：display 每次更新都是新对象，挂在它上面
+  // 会让这两个回调（进而每张卡片的 props）跟着换引用。
+  const onToggleSelect = display.onToggleSelect;
   const onCardClick = useCallback((row: any, event: MouseEvent<HTMLElement>) => {
     if (isRemoteRow(row)) return;
     const target = event.target as HTMLElement;
@@ -818,16 +866,16 @@ export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Elemen
     cancelOpen();
     openTimerRef.current = setTimeout(() => {
       openTimerRef.current = null;
-      display.onToggleSelect(row);
+      onToggleSelect(row);
     }, 220);
-  }, [cancelOpen, display]);
+  }, [cancelOpen, onToggleSelect]);
 
   const onCardKeyDown = useCallback((row: any, event: KeyboardEvent<HTMLElement>) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
     if (event.target !== event.currentTarget || isRemoteRow(row)) return;
     event.preventDefault();
-    display.onToggleSelect(row);
-  }, [display]);
+    onToggleSelect(row);
+  }, [onToggleSelect]);
 
   const onDragStartCard = useCallback((row: any, event: DragEvent<HTMLElement>) => {
     if (display.groupBy === 'bot') return;
@@ -899,19 +947,24 @@ export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Elemen
     display.onMoveRows([{ row, column: targetCol, position }]);
   }, [clearDrag, display]);
 
-  const cardProps = {
+  // 卡片 memo 只在 props 引用不变时才生效，所以这里必须是稳定引用：以前它是渲染
+  // 体里的字面量 + 内联箭头函数（onEditDone），每次渲染都全新，等于 memo 永远命不中。
+  const onEditDone = useCallback(() => setEditingId(null), []);
+  const cardProps = useMemo(() => ({
     dragId: drag?.kind === 'card' ? drag.id : null,
     dropBeforeId,
     editingId,
-    groupBy: display.groupBy,
     callbacks: display,
     cancelOpen,
     onBeginEdit,
     onCardClick,
     onCardKeyDown,
     onDragStartCard,
-    onEditDone: () => setEditingId(null),
-  };
+    onEditDone,
+  }), [
+    cancelOpen, display, dropBeforeId, drag, editingId,
+    onBeginEdit, onCardClick, onCardKeyDown, onDragStartCard, onEditDone,
+  ]);
 
   if (model.mode === 'loading') {
     return <LoadingState label={t('sessions.kanban.teamLoading')} className="kanban-loading-state" />;
