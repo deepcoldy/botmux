@@ -193,4 +193,50 @@ describe('botmux ask — CLI boundary', () => {
       });
     }
   });
+
+  it('--json 完整输出超出 pipe 容量的文字作答', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
+    tempDirs.push(dataDir);
+    const comment = 'x'.repeat(500_000);
+
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        kind: 'answered',
+        answers: [[]],
+        by: 'ou_test',
+        comment,
+        timedOut: false,
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(
+        join(registryDir, 'cli_test.json'),
+        JSON.stringify({ larkAppId: 'cli_test', ipcPort: port, lastHeartbeat: Date.now() }),
+      );
+
+      const result = await runAsk(dataDir, [
+        'ask', 'buttons', '--json', '--options', 'yes,no', '请作答',
+      ]);
+      expect(result.status).toBe(0);
+      expect(Buffer.byteLength(result.stdout)).toBeGreaterThan(400_000);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        selected: null,
+        answers: [[]],
+        by: 'ou_test',
+        comment,
+        timedOut: false,
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => err ? reject(err) : resolve());
+      });
+    }
+  }, 30_000);
 });
