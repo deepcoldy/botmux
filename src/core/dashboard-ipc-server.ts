@@ -162,6 +162,9 @@ import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
+import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
+import { validateRecycleRequest } from './workspace-recycle-journal.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1210,6 +1213,38 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
   jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+});
+
+// This route deliberately has NO session-capability/public allowlist entry.
+// Recycling multiple sessions requires the existing trusted-host HMAC.
+const workspaceRecycleRuntime = new WorkspaceRecycleRuntime({
+  appId: () => cachedLarkAppId,
+  dataDir: () => config.session.dataDir,
+  getSession: id => {
+    sessionStore.listSessionsStrict();
+    return sessionStore.getOwnedSession(id);
+  },
+  getRuntime: findActiveBySessionId,
+  allSessions: () => sessionStore.loadAllSessionsStrict(config.session.dataDir),
+  close: closeSession,
+  retireClosed: (id, workspaceRetirement) => sessionStore.closeSession(id, { workspaceRetirement }),
+  lifecycleBusy: ds => isSessionTransferring(ds) || isSessionLifecycleInFlight(ds) || hasPendingOrdinaryImDelivery(ds),
+  closeResidual: session => mojoCloseResidualForRow(session)?.reason,
+  onError: error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`),
+});
+
+ipcRoute('POST', '/api/workspace-recycle/:action', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!['prepare', 'close', 'defer', 'abort'].includes(params.action)) return jsonRes(res, 400, { ok: false, error: 'invalid_recycle_action' });
+  const body = await readJsonBody<unknown>(req);
+  try { validateRecycleRequest(body); }
+  catch (error) { return jsonRes(res, 400, { ok: false, error: String(error) }); }
+  try {
+    const result = await workspaceRecycleRuntime.perform(params.action as RecycleAction, body);
+    return jsonRes(res, result.status === 'deferred' ? 202 : result.ok ? 200 : 409, result);
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: String(error) });
+  }
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
@@ -7590,6 +7625,12 @@ export function startIpcServer(opts: {
     log: (m) => logger.warn(`[dashboard-ipc] ${m}`),
   }).then((port) => {
     boundPort = port;
+    // Restored current-session handoffs wait for the normal session restore
+    // barrier. The controller never depends on the removed workspace/process.
+    workspaceRecycleRuntime.start();
+    void (opts.ready ?? Promise.resolve()).then(() => workspaceRecycleRuntime.recoverDeferred())
+      .catch(error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`));
+    server.once('close', () => workspaceRecycleRuntime.stop());
     return {
     port,
     close: () => new Promise<void>(r => server.close(() => r())),

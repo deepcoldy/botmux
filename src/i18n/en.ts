@@ -950,6 +950,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_adopt_unsupported': '⚠️ Adopted sessions cannot be resumed.',
   'card.action.resume_deferred_unmaterialized': '⚠️ This silent scheduled run never created a topic. Its hidden session is audit-only and cannot be resumed.',
   'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
+  'card.action.resume_workspace_retired': 'This session’s workspace has been reclaimed and the session cannot be resumed. Create a new session in a valid workspace.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',
   'card.voice.toast_wait': '🔊 Generating a voice summary, hang tight…',
   'card.voice.toast_already': '🔊 A voice summary for this reply is already on the way.',

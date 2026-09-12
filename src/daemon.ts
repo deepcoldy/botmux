@@ -18131,7 +18131,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
   // 会话群里的新消息发现登记的会话已关闭时，自动 resume 原会话（与话题内续聊
-  // 同款体验），而不是新开 CLI。恢复失败则照常走全新会话。
+  // 同款体验），而不是新开 CLI。已回收的会话拒绝恢复，也不能隐式新建。
   if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth) {
     const sgEntry = getSessionGroup(chatId);
     if (sgEntry?.lastSessionId) {
@@ -18142,6 +18142,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
           touchSessionGroup(chatId);
           logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
           return handleThreadReply(data, ctx);
+        }
+        if (resumed.error === 'workspace_retired') {
+          await sessionReply(messageId, tr('card.action.resume_workspace_retired', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+          return;
         }
         logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
       }

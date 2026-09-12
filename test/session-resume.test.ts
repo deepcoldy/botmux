@@ -183,6 +183,7 @@ import {
   restoreUsageLimitRuntimeState,
   setActiveSessionSafe,
   setActiveSessionIfActive,
+  withActiveSessionKeyLock,
 } from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -224,6 +225,19 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
 }
 
 describe('resumeSession', () => {
+  it('rechecks retirement after waiting for the active-session lock', async () => {
+    const closed = makeClosedSession();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(withActiveSessionKeyLock).mockImplementationOnce(async (_map, _key, action) => {
+      sessionStore.closeSession(closed.sessionId, {
+        workspaceRetirement: { operationId: 'recycle-lock', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+      });
+      return action();
+    });
+    expect(await resumeSession(closed.sessionId, map)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    expect(map.size).toBe(0);
+  });
   describe('error branches', () => {
     it('returns not_found for an unknown session id', async () => {
       const r = await resumeSession('no-such-id', new Map());

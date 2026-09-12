@@ -946,6 +946,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
   'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
+  'card.action.resume_workspace_retired': '该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
   'card.voice.toast_wait': '🔊 正在生成语音总结，请耐心等待…',
   'card.voice.toast_already': '🔊 这条已经在生成语音啦，请稍候',

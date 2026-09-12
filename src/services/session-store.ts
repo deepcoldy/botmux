@@ -501,10 +501,13 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
 
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
-function readStoreEntries(ref: StoreFileRef): [string, Session][] {
+function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
+    if (!parsed || typeof parsed !== 'object' || (strict && Array.isArray(parsed))) {
+      if (strict) throw new Error(`Invalid session store: ${ref.path}`);
+      return [];
+    }
     return Object.entries(parsed as Record<string, Session>);
   }
   const db = openDbForRead(ref.path);
@@ -512,7 +515,8 @@ function readStoreEntries(ref: StoreFileRef): [string, Session][] {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
   } finally {
@@ -1662,6 +1666,12 @@ function persistRow(session: Session): void {
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.workspaceRetirement) {
+      if (session.status !== 'closed') throw new Error('workspace_retired');
+      // Late whole-row writers may hold a pre-close copy. Retirement cannot
+      // be erased by a stale metadata write or by changing workingDir.
+      session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2106,6 +2116,7 @@ export function closeSession(
   sessionId: string,
   opts: {
     cleanupBridgeMarkers?: boolean;
+    workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
     /**
      * Park an uncancellable mojo lineage as PART of this transaction.
@@ -2164,6 +2175,7 @@ export function closeSession(
       type: 'close',
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
+      ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
@@ -2207,10 +2219,11 @@ export function closeSession(
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
-| { ok: false; error: 'not_found' | 'not_closed' } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'workspace_retired' } {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before
@@ -2578,6 +2591,27 @@ export function loadAllSessionsSnapshot(options: {
     if (ref.appId) readInto(ref);
   }
   return out;
+}
+
+/** Destructive lifecycle discovery must account for every store, including
+ * corrupt stores and duplicate owners. Unlike the display snapshot this does
+ * not skip errors or collapse two copies of the same session id. Pure reader. */
+export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session[] {
+  const result: Session[] = [];
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    for (const [key, raw] of readStoreEntries(ref, true)) {
+      const session = raw as Session;
+      if (!session || typeof session !== 'object' || Array.isArray(session)
+          || session.sessionId !== key || !['active', 'closed'].includes(session.status)) {
+        throw new Error(`Invalid session identity in ${ref.path}`);
+      }
+      if (ref.appId && session.larkAppId && session.larkAppId !== ref.appId) {
+        throw new Error(`Session owner mismatch in ${ref.path}`);
+      }
+      result.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return result;
 }
 
 /**
