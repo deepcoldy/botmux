@@ -19,6 +19,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../../utils/daemon-version-display.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   parseIdleCleanupHours,
@@ -151,7 +152,7 @@ type HistoryState = {
   messages: any[];
   ownerOpenId?: string;
   error?: string;
-  stale?: boolean;
+  staleHint?: { running: string; disk: string };
 };
 
 type TerminalState = {
@@ -1914,7 +1915,9 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             {!props.state.loading && props.state.error ? (
               <div className="history-error">
                 {t('sessions.history.fail')}: {props.state.error}
-                {props.state.stale ? <><br /><span>{t('sessions.history.staleHint')}</span></> : null}
+                {props.state.staleHint ? (
+                  <><br /><span>{t('sessions.history.staleHint', props.state.staleHint)}</span></>
+                ) : null}
               </div>
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length === 0 ? (
@@ -3476,8 +3479,23 @@ function SessionsPage(): React.JSX.Element {
         const body = await r.json().catch(() => ({}));
         if (!r.ok || body?.ok === false) {
           const errCode = String(body?.error ?? r.status);
-          const stale = errCode === 'not_found_yet' || errCode === 'not_found';
-          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, stale } : prev);
+          let staleHint: HistoryState['staleHint'];
+          if ((errCode === 'not_found_yet' || errCode === 'not_found') && row.larkAppId) {
+            try {
+              const status = await fetch('/api/update/status', { cache: 'no-store' }).then(res => res.json()) as {
+                current?: string;
+                runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+              };
+              const running = status.runningDaemons?.find(d => d.larkAppId === row.larkAppId)?.version;
+              if (daemonVersionDiffersFromDisk(running, status.current)) {
+                staleHint = {
+                  running: stripBotmuxVersionPrefix(running!),
+                  disk: stripBotmuxVersionPrefix(status.current!),
+                };
+              }
+            } catch { /* raw not_found only */ }
+          }
+          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, staleHint } : prev);
           return;
         }
         const messages = Array.isArray(body.messages) ? body.messages : [];

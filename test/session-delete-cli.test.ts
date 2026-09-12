@@ -125,7 +125,7 @@ function writeReadIsolatedCapability(dataDir: string, sessionId: string): void {
   chmodSync(path, 0o600);
 }
 
-function runDelete(
+function runCli(
   dataDir: string,
   args: string[],
   envOverrides: Record<string, string | undefined> = {},
@@ -146,7 +146,7 @@ function runDelete(
     }
     const child = spawnTsScript(
       CLI_PATH,
-      ['delete', ...args],
+      args,
       { env, stdio: ['ignore', 'pipe', 'pipe'] },
     ) as ChildProcessWithoutNullStreams;
     let stdout = '';
@@ -158,6 +158,14 @@ function runDelete(
     child.once('error', reject);
     child.once('close', status => resolve({ status, stdout, stderr }));
   });
+}
+
+function runDelete(
+  dataDir: string,
+  args: string[],
+  envOverrides: Record<string, string | undefined> = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return runCli(dataDir, ['delete', ...args], envOverrides);
 }
 
 function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -366,11 +374,11 @@ describe('botmux delete — daemon-first close', () => {
     });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('owning_daemon_became_available');
+    expect(result.stderr).toContain('daemon 在线');
     expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
   });
 
-  it('closes offline once the lease has expired and no heartbeat is fresh', async () => {
+  it('closes offline once the lease has expired and no daemon is discoverable', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-lease-lapsed');
@@ -610,11 +618,7 @@ describe('botmux delete — daemon-first close', () => {
     }
   });
 
-  it('closes a session whose owning daemon has not imported the store yet', async () => {
-    // 升级窗口：npm 换了 dist、重指了 launcher，而拥有这些行的 daemon 还在跑
-    // 迁移前的版本、仍然读写 JSON。离线关闭必须照常落到那份 JSON 上——读不到
-    // 会让 CLI 报「没有活跃会话」，等于告诉用户会话没了；而在这里建 .db 会在
-    // 那台 daemon 背后把两种表示分叉，还会关掉它的一次性导入门。
+  it('refuses delete when the store is still unmigrated leftover JSON', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-unimported-'));
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-unimported');
@@ -629,9 +633,71 @@ describe('botmux delete — daemon-first close', () => {
       BOTMUX_DAEMON_IPC_PORT: undefined,
     });
 
-    expect(result.status).toBe(0);
-    expect(result.stdout).not.toContain('没有活跃会话');
-    expect(JSON.parse(readFileSync(jsonFp, 'utf-8'))[session.sessionId].status).toBe('closed');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('尚未迁移到 SQLite');
+    expect(result.stderr + result.stdout).not.toContain('没有活跃会话');
+    expect(JSON.parse(readFileSync(jsonFp, 'utf-8'))[session.sessionId].status).toBe('active');
     expect(existsSync(sessionStorePath(dataDir, APP_ID))).toBe(false);
+  });
+
+  it('refuses delete against a fresh pre-capability daemon and leaves the row', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-legacy-daemon-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-legacy-daemon');
+    writeSessions(dataDir, [session]);
+    writeDaemonDescriptor(dataDir, 1);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('后台 daemon 是升级前的旧进程');
+    expect(result.stderr).toContain('botmux restart');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('does not mention botmux restart in a session-scoped delete against a legacy daemon', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-scoped-legacy-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-scoped-legacy');
+    writeSessions(dataDir, [session]);
+    writeDaemonDescriptor(dataDir, 1);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: session.sessionId,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('本次未做任何修改');
+    expect(result.stderr).not.toContain('botmux restart');
+    expect(result.stderr).not.toMatch(/\bpid\b/i);
+    expect(result.stderr).not.toMatch(/\bport\b/i);
+    expect(result.stderr).not.toMatch(/v?\d+\.\d+\.\d+/);
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('list prints unmigrated instead of 没有活跃会话 when only leftover JSON exists', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-unmigrated-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-list-unmigrated');
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, `sessions-${APP_ID}.json`), JSON.stringify({ [session.sessionId]: session }));
+
+    const result = await runCli(dataDir, ['list', '--plain'], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.stderr).toContain('尚未迁移到 SQLite');
+    expect(result.stdout + result.stderr).not.toContain('没有活跃会话');
   });
 });

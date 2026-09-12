@@ -128,16 +128,44 @@ describe('deleteWhiteboard session unbind', () => {
     expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
   });
 
-  it('reports the session as unresolved when a daemon is visible but IPC fails', async () => {
+  it('reports the session as unresolved when a live lease exists and IPC fails', async () => {
     const board = createWhiteboard({ id: 'delete_abort', title: 't', larkAppId: 'app1', chatId: 'c1' });
+    seedBoundSession('app1', board.id);
+    seedOccupancyLease(tempDir, 'app1', {
+      ownerPid: 7,
+      bootId: 'boot-live',
+      leaseUntil: Date.now() + 60_000,
+    });
+    ipc.daemon = { larkAppId: 'app1', ipcPort: 18765 };
+    ipc.throws = true;
+
+    const result = await deleteWhiteboard(board.id);
+    expect(result).toMatchObject({ clearedSessions: 0, unresolvedSessions: 1 });
+    expect(result.reasons).toEqual(expect.arrayContaining(['daemon 在线']));
+    expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
+  });
+
+  it('does not fall back to a host write when the daemon answers 500', async () => {
+    const board = createWhiteboard({ id: 'delete_500', title: 't', larkAppId: 'app1', chatId: 'c1' });
+    seedBoundSession('app1', board.id);
+    ipc.daemon = { larkAppId: 'app1', ipcPort: 18765 };
+    ipc.status = 500;
+
+    const result = await deleteWhiteboard(board.id);
+    expect(result).toMatchObject({ clearedSessions: 0, unresolvedSessions: 1 });
+    expect(ipc.fetches).toHaveLength(1);
+    expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
+  });
+
+  it('leaves the row unresolved with a reason when a fresh daemon has no lease', async () => {
+    const board = createWhiteboard({ id: 'delete_nolease', title: 't', larkAppId: 'app1', chatId: 'c1' });
     seedBoundSession('app1', board.id);
     ipc.daemon = { larkAppId: 'app1', ipcPort: 18765 };
     ipc.throws = true;
 
     const result = await deleteWhiteboard(board.id);
-    // The liveness re-probe inside the store aborts the offline write, so the
-    // row is untouched — and the count says so instead of a bare 0.
     expect(result).toMatchObject({ clearedSessions: 0, unresolvedSessions: 1 });
+    expect(result.reasons).toEqual(expect.arrayContaining(['后台 daemon 是升级前的旧进程，请先运行 `botmux restart`']));
     expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
   });
 

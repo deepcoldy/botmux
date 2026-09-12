@@ -65,30 +65,24 @@ const USAGE = `用法:
  * unavailable"), which does NOT block the revoke but IS surfaced to the
  * operator; only a definite `status === 'active'` blocks.
  */
-export async function defaultIsSessionActive(sessionId: string): Promise<boolean | undefined> {
+export async function defaultIsSessionActive(
+  sessionId: string,
+  dataDir?: string,
+): Promise<boolean | undefined> {
   try {
-    const [{ config }, { readdirSync, readFileSync }, { join }] = await Promise.all([
-      import('../config.js'),
-      import('node:fs'),
-      import('node:path'),
-    ]);
-    const dir = config.session.dataDir;
-    let sawUnreadable = false;
-    for (const file of readdirSync(dir)) {
-      if (!/^sessions(-[^.]+)?\.json$/.test(file)) continue;
-      try {
-        const data = JSON.parse(readFileSync(join(dir, file), 'utf-8')) as
-          Record<string, { status?: string } | undefined>;
-        const row = data[sessionId];
-        if (row) return row.status === 'active';
-      } catch {
-        // A corrupt file may be the very one hiding this row: unknown, never
-        // "proven inactive".
-        sawUnreadable = true;
-      }
-    }
-    return sawUnreadable ? undefined : false;
-  } catch {
+    const { config } = await import('../config.js');
+    const {
+      readSessionRowCopiesAcrossStores,
+      SessionStoreSqliteUnavailableError,
+    } = await import('../services/session-store.js');
+    const dir = dataDir ?? config.session.dataDir;
+    const { matches, unreadableStores } = readSessionRowCopiesAcrossStores(sessionId, dir);
+    if (matches.some(s => s.status === 'active')) return true;
+    if (unreadableStores > 0) return undefined;
+    return false;
+  } catch (err) {
+    const { SessionStoreSqliteUnavailableError } = await import('../services/session-store.js');
+    if (err instanceof SessionStoreSqliteUnavailableError) return undefined;
     return undefined;
   }
 }
@@ -214,7 +208,8 @@ export async function runMojoContainmentCommand(
           }
         }
       }
-      const active = await (deps.isSessionActive ?? defaultIsSessionActive)(sessionId);
+      const active = await (deps.isSessionActive
+        ?? ((id: string) => defaultIsSessionActive(id, deps.dataDir)))(sessionId);
       if (active === true) {
         liveBlockers.push(`session ${sessionId} 的会话行仍处于 active（先 /close 它）`);
       } else if (active === undefined) {
