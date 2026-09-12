@@ -2260,6 +2260,7 @@ export class MojoBackend implements SessionBackend {
             base: this.spawnOpts?.env ?? process.env,
             botEnv: this.spawnOpts?.injectEnv,
             mojoEnv: this.config.env,
+            mojoChild: true,
         });
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes

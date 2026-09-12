@@ -10,6 +10,7 @@
  *
  * Run:  pnpm vitest run test/mojo-config-validation.test.ts
  */
+import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -17,9 +18,11 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  buildEffectiveChildEnv,
   deriveMojoExecutionMode,
   diffMojoSessionIdentity,
   findReservedMojoCliFlags,
+  MOJO_PM2_AMBIENT_ENV_KEYS,
   MOJO_CONTROL_ENV_KEYS,
   MOJO_IDENTITY_KEYS,
   MOJO_LIVE_PATCH_KEYS,
@@ -27,6 +30,7 @@ import {
   normalizeMojoLivePatch,
   pickMojoLivePatch,
   pickMojoSessionIdentity,
+  scrubMojoAmbientEnv,
 } from '../src/adapters/backend/mojo-types.js';
 import { isMojoFullyRemote, localSandboxApplies } from '../src/adapters/backend/sandbox.js';
 
@@ -159,6 +163,142 @@ describe('normalizeMojoConfig', () => {
     const r = normalizeMojoConfig({ localDaemon: 'false', cluod: true, idleTimeoutSec: 'abc' });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errors.length).toBe(3);
+  });
+});
+
+describe('Mojo ambient child environment isolation', () => {
+  const pollutedBase: NodeJS.ProcessEnv = {
+    PATH: '/usr/bin:/bin',
+    HOME: '/Users/bot',
+    LANG: 'en_US.UTF-8',
+    BOTMUX_SESSION_ID: 'session-1',
+    PM2_HOME: '/Users/bot/.pm2',
+    pm_id: '5',
+    pm_exec_path: '/opt/botmux/index-daemon.js',
+    pm_cwd: '/opt/botmux',
+    env: '[object Object]',
+    name: 'botmux-daemon',
+    axm_options: '{}',
+    error_file: '/tmp/pm2-error.log',
+    out_file: '/tmp/pm2-out.log',
+    pm_log_path: '/tmp/pm2-combined.log',
+    node_version: '24.0.0',
+    version: '3.17.0',
+    instance_var: 'BOTMUX_DAEMON_INSTANCE',
+    // pm2 writes the same-app instance ordinal here, not pm_id. Keep them
+    // deliberately different so the fixture matches a multi-app PM2 fleet.
+    BOTMUX_DAEMON_INSTANCE: '0',
+    HTTP_PROXY: 'http://ambient-proxy',
+    http_proxy: 'http://ambient-lower-proxy',
+    NO_PROXY: '127.0.0.1,localhost',
+  };
+
+  it('removes pm2 metadata while preserving ambient proxies for host execution', () => {
+    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoChild: true });
+    for (const key of [
+      'pm_id', 'pm_exec_path', 'pm_cwd', 'env', 'name', 'axm_options',
+      'error_file', 'out_file', 'pm_log_path', 'node_version', 'version',
+      'instance_var', 'BOTMUX_DAEMON_INSTANCE',
+    ]) {
+      expect(out[key], key).toBeUndefined();
+    }
+    expect(out).toMatchObject({
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/bot',
+      LANG: 'en_US.UTF-8',
+      BOTMUX_SESSION_ID: 'session-1',
+      PM2_HOME: '/Users/bot/.pm2',
+      HTTP_PROXY: 'http://ambient-proxy',
+      http_proxy: 'http://ambient-lower-proxy',
+      NO_PROXY: '127.0.0.1,localhost',
+    });
+    expect(pollutedBase.pm_id).toBe('5');
+    expect(pollutedBase.HTTP_PROXY).toBe('http://ambient-proxy');
+  });
+
+  it('uses the same PM2 scrub for every Mojo child while preserving proxies', () => {
+    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoChild: true });
+    expect(out.pm_id).toBeUndefined();
+    expect(out.env).toBeUndefined();
+    expect(out.BOTMUX_DAEMON_INSTANCE).toBeUndefined();
+    expect(out.HTTP_PROXY).toBe('http://ambient-proxy');
+    expect(out.http_proxy).toBe('http://ambient-lower-proxy');
+    expect(out.NO_PROXY).toBe('127.0.0.1,localhost');
+  });
+
+  it('does not scrub a direct non-pm2 Mojo launch', () => {
+    expect(scrubMojoAmbientEnv({ env: 'development', HTTP_PROXY: 'http://proxy' }))
+      .toEqual({ env: 'development', HTTP_PROXY: 'http://proxy' });
+  });
+
+  it('does not let a malformed pm2 instance_var delete a required runtime key', () => {
+    const out = scrubMojoAmbientEnv({
+      pm_id: '5',
+      instance_var: 'PATH',
+      // Numeric on purpose: value-shape validation alone must not authorize
+      // deletion of a required runtime key.
+      PATH: '0',
+    });
+    expect(out.PATH).toBe('0');
+  });
+
+  it('does not let a numeric pm2 instance_var delete Botmux session routing', () => {
+    const out = scrubMojoAmbientEnv({
+      pm_id: '5',
+      instance_var: 'BOTMUX_SESSION_ID',
+      BOTMUX_SESSION_ID: '0',
+    });
+    expect(out.BOTMUX_SESSION_ID).toBe('0');
+  });
+
+  it('covers every installed PM2 Common.js process-metadata key', () => {
+    const commonUrl = new URL('../node_modules/pm2/lib/Common.js', import.meta.url);
+    // Newer Botmux releases no longer depend on PM2. Keep the live upstream
+    // drift guard when a developer still has PM2 installed; the static scrub
+    // behaviour remains covered by the focused fixtures above when it is absent.
+    if (!existsSync(commonUrl)) return;
+    const common = readFileSync(commonUrl, 'utf-8');
+    const match = common.match(/var keysToIgnore\s*=\s*\[([\s\S]*?)\];/);
+    expect(match).not.toBeNull();
+    const pm2Keys = [...(match?.[1] ?? '').matchAll(/['"]([^'"]+)['"]/g)]
+      .map(entry => entry[1]);
+    expect(pm2Keys.length).toBeGreaterThan(0);
+    for (const key of pm2Keys) {
+      expect(MOJO_PM2_AMBIENT_ENV_KEYS as readonly string[], key).toContain(key);
+    }
+  });
+
+  it('lets explicit bot and mojo env override an inherited proxy with documented precedence', () => {
+    const out = buildEffectiveChildEnv({
+      base: pollutedBase,
+      botEnv: { HTTP_PROXY: 'http://bot-proxy', EXPLICIT: 'bot' },
+      mojoEnv: { HTTP_PROXY: 'http://mojo-proxy', EXPLICIT: 'mojo' },
+      mojoChild: true,
+    });
+    expect(out.HTTP_PROXY).toBe('http://mojo-proxy');
+    expect(out.EXPLICIT).toBe('mojo');
+    expect(out.pm_id).toBeUndefined();
+  });
+
+  it('lets explicit mojo env disable an inherited proxy', () => {
+    const out = buildEffectiveChildEnv({
+      base: pollutedBase,
+      mojoEnv: { HTTP_PROXY: '' },
+      mojoChild: true,
+    });
+    expect(out.HTTP_PROXY).toBe('');
+    expect(out.pm_id).toBeUndefined();
+  });
+
+  it('preserves the old merge exactly for non-Mojo callers', () => {
+    const out = buildEffectiveChildEnv({
+      base: pollutedBase,
+      botEnv: { EXPLICIT: 'bot' },
+    });
+    expect(out.pm_id).toBe('5');
+    expect(out.env).toBe('[object Object]');
+    expect(out.HTTP_PROXY).toBe('http://ambient-proxy');
+    expect(out.EXPLICIT).toBe('bot');
   });
 });
 

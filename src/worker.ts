@@ -15682,6 +15682,7 @@ async function spawnCli(
         mojoEnv: effectiveBackendType === 'mojo'
           ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
           : undefined,
+        mojoChild: effectiveBackendType === 'mojo',
       });
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,
