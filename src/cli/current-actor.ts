@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync } from 'node:fs';
+import { basename } from 'node:path';
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 export const CURRENT_ACTOR_SCHEMA = 'botmux.current-actor.v2' as const;
@@ -81,6 +82,31 @@ function processEnvironment(pid: number, procRoot: string): Record<string, strin
   } catch { return undefined; }
 }
 
+/**
+ * A pane process is parented by the long-lived tmux server, not by the tmux
+ * client that created the session. The server's kernel-held environment is a
+ * launch-time snapshot: `tmux set-environment -gu` can scrub tmux's global
+ * table, but cannot rewrite `/proc/<server>/environ`. Treat the real server as
+ * a lineage boundary so stale routing from an older BotMux session is neither
+ * trusted nor compared with the current pane's fresh routing.
+ *
+ * Require both the kernel process name and executable basename. A process that
+ * merely changes argv/comm to look like tmux must not truncate attestation.
+ */
+function isTmuxServerProcess(pid: number, procRoot: string): boolean {
+  try {
+    const raw = readFileSync(`${procRoot}/${pid}/stat`, 'utf8');
+    const openParen = raw.indexOf('(');
+    const closeParen = raw.lastIndexOf(')');
+    if (openParen < 0 || closeParen <= openParen
+      || raw.slice(openParen + 1, closeParen) !== 'tmux: server') return false;
+    const executable = basename(readlinkSync(`${procRoot}/${pid}/exe`)).replace(/ \(deleted\)$/, '');
+    return executable === 'tmux';
+  } catch {
+    return false;
+  }
+}
+
 /** Read routing only from an already-running BotMux CLI ancestor. A child can
  * mutate its own env but cannot rewrite its parent's kernel-held environment. */
 export function resolveBotmuxAncestorContext(
@@ -93,6 +119,7 @@ export function resolveBotmuxAncestorContext(
   const contexts: BotmuxAncestorContext[] = [];
   let pid = startPid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
+    if (isTmuxServerProcess(pid, procRoot)) break;
     const env = processEnvironment(pid, procRoot);
     if (!env) throw new CurrentActorError('current actor ancestor attestation failed');
     if (env.BOTMUX === '1') {
