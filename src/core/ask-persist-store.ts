@@ -74,9 +74,20 @@ export interface PersistedAsk {
   rootMessageId: string | null;
   sessionId: string;
   chatType?: 'group' | 'p2p';
+  /** Optional app-scoped responder lock for host-owned approval asks. */
+  answererOpenId?: string;
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;
+  /** Original relative timeout. Host-owned asks defer this clock until the
+   *  interaction card is confirmed delivered; ordinary CLI asks start it at
+   *  registration as before. Optional for backward-compatible v2 records. */
+  timeoutMs?: number;
+  /** True only for daemon-hosted asks whose responder cannot act before the
+   *  card exists. An undelivered record must not expire during restore. */
+  timeoutStartsAfterDelivery?: boolean;
+  /** Timestamp at which a deferred timeout was actually armed. */
+  timeoutStartedAt?: number;
   /** Feishu message id of the posted card, once dispatch landed. Undefined means
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
@@ -234,7 +245,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
             try { unlinkSync(fp); } catch { /* ignore */ }
             continue;
           }
-        } else if (typeof parsed.deadlineAt === 'number' && parsed.deadlineAt <= now) {
+        } else if (
+          !(parsed.timeoutStartsAfterDelivery === true && !parsed.cardMessageId)
+          && typeof parsed.deadlineAt === 'number'
+          && parsed.deadlineAt <= now
+        ) {
           try { unlinkSync(fp); } catch { /* ignore */ }
           continue;
         }

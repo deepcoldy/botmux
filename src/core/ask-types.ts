@@ -119,6 +119,9 @@ export interface CreateAskInput {
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
+  /** Optional exact responder lock for host-owned approval asks. Ordinary
+   * agent asks omit it and retain the existing canTalk-any-member policy. */
+  answererOpenId?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -127,6 +130,9 @@ export interface CreateAskInput {
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
   askId: string;
+  /** Broker origin, exposed only to daemon/card routing so host-owned choice
+   * cards can decline arbitrary free-text replies instead of swallowing them. */
+  originKind?: string;
   /** Anti-replay nonce embedded in each button's action value. Click events
    *  whose nonce doesn't match → treated as stale (e.g. card from a previous
    *  daemon process before restart). */
@@ -137,6 +143,8 @@ export interface PendingAsk {
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';
+  /** When present, only this app-scoped open_id may settle the ask. */
+  answererOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

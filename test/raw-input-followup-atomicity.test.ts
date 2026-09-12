@@ -72,7 +72,7 @@ describe('worker raw_input handler', () => {
 });
 
 describe('worker adopt/native-rename coordination', () => {
-  const messageRegion = caseRegion(workerSrc, "case 'message':", 6500);
+  const messageRegion = caseRegion(workerSrc, "case 'message':", 8500);
   const flushRegion = caseRegion(workerSrc, 'async function flushPending()', 16000);
 
   it('parks ordinary adopt messages for the full native-rename settle window', () => {

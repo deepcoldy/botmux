@@ -11,6 +11,7 @@ import type {
   ModelFallbackState,
   DisplayMode,
   StreamStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -359,6 +360,40 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /**
+   * Authenticated human principal that owns the currently executing interactive
+   * turn. Set only after a worker accepts the turn and cleared by its exact
+   * terminal. A different human's message cannot mutate this task directly;
+   * it is staged as a suggestion for this owner to approve after completion.
+   * In-memory only.
+   */
+  activeInteractiveTurn?: {
+    turnId: string;
+    caller: import('../types.js').TrustedCaller;
+    /** Stable authenticated task/session owner, when distinct from the caller
+     * that happened to start the current CLI turn. */
+    controller?: import('../types.js').TrustedCaller;
+  };
+  /** Host-owned classification/approval driver currently attached to disk state. */
+  crossPrincipalInterruptionDriving?: boolean;
+  /** Runtime wake-up for the bounded wait until the current owner turn ends. */
+  crossPrincipalWaitTimer?: NodeJS.Timeout;
+  /** Transitional runtime queue retained until the durable classifier replaces
+   * every old call site. Never persisted; do not add new producers. */
+  pendingCrossPrincipalSuggestions?: Array<{
+    turnId: string;
+    ownerTurnId: string;
+    owner: TrustedCaller;
+    text: string;
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    proposer: TrustedCaller;
+    proposerName?: string;
+    replyRootId?: string;
+    inThread?: boolean;
+    approved?: boolean;
+  }>;
+  crossPrincipalSuggestionConfirming?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
