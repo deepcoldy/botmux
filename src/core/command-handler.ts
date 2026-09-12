@@ -4420,7 +4420,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork <task>` hosts it in a new sibling topic of the same chat;
+        // both topic groups and native topics inside regular groups are valid.
         // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
@@ -4484,17 +4485,6 @@ export async function handleCommand(
             break;
           }
           if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-            break;
-          }
-          let chatMode: string | undefined;
-          try {
-            chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-          } catch {
-            // Treat an unknown mode as unsupported: sending a top-level message
-            // to a regular group would not create the isolated topic we promise.
-          }
-          if (chatMode !== 'topic') {
             await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
             break;
           }
@@ -5404,7 +5394,8 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current session into a new sub-topic of the same topic group.
+/** Fork the current thread-scoped session into a new sibling topic of the same
+ *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
  *  and records display-only lineage for the parent panel. */
@@ -5432,6 +5423,7 @@ export async function startForkSubtopicSession(
     ...(message.senderName ? { name: message.senderName } : {}),
   };
   let anchorId: string | undefined;
+  let topicCreated = false;
 
   const recallAnchor = async (): Promise<boolean> => {
     if (!anchorId) return true;
@@ -5474,7 +5466,23 @@ export async function startForkSubtopicSession(
       },
     });
     anchorId = await sendMessage(appId, chatId, seedPost, 'post');
-    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+    // A top-level post becomes a topic automatically only in topic-mode chats.
+    // In a regular group, explicitly replying in-thread materializes a native
+    // topic under the seed. Resolve the thread from that reply because the root
+    // message may not expose its new thread_id immediately.
+    const topicReplyId = await replyMessage(
+      appId,
+      anchorId,
+      t('cmd.fork.seed_topic_reply', undefined, loc),
+      'text',
+      true,
+    );
+    const childThreadId = (await getMessageThreadId(appId, topicReplyId)) ?? undefined;
+    if (!childThreadId?.startsWith('omt_')) {
+      const orphanTopic = !await recallAnchor();
+      return { ok: false, error: 'topic_creation_failed', orphanTopic };
+    }
+    topicCreated = true;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
@@ -5546,7 +5554,7 @@ export async function startForkSubtopicSession(
       ok: true,
       childSessionId: forkResult.childSessionId,
       anchorId,
-      link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+      link: threadAppLink(chatId, childThreadId, brand),
     };
   } catch (err) {
     logger.error(
@@ -5555,7 +5563,7 @@ export async function startForkSubtopicSession(
     );
     return {
       ok: false,
-      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      error: topicCreated ? 'fork_subtopic_failed' : 'topic_creation_failed',
       orphanTopic: anchorId ? !await recallAnchor() : false,
     };
   }
