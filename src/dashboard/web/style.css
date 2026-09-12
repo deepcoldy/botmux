@@ -4475,6 +4475,15 @@ td code,
   text-align: center;
 }
 
+.g-add-bots-result-main {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.g-add-bots-result-main small {
+  color: var(--text-muted, #888);
+}
+
 #g-drawer :where(.g-add-bots-dialog, .g-save-profile-dialog, .g-manage-dialog) > header h3 {
   max-width: min(560px, 100%);
   text-align: center;
