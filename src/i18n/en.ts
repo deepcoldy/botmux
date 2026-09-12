@@ -1601,6 +1601,7 @@ export const messages: Record<string, string> = {
   'sg.placeholder_untitled': 'New conversation',
   'sg.intro': 'started this conversation from DM:',
   'sg.intro_no_text': '(non-text message)',
+  'sg.intro_forwarded': 'started this conversation from DM — the original message is forwarded above ⬆️',
   'sg.receipt': '✅ Created a dedicated group for this conversation — continue there: {link}',
   'sg.birth_failed': '⚠️ Group creation failed ({error}); falling back to a DM topic for this conversation.',
   'sg.cmd_unsupported': '⚠️ {cmd} is not supported in session groups: they are auto-created and managed by the bot with a fixed continuous-session mode.',

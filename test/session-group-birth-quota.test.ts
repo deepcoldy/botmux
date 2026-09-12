@@ -93,6 +93,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    forwardMessage: vi.fn(async () => 'om_forwarded'),
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 1 })),

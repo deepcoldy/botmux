@@ -18270,6 +18270,23 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
   }
 
+  // 会话群出生命名（非文本种子）：birth 只拿得到 extractMessageTextForRouting 的
+  // 文本窥视结果（只认 text/post），图片/文件/合并转发消息的种子在那里是空串，
+  // 于是 AI 命名在出生侧被跳过。到这里消息已经被**完整解析**（合并转发也已展开
+  // 成 <forwarded_messages>、语音已转写），parsed.content 必然非空——这才是这类
+  // 群唯一能用的标题来源，也是「转发消息集合开的群停在占位名」的修复点。
+  //
+  // 文本种子照旧由 birth 侧调度（出生瞬间就开跑，早几百毫秒改名），并用
+  // sessionGroupTitleScheduled 告诉这里「已经调过了」——两处严格二选一。别指望
+  // title 服务自己去重：它的 titled / in-flight 闸在**异步体内**，出生侧刚发起的
+  // 那次此刻既没置 titled 也可能还没进 in-flight，重复调用会白烧一轮有限重试。
+  if (ctx.sessionGroupBirth && !ctx.sessionGroupTitleScheduled && isSessionGroup(chatId)) {
+    const sgEntry = getSessionGroup(chatId);
+    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+      scheduleSessionGroupTitle({ larkAppId, chatId, userText: parsed.content });
+    }
+  }
+
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
   const isForeignBotSender = isBotSenderType

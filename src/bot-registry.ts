@@ -1319,6 +1319,14 @@ export interface SessionGroupConfig {
   /** Send a DM receipt linking the freshly-created group (true). */
   dmReceipt?: boolean;
   /**
+   * Forward the DM that spawned the group into the group as its first
+   * message (true). This is what makes the group self-explaining: a text
+   * seed can be quoted inline, but an image / file / 合并转发消息 cannot be
+   * re-created from the event payload — only forwarded. Set false to keep
+   * just the intro line (non-text seeds then read「（非文本消息）」).
+   */
+  forwardOrigin?: boolean;
+  /**
    * What to do with the group when its session is closed:
    * 'keep' (default) — leave the group and registry entry; a later message in
    * the group resumes the closed session (same-group resume). 'disband' /

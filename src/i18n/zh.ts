@@ -1599,6 +1599,9 @@ export const messages: Record<string, string> = {
   'sg.placeholder_untitled': '新会话',
   'sg.intro': '发起的私聊会话：',
   'sg.intro_no_text': '（非文本消息）',
+  // 原消息已转发到群里（就在这条上面），所以引言只负责点明来历，不再复述正文——
+  // 图片 / 文件 / 合并转发消息本来就复述不了。
+  'sg.intro_forwarded': '从私聊发起了本次会话，原消息已转发到本群（见上 ⬆️）。',
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
