@@ -423,6 +423,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
+  // Host-resolved multi-topic orchestration switch. Managed panes must not
+  // inherit a stale value from a co-tenant tmux server.
+  'BOTMUX_MULTI_TOPIC_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
