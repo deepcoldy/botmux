@@ -77,9 +77,23 @@ export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
     };
     // Release the just-bound port and step upward. Used when verifyBound rejects
     // a port that listen() accepted (loopback shadow). The same http.Server can
-    // re-listen after close(); since a shadowed loopback request reached the
-    // OTHER process, our server has no in-flight verify connection to drain here.
+    // re-listen after close().
+    //
+    // closeAllConnections() is load-bearing, not defensive. server.close() only
+    // stops accepting; it waits for every already-accepted socket to drain, and
+    // its callback is where tryNext() — the only thing that logs or steps — runs.
+    // So one lingering socket wedges the whole probe *silently*: no LISTEN, no
+    // step to port+1, not a single log line.
+    //
+    // That is not hypothetical. The 'verify-failed' path exists precisely because
+    // some OTHER process dialed our port: 2026-09 a stale dashboard from an older
+    // checkout kept probing 127.0.0.1:7891, our listen() accepted it, it hung up
+    // without reading, the socket parked in CLOSE-WAIT with no timer armed, and
+    // the dashboard never came back — no log output to show why. An accepted-and-
+    // abandoned connection is the *expected* shape here, so tear the sockets down
+    // rather than wait on them.
     const releaseAndStep = (bound: number, reason: string) => {
+      server.closeAllConnections?.();
       server.close(() => {
         if (settled) return;
         port = bound;
