@@ -501,10 +501,13 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
 
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
-function readStoreEntries(ref: StoreFileRef): [string, Session][] {
+function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
+    if (!parsed || typeof parsed !== 'object' || (strict && Array.isArray(parsed))) {
+      if (strict) throw new Error(`Invalid session store: ${ref.path}`);
+      return [];
+    }
     return Object.entries(parsed as Record<string, Session>);
   }
   const db = openDbForRead(ref.path);
@@ -512,7 +515,8 @@ function readStoreEntries(ref: StoreFileRef): [string, Session][] {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
   } finally {
@@ -2578,6 +2582,27 @@ export function loadAllSessionsSnapshot(options: {
     if (ref.appId) readInto(ref);
   }
   return out;
+}
+
+/** Destructive lifecycle discovery must account for every store, including
+ * corrupt stores and duplicate owners. Unlike the display snapshot this does
+ * not skip errors or collapse two copies of the same session id. Pure reader. */
+export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session[] {
+  const result: Session[] = [];
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    for (const [key, raw] of readStoreEntries(ref, true)) {
+      const session = raw as Session;
+      if (!session || typeof session !== 'object' || Array.isArray(session)
+          || session.sessionId !== key || !['active', 'closed'].includes(session.status)) {
+        throw new Error(`Invalid session identity in ${ref.path}`);
+      }
+      if (ref.appId && session.larkAppId && session.larkAppId !== ref.appId) {
+        throw new Error(`Session owner mismatch in ${ref.path}`);
+      }
+      result.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return result;
 }
 
 /**
