@@ -50,12 +50,18 @@ vi.mock('node:fs', () => {
       };
     }),
     unlinkSync: vi.fn(),
+    // closeSync/writeSync are mocked so the fd-ownership guard below can observe
+    // them. They must also NOT hit the real syscall: openSync above is stubbed to
+    // return 7 for both the read fd and the wake fd, and 7 is a live fd in the test
+    // process itself — the unmocked versions were closing/writing it for real.
+    closeSync: vi.fn(),
+    writeSync: vi.fn(),
     constants: actual.constants,
   };
 });
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync, createReadStream } from 'node:fs';
+import { unlinkSync, createReadStream, closeSync, writeSync } from 'node:fs';
 import {
   TmuxPipeBackend,
   normaliseCaptureLineEndings,
@@ -72,6 +78,8 @@ const mockedExecSync = vi.mocked(execSync);
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
+const mockedCloseSync = vi.mocked(closeSync);
+const mockedWriteSync = vi.mocked(writeSync);
 
 type FakeShell = {
   readonly dir: string;
@@ -123,6 +131,8 @@ beforeEach(() => {
   mockedExecFileSync.mockReset();
   mockedSpawnSync.mockReset();
   mockedUnlinkSync.mockReset();
+  mockedCloseSync.mockReset();
+  mockedWriteSync.mockReset();
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
 });
@@ -1256,5 +1266,56 @@ describe('TmuxPipeBackend.onData', () => {
     const joined = received.join('');
     expect(joined).toBe('┌─┐');
     expect(joined).not.toContain('�');
+  });
+});
+
+describe('TmuxPipeBackend fifo fd ownership on teardown', () => {
+  // Guards the fix for a process-level wedge that the storm-recovery suite can
+  // also catch, but only by hanging until the 720s per-file wall — and only for
+  // as long as bun keeps parking a threadpool thread on the fifo read. This
+  // asserts the behaviour DIRECTLY instead: once a ReadStream has owned the fifo
+  // fd, teardown must not close that fd itself.
+  //
+  // The bug: spawn() holds the fifo O_RDWR and hands the fd to
+  // createReadStream(fd, {autoClose:false}). Under bun that read is serviced by a
+  // threadpool thread parked in read(2); destroy() detaches the JS stream but
+  // leaves the thread parked AND has already closed the fd. Closing it a second
+  // time here makes the thread unjoinable, and the next execFileSync() in the
+  // process never returns — not even on its own timeout. Measured: bun 1.4.0
+  // wedges deterministically, 1.4.2 about two runs in three, node is immune.
+  it('does not close the fifo fd that the ReadStream owns', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+
+    // spawn() opens two fds through the stubbed openSync, both reported as 7:
+    // the O_RDWR read fd (handed to the stream) and the O_WRONLY wake fd. Only
+    // the wake fd may be closed here, so record the count before teardown.
+    mockedCloseSync.mockClear();
+    be.kill();
+
+    // The wake fd is closed exactly once; the stream-owned read fd is not.
+    // Before the fix this was 2 — the second call is the one that wedges.
+    expect(mockedCloseSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaks no fd on the spawn fail-closed path', () => {
+    // The other way a fifo fd can be opened without a stream: the wake-fd open
+    // throws, so spawn() bails after opening the read fd. spawn() closes that fd
+    // ITSELF here (see the catch block around the wake-fd open) and never reaches
+    // teardown — which is why teardown's own `!hadStream` close has no reachable
+    // caller today and is a defensive backstop, not a tested branch. Asserting
+    // that would be asserting nothing: with the close removed from teardown this
+    // test still passes, because the close it observes belongs to spawn().
+    const be = new TmuxPipeBackend('0:2.0');
+    process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL = '1';
+    try {
+      expect(() => be.spawn('', [], spawnOpts())).toThrow(/EMFILE/);
+    } finally {
+      delete process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL;
+    }
+    // The read fd is closed and the fifo unlinked, so the failed spawn leaves
+    // nothing behind.
+    expect(mockedCloseSync).toHaveBeenCalledTimes(1);
+    expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo/));
   });
 });
