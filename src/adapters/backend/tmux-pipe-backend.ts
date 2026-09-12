@@ -988,6 +988,7 @@ export class TmuxPipeBackend implements SessionBackend {
   private teardownFifoReader(): void {
     liveFifoReaders.delete(this);
     this.fifoTornDown = true;
+    const hadStream = this.readStream !== null;
     if (this.readStream) {
       const stream = this.readStream as fs.ReadStream & { close?: () => void; unref?: () => void };
       this.readStream = null;
@@ -1017,7 +1018,12 @@ export class TmuxPipeBackend implements SessionBackend {
       // then the number could name a freshly-opened unrelated file).
       const fd = this.fifoFd;
       this.fifoFd = null;
-      try { fs.closeSync(fd); } catch { /* stream already closed it */ }
+      // Only close the fd ourselves when no ReadStream owned it. Under bun a
+      // destroy()ed stream leaves a threadpool thread parked in read(2) on this
+      // fd; closing it here makes that thread unjoinable and the next
+      // execFileSync() in the same process never returns (MEASURED: bun 1.4.0
+      // deterministic, 1.4.2 ~2/3). destroy() already closes the fd itself.
+      if (!hadStream) { try { fs.closeSync(fd); } catch { /* already closed */ } }
     }
     try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }
