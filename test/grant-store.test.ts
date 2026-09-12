@@ -152,6 +152,71 @@ describe('grant-store', () => {
 });
 
 describe('grant-store message quota', () => {
+  it('charges a dispatch launch receipt exactly once across repeated calls', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { registry, store } = await freshModules();
+    const input = {
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'1'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    };
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
+    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'1'.repeat(32)}`]).toMatchObject({ allow: true });
+    expect(registry.getBot('a1').config.quotaState?.[quotaKey]).toEqual({ limit: 3, used: 1 });
+  });
+
+  it('persists a denied dispatch receipt without changing exhausted quota', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 2, used: 2 } },
+    });
+    const { store } = await freshModules();
+    const input = {
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'2'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    };
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
+    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 2, used: 2 });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'2'.repeat(32)}`]).toMatchObject({ allow: false });
+  });
+
+  it('fails closed when the frozen dispatch quota key no longer has its grant', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    expect(await store.consumeDispatchLaunchQuotaOnce({
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'4'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    })).toEqual({ allow: false });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'4'.repeat(32)}`]).toMatchObject({ allow: false });
+    expect(readConfig().quotaState).toBeUndefined();
+  });
+
+  it('atomically exhausts finite dispatch quota and revokes the matching chat grant', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g', 'ou_other'] },
+      quotaState: { [quotaKey]: { limit: 1, used: 0 } },
+      grantExpiryState: { [quotaKey]: { expiresAt: Date.now() + 60_000 } },
+    });
+    const { registry, store } = await freshModules();
+    expect(await store.consumeDispatchLaunchQuotaOnce({
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'3'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    })).toEqual({ allow: true });
+    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_other'] });
+    expect(readConfig().quotaState).toBeUndefined();
+    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_other'] });
+    expect(registry.getBot('a1').config.dispatchLaunchQuotaReceipts?.[`quota_${'3'.repeat(32)}`]).toMatchObject({ allow: true });
+  });
+
   it('persists expiry and re-granting as permanent clears only the expiry record', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();
