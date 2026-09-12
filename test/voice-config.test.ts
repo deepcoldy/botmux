@@ -24,6 +24,12 @@ describe('evaluateVoiceConfig — button gating', () => {
     expect(ok?.engine).toBe('openai');
   });
 
+  it('MiniMax needs an API key and accepts the built-in endpoint and model defaults', () => {
+    expect(evaluateVoiceConfig({ engine: 'minimax', minimax: {} }, undefined)).toBeNull();
+    const ok = evaluateVoiceConfig({ engine: 'minimax', minimax: { apiKey: 'key', region: 'cn' } }, undefined);
+    expect(ok).toMatchObject({ engine: 'minimax', minimax: { apiKey: 'key', region: 'cn' } });
+  });
+
   it('infers engine from creds when engine omitted', () => {
     const v = evaluateVoiceConfig({ sami: { accessKey: 'a', secretKey: 'b', appkey: 'c' } }, undefined);
     expect(v?.engine).toBe('sami');
