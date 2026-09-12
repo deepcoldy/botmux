@@ -12,6 +12,7 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { WorkspaceRecycleRuntime } from '../src/core/workspace-recycle-runtime.js';
 import { WorkspaceRecycler } from '../src/services/workspace-recycle.js';
 import { sampleRecycleProcess } from '../src/core/workspace-recycle-resources.js';
+import { resumeSession } from '../src/core/session-manager.js';
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -57,6 +58,7 @@ describe('isolated real process and standard close', () => {
       appId: () => 'app-recycle-fixture', dataDir: () => dataDir,
       getSession: id => store.getOwnedSession(id), getRuntime: pool.findActiveBySessionId,
       allSessions: () => store.loadAllSessionsStrict(dataDir), close: pool.closeSession,
+      retireClosed: (id, workspaceRetirement) => store.closeSession(id, { workspaceRetirement }),
       lifecycleBusy: ds => pool.isSessionLifecycleInFlight(ds) || pool.isSessionTransferring(ds),
       closeResidual: session => pool.mojoCloseResidualForRow(session)?.reason,
     }); controllers.push(controller);
@@ -90,10 +92,18 @@ describe('isolated real process and standard close', () => {
       expect(result.status).toBe('closed');
       expect(store.getOwnedSession(session.sessionId)?.status).toBe('closed');
       expect(active.size).toBe(0);
+      store.init('app-recycle-fixture');
+      expect(await resumeSession(session.sessionId, active)).toEqual({ ok: false, error: 'workspace_retired' });
+      expect(store.getOwnedSession(session.sessionId)?.status).toBe('closed');
+      expect(active.size).toBe(0);
+      mkdirSync(workspace); // Even a newly created directory cannot revive the old owner.
+      expect(await resumeSession(session.sessionId, active)).toEqual({ ok: false, error: 'workspace_retired' });
+      rmSync(workspace, { recursive: true });
       expect(sampleRecycleProcess(pid, 'worker', before.identity).state).toBe('gone');
       expect(readFileSync(transcript, 'utf8')).toBe('retained\n');
       expect((await recycler.finish(operationId, { eventId: `end-${round}`, outcome: 'succeeded' })).status).toBe('closed');
-      evidence.push({ round, sessionId: session.sessionId, larkAppId: session.larkAppId, chatId: session.chatId, workspace, before, result });
+      evidence.push({ round, sessionId: session.sessionId, larkAppId: session.larkAppId, chatId: session.chatId, workspace, before, result,
+        resumeResult: 'workspace_retired', activeAfterResume: active.size, durableRow: store.getOwnedSession(session.sessionId) });
     }
     expect(store.listSessionsStrict().filter(s => s.status === 'active')).toHaveLength(0);
     expect(store.listSessionsStrict().filter(s => s.status === 'closed')).toHaveLength(3);

@@ -673,6 +673,34 @@ describe('closeSession()', () => {
     expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
   });
 
+  it('commits workspace retirement with closed state and refuses stale writers that resurrect or erase it', () => {
+    const session = createSession('chat1', 'root1', 'Retired workspace');
+    const stale = { ...session };
+    const retirement = { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+    expect(reactivateClosedSession(session.sessionId)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(() => updateSession({ ...stale, workingDir: tempDir })).toThrow('workspace_retired');
+    updateSession({ ...stale, status: 'closed', title: 'Late metadata' });
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', title: 'Late metadata', workspaceRetirement: retirement });
+  });
+
+  it('leaves no retirement in memory or on disk if the atomic close write fails', () => {
+    const session = createSession('chat1', 'root1', 'Retirement write failure');
+    __testOnly_setBeforeRowPersist(() => { throw new Error('retirement write failure'); });
+    expect(() => closeSession(session.sessionId, {
+      workspaceRetirement: { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+    })).toThrow('retirement write failure');
+    expect(session.status).toBe('active');
+    expect(session.workspaceRetirement).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init();
+    expect(getSession(session.sessionId)?.status).toBe('active');
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+  });
+
   it('restores Riff close state in memory when the atomic save fails', () => {
     const session = createSession('chat1', 'root1', 'Close Riff Save Failure');
     session.backendType = 'riff';

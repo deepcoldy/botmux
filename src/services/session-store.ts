@@ -1666,6 +1666,12 @@ function persistRow(session: Session): void {
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.workspaceRetirement) {
+      if (session.status !== 'closed') throw new Error('workspace_retired');
+      // Late whole-row writers may hold a pre-close copy. Retirement cannot
+      // be erased by a stale metadata write or by changing workingDir.
+      session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2110,6 +2116,7 @@ export function closeSession(
   sessionId: string,
   opts: {
     cleanupBridgeMarkers?: boolean;
+    workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
     /**
      * Park an uncancellable mojo lineage as PART of this transaction.
@@ -2168,6 +2175,7 @@ export function closeSession(
       type: 'close',
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
+      ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
@@ -2211,10 +2219,11 @@ export function closeSession(
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
-| { ok: false; error: 'not_found' | 'not_closed' } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'workspace_retired' } {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before

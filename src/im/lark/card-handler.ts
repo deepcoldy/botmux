@@ -3029,6 +3029,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
         } else if (result.error === 'resume_cancelled') {
           await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
+        } else if (result.error === 'workspace_retired') {
+          await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, locDsResume));
         }
       }
     }

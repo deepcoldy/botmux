@@ -59,9 +59,11 @@ function fixture() {
         allSessions: () => [...sessions.values()],
         closeResidual: s => residuals.has(s.sessionId) ? 'mojo_lineage_quarantined' : undefined,
         capture: resources, reread: (_before, s, ds) => resources(s, ds),
-        close: async sid => {
+        retireClosed: (sid, retirement) => { sessions.get(sid)!.workspaceRetirement ??= retirement; },
+        close: async (sid, opts) => {
           if (failures.has(sid)) throw new Error('injected_close_failure');
           closed.push(sid); sessions.get(sid)!.status = 'closed'; live.delete(sid);
+          sessions.get(sid)!.workspaceRetirement = opts.workspaceRetirement;
           return residuals.has(sid)
             ? { ok: true, outcome: 'closed_with_residual', known: true, alreadyClosed: false, residual: { reason: 'mojo_lineage_quarantined', taskId: 'remote-fixture' } }
             : { ok: true, outcome: 'closed', known: true, alreadyClosed: false };
@@ -155,6 +157,7 @@ describe('recycle lifecycle and recovery', () => {
     await expect(f.recycler.finish('op', success)).rejects.toThrow('workspace_still_exists');
     const failed = await f.recycler.finish('op', { eventId: 'failed', outcome: 'failed' });
     expect(failed.status).toBe('aborted'); expect(f.closed).toEqual([]);
+    expect(f.sessions.get('one')?.workspaceRetirement).toBeUndefined();
     await expect(f.recycler.finish('op', success)).rejects.toThrow('recycle_event_conflict');
   });
 
@@ -281,6 +284,15 @@ describe('recycle lifecycle and recovery', () => {
     writeFileSync(path, JSON.stringify(journal));
     expect((await f.recycler.finish('op', success)).status).toBe('closed');
     expect(f.closed).toEqual(['one']);
+  });
+
+  it('retires a target closed independently after prepare without repeating process close', async () => {
+    const f = fixture(); f.add('one'); await f.recycler.prepare('op', f.workspace);
+    f.sessions.get('one')!.status = 'closed'; f.live.delete('one');
+    rmSync(f.workspace, { recursive: true });
+    expect((await f.recycler.finish('op', success)).status).toBe('closed');
+    expect(f.sessions.get('one')?.workspaceRetirement).toMatchObject({ operationId: 'op', workspacePath: f.workspace });
+    expect(f.closed).toEqual([]);
   });
 
   it('keeps a reused path or changed alias from authorizing any stale close', async () => {

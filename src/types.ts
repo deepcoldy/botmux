@@ -413,6 +413,13 @@ export interface Session {
    *  a bot's own output. */
   lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Permanent retirement after successful workspace reclamation. Written with
+   * the closed row; generic resume must never reuse this conversation's cwd. */
+  workspaceRetirement?: {
+    operationId: string;
+    workspacePath: string;
+    retiredAt: string;
+  };
   /** Last cumulative token usage persisted at close time. Dashboard list
    *  reads this durable snapshot without rescanning historical transcripts. */
   tokenUsage?: SessionTokenUsageSnapshot | null;

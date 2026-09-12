@@ -26,7 +26,10 @@ export interface WorkspaceRecycleRuntimeDeps {
   getSession: (id: string) => Session | undefined;
   getRuntime: (id: string) => DaemonSession | undefined;
   allSessions: () => Session[];
-  close: (id: string) => Promise<CloseSessionResult>;
+  close: (id: string, opts: { workspaceRetirement: NonNullable<Session['workspaceRetirement']> }) => Promise<CloseSessionResult>;
+  /** Synchronous durable re-close only: attach retirement to a row that was
+   * independently closed after prepare, without retrying process teardown. */
+  retireClosed: (id: string, retirement: NonNullable<Session['workspaceRetirement']>) => void;
   lifecycleBusy: (ds: DaemonSession) => boolean;
   closeResidual: (session: Session) => string | undefined;
   capture?: typeof captureRecycleResources;
@@ -98,6 +101,11 @@ export class WorkspaceRecycleRuntime {
     return !!request.initiator && recycleKey(request.initiator) === recycleKey(request.target);
   }
 
+  private retirement(request: RecycleRequest): NonNullable<Session['workspaceRetirement']> {
+    return { operationId: request.operationId, workspacePath: request.workspace.canonicalPath,
+      retiredAt: new Date(this.now()).toISOString() };
+  }
+
   private checkIdentity(request: RecycleRequest, session: Session, ds?: DaemonSession): string[] {
     const blockers: string[] = [];
     if (session.larkAppId !== this.deps.appId() || targetFingerprint(session) !== request.target.fingerprint) blockers.push('session_identity_or_location_changed');
@@ -117,7 +125,7 @@ export class WorkspaceRecycleRuntime {
       return other?.phase === 'closed' && other.blockers.length === 0
         && JSON.stringify(other.workspace) === JSON.stringify(journal.workspace)
         && JSON.stringify(other.peers) === JSON.stringify(journal.peers)
-        && copies.length === 1 && copies[0].status === 'closed'
+        && copies.length === 1 && copies[0].status === 'closed' && !!copies[0].workspaceRetirement
         && targetFingerprint(copies[0]) === other.target.fingerprint;
     });
   }
@@ -210,7 +218,7 @@ export class WorkspaceRecycleRuntime {
           journal.before.processes.push(...latest.processes.filter(p => !seen.has(`${p.pid}:${p.identity}`)));
           journal.phase = 'closing'; journal.blockers = [];
           this.save(journal); // A crash after here recovers by readback, not a blind kill.
-          try { journal.closeResult = await this.deps.close(session.sessionId); }
+          try { journal.closeResult = await this.deps.close(session.sessionId, { workspaceRetirement: this.retirement(journal) }); }
           catch (error) {
             const fresh = this.deps.getSession(session.sessionId);
             if (fresh?.status === 'closed') {
@@ -235,6 +243,10 @@ export class WorkspaceRecycleRuntime {
   }
 
   private async verify(journal: RecycleJournal, session: Session, ds?: DaemonSession): Promise<RecycleTargetResult> {
+    if (session.status === 'closed' && !session.workspaceRetirement) {
+      this.deps.retireClosed(session.sessionId, this.retirement(journal));
+      session = this.deps.getSession(session.sessionId) ?? session;
+    }
     journal.after = (this.deps.reread ?? rereadRecycleResources)(journal.before, session, ds);
     // A standard close fence can be acknowledged just BEFORE process exit.
     // Give already-closing owned processes a bounded read-only release window.
@@ -246,6 +258,7 @@ export class WorkspaceRecycleRuntime {
     const residual = this.deps.closeResidual(session);
     const blockers = resourceResiduals(journal.after);
     if (session.status !== 'closed') blockers.push('durable_status_not_closed');
+    if (!session.workspaceRetirement) blockers.push('durable_retirement_missing');
     if (residual) blockers.push(residual);
     if (journal.closeResult?.ok && journal.closeResult.outcome === 'closed_with_residual') blockers.push(journal.closeResult.residual.reason);
     // Remote cancellation is proved by the standard close's durable result.

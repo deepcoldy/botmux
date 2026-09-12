@@ -211,7 +211,7 @@ export class WorkspaceRecycler {
         const sessions = this.sessions();
         for (const result of results.filter(result => result.phase === 'closed')) {
           const matches = sessions.filter(s => s.sessionId === result.target.sessionId);
-          if (matches.length !== 1 || matches[0].status !== 'closed' || targetFingerprint(matches[0]) !== result.target.fingerprint) {
+          if (matches.length !== 1 || matches[0].status !== 'closed' || !matches[0].workspaceRetirement || targetFingerprint(matches[0]) !== result.target.fingerprint) {
             errors.push({ sessionId: result.target.sessionId, error: 'durable_close_readback_changed_or_missing' });
           }
         }

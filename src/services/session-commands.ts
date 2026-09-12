@@ -26,6 +26,7 @@ import type { LarkAttachment, Session } from '../types.js';
 
 /** Close inputs only the owning daemon can produce. */
 type DaemonCloseOptions = {
+  workspaceRetirement?: Session['workspaceRetirement'];
   /**
    * Close-time token snapshot, sampled by the caller BEFORE the write (the
    * daemon's transcript scan, never run under the store lock). Omit to leave
@@ -156,6 +157,10 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   // The materialised images are cleaned up AFTER the row commits, so the list
   // is handed back before it is dropped from the row.
   const released: SessionRowReleased = {};
+  if (command.workspaceRetirement && !row.workspaceRetirement) {
+    row.workspaceRetirement = { ...command.workspaceRetirement };
+    changed = true;
+  }
 
   if (!alreadyClosed) {
     if (row.dashboardAttachments?.length) {

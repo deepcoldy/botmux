@@ -1227,6 +1227,7 @@ const workspaceRecycleRuntime = new WorkspaceRecycleRuntime({
   getRuntime: findActiveBySessionId,
   allSessions: () => sessionStore.loadAllSessionsStrict(config.session.dataDir),
   close: closeSession,
+  retireClosed: (id, workspaceRetirement) => sessionStore.closeSession(id, { workspaceRetirement }),
   lifecycleBusy: ds => isSessionTransferring(ds) || isSessionLifecycleInFlight(ds) || hasPendingOrdinaryImDelivery(ds),
   closeResidual: session => mojoCloseResidualForRow(session)?.reason,
   onError: error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`),

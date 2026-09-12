@@ -3382,6 +3382,8 @@ export async function handleCommand(
               await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
             } else if (result.error === 'resume_cancelled') {
               await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else if (result.error === 'workspace_retired') {
+              await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
             } else {
               await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
             }
