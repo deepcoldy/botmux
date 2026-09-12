@@ -460,14 +460,42 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
-    // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny. By default (experimental
-    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
-    // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    // Complex command syntax remains discoverable in the opening catalog. The
+    // follow-up repeats only the transport boundary and nothing-to-send rule;
+    // the experimental anti-resend clause stays off by default.
+    expect(content).toContain('`botmux send` 是唯一用户可见回复通道');
+    expect(content).toContain('`lark-cli`');
+    expect(content).toContain('`feishu-cli`');
+    expect(content).toContain('直接调用飞书 API');
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
+  });
+
+  it('restores the sole reply-channel constraint for a Chinese TRAE follow-up after compact', () => {
+    // TRAE may discard the opening <botmux_routing> after /compact. The first
+    // business follow-up must therefore carry the complete transport boundary.
+    const content = buildFollowUpContent('继续处理刚才的问题', SESSION_ID, {
+      cliId: 'traex',
+      locale: 'zh',
+    });
+
+    expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
+    expect(content).toContain('`botmux send` 是唯一用户可见回复通道');
+    expect(content).toContain('禁止用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复');
+  });
+
+  it('restores the sole reply-channel constraint for an English TRAE follow-up after compact', () => {
+    const content = buildFollowUpContent('continue with the previous task', SESSION_ID, {
+      cliId: 'traex',
+      locale: 'en',
+    });
+
+    expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
+    expect(content).toContain('`botmux send` is the only user-visible reply channel');
+    expect(content).toContain('`lark-cli`');
+    expect(content).toContain('`feishu-cli`');
+    expect(content).toContain('direct calls to the Lark API');
   });
 
   it('carries the anti-resend reminder variant when config.noVisibleOutputHint is ON', () => {
@@ -476,6 +504,8 @@ describe('buildFollowUpContent', () => {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
       // ON variant must inherit #554's sentinel semantics AND add anti-resend.
       expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
+      expect(content).toContain('`botmux send` 是唯一用户可见回复通道');
+      expect(content).toContain('禁止用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复');
       expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
@@ -487,13 +517,28 @@ describe('buildFollowUpContent', () => {
     // as redundant belt-and-braces on top of the real dedup fix
     // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
     // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
-    // the standard path. With the anti-resend toggle OFF (default) that is
-    // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
+    // the standard path, including the same transport boundary as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).toContain('`botmux send` 是唯一用户可见回复通道');
+    expect(content).toContain('禁止用 `lark-cli`、`feishu-cli` 或直接调用飞书 API 发回复');
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
+  });
+
+  it('keeps the no-transport follow-up isolated from chat reply-channel guidance', () => {
+    const content = buildFollowUpContent('return JSON', SESSION_ID, {
+      cliId: 'traex',
+      locale: 'en',
+      larkAppId: 'app_test',
+      chatId: 'http_wait_test',
+    });
+
+    expect(content).toContain('do not call botmux send');
+    expect(content).toContain('do not post to Feishu/Lark');
+    expect(content).not.toContain('only user-visible reply channel');
+    expect(content).not.toContain('`lark-cli`');
+    expect(content).not.toContain('`feishu-cli`');
   });
 
   it('routes Hermes through the shared anti-resend branch when noVisibleOutputHint is ON', () => {
