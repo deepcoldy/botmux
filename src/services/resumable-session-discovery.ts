@@ -485,24 +485,88 @@ function rolloutResponseItemText(payload: Record<string, unknown>): string {
   return parts.join('').trim();
 }
 
-/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd.
- *  Title preference: the first `event_msg`/`user_message` (legacy format); when
- *  absent (Codex >=0.147), the first non-synthetic `response_item` role:user
- *  message — skipping the startup preamble and botmux-injected turns (which mark
- *  the whole session botmux-origin, same as the user_message path). Streamed
- *  line by line, stopping once id + cwd + title are found. */
+/** TraeX 0.201.7 persists the canonical conversation stream inside
+ *  history_mutation.payload.items. Return every user message in one append so
+ *  the synthetic startup item can be skipped before the real prompt. */
+function rolloutHistoryMutationUserTexts(payload: Record<string, unknown>): string[] {
+  if ((payload.operation !== 'append' && payload.operation !== 'replace')
+    || !Array.isArray(payload.items)) return [];
+  const texts: string[] = [];
+  for (const item of payload.items) {
+    const message = asRecord(item);
+    if (message?.type !== 'message' || message.role !== 'user') continue;
+    const text = rolloutResponseItemText(message);
+    if (text) texts.push(text);
+  }
+  return texts;
+}
+
+/** TraeX 0.201.4 mirrors genuine user input as item_completed/UserMessage. */
+function rolloutCompletedUserText(payload: Record<string, unknown>): string {
+  const item = asRecord(payload.item);
+  if (item?.type !== 'UserMessage' || !Array.isArray(item.content)) return '';
+  const parts: string[] = [];
+  for (const block of item.content) {
+    const text = asRecord(block);
+    if (text?.type === 'text' && typeof text.text === 'string') parts.push(text.text);
+  }
+  return parts.join('').trim();
+}
+
+export interface RolloutSessionMetadata {
+  title?: string;
+  firstUserMessage?: string;
+  cwd?: string;
+  lastActivityAt?: number;
+}
+
+export interface RolloutDiscoveryOptions {
+  /** TraeX writes canonical user turns in history_mutation (0.201.7) or
+   *  item_completed/UserMessage (0.201.4). Top-level response_item role:user
+   *  records are only a final compatibility fallback for that dialect. */
+  dialect?: 'codex' | 'traex';
+  /** Native index metadata keyed by session id. TraeX's state DB title wins
+   *  over a title inferred from the first prompt, preserving /rename. */
+  metadataById?: ReadonlyMap<string, RolloutSessionMetadata>;
+}
+
+/** Parse one Codex/TRAE rollout. session_meta carries the resume id + cwd.
+ *  Codex titles come from event_msg/user_message or response_item role:user.
+ *  TraeX additionally uses its canonical history_mutation or item_completed
+ *  user record; response_item stays a weak fallback because TraeX also writes
+ *  runtime injections there. Native index metadata may override the inferred
+ *  title while the canonical first prompt still decides botmux ownership. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
   exclude?: ReadonlySet<string>,
+  options: RolloutDiscoveryOptions = {},
 ): Promise<ResumableSession | null> {
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string; fallbackTitle: string; botmux: boolean } = {
-    id: null, cwd: null, title: '', fallbackTitle: '', botmux: false,
+  const acc: {
+    id: string | null;
+    cwd: string | null;
+    title: string;
+    fallbackTitle: string;
+    weakTitle: string;
+    botmux: boolean;
+    weakBotmux: boolean;
+  } = {
+    id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false, weakBotmux: false,
   };
   let excluded = false;
+  let nativeMetadata: RolloutSessionMetadata | undefined;
+  const recordCanonicalUserText = (text: string): boolean | undefined => {
+    if (!text || isSyntheticPreamble(text)) return;
+    if (isBotmuxInjected(text)) {
+      acc.botmux = true;
+      return true;
+    }
+    if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+    return Boolean(acc.id && acc.cwd && acc.fallbackTitle);
+  };
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
     if (rec.type === 'session_meta' && payload) {
@@ -511,11 +575,26 @@ async function parseRolloutTranscript(
         // The resume id lives on the very first line; bail immediately on a
         // live session so excluded rollouts cost a single line read.
         if (exclude?.has(payload.id)) { excluded = true; return true; }
+        nativeMetadata = options.metadataById?.get(payload.id);
       }
-      if (typeof payload.cwd === 'string') acc.cwd = payload.cwd;
+      if (typeof payload.cwd === 'string') acc.cwd = nativeMetadata?.cwd || payload.cwd;
+      if (nativeMetadata?.firstUserMessage) {
+        const stop = recordCanonicalUserText(nativeMetadata.firstUserMessage.trim());
+        if (stop) return true;
+      }
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
       if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
+    } else if (options.dialect === 'traex'
+      && rec.type === 'event_msg'
+      && payload?.type === 'item_completed') {
+      const stop = recordCanonicalUserText(rolloutCompletedUserText(payload));
+      if (stop) return true;
+    } else if (options.dialect === 'traex' && rec.type === 'history_mutation' && payload) {
+      for (const text of rolloutHistoryMutationUserTexts(payload)) {
+        const stop = recordCanonicalUserText(text);
+        if (stop) return true;
+      }
     } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
       // New-format (>=0.147) fallback title source. The first meaningful user
       // turn determines origin, mirroring parseClaudeTranscript: a synthetic
@@ -525,25 +604,40 @@ async function parseRolloutTranscript(
       const text = rolloutResponseItemText(payload);
       if (!text) return; // empty / non-text content — not a title candidate
       if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
-      if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
-      if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+      if (isBotmuxInjected(text)) {
+        if (options.dialect !== 'traex') {
+          acc.botmux = true;
+          return true;
+        }
+        acc.weakBotmux = true;
+      } else if (!acc.weakTitle) {
+        acc.weakTitle = truncateTitle(text);
+      }
       // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
       // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
       // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
       // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
-      if (acc.id && acc.cwd && acc.fallbackTitle) return true;
+      if (options.dialect !== 'traex' && acc.id && acc.cwd && acc.weakTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  const title = acc.title || acc.fallbackTitle;
-  if (excluded || acc.botmux || !acc.id || !acc.cwd || !title) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title, lastActivityAt: mtimeMs };
+  const inferredTitle = acc.title || acc.fallbackTitle || acc.weakTitle;
+  const title = truncateTitle(nativeMetadata?.title ?? inferredTitle);
+  const botmux = acc.botmux || (!acc.title && !acc.fallbackTitle && acc.weakBotmux);
+  if (excluded || botmux || !acc.id || !acc.cwd || !title) return null;
+  return {
+    cliSessionId: acc.id,
+    cwd: nativeMetadata?.cwd || acc.cwd,
+    title,
+    lastActivityAt: nativeMetadata?.lastActivityAt ?? mtimeMs,
+  };
 }
 
 export async function discoverRolloutSessions(
   sessionsRoot: string,
   limit: number,
   exclude?: ReadonlySet<string>,
+  options: RolloutDiscoveryOptions = {},
 ): Promise<ResumableSession[]> {
   // The resume id is inside the file (not the filename), so we can't pre-filter
   // by name. Instead walk most-recent-first and parse until `limit` non-excluded
@@ -553,7 +647,7 @@ export async function discoverRolloutSessions(
   const out: ResumableSession[] = [];
   for (const f of files) {
     if (out.length >= limit) break;
-    const s = await parseRolloutTranscript(f.path, f.mtimeMs, exclude);
+    const s = await parseRolloutTranscript(f.path, f.mtimeMs, exclude, options);
     if (s) out.push(s);
   }
   return out;
