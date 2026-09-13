@@ -103,6 +103,27 @@ botmux 日常运维
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
 
+## 📑 群标签页
+
+| 命令 | 说明 |
+|------|------|
+| `/tabs` / `/tabs list` | 查看当前群的全部标签页及其 Tab ID |
+| `/tabs add <网址> [名称]` | 新增 URL 标签页（修改需 owner 或获授权的操作人） |
+| `/tabs rename <tab_id> <新名称>` | 重命名可编辑的 URL / 文档标签页 |
+| `/tabs delete <tab_id>` | 删除可编辑的 URL / 文档标签页 |
+| `/tabs sort <tab_id> ...` | 按给定顺序排列标签页；必须包含 `/tabs` 列出的全部 Tab ID |
+
+飞书内置标签页只能查看和参与排序，不能通过开放接口重命名或删除。若群设置为「仅群主和管理员可管理标签页」，机器人也必须具备相应群权限。
+
+AI 或后台脚本应使用 CLI，而不是向群里发送 slash command：
+
+```bash
+botmux tabs add "https://example.com/project/releases/2026" \
+  --name "项目发布页" --json
+```
+
+CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会话时可传 `--session-id`，要覆盖目标群可传 `--chat-id`。`add` 按 URL 幂等：同一个页面已有 Tab 时复用，并按需更新名称，适用于 MR、项目看板、发布页等自动化场景。后台还可使用 `botmux tabs list|update|remove|sort`。
+
 ## 🔀 透传给底层 CLI
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。

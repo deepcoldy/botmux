@@ -5346,6 +5346,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.tabs', undefined, loc),
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),

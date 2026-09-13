@@ -19,6 +19,7 @@
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux preview <port> — register this session's loopback Web preview
+ *   botmux tabs add <url> [--name <name>] — add/reuse a URL tab in the current Lark chat
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
@@ -6355,6 +6356,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token。
                    端口必须由本会话的进程持有（在会话内直接启动，别 setsid/nohup
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
+  tabs list|add|update|remove|sort
+                   查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -7339,6 +7342,56 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
     for (const cfg of loadBotConfigs()) registerBot(cfg);
   } catch { /* ignore */ }
   return { sid, larkAppId: s.larkAppId, session: s };
+}
+
+async function cmdTabs(rest: string[]): Promise<void> {
+  const {
+    CHAT_TABS_CLI_USAGE,
+    executeChatTabsCli,
+    formatChatTabsCliResult,
+    parseChatTabsCli,
+  } = await import('./cli/chat-tabs-command.js');
+  let parsed;
+  try {
+    parsed = parseChatTabsCli(rest);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === CHAT_TABS_CLI_USAGE) {
+      console.log(message);
+      return;
+    }
+    console.error(`botmux tabs: ${message}\n\n${CHAT_TABS_CLI_USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  assertTurnTransportOrExit('tabs');
+  await registerSelfFromCredFile();
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  assertSessionTransportOrExit(session, 'tabs');
+  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
+  // that turn-bound value over an old session record whose chatType/chatId may
+  // predate a DM→group handoff. Never apply it to an explicit different sid.
+  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
+    ? process.env.BOTMUX_CHAT_ID?.trim()
+    : undefined;
+  const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
+  if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
+    console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    const result = await executeChatTabsCli({ ...parsed, larkAppId, resolvedChatId: chatId });
+    console.log(parsed.json
+      ? JSON.stringify({ ok: true, chatId, ...(result as object) })
+      : formatChatTabsCliResult(result));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, error: message }));
+    else console.error(`botmux tabs: ${message}`);
+    process.exitCode = 1;
+  }
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
@@ -15165,6 +15218,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'tabs':     await cmdTabs(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;

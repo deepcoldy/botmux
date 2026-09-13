@@ -768,6 +768,7 @@ export const messages: Record<string, string> = {
   'help.repo_path': '/repo <path|name> - Use a path or a project name under workingDir, skipping the card',
   'help.repo_wt': '/repo wt <N|name> [branch] - Create a worktree off the remote default branch and open it (auto semantic name when branch is omitted)',
   'help.rename': '/rename <title> - Rename this Botmux session and sync the running Codex/Claude session name',
+  'help.tabs': '/tabs - List and manage tabs in the current Lark chat',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
   'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
   'cmd.retry.no_session': 'No active session in this topic to retry.',
