@@ -529,6 +529,20 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.usageDisplay).toBeUndefined();
   });
 
+  it('offers only default and unified reply modes and preserves the retired status-card opt-out on writes', async () => {
+    const { registry, store } = await loaded({ replyCardMode: 'final-only' });
+    const spec = store.findConfigField('replyCardMode')!;
+    expect(spec.enumValues).toEqual(['legacy', 'unified']);
+    expect(store.coerceConfigValue(spec, 'final-only')).toEqual({ ok: false, reason: 'invalid_enum' });
+    expect(registry.getBot('app_default').config).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    expect((await store.applyConfigField('app_default', spec, 'unified')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    const offSwitch = store.findConfigField('disableStreamingCard')!;
+    expect((await store.applyConfigField('app_default', offSwitch, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].disableStreamingCard).toBeUndefined();
+  });
+
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
     const { registry, store } = await loaded({ cliId: 'codex-app' });
     const spec = store.findConfigField('codexAppCleanInput')!;

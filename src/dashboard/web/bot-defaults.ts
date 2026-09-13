@@ -112,6 +112,7 @@ export type BotDefaultsRow = {
   usageDisplay?: 'streaming' | 'footer' | 'off';
   usageSupported?: boolean;
   disableStreamingCard?: boolean;
+  replyCardMode?: 'legacy' | 'unified';
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;

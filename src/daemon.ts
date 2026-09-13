@@ -41,6 +41,7 @@ import {
 } from './core/host-overload-alert.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
 import { settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
+import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -23754,6 +23755,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // THIS bot's markers: the orphan dir is shared across per-bot PM2 daemons.
   if (selfDaemonLarkAppId) {
     void sweepOrphanCotMessages(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
+    void sweepInterruptedReplyCards(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
   }
 
   // Freeze the control plane of restored mojo sessions NOW, not at their next
@@ -24350,8 +24352,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // missed here (SIGKILL, power loss, or a session added after this point).
     try {
       await waitAllWithin(
-        currentShutdownFleet.sessions.map(ds =>
-          settleCotMessageForShutdown(ds).catch(() => { /* cosmetic */ })),
+        currentShutdownFleet.sessions.flatMap(ds => [
+          settleCotMessageForShutdown(ds).catch(() => { /* cosmetic */ }),
+          settleTurnReplyCards(ds).catch(() => { /* cosmetic */ }),
+        ]),
         Math.min(shutdownDeadlineMs, Date.now() + DAEMON_COT_SETTLE_MS),
       );
     } catch { /* cosmetic — never block shutdown */ }

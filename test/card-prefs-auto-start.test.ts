@@ -91,6 +91,7 @@ describe('card-prefs store — 主动开工 fields', () => {
 
     const prefs = store.getBotCardPrefs('app_default');
     expect(prefs.pinStreamingCard).toBe(false);
+    expect(prefs.replyCardMode).toBe('legacy');
     expect(prefs.hiddenStreamingCardButtons).toEqual([]);
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
@@ -99,6 +100,33 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnGroupJoinSeed).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
     expect(prefs.regularGroupMentionMode).toBe('always');
+  });
+
+  it('persists reply mode through registry reload without changing other card preferences', async () => {
+    writeConfig({ thinkingCard: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect((await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' })).ok).toBe(true);
+    expect(store.getBotCardPrefs('app_default').replyCardMode).toBe('unified');
+    expect(registry.loadBotConfigs()[0].replyCardMode).toBe('unified');
+    expect(readConfig()).toMatchObject({ thinkingCard: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    await store.updateBotCardPrefs('app_default', { replyCardMode: 'legacy' });
+    expect(readConfig().replyCardMode).toBeUndefined();
+  });
+
+  it('preserves the retired status-card opt-out until that independent switch is changed', async () => {
+    writeConfig({ replyCardMode: 'final-only', noCardChats: ['oc_quiet'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default')).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    await store.updateBotCardPrefs('app_default', { thinkingCard: false });
+    expect(readConfig()).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' });
+    expect(store.getBotCardPrefs('app_default').disableStreamingCard).toBe(true);
+    await store.updateBotCardPrefs('app_default', { disableStreamingCard: false });
+    expect(store.getBotCardPrefs('app_default')).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: false });
+    expect(registry.loadBotConfigs()[0].disableStreamingCard).toBeUndefined();
+    expect(readConfig().noCardChats).toEqual(['oc_quiet']);
   });
 
   it('persists toggles + prompt to bots.json and syncs in-memory config (FR-9)', async () => {

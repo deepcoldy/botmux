@@ -312,6 +312,8 @@ export const messages: Record<string, string> = {
   'cmd.term.failed': '⚠️ 可操作链接发送失败（私密卡与 DM 均失败），看 daemon 日志。',
   'cmd.term.sent_dm': '🔑 可操作终端链接已私信发你（不在群里暴露）。',
   'cmd.card.off_ok': '🔕 已关闭本群流式卡片，不再发状态卡，答案仍作为新消息发送（照常通知）。/card on 恢复出卡；/card 可临时召唤一张实时卡。',
+  'cmd.card.reply_off_ok': '🔕 已关闭本群独立状态卡的自动显示，动态答复卡仍持续更新进度、工具调用和最终答复。/card on 清除群级关闭设置；/card 可临时打开状态卡。',
+  'cmd.card.reply_on_ok': '🔔 已清除本群独立状态卡的关闭设置，跟随机器人的状态卡开关；动态答复卡不受影响。机器人级关闭设置仍优先生效。',
   'cmd.card.on_ok': '🔔 已恢复本群流式卡片。下条状态起重新出实时卡。',
   'cmd.card.pin.off_ok': '📌 已关闭当前群的流式卡片置顶。实时卡仍会发送，但 botmux 不再在这里置顶它们。',
   'cmd.card.pin.on_ok': '📌 已恢复当前群的流式卡片置顶。',

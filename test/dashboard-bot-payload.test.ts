@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('maps retired final-only settings to a dynamic reply with the separate status card off', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyCardMode: 'final-only' }))
+      .toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyCardMode: 'unified' }))
+      .toMatchObject({ replyCardMode: 'unified', disableStreamingCard: false });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}))
+      .toMatchObject({ replyCardMode: 'legacy', disableStreamingCard: false });
+  });
+
   it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
     const row = botDefaultsPayload(
       {

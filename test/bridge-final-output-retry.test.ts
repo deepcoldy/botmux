@@ -68,6 +68,7 @@ vi.mock('../src/bot-registry.js', () => ({
   // Reply-card footer usage only renders in 'footer' mode; tests override this
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
+  normalizeUsageDisplay: vi.fn(() => 'footer'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -112,7 +113,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
+  postTurnStartingCard,
   __testOnly_setupWorkerHandlers,
+  sendWorkerInput,
+  __testOnly_resetOrdinaryImDeliveries,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
@@ -264,12 +268,155 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   afterEach(async () => {
+    __testOnly_resetOrdinaryImDeliveries();
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
+  });
+
+  it('merges the real worker final_output into its existing reply card', async () => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    bot.config.replyCardMode = 'unified';
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'thread';
+    ds.session.cliId = 'claude-code';
+    ds.currentTurnId = 'om_managed_turn';
+    const sessionReply = vi.fn(async () => 'om_managed_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+    await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' },
+      (body, type, uuid) => sessionReply(ds.session.rootMessageId, body, type, ds.larkAppId, ds.currentTurnId, { uuid }));
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'tool_call', id: 'read-1', name: 'Read', args: '{}', subject: 'README.md' }] });
+    ds.worker!.emit('message', { type: 'final_output', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      kind: 'bridge', content: '同卡完整答复', lastUuid: 'managed-final' });
+    ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      status: 'completed', durationMs: 2300, completedAtMs: Date.now() });
+    await vi.waitFor(() => {
+      expect(updateMessageMock.mock.calls.some(call => call[2]?.includes('同卡完整答复') && call[2]?.includes('已完成'))).toBe(true);
+    }, { timeout: 5000 });
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const record = new TurnReplyCardStore('/tmp/test-sessions').read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
+    expect(record?.tools[0]?.subject).toBe('README.md');
+    expect(record?.finalDelivered).toBe(true);
+  });
+
+  it.each([
+    ['claude-code', 'on'], ['claude-code', 'bot-off'], ['claude-code', 'chat-off'],
+    ['codex', 'on'], ['codex', 'bot-off'], ['codex', 'chat-off'],
+  ] as const)('%s unified replies keep the %s status card independent through ready and final output', async (cliId, statusMode) => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    Object.assign(bot.config, { replyCardMode: 'unified', disableStreamingCard: statusMode === 'bot-off',
+      noCardChats: statusMode === 'chat-off' ? ['oc_chat'] : [] });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'thread';
+    ds.session.cliId = cliId;
+    ds.workerReady = true;
+    ds.currentTurnId = ds.streamCardPendingTurnId = 'om_independent_turn';
+    ds.streamCardPending = true;
+    ds.lastScreenStatus = 'working';
+    const sessionReply = vi.fn(async (_root: string, body: string) => body === '{}' ? 'om_status' : 'om_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Admission and another starting-card trigger may race before either POST finishes.
+    await Promise.all([
+      postTurnStartingCard(ds, sessionReply, ds.currentTurnId),
+      postTurnStartingCard(ds, sessionReply, ds.currentTurnId),
+    ]);
+    const expectedPosts = statusMode === 'on' ? 2 : 1;
+    expect(sessionReply).toHaveBeenCalledTimes(expectedPosts);
+    expect(ds.streamCardId).toBe(statusMode === 'on' ? 'om_status' : undefined);
+    ds.worker!.emit('message', { type: 'ready', port: 9999, token: 'test-token', turnId: ds.currentTurnId });
+    await vi.waitFor(() => expect(ds.workerPort).toBe(9999));
+    if (statusMode === 'on') {
+      await vi.waitFor(() => expect(updateMessageMock.mock.calls.some(call => call[1] === 'om_status')).toBe(true));
+    }
+    ds.worker!.emit('message', { type: 'final_output', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      kind: 'bridge', content: '独立开关不影响完整答复', lastUuid: 'independent-final' });
+    await vi.waitFor(() => expect(updateMessageMock.mock.calls.some(call =>
+      call[1] === 'om_answer' && call[2]?.includes('独立开关不影响完整答复'))).toBe(true), { timeout: 5000 });
+    expect(sessionReply).toHaveBeenCalledTimes(expectedPosts);
+    expect(updateMessageMock.mock.calls.filter(call => call[2]?.includes('独立开关不影响完整答复'))
+      .every(call => call[1] === 'om_answer')).toBe(true);
+    if (statusMode !== 'on') expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_answer')).toBe(true);
+  });
+
+  it('does not let a delayed reply POST overwrite the successor status-card identity', async () => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'thread';
+    ds.session.cliId = 'claude-code';
+    ds.workerReady = true;
+    ds.currentTurnId = ds.streamCardPendingTurnId = 'om_old';
+    ds.streamCardPending = true;
+    let resolveOldReply!: (id: string) => void;
+    const oldReply = new Promise<string>(resolve => { resolveOldReply = resolve; });
+    const sessionReply = vi.fn(async (_root: string, body: string, _type?: string, _app?: string, turnId?: string) => {
+      if (body === '{}') return `status_${turnId}`;
+      return turnId === 'om_old' ? oldReply : `reply_${turnId}`;
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    const oldPost = postTurnStartingCard(ds, sessionReply, 'om_old');
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(ds.streamCardId).toBe('status_om_old');
+    ds.currentTurnId = ds.streamCardPendingTurnId = 'om_next';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_next')).resolves.toBe(true);
+    resolveOldReply('reply_om_old');
+    await expect(oldPost).resolves.toBe(true);
+    expect(ds.streamCardId).toBe('status_om_next');
+    expect(ds.streamCardPending).toBe(false);
+    expect(sessionReply).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(['unified', 'unified-status-off', 'legacy'] as const)('keeps delayed worker receipt consistent with %s mode', async mode => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    bot.config.replyCardMode = mode === 'legacy' ? 'legacy' : 'unified';
+    bot.config.disableStreamingCard = mode === 'unified-status-off';
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'thread';
+    ds.session.cliId = 'claude-code';
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    ds.currentTurnId = 'om_delayed_turn';
+    (ds.worker!.send as ReturnType<typeof vi.fn>).mockImplementation((_message, callback) => { callback?.(null); return true; });
+    const sessionReply = vi.fn(async () => 'om_wait_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+    await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'refresh' },
+      (body, type, uuid) => sessionReply(ds.session.rootMessageId, body, type, ds.larkAppId, ds.currentTurnId, { uuid }));
+    const enqueuedAt = Date.now();
+    expect(sendWorkerInput(ds, 'hello', ds.currentTurnId)).toBe(true);
+    if (mode === 'legacy') {
+      await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1), { timeout: 4000 });
+      expect(sessionReply.mock.calls[0][2]).toBe('text');
+    } else {
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      await vi.waitFor(() => expect(new TurnReplyCardStore('/tmp/test-sessions').read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId!,
+      })?.updatedAtMs).toBeGreaterThan(enqueuedAt), { timeout: 4000 });
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(sessionReply.mock.calls.every(call => call[2] === 'interactive')).toBe(true);
+    }
   });
 
   it('commits dedup uuid only after a successful sessionReply', async () => {

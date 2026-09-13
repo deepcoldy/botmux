@@ -41,6 +41,7 @@ import {
   type UsageDisplayMode,
 } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import { normalizeReplyCardMode, type ReplyCardMode } from './turn-reply-card.js';
 import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
@@ -56,6 +57,7 @@ export interface BotCardPrefs {
    *  reply-card footer, 'off' = nowhere. */
   usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
+  replyCardMode: ReplyCardMode;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
@@ -113,6 +115,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
+      replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
@@ -139,6 +142,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
+      replyCardMode: 'legacy',
       hiddenStreamingCardButtons: [],
       pinStreamingCard: false,
       silentTurnReactions: false,
@@ -243,8 +247,16 @@ async function updateBotCardPrefsInternal(
   };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
+    if (entry.replyCardMode === 'final-only') {
+      entry.replyCardMode = 'unified';
+      entry.disableStreamingCard = true;
+    }
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    if (patch.replyCardMode !== undefined) {
+      if (patch.replyCardMode === 'legacy') delete entry.replyCardMode;
+      else entry.replyCardMode = patch.replyCardMode;
+    }
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
@@ -270,6 +282,7 @@ async function updateBotCardPrefsInternal(
       result: {
         usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
+        replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
@@ -308,6 +321,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
+  }
+  if (patch.replyCardMode !== undefined) {
+    bot.config.replyCardMode = patch.replyCardMode === 'legacy' ? undefined : patch.replyCardMode;
   }
   if (patch.hiddenStreamingCardButtons !== undefined) {
     bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);

@@ -4705,7 +4705,8 @@ function explicitReplyMarkerForTurnWindow(
   if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return undefined;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper);
+  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
   return inWindow.at(-1);
 }
 

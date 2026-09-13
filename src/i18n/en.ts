@@ -313,6 +313,8 @@ export const messages: Record<string, string> = {
   'cmd.term.failed': '⚠️ Failed to send the operable link (both the private card and DM failed); check the daemon logs.',
   'cmd.term.sent_dm': '🔑 Sent the operable terminal link to your DM (kept out of the group).',
   'cmd.card.off_ok': '🔕 Streaming cards turned off for this chat; no status card is posted and answers still arrive as fresh messages (notified as usual). /card on to restore; /card summons a live card.',
+  'cmd.card.reply_off_ok': '🔕 Automatic separate status cards are off in this chat. The dynamic reply card still updates progress, tool calls and the final answer. /card on clears the chat override; /card opens a status card temporarily.',
+  'cmd.card.reply_on_ok': '🔔 Chat status-card override cleared; the bot’s status-card setting applies. Dynamic reply cards are unaffected. A bot-level off setting still takes precedence.',
   'cmd.card.on_ok': '🔔 Streaming cards restored for this chat. The next status update posts a live card again.',
   'cmd.card.pin.off_ok': '📌 Streaming-card Pin turned off for this chat. Live cards still post, but botmux stops pinning them here.',
   'cmd.card.pin.on_ok': '📌 Streaming-card Pin restored for this chat.',

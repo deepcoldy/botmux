@@ -165,6 +165,8 @@ import {
 import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.js';
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
+import { TurnReplyCardStore } from './services/turn-reply-card.js';
+import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
@@ -3641,13 +3643,15 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
     inThread?: boolean;
+    replyTargetSenderOpenId?: string;
+    replyTargetSenderIsBot?: boolean;
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -9877,6 +9881,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId,
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+        ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
@@ -9885,6 +9890,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -9931,6 +9937,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     content: string,
     msgType: string,
     originAlreadyRevalidated = false,
+    uuid?: string,
   ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
@@ -9974,7 +9981,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...(prepared ? { uuid: prepared.providerKey } : uuid ? { uuid } : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
@@ -10379,15 +10386,64 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
+      const canonicalCard = createReplyCard([...elements], layoutHeader);
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const canonicalCard = createReplyCard([...elements], layoutHeader);
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
-        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
+      }
+      const replyStore = new TurnReplyCardStore(resolveDataDir());
+      const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
+      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
+      // Mentioning this turn's human requester is still an ordinary reply.
+      // Peer bots, other recipients and unknown identities need a new message
+      // so their notification/automation cannot be swallowed by a PATCH.
+      const onlyRequesterMentions = !explicitKnownBotMention && mentions.every(mention =>
+        mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
+      const canUseReplyCard = replyKey && !sendTopLevel && !overrideChatId && !sendInto
+        && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
+        && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
+        && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
+      const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
+      if (replyRecord && replyKey) {
+        if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
+        const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
+          ? { kind: 'final', text, card: JSON.stringify(canonicalCard), source: 'explicit',
+              ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
+          : { kind: 'progress', text }, {
+          beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+          send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
+          patch: async (id, body) => {
+            const { updateMessage } = await import('./im/lark/client.js');
+            await updateMessage(appId, id, body);
+          },
+          isWithdrawn: error => error instanceof MessageWithdrawnError,
+          render: record => buildTurnReplyCard(record, {
+            ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
+            showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
+            canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
+          }),
+          sendOverflow: async (fullText, uuid) => {
+            const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
+            writeFileSync(path, fullText, { mode: 0o600 });
+            await revalidateIsolatedOriginBeforeEffect();
+            const fileKey = await uploadFile(appId, path);
+            return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+          },
+        });
+        unifiedReplyUsed = true;
+        if (!delivered.delivered || !delivered.messageId) {
+          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
+          return;
+        }
+        messageId = delivered.messageId;
       } else {
-        messageId = await dispatchPrimary(JSON.stringify(createReplyCard(elements, layoutHeader)), 'interactive');
+        messageId = await dispatchPrimary(JSON.stringify(canonicalCard), 'interactive');
       }
     }
 
@@ -10506,7 +10562,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
-    console.error(t('ai.send.after_success_hint', undefined, localeForBot(appId)));
+    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
+      ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
+      : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the

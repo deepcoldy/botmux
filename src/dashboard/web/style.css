@@ -24815,6 +24815,20 @@ dialog select[multiple]:hover:not(:disabled) {
   margin-top: 0;
 }
 
+.bot-defaults-page .bd-card-settings .bd-card-display {
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.bot-defaults-page .bd-card-display > .bd-field {
+  width: min(100%, 420px);
+}
+
+.bot-defaults-page .bd-card-display > .bd-card-setting-copy {
+  max-width: 72ch;
+  margin: 0;
+}
+
 .bot-defaults-page .bd-card-control-list {
   display: grid;
   gap: 10px;

@@ -108,7 +108,6 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
     expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
     expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
-    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
     expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
   });
 

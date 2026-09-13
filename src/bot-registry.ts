@@ -1880,6 +1880,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Ordinary Claude Code/Codex replies. Absent preserves legacy delivery. */
+  replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
@@ -3654,7 +3656,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
-      disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      // Retired final-only preference must not opt into an extra terminal card.
+      disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
+      replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

@@ -32,6 +32,8 @@ import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotM
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
@@ -1492,6 +1494,8 @@ export async function handleCardCommand(
   const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
+  const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
+    && ['claude-code', 'codex'].includes(ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1523,13 +1527,13 @@ export async function handleCardCommand(
   if (sub === 'off') {
     const r = await setCardMode(larkAppId, chatId, true);
     if (ds) ds.streamingCardForced = undefined;
-    await reply(r.ok ? t('cmd.card.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    await reply(r.ok ? t(managedReplyMode ? 'cmd.card.reply_off_ok' : 'cmd.card.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
     return;
   }
   if (sub === 'on') {
     const r = await setCardMode(larkAppId, chatId, false);
     if (ds) ds.streamingCardForced = undefined;
-    await reply(r.ok ? t('cmd.card.on_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    await reply(r.ok ? t(managedReplyMode ? 'cmd.card.reply_on_ok' : 'cmd.card.on_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
     return;
   }
   if (sub === '' || sub === 'show') {
@@ -1631,6 +1635,14 @@ export async function handleCotCommand(
     }
     ds.cotForced = true;
     if (ds.lastThinkingUpdate) {
+      if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
+        const update = ds.lastThinkingUpdate;
+        await updateTurnReplyCard(ds, update.turnId, {
+          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
+        }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
+        { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        return;
+      }
       // Turn in flight with thinking already accumulated — render right away
       // (the worker only emits on NEW entries, so waiting could miss a turn
       // whose thinking phase is over).
