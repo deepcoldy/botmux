@@ -30,6 +30,10 @@ vi.mock('../src/utils/user-token.js', () => ({
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  beginBytedcliLogin: vi.fn(async () => ({
+    authUrl: 'https://cloud.example.com/auth?state=auto',
+    completeToken: 'tok-auto',
+  })),
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
@@ -157,7 +161,8 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     // authorize the other provider and hit this same refusal again.
     expect(body).toContain('ByteCloud');
     expect(body).not.toContain('飞书');
-    expect(body).toContain('/login bytedcli');
+    expect(body).toContain('https://cloud.example.com/auth?state=auto');
+    expect(body).toContain('不需要再发送 /login bytedcli');
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.

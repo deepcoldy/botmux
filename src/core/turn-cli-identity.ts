@@ -17,7 +17,7 @@ import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
-import { mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -91,7 +91,7 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push(withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     }
   }
   return outcomes;
@@ -106,16 +106,16 @@ async function publishOne(
   locale: Locale | undefined,
   turnId: string | undefined,
 ): Promise<ToolIdentityOutcome> {
-  const withheld = () =>
+  const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId);
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
   // creator's or the owner's credentials to fill the gap.
-  if (!senderOpenId) return withheld();
+  if (!senderOpenId) return await withheld();
 
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
-  if (!identity) return withheld();
+  if (!identity) return await withheld();
 
   writeSessionIdentity(sessionDataDir, sessionId, { ...identity, ...(turnId ? { turnId } : {}) });
   return { tool, state: 'user' };
@@ -133,7 +133,7 @@ async function publishOne(
  * operator's on-disk login instead). And a refusal is published too, because it
  * carries the text the refused person reads.
  */
-function withholdIdentity(
+async function withholdIdentity(
   tool: TriggerUserAuthTool,
   botConfig: BotConfig,
   sessionDataDir: string,
@@ -141,7 +141,7 @@ function withholdIdentity(
   senderOpenId: string | undefined,
   locale: Locale | undefined,
   turnId: string | undefined,
-): ToolIdentityOutcome {
+): Promise<ToolIdentityOutcome> {
   if (
     unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) !== 'fail'
     && tool === 'lark-cli'
@@ -162,7 +162,18 @@ function withholdIdentity(
       // which is the safe end of this failure.
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId);
+  let authUrl: string | undefined;
+  if (tool === 'bytedcli' && senderOpenId) {
+    try {
+      authUrl = (await beginBytedcliLogin(senderOpenId))?.authUrl;
+    } catch (e) {
+      logger.warn(
+        `[trigger-user-auth] could not auto-start bytedcli login for session ${sessionId}: `
+        + `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, authUrl);
   return { tool, state: 'needs-authorization' };
 }
 
@@ -186,6 +197,7 @@ function writeDenial(
   botConfig: BotConfig,
   locale: Locale | undefined,
   turnId: string | undefined,
+  authUrl?: string,
 ): void {
   try {
     const name = senderOpenId && botConfig.larkAppId
@@ -218,12 +230,20 @@ function writeDenial(
         // Name the right command: ByteCloud and Feishu are separate providers,
         // so telling a refused bytedcli user to send `/login` would send them
         // to authorize the wrong thing and fail again.
-        t(
-          'trigger_user_auth.denied_howto',
-          { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
-          locale,
-        ),
-        t('trigger_user_auth.denied_howto_status', undefined, locale),
+        ...(tool === 'bytedcli' && authUrl
+          ? [
+              t('trigger_user_auth.denied_auto_login', undefined, locale),
+              authUrl,
+              t('trigger_user_auth.denied_auto_retry', undefined, locale),
+            ]
+          : [t(
+              'trigger_user_auth.denied_howto',
+              { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+              locale,
+            )]),
+        ...(tool === 'bytedcli' && authUrl
+          ? []
+          : [t('trigger_user_auth.denied_howto_status', undefined, locale)]),
       ].join('\n'),
     });
   } catch (e) {

@@ -3730,8 +3730,9 @@ export async function noteTurnReceived(
 }
 
 /**
- * Publish the acting CLI identity for one turn, and tell the sender when they
- * need to authorize.
+ * Publish the acting CLI identity for one turn. A missing bytedcli identity
+ * also prepares a direct device-login link inside the wrapper refusal, so the
+ * agent can surface it only if that tool is actually invoked.
  *
  * The sender comes from the daemon's own per-turn record (`replyTargets`, via
  * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
@@ -3786,10 +3787,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // refused) it stayed silent.
   //
   // The refusal already carries this. The wrapper prints, on stderr, which tool
-  // was refused and which command authorizes it — at the moment of the refusal,
-  // for that tool only, every time it happens. That is strictly better
-  // information than a guess made a second earlier, so the guess is gone rather
-  // than being made narrower.
+  // was refused and how to authorize it — including a direct ByteCloud login
+  // link when bytedcli can start one automatically — at the moment of the
+  // refusal, for that tool only. That is strictly better information than a
+  // pre-turn guess, so the chat notice stays absent.
 }
 
 async function sessionReply(

@@ -1299,9 +1299,9 @@ function triggerUserAuthStatusLines(
         // different verdict from the Lark line above — the same person can be
         // authorized for one and not the other. There is no bot identity to
         // degrade to here, so unauthorized always means the command is refused.
-        : hasBytedcliHome(senderOpenId ?? '')
+        : hasBytedcliHome(senderOpenId ?? '') && !pendingBytedcliChallenge(senderOpenId ?? '')
           ? '以你自己的身份调用'
-          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
+          : '你未授权 —— 首次调用时会自动返回登录链接'
     }`);
   }
   return lines;
@@ -3331,7 +3331,7 @@ export async function handleCommand(
           // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
             lines.push(t(
-              hasBytedcliHome(loginOpenId)
+              hasBytedcliHome(loginOpenId) && !pendingBytedcliChallenge(loginOpenId)
                 ? 'cmd.login.bytedcli_status_yes'
                 : 'cmd.login.bytedcli_status_no',
               undefined,

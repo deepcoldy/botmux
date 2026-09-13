@@ -3319,7 +3319,7 @@ describe('handleCommand', () => {
         );
         expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
         expect(text).toContain('bytedcli: 你未授权');
-        expect(text).toContain('/login bytedcli');
+        expect(text).toContain('首次调用时会自动返回登录链接');
       });
 
       it('reports bytedcli as authorized once that person has logged in', async () => {
@@ -3328,6 +3328,20 @@ describe('handleCommand', () => {
           statusWith({ enabled: true, tools: ['bytedcli'] }, false),
         );
         expect(text).toContain('bytedcli: 以你自己的身份调用');
+      });
+
+      it('does not call a merely pending device login authorized', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
+        try {
+          const text = await statusText(
+            statusWith({ enabled: true, tools: ['bytedcli'] }, false),
+          );
+          expect(text).toContain('bytedcli: 你未授权');
+          expect(text).toContain('首次调用时会自动返回登录链接');
+        } finally {
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+        }
       });
     });
   });
