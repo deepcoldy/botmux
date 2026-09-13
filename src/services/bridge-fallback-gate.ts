@@ -194,6 +194,7 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
+  responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
   contentLength?: number;

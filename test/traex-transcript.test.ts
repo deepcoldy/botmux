@@ -703,6 +703,18 @@ describe('drainTraexRollout', () => {
     });
   });
 
+  it('maps only the exact output-limit failure to the continuation allowlist code', () => {
+    writeFileSync(path, [
+      line(user('long task')),
+      line(taskCompleteWithError({ message: 'model output limit exceeded: max_output_tokens' })),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      terminalStatus: 'failed',
+      terminalErrorCode: 'codex_output_limit_exceeded',
+    });
+  });
+
   it('synthesises the bare sentinel when the last commentary ends with BOTMUX_NO_REPLY (path B: deliberate silence)', () => {
     writeFileSync(path, [
       line(user('do the work')),

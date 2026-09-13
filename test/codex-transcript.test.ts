@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -273,6 +273,14 @@ describe('extractLastCodexTurn', () => {
 });
 
 describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => {
+  it('keeps the exact output-limit discriminator separate from the shared classifier', () => {
+    const exact = 'model output limit exceeded: max_output_tokens';
+    expect(isExactCodexOutputLimitError(exact)).toBe(true);
+    expect(isExactCodexOutputLimitError({ message: `  ${exact.toUpperCase()}  ` })).toBe(true);
+    expect(isExactCodexOutputLimitError(`${exact}: extra`)).toBe(false);
+    expect(codexTaskFailureCode(exact)).toBe(CODEX_TASK_FAILED_ERROR_CODE);
+  });
+
   it('classifies model gateway / upstream failures as codex_upstream_error', () => {
     // Live incident shape: the model gateway cancelled the stream mid-turn.
     expect(codexTaskFailureCode(

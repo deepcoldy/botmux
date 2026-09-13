@@ -51,6 +51,8 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
   codexTaskFailureCode,
+  CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  isExactCodexOutputLimitError,
   safeFailureSummary,
 } from './codex-transcript.js';
 import {
@@ -552,7 +554,9 @@ export function drainTraexRollout(
         // the real reason instead of an empty-final alert.
         ...(failed ? {
           terminalStatus: 'failed' as const,
-          terminalErrorCode: codexTaskFailureCode(payload.error),
+          terminalErrorCode: isExactCodexOutputLimitError(payload.error)
+            ? CODEX_OUTPUT_LIMIT_ERROR_CODE
+            : codexTaskFailureCode(payload.error),
           terminalErrorSummary: safeFailureSummary(payload.error),
         } : {}),
       });
