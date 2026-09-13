@@ -123,7 +123,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(turns[1].multiAgentMode).toBeUndefined();
   }, 20_000);
 
-  it('fails capability proof closed for external MCP, enabled tool skills, or unhardened runtime', async () => {
+  it('fails capability proof closed for provider tools, external MCP, enabled tool skills, or unhardened runtime', async () => {
     const unhardened = makeEngine();
     expect(await unhardened.checkReadonlyContinuationCapabilities()).toEqual({
       ok: false, reason: 'readonly_continuation_runtime_not_hardened',
@@ -131,6 +131,9 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     unhardened.stop();
 
     for (const [env, reason] of [
+      [{ FAKE_PROVIDER_CAPABILITY: 'web-search' }, 'readonly_continuation_provider_external_capability'],
+      [{ FAKE_PROVIDER_CAPABILITY: 'image-generation' }, 'readonly_continuation_provider_external_capability'],
+      [{ FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'future-enabled' }, 'readonly_continuation_provider_external_capability'],
       [{ FAKE_MCP_CAPABILITY: 'tools' }, 'readonly_continuation_external_mcp_capability'],
       [{ FAKE_MCP_CAPABILITY: 'empty' }, 'readonly_continuation_external_mcp_capability'],
       [{ FAKE_SKILL_TOOL_DEPENDENCY: '1' }, 'readonly_continuation_skill_tool_dependency'],
@@ -153,6 +156,8 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
   }, 20_000);
 
   it.each([
+    { FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'missing-field' },
+    { FAKE_PROVIDER_CAPABILITIES_RESPONSE: 'malformed-field' },
     { FAKE_MCP_RESPONSE: 'missing-data' },
     { FAKE_MCP_RESPONSE: 'malformed-data' },
     { FAKE_MCP_RESPONSE: 'malformed-cursor' },

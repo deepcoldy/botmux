@@ -134,6 +134,27 @@ wss.on('connection', (ws) => {
           updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
+      case 'modelProvider/capabilities/read': {
+        const responseMode = process.env.FAKE_PROVIDER_CAPABILITIES_RESPONSE ?? '';
+        if (responseMode === 'missing-field') return reply({ namespaceTools: true, webSearch: false });
+        if (responseMode === 'malformed-field') {
+          return reply({ namespaceTools: true, webSearch: 'yes', imageGeneration: false });
+        }
+        if (responseMode === 'future-enabled') {
+          return reply({
+            namespaceTools: true,
+            webSearch: false,
+            imageGeneration: false,
+            futureExternalTool: true,
+          });
+        }
+        const capability = process.env.FAKE_PROVIDER_CAPABILITY ?? '';
+        return reply({
+          namespaceTools: true,
+          webSearch: capability === 'web-search',
+          imageGeneration: capability === 'image-generation',
+        });
+      }
       case 'mcpServerStatus/list': {
         const responseMode = process.env.FAKE_MCP_RESPONSE ?? '';
         if (responseMode === 'missing-data') return reply({});

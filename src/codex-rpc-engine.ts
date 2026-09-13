@@ -457,18 +457,42 @@ export class CodexRpcEngine {
     return { nativeTurnId };
   }
 
-  /** Prove that this exact app-server generation has no configured MCP server
-   * and no enabled Skill that declares external tool dependencies. Status/list
-   * is deliberately used only as a conservative inventory check: it cannot
-   * recover the thread's effective allowlist, and a currently disconnected or
-   * empty server can expose tools later, so any server record makes the
-   * continuation ineligible. */
+  /** Prove that this exact app-server generation exposes no provider-native
+   * external tool, configured MCP server, or enabled Skill that declares
+   * external tool dependencies. The turn sandbox does not constrain provider-
+   * hosted WebSearch/ImageGeneration, so those capabilities need an explicit
+   * fail-closed gate. Status/list is deliberately used only as a conservative
+   * inventory check: it cannot recover the thread's effective allowlist, and a
+   * currently disconnected or empty server can expose tools later, so any
+   * server record makes the continuation ineligible. */
   async checkReadonlyContinuationCapabilities(): Promise<ReadonlyContinuationCapabilityCheck> {
     if (!this.opts.readonlyContinuationHardened) {
       return { ok: false, reason: 'readonly_continuation_runtime_not_hardened' };
     }
     if (!this.threadId) return { ok: false, reason: 'readonly_continuation_thread_unavailable' };
     try {
+      const providerCapabilities = await this.request(
+        'modelProvider/capabilities/read',
+        {},
+        { timeoutMs: 10_000, fatalOnTimeout: false },
+      );
+      if (!providerCapabilities || typeof providerCapabilities !== 'object'
+        || typeof providerCapabilities.namespaceTools !== 'boolean'
+        || typeof providerCapabilities.webSearch !== 'boolean'
+        || typeof providerCapabilities.imageGeneration !== 'boolean'
+        || Object.values(providerCapabilities).some(value => typeof value !== 'boolean')) {
+        throw new Error('modelProvider/capabilities/read returned malformed data');
+      }
+      const unknownEnabledCapability = Object.entries(providerCapabilities).some(
+        ([name, enabled]) => !['namespaceTools', 'webSearch', 'imageGeneration'].includes(name)
+          && enabled === true,
+      );
+      if (providerCapabilities.webSearch === true
+        || providerCapabilities.imageGeneration === true
+        || unknownEnabledCapability) {
+        return { ok: false, reason: 'readonly_continuation_provider_external_capability' };
+      }
+
       let cursor: string | undefined;
       do {
         const result = await this.request('mcpServerStatus/list', {
