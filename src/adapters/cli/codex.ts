@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -495,7 +496,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     get skillsDir(): string { return join(codexHome(), 'skills'); },
     // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
     // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
-    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    modelChoices: CLI_MODEL_CHOICES['codex'],
     // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
     // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
     // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中

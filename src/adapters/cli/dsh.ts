@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
@@ -133,7 +134,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     systemHints: [],
     injectsSessionContext: true,
     altScreen: false,
-    modelChoices: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    modelChoices: CLI_MODEL_CHOICES['dsh'],
   };
 }
 
