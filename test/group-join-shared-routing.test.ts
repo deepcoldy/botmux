@@ -423,6 +423,45 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
+  // 卡片发不出去（飞书 230025 等）时不能停在 pendingRepo：入群自动开工没有任何
+  // 用户输入可再触发，会话会永久挂在一张不存在的卡片上。降级 = 走同一个「无可选
+  // 项目」分支，用默认目录直接开工，且共享 seed 仍归本轮所有。
+  it('repo 卡发送失败时改用默认目录直接开工，而不是挂在不存在的卡片上', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_pending_repo_card_fail';
+    const chatId = 'oc_join_pending_repo_card_fail';
+    const scanDir = tempDir('scan-pending-repo-card-fail');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // 卡片没发出去就没有可删的消息，别拿 undefined 去调删除接口。
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_shared_race';

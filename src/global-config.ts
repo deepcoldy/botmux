@@ -132,7 +132,9 @@ export interface WorkflowFeatureGlobalConfig {
 }
 
 export interface WorkerConfig {
-  /** Refuse a fresh/resumed worker while MemAvailable is below this value. */
+  /** Default-on switch for fresh/resumed worker memory admission. */
+  memoryAdmissionEnabled?: boolean;
+  /** Refuse a fresh/resumed worker while available memory is below this value. */
   minAvailableMemoryBytes?: number;
   /** Refuse a fresh/resumed worker while memory full PSI avg10 reaches this percentage. */
   maxMemoryFullAvg10?: number;
@@ -468,6 +470,7 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
   const out: WorkerConfig = {};
   const minAvailableMemoryBytes = readPositiveInteger(value.minAvailableMemoryBytes);
   const sessionMemoryMaxBytes = readPositiveInteger(value.sessionMemoryMaxBytes);
+  if (typeof value.memoryAdmissionEnabled === 'boolean') out.memoryAdmissionEnabled = value.memoryAdmissionEnabled;
   if (minAvailableMemoryBytes !== undefined) out.minAvailableMemoryBytes = minAvailableMemoryBytes;
   if (sessionMemoryMaxBytes !== undefined) out.sessionMemoryMaxBytes = sessionMemoryMaxBytes;
   if (typeof value.maxMemoryFullAvg10 === 'number'
@@ -887,6 +890,7 @@ export function clearWorkerConfig(): WorkerConfig {
     return {};
   }
   const remaining = { ...raw.worker as Record<string, unknown> };
+  delete remaining.memoryAdmissionEnabled;
   delete remaining.minAvailableMemoryBytes;
   delete remaining.maxMemoryFullAvg10;
   delete remaining.sessionMemoryMaxBytes;

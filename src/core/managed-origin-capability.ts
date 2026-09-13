@@ -5,6 +5,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { linuxIsolationDetected } from './linux-isolation.js';
 
 export const RELAY_ORIGIN_CAPABILITY_BASENAME = '.botmux-origin-capability.json';
 export const MANAGED_ORIGIN_ISOLATION_MARKER_BASENAME = '.botmux-read-isolated-v1';
@@ -354,7 +355,8 @@ export function managedOriginLegacyIsolationProbeAccess(
  * therefore cannot act as a session store host (it may only SEND commands to
  * the owning daemon). Positive signals only: the sandbox outbox marker, the
  * host-stamped read-isolation env, the host-stamped origin channel, or a
- * kernel denial (EACCES/EPERM) on a probe inode. `missing_or_unsafe` — an
+ * kernel denial on a probe inode or the inherited Linux seccomp probe.
+ * `missing_or_unsafe` — an
  * absent `~/.botmux`, a secret never created because no daemon ran here, a
  * foreign HOME — is NEVER isolation: a genuine host shell must keep its
  * offline close / abandon / prune.
@@ -380,7 +382,8 @@ export function isIsolatedCliProcess(
   if (env.BOTMUX_SEND_RELAY) return true;
   if (env.BOTMUX_READ_ISOLATED === '1') return true;
   if (env.BOTMUX_ORIGIN_CHANNEL_ID?.trim()) return true;
-  return managedOriginLegacyIsolationProbeAccess(osUserHomeDir) === 'sandbox_denied'
+  return linuxIsolationDetected()
+    || managedOriginLegacyIsolationProbeAccess(osUserHomeDir) === 'sandbox_denied'
     || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
 }
 

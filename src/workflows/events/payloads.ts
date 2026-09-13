@@ -103,6 +103,8 @@ export const BackoffPolicySchema = z.object({
  * with partial registry data still serializes cleanly.
  */
 export const BotSnapshotSchema = z.object({
+  cliInstanceBinding: z.object({ version: z.literal(1), source: z.literal('default'), instanceId: z.string(), cliId: z.literal('codex'), codexHome: z.string(), authMode: z.literal('isolated') }).optional(),
+  cliRuntime: z.record(z.unknown()).optional(),
   larkAppId: z.string().optional(),
   cliId: z.string().optional(),
   displayName: z.string().optional(),

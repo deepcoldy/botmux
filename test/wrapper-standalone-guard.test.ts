@@ -93,13 +93,21 @@ describe('botmuxWrapperFiles — standalone (compiled binary) form', () => {
     expect(cmd.content).not.toContain('$bunfs');
   });
 
-  it('the Node (non-standalone) form is unchanged — default stays backward-compatible', () => {
+  it('the Node (non-standalone) form pins the interpreter — default stays consistent', () => {
     // Same expectation as the pre-existing test, asserted here too so a future
     // edit cannot "fix" standalone by breaking the Node path.
     const viaDefault = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/usr/bin/node', 'linux');
     const viaExplicitFalse = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/usr/bin/node', 'linux', false);
-    expect(viaDefault[0].content).toBe('#!/bin/sh\nexec node "/opt/botmux/dist/cli.js" "$@"\n');
+    expect(viaDefault[0].content).toBe('#!/bin/sh\nexec "/usr/bin/node" "/opt/botmux/dist/cli.js" "$@"\n');
     expect(viaExplicitFalse).toEqual(viaDefault);
+  });
+
+  it('pins whatever interpreter it is handed — Bun hosts the same wrapper shape', () => {
+    // Under `bun dist/cli.js` process.execPath IS the bun binary; Bun runs
+    // dist/*.js and supplies bun:sqlite, so no runtime-specific branch is needed.
+    const [sh] = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/home/u/.bun/bin/bun', 'linux');
+    expect(sh.content).toBe('#!/bin/sh\nexec "/home/u/.bun/bin/bun" "/opt/botmux/dist/cli.js" "$@"\n');
+    expect(sh.content).not.toMatch(/exec node /);
   });
 });
 

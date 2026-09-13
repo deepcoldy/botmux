@@ -7,6 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const daemonSource = readFileSync(join(__dirname, '..', 'src', 'daemon.ts'), 'utf8');
 
 describe('daemon per-turn reply sender + participant wiring', () => {
+  it('wires delayed raw-input credential preparation into worker-pool startup', () => {
+    expect(daemonSource).toContain(
+      'prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
+    );
+  });
+
   it('computes a turn window per path and binds participants + incomplete', () => {
     // passthrough (raw command → sender-only window)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined)');
@@ -102,6 +108,9 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // Both callers pass a cross-ref-resolved is-bot, kept separate from quota's botSender.
     expect(daemonSource).toMatch(/botSender: isBotSenderType,\n[\s\S]{0,400}senderIsBot: isForeignBotSender,/);
     expect(daemonSource).toMatch(/botSender: isBotSenderType \|\| isForeignBot,\n[\s\S]{0,400}senderIsBot: isBotSenderType \|\| isForeignBot,/);
+  });
+
+  it('keeps the source DM id separate from the generated session-group turn id', () => {
   });
 
   it('does not invent a sender for scheduled or system-created turns', () => {

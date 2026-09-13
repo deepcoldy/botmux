@@ -922,6 +922,16 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     }), ['credential', 'read', 'write'])).toBe(false);
   });
 
+  it('cold-spawns v14 panes that lack the Linux kernel isolation stamp', () => {
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(14);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 14,
+      bootId: 'before-kernel-marker',
+      state: 'committed',
+      capabilities: ['credential', 'read', 'write'],
+    }), ['credential', 'read', 'write'])).toBe(false);
+  });
+
   it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
     // A pane spawned before this change keeps its ORIGINAL process environment, so
     // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep

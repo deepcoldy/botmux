@@ -89,6 +89,32 @@ worker spawnCli
 
 → **所有飞书密钥全程不进沙盒**。
 
+### Linux 隔离判据
+
+环境变量只是路由提示，不是安全边界。完整 bwrap 和仅凭据隔离 bwrap 在启动 CLI
+前都会安装一个很窄的 seccomp 规则：拒绝 `getpriority(PRIO_PROCESS, 1)`，其它
+已支持 ABI 的系统调用保持原策略。内核会把规则传给 fork / exec 的后代；清空环境、
+替换 HOME / 数据目录或再创建 namespace 都不能移除它。
+
+CLI 通过 `os.getPriority(1)` 查询这个判据，只把成功且位于合法 nice 范围
+`[-20, 19]` 的结果视为普通宿主。不能只匹配 EPERM：后代可以叠加 seccomp 规则
+替换 errno，但不能恢复真实调用；即使伪造 errno 0，libc 返回的 nice 20 仍会被拒绝。
+规则通过匿名管道传给 bwrap，不落可修改的配置文件，也不占用交互终端的 stdin。
+
+确认处于隔离中的 `send` 不能因缺失 capability 或伪造进程标记降级为宿主直发；
+daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正常宿主 relay 不安装此
+规则，普通宿主命令不依赖 HOME 中是否存在探针文件。
+
+兼容边界：支持 Linux x64 / arm64 及其 i386 / ARM EABI / x32 调用约定；未知 ABI
+或无法安装 seccomp 时拒绝启动，不静默关闭保护。查询 PID 1 的 nice 值会被拒绝，
+查询当前进程优先级、调整优先级不受此规则影响。如果外层容器策略本来就禁止这个
+查询，宿主命令也会按隔离处理，需要先核对外层策略，不能靠环境变量绕过。
+隔离 pane 标记版本升至 15，旧 pane 必须冷启动一次才能获得新规则。
+
+这是受信 CLI 的隔离分类防线，不代替文件和凭据隔离，也不承诺阻止修改 CLI 代码、
+持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
+[Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
+
 ## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
 
 no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读写范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（以同一 OS 用户身份对宿主文件有完整**读写**权，能读宿主 `bots.json`、也能改写宿主配置）；配了 → 照常隔离。

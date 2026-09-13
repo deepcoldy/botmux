@@ -5,8 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /**
  * #1260：文档评论事件被丢弃时给触发回复打 ❌，让「这条 @ 我没能处理」看得见。
  *
- * 背景：事件已 ACK ⇒ 飞书不重投；mention-only 订阅不进轮询（poller 只收
- * commentTriggerMode==='all'）⇒ 没有兜底。所以事件链路一丢就是终点，而用户侧
+ * 背景：事件已 ACK ⇒ 飞书不重投。通过 @/审计门的投递现在有持久 pending；
+ * 但本文件覆盖的是更早、连安全投递上下文都构造不出的失败，所以仍是终点。用户侧
  * 原本零感知 —— doc 发起的会话在飞书整个不可见，只能去 dashboard 翻 terminal。
  */
 
@@ -245,8 +245,8 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
 
   /**
    * 三个打点的闸口必须一致，且**只在 mention-only 下打**。
-   * 'all' 有 poller 兜底（pollWatchedDocComments 只轮 'all'，且不经过
-   * processCommentEvent），push 这次没读到的评论下轮 poll 很可能被正常处理；
+   * 'all' 有列表 poller 兜底；mention-only 的 pending 要到正文/@/审计均通过后
+   * 才建立，所以本文件覆盖的 pre-dispatch 读失败仍不能靠 pending 恢复；
    * 而 ❌ 是终态不清理，在 'all' 下打就会永久挂在一条根本没丢的评论上。
    */
   it("收窄谓词只认 mention-only + is_mentioned（'all' 有轮询兜底，不该打)", () => {
@@ -267,6 +267,14 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     // 这个调用在 markCommentEventDropped 里，位于 processCommentEvent **之前**，
     // 不在 region 切片内 —— 用整份源码断言，别锚错范围（锚错就又是一条假绿）。
     expect(src).toContain("rollbackAutoSub, 'dropped-signal')");
+  });
+
+  it('WS 未接纳或抛错都先交给持久重试，再结束 ACK-safe 任务', () => {
+    expect(region).toContain('accepted = await handlers.handleDocComment(delivery)');
+    expect(region.indexOf('const retryOutcome = settleDocCommentWsDelivery(')).toBeGreaterThan(
+      region.indexOf('accepted = await handlers.handleDocComment(delivery)'),
+    );
+    expect(region).toContain('if (deliveryError) throw deliveryError');
   });
 
   it('每个未打标记的早退都回滚 auto-sub（不留 owner 不知情的订阅）', () => {

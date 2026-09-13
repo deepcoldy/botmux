@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
@@ -207,12 +208,37 @@ describe('redactChildEnv()', () => {
     expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
   });
 
-  it('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
-    // End-to-end guard for the actual leak vector Codex found: a spawned child
-    // must see the redacted var as genuinely UNSET. `${VAR+x}` expands to empty
-    // only when VAR is unset, distinguishing "unset" from "set to the string
-    // 'undefined'". Run against the real bundled node-pty + /bin/sh.
-    const pty = await import('node-pty');
+  // Two REAL-CHILD guards for the same leak vector, split by transport.
+  //
+  // The plain-spawn one runs everywhere. The node-pty one is Node-only, because
+  // node-pty's fork/exec is broken under Bun when cores are scarce — MEASURED
+  // here with `taskset` (node-pty 1.1.0, bun 1.4.2, `/bin/sh -c`):
+  //
+  //     node, 1 core .......... 25/25 child ran
+  //     bun,  1 core ..........  1/25
+  //     bun,  2 cores .........  24/25   <- the ~4% red on the 2-core CI runner
+  //
+  // It is NOT a lost read, which is what this test used to claim. Point the child
+  // at a file instead of the pty stream and it still fails 1/25 under bun; have
+  // the shell announce itself first (`exec >>log; echo ENTERED`) and a failing run
+  // leaves exitCode 1 with no log file at all — /bin/sh never starts. So no
+  // amount of draining, waiting or retrying on the JS side can fix it: retrying
+  // four times inside one process recovered 0/20 on one core, because the failure
+  // is per-process, not per-attempt. A retry loop would look like a fix and only
+  // be one on a fast runner.
+  //
+  // Skipping under Bun keeps the pty leg honest on Node instead of trading a real
+  // guard for a flaky one. `redactChildEnv` is transport-agnostic, and the
+  // plain-spawn case below exercises the same env marshalling on BOTH runtimes,
+  // so nothing about the leak vector goes unguarded here.
+  const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+
+  const leakProbeScript = (sentinel: string) =>
+    'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; '
+    + `if [ -z "\${${sentinel}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${sentinel}]"; fi`;
+
+  /** Set the two vars, hand `redactChildEnv`'s output to `run`, always restore. */
+  const withLeakyParentEnv = async (run: (env: NodeJS.ProcessEnv) => Promise<string>) => {
     const prev = process.env.LARK_APP_ID;
     const prevSentinel = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
     process.env.LARK_APP_ID = 'cli_parent_must_not_leak';
@@ -220,67 +246,81 @@ describe('redactChildEnv()', () => {
     // which must not survive into the forked CLI child.
     process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
     try {
-      const env = redactChildEnv(process.env) as { [k: string]: string };
-      const script =
-        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
-        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve, reject) => {
-        const p = pty.spawn('/bin/sh', ['-c', script], {
-          name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
-        });
-        let buf = '';
-        let settled = false;
-        // node-pty delivers onData and onExit on independent paths: the child can
-        // be reaped before the pty's pending output has been drained, so
-        // resolving straight from onExit can hand back an empty string. That
-        // surfaces as `Expected to contain "R=UNSET" / Received: ""` under CI
-        // load, which reads like a real leak but is only a lost read.
-        //
-        // So settle on having BOTH answers, and let exit only START a short grace
-        // period rather than decide. If the grace period expires with the output
-        // still incomplete, REJECT with the raw buffer instead of resolving it:
-        // the whole point is that a lost read must never again be reported as a
-        // leak-shaped assertion failure. Resolving '' here would rebuild the very
-        // trap this guard exists to remove.
-        const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
-        const finish = (settle: () => void) => {
-          if (settled) return;
-          settled = true;
-          settle();
-        };
-        const fail = () => finish(() => reject(new Error(
-          'pty output incomplete — a lost read, not an env leak. '
-          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
-        )));
-        const guard = setTimeout(fail, 10_000);
-        guard.unref?.();
-        p.onData((d) => {
-          buf += d;
-          if (hasBothAnswers()) {
-            clearTimeout(guard);
-            finish(() => resolve(buf));
-          }
-        });
-        p.onExit(() => {
-          // Exit is a deadline, not the signal: give already-queued reads a
-          // moment to land, then decide — complete output resolves, incomplete
-          // output fails loudly as a fixture problem.
-          setTimeout(() => {
-            clearTimeout(guard);
-            if (hasBothAnswers()) finish(() => resolve(buf));
-            else fail();
-          }, 250);
-        });
-      });
-      expect(out).toContain('R=UNSET');
-      expect(out).toContain('S=UNSET');
-      expect(out).not.toContain('undefined');
+      return await run(redactChildEnv(process.env) as { [k: string]: string });
     } finally {
       if (prev === undefined) delete process.env.LARK_APP_ID;
       else process.env.LARK_APP_ID = prev;
       if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
       else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
+  };
+
+  /** Both answers present — the only shape that proves the child actually ran. */
+  const expectNoLeak = (out: string) => {
+    expect(out).toContain('R=UNSET');
+    expect(out).toContain('S=UNSET');
+    expect(out).not.toContain('undefined');
+  };
+
+  it('real spawned child does NOT inherit a redacted var (not the string "undefined")', async () => {
+    // End-to-end guard for the actual leak vector: a spawned child must see the
+    // redacted var as genuinely UNSET. `${VAR+x}` expands to empty only when VAR
+    // is unset, distinguishing "unset" from "set to the string 'undefined'".
+    // Plain spawn, so this leg runs on Node AND Bun (measured 25/25 on both at
+    // one core).
+    const out = await withLeakyParentEnv((env) => new Promise<string>((resolve, reject) => {
+      const child = spawn('/bin/sh', ['-c', leakProbeScript(PM2_GRACEFUL_EXIT_CODE_ENV)], {
+        cwd: '/tmp', env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let buf = '';
+      child.stdout.on('data', (d) => { buf += String(d); });
+      child.on('error', reject);
+      // `close` (not `exit`) fires only after both stdio streams are drained, so
+      // the buffer is complete by definition — no grace period to tune.
+      child.on('close', () => resolve(buf));
+    }));
+    expectNoLeak(out);
+  });
+
+  it.skipIf(isBun)('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
+    // Same guard across the PTY transport, which marshals env into raw K=V pairs
+    // in native code rather than reusing libuv's spawn path — a distinct code
+    // path worth covering. Node-only for the reason documented above.
+    const pty = await import('node-pty');
+    const out = await withLeakyParentEnv((env) => new Promise<string>((resolve, reject) => {
+      const p = pty.spawn('/bin/sh', ['-c', leakProbeScript(PM2_GRACEFUL_EXIT_CODE_ENV)], {
+        name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env: env as { [k: string]: string },
+      });
+      let buf = '';
+      let settled = false;
+      // node-pty delivers onData and onExit on independent paths: the child can be
+      // reaped before the pty's pending output has been drained, so resolving
+      // straight from onExit can hand back an empty string. Settle on having BOTH
+      // answers, and let exit only START a short grace period rather than decide.
+      // If the grace period expires with the output still incomplete, REJECT with
+      // the raw buffer: a lost read must never be reported as a leak-shaped
+      // assertion failure ("Expected to contain R=UNSET / Received: ''").
+      const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
+      const finish = (settle: () => void) => { if (settled) return; settled = true; settle(); };
+      const fail = () => finish(() => reject(new Error(
+        'pty output incomplete — a lost read, not an env leak. '
+        + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+      )));
+      const guard = setTimeout(fail, 10_000);
+      guard.unref?.();
+      p.onData((d) => {
+        buf += d;
+        if (hasBothAnswers()) { clearTimeout(guard); finish(() => resolve(buf)); }
+      });
+      p.onExit(() => {
+        setTimeout(() => {
+          clearTimeout(guard);
+          if (hasBothAnswers()) finish(() => resolve(buf));
+          else fail();
+        }, 250);
+      });
+    }));
+    expectNoLeak(out);
   });
 });
 

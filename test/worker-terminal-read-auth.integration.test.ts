@@ -617,13 +617,9 @@ setInterval(() => {}, 1_000);
   // 解析已经拿不到 controlExpiresAt，于是这条只读连接连到期 timer 都没有——一条永不
   // 过期的窥屏通道，中央前门再怎么撤销也够不着它。
   //
-  // 这条缝的宽度就等于那次同步文件读：本地 SSD 上 ~0.1ms，$HOME 挂在慢盘/NFS 上就是
-  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。以前靠把 secret 文件用 32MB 空白
-  // 撑大来复现慢 HOME 的时序，但 #920 给宿主凭证读取加了严格 0600 + 256 字节上限，撑大的
-  // 文件会被直接判「大小异常」拒读——于是改用 worker 侧的测试专用 env
-  // （BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS）在握手路径的那次 secret 读后加一段有界
-  // 忙等：secret 值一个字节没变、凭证文件仍是合法的小文件，只是把这条本来就存在的缝
-  // 稳定拉宽到可观测（生产不设该 env，行为不变）。
+  // 不能用一次 HTTP 往返耗时估计两次校验之间的窗口：连接建立、调度和页面渲染都
+  // 会混进测量，扫描 TTL 可能全部落在窗口之外。测试入口只在真实 connection 回调
+  // 同步执行期间推进 Date.now，精确覆盖到期边界；生产 worker 不包含测试时钟或忙等。
   it('P1-3: a view capability that dies inside the WS handshake is refused at the connection re-check', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-ws-handshake-race-'));
     tempDirs.add(root);
@@ -632,16 +628,12 @@ setInterval(() => {}, 1_000);
     const secret = 'integration-ws-handshake-race-secret';
     const botmuxDir = join(root, '.botmux');
     mkdirSync(botmuxDir, { recursive: true });
-    // 合法的小凭证文件（0600），满足 #920 的严格宿主凭证读取；握手读窗口由下面的
-    // 测试专用 env 拉宽，而不是靠撑大文件。
+    // 合法的小凭证文件（0600），满足 #920 的严格宿主凭证读取。
     writeFileSync(
       join(botmuxDir, '.dashboard-secret'),
       secret,
       { mode: 0o600 },
     );
-    // 握手路径每次读 secret 后忙等这么久，复现慢 HOME 的读窗口（> P1-3 需要的 20ms 下限）。
-    const handshakeReadDelayMs = 40;
-
     // 让 scrollback 非空。socket 一旦被登记，worker 会立刻把这段历史种子推过去，于是
     // 「有没有被登记」在客户端侧是直接可观测的事实，不用去断言 worker 的内部集合。
     const seedMarker = 'BOTMUX_SCROLLBACK_SEED_MARKER';
@@ -656,7 +648,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'ws-handshake-race-session';
-    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('test/fixtures/worker-terminal-recheck-clock.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -665,7 +657,6 @@ setInterval(() => {}, 1_000);
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_ws_race',
         LARK_APP_SECRET: 'secret',
-        BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS: String(handshakeReadDelayMs),
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -686,7 +677,6 @@ setInterval(() => {}, 1_000);
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
     const ready = await waitForReady(child, logs);
-    const base = `http://127.0.0.1:${ready.port}`;
     const boot = ready.viewToken!;
 
     interface ViewSocketAttempt {
@@ -698,11 +688,14 @@ setInterval(() => {}, 1_000);
     }
 
     /** 走真实握手开一条 view WS，看它最终是被拒、被关，还是活过了自己的有效期。 */
-    const openViewSocket = (capability: string, waitMs: number): Promise<ViewSocketAttempt> => (
+    const openViewSocket = (capability: string, waitMs: number, recheckNow?: number): Promise<ViewSocketAttempt> => (
       new Promise(resolveAttempt => {
         const socket = new WebSocket(
           `ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(capability)}`,
-          { headers: centralForwardHeaders(secret, capability) },
+          { headers: {
+            ...centralForwardHeaders(secret, capability),
+            ...(recheckNow === undefined ? {} : { 'x-botmux-test-recheck-now': String(recheckNow) }),
+          } },
         );
         const chunks: string[] = [];
         let opened = false;
@@ -726,8 +719,8 @@ setInterval(() => {}, 1_000);
       })
     );
 
-    // 对照组，同时也是页缓存预热：一条两次校验都过的正常能力照常放行、照常拿到历史
-    // 种子，并且由第二次解析算出的 expiresAt timer 到点关掉（4003 / view expired）。
+    // 真实时钟对照组：一条两次校验都过的正常能力照常登记，并且由第二次解析算出的
+    // expiresAt timer 到点关掉（4003 / view expired）。
     const liveTtlMs = 1_500;
     const liveCapability = centralViewCapability(secret, sessionId, boot, {
       issuedAt: Date.now(), expiresAt: Date.now() + liveTtlMs,
@@ -745,43 +738,18 @@ setInterval(() => {}, 1_000);
     expect(live.received).toContain('{"botmux":"terminal.write","write":false}');
     expect(Date.now() - liveStart).toBeGreaterThanOrEqual(liveTtlMs - 300);
 
-    // 量一次 access 解析在这台机器上到底多贵——这个数值就是那条缝的宽度：
-    // 握手前那次校验发生在「一次解析之后」，connection 里那次发生在「两次解析之后」。
-    const probeCapability = centralViewCapability(secret, sessionId, boot, {
-      issuedAt: Date.now(), expiresAt: Date.now() + 60_000,
-    });
-    const probeStart = Date.now();
-    const probe = await fetch(`${base}/?viewToken=${encodeURIComponent(probeCapability)}`, {
-      headers: centralForwardHeaders(secret, probeCapability),
-    });
-    const oneResolveMs = Date.now() - probeStart;
-    expect(probe.status).toBe(200);
-    // 慢 HOME 复现必须真的生效，否则这条缝窄到根本量不出来，后面的扫描就成了空跑。
-    expect(oneResolveMs).toBeGreaterThan(20);
-
-    // 把到期时刻扫过 (第一次校验, 第二次校验] 这段区间。
-    const attempts: ViewSocketAttempt[] = [];
-    for (const factor of [1.15, 1.3, 1.45, 1.6, 1.75, 1.9, 1.45, 1.6]) {
-      const ttlMs = Math.max(2, Math.round(oneResolveMs * factor));
+    // 第一次校验使用真实时钟且能力仍有效；只有 connection 回调使用精确的到期时刻。
+    // 每个边界都必须被二次校验拒绝，不能靠“多试几次至少撞中一次”来证明覆盖。
+    for (const expiryOffsetMs of [0, 1]) {
+      const expiresAt = Date.now() + 60_000;
       const capability = centralViewCapability(secret, sessionId, boot, {
-        issuedAt: Date.now(), expiresAt: Date.now() + ttlMs,
+        issuedAt: Date.now(), expiresAt,
       });
-      attempts.push(await openViewSocket(capability, ttlMs + 900));
+      const attempt = await openViewSocket(capability, 5_000, expiresAt + expiryOffsetMs);
+      expect(attempt).toEqual({
+        kind: 'closed', code: 4003, reason: 'authorization expired', received: '',
+      });
     }
-
-    // 1) 没有任何一条 socket 活过自己能力的有效期。旧实现里跨缝那条既没被拒也没有
-    //    timer，会一直活着——这一条就是本项的红线。
-    expect(attempts.filter(attempt => attempt.kind === 'alive')).toEqual([]);
-    // 2) 这一轮确实撞进了缝：至少有一条是被 connection 二次校验 fail closed 掉的，
-    //    而不是被握手前那次拦掉（refused）、也不是靠到期 timer 兜底（view expired）。
-    //    没撞进去就说明这个测试根本没测到东西，所以它必须响，不能默默变绿。
-    const refusedAtRecheck = attempts.filter(attempt => (
-      attempt.kind === 'closed' && attempt.reason === 'authorization expired'
-    ));
-    expect(refusedAtRecheck.length).toBeGreaterThan(0);
-    expect(refusedAtRecheck.every(attempt => attempt.code === 4003)).toBe(true);
-    // 3) 被二次校验拒掉的 socket 压根没进 wsClients，所以一个字节的终端历史都没拿到。
-    for (const attempt of refusedAtRecheck) expect(attempt.received).toBe('');
 
     // worker 重启语义：钉在上一代 worker 上的能力连握手都过不去，压根到不了
     // connection——二次校验是补上的那道闸，不是把前一道闸放松的借口。

@@ -58,14 +58,34 @@ describe('plugin services on the built-in supervisor', () => {
     writeFileSync(join(root, 'dist', 'service', 'server.cjs'), options.body ?? `
       const fs = require('node:fs');
       process.on('SIGTERM', () => process.exit(0));
-      fs.writeFileSync(process.env.MARKER, JSON.stringify({pid: process.pid, args: process.argv.slice(2), env: process.env, cwd: process.cwd()}));
+      // Write the marker ATOMICALLY (tmp + rename). The reader below polls every
+      // 40ms while this child writes a multi-KB JSON blob (it embeds the whole
+      // env), so a plain writeFileSync lets the poller read a half-written file
+      // and blow up with \`SyntaxError: JSON Parse error: Unterminated string\`
+      // — MEASURED on CI, and it reads like a supervisor defect when it is only
+      // a torn read. rename(2) is atomic within a filesystem, so the reader sees
+      // either the old absence or the complete file, never a prefix.
+      const marker = process.env.MARKER;
+      const tmp = marker + '.' + process.pid + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({pid: process.pid, args: process.argv.slice(2), env: process.env, cwd: process.cwd()}));
+      fs.renameSync(tmp, marker);
       setInterval(() => {}, 1000);
     `);
     return { ...installLocalPlugin(root, { link: options.linked }), root };
   }
   const proc = (id: string) => readPluginProcesses().find(p => p.name === `botmux-plugin-${id}`);
-  const ready = (id: string) => until(() => existsSync(join(home, id + '.ready'))
-    && JSON.parse(readFileSync(join(home, id + '.ready'), 'utf8')).pid === proc(id)?.pid, `${id} ready`);
+  // A predicate that THROWS aborts the poll loop and reports the parse error as
+  // the test's failure, hiding what was actually being waited for. The marker is
+  // written atomically (see the fixture), so a malformed read should no longer
+  // happen — but if one ever does, the honest outcome is "timed out: <id> ready",
+  // not a SyntaxError masquerading as a supervisor defect.
+  const readyPid = (id: string): number | undefined => {
+    const marker = join(home, id + '.ready');
+    if (!existsSync(marker)) return undefined;
+    try { return JSON.parse(readFileSync(marker, 'utf8')).pid as number; }
+    catch { return undefined; }
+  };
+  const ready = (id: string) => until(() => readyPid(id) !== undefined && readyPid(id) === proc(id)?.pid, `${id} ready`);
 
   it('installs and queries without creating a supervisor; update/uninstall guard checks actual liveness', async () => {
     const { root, runtimeDir } = fixture('demo');
@@ -147,7 +167,9 @@ describe('plugin services on the built-in supervisor', () => {
     await delay(600);
     expect(proc('once')!.pid).toBeUndefined();
     fixture('stubborn', { body: `process.on('SIGTERM',()=>{});
-      require('fs').writeFileSync(process.env.MARKER, JSON.stringify({pid:process.pid})); setInterval(()=>{},1000);` });
+      const fs = require('fs'); const tmp = process.env.MARKER + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({pid:process.pid})); fs.renameSync(tmp, process.env.MARKER);
+      setInterval(()=>{},1000);` });
     await startPluginServices(['stubborn']);
     await ready('stubborn');
     const pid = proc('stubborn')!.pid!;

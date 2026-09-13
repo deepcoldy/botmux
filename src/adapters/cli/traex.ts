@@ -1,6 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -227,7 +228,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -254,6 +255,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         '--no-alt-screen',
         ...goalEnvConfigArgs(),
       ];
+      // Keep trigger-user identity wrappers available in tool shells. Set only
+      // the requested keys, without inheriting the entire worker environment.
+      for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+      }
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       if (modelBackendVariant) baseArgs.push('-c', `model_backend_variant=${JSON.stringify(modelBackendVariant)}`);
@@ -427,16 +433,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // Curated subset — the full catalogue has 27 models. `traex debug models`
     // lists the rest; the setup flow always appends an "Other / custom"
     // free-text option so users aren't locked out.
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'gpt-5.5',
-      'gpt-5',
-      'o3',
-      'Doubao_1_8',
-      'DeepSeek-V4-Pro',
-      'kimi-k2.6',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['traex'],
     // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
     // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
     // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动

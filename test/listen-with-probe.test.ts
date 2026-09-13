@@ -23,6 +23,45 @@ function rawListen(s: Server, port: number, host = '127.0.0.1'): Promise<number>
 }
 afterEach(async () => { for (const s of open.splice(0)) await new Promise<void>(r => s.close(() => r())); });
 
+/**
+ * Reserve a port `p` such that `p + 1` is ALSO free right now, and return `p`
+ * with nothing bound.
+ *
+ * WHY: every case here exercises "requested port busy → step to port+1", so it
+ * needs a base port whose successor is available. Asking the OS for an ephemeral
+ * port (`listen(0)`) only guarantees the port itself — on a shared runner the
+ * neighbour can already be held by an unrelated process, and then
+ * `rawListen(mk(), busy + 1)` rejects with EADDRINUSE and the case fails on its
+ * own fixture. MEASURED on CI: `Failed to start server. Is port 33638 in use?`
+ * raised from rawListen, reported as "rejects once maxProbe is exhausted"
+ * failing — a fixture collision wearing the assertion's name.
+ *
+ * Probing both and retrying removes the assumption instead of widening a
+ * tolerance: we only proceed once the OS has told us both are bindable.
+ */
+async function reserveAdjacentPair(attempts = 40): Promise<number> {
+  for (let i = 0; i < attempts; i++) {
+    const probe = createServer();
+    const base = await new Promise<number>((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const a = probe.address();
+        resolve(typeof a === 'object' && a ? a.port : 0);
+      });
+    });
+    // Hold `base` while testing the neighbour, so nothing can slip into `base`
+    // between the two checks.
+    const neighbourFree = await new Promise<boolean>((resolve) => {
+      const nb = createServer();
+      nb.once('error', () => resolve(false));
+      nb.listen(base + 1, '127.0.0.1', () => nb.close(() => resolve(true)));
+    });
+    await new Promise<void>(r => probe.close(() => r()));
+    if (neighbourFree) return base;
+  }
+  throw new Error('could not reserve a free adjacent port pair');
+}
+
 describe('listenWithProbe', () => {
   it('binds the requested port when it is free', async () => {
     const port = await listenWithProbe({ server: mk(), port: 0, host: '127.0.0.1' });
@@ -30,10 +69,7 @@ describe('listenWithProbe', () => {
   });
 
   it('skips ports rejected by caller-specific availability checks', async () => {
-    const tmp = mk();
-    const start = await rawListen(tmp, 0);
-    await new Promise<void>(r => tmp.close(() => r()));
-    open.splice(open.indexOf(tmp), 1);
+    const start = await reserveAdjacentPair();
     const logs: string[] = [];
     const bound = await listenWithProbe({
       server: mk(),
@@ -47,7 +83,7 @@ describe('listenWithProbe', () => {
   });
 
   it('probes to the next port without crashing when the requested port is busy', async () => {
-    const busy = await rawListen(mk(), 0);
+    const busy = await rawListen(mk(), await reserveAdjacentPair());
     const logs: string[] = [];
     const bound = await listenWithProbe({ server: mk(), port: busy, host: '127.0.0.1', log: m => logs.push(m) });
     expect(bound).toBe(busy + 1);
@@ -55,7 +91,7 @@ describe('listenWithProbe', () => {
   });
 
   it('rejects (does not loop forever) once maxProbe is exhausted', async () => {
-    const busy = await rawListen(mk(), 0);
+    const busy = await rawListen(mk(), await reserveAdjacentPair());
     await rawListen(mk(), busy + 1);            // occupy the single probe target too
     let err: NodeJS.ErrnoException | null = null;
     await listenWithProbe({ server: mk(), port: busy, host: '127.0.0.1', maxProbe: 1 })
@@ -68,10 +104,7 @@ describe('listenWithProbe', () => {
     // A wildcard bind can succeed at the OS level yet be shadowed on loopback
     // (someone else holds 127.0.0.1:port and wins loopback routing). verifyBound
     // runs AFTER listen; returning false must close that binding and re-probe.
-    const tmp = mk();
-    const start = await rawListen(tmp, 0);
-    await new Promise<void>(r => tmp.close(() => r()));
-    open.splice(open.indexOf(tmp), 1);
+    const start = await reserveAdjacentPair();
 
     const verified: number[] = [];
     const logs: string[] = [];

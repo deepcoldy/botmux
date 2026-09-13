@@ -76,10 +76,10 @@ const CONSUMERS: Record<string, Rule> = {
   // ── user surfaces: must render refusal AND residual ──────────────────────
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close plus shared-adopt /detach and /disconnect all branch on '
-      + 'refused/residual results; none report an ordinary close/disconnect while '
-      + 'cleanup is unproven.',
-    count: 4,
+    why: '/close, shared-adopt /detach and /disconnect, and same-daemon /close wt '
+      + 'siblings all branch on refused/residual results; none report ordinary '
+      + 'success or remove a worktree while cleanup is unproven.',
+    count: 5,
   },
   'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
@@ -161,6 +161,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '
       + 'rather than closed.',
+  },
+  'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Document-comment admission rollback has no direct user surface; the '
+      + 'background wrapper logs refused cleanup and any remote residual.',
   },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',
@@ -341,6 +346,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
   },
   'im/lark/sessions-card.ts::handleSessionsCardAction::close-route': {
     why: 'Sessions board card: residual banner on the closed detail card.',
+    mustParse: true,
+  },
+  'core/command-handler.ts::handleCommand::close-route': {
+    why: 'Cross-daemon /close wt parses residual and refuses worktree removal when remote teardown is incomplete.',
     mustParse: true,
   },
   'core/dashboard-ipc-server.ts::<module>::close-route': {

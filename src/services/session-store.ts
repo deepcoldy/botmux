@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
+import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -22,10 +22,14 @@ import {
   type StatementLike,
 } from './sqlite-compat.js';
 import type { Session } from '../types.js';
+import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+let migratedCodexInstanceConfig: string | undefined;
 // Only the store-owning daemon process may create/import the SQLite store.
 // Workers spawned from a NEWER dist by a still-running OLDER daemon must not
 // bootstrap a .db while that daemon keeps writing JSON — the mixed upgrade
@@ -224,7 +228,8 @@ interface OwnSqliteStore {
   db: SqliteDatabaseLike;
   selectRow: SqliteStatementLike;
   selectAll: SqliteStatementLike;
-  upsert: SqliteStatementLike;
+  updateExact: SqliteStatementLike;
+  insertNew: SqliteStatementLike;
 }
 let ownStore: OwnSqliteStore | undefined;
 
@@ -241,10 +246,8 @@ function attachOwnStore(path: string): OwnSqliteStore {
     db,
     selectRow: db.prepare('SELECT row FROM sessions WHERE session_id = ?'),
     selectAll: db.prepare('SELECT session_id, row FROM sessions'),
-    upsert: db.prepare(
-      'INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?) '
-      + 'ON CONFLICT(session_id) DO UPDATE SET status = excluded.status, row = excluded.row',
-    ),
+    updateExact: db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ? AND row = ?'),
+    insertNew: db.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?) ON CONFLICT(session_id) DO NOTHING'),
   };
   return ownStore;
 }
@@ -543,11 +546,25 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
+  opts: { strict?: boolean } = {},
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (opts.strict) throw new Error(`malformed active session store in ${ref.path}`);
+      return [];
+    }
+    const out: Session[] = [];
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object' || (value as { status?: unknown }).status !== 'active') continue;
+      const session = value as Partial<Session>;
+      if (typeof session.sessionId !== 'string') {
+        if (opts.strict) throw new Error(`malformed active session row in ${ref.path}: invalid session object`);
+        continue;
+      }
+      out.push(session as Session);
+    }
+    return out;
   }
   const db = openDbForRead(ref.path);
   try {
@@ -568,7 +585,17 @@ function readStoreActiveRows(
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
     for (const r of rows) {
-      try { out.push(JSON.parse(r.row) as Session); } catch { /* skip unparseable row */ }
+      try {
+        const session = JSON.parse(r.row) as Session;
+        if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
+          throw new Error('invalid session object');
+        }
+        out.push(session);
+      } catch (err) {
+        if (opts.strict) {
+          throw new Error(`malformed active session row in ${ref.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
     return out;
   } finally {
@@ -645,6 +672,7 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
  * and only the daemon itself may flip the on-disk engine.
  */
 export function init(appId?: string, opts: { owner?: boolean; occupancy?: OccupancyHolder } = {}): void {
+  migratedCodexInstanceConfig = undefined;
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
   loaded = false;
@@ -1398,6 +1426,39 @@ function load(): void {
 function loadForWrite(): void {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  migrateCodexInstanceBindings();
+}
+
+/** Migrate all recoverable rows before first admission/restore, not just active ones. */
+function migrateCodexInstanceBindings(): void {
+  const bot = configuredCodexInstanceBot(currentAppId);
+  if (!sqliteBootstrapAllowed || !ownStore || !bot?.codexInstancePool) return;
+  const configKey = JSON.stringify([bot.codexInstancePool, bot.cliId, bot.cliRuntime, bot.cliPathOverride, bot.codexAuthSync]);
+  if (migratedCodexInstanceConfig === configKey) return;
+  const changes: Session[] = [];
+  ownStore.db.exec('BEGIN IMMEDIATE');
+  try {
+   for (const durable of readOwnStoreAllRows(ownStore).map(([, row]) => row)) {
+    const binding = legacyCodexInstanceBinding(durable, bot, botHomePath(dirname(config.session.dataDir), bot.larkAppId));
+    if (!binding) continue;
+    const cliId = durable.cliId ?? bot.cliId;
+    const next: Session = { ...durable, cliInstanceBinding: binding, cliId, agentFrozen: true,
+      reasoningEffort: durable.agentFrozen ? durable.reasoningEffort : durable.reasoningEffort ?? bot.reasoningEffort,
+      cliRuntime: durable.cliRuntime ?? snapshotCliRuntime(resolveCliRuntime({ cliId,
+        cliRuntime: durable.agentFrozen || durable.cliPathOverride ? undefined : bot.cliRuntime,
+        cliPathOverride: durable.cliPathOverride ?? (durable.agentFrozen || bot.cliRuntime ? undefined : bot.cliPathOverride),
+        context: 'legacy Codex instance migration' })) };
+    changes.push(next);
+   }
+    for (const next of changes) persistRow(next);
+    ownStore.db.exec('COMMIT');
+  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
+  migratedCodexInstanceConfig = configKey;
+  for (const next of changes) {
+    const cached = sessions.get(next.sessionId);
+    if (cached) Object.assign(cached, next);
+    else sessions.set(next.sessionId, next);
+  }
 }
 
 function readOwnStoreAllRows(store: OwnSqliteStore): [string, Session][] {
@@ -1622,10 +1683,28 @@ function persistRow(session: Session): void {
     );
   }
   testOnlyBeforeRowPersist?.(session.sessionId);
-  const json = JSON.stringify(session);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (existing) {
+    const durable = JSON.parse(existing.row) as Session;
+    if (durable.cliInstanceBinding) {
+      if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
+        throw new Error('Codex instance binding is immutable');
+      }
+      // Whole-row writers may hold pre-migration objects. Carry forward the
+      // complete routing identity rather than letting them erase one field.
+      session = { ...session, cliInstanceBinding: durable.cliInstanceBinding, creationSource: durable.creationSource,
+        cliId: durable.cliId, cliRuntime: durable.cliRuntime, cliPathOverride: durable.cliPathOverride,
+        wrapperCli: durable.wrapperCli, agentFrozen: durable.agentFrozen };
+    }
+  }
+  const json = JSON.stringify(session);
   if (existing?.row === json) return;
-  ownStore.upsert.run(session.sessionId, sessionStatusText(session), json);
+  // Compare-and-set across the read/merge/write boundary. An offline writer
+  // must not install a binding between our SELECT and an unconditional UPSERT.
+  const result = existing
+    ? ownStore.updateExact.run(sessionStatusText(session), json, session.sessionId, existing.row)
+    : ownStore.insertNew.run(session.sessionId, sessionStatusText(session), json);
+  if (Number(result.changes) !== 1) throw new Error('Session changed concurrently; routing write refused');
 }
 
 export function createSession(
@@ -1634,8 +1713,16 @@ export function createSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
+  intent: { source?: SessionCreationSource; inherit?: Session } = {},
 ): Session {
   loadForWrite();
+  const bot = configuredCodexInstanceBot(currentAppId);
+  const source = intent.source ?? 'other';
+  const initial = intent.inherit ? {
+    cliInstanceBinding: intent.inherit.cliInstanceBinding,
+    cliId: intent.inherit.cliId, cliRuntime: intent.inherit.cliRuntime, cliPathOverride: intent.inherit.cliPathOverride,
+    wrapperCli: intent.inherit.wrapperCli, agentFrozen: intent.inherit.agentFrozen, creationSource: 'fork' as const,
+  } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
     chatId,
@@ -1645,9 +1732,11 @@ export function createSession(
     title,
     status: 'active',
     createdAt: new Date().toISOString(),
+    creationSource: source,
+    ...initial,
   };
-  sessions.set(session.sessionId, session);
   persistRow(session);
+  sessions.set(session.sessionId, session);
   logger.info(`Created session ${session.sessionId} (thread: ${rootMessageId})`);
   return session;
 }
@@ -2192,8 +2281,22 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
 
 export function updateSession(session: Session): void {
   loadForWrite();
+  try { persistRow(session); }
+  catch (error) {
+    const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
+    if (row) {
+      const durable = JSON.parse(row.row) as Session;
+      const cached = sessions.get(session.sessionId);
+      for (const target of new Set([session, cached].filter((s): s is Session => !!s))) {
+        for (const key of Object.keys(target)) delete (target as unknown as Record<string, unknown>)[key];
+        Object.assign(target, durable);
+      }
+    }
+    throw error;
+  }
+  const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
-  persistRow(session);
 }
 
 /**
@@ -2272,6 +2375,7 @@ export function persistActiveRemoteLineageExact(
 
 export function listSessions(): Session[] {
   load();
+  migrateCodexInstanceBindings();
   return [...sessions.values()];
 }
 
@@ -2285,7 +2389,29 @@ export function listSessions(): Session[] {
 export function listSessionsStrict(): Session[] {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  migrateCodexInstanceBindings();
   return [...sessions.values()];
+}
+
+/** Read-only configuration-change guard; unlike display snapshots, malformed rows fail closed. */
+export function readBotSessionsStrict(appId: string, dataDir = config.session.dataDir): Session[] {
+  const result: Session[] = [];
+  for (const id of [undefined, appId]) {
+    const ref = resolveStoreFile(id, dataDir);
+    if (!existsSync(ref.path)) continue;
+    if (ref.kind === 'json') {
+      const parsed = JSON.parse(readFileSync(ref.path, 'utf8')) as Record<string, Session>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid session store');
+      result.push(...Object.values(parsed).filter(s => id === appId || s.larkAppId === appId));
+    } else {
+      const db = openDbForRead(ref.path);
+      try {
+        const rows = db.prepare('SELECT row FROM sessions').all() as { row: string }[];
+        result.push(...rows.map(row => JSON.parse(row.row) as Session).filter(s => id === appId || s.larkAppId === appId));
+      } finally { db.close(); }
+    }
+  }
+  return result;
 }
 
 /**
@@ -2320,6 +2446,35 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
+}
+
+export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
+  return findActiveSessionsMatching(s => s.workingDir === workingDir);
+}
+
+/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
+export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const target = resolve(workingDir);
+  const matches: Session[] = [];
+  const targetReal = realpathSync(target);
+  const matchesDir = (session: Session) => {
+    if (session.status !== 'active' || !session.workingDir) return false;
+    let candidate: string;
+    try { candidate = realpathSync(resolve(session.workingDir)); }
+    catch { candidate = resolve(session.workingDir); }
+    const rel = relative(targetReal, candidate);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  };
+  for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
+  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
+    if (ref.appId === currentAppId) continue;
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      if (matchesDir(session)) matches.push(session);
+    }
+  }
+  return matches;
 }
 
 /**

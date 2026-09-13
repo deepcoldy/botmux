@@ -362,6 +362,39 @@ describe('document-comment routing generation primitives', () => {
     expect(winner.session.status).toBe('active');
   });
 
+  it('does not retire an ephemeral session while another turn reserves it or after acceptance', async () => {
+    const daemon = await import('../src/daemon.js');
+    const candidate = makeDocDs('candidate');
+    const key = 'doc:doccnFILE::app-doc';
+    daemon.__testOnly_activeSessions.set(key, candidate);
+    daemon.__testOnly_markEphemeralDocCommentSession(candidate);
+    const releaseOld = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-old');
+    const releaseNew = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-new');
+
+    releaseOld();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(candidate);
+
+    daemon.__testOnly_acceptDocCommentSession(candidate);
+    releaseNew();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(candidate);
+  });
+
+  it('retires an unaccepted ephemeral session only after its final reservation releases', async () => {
+    const daemon = await import('../src/daemon.js');
+    const candidate = makeDocDs('candidate');
+    const key = 'doc:doccnFILE::app-doc';
+    daemon.__testOnly_activeSessions.set(key, candidate);
+    daemon.__testOnly_markEphemeralDocCommentSession(candidate);
+    const release = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-only');
+
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    release();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(true);
+    expect(daemon.__testOnly_activeSessions.has(key)).toBe(false);
+  });
+
   it('makes a concurrent follower await the owner failure instead of reporting success', async () => {
     const daemon = await import('../src/daemon.js');
     let failOwner!: () => void;
@@ -402,10 +435,24 @@ describe('document-comment routing integration', () => {
     expect(region).not.toContain('resolveSender(');
     expect(region).not.toContain('docCommentTurns');
     expect(region).not.toContain('docCommentTargets');
-    expect(region).toContain('const virtualAnchor = virtualChatId;');
+    expect(region).toContain('docCommentThreadAnchor(sub.fileToken, ctx.commentId)');
     expect(region).toContain('registerDocSessionCandidate(routingKey, ds)');
     expect(region).toContain('persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds)');
     expect(region).toContain('return selected;');
+  });
+
+  it('coordinates persisted WS retries with the --all cursor without double delivery', () => {
+    const start = src.indexOf('async function pollWatchedDocComments');
+    const end = src.indexOf('function normalizeDocNativeSubscriptionsBeforeSessionRestore', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const region = src.slice(start, end);
+    expect(region).toContain('if (pendingRetry.acceptedKeys.has(pendingKey)) return true;');
+    expect(region).toContain('commitDocCommentPollCursor(');
+    expect(region).toContain('if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;');
+    expect(region.indexOf('retryPendingDocCommentDeliveries(larkAppId)')).toBeLessThan(
+      region.indexOf('listDocComments(larkAppId'),
+    );
   });
 
   it('revalidates prewarm after sender resolution before mutating or dispatching', () => {

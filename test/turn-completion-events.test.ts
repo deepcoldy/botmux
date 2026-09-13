@@ -179,4 +179,103 @@ describe('durable turn.completed events', () => {
     expect(() => store.recordTurnTerminal(terminal({ status: 'completed' }))).toThrow('turn_terminal_status_conflict');
     store.close();
   });
+
+  it('records a measured completion instant and native duration, not write time', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    store.recordTurnDelivery(delivery());
+    // Epoch ms → ISO; 2026-08-11T12:00:00.000Z is exactly what `terminal()` uses.
+    const measuredAt = Date.parse('2026-08-11T12:00:00.000Z');
+    store.recordTurnTerminal(terminal({
+      completedAt: new Date(measuredAt).toISOString(),
+      durationMs: 321,
+    }));
+    const event = store.listTurnCompletionEvents()[0].payload;
+    expect(event.time).toBe('2026-08-11T12:00:00.000Z');
+    expect(event.durationMs).toBe(321);
+    // A measured instant carries no estimate flag.
+    expect(event).not.toHaveProperty('completedAtEstimated');
+    store.close();
+  });
+
+  it('flags an estimated completion time when the emitter sent no instant', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    store.recordTurnDelivery(delivery());
+    // No completedAt / durationMs: the store stamps its own write time and
+    // must flag it so a consumer does not read it as a measured instant.
+    store.recordTurnTerminal({
+      botAppId: 'app_a', sessionId: 'session_a', turnId: 'turn_a',
+      dispatchAttempt: 2, status: 'completed',
+    });
+    const event = store.listTurnCompletionEvents()[0].payload;
+    expect(event.completedAtEstimated).toBe(true);
+    expect(event).not.toHaveProperty('durationMs');
+    expect(Date.parse(event.time)).toBeGreaterThan(Date.parse('2026-08-11T12:00:00.000Z'));
+    store.close();
+  });
+
+  it('persists real timing end-to-end through the nonblocking queue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    store.recordTurnDelivery(delivery());
+    const measuredAt = Date.parse('2026-08-11T12:00:00.000Z');
+    await persistTurnTerminal({
+      dataDir: dir,
+      botAppId: 'app_a',
+      session: { sessionId: 'session_a' },
+      terminal: {
+        turnId: 'turn_a', dispatchAttempt: 2, status: 'completed',
+        completedAtMs: measuredAt, durationMs: 321,
+      },
+      store,
+    });
+    const event = store.listTurnCompletionEvents()[0].payload;
+    expect(event).toMatchObject({ time: '2026-08-11T12:00:00.000Z', durationMs: 321 });
+    expect(event).not.toHaveProperty('completedAtEstimated');
+    store.close();
+  });
+
+  it('ignores malformed timing instead of writing a nonsense timestamp', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    store.recordTurnDelivery(delivery());
+    await persistTurnTerminal({
+      dataDir: dir,
+      botAppId: 'app_a',
+      session: { sessionId: 'session_a' },
+      terminal: {
+        turnId: 'turn_a', dispatchAttempt: 2, status: 'completed',
+        completedAtMs: Number.NaN, durationMs: -5,
+      } as any,
+      store,
+    });
+    const event = store.listTurnCompletionEvents()[0].payload;
+    // Bad input falls back to an honest estimated time, never an Invalid Date.
+    expect(event.completedAtEstimated).toBe(true);
+    expect(Number.isFinite(Date.parse(event.time))).toBe(true);
+    expect(event).not.toHaveProperty('durationMs');
+    store.close();
+  });
+
+  it('records a canonical final answer without a feedback control and still emits turn.completed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    // A delivery with NO policy/baseCard — feedback turned off. It must still be
+    // recorded (cardMode 'card') and still correlate to a turn.completed event.
+    const saved = store.recordTurnDelivery(delivery({
+      platformMessageId: 'om_no_feedback',
+      cardMode: 'card' as const,
+      policy: undefined, baseCard: undefined, requesterSubjectId: undefined,
+    }));
+    expect(saved.cardMode).toBe('card');
+    expect(saved.policy).toBeUndefined();
+    store.recordTurnTerminal(terminal({}));
+    const events = store.listTurnCompletionEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0].payload).toMatchObject({
+      deliveryId: saved.deliveryId, status: 'completed',
+    });
+    store.close();
+  });
 });

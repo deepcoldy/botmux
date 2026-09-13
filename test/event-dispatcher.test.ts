@@ -145,7 +145,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -2652,8 +2652,39 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('路由侧与 daemon 侧的 @ 剥离同源：本 bot 的 @ 占住指令参数位时，两边都判「不是指令头」', () => {
+    // 路由这边曾经只剥前导 @，于是 `重构登录 /t /model @机器人` 在这里解析成
+    //「合法头部（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——
+    // 路由已经把 scope 翻成新话题，daemon 才回一句用法错误，错误提示落进一个
+    // 凭空开出来的空话题里。两边必须得出同一个结论。
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    const message = {
+      content: JSON.stringify({ text: '重构登录 /t /model @_user_1' }),
+      mentions: [{ key: '@_user_1', name: '机器人', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+
+    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(false);
+    // 没有被翻成新话题 —— 拒绝会留在原地回复，不会先产生「开了个话题」这个副作用。
+    expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+  });
+
+  it('本 bot 的 @ 夹在正文里时，路由仍然认得出这是指令头', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    const message = {
+      content: JSON.stringify({ text: '重构登录 /t /repo botmux 看看 @_user_1' }),
+      mentions: [{ key: '@_user_1', name: '机器人', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+
+    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(true);
+    // forceTopicApplied 只在**真翻了**的时候置位（上一条没翻的用例里不出现），下游的
+    // 授权闸靠它认出「这条 thread 路是 `/t` 挣来的」。
+    expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
+  });
+
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
-    // /t 和 /topic 走同一条 parseForceTopicInvocation，别让别名成为绕过 vetting 的后门。
+    // /t 和 /topic 走同一条 parseTopicHeader，别让别名成为绕过 vetting 的后门。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效
     mockGetChatMode.mockResolvedValueOnce('group');
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer

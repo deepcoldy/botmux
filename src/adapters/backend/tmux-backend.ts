@@ -148,6 +148,19 @@ export class TmuxBackend implements SessionBackend {
     return TmuxBackend.probeSession(name) === 'exists';
   }
 
+  static assertInstanceIdentity(name: string, expected: string): void {
+    const probe = TmuxBackend.probeSession(name);
+    if (probe === 'missing') return;
+    let actual = '';
+    try {
+      actual = execFileSync('tmux', ['show-environment', '-t', name, 'BOTMUX_CODEX_INSTANCE_BINDING'],
+        { encoding: 'utf8', timeout: 5000, env: tmuxEnv() }).trim();
+    } catch { /* unknown/missing identity is not permission to attach */ }
+    if (actual !== `BOTMUX_CODEX_INSTANCE_BINDING=${expected}`) {
+      throw new Error('Codex instance identity mismatch: existing tmux session preserved; attachment refused');
+    }
+  }
+
   /**
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
@@ -294,6 +307,8 @@ export class TmuxBackend implements SessionBackend {
     // (once per daemon process; no-op on a server this build booted clean).
     TmuxBackend.scrubServerGlobalEnvOnce();
     this.reattaching = TmuxBackend.hasSession(this.sessionName);
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    if (this.reattaching && instanceIdentity) TmuxBackend.assertInstanceIdentity(this.sessionName, instanceIdentity);
     logger.debug(
       `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
       `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
@@ -376,6 +391,7 @@ export class TmuxBackend implements SessionBackend {
         '-s', this.sessionName,
         '-x', String(opts.cols),
         '-y', String(opts.rows),
+        ...(instanceIdentity ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
         '--',
         ...shellCommandArgv(shellSpec, script, [
           opts.cwd,
@@ -712,6 +728,11 @@ export function buildBotmuxEnvAssignments(
   injectEnv?: Record<string, string>,
 ): string[] {
   const out: string[] = [];
+  // env(1) runs AFTER the login shell's rcfiles, so stripping these only from
+  // the worker/client env is insufficient: rcfiles can reintroduce them.
+  if (env?.BOTMUX_CODEX_INSTANCE_BINDING) {
+    for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) out.push('-u', key);
+  }
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
       const val = env[key];
@@ -746,6 +767,7 @@ export function buildBotmuxEnvAssignments(
   // crossed an IPC boundary from the daemon).
   if (injectEnv) {
     for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      if (env?.BOTMUX_CODEX_INSTANCE_BINDING && ['CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL', 'BOTMUX_CODEX_INSTANCE_BINDING'].includes(key)) continue;
       out.push(`${key}=${val}`);
     }
   }

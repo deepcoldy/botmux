@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
+import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 
 // Orphan markers land under config.session.dataDir — point it at a tmp dir so
 // tests never touch the packaged data directory.
@@ -63,6 +64,38 @@ beforeEach(() => {
 });
 
 describe('handleCotThinkingUpdate', () => {
+  it.each([false, true])('keeps silent scheduled thinking quiet with cotForced=%s', async (cotForced) => {
+    const ds = makeDs({ cotForced });
+    armSilentScheduledTurn(ds, 'schedule:quiet');
+
+    expect(handleCotThinkingUpdate(ds, upd([think('private check')], 'schedule:quiet'))).toBe(false);
+    expect(finalizeCotMessage(ds, 'schedule:quiet', 'completed')).toBe(false);
+    // Late thinking after terminal must remain silent as well.
+    expect(handleCotThinkingUpdate(ds, upd([think('late check')], 'schedule:quiet'))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(existsSync(orphanDir)).toBe(false);
+
+    // The same session can still answer an ordinary human turn.
+    expect(handleCotThinkingUpdate(ds, upd([think('human reply')], 'om_human'))).toBe(true);
+    await flush();
+    expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
+  });
+
+  it('does not supersede a normal bubble when a silent scheduled update overlaps', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('human work')], 'om_human'));
+    await flush();
+    request.mockClear();
+    armSilentScheduledTurn(ds, 'schedule:quiet');
+    expect(handleCotThinkingUpdate(ds, upd([think('quiet check')], 'schedule:quiet'))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(finalizeCotMessage(ds, 'om_human', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(true);
+  });
+
   it('topic session: creates INSIDE the topic (root anchor + reply_in_thread), sends the AG-UI prologue', async () => {
     const ds = makeDs();
     expect(handleCotThinkingUpdate(ds, upd([think('step 1')]))).toBe(true);
