@@ -8,8 +8,9 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
+import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
 import { MessageWithdrawnError, updateMessage, uploadFile } from '../im/lark/client.js';
-import { buildTurnReplyCard, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
   normalizeReplyCardMode, TurnReplyCardStore,
   type TurnReplyCardMode, type TurnReplyCardEvent, type TurnReplyCardKey,
@@ -75,6 +76,7 @@ export async function updateTurnReplyCard(
     }
   };
   beforeEffect();
+  if (event.kind === 'terminal' && !event.disconnected) invalidateReplyCardAsks(key, 'Turn finished');
   await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds) });
   const cfg = getBot(ds.larkAppId).config;
   let usage;
@@ -162,6 +164,7 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
   const work = updateTurnReplyCard(ds, turnId, {
     kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
+    activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
   }, next.send, { dispatchAttempt, owns: next.owns }).then(() => undefined);
   let running = toolFlushes.get(ds);
   if (!running) { running = new Map(); toolFlushes.set(ds, running); }
@@ -184,7 +187,10 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
 }
 
 async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord): Promise<void> {
-  await store.update(record, { kind: 'terminal', phase: 'ambiguous', disconnected: true }, {
+  // Resumable asks have already been restored by the broker at startup.
+  const orphanAskIds = (record.asks ?? []).filter(entry => !entry.result && !getAskSnapshot(entry.ask.askId))
+    .map(entry => entry.ask.askId);
+  await store.update(record, { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds }, {
     beforeEffect: () => {
       if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
     },
@@ -208,7 +214,7 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       const key = JSON.parse(readFileSync(join(store.directory, file), 'utf8')) as TurnReplyCardKey;
       if (key.larkAppId !== larkAppId) continue;
       const record = store.read(key);
-      if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn || ['completed', 'failed', 'cancelled', 'ambiguous'].includes(record.phase)) continue;
+      if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn || ['completed', 'failed', 'cancelled'].includes(record.phase)) continue;
       await settleDisconnectedReplyCard(store, record);
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);

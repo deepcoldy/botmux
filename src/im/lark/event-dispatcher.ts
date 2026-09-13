@@ -1030,7 +1030,7 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1078,6 +1078,15 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
+      if (typeof result?.afterAck === 'function') {
+        // Run a fresh serialized publisher after ACK, never a captured card
+        // snapshot which could overwrite another tool/answer update.
+        setTimeout(() => {
+          void Promise.resolve().then(result.afterAck)
+            .catch(err => logger.warn(`Failed to publish card action after ACK: ${err}`));
+        }, 0);
+        return result.toast ? { toast: result.toast } : {};
+      }
       if (!result?.deferredCard) return result;
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
+import type { AskResult, PendingAsk } from '../core/ask-types.js';
 
 export type ReplyCardMode = 'legacy' | 'unified';
 /** Retain quiet delivery only for persisted turns accepted by older versions. */
@@ -23,6 +24,10 @@ export interface TurnReplyCardKey {
 
 export type ReplyCardPhase = 'queued' | 'working' | 'waiting' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'ambiguous';
 export interface ReplyCardTool { id: string; name: string; subject: string; completed?: boolean; result?: string }
+export type ReplyCardActivity =
+  | { kind: 'thinking' | 'progress'; id: string; text: string }
+  | { kind: 'tool' | 'ask'; id: string };
+export interface ReplyCardAsk { ask: PendingAsk; result?: AskResult; confirmEmptyArmed?: boolean; runtimeInvalidated?: boolean }
 export interface TurnReplyCardRecord extends TurnReplyCardKey {
   version: 1;
   mode: Exclude<TurnReplyCardMode, 'legacy'>;
@@ -36,6 +41,9 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   completedAtMs?: number;
   progress: string[];
   tools: ReplyCardTool[];
+  /** Ordered by receipt; source IDs keep cumulative CLI snapshots idempotent. */
+  activity?: ReplyCardActivity[];
+  asks?: ReplyCardAsk[];
   finalCard?: string;
   finalText?: string;
   finalSource?: 'explicit' | 'bridge';
@@ -52,11 +60,12 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
 
 export type TurnReplyCardEvent =
   | { kind: 'start' }
-  | { kind: 'tools'; tools: ReplyCardTool[] }
+  | { kind: 'tools'; tools: ReplyCardTool[]; activity?: ReplyCardActivity[] }
+  | { kind: 'ask'; entry: ReplyCardAsk }
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number; disconnected?: boolean }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'refresh' };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
@@ -72,6 +81,8 @@ export interface TurnReplyCardTransport {
   /** A full answer that does not fit is delivered once as a native file. */
   sendOverflow?(text: string, uuid: string): Promise<string>;
   forceVisible?: boolean;
+  /** Card callback ACK may restore the pre-click view despite an earlier PATCH. */
+  forcePatch?: boolean;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
 }
 
@@ -151,13 +162,14 @@ export class TurnReplyCardStore {
     });
   }
 
-  async update(key: TurnReplyCardKey, event: TurnReplyCardEvent, io: TurnReplyCardTransport): Promise<{
+  async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
     messageId?: string; delivered: boolean; card?: string; record: TurnReplyCardRecord;
   }> {
     return withFileLock(this.path(key), async () => {
       const record = this.read(key);
       if (!record) throw new Error('Reply-card turn was not prepared by the daemon');
       await io.beforeEffect();
+      const event = typeof inputEvent === 'function' ? inputEvent() : inputEvent;
       if (record.withdrawn) throw new ReplyCardWithdrawnError();
       const terminal = replyCardIsTerminal(record) && !record.disconnected;
       record.updatedAtMs = Date.now();
@@ -172,7 +184,25 @@ export class TurnReplyCardStore {
         }
         return { messageId: record.messageId, delivered: !!record.messageId, card: record.lastCard, record };
       }
-      if (event.kind === 'final') {
+      record.activity ??= [
+        ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: `progress:${i}`, text })),
+        ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
+      ];
+      if (event.kind === 'ask') {
+        record.asks ??= [];
+        const prior = record.asks.find(item => item.ask.askId === event.entry.ask.askId);
+        if (!prior && (terminal || record.finalDelivered) && !event.entry.result) throw new Error('Cannot ask after turn completion');
+        if (prior) {
+          // A late initial send/toggle cannot resurrect a resolved question.
+          if (!prior.result || (prior.runtimeInvalidated && event.entry.result)) {
+            Object.assign(prior, event.entry);
+            delete prior.runtimeInvalidated;
+          }
+        } else {
+          record.asks.push(event.entry);
+          record.activity.push({ kind: 'ask', id: event.entry.ask.askId });
+        }
+      } else if (event.kind === 'final') {
         // The first explicit final is authoritative. Transcript fallback and
         // command retries may acknowledge it, but must not replace it.
         if (!record.finalDelivered && (record.finalSource !== 'explicit' || event.source === 'explicit')) {
@@ -182,6 +212,14 @@ export class TurnReplyCardStore {
           record.feedback = event.feedback;
         }
       } else if (event.kind === 'terminal') {
+        for (const entry of record.asks ?? []) {
+          if (!entry.result && (!event.disconnected || event.orphanAskIds?.includes(entry.ask.askId))) {
+            entry.result = { kind: 'invalidated', reason: 'Task no longer awaiting this answer', selected: null, by: null, comment: null, timedOut: false };
+            // A broker answer accepted before this terminal edge may still be
+            // waiting for the publish lock; its confirmed result wins later.
+            entry.runtimeInvalidated = true;
+          }
+        }
         // A persisted terminal phase does not prove its provider PATCH was
         // acknowledged. Keep rendering it on retry without changing its facts.
         if (!terminal) {
@@ -193,11 +231,17 @@ export class TurnReplyCardStore {
       } else if (!terminal) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
+          const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
+          const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
+          for (const item of incoming) {
+            if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);
+          }
         } else if (event.kind === 'start' && !record.finalDelivered) {
           record.phase = 'working';
           record.startedAtMs ??= Date.now();
         } else if (event.kind === 'progress' && event.text.trim() && record.progress.at(-1) !== event.text) {
           record.progress.push(event.text);
+          record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.text });
         } else if (event.kind === 'phase' && record.phase !== 'stopping') {
           record.phase = event.phase;
         }
@@ -239,7 +283,7 @@ export class TurnReplyCardStore {
           delete record.pendingCreate;
           this.write(key, record);
         }
-        if (record.lastCard !== card) {
+        if (record.lastCard !== card || io.forcePatch) {
           await io.beforeEffect();
           await io.patch(record.messageId, card);
           record.lastCard = card;

@@ -10,7 +10,7 @@
 
 - `replyCardMode=legacy|unified`，页面统一命名为“默认模式”和“动态单卡模式”，与 `/botconfig` 保持一致。每轮冻结模式。“显示独立状态卡”在两种模式下均可开关，切换模式保留其值。`disableStreamingCard` 和 `/card off` 仅关闭独立状态卡，不影响答复卡的动态更新。旧 `final-only` 配置兼容为 unified + disableStreamingCard，不再作为独立选项；升级前已接受轮次的投递状态仍可恢复。
 - `services/turn-reply-card.ts` 保存每个 app/session/turn/attempt 的卡片 ID、进度、工具、执行状态与最终交付状态。跨进程文件锁串行化 Daemon 与短命 CLI 的更新；初次 POST 的正文与 UUID 在调用前持久化，重试保持一致。普通状态卡的 recall 流程不拥有这些答复卡。
-- `core/turn-reply-card.ts` 处理入口资格、模式快照、工具更新合并、用量、短重试及断开后的状态收尾；`im/lark/turn-reply-card.ts` 复用现有 Markdown 渲染和反馈组件。工具输入/结果中的 @ 不执行为提及，私有 thinking 不进入记录。
+- `core/turn-reply-card.ts` 处理入口资格、模式快照、工具更新合并、用量、短重试及断开后的状态收尾；`im/lark/turn-reply-card.ts` 复用现有 Markdown 渲染和反馈组件。工具输入/结果中的 @ 不执行为提及；当前版本记录 CLI 已输出的思考文本或摘要，不推断未输出的内部思考。
 - `cli.ts` 管理普通当前轮发送，包括回复并 @ 本轮真人提问者；显式定向、辅助消息、通知其他对象的 @ 和 attention 仍独立。进度标记与最终交付标记分开，CLI 的首次明确 final 优先于终端 fallback。
 - `worker-pool.ts` 将输入提交、工具事件、最终输出、terminal 接入同一卡片。最终交付和执行结束可以以任意顺序抵达；反馈索引沿用原有身份与策略，不新增反馈体系。
 - Stop 使用现有 Ctrl-C 通道和管理员权限；额外验证卡片消息及实际运行回合。状态卡的停止反馈不会覆盖主答复卡。
@@ -84,3 +84,41 @@ git diff --check
 8. 可选测试：运行中重启、断网恢复、撤回主卡片；观察状态能否收尾、恢复后是否仍更新原卡，以及撤回后是否保持不重建。
 
 飞书实测由用户执行；没有在本次本地测试中向真实聊天发送测试消息。
+
+
+## 同轮提问与执行过程补齐（2026-09-14）
+
+- 普通同轮 Ask（显式命令与已有 Ask hook）复用原卡。问题使用 Card JSON 2.0 按钮，broker 继续负责权限、nonce、选择、超时、文字/桌面答复与恢复；多个问题按顺序展示，结束后归入过程。
+- 单卡采用一条接收顺序时间线，包含 CLI 已输出的思考文本或摘要、工具调用、公开进度和问答。过程开关统一叫“展示执行过程”，工具输出继续可选；未输出的内部思考不作推断。显示最近的有限片段，不承诺完整日志。
+- 卡片点击先 ACK，再从 broker 读取最新状态，经原有文件锁发布整卡，避免同步回调携带的旧快照覆盖新答复。终态问答不可被迟到的 pending/toggle 复活。
+- 同轮与同受众之外的交互保持独立。大问卷（选项总数 >16 或问题 JSON >3000 UTF-8 字节）使用独立卡以完整保留选项。独立状态卡开关不变；独立审批、授权申请、附件、跨对象通知与手动卡片流不改。
+- 兼容 macOS/Linux 的文件锁与既有 IM API；不新增进程/PTY 平台分支。只为既有动态单卡记录接入 Ask，默认模式和其他 CLI 的发送路径保留。
+
+![同一卡片的执行、提问和完成状态（本地示意，非飞书实拍）](../assets/unified-reply-ask-preview.png)
+
+
+本轮最终验证（2026-09-14，本地 macOS）：24 个相关文件 911 项测试通过，卡片回调定向测试另 29 项通过，共 **940 项通过**。
+
+```bash
+bun run test \
+  test/command-handler.test.ts test/ask-card.test.ts test/ask-broker.test.ts \
+  test/ask-resume-restart.test.ts test/ask-resume-contract.test.ts test/ask-api.test.ts \
+  test/ask-args.test.ts test/ask-types-shape.test.ts test/ask-unauthorized-grant.test.ts \
+  test/ask-answer-talk-dispatch.test.ts test/ask-hook-claude.test.ts \
+  test/ask-hook-codex.test.ts test/ask-hook-opencode.test.ts test/cot-message.test.ts \
+  test/cli-send-reply-card.test.ts test/bridge-final-output-retry.test.ts \
+  test/dashboard-streaming-card-pin-toggle.test.ts test/card-prefs-auto-start.test.ts \
+  test/card-handler-stop-compact.test.ts test/cmd-hook.test.ts test/ask-cli.test.ts \
+  test/turn-reply-ask.test.ts test/turn-reply-card.test.ts test/turn-reply-card-runtime.test.ts \
+  --no-file-parallelism --silent
+bun run test test/event-dispatcher.test.ts -t 'card.action.trigger.*ack-safe slow handlers' --silent
+bun run switch:here
+bun run daemon:restart
+bun run daemon:status
+git diff --check
+```
+
+- 同卡问答覆盖并发进度/最终答复、多选与空提交、多个 Ask 排队、权限/消息/应用隔离、超时、重启恢复、终态失效、原生 hook 轮次固定、普通群锚点和执行过程时间线。ACK 后强制用最新持久状态 PATCH；broker 已接受的答案晚于执行终态发布时，仍保留真实回答。
+- 默认模式、原生 CoT、其他 CLI hook 和独立状态卡回归通过。上一版 CI 的 `/cot show` 用例失败已在本地复现：共享文件系统 mock 把不存在的单卡记录模拟为存在。该用例现在明确模拟没有持久化记录，仍验证原生 CoT 路径；修复后通过。
+- 标题只显示状态与耗时，调用次数保留在过程折叠栏；过程条目之间只换行，工具输出内部空行保留；问答选项使用原生图标显示未选/已选状态。
+- 飞书手动测试的截图反馈已用于调整排版。预览图由当前卡片 JSON 在本地近似渲染，折叠可展开，390px 窄屏无横向溢出。新的原生选项图标和精简标题仍需客户端确认；本地自动测试未向真实聊天发送消息。

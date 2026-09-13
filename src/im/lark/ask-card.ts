@@ -10,6 +10,7 @@ import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
+import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -23,6 +24,8 @@ export const ASK_TOGGLE_ACTION = 'ask_toggle';
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
 export interface AskCardActionData {
+  context?: { open_message_id?: string };
+  open_message_id?: string;
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, unknown>;
@@ -39,6 +42,7 @@ export interface AskCardDispatcherDeps {
 /** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
 export interface AskCardActionDeps {
   requestGrant?: typeof requestGrantForAskClicker;
+  larkAppId?: string;
 }
 
 export function createLarkAskCardDispatcher(
@@ -50,6 +54,13 @@ export function createLarkAskCardDispatcher(
 
   return {
     async send(ask) {
+      if (ask.replyCardTarget) {
+        try { return { messageId: await publishReplyCardAsk(ask) }; }
+        catch (err) {
+          const { retryable, detail } = classifyAskDispatchError(err);
+          throw new AskDispatchError(detail, retryable);
+        }
+      }
       const cardJson = buildAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
@@ -75,6 +86,7 @@ export function createLarkAskCardDispatcher(
       }
     },
     async onSettle(ask, result) {
+      if (ask.replyCardTarget) { await publishReplyCardAsk(ask, result); return; }
       if (!ask.cardMessageId) return;
       try {
         await update(ask.larkAppId, ask.cardMessageId, buildAskCard(ask, result));
@@ -199,6 +211,9 @@ export async function handleAskCardAction(
   if (!askId || !nonce || !by) {
     return staleToast(locale);
   }
+  const pending = getAskSnapshot(askId);
+  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) return staleToast(locale);
+  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) return staleToast(locale);
 
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
@@ -232,6 +247,7 @@ export async function handleAskCardAction(
     if (outcome !== 'toggled') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     if (!updated) return staleToast(locale);
+    if (updated.replyCardTarget) return inlineAskResponse(updated);
     return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
   }
 
@@ -289,6 +305,10 @@ export async function handleAskCardAction(
 function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
   const ask = getAskSnapshot(askId);
   if (!ask) return staleToast(locale);
+  if (ask.replyCardTarget) return {
+    ...inlineAskResponse(ask, undefined, true),
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
   return {
     card: {
       type: 'raw',
@@ -311,7 +331,12 @@ function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string,
 function settledCardResponse(askId: string, result: AskResult): Record<string, unknown> | undefined {
   const updated = getAskSnapshot(askId);
   if (!updated) return undefined;
+  if (updated.replyCardTarget) return inlineAskResponse(updated, result);
   return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
+}
+
+function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArmed = false): Record<string, unknown> {
+  return { afterAck: async () => { await publishReplyCardAsk(ask, result, confirmEmptyArmed, true); } };
 }
 
 /**

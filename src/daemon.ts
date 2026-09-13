@@ -570,6 +570,7 @@ import { parseAskBody } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
+import { replyCardAskTarget } from './core/turn-reply-ask.js';
 import { normalizeVcMeetingEvents } from './vc-agent/normalizer.js';
 import {
   beginVcIngestionPass,
@@ -6540,10 +6541,10 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }
   let boundAsk = parsed;
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
   if (!isTrustedHostIpcRequest(req)) {
-    const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? raw as Record<string, unknown>
-      : {};
     const claimedAttempt = typeof body.originDispatchAttempt === 'number'
       && Number.isSafeInteger(body.originDispatchAttempt)
       && body.originDispatchAttempt > 0
@@ -6621,6 +6622,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
+    replyCardTarget: replyCardAskTarget(askSession, boundAsk, body),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     // Invocation identity (from the hook; enables cross-restart re-attach).

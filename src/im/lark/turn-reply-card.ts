@@ -2,8 +2,9 @@ import type { BotConfig } from '../../bot-registry.js';
 import type { CotEntry } from '../../types.js';
 import { subjectFromArgsString } from '../../services/cot-subject.js';
 import {
-  replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord,
+  replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
+import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
 import { buildCardBodyElements, cardUsageFooterSegment, createReplyCard } from './md-card.js';
 
 export interface TurnReplyCardPresentation {
@@ -15,7 +16,7 @@ export interface TurnReplyCardPresentation {
   showLiveUsage?: boolean;
 }
 
-/** Never carry model-private thinking into the persistent reply history. */
+/** Extract tools without mixing provider-supplied reasoning into tool output. */
 export function publicReplyCardTools(entries: readonly CotEntry[], showResults: boolean): ReplyCardTool[] {
   const tools = new Map<string, ReplyCardTool>();
   for (const entry of entries) {
@@ -33,6 +34,13 @@ export function publicReplyCardTools(entries: readonly CotEntry[], showResults: 
     }
   }
   return [...tools.values()];
+}
+
+/** Only text already emitted by the CLI is available here (often a summary). */
+export function publicReplyCardActivity(entries: readonly CotEntry[]): ReplyCardActivity[] {
+  return entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking'
+    ? [{ kind: 'thinking', id: `thinking:${index}`, text: bounded(entry.text, 4000) }]
+    : entry.kind === 'tool_call' ? [{ kind: 'tool', id: entry.id }] : []);
 }
 
 function bounded(text: string, bytes: number): string {
@@ -72,6 +80,7 @@ function toolLine(tool: ReplyCardTool, subjectLimit: number): string {
 export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: TurnReplyCardPresentation): string {
   const en = presentation.locale === 'en';
   const terminal = replyCardIsTerminal(record);
+  const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
   const phaseLabels = en
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认' };
@@ -80,8 +89,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const toolCountLabel = en ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : `${toolCount} 次工具调用`;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
-  const title = [phaseLabels[record.phase], duration !== undefined ? `${(Math.max(0, duration) / 1000).toFixed(1)}s` : '',
-    toolCount ? toolCountLabel : '',
+  const title = [
+    pendingAsks.length ? (en ? 'Waiting for your response' : '等待你确认') : phaseLabels[record.phase],
+    duration !== undefined ? `${(Math.max(0, duration) / 1000).toFixed(1)}s` : '',
   ].filter(Boolean).join(' · ');
 
   const card = record.finalCard
@@ -97,7 +107,13 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       : '完整答复较长，已作为本轮的 **Markdown 附件**发送，请查看附件。' });
   }
 
-  if (!record.finalCard) {
+  if (pendingAsks.length) {
+    card.body.elements.unshift(...buildTurnReplyAskElements(pendingAsks[0], presentation.locale));
+    if (pendingAsks.length > 1) card.body.elements.push({ tag: 'markdown', text_size: 'notation', content: en
+      ? `${pendingAsks.length - 1} more requests will appear after this one is answered.`
+      : `还有 ${pendingAsks.length - 1} 个待回答请求，完成当前问题后依次显示。` });
+  }
+  if (!record.finalCard && !pendingAsks.length) {
     const latest = record.progress.at(-1);
     const content = latest ? bounded(latest, 6000)
       : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
@@ -107,22 +123,32 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
 
   const process: string[] = [];
   if (presentation.showProcess) {
-    if (!terminal && !record.finalCard && record.tools.length) {
+    const latest = record.activity?.at(-1);
+    if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
+      card.body.elements.push({ tag: 'markdown', content: `🧠 ${publicText(bounded(latest.text, 600))}` });
+    }
+    if (!terminal && !record.finalCard && !pendingAsks.length && record.tools.length) {
       card.body.elements.push({ tag: 'markdown', content: record.tools.slice(-2).map(tool =>
         toolLine(tool, 300),
       ).join('\n') });
     }
-    for (const tool of record.tools.slice(-20)) {
-      process.push(toolLine(tool, 400));
-      if (presentation.showToolResults && tool.result) {
-        process.push(publicText(bounded(tool.result, 600)));
-      }
-    }
   }
-  // Explicit progress messages are part of the public turn record even when
-  // the user hides tool calls. They are never promoted to an inferred final.
-  if (record.progress.length && (terminal || record.finalCard || record.progress.length > 1)) {
-    process.unshift(...record.progress.slice(-10).map(value => `💬 ${publicText(bounded(value, 600))}`));
+  const activity: ReplyCardActivity[] = record.activity ?? [
+    ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: String(i), text })),
+    ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
+  ];
+  for (const item of activity) {
+    if (item.kind === 'progress') {
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push(`💬 ${publicText(bounded(item.text, 600))}`);
+    } else if (item.kind === 'ask') {
+      const entry = record.asks?.find(entry => entry.ask.askId === item.id);
+      if (entry?.result) process.push(bounded(turnReplyAskSummary(entry, presentation.locale), 1200));
+    } else if (presentation.showProcess && item.kind === 'thinking') {
+      process.push(`🧠 ${publicText(bounded(item.text, 1200))}`);
+    } else if (presentation.showProcess && item.kind === 'tool') {
+      const tool = record.tools.find(tool => tool.id === item.id);
+      if (tool) process.push(toolLine(tool, 400) + (presentation.showToolResults && tool.result ? `\n${publicText(bounded(tool.result, 600))}` : ''));
+    }
   }
   if (process.length) {
     const footerIndex = card.body.elements.findIndex(element =>
@@ -133,19 +159,19 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       border: { color: 'grey-50', corner_radius: '8px' },
       header: {
         title: { tag: 'plain_text', content: toolCount
-          ? (en ? `📋 Activity (${toolCountLabel})` : `📋 调用过程（${toolCountLabel}）`)
-          : (en ? '📋 Turn record' : '📋 本轮记录') },
+          ? (en ? `📋 Activity (${toolCountLabel})` : `📋 执行过程（${toolCountLabel}）`)
+          : presentation.showProcess ? (en ? '📋 Activity' : '📋 执行过程') : (en ? '📋 Turn record' : '📋 本轮记录') },
         background_color: 'grey-50', padding: '10px 12px 10px 12px',
         icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey', size: '16px 16px' },
         icon_position: 'right', icon_expanded_angle: -180,
       },
-      elements: [{ tag: 'markdown', content: bounded(process.join('\n\n'), 7000)
-        + (record.tools.length > 20 || record.progress.length > 10 ? (en ? '\n\nRecent entries shown.' : '\n\n这里只展示最近的过程记录。') : '') }],
+      elements: [{ tag: 'markdown', content: bounded(process.slice(-20).join('\n'), 7000)
+        + (process.length > 20 ? (en ? '\n\nRecent entries shown.' : '\n\n这里只展示最近的过程记录。') : '') }],
     });
   }
 
   // A runtime status is separate from a model-authored layout title.
-  card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${phaseIcons[record.phase]} **${title}**` });
+  card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
   if (usage) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usage });

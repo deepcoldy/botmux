@@ -1448,7 +1448,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (isAskCardAction(value?.action)) {
-    return handleAskCardAction(data);
+    return handleAskCardAction(data, { larkAppId });
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {

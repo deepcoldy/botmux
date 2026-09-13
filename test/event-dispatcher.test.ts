@@ -7303,6 +7303,34 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     );
   });
 
+  it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({ afterAck });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_toggle', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps an inline confirmation toast in the ACK and handles publisher rejection', async () => {
+    const afterAck = vi.fn(async () => { throw new Error('temporary publish failure'); });
+    const toast = { type: 'warning', content: 'confirm empty selection' };
+    handlers.handleCardAction.mockResolvedValue({ afterAck, toast });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_submit', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({ toast });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
     mockUpdateMessage.mockRejectedValueOnce(new Error('HTTP 400 invalid card'));
     handlers.handleCardAction.mockResolvedValue({ deferredCard: { type: 'raw', data: { type: 'invalid-negative-followup' } } });

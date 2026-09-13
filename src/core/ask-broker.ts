@@ -268,6 +268,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       sessionId: input.sessionId,
       chatType: input.chatType,
       questions: input.questions,
+      replyCardTarget: input.replyCardTarget,
       createdAt,
       deadlineAt,
       settled: false,
@@ -451,6 +452,7 @@ function persistFromInternal(ask: InternalPending): void {
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
     cardMessageId: ask.cardMessageId,
+    replyCardTarget: ask.replyCardTarget,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
   };
@@ -678,6 +680,15 @@ export function tryResolveAsk(args: {
   });
 }
 
+export function invalidateReplyCardAsks(target: { larkAppId: string; sessionId: string; turnId: string; dispatchAttempt?: number }, reason: string): void {
+  for (const ask of pending.values()) {
+    if (ask.larkAppId === target.larkAppId && ask.sessionId === target.sessionId
+      && ask.replyCardTarget?.turnId === target.turnId && ask.replyCardTarget.dispatchAttempt === target.dispatchAttempt) {
+      settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
+    }
+  }
+}
+
 /** Invalidate every pending ask. Intended for daemon shutdown / restart paths
  *  so CLI subprocesses unblock with `kind:'invalidated'` instead of waiting
  *  forever on a dead daemon. Returns the number of asks actually settled
@@ -763,6 +774,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
       cardMessageId: p.cardMessageId,
+      replyCardTarget: p.replyCardTarget,
       // A stashed-answer restore is terminal-but-unclaimed: settled=true so
       // gcSettled/other paths treat it as done, dormant=true so a hook re-POST
       // routes to reattachByRequest to CLAIM it.
@@ -883,12 +895,14 @@ function snapshot(ask: InternalPending): PendingAsk {
   const {
     // Runtime-only / broker-internal fields excluded from the IM contract:
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
+    handoffExpiryHandle: _he,
     askKey: _ak, requestId: _rid, originKind: _ok, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
     ...rest
   } = ask;
   return {
     ...rest,
+    ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded
     // retry re-sends the card, and a re-send without a uuid posts a DUPLICATE on

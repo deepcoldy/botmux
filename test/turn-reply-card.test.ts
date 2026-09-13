@@ -208,10 +208,11 @@ describe('one reply card per turn', () => {
 
 describe('public process and fallback compatibility', () => {
   it('keeps responsive width and distinguishes tool types inside a shaded, collapsed activity panel', () => {
+    const toolOutput = 'file contents\n\n```ts\nconst value = 1;\n\nconsole.log(value);\n```';
     const card = JSON.parse(buildTurnReplyCard({
       ...key, ...input, version: 1, phase: 'working', createdAtMs: 0, progress: [],
       tools: [
-        { id: 'read', name: 'Read', subject: 'README.md', completed: true, result: 'file contents' },
+        { id: 'read', name: 'Read', subject: 'README.md', completed: true, result: toolOutput },
         { id: 'search', name: 'mcp__web__search', subject: 'card schema', completed: true },
         { id: 'bash', name: 'Bash', subject: 'bun run build', completed: true },
         { id: 'exec', name: 'exec_command', subject: 'bun run test' },
@@ -219,11 +220,11 @@ describe('public process and fallback compatibility', () => {
       ],
     }, presentation));
     expect(card.config.width_mode).toBe('fill');
-    expect(card.body.elements[0].content).toContain('🧠 **处理中');
+    expect(card.body.elements[0].content).toBe('🧠 **处理中**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
     expect(panel).toMatchObject({ expanded: false, background_color: 'grey-50', border: { corner_radius: '8px' } });
     expect(panel.header).toMatchObject({
-      title: { content: '📋 调用过程（5 次工具调用）' },
+      title: { content: '📋 执行过程（5 次工具调用）' },
       background_color: 'grey-50', icon_position: 'right', icon_expanded_angle: -180,
     });
     const history = panel.elements[0].content;
@@ -232,7 +233,10 @@ describe('public process and fallback compatibility', () => {
     expect(history).toContain('💻 **Bash** ✓');
     expect(history).toContain('💻 **exec_command** · bun run test');
     expect(history).toContain('🔧 **custom_tool**');
-    expect(history).toContain('file contents');
+    expect(history).toContain(`README.md\n${toolOutput}\n🔍`);
+    expect(history).toContain('card schema\n💻');
+    expect(history).toContain('bun run build\n💻');
+    expect(history).toContain('bun run test\n🔧');
   });
 
   it('keeps the canonical final card and public progress while hiding tools and their counts', () => {
@@ -255,10 +259,10 @@ describe('public process and fallback compatibility', () => {
 
   it('shows a distinct failure state and localized activity header without exposing hidden outputs', () => {
     const body = buildTurnReplyCard({
-      ...key, ...input, version: 1, phase: 'failed', createdAtMs: 0, progress: [],
+      ...key, ...input, version: 1, phase: 'failed', createdAtMs: 0, durationMs: 1400, progress: [],
       tools: [{ id: 't', name: 'apply_patch', subject: 'src/index.ts', result: 'hidden output' }],
     }, { ...presentation, locale: 'en', showToolResults: false });
-    expect(body).toContain('❌ **Failed');
+    expect(JSON.parse(body).body.elements[0].content).toBe('❌ **Failed · 1.4s**');
     expect(body).toContain('📋 Activity (1 tool call)');
     expect(body).toContain('✏️ **apply_patch**');
     expect(body).not.toContain('hidden output');

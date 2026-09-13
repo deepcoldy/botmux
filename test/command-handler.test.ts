@@ -7891,6 +7891,8 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     const ds = makeDaemonSession();
     ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
     const deps = makeDeps(ds);
+    // This legacy turn has no persisted reply card; the shared fs mock otherwise reports every path as present.
+    vi.mocked(existsSync).mockReturnValueOnce(false);
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
     expect(ds.cotForced).toBe(true);
     expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({
