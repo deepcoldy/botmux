@@ -342,12 +342,32 @@ export interface Session {
    * independently-created session.
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
-  /** Sessions sharing this id point at the same writable cwd and therefore
-   * admit at most one interactive turn across the whole group. */
-  cwdSerializationGroup?: string;
-  /** Crash-safe FIFO for turns admitted while a sibling in the cwd group owns
-   * execution. Items stay in their own Session and never see sibling CLI output. */
-  cwdSerializedTurns?: CwdSerializedTurn[];
+  /**
+   * Narrow XPI fallback coordination for an independent child that could not
+   * obtain an isolated worktree and therefore shares its source session's cwd.
+   *
+   * This is NOT a physical-directory mutex and does NOT cover other writers to
+   * the same cwd: trigger/API sessions, scheduled tasks, document-comment
+   * sessions, or Dashboard/command-created work. Those entrances need their own
+   * product-level wait/reject/queue policy before they can join one common lock.
+   */
+  xpiSharedCwdAdmissionGroupId?: string;
+  /** Stable session row that owns this narrow XPI group's durable admission lease. */
+  xpiSharedCwdAdmissionCoordinatorSessionId?: string;
+  /** Present only on the coordinator row. Route/principal authority has a
+   * separate lifecycle and must never be released through this field. */
+  xpiSharedCwdAdmissionLease?: XpiSharedCwdAdmissionLease;
+  /** Crash-safe FIFO for turns admitted through an explicitly grouped XPI
+   * source/child session. Items remain on their own session row. */
+  xpiSharedCwdQueuedTurns?: XpiSharedCwdQueuedTurn[];
+  /** Durable owner-visible terminal notices for an in-flight grouped turn whose
+   * outcome became unknowable across a daemon restart. These records are not
+   * runnable queue items and are removed only after the notice is delivered. */
+  xpiSharedCwdDispatchUnknownNotices?: XpiSharedCwdDispatchUnknownNotice[];
+  /** Recovery containment for one malformed legacy XPI row or one ambiguous
+   * narrow admission group. Quarantined rows are skipped while other sessions
+   * restore normally. */
+  xpiSharedCwdQuarantine?: XpiSharedCwdQuarantine;
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
@@ -914,12 +934,60 @@ export interface CrossPrincipalInterruption {
   independentRootMessageId?: string;
   independentChildSessionId?: string;
   independentWorkingDir?: string;
-  /** Present only when the child must serialize all cwd access with the source. */
-  cwdSerializationGroup?: string;
+  /** Present only when this XPI independent child fell back to the source cwd.
+   * It does not claim that non-XPI writers to the same directory participate. */
+  xpiSharedCwdAdmissionGroupId?: string;
 }
 
-export interface CwdSerializedTurn extends CrossPrincipalInterruptionMessage {
+export interface XpiSharedCwdAdmissionLease {
+  version: 1;
+  groupId: string;
+  holderSessionId: string;
+  turnId: string;
+  workerGeneration: number;
+  acquiredAt: string;
+}
+
+export interface XpiSharedCwdQueuedTurn {
+  version: 1;
+  id: string;
+  turnId: string;
   caller: TrustedCaller;
+  userPrompt: string;
+  cliInput: CliTurnPayload;
+  createdAt: string;
+  resume: boolean;
+  /** `attempting` is the durable commit-unknown barrier written before worker
+   * IPC/fork. Omitted legacy values are interpreted as `queued`. */
+  dispatchState?: 'queued' | 'attempting';
+}
+
+export interface XpiSharedCwdDispatchUnknownNotice {
+  version: 1;
+  id: string;
+  turnId: string;
+  caller: TrustedCaller;
+  detectedAt: string;
+  noticePending: true;
+}
+
+export interface XpiSharedCwdQuarantine {
+  version: 1;
+  scope: 'session' | 'group';
+  reason:
+    | 'stale_legacy_xpi_record'
+    | 'authority_without_group'
+    | 'conflicting_coordinators'
+    | 'coordinator_missing'
+    | 'malformed_queue'
+    | 'lease_outside_coordinator'
+    | 'ambiguous_lease'
+    | 'inflight_lease_after_restart'
+    | 'close_migration_unproven'
+    | 'recovery_persistence_failure';
+  detail: string;
+  detectedAt: string;
+  noticePending: boolean;
 }
 
 export interface SessionCliLaunchSnapshotV1 {

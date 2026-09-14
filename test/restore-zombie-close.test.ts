@@ -329,6 +329,87 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   return s; // left active
 }
 
+describe('restoreActiveSessions — narrow XPI recovery containment', () => {
+  it('quarantines only the stale XPI session before restore side effects and keeps restoring a healthy peer', async () => {
+    const stale = makeActivePersistentSession('om_stale_xpi');
+    stale.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_synthetic_stale',
+      ownerTurnId: 'turn_owner',
+      owner: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      proposer: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_proposer', senderType: 'user' },
+      phase: 'awaiting_classification',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      classificationDeadlineAt: 1,
+      messages: [{ turnId: 'turn_proposal', text: 'synthetic', createdAt: '2026-01-01T00:00:00.000Z' }],
+    }];
+    sessionStore.updateSession(stale);
+    const healthy = makeActivePersistentSession('om_healthy_peer');
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const notices = await restoreActiveSessions(map);
+
+    expect(notices).toEqual([expect.objectContaining({
+      sessionId: stale.sessionId,
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    })]);
+    expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+    expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(stale.sessionId);
+    expect(sessionStore.getSession(stale.sessionId)?.xpiSharedCwdQuarantine).toMatchObject({
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    });
+    expect(vi.mocked(forkWorker).mock.calls.some(([ds]) => ds.session.sessionId === stale.sessionId)).toBe(false);
+  });
+
+  it('contains a recovery transaction failure to its explicit group and restores an unrelated session', async () => {
+    const coordinator = makeActivePersistentSession('om_failed_group_coordinator');
+    const member = makeActivePersistentSession('om_failed_group_member');
+    const healthy = makeActivePersistentSession('om_healthy_outside_failed_group');
+    for (const session of [coordinator, member]) {
+      session.xpiSharedCwdAdmissionGroupId = 'xpi_group_persist_failure';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
+      sessionStore.updateSession(session);
+    }
+    sessionStore.init();
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.includes(coordinator.sessionId)) throw new Error('synthetic group persistence failure');
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    try {
+      const notices = await restoreActiveSessions(map);
+
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          sessionId: coordinator.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+        expect.objectContaining({
+          sessionId: member.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+      ]));
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(coordinator.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(member.sessionId);
+      expect(sessionStore.getSession(coordinator.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(sessionStore.getSession(member.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('recovery_partition_failure'));
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+});
+
 describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
   // The module-level bot-registry mock serves every other describe; stash its
   // implementations so these tests can swap in their own without leaking.

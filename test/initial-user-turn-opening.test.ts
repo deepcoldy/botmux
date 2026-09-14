@@ -252,6 +252,11 @@ function openingExpectations(cliId: CliId, mode: 'prompt' | 'off' | 'global') {
 describe('empty-started session — first real business turn must use the new-topic opening', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Production forkWorker has a strict boolean contract: false is reserved
+    // for an unaccepted fork. Keep the default fixture on the successful path
+    // so orchestration that reads the return value does not misclassify an
+    // unconfigured vi.fn() (undefined) as a real rejection.
+    mocks.forkWorker.mockReturnValue(true);
     home = mkdtempSync(join(tmpdir(), 'botmux-initial-turn-'));
     vi.stubEnv('HOME', home);
     vi.stubEnv('CODEX_HOME', '');
@@ -776,6 +781,29 @@ describe('empty-started session — first real business turn must use the new-to
 
     expect(forkInputs()[0]!.content).toContain('<botmux_routing>');
     expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('a rejected cold fork restores the pending opening without recording a phantom turn', async () => {
+    const anchor = 'om_fork_reject_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true });
+    mocks.forkWorker.mockReturnValueOnce(false);
+
+    await handleThreadReply(
+      makeEventData('om_fork_rejected', '冷启拒绝', anchor),
+      makeCtx(anchor, 'om_fork_rejected'),
+    );
+
+    expect(forkInputs()[0]!.content).toContain('<botmux_routing>');
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(ds.lastCliInput ?? ds.session.lastCliInput).toBeFalsy();
+
+    await handleThreadReply(
+      makeEventData('om_fork_retry', '冷启重试', anchor),
+      makeCtx(anchor, 'om_fork_retry'),
+    );
+    expect(forkInputs()[1]!.content).toContain('<botmux_routing>');
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ds.currentTurnId).toBe('om_fork_retry');
   });
 
   // ─── regression: a FAILED delivery must not poison last* / --resume ──────────

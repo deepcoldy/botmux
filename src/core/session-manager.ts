@@ -95,6 +95,11 @@ import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import {
+  reconcileXpiSharedCwdRecovery,
+  type XpiSharedCwdQuarantineNotice,
+  type XpiSharedCwdStartupNotice,
+} from './xpi-shared-cwd-admission.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -2105,7 +2110,7 @@ export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
   options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
-): Promise<void> {
+): Promise<XpiSharedCwdStartupNotice[] | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.headless) return 2;
@@ -2117,7 +2122,7 @@ export async function restoreActiveSessions(
   // real CLI/adopt rows first, queued intent second, command scratches last.
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
-  const active = sessions
+  let active = sessions
     .filter(s => s.status === 'active')
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
@@ -2128,6 +2133,87 @@ export async function restoreActiveSessions(
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
 
+  // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
+  // before stale-pid sweeping, backend probes, registration, card recovery, or
+  // any worker fork. One stale legacy record quarantines only its session; an
+  // ambiguous authority quarantines only its explicit group. Every unrelated
+  // session continues through ordinary restore.
+  let xpiQuarantineNotices: XpiSharedCwdStartupNotice[] = [];
+  if (active.length > 0) {
+    const groups = new Map<string, Session[]>();
+    const standalone: Session[][] = [];
+    for (const session of active) {
+      const groupId = session.xpiSharedCwdAdmissionGroupId;
+      if (groupId) {
+        const members = groups.get(groupId) ?? [];
+        members.push(session);
+        groups.set(groupId, members);
+        continue;
+      }
+      const hasStandaloneRecoveryState = !!session.xpiSharedCwdQuarantine
+        || (session.crossPrincipalInterruptions?.length ?? 0) > 0
+        || !!session.xpiSharedCwdAdmissionCoordinatorSessionId
+        || !!session.xpiSharedCwdAdmissionLease
+        || (session.xpiSharedCwdQueuedTurns?.length ?? 0) > 0;
+      if (hasStandaloneRecoveryState) standalone.push([session]);
+    }
+    const partitions = [
+      ...[...groups.entries()].map(([key, members]) => ({ scope: 'group' as const, key, members })),
+      ...standalone.map(members => ({ scope: 'session' as const, key: members[0]!.sessionId, members })),
+    ];
+    const quarantinedSessionIds = new Set<string>();
+    for (const partition of partitions) {
+      try {
+        let result: ReturnType<typeof reconcileXpiSharedCwdRecovery> | undefined;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            ({ result } = sessionStore.mutateOwnedSessionsAtomically(
+              partition.members.map(session => session.sessionId),
+              fresh => reconcileXpiSharedCwdRecovery([...fresh.values()], Date.now()),
+              { nonblocking: true },
+            ));
+            break;
+          } catch (error) {
+            if (!(error instanceof sessionStore.SessionStoreBusyError) || attempt === 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        if (!result) throw new Error('XPI shared-cwd recovery transaction returned no result');
+        xpiQuarantineNotices.push(...result.notices);
+        xpiQuarantineNotices.push(...result.dispatchUnknownNotices);
+        for (const sessionId of result.quarantinedSessionIds) quarantinedSessionIds.add(sessionId);
+        for (const notice of result.notices) {
+          logger.error(`[xpi-shared-cwd] recovery_quarantine ${JSON.stringify(notice)}`);
+        }
+      } catch (error) {
+        const detail = `XPI shared-cwd ${partition.scope} ${partition.key} recovery persistence failed: `
+          + `${error instanceof Error ? error.message : String(error)}`;
+        logger.error(`[xpi-shared-cwd] recovery_partition_failure ${JSON.stringify({
+          scope: partition.scope,
+          key: partition.key,
+          sessionIds: partition.members.map(session => session.sessionId),
+          detail,
+        })}`);
+        for (const session of partition.members) {
+          // The write lock is unavailable, so this marker cannot be durable in
+          // this attempt. listSessions() exposes the owned in-memory cache;
+          // stamping it still reserves the route for this daemon lifetime and
+          // prevents a replacement session beside an unverified old backing.
+          // The next boot retries the durable reconcile before opening ingress.
+          session.restoreQuarantinedAt ??= new Date().toISOString();
+          quarantinedSessionIds.add(session.sessionId);
+          xpiQuarantineNotices.push({
+            sessionId: session.sessionId,
+            scope: partition.scope,
+            reason: 'recovery_persistence_failure',
+            detail,
+          });
+        }
+      }
+    }
+    active = active.filter(session => !quarantinedSessionIds.has(session.sessionId));
+  }
+
   // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:
   // the landmine files (recycled-PID misroute source) accumulate across every
   // daemon run, and a run with zero active sessions is still a fresh start that
@@ -2136,7 +2222,7 @@ export async function restoreActiveSessions(
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
-    return;
+    return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
   }
 
   // Kill any stale CLI processes from previous daemon run
@@ -3015,6 +3101,7 @@ export async function restoreActiveSessions(
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
+  return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
 }
 
 /** Re-attaching to a pane that is already alive: the worker only has to reconnect. */

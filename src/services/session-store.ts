@@ -51,6 +51,17 @@ export class SessionStoreUnavailableError extends Error {
   }
 }
 
+/** A nonblocking owned-store mutation could not acquire SQLite's write lock.
+ * Callers may retry after yielding the event loop; no transaction or cache
+ * mutation was published. */
+export class SessionStoreBusyError extends Error {
+  override readonly name = 'SessionStoreBusyError';
+
+  constructor(readonly storeError: unknown) {
+    super(`session store is busy: ${storeError instanceof Error ? storeError.message : String(storeError)}`);
+  }
+}
+
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on `Session`, so no code path can produce them any more —
@@ -239,6 +250,41 @@ let ownStore: OwnSqliteStore | undefined;
 function isTransientStoreContentionError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /database is locked|SQLITE_BUSY|SQLITE_LOCKED|file-lock timeout/i.test(message);
+}
+
+/** Run one owned-row write transaction, optionally borrowing busy_timeout=0.
+ *
+ * BEGIN intentionally sits outside the transaction-body try/finally: when
+ * BEGIN itself fails there is no transaction to roll back, so the original
+ * SQLITE_BUSY error cannot be hidden by a spurious ROLLBACK failure.
+ */
+function runOwnedWriteTransaction<T>(
+  store: OwnSqliteStore,
+  nonblocking: boolean,
+  operation: () => T,
+): T {
+  if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
+  try {
+    let committed = false;
+    store.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = operation();
+      store.db.exec('COMMIT');
+      committed = true;
+      return result;
+    } finally {
+      if (!committed) {
+        try { store.db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      }
+    }
+  } catch (error) {
+    if (nonblocking && isTransientStoreContentionError(error)) {
+      throw new SessionStoreBusyError(error);
+    }
+    throw error;
+  } finally {
+    if (nonblocking) store.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
+  }
 }
 
 function attachOwnStore(path: string): OwnSqliteStore {
@@ -675,7 +721,6 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
 export function init(appId?: string, opts: {
   owner?: boolean;
   occupancy?: OccupancyHolder;
-  /** Called only when creating a row, never when loading/resuming one. */
   groupDefaultModels?: (chatId: string) => Session['groupDefaultModels'];
 } = {}): void {
   migratedCodexInstanceConfig = undefined;
@@ -1714,7 +1759,7 @@ function persistRow(session: Session): void {
   if (Number(result.changes) !== 1) throw new Error('Session changed concurrently; routing write refused');
 }
 
-export function createSession(
+function buildNewSession(
   chatId: string,
   rootMessageId: string,
   title: string,
@@ -1722,7 +1767,6 @@ export function createSession(
   scope?: 'thread' | 'chat',
   intent: { source?: SessionCreationSource; inherit?: Session } = {},
 ): Session {
-  loadForWrite();
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
   const initial = intent.inherit ? {
@@ -1746,10 +1790,90 @@ export function createSession(
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
   }
+  return session;
+}
+
+export function createSession(
+  chatId: string,
+  rootMessageId: string,
+  title: string,
+  chatType?: 'group' | 'p2p',
+  scope?: 'thread' | 'chat',
+  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+): Session {
+  loadForWrite();
+  const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
   persistRow(session);
   sessions.set(session.sessionId, session);
   logger.info(`Created session ${session.sessionId} (thread: ${rootMessageId})`);
   return session;
+}
+
+/**
+ * Create one session and mutate a fixed set of existing owned sessions in the
+ * same transaction. The new row is invisible to the cache until COMMIT.
+ *
+ * This is deliberately separate from createSession(): callers that publish a
+ * child whose safety metadata lives on its parent must not leave a crash
+ * window in which the child is durable but the parent-side authority is not.
+ */
+export function createSessionWithOwnedMutation<T>(
+  args: {
+    chatId: string;
+    rootMessageId: string;
+    title: string;
+    chatType?: 'group' | 'p2p';
+    scope?: 'thread' | 'chat';
+    intent?: { source?: SessionCreationSource; inherit?: Session };
+    ownedSessionIds: readonly string[];
+    /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
+     * event loop behind the connection's normal busy_timeout. */
+    nonblocking?: boolean;
+  },
+  mutate: (fresh: Map<string, Session>, created: Session) => T,
+): { session: Session; result: T; rows: Map<string, Session> } {
+  loadForWrite();
+  const unique = [...new Set(args.ownedSessionIds)];
+  if (unique.length !== args.ownedSessionIds.length) {
+    throw new Error('duplicate session id in atomic session creation');
+  }
+  const store = ownStore;
+  if (!store) {
+    throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  }
+  const created = buildNewSession(
+    args.chatId,
+    args.rootMessageId,
+    args.title,
+    args.chatType,
+    args.scope,
+    args.intent,
+  );
+  const fresh = new Map<string, Session>();
+  let result!: T;
+  runOwnedWriteTransaction(store, args.nonblocking === true, () => {
+    for (const sessionId of unique) {
+      const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
+      if (!hit) throw new Error(`atomic session creation cannot find ${sessionId}`);
+      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
+    }
+    result = mutate(fresh, created);
+    for (const row of fresh.values()) persistRow(row);
+    persistRow(created);
+  });
+  for (const [sessionId, row] of fresh) {
+    const cached = sessions.get(sessionId);
+    if (cached) {
+      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
+      Object.assign(cached, structuredClone(row));
+      fresh.set(sessionId, cached);
+    } else {
+      sessions.set(sessionId, row);
+    }
+  }
+  sessions.set(created.sessionId, created);
+  logger.info(`Created session ${created.sessionId} (thread: ${args.rootMessageId})`);
+  return { session: created, result, rows: fresh };
 }
 
 export function getSession(sessionId: string): Session | undefined {
@@ -2308,6 +2432,55 @@ export function updateSession(session: Session): void {
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
+}
+
+/**
+ * Mutate a fixed set of owned session rows inside one SQLite transaction.
+ *
+ * The callback receives fresh cloned rows, never the process cache. Cache and
+ * caller-visible objects are updated only after COMMIT, so a failed coordinator
+ * election cannot publish half of a multi-row authority transition in memory.
+ */
+export function mutateOwnedSessionsAtomically<T>(
+  sessionIds: readonly string[],
+  mutate: (fresh: Map<string, Session>) => T,
+  options: {
+    /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
+     * event loop behind the connection's normal busy_timeout. */
+    nonblocking?: boolean;
+  } = {},
+): { result: T; rows: Map<string, Session> } {
+  loadForWrite();
+  const unique = [...new Set(sessionIds)];
+  if (unique.length !== sessionIds.length) {
+    throw new Error('duplicate session id in atomic session mutation');
+  }
+  const store = ownStore;
+  if (!store) {
+    throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  }
+  const fresh = new Map<string, Session>();
+  let result!: T;
+  runOwnedWriteTransaction(store, options.nonblocking === true, () => {
+    for (const sessionId of unique) {
+      const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
+      if (!hit) throw new Error(`atomic session mutation cannot find ${sessionId}`);
+      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
+    }
+    result = mutate(fresh);
+    for (const row of fresh.values()) persistRow(row);
+  });
+  for (const [sessionId, row] of fresh) {
+    const cached = sessions.get(sessionId);
+    if (cached) {
+      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
+      Object.assign(cached, structuredClone(row));
+      fresh.set(sessionId, cached);
+    } else {
+      sessions.set(sessionId, row);
+    }
+  }
+  return { result, rows: fresh };
 }
 
 /**

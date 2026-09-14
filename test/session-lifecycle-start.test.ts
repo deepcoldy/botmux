@@ -294,6 +294,32 @@ beforeEach(() => {
   });
 });
 
+describe('narrow XPI shared-cwd generation admission seam', () => {
+  it('delivers reserveWorkerGeneration actual max result before child creation', () => {
+    const order: string[] = [];
+    forkMock.mockImplementation(() => {
+      order.push('fork');
+      return makeFakeWorker();
+    });
+    const ds = makeDs({ workerGeneration: 9 });
+    ds.session.workerGeneration = 3;
+    let admittedGeneration: number | undefined;
+
+    expect(forkWorker(ds, 'synthetic input', {
+      turnId: 'turn-xpi-generation',
+      onWorkerGenerationReserved(workerGeneration) {
+        admittedGeneration = workerGeneration;
+        order.push(`admit:${workerGeneration}`);
+      },
+    })).toBe(true);
+
+    expect(admittedGeneration).toBe(10);
+    expect(ds.workerGeneration).toBe(10);
+    expect(ds.session.workerGeneration).toBe(10);
+    expect(order).toEqual(['admit:10', 'fork']);
+  });
+});
+
 describe('host memory pressure worker admission', () => {
   it('blocks a fresh/resumed fork before child creation and posts retry guidance', async () => {
     const sessionReply = vi.fn(async () => 'om_pressure');
@@ -3455,6 +3481,47 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       turnId: 'om_refork_turn',
     }));
     expect(init).not.toHaveProperty('replyStyle');
+  });
+
+  it('forwards atMostOnce into an adopt init so a retained XPI turn is not replayed by the worker', () => {
+    const ds = makeAdoptDs();
+    forkAdoptWorker(ds, {
+      prompt: '<bridge>retained XPI turn</bridge>',
+      turnId: 'om_adopt_at_most_once',
+      atMostOnce: true,
+    });
+
+    expect(vi.mocked((ds.worker as any).send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      turnId: 'om_adopt_at_most_once',
+      atMostOnce: true,
+    }));
+  });
+
+  it('passes reserveWorkerGeneration actual max result to adopt admission before child creation', () => {
+    const order: string[] = [];
+    forkMock.mockImplementation(() => {
+      order.push('fork');
+      return makeFakeWorker();
+    });
+    const ds = makeAdoptDs();
+    ds.workerGeneration = 12;
+    ds.session.workerGeneration = 4;
+    let admittedGeneration: number | undefined;
+
+    expect(forkAdoptWorker(ds, {
+      prompt: '<bridge>generation</bridge>',
+      turnId: 'om_adopt_generation',
+      onWorkerGenerationReserved(workerGeneration) {
+        admittedGeneration = workerGeneration;
+        order.push(`admit:${workerGeneration}`);
+      },
+    })).toBe('accepted');
+
+    expect(admittedGeneration).toBe(13);
+    expect(ds.workerGeneration).toBe(13);
+    expect(ds.session.workerGeneration).toBe(13);
+    expect(order).toEqual(['admit:13', 'fork']);
   });
 
   it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {

@@ -2843,6 +2843,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     mocks.forkWorker.mockImplementation((owner: any) => {
       owner.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await handleThreadReply(
       makeEventData('om_retry_owner', 'RETRY_OWNER_REPLY', anchor),
