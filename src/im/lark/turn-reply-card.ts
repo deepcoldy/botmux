@@ -118,7 +118,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const phaseLabels = en
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认' };
-  const phaseIcons = { queued: '⏳', working: '🧠', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️' };
+  const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️' };
   const toolCount = presentation.showProcess ? record.tools.length : 0;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
@@ -160,7 +160,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // narration visible until a newer narration or another card view replaces it.
     const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
-      card.body.elements.push({ tag: 'markdown', content: `🧠 ${publicText(bounded(latest.text, 600))}` });
+      card.body.elements.push({ tag: 'markdown', content: `💭 ${publicText(bounded(latest.text, 600))}` });
     }
     if (!terminal && !record.finalCard && !pendingAsks.length && record.tools.length) {
       card.body.elements.push({ tag: 'markdown', content: record.tools.slice(-2).map(tool =>
@@ -179,7 +179,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
       if (entry?.result) process.push({ kind: 'text', content: bounded(turnReplyAskSummary(entry, presentation.locale), 1200) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push({ kind: 'text', content: `🧠 ${publicText(bounded(item.text, 1200))}` });
+      process.push({ kind: 'text', content: `💭 ${publicText(bounded(item.text, 1200))}` });
     } else if (presentation.showProcess && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
       if (tool) process.push({ kind: 'tool', content: toolLine(tool, 400)

@@ -166,19 +166,19 @@ describe('reply-card runtime eligibility and recovery', () => {
     await flushTurnReplyTools(ds, 'om_mode');
     const liveText = () => JSON.parse(vi.mocked(updateMessage).mock.calls.at(-1)![2]).body.elements
       .filter((element: any) => element.tag === 'markdown').map((element: any) => element.content).join('\n');
-    expect(liveText()).toContain('🧠 NARRATION_A');
+    expect(liveText()).toContain('💭 NARRATION_A');
     expect(liveText()).toContain('**Bash** ✓ · pwd');
 
     entries.push({ kind: 'tool_call', id: 'files', name: 'Read', args: '{}', subject: 'README.md' });
     queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
     await flushTurnReplyTools(ds, 'om_mode');
-    expect(liveText()).toContain('🧠 NARRATION_A');
+    expect(liveText()).toContain('💭 NARRATION_A');
 
     entries.push({ kind: 'text', text: 'NARRATION_B' },
       { kind: 'tool_call', id: 'time', name: 'Bash', args: '{}', subject: 'date' });
     queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
     await flushTurnReplyTools(ds, 'om_mode');
-    expect(liveText()).toContain('🧠 NARRATION_B');
+    expect(liveText()).toContain('💭 NARRATION_B');
     expect(liveText()).not.toContain('NARRATION_A');
     expect(send).toHaveBeenCalledTimes(1);
     expect(vi.mocked(updateMessage).mock.calls.every(call => call[1] === 'om_reply')).toBe(true);

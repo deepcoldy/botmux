@@ -300,7 +300,7 @@ describe('public process and fallback compatibility', () => {
     const original = structuredClone(record);
     const card = JSON.parse(buildTurnReplyCard(record, presentation));
     const live: string[] = card.body.elements.filter((element: any) => element.tag === 'markdown').map((element: any) => element.content);
-    expect(live).toContain('🧠 NARRATION_B');
+    expect(live).toContain('💭 NARRATION_B');
     expect(live.join('\n')).not.toContain('NARRATION_A');
     expect(live.join('\n')).toContain('**TOOL_1**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
@@ -426,7 +426,7 @@ describe('public process and fallback compatibility', () => {
       ],
     }, presentation));
     expect(card.config.width_mode).toBe('fill');
-    expect(card.body.elements[0].content).toBe('🧠 **处理中**');
+    expect(card.body.elements[0].content).toBe('💭 **处理中**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
     expect(panel).toMatchObject({ expanded: false, background_color: 'grey-50', border: { corner_radius: '8px' } });
     expect(panel.header).toMatchObject({
