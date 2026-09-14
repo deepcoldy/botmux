@@ -3482,15 +3482,17 @@ function SessionsPage(): React.JSX.Element {
           let staleHint: HistoryState['staleHint'];
           if ((errCode === 'not_found_yet' || errCode === 'not_found') && row.larkAppId) {
             try {
+              // `diskVersion` is absent when the server cannot tell what is on
+              // disk (compiled binary): then no stale hint, never an inverted one.
               const status = await fetch('/api/update/status', { cache: 'no-store' }).then(res => res.json()) as {
-                current?: string;
+                diskVersion?: string;
                 runningDaemons?: Array<{ larkAppId: string; version?: string }>;
               };
               const running = status.runningDaemons?.find(d => d.larkAppId === row.larkAppId)?.version;
-              if (daemonVersionDiffersFromDisk(running, status.current)) {
+              if (daemonVersionDiffersFromDisk(running, status.diskVersion)) {
                 staleHint = {
                   running: stripBotmuxVersionPrefix(running!),
-                  disk: stripBotmuxVersionPrefix(status.current!),
+                  disk: stripBotmuxVersionPrefix(status.diskVersion!),
                 };
               }
             } catch { /* raw not_found only */ }

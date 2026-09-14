@@ -4509,12 +4509,19 @@ const server = createServer(async (req, res) => {
         larkAppId: d.larkAppId,
         version: d.botmuxVersion,
       }));
+      // In the compiled binary `current` is this dashboard process's OWN baked
+      // version (install-info.ts: bakedBinaryVersion shadows the install tree),
+      // not what install.sh last put on disk, so "running daemon vs disk" is
+      // undetermined there — say nothing rather than invert after a partial
+      // respawn. A Node install reads package.json, which is the disk.
+      const diskVersion = isStandaloneBinary() ? undefined : current;
       const runningDaemonRestartHint = formatRunningDaemonsRestartSummary(
         runningDaemons.map(d => d.version),
-        current,
+        diskVersion,
       );
       return jsonRes(res, 200, {
         current,
+        ...(diskVersion ? { diskVersion } : {}),
         latest,
         versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),
