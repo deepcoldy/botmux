@@ -414,13 +414,7 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   const botProblems: string[] = [];
   validateDirectBotSelectors(nodes, undefined, 'dagTemplate.nodes', botProblems);
   if (botProblems.length > 0) throw new SavedWorkflowSchemaError(botProblems);
-  // NOTE: the chat-facing side-effect policy lint is deliberately NOT run here.
-  // validateDagTemplate is the structural deserializer shared by the READ path
-  // (loadSavedWorkflowRevision → validateSavedWorkflowRevisionPayload), so
-  // gating it would retroactively brick already-saved revisions that were legal
-  // before the lint existed. The policy check runs only at authoring boundaries
-  // (buildSavedWorkflowRevisionBaseline / validateSavedWorkflowRevisionDraft /
-  // v2 migration) via assertNoSavedWorkflowChatSideEffects.
+  // Keep text lint at authoring boundaries so existing revisions remain loadable.
   return {
     ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion as 1 | 2 } : {}),
     nodes,
@@ -494,6 +488,19 @@ function collectStrings(value: unknown, path: string, out: Array<{ path: string;
   }
 }
 
+function hasAffirmativeChatSideEffect(text: string, pattern: RegExp): boolean {
+  // Look ahead so a greedy pattern cannot hide a later affirmative command.
+  for (const match of text.matchAll(new RegExp(`(?=${pattern.source})`, `${pattern.flags}g`))) {
+    // Split only the prefix so slashes/dots inside an API command stay intact.
+    const clausePrefix = text.slice(0, match.index)
+      .split(/[。；;，,\r\n.!?！？/]|但是|但|然而|\b(?:but|however)\b/i).at(-1)!;
+    if (!/(?:不要|禁止|不得|严禁|勿|\b(?:never|do\s+not|don['’]t|no)\b)/i.test(clausePrefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function pushChatSideEffectProblems(
   node: V3Node,
   nodeId: string,
@@ -512,7 +519,7 @@ function pushChatSideEffectProblems(
   );
   for (const item of strings) {
     for (const pattern of CHAT_SIDE_EFFECT_PATTERNS) {
-      if (!pattern.re.test(item.value)) continue;
+      if (!hasAffirmativeChatSideEffect(item.value, pattern.re)) continue;
       problems.push({
         nodeId,
         path: item.path,
@@ -557,18 +564,7 @@ export function formatSavedWorkflowChatSideEffectProblems(
     `${problem.path} contains chat-facing side effect (${problem.kind}); ${problem.guidance}`);
 }
 
-/**
- * Authoring-boundary policy gate. Throw when a to-be-saved DAG template has a
- * chat-facing side effect in a goal node. This is intentionally NOT part of the
- * structural deserializer (validateDagTemplate) or the read path
- * (validateSavedWorkflowRevisionPayload): those are traversed when LOADING an
- * already-saved revision, and gating them would retroactively brick revisions
- * that were legal before the lint existed. Callers on the write/compile/publish
- * side (buildSavedWorkflowRevisionBaseline, validateSavedWorkflowRevisionDraft,
- * v2→v3 migration) invoke this so a fresh authored definition must be
- * lint-clean, while old revisions stay loadable/show-able/appendable (and can
- * be fixed by appending a clean revision).
- */
+// Draft validation and migration stay strict; exact save exposes lint for acknowledgement.
 export function assertNoSavedWorkflowChatSideEffects(dagTemplate: V3DagTemplate): void {
   const chatEffects = formatSavedWorkflowChatSideEffectProblems(
     collectSavedWorkflowChatSideEffectProblems(dagTemplate),

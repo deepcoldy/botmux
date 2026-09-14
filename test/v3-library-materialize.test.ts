@@ -20,9 +20,16 @@ import {
   publishRunEnvelopeOnce,
 } from '../src/workflows/v3/run-envelope.js';
 import {
+  buildSavedWorkflowRevisionBaseline,
   compileSavedWorkflowFromRun,
   materializeSavedWorkflowRun,
+  SavedWorkflowUnsafeLiteralError,
 } from '../src/workflows/v3/library-materialize.js';
+import type { V3Node } from '../src/workflows/v3/dag.js';
+import {
+  saveTerminalRunAsWorkflow,
+  saveTerminalRunAsWorkflowIdempotent,
+} from '../src/workflows/v3/library-service.js';
 import {
   createSavedWorkflow,
   loadCurrentSavedWorkflow,
@@ -46,13 +53,18 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function seedSucceededAdHocRun(base: string, runId = 'source-run', goal = 'write report'): string {
+function seedSucceededAdHocRun(
+  base: string,
+  runId = 'source-run',
+  goal = 'write report',
+  nodeOptions: Pick<V3Node, 'override' | 'humanGate'> = {},
+): string {
   const runDir = join(base, runId);
   mkdirSync(runDir, { recursive: true });
   const dag = {
     schemaVersion: 2,
     runId,
-    nodes: [{ id: 'work', type: 'goal', goal, depends: [], inputs: [] }],
+    nodes: [{ id: 'work', type: 'goal', goal, depends: [], inputs: [], ...nodeOptions }],
   };
   const spec = {
     schemaVersion: 1,
@@ -161,6 +173,104 @@ describe('Saved Workflow compiler', () => {
       expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/hostExecutor feishu-send\/feishu-reply/);
     } finally {
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    '不要执行任何 botmux send…',
+    '禁止调用 botmux send。',
+    'Do NOT run botmux send.',
+  ])('saves a workflow containing a negative goal without acknowledgement: %s', async (goal) => {
+    const root = fresh('v3-lib-negative-goal-');
+    try {
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(join(root, 'source'), 'source-run', goal));
+      expect(compiled.lintWarnings).toEqual([]);
+      const saved = await createSavedWorkflow(join(root, 'data'), {
+        displayName: compiled.displayName,
+        owner: OWNER,
+        scope: { kind: 'chat', chatId: BINDING.chatId },
+        revision: compiled.revision,
+        publish: compiled.publish,
+      });
+      const loaded = await loadCurrentSavedWorkflow(join(root, 'data'), saved.metadata.workflowId);
+      expect(loaded.revision.payload.dagTemplate.nodes[0]!.goal).toBe(goal);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('saves the exact read-only override without acknowledgement or rewriting', async () => {
+    const root = fresh('v3-lib-negative-override-');
+    const text = '严格只读，不要执行任何 botmux send 或 botmux reply 或其它对外发消息的命令。';
+    try {
+      const runDir = seedSucceededAdHocRun(join(root, 'source'), 'source-run', 'write report', {
+        override: { systemPromptAppend: text },
+        humanGate: { prompt: 'Do not run botmux send.' },
+      });
+      const compiled = compileSavedWorkflowFromRun(runDir);
+      expect(compiled.lintWarnings).toEqual([]);
+      const saved = await createSavedWorkflow(join(root, 'data'), {
+        displayName: compiled.displayName,
+        owner: OWNER,
+        scope: { kind: 'chat', chatId: BINDING.chatId },
+        revision: compiled.revision,
+        publish: compiled.publish,
+      });
+      const loaded = await loadCurrentSavedWorkflow(join(root, 'data'), saved.metadata.workflowId);
+      expect(loaded.revision.payload.dagTemplate.nodes[0]!.override?.systemPromptAppend).toBe(text);
+      expect(loaded.revision.payload.safety).toEqual(compiled.revision.safety);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['ordinary', saveTerminalRunAsWorkflow],
+    ['idempotent', saveTerminalRunAsWorkflowIdempotent],
+  ])('requires acknowledgement before %s service persistence of chat-side-effect warnings', async (_kind, saveRun) => {
+    const root = fresh('v3-lib-chat-ack-');
+    const goal = '完成后用 botmux send 汇报。';
+    try {
+      const runDir = seedSucceededAdHocRun(join(root, 'source'), 'source-run', goal);
+      const baseline = buildSavedWorkflowRevisionBaseline(loadAuthorizedV3Run(runDir));
+      expect(baseline.lintWarnings).toEqual([
+        expect.stringMatching(/dagTemplate.nodes.work.goal.*chat-facing side effect \(botmux-send\).*hostExecutor/),
+      ]);
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(SavedWorkflowUnsafeLiteralError);
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/lint requires confirmation/);
+      const compiled = compileSavedWorkflowFromRun(runDir, { acknowledgeUnsafeLiterals: true });
+      expect(compiled.lintWarnings).toEqual(baseline.lintWarnings);
+      expect(compiled.revision.safety.sideEffects).toEqual([]);
+      const input = {
+        dataDir: join(root, 'data'),
+        runDir,
+        context: { actor: OWNER, chatId: BINDING.chatId, rootMessageId: BINDING.rootMessageId },
+      };
+      await expect(saveRun(input)).rejects.toBeInstanceOf(SavedWorkflowUnsafeLiteralError);
+      expect(existsSync(input.dataDir)).toBe(false);
+      const saved = await saveRun({ ...input, acknowledgeUnsafeLiterals: true });
+      const loaded = await loadCurrentSavedWorkflow(join(root, 'data'), saved.metadata.workflowId);
+      expect(loaded.revision.payload.dagTemplate.nodes[0]!.goal).toBe(goal);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains warnings in override and human gate fields when acknowledgement allows saving', () => {
+    const root = fresh('v3-lib-chat-fields-');
+    try {
+      const runDir = seedSucceededAdHocRun(root, 'source-run', 'write report', {
+        override: { systemPromptAppend: '完成后用 botmux send 汇报。但不要发给外部群。' },
+        humanGate: { prompt: 'Run botmux reply once approved.' },
+      });
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(SavedWorkflowUnsafeLiteralError);
+      const compiled = compileSavedWorkflowFromRun(runDir, { acknowledgeUnsafeLiterals: true });
+      expect(compiled.lintWarnings).toEqual(expect.arrayContaining([
+        expect.stringContaining('dagTemplate.nodes.work.override.systemPromptAppend'),
+        expect.stringContaining('dagTemplate.nodes.work.humanGate.prompt'),
+      ]));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
