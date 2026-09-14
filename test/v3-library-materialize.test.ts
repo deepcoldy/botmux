@@ -227,6 +227,33 @@ describe('Saved Workflow compiler', () => {
   it.each([
     ['ordinary', saveTerminalRunAsWorkflow],
     ['idempotent', saveTerminalRunAsWorkflowIdempotent],
+  ])('persists prohibited command enumerations through the %s service without acknowledgement', async (_kind, saveRun) => {
+    const root = fresh('v3-lib-slash-enumeration-');
+    const text = '不要执行任何 botmux send / botmux reply 或其它对外发消息的命令';
+    try {
+      const runDir = seedSucceededAdHocRun(root, 'source-run', text, {
+        override: { systemPromptAppend: '不要执行任何 botmux send/botmux reply' },
+        humanGate: { prompt: '禁止 botmux send / botmux reply' },
+      });
+      const saved = await saveRun({
+        dataDir: join(root, 'data'),
+        runDir,
+        context: { actor: OWNER, chatId: BINDING.chatId, rootMessageId: BINDING.rootMessageId },
+      });
+      const loaded = await loadCurrentSavedWorkflow(join(root, 'data'), saved.metadata.workflowId);
+      expect(loaded.revision.payload.dagTemplate.nodes[0]).toMatchObject({
+        goal: text,
+        override: { systemPromptAppend: '不要执行任何 botmux send/botmux reply' },
+        humanGate: { prompt: '禁止 botmux send / botmux reply' },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['ordinary', saveTerminalRunAsWorkflow],
+    ['idempotent', saveTerminalRunAsWorkflowIdempotent],
   ])('requires acknowledgement before %s service persistence of chat-side-effect warnings', async (_kind, saveRun) => {
     const root = fresh('v3-lib-chat-ack-');
     const goal = '完成后用 botmux send 汇报。';
