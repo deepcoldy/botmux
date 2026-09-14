@@ -209,10 +209,11 @@ function canForwardPaneAgentArgs(args: readonly string[]): boolean {
  *
  * Herdr 0.7.5 rejects control characters in `agent start` arguments, while
  * Botmux intentionally passes multiline system/initial prompts to several
- * CLIs. Put the exact executable + argv in a mode-0700 script and give Herdr
- * no agent arguments. The shell immediately execs the real CLI, so Herdr still
- * observes and validates the actual supported coding-agent process. The script
- * is removed as soon as Herdr reports the TUI interactive.
+ * CLIs. Put the exact executable + argv in a mode-0700 script so multiline
+ * values do not pass through Herdr's argument parser. The shell execs the full
+ * launch command, including wrappers, while Herdr detects the supported CLI
+ * inside the pane. The script is removed as soon as Herdr reports the TUI
+ * interactive.
  */
 function createPaneAgentLauncher(
   canonicalExecutable: string,
@@ -792,17 +793,31 @@ export class HerdrBackend implements SessionBackend {
    * installed under ~/.local/bin/node/bin/pi).
    */
   private startPaneAgent(bin: string, args: string[], opts: SpawnOpts): string {
-    const kind = paneAgentKindForExecutable(bin);
+    // Launch wrappers can replace bin with env, systemd-run, or a sandbox.
+    // Identify the managed kind by the original CLI; the PATH launcher still
+    // executes the complete wrapped command.
+    const cliBin = opts.cliBin ?? bin;
+    const wrapped = cliBin !== bin;
+    const kind = paneAgentKindForExecutable(cliBin);
     if (!kind) {
       throw new Error(
-        `Herdr >=0.7.5 cannot launch executable "${basename(bin)}" as a managed coding agent; ` +
+        `Herdr >=0.7.5 cannot launch executable "${basename(cliBin)}" as a managed coding agent; ` +
         'use a Herdr-supported CLI executable or select the tmux backend',
       );
     }
+    if (wrapped && process.platform === 'darwin') {
+      // On macOS Herdr's managed integration may resolve the kind itself and
+      // bypass the workspace PATH, silently starting the bare CLI without the
+      // wrapper or its argv. Keep that fail-closed instead of guessing.
+      throw new Error(
+        `Herdr >=0.7.5 on macOS cannot launch "${basename(cliBin)}" through the "${basename(bin)}" launch wrapper; ` +
+        'the managed integration may bypass the PATH launcher, select the tmux backend',
+      );
+    }
 
-    const workspaceEnv = environmentForPaneAgent(bin, this.childEnv);
+    const workspaceEnv = environmentForPaneAgent(cliBin, this.childEnv);
     const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
-    const launcher = createPaneAgentLauncher(basename(bin), bin, args, originalPath);
+    const launcher = createPaneAgentLauncher(basename(cliBin), bin, args, originalPath);
     workspaceEnv.PATH = [launcher.dir, originalPath].filter(Boolean).join(delimiter);
     let workspaceId: string | undefined;
     try {
@@ -833,8 +848,9 @@ export class HerdrBackend implements SessionBackend {
         // Forward control-character-free argv as well (Pi's @prompt-file path
         // is safe) to preserve session identity and initial-message delivery.
         // Multiline argv still stays exclusively in the launcher because Herdr
-        // rejects control characters with invalid_agent_argument.
-        ...(canForwardPaneAgentArgs(args) ? ['--', ...args] : []),
+        // rejects control characters with invalid_agent_argument. A wrapped
+        // launch forwards nothing: its argv belongs to the wrapper, not the CLI.
+        ...(!wrapped && canForwardPaneAgentArgs(args) ? ['--', ...args] : []),
       ]);
       const readyDeadline = Date.now() + PANE_SHELL_READY_TIMEOUT_MS;
       let started: any;

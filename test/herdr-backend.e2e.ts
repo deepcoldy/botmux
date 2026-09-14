@@ -125,6 +125,29 @@ describe('HerdrBackend (e2e)', () => {
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
 
+  it.skipIf(process.platform !== 'linux' || !HerdrBackend.isAvailable())('a wrapped managed agent executes the wrapper and preserves CLI argv', async () => {
+    const backend = new HerdrBackend(TEST_SESSION);
+    try {
+      // No systemd service is required: the env assignment proves the PATH
+      // launcher ran the wrapper, and printf proves the CLI received its argv.
+      backend.spawn('/usr/bin/env', [
+        'BOTMUX_HERDR_E2E_MARKER=wrapper-ran',
+        FAKE_MANAGED_AGENT,
+        '-lc', 'printf "WRAPPED:%s\\n" "$BOTMUX_HERDR_E2E_MARKER"; sleep 30',
+      ], { ...spawnOpts(), cliBin: FAKE_MANAGED_AGENT });
+
+      await waitFor(
+        () => backend.captureCurrentScreen().includes('WRAPPED:wrapper-ran'),
+        10_000,
+        'wrapper environment and CLI argv reached the managed agent',
+      );
+      expect(backend.isReattach).toBe(false);
+      expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
+    } finally {
+      backend.destroySession();
+    }
+  }, TEST_TIMEOUT);
+
   it.skipIf(!HerdrBackend.isAvailable())('re-attach observes the same agent without spawning a new one', async () => {
     // Phase 1: create the session and let it produce a marker line.
     const be1 = new HerdrBackend(TEST_SESSION);

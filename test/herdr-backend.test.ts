@@ -16,7 +16,8 @@
  * Run:  pnpm vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('node:child_process', () => ({
@@ -67,6 +68,17 @@ class FakePty {
 }
 
 function makeFakePty(): FakePty { return new FakePty(); }
+
+/** Run `fn` with `process.platform` pinned, restoring the real descriptor. */
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, 'platform', descriptor);
+  }
+}
 
 function findCall(predicate: (args: string[]) => boolean): string[] | undefined {
   for (const call of mockedExecFileSync.mock.calls) {
@@ -408,6 +420,121 @@ describe('HerdrBackend.spawn', () => {
       cwd: '/work', cols: 120, rows: 30, env: {},
     })).toThrow(/cannot launch executable "custom-pi-wrapper".*tmux backend/);
     expect(herdrCall('workspace', 'create')).toBeUndefined();
+    be.kill();
+  });
+
+  it.each([
+    { label: 'single-line', prompt: 'line one' },
+    { label: 'multiline', prompt: 'line one\nline two' },
+  ])('Herdr 0.7.5: launches a session-scope-wrapped CLI with a $label prompt without forwarding wrapper argv', ({ prompt }) => {
+    const cliBin = '/home/test/.local/bin/claude';
+    // Match wrapCommandInSessionScope() on a host with a user systemd bus.
+    const scopedArgs = [
+      'XDG_RUNTIME_DIR=/run/user/1000',
+      'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
+      'systemd-run', '--user', '--scope', '--quiet', '--collect',
+      '--unit=botmux-session-sid-1.scope', '--property=KillMode=control-group',
+      '--', cliBin, '--session-id', 'sid-1', '--append-system-prompt', prompt,
+    ];
+    let launcherScript = '';
+    let launcherDir = '';
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd !== 'herdr') return '' as any;
+      const argv = args as string[];
+      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('workspace') && argv.includes('create')) {
+        const pathArg = argv.find(arg => arg.startsWith('PATH='))!;
+        launcherDir = pathArg.slice('PATH='.length).split(delimiter)[0]!;
+        // Herdr would resolve `claude` on the workspace PATH and run it: read the
+        // launcher now, before the backend's finally block removes it.
+        launcherScript = readFileSync(join(launcherDir, 'claude'), 'utf-8');
+        return WORKSPACE_CREATED_REPLY('w_scope', 'w_scope-1') as any;
+      }
+      if (argv.includes('agent') && argv.includes('start')) return AGENT_GET_REPLY('w_scope-1') as any;
+      if (argv.includes('read')) return PANE_READ_REPLY('hello') as any;
+      return '' as any;
+    }) as any);
+    const be = new HerdrBackend(SESSION);
+    withPlatform('linux', () => be.spawn('/usr/bin/env', scopedArgs, {
+      cwd: '/work', cols: 120, rows: 30,
+      env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-1' },
+      cliBin,
+    }));
+
+    // The real CLI's directory follows the launcher on the workspace PATH.
+    const workspaceCall = herdrCall('workspace', 'create', '--cwd', '/work', '--label', 'botmux', '--no-focus');
+    expect(workspaceCall).toContain(`PATH=${launcherDir}:/home/test/.local/bin:/usr/bin:/bin`);
+
+    // The agent kind comes from the canonical CLI, never from the wrapper.
+    const startCall = herdrCall('agent', 'start', 'botmux', '--kind', 'claude', '--pane', 'w_scope-1', '--timeout', '30000');
+    // The single-line case must suppress forwarding even though its argv
+    // passes canForwardPaneAgentArgs(). Multiline argv alone cannot prove this.
+    expect(startCall).toEqual([
+      '--session', SESSION, 'agent', 'start', 'botmux',
+      '--kind', 'claude', '--pane', 'w_scope-1', '--timeout', '30000',
+    ]);
+
+    // The launcher is named after the CLI and execs the exact wrapped command.
+    expect(launcherScript).toContain(
+      "PATH='/home/test/.local/bin:/usr/bin:/bin'\nexport PATH\n"
+      + "exec '/usr/bin/env' 'XDG_RUNTIME_DIR=/run/user/1000' 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' "
+      + "'systemd-run' '--user' '--scope' '--quiet' '--collect' "
+      + "'--unit=botmux-session-sid-1.scope' '--property=KillMode=control-group' "
+      + `'--' '${cliBin}' '--session-id' 'sid-1' '--append-system-prompt' '${prompt}'\n`,
+    );
+    expect(existsSync(launcherDir)).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: a wrapped launch whose canonical CLI is not a Herdr kind is rejected by the CLI name', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+    ]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => withPlatform('linux', () => be.spawn('/usr/bin/env', ['systemd-run', '--', '/opt/coco/bin/coco'], {
+      cwd: '/work', cols: 120, rows: 30, env: {}, cliBin: '/opt/coco/bin/coco',
+    }))).toThrow(/cannot launch executable "coco".*tmux backend/);
+    expect(herdrCall('workspace', 'create')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: on macOS a wrapped launch stays fail-closed (the managed integration may bypass the PATH launcher)', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+    ]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => withPlatform('darwin', () => be.spawn('/usr/local/bin/ttadk', ['claude', '--session-id', 'sid-1'], {
+      cwd: '/work', cols: 120, rows: 30, env: {}, cliBin: '/usr/local/bin/claude',
+    }))).toThrow(/on macOS cannot launch "claude" through the "ttadk" launch wrapper.*tmux backend/);
+    expect(herdrCall('workspace', 'create')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    be.kill();
+  });
+
+  it.each(['linux', 'darwin'] as const)('Herdr 0.7.5: an unwrapped launch with opts.cliBin === bin keeps forwarding safe argv on %s', (platform) => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    withPlatform(platform, () => be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', '@/tmp/initial.prompt.md'], {
+      cwd: '/work', cols: 120, rows: 30, env: { PATH: '/usr/bin:/bin' },
+      cliBin: '/Users/test/.local/bin/node/bin/pi',
+    }));
+
+    expect(herdrCall(
+      'agent', 'start', 'botmux', '--kind', 'pi', '--pane', 'w_pi-1', '--timeout', '30000',
+      '--', '--session-id', 'sid-1', '@/tmp/initial.prompt.md',
+    )).toBeDefined();
     be.kill();
   });
 

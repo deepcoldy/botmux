@@ -16046,6 +16046,9 @@ async function spawnCli(
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
       launchShell: lastInitConfig?.launchShell,
+      // spawnBin may now be a launch wrapper (session scope / wrapperCli /
+      // credential sandbox); the Herdr facade still needs the real CLI name.
+      cliBin: cliAdapter.resolvedBin,
     });
   } catch (err) {
     cleanupCodexAppControlBootstrap();
