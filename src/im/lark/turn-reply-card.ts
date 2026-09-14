@@ -95,8 +95,12 @@ function closeProcessCodeFence(text: string): string {
   for (const line of text.split('\n')) {
     const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (!fence) continue;
-    if (!openFence) openFence = fence[1];
-    else if (fence[1][0] === openFence[0] && fence[1].length >= openFence.length && !fence[2].trim()) openFence = '';
+    if (!openFence) {
+      // A backtick fence's info string cannot contain backticks. Such a line
+      // may be inline code, so appending a closing fence would open a new block.
+      if (fence[1][0] === '`' && fence[2].includes('`')) continue;
+      openFence = fence[1];
+    } else if (fence[1][0] === openFence[0] && fence[1].length >= openFence.length && !fence[2].trim()) openFence = '';
   }
   return text + (openFence ? `\n${openFence}` : '');
 }

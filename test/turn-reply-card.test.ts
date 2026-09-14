@@ -544,6 +544,18 @@ describe('public process and fallback compatibility', () => {
     expect(record).toEqual(original);
   });
 
+  it.each(['```echo hello```', '````code with ``` inside````'])(
+    'keeps inline code %s from opening a block around later tools', inline => {
+      const record = processRecord(2, 0);
+      record.tools[0].result = inline;
+      const history = processPanel(record).elements[0].content;
+      const tokens = new MarkdownIt().parse(history, {});
+      expect(tokens.some(token => token.type === 'fence')).toBe(false);
+      expect(tokens.filter(token => token.type === 'inline').map(token => token.content).join('\n')).toContain('**TOOL_1**');
+      expect(history).toContain(inline);
+    },
+  );
+
   it('gives a long final answer priority and keeps hidden-process semantics under truncation', () => {
     const record = processRecord(5, 80);
     record.activity = record.activity!.map(item => item.kind === 'progress' ? { ...item, text: item.text + 'x'.repeat(500) } : item);
