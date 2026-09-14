@@ -252,6 +252,13 @@ describe('v3 Saved Workflow library schema', () => {
         .toMatchObject([{ kind }]);
     });
 
+    it.each([
+      '禁止使用 lark-cli；禁止 botmux send',
+      '不要用 bytedcli feishu 相关能力。不要执行 botmux send',
+    ])('keeps both prohibitions when broad command matches overlap: %s', (text) => {
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(text))).toEqual([]);
+    });
+
     it('inherits negation across command families', () => {
       expect(collectSavedWorkflowChatSideEffectProblems(withText(
         '禁止 botmux send / lark-cli im reply / /open-apis/im/v1/messages / im.v1.message.create',
