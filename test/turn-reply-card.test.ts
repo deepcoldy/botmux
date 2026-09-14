@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import MarkdownIt from 'markdown-it';
 import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
+import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import type { CotEntry } from '../src/types.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
@@ -77,7 +80,7 @@ describe('one reply card per turn', () => {
     expect(body).toContain('完整答复');
     for (const tool of tools) expect(body).toContain(`**${tool.name}**`);
     expect(body).toContain('PROGRESS_29');
-    expect(body).not.toContain('PROGRESS_0');
+    expect(body).toContain('PROGRESS_0');
   });
 
   it.each([false, true])('preserves interim narration in the same card with extended thinking=%s', async withThinking => {
@@ -119,6 +122,33 @@ describe('one reply card per turn', () => {
     const hidden = buildTurnReplyCard(finished, { ...presentation, showProcess: false });
     expect(hidden).toContain('完整答复');
     for (const text of narration) expect(hidden).not.toContain(text);
+  });
+
+  it('truncates only the card view of oversized CLI activity without sending an extra file or losing stored text', async () => {
+    const narration = '旁白\n'.repeat(5000);
+    const subject = '完整命令参数'.repeat(1000);
+    const result = '完整工具结果\n'.repeat(5000);
+    const entries: CotEntry[] = [
+      { kind: 'text', text: narration },
+      { kind: 'tool_call', id: 'long', name: 'Bash', args: '{}', subject },
+      { kind: 'tool_result', id: 'long', result },
+    ];
+    io.sendOverflow = vi.fn(async () => 'om_unwanted');
+    const start = await store.update(key, { kind: 'tools', tools: publicReplyCardTools(entries, true), activity: publicReplyCardActivity(entries) }, io);
+    await store.update(key, { kind: 'progress', text: '正在整理结果' }, io);
+    await store.update(key, finalEvent(), io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.sendOverflow).not.toHaveBeenCalled();
+    for (const [, body] of vi.mocked(io.patch).mock.calls) {
+      expect(body).toContain('已截断');
+      expect(turnReplyCardRequestBytes(body, input.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+    }
+    const saved = new TurnReplyCardStore(dir).read(key)!;
+    expect(saved.activity).toContainEqual({ kind: 'thinking', id: 'thinking:0', text: narration });
+    expect(saved.tools).toEqual([{ id: 'long', name: 'Bash', subject, result, completed: true }]);
+    expect(saved.finalDelivered).toBe(true);
+    expect(cards.get(start.messageId!)!).toContain('完整答复');
   });
 
   it('serializes independent publishers and fences progress after final delivery', async () => {
@@ -250,14 +280,16 @@ describe('one reply card per turn', () => {
 
   it('exports a large CJK answer in full and sends a bounded summary card once', async () => {
     const text = '这是完整的回答内容。'.repeat(6000);
+    await store.update(key, { kind: 'tools', tools: [{ id: 't', name: 'Read', subject: 'large.txt', result: '长输出'.repeat(20_000) }] }, io);
     io.sendOverflow = vi.fn(async () => 'om_full_answer');
     await store.update(key, finalEvent(text), io);
     await store.update(key, finalEvent(text), io);
     expect(io.sendOverflow).toHaveBeenCalledTimes(1);
     expect(io.sendOverflow).toHaveBeenCalledWith(text, expect.any(String));
     const card = [...cards.values()][0];
-    expect(Buffer.byteLength(card)).toBeLessThan(24 * 1024);
+    expect(turnReplyCardRequestBytes(card, input.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
     expect(card).toContain('完整答复较长');
+    expect(card).toContain('已截断');
     expect(store.read(key)?.finalText).toBe(text);
   });
 
@@ -332,85 +364,133 @@ describe('public process and fallback compatibility', () => {
     },
   );
 
-  it.each([
-    [5, 30, 5, 15], [15, 15, 10, 10], [30, 5, 15, 5], [30, 0, 20, 0], [0, 30, 0, 20],
-  ])('retains recent tools and progress independently for %i tools and %i progress entries', (tools, texts, shownTools, shownTexts) => {
-    const record = processRecord(tools, texts);
-    const original = structuredClone(record);
-    const panel = processPanel(record);
-    const history: string = panel.elements[0].content;
-    expect(history.match(/\*\*TOOL_\d+\*\*/g) ?? []).toHaveLength(shownTools);
-    expect(history.match(/PROGRESS_\d+/g) ?? []).toHaveLength(shownTexts);
-    const expected = [
-      ...record.tools.slice(tools - shownTools).map(tool => `**${tool.name}**`),
-      ...record.progress.slice(texts - shownTexts),
+  it.each([[5, 30], [15, 15], [100, 5], [0, 100]])(
+    'shows all %i tools and %i progress entries when the whole card fits', (tools, texts) => {
+      const record = processRecord(tools, texts);
+      const original = structuredClone(record);
+      const panel = processPanel(record);
+      const history: string = panel.elements[0].content;
+      expect(history.match(/\*\*TOOL_\d+\*\*/g) ?? []).toHaveLength(tools);
+      expect(history.match(/PROGRESS_\d+/g) ?? []).toHaveLength(texts);
+      expect(history.match(/\*\*TOOL_\d+\*\*|PROGRESS_\d+/g)).toEqual([
+        ...record.tools.map(tool => `**${tool.name}**`), ...record.progress,
+      ]);
+      expect(history).not.toContain('已截断');
+      expect(panel.header.title.content).toBe(tools ? `📋 执行过程（${tools} 次工具调用）` : '📋 执行过程');
+      expect(record).toEqual(original);
+    },
+  );
+
+  it('preserves process content beyond 7000 bytes, including long individual entries, when the card fits', () => {
+    const record = processRecord(1, 2);
+    const narration = '旁白内容'.repeat(400);
+    record.tools[0].subject = 'tool subject '.repeat(100);
+    record.tools[0].result = 'tool output '.repeat(400);
+    record.activity = [
+      { kind: 'thinking', id: 'n', text: narration }, { kind: 'tool', id: 't0' },
+      ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: `p${i}`, text: text + '进度内容'.repeat(100) })),
     ];
-    expect(history.match(/\*\*TOOL_\d+\*\*|PROGRESS_\d+/g)).toEqual(expected);
-    expect(history).toContain('已省略');
-    expect(panel.header.title.content).toBe(tools > shownTools
-      ? `📋 执行过程（已展示 ${shownTools} / ${tools} 次工具调用）`
-      : tools ? `📋 执行过程（${tools} 次工具调用）` : '📋 执行过程');
+    const card = buildTurnReplyCard(record, presentation);
+    const history: string = processPanel(record).elements[0].content;
+    expect(Buffer.byteLength(history)).toBeGreaterThan(7000);
+    expect(history).toContain(narration);
+    expect(history).toContain(record.tools[0].subject);
+    expect(history).toContain(record.tools[0].result);
+    expect(history).not.toContain('已截断');
+    expect(turnReplyCardRequestBytes(card, record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+
+  it.each(['progress', 'thinking'] as const)('truncates overflowing %s while retaining a late tool and the final answer', kind => {
+    const record = processRecord(1, 80);
+    record.activity = [
+      ...record.progress.map((text, i) => ({ kind, id: `p${i}`, text: `${text} ${'中文<>&🧠\\"'.repeat(200)}` })),
+      { kind: 'tool', id: 't0' },
+    ];
+    const original = structuredClone(record);
+    const card = buildTurnReplyCard(record, presentation);
+    const history: string = processPanel(record).elements[0].content;
+    expect(history).toContain('**TOOL_0**');
+    expect(history).toContain('PROGRESS_79');
+    expect(history).not.toContain('PROGRESS_0');
+    expect(history.indexOf('PROGRESS_79')).toBeLessThan(history.indexOf('**TOOL_0**'));
+    expect(history).toContain('已截断');
+    expect(history).not.toContain('\uFFFD');
+    expect(history).not.toContain('<');
+    expect(card).toContain('完整答复');
+    expect(turnReplyCardRequestBytes(card, record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
     expect(record).toEqual(original);
   });
 
-  it.each(['progress', 'thinking'] as const)('keeps a late tool visible when long %s fills the byte budget', kind => {
-    const record = processRecord(1, 19);
-    record.activity = [
-      ...record.progress.map((text, i) => ({ kind, id: `p${i}`, text: `${text} ${'中文<>&🧠'.repeat(90)}` })),
-      { kind: 'tool', id: 't0' },
-    ];
-    const panel = processPanel(record);
-    const history: string = panel.elements[0].content;
-    expect(history).toContain('**TOOL_0**');
-    expect(history.match(/PROGRESS_\d+/g)).toHaveLength(19);
-    expect(history.indexOf('PROGRESS_18')).toBeLessThan(history.indexOf('**TOOL_0**'));
-    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
-    expect(history).toContain('已省略');
-    expect(history).not.toContain('\uFFFD');
-    expect(history).not.toContain('<');
-  });
-
-  it('preserves tool names and interleaved order when tool output also needs shortening', () => {
-    const record = processRecord(15, 15);
-    record.tools.forEach(tool => {
-      tool.subject = '<'.repeat(400);
-      tool.result = '🧠输出'.repeat(200);
-    });
+  it('shares available card space across tools and text, with honest counts and original order', () => {
+    const record = processRecord(80, 80);
+    record.tools.forEach(tool => { tool.result = '输出'.repeat(300); });
     record.activity = record.tools.flatMap((tool, i) => [
-      { kind: 'progress', id: `p${i}`, text: `${record.progress[i]} ${'long text '.repeat(80)}` },
+      { kind: 'progress', id: `p${i}`, text: `${record.progress[i]} ${'进度'.repeat(300)}` },
       { kind: 'tool', id: tool.id },
     ]);
-    const history: string = processPanel(record).elements[0].content;
-    expect(history.match(/PROGRESS_\d+|\*\*TOOL_\d+\*\*/g)).toEqual(
-      record.tools.slice(-10).flatMap((tool, i) => [`PROGRESS_${i + 5}`, `**${tool.name}**`]),
-    );
-    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
-    expect(history).toContain('已省略');
-    expect(history).not.toContain('\uFFFD');
-    expect(history).not.toContain('<');
+    const panel = processPanel(record);
+    const history: string = panel.elements[0].content;
+    const shownTools = (history.match(/\*\*TOOL_\d+\*\*/g) ?? []).length;
+    expect(shownTools).toBeGreaterThan(0);
+    expect(shownTools).toBeLessThan(80);
+    expect(history).toContain('PROGRESS_79');
+    expect(history).toContain('**TOOL_79**');
+    const numbers = [...history.matchAll(/PROGRESS_(\d+)|\*\*TOOL_(\d+)\*\*/g)].map(match => Number(match[1] ?? match[2]));
+    expect(numbers).toEqual([...numbers].sort((a, b) => a - b));
+    expect(panel.header.title.content).toBe(`📋 执行过程（已展示 ${shownTools} / 80 次工具调用）`);
+    expect(turnReplyCardRequestBytes(buildTurnReplyCard(record, presentation), record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
   });
 
-  it('keeps unusually long tool names inside closed labels under the byte budget', () => {
-    const record = processRecord(20, 0);
-    record.tools.forEach(tool => {
-      tool.name += '长工具名称'.repeat(100);
-      tool.result = 'output '.repeat(200);
-    });
-    const history: string = processPanel(record).elements[0].content;
-    expect(history.match(/\*\*TOOL_\d+[^\n]*?\*\* ✓/g)).toHaveLength(20);
-    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
+  it.each(['```', '~~~~'])( 'closes a truncated %s code fence before later tools and the notice', fence => {
+    const record = processRecord(1, 0);
+    record.activity = [
+      { kind: 'thinking', id: 'code', text: `运行示例\n${fence}text\n${'代码行\n'.repeat(10_000)}${fence}` },
+      { kind: 'tool', id: 't0' },
+    ];
+    const history = processPanel(record).elements[0].content;
+    const tokens = new MarkdownIt().parse(history, {});
+    const code = tokens.find(token => token.type === 'fence');
+    expect(code).toBeDefined();
+    expect(code!.content).not.toContain('TOOL_0');
+    expect(code!.content).not.toContain('已截断');
+    const outsideCode = tokens.filter(token => token.type === 'inline').map(token => token.content).join('\n');
+    expect(outsideCode).toContain('**TOOL_0**');
+    expect(outsideCode).toContain('已截断');
+    expect(turnReplyCardRequestBytes(buildTurnReplyCard(record, presentation), record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
   });
 
-  it('localizes omitted tool counts and keeps the process toggle effective under truncation', () => {
-    const record = processRecord(30, 30);
-    const english = JSON.parse(buildTurnReplyCard(record, { ...presentation, locale: 'en' }));
-    const panel = english.body.elements.find((element: any) => element.tag === 'collapsible_panel');
-    expect(panel.header.title.content).toBe('📋 Activity (10 of 30 tool calls shown)');
-    expect(panel.elements[0].content).toContain('omitted');
+  it('gives a long final answer priority and keeps hidden-process semantics under truncation', () => {
+    const record = processRecord(5, 80);
+    record.activity = record.activity!.map(item => item.kind === 'progress' ? { ...item, text: item.text + 'x'.repeat(500) } : item);
+    const count = () => (processPanel(record).elements[0].content.match(/PROGRESS_\d+/g) ?? []).length;
+    const before = count();
+    const finalText = '完整答复'.repeat(1400);
+    record.finalCard = buildCanonicalFinalReplyCard({ markdown: finalText });
+    const card = buildTurnReplyCard(record, presentation);
+    expect(count()).toBeLessThan(before);
+    expect(card).toContain(finalText);
+    expect(turnReplyCardRequestBytes(card, record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
     const hidden = processPanel(record, { ...presentation, showProcess: false });
     expect(hidden.header.title.content).toBe('📋 本轮记录');
-    expect(hidden.elements[0].content.match(/PROGRESS_\d+/g)).toHaveLength(20);
+    expect(hidden.elements[0].content).toContain('已截断');
     expect(JSON.stringify(hidden)).not.toMatch(/TOOL_|次工具调用/);
+    const english = JSON.parse(buildTurnReplyCard(record, { ...presentation, locale: 'en' }));
+    expect(english.body.elements.find((element: any) => element.tag === 'collapsible_panel').elements[0].content).toContain('truncated');
+  });
+
+  it('counts stamped callbacks and both JSON serialization layers in its size estimate', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'button',
+      text: { tag: 'plain_text', content: '中文\n"\\'.repeat(100) },
+      behaviors: [{ type: 'callback', value: { action: 'stop_turn' } }],
+    }] } });
+    const content = stampBotmuxCallbackMarkers(raw);
+    const create = { msg_type: 'interactive', content, receive_id: input.chatId, uuid: 'brc_' + 'a'.repeat(32) };
+    const reply = { msg_type: 'interactive', content, reply_in_thread: true, uuid: create.uuid };
+    expect(content).toContain('__bm_cb');
+    expect(turnReplyCardRequestBytes(raw, input.chatId)).toBe(Math.max(
+      Buffer.byteLength(JSON.stringify(create)), Buffer.byteLength(JSON.stringify(reply)),
+    ));
+    expect(turnReplyCardRequestBytes(raw, input.chatId)).toBeGreaterThan(Buffer.byteLength(raw));
   });
 
   it('keeps responsive width and distinguishes tool types inside a shaded, collapsed activity panel', () => {

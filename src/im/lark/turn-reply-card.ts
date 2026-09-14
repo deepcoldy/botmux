@@ -6,6 +6,7 @@ import {
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
 import { buildCardBodyElements, cardUsageFooterSegment, createReplyCard } from './md-card.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -23,13 +24,13 @@ export function publicReplyCardTools(entries: readonly CotEntry[], showResults: 
     if (entry.kind === 'tool_call') {
       tools.set(entry.id, {
         id: entry.id, name: entry.name,
-        subject: (entry.subject || subjectFromArgsString(entry.args)).slice(0, 1000),
+        subject: entry.subject || subjectFromArgsString(entry.args),
       });
     } else if (entry.kind === 'tool_result') {
       const tool = tools.get(entry.id);
       if (tool) {
         tool.completed = true;
-        if (showResults) tool.result = entry.result.slice(0, 2000);
+        if (showResults) tool.result = entry.result;
       }
     }
   }
@@ -39,17 +40,18 @@ export function publicReplyCardTools(entries: readonly CotEntry[], showResults: 
 /** Only text already emitted by the CLI is available here (often a summary). */
 export function publicReplyCardActivity(entries: readonly CotEntry[]): ReplyCardActivity[] {
   return entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking' || entry.kind === 'text'
-    ? [{ kind: 'thinking', id: `thinking:${index}`, text: bounded(entry.text, 4000) }]
+    ? [{ kind: 'thinking', id: `thinking:${index}`, text: entry.text }]
     : entry.kind === 'tool_call' ? [{ kind: 'tool', id: entry.id }] : []);
 }
 
-function bounded(text: string, bytes: number): string {
-  if (Buffer.byteLength(text, 'utf8') <= bytes) return text;
+function bounded(text: string, bytes: number, measure = (value: string) => Buffer.byteLength(value, 'utf8')): string {
+  if (measure(text) <= bytes) return text;
+  if (bytes < measure('…')) return '';
   let result = '';
   let size = 0;
   for (const char of text) {
-    size += Buffer.byteLength(char, 'utf8');
-    if (size > bytes - 4) break;
+    size += measure(char);
+    if (size > bytes - measure('…')) break;
     result += char;
   }
   return `${result}…`;
@@ -72,43 +74,71 @@ function toolIcon(name: string): string {
   return '🔧';
 }
 
-function toolLine(tool: ReplyCardTool, subjectLimit: number): string {
+function toolLine(tool: ReplyCardTool, subjectLimit = Infinity): string {
   return `${toolIcon(tool.name)} **${bounded(publicText(tool.name), 120)}**${tool.completed ? ' ✓' : ''}`
     + (tool.subject ? ` · ${publicText(bounded(tool.subject, subjectLimit))}` : '');
 }
 
-interface ProcessEntry { kind: 'tool' | 'text'; content: string }
+interface ProcessEntry { kind: 'tool' | 'text'; content: string; label?: string }
+interface ProcessPreview { content: string; shownTools: number }
 
-function processPreview(entries: ProcessEntry[], en: boolean): { content: string; shownTools: number } {
-  const entryLimit = 20;
-  const notice = en ? 'Some earlier entries or long content have been omitted.' : '部分较早的过程记录或长内容已省略。';
-  const byteLimit = 7000 - Buffer.byteLength(`\n\n${notice}`, 'utf8');
+// Markdown is inside a card JSON string, itself inside the request JSON.
+// Subtract the two string envelopes to measure its additive wire cost.
+function processTextBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(JSON.stringify(text)), 'utf8') - 6;
+}
+
+function boundedProcessEntry(text: string, limit: number): string {
+  let budget = limit;
+  while (budget > 0) {
+    const clipped = bounded(text, budget, processTextBytes);
+    // A cut inside a code fence must not swallow later entries or the notice.
+    let openFence = '';
+    for (const line of clipped.split('\n')) {
+      const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (!fence) continue;
+      if (!openFence) openFence = fence[1];
+      else if (fence[1][0] === openFence[0] && fence[1].length >= openFence.length && !fence[2].trim()) openFence = '';
+    }
+    const result = clipped + (openFence ? `\n${openFence}` : '');
+    const excess = processTextBytes(result) - limit;
+    if (excess <= 0) return result;
+    budget -= excess;
+  }
+  return '';
+}
+
+function processPreview(entries: ProcessEntry[], byteLimit: number, notice: string): ProcessPreview {
   const tools = entries.filter(entry => entry.kind === 'tool');
   const texts = entries.filter(entry => entry.kind === 'text');
-  // Reserve half for each category; lend unused slots and bytes to the other.
-  const selectedTools = tools.slice(-Math.max(entryLimit / 2, entryLimit - texts.length));
-  const selectedTexts = texts.slice(-Math.max(entryLimit / 2, entryLimit - tools.length));
-  const cost = (entry: ProcessEntry) => Buffer.byteLength(entry.content, 'utf8') + 1;
+  const cost = (entry: ProcessEntry) => processTextBytes(entry.content) + processTextBytes('\n');
   const totalCost = (group: ProcessEntry[]) => group.reduce((sum, entry) => sum + cost(entry), 0);
-  const toolBudget = Math.min(totalCost(selectedTools), Math.max(Math.floor(byteLimit / 2), byteLimit - totalCost(selectedTexts)));
+  // Only on overflow: keep recent entries from both categories, lending unused
+  // space to the other so progress cannot consume the entire tool history.
+  const toolBudget = Math.min(totalCost(tools), Math.max(Math.floor(byteLimit / 2), byteLimit - totalCost(texts)));
   const rendered = new Map<ProcessEntry, string>();
-  let omitted = selectedTools.length + selectedTexts.length < entries.length;
   const fit = (group: ProcessEntry[], budget: number) => {
-    // Short entries keep their full text. Share the remainder across long
-    // entries so one large output cannot remove another entry's tool label.
-    const bySize = [...group].sort((a, b) => cost(a) - cost(b));
-    bySize.forEach((entry, index) => {
-      const limit = Math.floor(budget / (bySize.length - index)) - 1;
-      const content = bounded(entry.content, limit);
-      rendered.set(entry, content);
-      omitted ||= content !== entry.content;
-      budget -= Buffer.byteLength(content, 'utf8') + 1;
-    });
+    for (let index = group.length - 1; index >= 0; index--) {
+      const entry = group[index];
+      if (cost(entry) <= budget) {
+        rendered.set(entry, entry.content);
+        budget -= cost(entry);
+      } else {
+        // If even the newest entry is too large, retain its beginning. Never
+        // count a tool whose label cannot fit as a displayed tool call.
+        const limit = budget - processTextBytes('\n');
+        if (index === group.length - 1 && limit >= processTextBytes((entry.label ?? '') + '…')) {
+          const clipped = boundedProcessEntry(entry.content, limit);
+          if (clipped && (!entry.label || clipped.startsWith(entry.label))) rendered.set(entry, clipped);
+        }
+        break;
+      }
+    }
   };
-  fit(selectedTools, toolBudget);
-  fit(selectedTexts, byteLimit - toolBudget);
+  fit(tools, toolBudget);
+  fit(texts, byteLimit - toolBudget);
   const content = entries.filter(entry => rendered.has(entry)).map(entry => rendered.get(entry)!).join('\n');
-  return { content: content + (omitted ? `\n\n${notice}` : ''), shownTools: selectedTools.length };
+  return { content: content ? `${content}\n\n${notice}` : notice, shownTools: tools.filter(entry => rendered.has(entry)).length };
 }
 
 export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: TurnReplyCardPresentation): string {
@@ -155,6 +185,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
 
   const process: ProcessEntry[] = [];
+  let setProcessPreview: ((preview: ProcessPreview) => void) | undefined;
   if (presentation.showProcess) {
     // A coalesced snapshot often ends in a tool call; keep its preceding
     // narration visible until a newer narration or another card view replaces it.
@@ -174,39 +205,44 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   ];
   for (const item of activity) {
     if (item.kind === 'progress') {
-      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(bounded(item.text, 600))}` });
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(item.text)}` });
     } else if (item.kind === 'ask') {
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
-      if (entry?.result) process.push({ kind: 'text', content: bounded(turnReplyAskSummary(entry, presentation.locale), 1200) });
+      if (entry?.result) process.push({ kind: 'text', content: turnReplyAskSummary(entry, presentation.locale) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push({ kind: 'text', content: `💭 ${publicText(bounded(item.text, 1200))}` });
+      process.push({ kind: 'text', content: `💭 ${publicText(item.text)}` });
     } else if (presentation.showProcess && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
-      if (tool) process.push({ kind: 'tool', content: toolLine(tool, 400)
-        + (presentation.showToolResults && tool.result ? `\n${publicText(bounded(tool.result, 600))}` : '') });
+      if (tool) process.push({ kind: 'tool', label: toolLine({ ...tool, subject: '' }), content: toolLine(tool)
+        + (presentation.showToolResults && tool.result ? `\n${publicText(tool.result)}` : '') });
     }
   }
   if (process.length) {
-    const preview = processPreview(process, en);
-    const toolCountLabel = preview.shownTools < toolCount
-      ? (en ? `${preview.shownTools} of ${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'} shown` : `已展示 ${preview.shownTools} / ${toolCount} 次工具调用`)
-      : (en ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : `${toolCount} 次工具调用`);
     const footerIndex = card.body.elements.findIndex(element =>
       element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
-    card.body.elements.splice(footerIndex < 0 ? card.body.elements.length : footerIndex, 0, {
+    const panel = {
       tag: 'collapsible_panel', expanded: false,
       background_color: 'grey-50', padding: '4px 12px 12px 12px', margin: '4px 0px 0px 0px',
       border: { color: 'grey-50', corner_radius: '8px' },
       header: {
-        title: { tag: 'plain_text', content: toolCount
-          ? (en ? `📋 Activity (${toolCountLabel})` : `📋 执行过程（${toolCountLabel}）`)
-          : presentation.showProcess ? (en ? '📋 Activity' : '📋 执行过程') : (en ? '📋 Turn record' : '📋 本轮记录') },
+        title: { tag: 'plain_text', content: '' },
         background_color: 'grey-50', padding: '10px 12px 10px 12px',
         icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey', size: '16px 16px' },
         icon_position: 'right', icon_expanded_angle: -180,
       },
-      elements: [{ tag: 'markdown', content: preview.content }],
-    });
+      elements: [{ tag: 'markdown', content: '' }],
+    };
+    setProcessPreview = preview => {
+      const toolCountLabel = preview.shownTools < toolCount
+        ? (en ? `${preview.shownTools} of ${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'} shown` : `已展示 ${preview.shownTools} / ${toolCount} 次工具调用`)
+        : (en ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : `${toolCount} 次工具调用`);
+      panel.header.title.content = toolCount
+        ? (en ? `📋 Activity (${toolCountLabel})` : `📋 执行过程（${toolCountLabel}）`)
+        : presentation.showProcess ? (en ? '📋 Activity' : '📋 执行过程') : (en ? '📋 Turn record' : '📋 本轮记录');
+      panel.elements[0].content = preview.content;
+    };
+    setProcessPreview({ content: process.map(entry => entry.content).join('\n'), shownTools: process.filter(entry => entry.kind === 'tool').length });
+    card.body.elements.splice(footerIndex < 0 ? card.body.elements.length : footerIndex, 0, panel);
   }
 
   // A runtime status is separate from a model-authored layout title.
@@ -227,7 +263,26 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   // Feedback becomes clickable after runtime settlement, avoiding a feedback
   // callback racing with the last status PATCH.
   if (!terminal) card.body.elements = card.body.elements.filter(element => element.element_id !== 'botmux_feedback');
-  return JSON.stringify(card);
+  let serialized = JSON.stringify(card);
+  if (setProcessPreview && turnReplyCardRequestBytes(serialized, record.chatId) > TURN_REPLY_CARD_MAX_BYTES) {
+    const notice = en ? 'Card size limit reached. Some activity has been truncated; recent entries are shown.'
+      : '卡片内容超出容量，部分执行过程已截断，保留最近记录。';
+    setProcessPreview({ content: notice, shownTools: 0 });
+    serialized = JSON.stringify(card);
+    let budget = TURN_REPLY_CARD_MAX_BYTES - turnReplyCardRequestBytes(serialized, record.chatId) - processTextBytes('\n\n');
+    while (budget > 0) {
+      setProcessPreview(processPreview(process, budget, notice));
+      serialized = JSON.stringify(card);
+      const excess = turnReplyCardRequestBytes(serialized, record.chatId) - TURN_REPLY_CARD_MAX_BYTES;
+      if (excess <= 0) break;
+      budget -= excess;
+      // Leave a notice even if the answer/controls consume all available space.
+      // The store handles an oversized final answer with its existing file path.
+      setProcessPreview({ content: notice, shownTools: 0 });
+      if (budget <= 0) serialized = JSON.stringify(card);
+    }
+  }
+  return serialized;
 }
 
 export function replyCardPresentation(config: Pick<BotConfig, 'thinkingCard' | 'thinkingCardToolResult' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showToolResults' | 'canStop'> {

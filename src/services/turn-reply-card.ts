@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../im/lark/turn-reply-card-size.js';
 import type { AskResult, PendingAsk } from '../core/ask-types.js';
 
 export type ReplyCardMode = 'legacy' | 'unified';
@@ -253,7 +254,7 @@ export class TurnReplyCardStore {
       let card = io.render(record);
       const completeRecordNeedsFile = replyCardIsTerminal(record) && !record.disconnected && !record.finalCard
         && Buffer.byteLength(record.progress.join('\n\n'), 'utf8') > 6000;
-      if (Buffer.byteLength(card, 'utf8') > 24 * 1024 || completeRecordNeedsFile) {
+      if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES || completeRecordNeedsFile) {
         if (!io.sendOverflow) throw new Error('Reply exceeds card size limit');
         if (!record.overflowMessageId) {
           await io.beforeEffect();
@@ -263,7 +264,7 @@ export class TurnReplyCardStore {
           this.write(key, record);
         }
         card = io.render(record);
-        if (Buffer.byteLength(card, 'utf8') > 24 * 1024) throw new Error('Reply-card summary exceeds size limit');
+        if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES) throw new Error('Reply-card summary exceeds size limit');
       }
 
       try {

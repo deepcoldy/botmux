@@ -14,6 +14,7 @@ import { updateTurnReplyCard, settleTurnReplyCards, replyCardModeFor } from '../
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
@@ -92,6 +93,22 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
 }
 
 describe('Ask inside the running reply card', () => {
+  it('keeps pending options usable when the execution history exceeds the card size limit', async () => {
+    await store.update(key, { kind: 'tools', tools: [{ id: 't', name: 'Read', subject: 'large.txt', result: '工具输出'.repeat(10_000) }] }, io);
+    const { snapshot, answer } = await ask();
+    await store.update(key, { kind: 'progress', text: '等待你的选择' }, io);
+    expect(body).toContain('已截断');
+    expect(body).toContain('继续执行吗');
+    expect(turnReplyCardRequestBytes(body, input.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+    const choice = optionButton('yes').behaviors[0].value;
+    expect(choice).toMatchObject({ ask_id: snapshot.askId, nonce: snapshot.nonce, action: 'ask_select', key: 'yes' });
+    await click(snapshot, choice);
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    expect(body).not.toContain('ask_select');
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it('keeps a question, concurrent progress and final in one message', async () => {
     const { snapshot, answer } = await ask();
     expect(body).toContain('等待你确认');
