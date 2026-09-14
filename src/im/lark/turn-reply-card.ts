@@ -156,7 +156,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
 
   const process: ProcessEntry[] = [];
   if (presentation.showProcess) {
-    const latest = record.activity?.at(-1);
+    // A coalesced snapshot often ends in a tool call; keep its preceding
+    // narration visible until a newer narration or another card view replaces it.
+    const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
       card.body.elements.push({ tag: 'markdown', content: `🧠 ${publicText(bounded(latest.text, 600))}` });
     }

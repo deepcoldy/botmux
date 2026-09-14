@@ -8,6 +8,7 @@ import { getBot } from '../src/bot-registry.js';
 import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import type { CotEntry } from '../src/types.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn(() => ({ context: null, tokens: null })) }));
@@ -148,6 +149,39 @@ describe('reply-card runtime eligibility and recovery', () => {
     await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed', durationMs: 2500 }, send);
     expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('已完成');
     expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' })?.durationMs).toBe(2500);
+  });
+
+  it.each(['claude-code', 'codex'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
+    const ds = session();
+    ds.session.cliId = cliId;
+    const send = vi.fn(async (_body: string) => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    const entries: CotEntry[] = [
+      { kind: 'text', text: 'NARRATION_A' },
+      { kind: 'tool_call', id: 'pwd', name: 'Bash', args: '{}', subject: 'pwd' },
+      { kind: 'tool_result', id: 'pwd', result: '/tmp' },
+    ];
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries: entries.slice(0, 1) }, send, () => true);
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    const liveText = () => JSON.parse(vi.mocked(updateMessage).mock.calls.at(-1)![2]).body.elements
+      .filter((element: any) => element.tag === 'markdown').map((element: any) => element.content).join('\n');
+    expect(liveText()).toContain('🧠 NARRATION_A');
+    expect(liveText()).toContain('**Bash** ✓ · pwd');
+
+    entries.push({ kind: 'tool_call', id: 'files', name: 'Read', args: '{}', subject: 'README.md' });
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    expect(liveText()).toContain('🧠 NARRATION_A');
+
+    entries.push({ kind: 'text', text: 'NARRATION_B' },
+      { kind: 'tool_call', id: 'time', name: 'Bash', args: '{}', subject: 'date' });
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    expect(liveText()).toContain('🧠 NARRATION_B');
+    expect(liveText()).not.toContain('NARRATION_A');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateMessage).mock.calls.every(call => call[1] === 'om_reply')).toBe(true);
   });
 
   it('uses the replacement worker sender and ownership when coalescing tool updates', async () => {

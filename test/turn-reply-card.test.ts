@@ -60,7 +60,7 @@ describe('one reply card per turn', () => {
   });
 
   it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {
-    const tools = Array.from({ length: 5 }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}` }));
+    const tools = Array.from({ length: 5 }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}`, subject: '' }));
     const start = await store.update(key, { kind: 'tools', tools }, io);
     for (let i = 0; i < 30; i++) {
       await store.update(key, { kind: 'progress', text: `PROGRESS_${i}` }, io);
@@ -271,7 +271,7 @@ describe('one reply card per turn', () => {
 
 describe('public process and fallback compatibility', () => {
   function processRecord(toolCount: number, textCount: number): TurnReplyCardRecord {
-    const tools = Array.from({ length: toolCount }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}`, completed: true }));
+    const tools = Array.from({ length: toolCount }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}`, subject: '', completed: true }));
     const progress = Array.from({ length: textCount }, (_, i) => `PROGRESS_${i}`);
     return {
       ...key, ...input, version: 1, phase: 'completed', createdAtMs: 0, tools, progress,
@@ -287,6 +287,50 @@ describe('public process and fallback compatibility', () => {
     const card = JSON.parse(buildTurnReplyCard(record, options));
     return card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
   }
+
+  it('keeps the latest nonempty narration outside the collapsed panel after subsequent tool events', () => {
+    const record = processRecord(2, 0);
+    record.phase = 'working';
+    delete record.finalCard;
+    record.activity = [
+      { kind: 'thinking', id: 'a', text: 'NARRATION_A' }, { kind: 'tool', id: 't0' },
+      { kind: 'thinking', id: 'b', text: 'NARRATION_B' }, { kind: 'tool', id: 't1' },
+      { kind: 'thinking', id: 'empty', text: '  \n' },
+    ];
+    const original = structuredClone(record);
+    const card = JSON.parse(buildTurnReplyCard(record, presentation));
+    const live: string[] = card.body.elements.filter((element: any) => element.tag === 'markdown').map((element: any) => element.content);
+    expect(live).toContain('🧠 NARRATION_B');
+    expect(live.join('\n')).not.toContain('NARRATION_A');
+    expect(live.join('\n')).toContain('**TOOL_1**');
+    const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
+    expect(panel.expanded).toBe(false);
+    expect(panel.elements[0].content).toContain('NARRATION_A');
+    expect(panel.elements[0].content).toContain('NARRATION_B');
+    expect(record).toEqual(original);
+  });
+
+  it.each(['hidden', 'pending-ask', 'final', 'completed', 'failed', 'cancelled'] as const)(
+    'does not retain live narration in the %s view', view => {
+      const record = processRecord(1, 0);
+      record.phase = 'working';
+      if (view !== 'final') delete record.finalCard;
+      record.activity = [{ kind: 'thinking', id: 'a', text: 'NARRATION_A' }, { kind: 'tool', id: 't0' }];
+      if (view === 'completed' || view === 'failed' || view === 'cancelled') record.phase = view;
+      if (view === 'pending-ask') record.asks = [{ ask: {
+        askId: 'a1', nonce: 'nonce', larkAppId: key.larkAppId, chatId: input.chatId,
+        rootMessageId: input.rootId, sessionId: key.sessionId, createdAt: 0, deadlineAt: 10_000, settled: false,
+        questions: [{ prompt: '继续吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+      } }];
+      const card = JSON.parse(buildTurnReplyCard(record, { ...presentation, showProcess: view !== 'hidden' }));
+      const live = card.body.elements.filter((element: any) => element.tag === 'markdown').map((element: any) => element.content).join('\n');
+      expect(live).not.toContain('NARRATION_A');
+      if (view === 'pending-ask') expect(live).toContain('继续吗');
+      if (view === 'final') expect(live).toContain('完整答复');
+      if (view === 'hidden') expect(JSON.stringify(card)).not.toContain('NARRATION_A');
+      else expect(JSON.stringify(card)).toContain('NARRATION_A');
+    },
+  );
 
   it.each([
     [5, 30, 5, 15], [15, 15, 10, 10], [30, 5, 15, 5], [30, 0, 20, 0], [0, 30, 0, 20],
