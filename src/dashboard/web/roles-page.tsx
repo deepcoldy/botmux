@@ -54,6 +54,7 @@ import {
   ROLE_WARN_BYTES,
   saveInjectMode,
   saveDispatchCompletionEnabled,
+  saveReplyPrivately,
   saveMessageListener,
   saveProfileEntry,
   saveRole,
@@ -258,6 +259,8 @@ function RolesPage(props: { tab: RolesTab }) {
   const [editingContent, setEditingContent] = useState('');
   const [editingInjectMode, setEditingInjectMode] = useState<RoleInjectMode>('every');
   const [editingDispatchCompletionEnabled, setEditingDispatchCompletionEnabled] = useState(false);
+  const [privateReplySaving, setPrivateReplySaving] = useState(false);
+  const [editingPrivateReplyNotice, setEditingPrivateReplyNotice] = useState('');
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleDeleting, setRoleDeleting] = useState(false);
   const [injectSaving, setInjectSaving] = useState(false);
@@ -474,6 +477,7 @@ function RolesPage(props: { tab: RolesTab }) {
     if (!alive.current || serial !== selectSerial.current) return;
     setSelectedRole(role);
     setEditingContent(role.content ?? '');
+    setEditingPrivateReplyNotice(role.privateReplyNotice ?? '');
     setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
     setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
     await loadListenerForSelection(botId, groupId, serial);
@@ -489,6 +493,7 @@ function RolesPage(props: { tab: RolesTab }) {
       if (!alive.current || serial !== selectSerial.current) return;
       setSelectedRole(role);
       setEditingContent(role.content ?? '');
+      setEditingPrivateReplyNotice(role.privateReplyNotice ?? '');
       setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
       setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
       await loadListenerForSelection(selectedBotId, selectedGroupId, serial);
@@ -562,6 +567,22 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setInjectFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
     } finally {
       if (alive.current) setInjectSaving(false);
+    }
+  }
+
+  async function handleReplyPrivatelyChange(settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<void> {
+    if (!selectedGroupId || !selectedBotId) return;
+    const serial = selectSerial.current;
+    setPrivateReplySaving(true);
+    try {
+      const ok = await saveReplyPrivately(selectedBotId, selectedGroupId, settings);
+      if (!alive.current || serial !== selectSerial.current) return;
+      if (ok) setSelectedRole(prev => prev ? { ...prev, ...settings } : prev);
+      flash(setRoleFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
+    } catch {
+      if (alive.current && serial === selectSerial.current) flash(setRoleFlash, tr('roles.saveFailed'), true);
+    } finally {
+      if (alive.current) setPrivateReplySaving(false);
     }
   }
 
@@ -1191,6 +1212,31 @@ function RolesPage(props: { tab: RolesTab }) {
                     </label>
                     <span className="roles-editor-inject-hint">{tr('roles.dispatchCompletionHint')}</span>
                     <Flash flash={dispatchCompletionFlash} />
+                  </div>
+                  <div className="roles-editor-inject">
+                    <label className="filter-toggle roles-listener-enabled">
+                      <input id="roles-editor-reply-privately" type="checkbox"
+                        checked={selectedRole?.replyPrivately === true} disabled={privateReplySaving}
+                        onChange={event => void handleReplyPrivatelyChange({ replyPrivately: event.currentTarget.checked })} />
+                      <span className="filter-toggle-switch" aria-hidden="true"></span>
+                      <span className="filter-toggle-label">{tr('roles.replyPrivately')}</span>
+                    </label>
+                    <span className="roles-editor-inject-hint">{tr('roles.replyPrivatelyHint')}</span>
+                    <div className="roles-private-reply-notice">
+                      <label className="roles-field-label" htmlFor="roles-editor-private-reply-notice">{tr('roles.privateReplyNotice')}</label>
+                      <input id="roles-editor-private-reply-notice" type="text" maxLength={500}
+                        value={editingPrivateReplyNotice}
+                        placeholder={tr('roles.privateReplyNoticePlaceholder')}
+                        disabled={privateReplySaving || selectedRole?.replyPrivately !== true}
+                        onChange={event => setEditingPrivateReplyNotice(event.currentTarget.value)}
+                        onBlur={() => {
+                          const notice = editingPrivateReplyNotice.trim();
+                          if (notice !== (selectedRole?.privateReplyNotice ?? '')) {
+                            void handleReplyPrivatelyChange({ privateReplyNotice: notice });
+                          }
+                        }} />
+                      <span className="roles-editor-inject-hint">{tr('roles.privateReplyNoticeHint')}</span>
+                    </div>
                   </div>
                   <textarea
                     id="roles-editor-textarea"

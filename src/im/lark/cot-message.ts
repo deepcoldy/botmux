@@ -46,6 +46,7 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { privateReplyEnabled } from '../../core/private-reply.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -235,11 +236,12 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
  *  `/cot off` (`noCotChats`). Read fresh from the in-memory registry so
  *  `/cot` toggles apply from the next update without a daemon restart.
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
- *  apiOnly stays a hard block (such bots must not emit IM messages). */
+ *  apiOnly and private replies stay hard blocks for this public channel. */
 export function cotEnabled(ds: DaemonSession): boolean {
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
+    if (privateReplyEnabled(ds.session)) return false;
     if (ds.cotForced) return true;
     return cfg.thinkingCard !== false
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));

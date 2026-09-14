@@ -34,6 +34,8 @@ export interface RoleData {
   hasRole: boolean;
   injectMode?: RoleInjectMode;
   dispatchCompletionEnabled?: boolean;
+  replyPrivately?: boolean;
+  privateReplyNotice?: string;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
@@ -501,4 +503,11 @@ export async function applyRoleProfile(input: {
     error: body.error,
     wouldRefuse: body.wouldRefuse,
   };
+}
+
+export async function saveReplyPrivately(larkAppId: string, chatId: string, settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings),
+  });
+  return r.ok;
 }

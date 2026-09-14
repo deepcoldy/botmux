@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 
 // Orphan markers land under config.session.dataDir — point it at a tmp dir so
 // tests never touch the packaged data directory.
@@ -61,6 +62,7 @@ beforeEach(() => {
   });
   vi.mocked(getBot).mockClear().mockReturnValue({ config: { thinkingCard: true } } as any);
   rmSync(orphanDir, { recursive: true, force: true });
+  rmSync(join(dataDir, 'roles'), { recursive: true, force: true });
 });
 
 describe('handleCotThinkingUpdate', () => {
@@ -608,6 +610,27 @@ describe('handleCotThinkingUpdate', () => {
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
     vi.mocked(getBot).mockReturnValue({ config: { apiOnly: true } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+  });
+
+  it.each([false, true])('private replies suppress thinking and tool output even with cotForced=%s', async cotForced => {
+    const ds = makeDs({
+      cotForced,
+      session: { larkAppId: 'app1', chatId: 'oc_chat1', chatType: 'group', scope: 'thread' },
+    });
+    const update = upd([
+      think('private reasoning'),
+      { kind: 'tool_call', id: 'tool1', name: 'Bash', args: '{"command":"cat secret.txt"}' },
+      { kind: 'tool_result', id: 'tool1', result: 'private output' },
+    ]);
+    writeRoleReplyPrivately('app1', 'oc_chat1', true);
+    expect(handleCotThinkingUpdate(ds, update)).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+
+    writeRoleReplyPrivately('app1', 'oc_chat1', false);
+    expect(handleCotThinkingUpdate(ds, update)).toBe(true);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'TOOL_CALL_RESULT')).toBe(true);
   });
 
   it('does nothing when the chat is muted via noCotChats (/cot off)', () => {
