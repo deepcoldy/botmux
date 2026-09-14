@@ -3,6 +3,7 @@ import type { CardActionData } from './card-handler.js';
 import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
+import { buildOncallGroupColumn } from './oncall-group.js';
 
 export interface FeedbackCardState { result?: string; reasonKey?: string; comment?: string }
 
@@ -64,7 +65,11 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   if (feedbackIndex < 0) return card;
   let end = feedbackIndex + 1;
   while (end < elements.length && FEEDBACK_ELEMENT_IDS.has(String((elements[end] as any)?.element_id ?? ''))) end++;
-  elements.splice(feedbackIndex, end - feedbackIndex, ...feedbackStateElements(policy, state));
+  const updated = feedbackStateElements(policy, state);
+  const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
+  // Lark's message read API omits behaviors, so restore the callback definition.
+  if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }
+  elements.splice(feedbackIndex, end - feedbackIndex, ...updated);
   card.body.elements = elements;
   return card;
 }
