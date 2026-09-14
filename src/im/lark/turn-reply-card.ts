@@ -73,8 +73,42 @@ function toolIcon(name: string): string {
 }
 
 function toolLine(tool: ReplyCardTool, subjectLimit: number): string {
-  return `${toolIcon(tool.name)} **${publicText(tool.name)}**${tool.completed ? ' ✓' : ''}`
+  return `${toolIcon(tool.name)} **${bounded(publicText(tool.name), 120)}**${tool.completed ? ' ✓' : ''}`
     + (tool.subject ? ` · ${publicText(bounded(tool.subject, subjectLimit))}` : '');
+}
+
+interface ProcessEntry { kind: 'tool' | 'text'; content: string }
+
+function processPreview(entries: ProcessEntry[], en: boolean): { content: string; shownTools: number } {
+  const entryLimit = 20;
+  const notice = en ? 'Some earlier entries or long content have been omitted.' : '部分较早的过程记录或长内容已省略。';
+  const byteLimit = 7000 - Buffer.byteLength(`\n\n${notice}`, 'utf8');
+  const tools = entries.filter(entry => entry.kind === 'tool');
+  const texts = entries.filter(entry => entry.kind === 'text');
+  // Reserve half for each category; lend unused slots and bytes to the other.
+  const selectedTools = tools.slice(-Math.max(entryLimit / 2, entryLimit - texts.length));
+  const selectedTexts = texts.slice(-Math.max(entryLimit / 2, entryLimit - tools.length));
+  const cost = (entry: ProcessEntry) => Buffer.byteLength(entry.content, 'utf8') + 1;
+  const totalCost = (group: ProcessEntry[]) => group.reduce((sum, entry) => sum + cost(entry), 0);
+  const toolBudget = Math.min(totalCost(selectedTools), Math.max(Math.floor(byteLimit / 2), byteLimit - totalCost(selectedTexts)));
+  const rendered = new Map<ProcessEntry, string>();
+  let omitted = selectedTools.length + selectedTexts.length < entries.length;
+  const fit = (group: ProcessEntry[], budget: number) => {
+    // Short entries keep their full text. Share the remainder across long
+    // entries so one large output cannot remove another entry's tool label.
+    const bySize = [...group].sort((a, b) => cost(a) - cost(b));
+    bySize.forEach((entry, index) => {
+      const limit = Math.floor(budget / (bySize.length - index)) - 1;
+      const content = bounded(entry.content, limit);
+      rendered.set(entry, content);
+      omitted ||= content !== entry.content;
+      budget -= Buffer.byteLength(content, 'utf8') + 1;
+    });
+  };
+  fit(selectedTools, toolBudget);
+  fit(selectedTexts, byteLimit - toolBudget);
+  const content = entries.filter(entry => rendered.has(entry)).map(entry => rendered.get(entry)!).join('\n');
+  return { content: content + (omitted ? `\n\n${notice}` : ''), shownTools: selectedTools.length };
 }
 
 export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: TurnReplyCardPresentation): string {
@@ -86,7 +120,6 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认' };
   const phaseIcons = { queued: '⏳', working: '🧠', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️' };
   const toolCount = presentation.showProcess ? record.tools.length : 0;
-  const toolCountLabel = en ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : `${toolCount} 次工具调用`;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
   const title = [
@@ -121,7 +154,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled'));
   }
 
-  const process: string[] = [];
+  const process: ProcessEntry[] = [];
   if (presentation.showProcess) {
     const latest = record.activity?.at(-1);
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
@@ -139,18 +172,23 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   ];
   for (const item of activity) {
     if (item.kind === 'progress') {
-      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push(`💬 ${publicText(bounded(item.text, 600))}`);
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(bounded(item.text, 600))}` });
     } else if (item.kind === 'ask') {
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
-      if (entry?.result) process.push(bounded(turnReplyAskSummary(entry, presentation.locale), 1200));
+      if (entry?.result) process.push({ kind: 'text', content: bounded(turnReplyAskSummary(entry, presentation.locale), 1200) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push(`🧠 ${publicText(bounded(item.text, 1200))}`);
+      process.push({ kind: 'text', content: `🧠 ${publicText(bounded(item.text, 1200))}` });
     } else if (presentation.showProcess && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
-      if (tool) process.push(toolLine(tool, 400) + (presentation.showToolResults && tool.result ? `\n${publicText(bounded(tool.result, 600))}` : ''));
+      if (tool) process.push({ kind: 'tool', content: toolLine(tool, 400)
+        + (presentation.showToolResults && tool.result ? `\n${publicText(bounded(tool.result, 600))}` : '') });
     }
   }
   if (process.length) {
+    const preview = processPreview(process, en);
+    const toolCountLabel = preview.shownTools < toolCount
+      ? (en ? `${preview.shownTools} of ${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'} shown` : `已展示 ${preview.shownTools} / ${toolCount} 次工具调用`)
+      : (en ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : `${toolCount} 次工具调用`);
     const footerIndex = card.body.elements.findIndex(element =>
       element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
     card.body.elements.splice(footerIndex < 0 ? card.body.elements.length : footerIndex, 0, {
@@ -165,8 +203,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
         icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey', size: '16px 16px' },
         icon_position: 'right', icon_expanded_angle: -180,
       },
-      elements: [{ tag: 'markdown', content: bounded(process.slice(-20).join('\n'), 7000)
-        + (process.length > 20 ? (en ? '\n\nRecent entries shown.' : '\n\n这里只展示最近的过程记录。') : '') }],
+      elements: [{ tag: 'markdown', content: preview.content }],
     });
   }
 

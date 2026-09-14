@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
 import type { CotEntry } from '../src/types.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
@@ -57,6 +57,27 @@ describe('one reply card per turn', () => {
     await store.update(nextKey, { kind: 'start' }, io);
     expect(cards.size).toBe(2);
     expect(cards.get(start.messageId!)).toBe(body);
+  });
+
+  it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {
+    const tools = Array.from({ length: 5 }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}` }));
+    const start = await store.update(key, { kind: 'tools', tools }, io);
+    for (let i = 0; i < 30; i++) {
+      await store.update(key, { kind: 'progress', text: `PROGRESS_${i}` }, io);
+    }
+    await store.update(key, finalEvent(), io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(new Set(vi.mocked(io.patch).mock.calls.map(([id]) => id))).toEqual(new Set([start.messageId]));
+    const final = new TurnReplyCardStore(dir).read(key)!;
+    expect(final.progress).toHaveLength(30);
+    expect(final.activity).toHaveLength(35);
+    expect(final.tools).toEqual(tools);
+    const body = cards.get(start.messageId!)!;
+    expect(body).toContain('完整答复');
+    for (const tool of tools) expect(body).toContain(`**${tool.name}**`);
+    expect(body).toContain('PROGRESS_29');
+    expect(body).not.toContain('PROGRESS_0');
   });
 
   it.each([false, true])('preserves interim narration in the same card with extended thinking=%s', async withThinking => {
@@ -249,6 +270,105 @@ describe('one reply card per turn', () => {
 });
 
 describe('public process and fallback compatibility', () => {
+  function processRecord(toolCount: number, textCount: number): TurnReplyCardRecord {
+    const tools = Array.from({ length: toolCount }, (_, i) => ({ id: `t${i}`, name: `TOOL_${i}`, completed: true }));
+    const progress = Array.from({ length: textCount }, (_, i) => `PROGRESS_${i}`);
+    return {
+      ...key, ...input, version: 1, phase: 'completed', createdAtMs: 0, tools, progress,
+      activity: [
+        ...tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
+        ...progress.map((text, i) => ({ kind: 'progress' as const, id: `p${i}`, text })),
+      ],
+      finalCard: buildCanonicalFinalReplyCard({ markdown: '完整答复' }),
+    };
+  }
+
+  function processPanel(record: TurnReplyCardRecord, options = presentation) {
+    const card = JSON.parse(buildTurnReplyCard(record, options));
+    return card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
+  }
+
+  it.each([
+    [5, 30, 5, 15], [15, 15, 10, 10], [30, 5, 15, 5], [30, 0, 20, 0], [0, 30, 0, 20],
+  ])('retains recent tools and progress independently for %i tools and %i progress entries', (tools, texts, shownTools, shownTexts) => {
+    const record = processRecord(tools, texts);
+    const original = structuredClone(record);
+    const panel = processPanel(record);
+    const history: string = panel.elements[0].content;
+    expect(history.match(/\*\*TOOL_\d+\*\*/g) ?? []).toHaveLength(shownTools);
+    expect(history.match(/PROGRESS_\d+/g) ?? []).toHaveLength(shownTexts);
+    const expected = [
+      ...record.tools.slice(tools - shownTools).map(tool => `**${tool.name}**`),
+      ...record.progress.slice(texts - shownTexts),
+    ];
+    expect(history.match(/\*\*TOOL_\d+\*\*|PROGRESS_\d+/g)).toEqual(expected);
+    expect(history).toContain('已省略');
+    expect(panel.header.title.content).toBe(tools > shownTools
+      ? `📋 执行过程（已展示 ${shownTools} / ${tools} 次工具调用）`
+      : tools ? `📋 执行过程（${tools} 次工具调用）` : '📋 执行过程');
+    expect(record).toEqual(original);
+  });
+
+  it.each(['progress', 'thinking'] as const)('keeps a late tool visible when long %s fills the byte budget', kind => {
+    const record = processRecord(1, 19);
+    record.activity = [
+      ...record.progress.map((text, i) => ({ kind, id: `p${i}`, text: `${text} ${'中文<>&🧠'.repeat(90)}` })),
+      { kind: 'tool', id: 't0' },
+    ];
+    const panel = processPanel(record);
+    const history: string = panel.elements[0].content;
+    expect(history).toContain('**TOOL_0**');
+    expect(history.match(/PROGRESS_\d+/g)).toHaveLength(19);
+    expect(history.indexOf('PROGRESS_18')).toBeLessThan(history.indexOf('**TOOL_0**'));
+    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
+    expect(history).toContain('已省略');
+    expect(history).not.toContain('\uFFFD');
+    expect(history).not.toContain('<');
+  });
+
+  it('preserves tool names and interleaved order when tool output also needs shortening', () => {
+    const record = processRecord(15, 15);
+    record.tools.forEach(tool => {
+      tool.subject = '<'.repeat(400);
+      tool.result = '🧠输出'.repeat(200);
+    });
+    record.activity = record.tools.flatMap((tool, i) => [
+      { kind: 'progress', id: `p${i}`, text: `${record.progress[i]} ${'long text '.repeat(80)}` },
+      { kind: 'tool', id: tool.id },
+    ]);
+    const history: string = processPanel(record).elements[0].content;
+    expect(history.match(/PROGRESS_\d+|\*\*TOOL_\d+\*\*/g)).toEqual(
+      record.tools.slice(-10).flatMap((tool, i) => [`PROGRESS_${i + 5}`, `**${tool.name}**`]),
+    );
+    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
+    expect(history).toContain('已省略');
+    expect(history).not.toContain('\uFFFD');
+    expect(history).not.toContain('<');
+  });
+
+  it('keeps unusually long tool names inside closed labels under the byte budget', () => {
+    const record = processRecord(20, 0);
+    record.tools.forEach(tool => {
+      tool.name += '长工具名称'.repeat(100);
+      tool.result = 'output '.repeat(200);
+    });
+    const history: string = processPanel(record).elements[0].content;
+    expect(history.match(/\*\*TOOL_\d+[^\n]*?\*\* ✓/g)).toHaveLength(20);
+    expect(Buffer.byteLength(history, 'utf8')).toBeLessThanOrEqual(7000);
+  });
+
+  it('localizes omitted tool counts and keeps the process toggle effective under truncation', () => {
+    const record = processRecord(30, 30);
+    const english = JSON.parse(buildTurnReplyCard(record, { ...presentation, locale: 'en' }));
+    const panel = english.body.elements.find((element: any) => element.tag === 'collapsible_panel');
+    expect(panel.header.title.content).toBe('📋 Activity (10 of 30 tool calls shown)');
+    expect(panel.elements[0].content).toContain('omitted');
+    const hidden = processPanel(record, { ...presentation, showProcess: false });
+    expect(hidden.header.title.content).toBe('📋 本轮记录');
+    expect(hidden.elements[0].content.match(/PROGRESS_\d+/g)).toHaveLength(20);
+    expect(JSON.stringify(hidden)).not.toMatch(/TOOL_|次工具调用/);
+  });
+
   it('keeps responsive width and distinguishes tool types inside a shaded, collapsed activity panel', () => {
     const toolOutput = 'file contents\n\n```ts\nconst value = 1;\n\nconsole.log(value);\n```';
     const card = JSON.parse(buildTurnReplyCard({
