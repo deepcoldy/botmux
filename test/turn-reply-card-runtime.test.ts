@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
@@ -30,13 +30,66 @@ describe('reply-card runtime eligibility and recovery', () => {
   let dir: string;
   let bot: ReturnType<typeof getBot>;
   beforeEach(() => {
+    vi.stubEnv('BOTMUX_SANDBOX', undefined);
     dir = mkdtempSync(join(tmpdir(), 'botmux-reply-runtime-'));
     config.session.dataDir = dir;
     bot = { config: { larkAppId: 'app_mode', cliId: 'claude-code', replyCardMode: 'unified' } } as ReturnType<typeof getBot>;
     vi.mocked(getBot).mockReturnValue(bot);
     vi.mocked(updateMessage).mockClear();
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it.each(['claude-code', 'codex'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+    const ds = session();
+    ds.session.cliId = cliId;
+    ds.session.sandbox = true;
+    const send = vi.fn(async () => 'om_reply');
+    expect(replyCardModeFor(ds)).toBe('legacy');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+    expect(send).not.toHaveBeenCalled();
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
+  });
+
+  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global'] as const)(
+    'rejects %s isolation even with a persisted unified reservation', source => {
+      const ds = session();
+      new TurnReplyCardStore(dir).prepareSync({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' }, {
+        mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId,
+      });
+      if (source === 'new-bot') bot.config.sandbox = true;
+      if (source === 'legacy-isolation') bot.config.readIsolation = true;
+      if (source === 'worker-sandbox') ds.initConfig = { sandbox: true } as DaemonSession['initConfig'];
+      if (source === 'worker-isolation') ds.initConfig = { readIsolation: true } as DaemonSession['initConfig'];
+      if (source === 'global') vi.stubEnv('BOTMUX_SANDBOX', '1');
+      expect(replyCardModeFor(ds)).toBe('legacy');
+    },
+  );
+
+  it('does not let a cached unified mode override the frozen sandbox state on worker replacement', () => {
+    const ds = session();
+    expect(replyCardModeFor(ds)).toBe('unified');
+    ds.session.sandbox = true;
+    expect(replyCardModeFor(ds)).toBe('legacy');
+  });
+
+  it('follows frozen session and worker isolation instead of retroactively applying bot toggles', () => {
+    const plain = session();
+    plain.session.sandbox = false;
+    plain.initConfig = { sandbox: false, readIsolation: false } as DaemonSession['initConfig'];
+    bot.config.sandbox = true;
+    bot.config.readIsolation = true;
+    expect(replyCardModeFor(plain)).toBe('unified');
+    bot.config.sandbox = false;
+    bot.config.readIsolation = false;
+    const isolated = session();
+    isolated.session.sandbox = true;
+    expect(replyCardModeFor(isolated)).toBe('legacy');
+    const legacyIsolated = session();
+    legacyIsolated.initConfig = { readIsolation: true } as DaemonSession['initConfig'];
+    expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
+  });
 
   it('freezes the old turn while mode changes apply to the next turn', () => {
     const ds = session();

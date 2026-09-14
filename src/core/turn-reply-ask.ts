@@ -6,6 +6,7 @@ import { localeForBot } from '../i18n/index.js';
 import { getAskSnapshot } from './ask-broker.js';
 import type { AskResult, CreateAskInput, PendingAsk } from './ask-types.js';
 import type { DaemonSession } from './types.js';
+import { replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import { MessageWithdrawnError, replyMessage, sendMessage, updateMessage, uploadFile } from '../im/lark/client.js';
@@ -25,6 +26,7 @@ export function replyCardAskTarget(
     || !sameAnchor
     || input.questions.reduce((sum, q) => sum + q.options.length, 0) > 16
     || Buffer.byteLength(JSON.stringify(input.questions), 'utf8') > 3000) return undefined;
+  if (replyCardSandboxBlocked(ds)) return undefined;
   const dispatchAttempt = typeof origin.originDispatchAttempt === 'number' ? origin.originDispatchAttempt : undefined;
   const target = { turnId: origin.originTurnId, dispatchAttempt };
   const record = new TurnReplyCardStore(config.session.dataDir).read({

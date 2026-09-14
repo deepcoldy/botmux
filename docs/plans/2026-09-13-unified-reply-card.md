@@ -17,7 +17,9 @@
 
 ## 首版边界
 
-覆盖 Claude Code / Codex 普通飞书 IM 回合；存储与更新机制不依赖 macOS 专属命令。PTY/tmux 走原输入、恢复和终态链路，真实客户端行为仍需飞书验证。其他 CLI、adopt、远程、v3、VC、文档和静默入口不切换到新交付模型。
+覆盖未启用文件沙盒的 Claude Code / Codex 普通飞书 IM 回合；存储与更新机制不依赖 macOS 专属命令。PTY/tmux 走原输入、恢复和终态链路，真实客户端行为仍需飞书验证。文件沙盒、其他 CLI、adopt、远程、v3、VC、文档和静默入口不切换到新交付模型。
+
+文件沙盒的具体兼容修复、验证和限制见文末「文件沙盒兼容修复」。
 
 使用同卡 PATCH，未启用 CardKit 打字机动画。工具更新约 1.2 秒合并一次；复用现有飞书客户端请求闸门。原生耗时有值时使用 Worker terminal 时间，未知时不补造终态耗时。
 
@@ -122,3 +124,29 @@ git diff --check
 - 默认模式、原生 CoT、其他 CLI hook 和独立状态卡回归通过。上一版 CI 的 `/cot show` 用例失败已在本地复现：共享文件系统 mock 把不存在的单卡记录模拟为存在。该用例现在明确模拟没有持久化记录，仍验证原生 CoT 路径；修复后通过。
 - 标题只显示状态与耗时，调用次数保留在过程折叠栏；过程条目之间只换行，工具输出内部空行保留；问答选项使用原生图标显示未选/已选状态。
 - 飞书手动测试的截图反馈已用于调整排版。预览图由当前卡片 JSON 在本地近似渲染，折叠可展开，390px 窄屏无横向溢出。新的原生选项图标和精简标题仍需客户端确认；本地自动测试未向真实聊天发送消息。
+
+## 文件沙盒兼容修复（2026-09-14）
+
+文件沙盒的白名单未开放 `turn-reply-cards/`。原实现允许 daemon 创建动态卡，却要求沙盒内的 `send` 读取并锁定共享记录，无法保证同卡交付。锁的 stale-claim/candidate 和溢出附件也位于这个共享目录，不能通过放开整个目录来破坏会话间隔离。
+
+- 在模式缓存和持久化记录之前排除文件沙盒会话，复用已冻结的 session/Worker 配置，并覆盖旧 `readIsolation` 和全局 `BOTMUX_SANDBOX=1`。未冻结的新会话使用机器人配置；配置切换不改变已有 Worker 的隔离状态。
+- Ask 使用同一个无文件副作用的隔离判断，已有单卡记录不能让沙盒问题重新进入单卡；独立 Ask 的答题流程保持可用。
+- `send` 根据持久化 sandbox 状态和 Worker 的文件隔离标记跳过旧单卡。Linux 宿主 relay 保留该标记，因此可读的历史记录也不能被重新启用。
+- 不修改 `fs-policy.ts` 和文件锁权限。Dashboard 中英文说明及用户文档明确文件沙盒暂时使用默认模式。其他 CLI、独立状态卡、默认 CoT、问答 broker 和原发送去重策略保持原行为。
+
+验证结果：新增回归在修复前产生 14 项失败；修复后定向测试 **152 项通过**，兼容回归 **690 项通过**，合计 **842 项通过**。Linux bwrap 专用测试 **10 项跳过**，本机无法执行，不计入通过数。`bun run build` 与 `git diff --check` 通过。
+
+```bash
+bun run test test/turn-reply-card-runtime.test.ts test/turn-reply-ask.test.ts \
+  test/cli-send-reply-card.test.ts test/fs-policy.test.ts --no-file-parallelism --silent
+bun run test test/bridge-final-output-retry.test.ts test/cot-message.test.ts \
+  test/command-handler.test.ts test/ask-api.test.ts test/ask-card.test.ts \
+  test/ask-hook-claude.test.ts test/ask-hook-codex.test.ts test/ask-hook-opencode.test.ts \
+  test/ask-cli.test.ts test/sandbox.test.ts test/sandbox-dispatch-routing.test.ts \
+  test/sandbox-session-data-dir.test.ts test/dashboard-streaming-card-pin-toggle.test.ts \
+  test/turn-reply-card.test.ts --no-file-parallelism --silent
+bun run build
+git diff --check
+```
+
+另用临时目录、真实 `buildFsPolicy`/`compileToSeatbelt` 和 `sandbox-exec` 做了 macOS 内核探针：共享记录内容读取报 `EPERM`，自身 `turn-sends/sid.jsonl` 可写，`bots-info.json` 可读。Bun 1.4.2 下记录的 `existsSync` 为 `true`，因此本机不能复现“existsSync=false 后另发消息”的具体推导，更可能在读取阶段报错；Linux 又有宿主 relay，不能声称两端必然表现相同。实际确认的是权限缺口与错误的功能资格。探针只访问临时测试数据，未在真实 sandbox Bot 的飞书对话中做端到端验证。

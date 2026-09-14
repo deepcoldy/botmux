@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { config } from '../config.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { getBot } from '../bot-registry.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -27,10 +28,24 @@ export function replyCardKey(ds: DaemonSession, turnId: string, dispatchAttempt?
   return { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId, dispatchAttempt };
 }
 
+/** Shared by turn delivery and Ask admission; never reads or creates card records. */
+export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
+  let cfg;
+  try { cfg = getBot(ds.larkAppId).config; } catch { return true; }
+  // The shared record directory (including lock/overflow files) is deliberately
+  // outside the sandbox allow-list. Check before cached or persisted modes;
+  // otherwise the daemon creates a card the sandboxed sender cannot update.
+  // Live workers keep their frozen isolation state when bot settings change.
+  return (ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox) === true
+    || ds.initConfig?.sandbox === true
+    || (ds.initConfig?.readIsolation ?? cfg.readIsolation) === true
+    || sandboxEnabled();
+}
+
 /** Freeze display mode per accepted turn. Unsupported entry points keep their
- * established delivery contract, including API-only, v3, adoption and VC. */
+ * established delivery contract, including sandbox, API-only, v3, adoption and VC. */
 export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): TurnReplyCardMode {
-  if (!turnId) return 'legacy';
+  if (!turnId || replyCardSandboxBlocked(ds)) return 'legacy';
   let snapshot = modes.get(ds);
   if (!snapshot) { snapshot = new Map(); modes.set(ds, snapshot); }
   const prior = snapshot.get(turnId);

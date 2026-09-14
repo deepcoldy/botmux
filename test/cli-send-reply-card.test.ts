@@ -13,7 +13,10 @@ const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
-  it.each([
+  it.each<{
+    cliId: string; args: string[]; senderIsBot: boolean | undefined; merged: boolean;
+    sandbox?: boolean; sandboxEnv?: NodeJS.ProcessEnv; reserveCard?: boolean;
+  }>([
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
@@ -21,7 +24,12 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'claude-code', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: true, merged: false },
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: undefined, merged: false },
-  ])('$cliId $args senderIsBot=$senderIsBot merged=$merged', async ({ cliId, args, senderIsBot, merged }) => {
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_READ_ISOLATION: '1' } },
+    { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: '1' } },
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true, reserveCard: false },
+  ])('$cliId $args senderIsBot=$senderIsBot merged=$merged sandbox=$sandbox env=$sandboxEnv reserved=$reserveCard', async ({ cliId, args, senderIsBot, merged, sandbox, sandboxEnv, reserveCard = true }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-'));
     const dataDir = join(root, 'data');
     try {
@@ -33,7 +41,7 @@ describe('real CLI send into a running reply card', () => {
         larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId, replyCardMode: 'unified',
       }]));
       seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
-        ...key, status: 'active', cliId, chatId: 'oc_test', rootMessageId: 'om_root',
+        ...key, status: 'active', cliId, sandbox, chatId: 'oc_test', rootMessageId: 'om_root',
         scope: 'thread', chatType: 'group', workingDir: root,
         replyTargets: { [key.turnId]: { updatedAt: new Date().toISOString(), senderOpenId: 'ou_requester',
           participants: [{ openId: 'ou_requester', isBot: senderIsBot }] } },
@@ -45,13 +53,15 @@ describe('real CLI send into a running reply card', () => {
       const patch = vi.fn(async () => {});
       const io = { send, patch, beforeEffect: () => {}, isWithdrawn: () => false,
         render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, presentation) };
-      await store.prepare(key, { mode: 'unified', chatId: 'oc_test', rootId: 'om_root' });
-      await store.update(key, { kind: 'start' }, io);
-      await store.update(key, { kind: 'tools', tools: [{ id: 'tool1', name: 'Read', subject: 'README.md' }] }, io);
+      if (reserveCard) {
+        await store.prepare(key, { mode: 'unified', chatId: 'oc_test', rootId: 'om_root' });
+        await store.update(key, { kind: 'start' }, io);
+        await store.update(key, { kind: 'tools', tools: [{ id: 'tool1', name: 'Read', subject: 'README.md' }] }, io);
+      }
       const result = spawnSyncTsScript(fixture, ['send', ...args, '--response-kind', 'final', 'Hello! 这是完整答复。'], {
         cwd: fileURLToPath(new URL('..', import.meta.url)),
         env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
-          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId, ...sandboxEnv },
         encoding: 'utf8', timeout: 30_000,
       });
       expect(result.status, String(result.stderr)).toBe(0);
@@ -70,7 +80,11 @@ describe('real CLI send into a running reply card', () => {
         expect(JSON.parse(markers.trim())).toMatchObject({ messageId: 'om_original_card', replyCardResponseKind: 'final' });
       } else {
         expect(requests[0].method).toBe('POST');
+        expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
         expect(store.read(key)?.finalDelivered).not.toBe(true);
+        const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
+        expect(JSON.parse(markers.trim())).not.toHaveProperty('replyCardResponseKind');
+        if (!reserveCard) expect(store.read(key)).toBeUndefined();
       }
     } finally {
       rmSync(root, { recursive: true, force: true });

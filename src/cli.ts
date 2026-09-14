@@ -3679,6 +3679,8 @@ interface SessionData {
   cliId?: string;
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
+  /** Frozen file-sandbox decision from the persisted session. */
+  sandbox?: boolean;
   backendType?: BackendType;
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
@@ -10404,7 +10406,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       // so their notification/automation cannot be swallowed by a PATCH.
       const onlyRequesterMentions = !explicitKnownBotMention && mentions.every(mention =>
         mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
-      const canUseReplyCard = replyKey && !sendTopLevel && !overrideChatId && !sendInto
+      // A restored record can remain readable (for example via the Linux host
+      // relay). Match the daemon's sandbox exclusion instead of reviving it.
+      const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
+        || process.env.BOTMUX_SANDBOX === '1';
+      const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));

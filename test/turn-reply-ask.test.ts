@@ -267,6 +267,21 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'om_other_thread' }, origin)).toBeUndefined();
   });
 
+  it('keeps sandbox Ask standalone even when the daemon can read an old unified card', async () => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root', sandbox: true } } as DaemonSession;
+    const replyCardTarget = replyCardAskTarget(ds, input, { originTurnId: 'om_turn' });
+    expect(replyCardTarget).toBeUndefined();
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(updateMessage).mockClear();
+    const { snapshot, answer } = await ask({ replyCardTarget });
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(store.read(key)?.asks).toBeUndefined();
+    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+  });
+
   it('orders emitted reasoning, tools, progress and answers without duplicating cumulative snapshots', async () => {
     const entries = [
       { kind: 'thinking' as const, text: '先检查配置 <at id=ou_other></at>' },

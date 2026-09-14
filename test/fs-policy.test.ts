@@ -290,6 +290,21 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/home/u/.cargo/registry/x').access).toBe('readOnly');
   });
 
+  it.each(['darwin', 'linux'] as const)('keeps shared reply-card records and lock files inaccessible on %s', platform => {
+    const homeDir = platform === 'darwin' ? '/Users/u' : '/home/u';
+    const botmuxHome = `${homeDir}/.botmux`;
+    const sessionDataDir = `${botmuxHome}/data`;
+    const p = buildFsPolicy(ctx({ platform, homeDir, botmuxHome, sessionDataDir,
+      botHome: `${botmuxHome}/bots/cli_self`, workingDir: `${homeDir}/proj` }));
+    for (const suffix of ['', '/record.json', '/record.json.lock', '/record-reply.md',
+      '/.file-lock-stale-claim-test/owner.candidate-123-uuid']) {
+      expect(accessForPath(p.rules, `${sessionDataDir}/turn-reply-cards${suffix}`).access).toBe('none');
+    }
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/s.jsonl`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/other.jsonl`).access).toBe('none');
+    expect(accessForPath(p.rules, `${sessionDataDir}/bots-info.json`).access).toBe('readOnly');
+  });
+
   it('botmux CLI runtime surface is an ALLOW-LIST (deny-by-default): install dir + a small ~/.botmux set readable, everything else — incl. creds + cross-bot — inaccessible', () => {
     const p = buildFsPolicy(ctx({ botmuxInstallRoot: '/opt/botmux' }));
     // install dir readable (hooks exec node <install>/dist/cli.js — verified live: without this, EPERM)
