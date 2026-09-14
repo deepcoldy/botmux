@@ -189,6 +189,7 @@ export class TurnReplyCardStore {
         ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: `progress:${i}`, text })),
         ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
       ];
+      const priorOverflowText = record.overflowMessageId ? record.finalText ?? record.progress.join('\n\n') : undefined;
       if (event.kind === 'ask') {
         record.asks ??= [];
         const prior = record.asks.find(item => item.ask.askId === event.entry.ask.askId);
@@ -247,6 +248,10 @@ export class TurnReplyCardStore {
           record.phase = event.phase;
         }
       }
+      const overflowText = record.finalText ?? record.progress.join('\n\n');
+      // A late final (or a corrected, still-undelivered final) must not keep
+      // pointing at an attachment containing the previous progress/answer.
+      if (record.overflowMessageId && overflowText !== priorOverflowText) delete record.overflowMessageId;
       this.write(key, record);
       const visible = record.mode === 'unified' || io.forceVisible || !!record.finalCard || terminal || event.kind === 'terminal';
       if (!visible) return { delivered: false, record };
@@ -258,9 +263,10 @@ export class TurnReplyCardStore {
         if (!io.sendOverflow) throw new Error('Reply exceeds card size limit');
         if (!record.overflowMessageId) {
           await io.beforeEffect();
-          record.overflowMessageId = await io.sendOverflow(
-            record.finalText ?? record.progress.join('\n\n'), `brf_${this.id(key)}`,
-          );
+          // Same content retries share a UUID; different content must not be
+          // deduplicated by Feishu to the previously uploaded attachment.
+          const digest = createHash('sha256').update(JSON.stringify([this.id(key), overflowText])).digest('hex').slice(0, 32);
+          record.overflowMessageId = await io.sendOverflow(overflowText, `brf_${digest}`);
           this.write(key, record);
         }
         card = io.render(record);

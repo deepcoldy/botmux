@@ -11,6 +11,7 @@ import type { CotEntry } from '../src/types.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
+import { extractCotEntries } from '../src/services/claude-transcript.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -260,6 +261,69 @@ describe('one reply card per turn', () => {
     expect([...cards.values()][0]).toContain('2.0s');
   });
 
+  it.each([false, true])('replaces a progress attachment with the actual late final (long=%s)', async long => {
+    const progress = '公开进度'.repeat(1000);
+    const answer = long ? '这是最终答复'.repeat(3000) : '这是实际最终答复';
+    const attachments = new Map<string, string>();
+    // Match Feishu's UUID deduplication: an existing UUID returns the old file.
+    io.sendOverflow = vi.fn(async (text, uuid) => {
+      if (!attachments.has(uuid)) attachments.set(uuid, text);
+      return uuid;
+    });
+    const start = await store.update(key, { kind: 'progress', text: progress }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    const progressAttachment = store.read(key)!.overflowMessageId!;
+    expect(attachments.get(progressAttachment)).toBe(progress);
+    const restored = new TurnReplyCardStore(dir);
+    await restored.update(key, finalEvent(answer), io);
+    await restored.update(key, finalEvent(answer), io);
+    const final = restored.read(key)!;
+    expect(final.finalDelivered).toBe(true);
+    expect(final.messageId).toBe(start.messageId);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    const body = cards.get(start.messageId!)!;
+    if (long) {
+      expect(attachments.get(final.overflowMessageId!)).toBe(answer);
+      expect(final.overflowMessageId).not.toBe(progressAttachment);
+      expect(io.sendOverflow).toHaveBeenCalledTimes(2);
+      expect(body).toContain('Markdown 附件');
+    } else {
+      expect(final.overflowMessageId).toBeUndefined();
+      expect(body).toContain(answer);
+      expect(body).not.toContain('Markdown 附件');
+      expect(io.sendOverflow).toHaveBeenCalledTimes(1);
+    }
+    expect(turnReplyCardRequestBytes(body, input.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+
+  it('reuses the attachment UUID after an uncertain send and renews it for a corrected undelivered final', async () => {
+    const firstAnswer = '第一次长答复'.repeat(3000);
+    const correctedAnswer = '修正后的长答复'.repeat(3000);
+    const attachments = new Map<string, string>();
+    const start = await store.update(key, { kind: 'start' }, io);
+    let uncertain = true;
+    io.sendOverflow = vi.fn(async (text, uuid) => {
+      if (!attachments.has(uuid)) attachments.set(uuid, text);
+      if (uncertain) { uncertain = false; throw new Error('uncertain file response'); }
+      return uuid;
+    });
+    await expect(store.update(key, finalEvent(firstAnswer), io)).rejects.toThrow('uncertain file response');
+    const restored = new TurnReplyCardStore(dir);
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('temporary PATCH failure'));
+    await expect(restored.update(key, finalEvent(firstAnswer), io)).rejects.toThrow('temporary PATCH failure');
+    const calls = vi.mocked(io.sendOverflow).mock.calls;
+    expect(calls[0]).toEqual(calls[1]);
+    expect(attachments.size).toBe(1);
+    expect(restored.read(key)!.finalDelivered).not.toBe(true);
+    await restored.update(key, finalEvent(correctedAnswer), io);
+    const final = restored.read(key)!;
+    expect(attachments.size).toBe(2);
+    expect(attachments.get(final.overflowMessageId!)).toBe(correctedAnswer);
+    expect(final.finalDelivered).toBe(true);
+    expect(final.messageId).toBe(start.messageId);
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
   it('acknowledges bridge fallback without replacing an explicit final', async () => {
     await store.update(key, finalEvent('用户已经收到的最终答复'), io);
     await store.update(key, finalEvent('更长的终端叙述'.repeat(100), 'bridge'), io);
@@ -457,6 +521,27 @@ describe('public process and fallback compatibility', () => {
     expect(outsideCode).toContain('**TOOL_0**');
     expect(outsideCode).toContain('已截断');
     expect(turnReplyCardRequestBytes(buildTurnReplyCard(record, presentation), record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+
+  it.each(['```', '~~~~'])('contains a code fence cut by upstream tool-result extraction (%s)', fence => {
+    const record = processRecord(0, 0);
+    const entries: CotEntry[] = [
+      { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'example.md' },
+      ...extractCotEntries({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'read',
+        content: `文件片段\n${fence}ts\n${'const example = 1;\n'.repeat(200)}${fence}`,
+      }] } }),
+      { kind: 'tool_call', id: 'next', name: 'NEXT_TOOL', args: '{}' },
+    ];
+    record.tools = publicReplyCardTools(entries, true);
+    record.activity = publicReplyCardActivity(entries);
+    const original = structuredClone(record);
+    const history = processPanel(record).elements[0].content;
+    const tokens = new MarkdownIt().parse(history, {});
+    expect(tokens.find(token => token.type === 'fence')!.content).not.toContain('NEXT_TOOL');
+    const outsideCode = tokens.filter(token => token.type === 'inline').map(token => token.content).join('\n');
+    expect(outsideCode).toContain('**NEXT_TOOL**');
+    expect(history).not.toContain('已截断'); // Whole card fits; upstream supplied the partial block.
+    expect(record).toEqual(original);
   });
 
   it('gives a long final answer priority and keeps hidden-process semantics under truncation', () => {

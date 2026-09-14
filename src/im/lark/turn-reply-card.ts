@@ -88,19 +88,23 @@ function processTextBytes(text: string): number {
   return Buffer.byteLength(JSON.stringify(JSON.stringify(text)), 'utf8') - 6;
 }
 
+function closeProcessCodeFence(text: string): string {
+  // An upstream excerpt or our size clipping may end inside a code block.
+  // Keep that block from swallowing later entries and the truncation notice.
+  let openFence = '';
+  for (const line of text.split('\n')) {
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (!fence) continue;
+    if (!openFence) openFence = fence[1];
+    else if (fence[1][0] === openFence[0] && fence[1].length >= openFence.length && !fence[2].trim()) openFence = '';
+  }
+  return text + (openFence ? `\n${openFence}` : '');
+}
+
 function boundedProcessEntry(text: string, limit: number): string {
   let budget = limit;
   while (budget > 0) {
-    const clipped = bounded(text, budget, processTextBytes);
-    // A cut inside a code fence must not swallow later entries or the notice.
-    let openFence = '';
-    for (const line of clipped.split('\n')) {
-      const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-      if (!fence) continue;
-      if (!openFence) openFence = fence[1];
-      else if (fence[1][0] === openFence[0] && fence[1].length >= openFence.length && !fence[2].trim()) openFence = '';
-    }
-    const result = clipped + (openFence ? `\n${openFence}` : '');
+    const result = closeProcessCodeFence(bounded(text, budget, processTextBytes));
     const excess = processTextBytes(result) - limit;
     if (excess <= 0) return result;
     budget -= excess;
@@ -218,6 +222,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     }
   }
   if (process.length) {
+    for (const entry of process) entry.content = closeProcessCodeFence(entry.content);
     const footerIndex = card.body.elements.findIndex(element =>
       element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
     const panel = {
