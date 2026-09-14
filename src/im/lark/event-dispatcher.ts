@@ -2743,13 +2743,17 @@ function stripHeaderMentions(rawText: string, message: any, larkAppId: string): 
  * 「@bot /th …」「@bot /tw …」就不会被翻成新话题，而是落进 chat-scope 的
  * 普通消息车道，别名永远到不了 daemon 的归一逻辑——表现为 /th /tw 失效。
  *
- * 只做**行首**、且必须是完整 token（`/th` 不匹配 `/the`）；别名后面的正文原样保留，
- * here/worktree 模式由 daemon 在归一后的 `/t …` 上照旧解析（`/t here|worktree` 与
- * 由 `/th` `/tw` 推导出的 forceTopicMode）。
+ * 归一必须与 daemon **逐字一致**：两者都只是把 `/th`、`/tw` 换成 `/t`，
+ * 余下正文（含 `/model` `/repo` `/effort` 等指令）原样保留，here/worktree
+ * 模式由 daemon 单独推导（forceTopicMode），**不能**把 `here`/`worktree`
+ * 注入正文。否则 `/th /model @bot` 会被归一成 `/t here /model`，parseTopicHeader
+ * 把 `here` 当成普通 prompt、漏掉 `/model` 缺参数的指令校验，路由误翻 scope，
+ * 与 daemon 的 fail-closed 结论不一致。
+ *
+ * 只做**行首**、且必须是完整 token（`/th` 不匹配 `/the`）。
  */
 function normalizeLifecycleAliasForRouting(text: string): string {
-  return text.replace(/^\s*\/(th|tw)(?=\s|$)/i, (match, alias: string) =>
-    alias.toLowerCase() === 'tw' ? '/t worktree' : '/t here');
+  return text.replace(/^\s*\/(?:th|tw)(?=\s|$)/i, '/t');
 }
 
 export function maybeApplyForceTopicOverride(

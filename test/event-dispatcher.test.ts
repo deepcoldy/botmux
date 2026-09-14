@@ -2694,11 +2694,36 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(maybeApplyForceTopicOverride(r1, withMention, 'om_th', MY_APP_ID)).toBe(true);
     expect(r1).toEqual({ scope: 'thread', anchor: 'om_th', forceTopicApplied: true });
 
-    // /tw 同样翻 scope（worktree 模式由 daemon 在归一后的 /t worktree 上解析）。
+    // /tw 同样翻 scope（worktree 模式由 daemon 单独推导，不把 worktree 注入正文）。
     const tw = { content: JSON.stringify({ text: '/tw 修复登录' }), mentions: [] };
     const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
     expect(maybeApplyForceTopicOverride(r2, tw, 'om_tw', MY_APP_ID)).toBe(true);
     expect(r2).toEqual({ scope: 'thread', anchor: 'om_tw', forceTopicApplied: true });
+  });
+
+  it('/th /tw 归一与 daemon 同源：不把 here/worktree 注入正文，指令头仍按原词 fail-closed', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    // Codex CR (#1385)：旧实现把 /th 归一成 `/t here /model`，parseTopicHeader 把 here
+    // 当 prompt、漏掉 /model 缺参数而误翻 scope。daemon 是把别名仅归一成 `/t`（余下
+    // 原样）再判 missing_arg。故缺参数的 /model /effort 必须不翻 scope，错误留在原地。
+    for (const text of ['/th /model', '/tw /model', '/th /effort', '/tw /effort']) {
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(routing, { content: JSON.stringify({ text }), mentions: [] }, 'om_bad', MY_APP_ID)).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
+
+    // /model 显式给值是合法指令头，/tw 也应翻 scope（worktree 模式由 daemon 单独推导，
+    // 不进正文，故 directive 仍被正常解析）。
+    const modelVal = { content: JSON.stringify({ text: '/tw /model gpt-5 做点事' }), mentions: [] };
+    const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r1, modelVal, 'om_m', MY_APP_ID)).toBe(true);
+    expect(r1).toEqual({ scope: 'thread', anchor: 'om_m', forceTopicApplied: true });
+
+    // /repo 允许裸形式：/tw /repo 合法并翻 scope。
+    const bareRepo = { content: JSON.stringify({ text: '/tw /repo' }), mentions: [] };
+    const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r2, bareRepo, 'om_repo', MY_APP_ID)).toBe(true);
+    expect(r2).toEqual({ scope: 'thread', anchor: 'om_repo', forceTopicApplied: true });
   });
 
   it('/th /tw 必须是行首完整 token，正文里提到 /the 或 /two 不触发翻话题', () => {
