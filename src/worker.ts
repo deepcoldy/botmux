@@ -11262,6 +11262,9 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
+          acknowledgeTurnInputCommitted(turnIdentity?.turnId);
+        }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
@@ -12167,6 +12170,9 @@ async function flushPending(): Promise<void> {
         && item.turnId
         && result?.submitted !== false) {
         rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
+      }
+      if (result?.submitted === true && deferNativeCodexInputCommit(item.dispatchAttempt)) {
+        acknowledgeTurnInputCommitted(item.turnId);
       }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
@@ -16619,7 +16625,10 @@ async function spawnCli(
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   // (For mojo it is also actively harmful — see MojoBackend.settleTurn.)
   if (!isRemoteBackendType(effectiveBackendType)) {
-    idleDetector = new IdleDetector(cliAdapter);
+    idleDetector = new IdleDetector(cliAdapter, () => {
+      if (backend !== observedBackend || !backendScreenEvidenceIsAuthoritativeForMutation()) return '';
+      return captureBackendScreen(observedBackend);
+    });
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
     idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
@@ -16929,10 +16938,6 @@ async function spawnCli(
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
     // normal idle detection and flushes it without replaying a pasted draft.
-    if (idleDetector?.isStartupPending()) {
-      log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
-      return;
-    }
     if (!shouldReleaseFirstPromptTimeout({
       deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
       hasReadyPattern: !!cliAdapter?.readyPattern,
@@ -16943,6 +16948,12 @@ async function spawnCli(
       log(`First prompt timeout — ${cliName()} still waiting for readyPattern before flushing queued messages`);
       const hardTimer = setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_HARD_TIMEOUT_MS, true), hardWaitMs);
       hardTimer.unref?.();
+      return;
+    }
+
+    if (idleDetector?.isStartupPending()) {
+      log(`WARN First prompt hard timeout — ${cliName()} startup readiness unconfirmed; keeping ${pendingMessages.length} input(s) queued`);
+      send({ type: 'user_notify', message: `${cliName()} 启动超过 90 秒仍未确认就绪；消息已保留在队列中，尚未提交。请检查终端中的加载状态或待处理对话框。`, turnId: currentBotmuxTurnId });
       return;
     }
 
@@ -19359,6 +19370,11 @@ function send(msg: WorkerToDaemon): void {
   process.send?.(payload);
 }
 
+function deferNativeCodexInputCommit(dispatchAttempt?: number): boolean {
+  return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode
+    && !codexRpcEngine && dispatchAttempt === undefined;
+}
+
 function acknowledgeTurnInputCommitted(turnId?: string): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
@@ -19931,7 +19947,7 @@ process.on('message', async (raw: unknown) => {
             trustedController: msg.trustedController,
           });
         }
-        if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
+        if (initialInputCommitted && !deferNativeCodexInputCommit(msg.dispatchAttempt)) acknowledgeTurnInputCommitted(msg.turnId);
         initPromptMaterialized = true;
 
         // A backend may become prompt-ready before spawnCli() returns. The
@@ -20156,8 +20172,9 @@ process.on('message', async (raw: unknown) => {
           ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
           ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });
-        if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
-        else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+        if (inputCommitted) {
+          if (!deferNativeCodexInputCommit(msg.dispatchAttempt)) acknowledgeTurnInputCommitted(msg.turnId);
+        } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
       }
       break;
     }
