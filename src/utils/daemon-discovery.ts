@@ -65,13 +65,20 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+/** `strict`: an unlistable registry dir throws instead of reading as "nobody
+ *  online" — for callers that must not mistake an unreadable registry for an
+ *  empty one. Malformed individual descriptors are skipped either way. */
+export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } = {}): OnlineDaemonInfo[] {
   const dir = registryDir(dataDir);
-  if (!existsSync(dir)) return [];
+  // No existsSync pre-check: it also answers false on EACCES, which strict
+  // mode must surface. A registry that was never created (ENOENT) is empty.
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
   let names: string[] = [];
-  try { names = readdirSync(dir); } catch { return []; }
+  try { names = readdirSync(dir); } catch (err) {
+    if (opts.strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return [];
+  }
   for (const f of names) {
     if (!f.endsWith('.json')) continue;
     try {

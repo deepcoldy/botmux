@@ -26,6 +26,7 @@ import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexIn
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import type { HolderReason } from './session-store-copy.js';
+import { knownBotAppIds } from './known-bot-app-ids.js';
 export type { HolderReason } from './session-store-copy.js';
 
 let sessions: Map<string, Session> = new Map();
@@ -2397,10 +2398,29 @@ export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
   return findActiveSessionsMatching(s => s.workingDir === workingDir);
 }
 
-/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
-export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
+/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed.
+ *  A still-unmigrated store of a bot that exists on this machine holds rows no
+ *  cross-process reader may parse, so it fails closed too. Which bots exist is
+ *  decided conclusively — `knownAppIds`, else `services/known-bot-app-ids.ts`
+ *  in strict mode: an unreadable bots.json or daemon registry throws rather
+ *  than quietly reclassifying a pending migration as abandoned data. */
+export function findActiveSessionsByWorkingDirStrict(
+  workingDir: string,
+  opts: { knownAppIds?: ReadonlySet<string> } = {},
+): Session[] {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const dataDir = config.session.dataDir;
+  const pending = listUnmigratedAppIds(dataDir).filter(id => id && id !== currentAppId);
+  if (pending.length > 0) {
+    const known = opts.knownAppIds ?? knownBotAppIds({ dataDir, strict: true });
+    const unmigrated = pending.filter(id => known.has(id));
+    if (unmigrated.length > 0) {
+      throw new SessionStoreUnmigratedError(
+        `会话库尚未迁移到 SQLite（${unmigrated.map(id => storeJsonFileName(id)).join('、')} 仍在，对应 sessions.db 不存在）`,
+      );
+    }
+  }
   const target = resolve(workingDir);
   const matches: Session[] = [];
   const targetReal = realpathSync(target);
@@ -2413,7 +2433,7 @@ export function findActiveSessionsByWorkingDirStrict(workingDir: string): Sessio
     return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
   };
   for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
-  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
     if (ref.appId === currentAppId) continue;
     for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
       if (matchesDir(session)) matches.push(session);

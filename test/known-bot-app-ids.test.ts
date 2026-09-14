@@ -33,4 +33,45 @@ describe('knownBotAppIds', () => {
     writeFileSync(broken, '{not json');
     expect([...knownBotAppIds({ dataDir, botsJsonPath: broken, env: {} })]).toEqual([]);
   });
+
+  describe('strict', () => {
+    it('still unions the three sources when every source is readable', () => {
+      const dataDir = tempDataDir();
+      const botsJsonPath = join(dataDir, 'bots.json');
+      writeFileSync(botsJsonPath, JSON.stringify([{ larkAppId: 'cli_conf' }]));
+      mkdirSync(join(dataDir, 'dashboard-daemons'), { recursive: true });
+      writeFileSync(join(dataDir, 'dashboard-daemons', 'cli_online.json'), JSON.stringify({
+        larkAppId: 'cli_online', ipcPort: 9, lastHeartbeat: Date.now(),
+      }));
+      const known = knownBotAppIds({ dataDir, botsJsonPath, env: { BOTMUX_LARK_APP_ID: 'cli_self' }, strict: true });
+      expect([...known].sort()).toEqual(['cli_conf', 'cli_online', 'cli_self']);
+    });
+
+    it('throws instead of degrading when bots.json is missing, malformed or shapeless', () => {
+      const dataDir = tempDataDir();
+      const env = { BOTMUX_LARK_APP_ID: 'cli_self' };
+      expect(() => knownBotAppIds({ dataDir, botsJsonPath: join(dataDir, 'missing.json'), env, strict: true }))
+        .toThrow(/cannot read bots\.json/);
+      const broken = join(dataDir, 'broken.json');
+      writeFileSync(broken, '{not json');
+      expect(() => knownBotAppIds({ dataDir, botsJsonPath: broken, env, strict: true }))
+        .toThrow(/not valid JSON/);
+      const shapeless = join(dataDir, 'shapeless.json');
+      writeFileSync(shapeless, JSON.stringify({ bots: 'nope' }));
+      expect(() => knownBotAppIds({ dataDir, botsJsonPath: shapeless, env, strict: true }))
+        .toThrow(/no bot list/);
+      // The non-strict reading of the same files stays best-effort.
+      expect([...knownBotAppIds({ dataDir, botsJsonPath: broken, env })]).toEqual(['cli_self']);
+    });
+
+    it('throws when the daemon registry exists but cannot be listed', () => {
+      const dataDir = tempDataDir();
+      const botsJsonPath = join(dataDir, 'bots.json');
+      writeFileSync(botsJsonPath, JSON.stringify({ bots: [] }));
+      // A regular file where the registry directory should be: readdir → ENOTDIR.
+      writeFileSync(join(dataDir, 'dashboard-daemons'), '');
+      expect(() => knownBotAppIds({ dataDir, botsJsonPath, env: {}, strict: true })).toThrow();
+      expect([...knownBotAppIds({ dataDir, botsJsonPath, env: {} })]).toEqual([]);
+    });
+  });
 });

@@ -8,11 +8,12 @@
  * not a pending upgrade — no daemon will ever import them — so they must not
  * trigger the "restart the daemon" hint.
  *
- * Every source is best-effort: a sandboxed CLI cannot read bots.json (denied
- * → treated as absent) and may not list descriptors; its own app id still
- * comes from the environment.
+ * By default every source is best-effort: a sandboxed CLI cannot read bots.json
+ * (denied → treated as absent) and may not list descriptors; its own app id still
+ * comes from the environment. `strict` is for destructive callers (the worktree
+ * reclaim inventory): an unreadable source throws instead of narrowing the set.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
@@ -21,18 +22,24 @@ export function defaultBotsJsonPath(env: NodeJS.ProcessEnv = process.env): strin
   return env.BOTS_CONFIG || join(homedir(), '.botmux', 'bots.json');
 }
 
-function configuredBotAppIds(botsJsonPath: string): string[] {
+function configuredBotAppIds(botsJsonPath: string, strict: boolean): string[] {
   let raw: string;
   try {
-    if (!existsSync(botsJsonPath)) return [];
     raw = readFileSync(botsJsonPath, 'utf-8');
-  } catch {
+  } catch (err) {
+    if (strict) throw new Error(`cannot read bots.json at ${botsJsonPath}: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
   let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { return []; }
+  try { parsed = JSON.parse(raw); } catch {
+    if (strict) throw new Error(`bots.json at ${botsJsonPath} is not valid JSON`);
+    return [];
+  }
   const list = Array.isArray(parsed) ? parsed : (parsed as { bots?: unknown } | null)?.bots;
-  if (!Array.isArray(list)) return [];
+  if (!Array.isArray(list)) {
+    if (strict) throw new Error(`bots.json at ${botsJsonPath} has no bot list`);
+    return [];
+  }
   const ids: string[] = [];
   for (const entry of list) {
     const bot = (entry ?? {}) as { larkAppId?: unknown; appId?: unknown };
@@ -48,13 +55,21 @@ export function knownBotAppIds(opts: {
   dataDir: string;
   env?: NodeJS.ProcessEnv;
   botsJsonPath?: string;
+  /** Throw instead of degrading when bots.json or the daemon registry cannot be
+   *  read. For a caller whose decision is destructive, "could not tell which
+   *  bots exist" must not quietly narrow into "that bot no longer exists". */
+  strict?: boolean;
 }): Set<string> {
   const env = opts.env ?? process.env;
+  const strict = opts.strict === true;
   const known = new Set<string>();
   if (env.BOTMUX_LARK_APP_ID) known.add(env.BOTMUX_LARK_APP_ID);
-  for (const id of configuredBotAppIds(opts.botsJsonPath ?? defaultBotsJsonPath(env))) known.add(id);
+  for (const id of configuredBotAppIds(opts.botsJsonPath ?? defaultBotsJsonPath(env), strict)) known.add(id);
   try {
-    for (const daemon of listOnlineDaemons(opts.dataDir)) known.add(daemon.larkAppId);
-  } catch { /* unreadable registry → nothing to add */ }
+    for (const daemon of listOnlineDaemons(opts.dataDir, { strict })) known.add(daemon.larkAppId);
+  } catch (err) {
+    if (strict) throw err;
+    /* unreadable registry → nothing to add */
+  }
   return known;
 }

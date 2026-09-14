@@ -80,6 +80,7 @@ import {
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   findActiveSessionsByWorkingDirStrict,
+  SessionStoreUnmigratedError,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
   applySessionCommandUnowned,
@@ -1347,6 +1348,58 @@ describe('findActiveSessionsByWorkingDirStrict()', () => {
 
     expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
       .toThrow(/simulated readdir denial/);
+  });
+
+  it('fails closed while another known bot store is still unmigrated (JSON only)', () => {
+    init('app-B');
+    // Cross-process readers never parse JSON: the rows in here are invisible
+    // until app-A's daemon restarts and imports them into its .db.
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      s1: { sessionId: 's1', status: 'active', workingDir: tempDir },
+    }));
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir, { knownAppIds: new Set(['app-A', 'app-B']) }))
+      .toThrow(SessionStoreUnmigratedError);
+    // A leftover JSON of a bot removed from this machine is abandoned data,
+    // not a pending migration — it must not block worktree reclamation.
+    expect(findActiveSessionsByWorkingDirStrict(tempDir, { knownAppIds: new Set(['app-B']) })).toEqual([]);
+  });
+
+  it('resolves the known bots conclusively: an unreadable bots.json fails closed instead of narrowing', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      s1: { sessionId: 's1', status: 'active', workingDir: tempDir },
+    }));
+    const botsJsonPath = join(tempDir, 'bots.json');
+    const savedBotsConfig = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsJsonPath;
+    try {
+      // No bots.json at all: which bots exist cannot be told → fail closed.
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(/cannot read bots\.json/);
+      writeFileSync(botsJsonPath, '{not json');
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(/not valid JSON/);
+      // Conclusive answers keep their meaning: app-A still configured → unmigrated
+      // blocks; app-A gone → its leftover JSON is abandoned data.
+      writeFileSync(botsJsonPath, JSON.stringify({ bots: [{ larkAppId: 'app-A' }, { larkAppId: 'app-B' }] }));
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(SessionStoreUnmigratedError);
+      writeFileSync(botsJsonPath, JSON.stringify({ bots: [{ larkAppId: 'app-B' }] }));
+      expect(findActiveSessionsByWorkingDirStrict(tempDir)).toEqual([]);
+    } finally {
+      if (savedBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = savedBotsConfig;
+    }
+  });
+
+  it('does not consult the bot list at all when no store is pending migration', () => {
+    init('app-A');
+    const savedBotsConfig = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = join(tempDir, 'absent-bots.json');
+    try {
+      expect(findActiveSessionsByWorkingDirStrict(tempDir)).toEqual([]);
+    } finally {
+      if (savedBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = savedBotsConfig;
+    }
   });
 
   it('fails closed when another SQLite store has a malformed active row', () => {
