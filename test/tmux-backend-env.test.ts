@@ -318,6 +318,38 @@ describe('buildBotmuxEnvAssignments()', () => {
       .toBeGreaterThan(out.indexOf('HTTPS_PROXY=http://daemon-proxy:8080'));
   });
 
+  // ── Workflow (v3 goal-mode) env forwarding (WORKFLOW_WORKER_ENV_KEYS) ──────
+  it('forwards workflow identity (BOTMUX_WORKFLOW / BOTMUX_GOAL_*) so a v3 worker on tmux sees the goal', () => {
+    // The PTY backend passed the full env, so it never needed this; the tmux
+    // backend forwards only allowlisted keys, and these live on their own table
+    // (not BOTMUX_INJECTED_ENV_KEYS). Without this loop a v3 worker on tmux
+    // loses its whole workflow env and the CLI can't see the goal.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_WORKFLOW_RUN_ID: 'run-123',
+      BOTMUX_GOAL_PATH: '/runs/run-123/goal.md',
+      BOTMUX_GOAL_ATTEMPT_DIR: '/runs/run-123/architect/attempts/001',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_WORKFLOW=1');
+    expect(out).toContain('BOTMUX_WORKFLOW_RUN_ID=run-123');
+    expect(out).toContain('BOTMUX_GOAL_PATH=/runs/run-123/goal.md');
+    expect(out).toContain('BOTMUX_GOAL_ATTEMPT_DIR=/runs/run-123/architect/attempts/001');
+    // Non-allowlisted env (PATH) still never leaks in.
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('skips workflow keys whose value is undefined (a normal, non-workflow pane)', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      SESSION_DATA_DIR: '/d',
+      // No BOTMUX_WORKFLOW / BOTMUX_GOAL_* set at all.
+    });
+    expect(out).toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
+    expect(out.some(s => /^(BOTMUX_WORKFLOW|BOTMUX_GOAL_|BOTMUX_V3_GOAL)/.test(s))).toBe(false);
+  });
+
   it('preserves values with spaces, quotes, equals, newlines (argv array, no shell parsing)', () => {
     const out = buildBotmuxEnvAssignments({
       SESSION_DATA_DIR: 'with space',
