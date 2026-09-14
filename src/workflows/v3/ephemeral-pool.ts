@@ -239,6 +239,8 @@ async function runNodeImpl(
     ...(req.chatBinding?.ownerOpenId ? { ownerOpenId: req.chatBinding.ownerOpenId } : {}),
     workingDir: cwd,
     cliId: req.botSnapshot.cliId,
+    cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
+    cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
     // Workflow workers require CLI bypass permissions by product contract.

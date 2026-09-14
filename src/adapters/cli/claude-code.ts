@@ -19,6 +19,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
@@ -769,7 +770,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
     // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
-    modelChoices: ['fable', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
+    modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
 

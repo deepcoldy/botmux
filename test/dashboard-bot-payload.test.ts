@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'substituteMode', 'feedback', 'replyStyle',
       'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
-      'envelopeInjection', 'codexAuthSync',
+      'envelopeInjection', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
       'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
       'nativeSubagentRuntime',
@@ -74,6 +74,37 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'cli_source' }, { quotaFallbackBot: { ...quotaFallbackBot, targetAppId: 'ou_wrong' } }))
       .toMatchObject({ quotaFallbackBot: null });
     expect(botSummaryPayload({ larkAppId: 'cli_source' })).not.toHaveProperty('quotaFallbackBot');
+  });
+
+  it('carries the trigger-user auth policy through the aggregate, degrading unusable values to off', () => {
+    const policy = {
+      enabled: true,
+      tools: ['lark-cli' as const],
+      fallback: 'none' as const,
+      gitHost: 'code.example.com',
+    };
+    // An enabled policy survives whole — a refresh rebuilds the toggle, the tool
+    // checkboxes and the fallback select from exactly this row.
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: policy }))
+      .toMatchObject({ triggerUserAuth: policy });
+
+    // Off / older daemon that omits the field / explicitly disabled — all null,
+    // which the toggle renders unchecked.
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ triggerUserAuth: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: null }))
+      .toMatchObject({ triggerUserAuth: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: false } }))
+      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' } });
+
+    // A malformed policy must not throw here: this builds every bot row, so one
+    // bad value would blank the whole Bot Defaults page rather than one toggle.
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, fallback: 'device' } }))
+      .toMatchObject({ triggerUserAuth: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: 'yes' }))
+      .toMatchObject({ triggerUserAuth: null });
+
+    // Never in the public summary — it names which credential boundary a bot runs.
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('triggerUserAuth');
   });
 
   it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {

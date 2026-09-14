@@ -39,7 +39,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import { stripComments } from './helpers/bun-leg-selectors.js';
 
@@ -98,21 +98,30 @@ describe('sandbox botmux shim — compiled binary form', () => {
   });
 });
 
-describe('sandbox botmux shim — Node form unchanged', () => {
-  it('keeps `exec node <dist/cli.js>` (verified byte-identical to pre-change)', () => {
+describe('sandbox botmux shim — Node form pins the interpreter', () => {
+  it('execs an ABSOLUTE interpreter + <dist/cli.js>, never a bare `node`', () => {
     const shim = botmuxShimExecLine();
-    expect(shim.startsWith('#!/bin/sh\nexec node "')).toBe(true);
+    // A bare name would be resolved by the in-sandbox PATH, whose tail is the host
+    // PATH and can name a different Node than the daemon runs on. MEASURED
+    // (2026-09-08): `node dist/cli.js send --help` on v18.20.4 exits 1 at the
+    // session store's SQLite gate, so in-sandbox `botmux send` fails outright.
+    expect(shim).not.toMatch(/exec node /);
+    const m = /^exec (".*?") (".*?") "\$@"$/m.exec(shim);
+    expect(m).not.toBeNull();
+    expect(isAbsolute(JSON.parse(m![1]))).toBe(true);
+    expect(JSON.parse(m![1])).toBe(process.execPath);
     expect(shim).toMatch(/[/\\]cli\.js" "\$@"\n$/);
     expect(shim).not.toContain('$bunfs');
   });
 
-  it('quotes the script path so a directory with spaces still works', () => {
+  it('quotes both paths so a directory with spaces still works', () => {
     // JSON.stringify is the quoting mechanism; assert the observable property
     // rather than the implementation.
     const shim = botmuxShimExecLine();
-    const m = /exec node (".*?") "\$@"/.exec(shim);
+    const m = /exec (".*?") (".*?") "\$@"/.exec(shim);
     expect(m).not.toBeNull();
     expect(() => JSON.parse(m![1])).not.toThrow();
+    expect(() => JSON.parse(m![2])).not.toThrow();
   });
 });
 

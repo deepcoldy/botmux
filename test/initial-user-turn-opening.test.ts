@@ -658,6 +658,11 @@ describe('empty-started session — first real business turn must use the new-to
       type: 'raw_input',
       content: '/model opus',
       turnId: 'om_model',
+      trustedController: {
+        senderType: 'user',
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+      },
     });
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
     expect(ds.session.initialUserTurnPending).toBe(true);

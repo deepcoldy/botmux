@@ -125,6 +125,7 @@ function formatRelative(fromMs: number, nowMs: number): string {
 function buildSecondary(row: SessionRow, nowMs?: number): string {
   const parts: string[] = [];
   if (row.cliId) parts.push(String(row.cliId));
+  if (row.cliInstanceSource) parts.push(`instance:${row.cliInstanceId ?? 'legacy'} (${row.cliInstanceSource})`);
   if (row.workingDir) parts.push(row.workingDir);
   if (typeof nowMs === 'number' && Number.isFinite(row.lastMessageAt)) {
     parts.push(formatRelative(row.lastMessageAt, nowMs));

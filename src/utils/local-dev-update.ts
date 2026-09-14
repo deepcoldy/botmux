@@ -8,7 +8,7 @@
  * `~/.botmux/bin/botmux`:
  *
  *   #!/bin/sh
- *   exec node "/path/to/checkout/dist/cli.js" "$@"
+ *   exec "/abs/path/to/node-or-bun" "/path/to/checkout/dist/cli.js" "$@"
  *
  * Parsing the wrapper's `dist/cli.js` path (and walking up two levels) is the
  * most reliable way to find the checkout the user actually runs — more reliable
@@ -31,10 +31,11 @@ import { botmuxInstallRoot } from './install-info.js';
  * scripts/claim-botmux-bin.mjs and the daemon):
  *
  *   #!/bin/sh
- *   exec node "<abs>/dist/cli.js" "$@"
+ *   exec "<abs interpreter>" "<abs>/dist/cli.js" "$@"
  *
  * Match exactly that: a line that STARTS with `exec` (optional leading
- * whitespace only), a `node`/absolute-node-path command, then the quoted
+ * whitespace only), any interpreter command (quoted absolute path — node or bun —
+ * or a legacy bare name), then the quoted
  * absolute path ending in `dist/cli.js` (either separator, so Windows wrappers
  * work), then the trailing `"$@"`. Anchoring to line start + requiring `"$@"`
  * rejects a commented-out old command (`# old: exec node "…"`) or an `echo exec
@@ -45,8 +46,16 @@ import { botmuxInstallRoot } from './install-info.js';
  * (e.g. a hand-edited wrapper), letting callers fall back safely.
  */
 export function parseWrapperCliEntry(wrapperText: string): string | null {
-  // ^\s*exec  <node|/abs/node>  "<path…/dist/cli.js>"  "$@"
-  const re = /^\s*exec\s+(?:\S*[\\/])?node(?:\.exe)?\s+"([^"]*[\\/]dist[\\/]cli\.js)"\s+"\$@"\s*$/;
+  // ^\s*exec  <interpreter>  "<path…/dist/cli.js>"  "$@"
+  //
+  // The interpreter is now PINNED to an absolute `process.execPath` and may be
+  // either node OR bun (see core/botmux-wrapper.ts), so match on the SHAPE — a
+  // quoted or bare command followed by a quoted `…/dist/cli.js` — rather than on
+  // the interpreter's name. Keying off the name `node` would make this return null
+  // for every Bun-hosted checkout, and a null here silently degrades `botmux
+  // update` to the running process's own root, which under `switch:here` can be a
+  // different worktree than the one the wrapper points at.
+  const re = /^\s*exec\s+(?:"[^"]+"|\S+)\s+"([^"]*[\\/]dist[\\/]cli\.js)"\s+"\$@"\s*$/;
   for (const line of wrapperText.split('\n')) {
     const match = line.match(re);
     if (match && (posix.isAbsolute(match[1]) || win32.isAbsolute(match[1]))) return match[1];

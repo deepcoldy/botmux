@@ -11,6 +11,7 @@ import type {
   ModelFallbackState,
   DisplayMode,
   StreamStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -359,6 +360,40 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /**
+   * Authenticated human principal that owns the currently executing interactive
+   * turn. Set only after a worker accepts the turn and cleared by its exact
+   * terminal. A different human's message cannot mutate this task directly;
+   * it is staged as a suggestion for this owner to approve after completion.
+   * In-memory only.
+   */
+  activeInteractiveTurn?: {
+    turnId: string;
+    caller: import('../types.js').TrustedCaller;
+    /** Stable authenticated task/session owner, when distinct from the caller
+     * that happened to start the current CLI turn. */
+    controller?: import('../types.js').TrustedCaller;
+  };
+  /** Host-owned classification/approval driver currently attached to disk state. */
+  crossPrincipalInterruptionDriving?: boolean;
+  /** Runtime wake-up for the bounded wait until the current owner turn ends. */
+  crossPrincipalWaitTimer?: NodeJS.Timeout;
+  /** Transitional runtime queue retained until the durable classifier replaces
+   * every old call site. Never persisted; do not add new producers. */
+  pendingCrossPrincipalSuggestions?: Array<{
+    turnId: string;
+    ownerTurnId: string;
+    owner: TrustedCaller;
+    text: string;
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    proposer: TrustedCaller;
+    proposerName?: string;
+    replyRootId?: string;
+    inThread?: boolean;
+    approved?: boolean;
+  }>;
+  crossPrincipalSuggestionConfirming?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
@@ -731,16 +766,24 @@ export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>):
 }
 
 /** A session created by the HTTP control API (`waitForFinalOutput` /
- * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
- * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*`,
+ * `http_wait_*`, or `headless_*` address, NOT a real Lark chat. Any Feishu chat API call
  * targeting it (sendMessage / card / reply / roster probe) would fail — these
  * sessions are request/response only and must never touch Lark transport.
  * Tolerates a nullish chatId (returns false — a missing surface is not an
  * HTTP virtual chat), so callers converging onto this predicate can pass an
  * optional chatId without a separate `?.` guard. */
+export const HEADLESS_CHAT_PREFIX = 'headless_';
+
+export function isHeadlessSessionChatId(chatId: string | undefined | null): boolean {
+  return !!chatId && chatId.startsWith(HEADLESS_CHAT_PREFIX);
+}
+
 export function isHttpVirtualSession(chatId: string | undefined | null): boolean {
   if (!chatId) return false;
-  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  return chatId.startsWith('http_async_')
+    || chatId.startsWith('http_wait_')
+    || isHeadlessSessionChatId(chatId);
 }
 
 /** Central Lark-transport capability gate for a live session. Returns false —

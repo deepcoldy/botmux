@@ -217,7 +217,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
     expect(mockGetMessageChatId).toHaveBeenCalledWith(APP, ROOT);
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
@@ -376,7 +376,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'CI 构建失败，请检查发布流水线');
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
   });
 
@@ -388,7 +388,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);

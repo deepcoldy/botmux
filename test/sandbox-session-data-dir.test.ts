@@ -8,7 +8,7 @@ import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import type { FsPolicy } from '../src/adapters/cli/fs-policy.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
-import { ensureManagedOriginAttestationDirectory } from '../src/core/managed-origin-capability.js';
+import { ensureManagedOriginAttestationDirectory, RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 
 const linux = process.platform === 'linux';
 const hasBwrap = linux && spawnSync('bwrap', ['--version']).status === 0;
@@ -219,7 +219,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
         'send', 'must not send', '--session-id', 'session', '--no-mention'],
       });
       expect(plan).not.toBeNull();
-      const result = spawnSync(plan!.bin, ['--uid', '0', '--gid', '0', ...plan!.args], {
+      const args = [...plan!.args];
+      args.splice(args.indexOf('--'), 0, '--uid', '0', '--gid', '0');
+      const result = spawnSync(plan!.bin, args, {
         cwd: repoRoot,
         env: {
           ...process.env,
@@ -237,6 +239,108 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       expect(result.status, result.stderr).toBe(2);
       expect(result.stderr).toContain('read-isolated owning data-root locator is missing or ambiguous');
       expect(result.stderr).not.toContain('authorized Codex App origin');
+    } finally {
+      cleanup(f, plan);
+    }
+  });
+
+  it.each([0, 65534])('rejects env-cleared direct sends inside a real sandbox (UID %s)', uid => {
+    if (!canRunBwrap) return;
+    const f = fixture('canonical');
+    f.policy.net = false;
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      rmSync(join(f.dataDir, 'session-stores/app-a/sessions.db'));
+      seedPersistedSessionRows(f.dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_own', rootMessageId: 'om_own',
+          title: 'fixture', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'codex',
+        },
+      });
+      const { repoRoot, command, prefixArgs } = allowTestRuntime(f.policy);
+      plan = prepareDirectSandbox({
+        sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+        chdir: repoRoot, home: f.home, cliBin: '/usr/bin/env',
+        cliArgs: ['-i', `HOME=${f.home}`, `SESSION_DATA_DIR=${f.dataDir}`,
+          'BOTMUX_SESSION_ID=session', 'BOTMUX_LARK_APP_ID=app-a',
+          'BOTMUX_HOST_RELAY_AUTHORIZED=1', command, ...prefixArgs,
+          // If classification ever regresses, stop at the later argument
+          // validation gate. No credentials, provider request or network.
+          join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--video'],
+      });
+      expect(plan).not.toBeNull();
+      const args = [...plan!.args];
+      args.splice(args.indexOf('--'), 0, '--uid', String(uid), '--gid', String(uid));
+      const result = spawnSync(plan!.bin, args, {
+        cwd: repoRoot, encoding: 'utf8', timeout: 15_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain('read-isolated pane authority channel is missing or invalid');
+      expect(result.stderr).not.toContain('--video 需要路径参数');
+    } finally {
+      cleanup(f, plan);
+    }
+  });
+
+  it.skipIf(!canRunBwrap)('does not let a forged relay and process marker authorize direct send', () => {
+    const f = fixture('canonical');
+    f.policy.net = false;
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      const { repoRoot, command, prefixArgs } = allowTestRuntime(f.policy);
+      const fakeDataDir = join(f.ownBotHome, 'fake-data');
+      plan = prepareDirectSandbox({
+        sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+        chdir: repoRoot, home: f.home, cliBin: '/usr/bin/env',
+        cliArgs: ['-i', `HOME=${f.home}`, `SESSION_DATA_DIR=${fakeDataDir}`,
+          `BOTMUX_SEND_RELAY=${join(f.ownBotHome, 'fake-relay')}`, 'BOTMUX_SESSION_ID=session',
+          '/bin/sh', '-c', `
+            mkdir -p "$SESSION_DATA_DIR/.botmux-cli-pids"
+            printf session > "$SESSION_DATA_DIR/.botmux-cli-pids/$$"
+            "$@"
+          `, 'marker-fixture', command, ...prefixArgs, join(repoRoot, 'src/cli.ts'),
+          'send', 'fixture', '--video'],
+      });
+      expect(plan).not.toBeNull();
+      const result = spawnSync(plan!.bin, plan!.args, {
+        cwd: repoRoot, encoding: 'utf8', timeout: 15_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain('managed host relay capability is stale or missing');
+      expect(result.stderr).not.toContain('--video 需要路径参数');
+    } finally {
+      cleanup(f, plan);
+    }
+  });
+
+  it.skipIf(!canRunBwrap)('keeps a valid sandbox capability on the relay path', () => {
+    const f = fixture('canonical');
+    f.policy.net = false;
+    f.policy.rules.push({ path: join(f.dataDir, 'sandboxes/session/outbox'), access: 'readWrite', source: 'internal' });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      const { repoRoot, command, prefixArgs } = allowTestRuntime(f.policy);
+      plan = prepareDirectSandbox({
+        sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+        chdir: repoRoot, home: f.home, cliBin: command,
+        // This flag is rejected at the start of relaySend, proving that the
+        // normal relay path was reached without issuing any real request.
+        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--top-level'],
+      });
+      expect(plan).not.toBeNull();
+      writeFileSync(join(plan!.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
+        token: 'ab'.repeat(32), turnId: 'turn', dispatchAttempt: 1,
+      }), { mode: 0o600 });
+      const result = spawnSync(plan!.bin, plan!.args, {
+        cwd: repoRoot, env: { ...process.env, BOTMUX_SESSION_ID: 'session' },
+        encoding: 'utf8', timeout: 15_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain('ROUTING_NOT_SUPPORTED');
     } finally {
       cleanup(f, plan);
     }

@@ -33,7 +33,10 @@ export interface TranscriptEvent {
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
     /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
-     *  Code writes the placeholder `<synthetic>` on API-error records. */
+     *  Code writes the placeholder `<synthetic>` on records no model produced:
+     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
+     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
   };
   /** API-error records. When the model call fails, Claude Code writes a
@@ -507,6 +510,37 @@ function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
 }
 
+/** Model placeholder Claude Code writes on assistant records no model produced. */
+export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
+
+/**
+ * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
+ * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
+ * bridge resume of a turn that was cut mid-flight):
+ *
+ *     {"type":"assistant","isApiErrorMessage":false,
+ *      "message":{"model":"<synthetic>","stop_reason":"stop_sequence",
+ *                 "content":[{"type":"text","text":"No response requested."}],
+ *                 "usage":{"input_tokens":0,"output_tokens":0,...}}}
+ *
+ * It is always preceded (same timestamp) by an `isMeta` user record
+ * "Continue from where you left off.", and it carries no `requestId`.
+ *
+ * Such a record has every attribute the queue reads as "the model's final
+ * answer" — visible text block, terminal `stop_reason`, not an API error — but
+ * the user's message was never answered. Treating it as `completed` closes the
+ * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
+ * them directly after a Lark-delivered user message, none surfaced anywhere).
+ * Only `message.model` distinguishes it from a real reply.
+ */
+export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
@@ -545,6 +579,14 @@ export function classifyClaudeTerminalEvent(
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
   if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  // No model call happened, so nothing was answered; the input is still intact
+  // in the transcript, so a continuation can pick it up. `provider_` prefix on
+  // purpose: the daemon routes Claude execution failures (Wait-Mode settle,
+  // async sink, failure card) on that prefix, and the retry offer stays
+  // `caveated` — the cut turn may have run tools before it was resumed.
+  if (isSyntheticNoModelReplyEvent(ev)) {
+    return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
+  }
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return undefined;
   const reason = ev.message?.stop_reason;

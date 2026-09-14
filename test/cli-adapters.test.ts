@@ -25,6 +25,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -501,7 +502,9 @@ describe('codex buildArgs', () => {
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      'thread-abc',
     ]);
     // the -c disable must land BEFORE the thread id (a resume-subcommand config)
     const cIdx = args.indexOf('-c');
@@ -567,6 +570,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -580,6 +585,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -592,6 +599,40 @@ describe('codex buildArgs', () => {
     const idx = args.indexOf('check_for_update_on_startup=false');
     expect(idx).toBeGreaterThan(0);
     expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('suppresses the low-usage luna model nudge for plain TUI launches', () => {
+    // Codex 0.151+ shows a "Switch to <luna> for lower credit usage?" popup at
+    // >=90% primary usage; its default item switches models, and the paste
+    // path's submit Enter would confirm it (#1281). Process-level -c only.
+    const fresh = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    const idx = fresh.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(fresh[idx - 1]).toBe('-c');
+
+    // Must survive resume as well, placed before the resumed session id.
+    const resumed = adapter.buildArgs({
+      sessionId: 'sess-4',
+      resume: true,
+      resumeSessionId: 'codex-session-id',
+    });
+    const resumeIdx = resumed.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(resumeIdx).toBeGreaterThan(0);
+    expect(resumeIdx).toBeLessThan(resumed.indexOf('codex-session-id'));
+  });
+
+  it('also suppresses the luna nudge popup on the pure --remote RPC viewer', () => {
+    // The viewer injects no keys (turns go through app-server JSON-RPC), but it
+    // is itself a TUI that renders the modal; keep the pane free of it like the
+    // startup update picker, before the resumed thread id.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    const idx = args.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+    expect(idx).toBeLessThan(args.indexOf('thread-abc'));
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {
@@ -2353,6 +2394,52 @@ describe('busyPattern', () => {
     // Shared def: seed/relay render the same Claude Code footer.
     expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy!.source);
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
+  });
+
+  it('claude-code busy footer matches through the SGR color codes tmux capture-pane -e emits at line starts', () => {
+    // Regression: the worker's viewport busy probe reads captureViewport() =
+    // `tmux capture-pane -e -p`, whose rows carry SGR/control codes. A live
+    // busy footer is literally (verbatim bytes from a busy pane):
+    //   \x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m
+    // The pattern anchors on `^\s*[⏵⏸]`, but the line STARTS with an ESC
+    // sequence, so the anchor never binds and the pre-idle veto never fires —
+    // the card flips green while Claude works. Assertions go through the REAL
+    // worker entry (busyProbeRegion, which strips ANSI before region/slice),
+    // so reverting the worker fix makes these fail.
+    const busy = createCliAdapterSync('claude-code').busyPattern!;
+    const ansiBusyFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m';
+    const ansiIdleFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · ← for agents\x1b[39m';
+    // Raw ANSI rows do NOT match the bare pattern — that is the production
+    // bug; busyProbeRegion must repair them.
+    expect(busy.test(ansiBusyFooter)).toBe(false);
+    expect(busy.test(ansiIdleFooter)).toBe(false);
+    // Through the real viewport entry: busy resolves busy, idle stays idle.
+    expect(busy.test(busyProbeRegion(ansiBusyFooter))).toBe(true);
+    expect(busy.test(busyProbeRegion(ansiIdleFooter))).toBe(false);
+    // Multi-line region (tail slice + strip): colored prose above + colored
+    // busy footer at the bottom resolves busy; the same with the interrupt
+    // segment removed stays idle.
+    const region = (footer: string) => [
+      '\x1b[36m● docs say esc to interrupt works\x1b[39m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      '\x1b[1m❯\x1b[22m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      footer,
+    ].join('\n');
+    expect(busy.test(busyProbeRegion(region(ansiBusyFooter)))).toBe(true);
+    expect(busy.test(busyProbeRegion(region(ansiIdleFooter)))).toBe(false);
+    // Control sequences tmux capture-pane can emit that a narrower stripper
+    // misses (Codex review): CSI with ':' subparameter, ST-terminated OSC 8
+    // hyperlink, and bare SO/SI charset-shift bytes at the line start. Each
+    // must be removed so the `^` anchor still binds; all must resolve busy.
+    const plainBusy = '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents';
+    expect(busy.test(busyProbeRegion('\x1b[4:3m' + plainBusy))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x1b]8;;http://x\x1b\\' + plainBusy + '\x1b]8;;\x1b\\'))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x0f' + plainBusy))).toBe(true);
+    // Cursor-forward (ESC[nC) renders as real gaps and is preserved as spaces.
+    expect(busy.test(busyProbeRegion('\x1b[5C' + plainBusy))).toBe(true);
   });
 
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {

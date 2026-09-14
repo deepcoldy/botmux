@@ -28,6 +28,7 @@ import { logger } from '../../utils/logger.js';
 import { buildGrantCard } from './card-builder.js';
 import { getUserProfile, replyMessage, sendMessage } from './client.js';
 import { clearPending, openPending, throttleReason } from './grant-pending.js';
+import { resolveGrantApprover } from './grant-owner.js';
 
 /** 本次升级的结论。调用方据此选 toast 文案。 */
 export type AskGrantRequestOutcome =
@@ -67,6 +68,8 @@ export interface AskGrantRequestDeps {
   resolveTargetName?: (larkAppId: string, chatId: string, openId: string) => Promise<string>;
   /** 实际投递授权卡（异步，不在 ACK 路径上）。 */
   deliverCard?: (target: AskGrantRequestTarget, cardJson: string) => Promise<void>;
+  /** 群内审批人解析（异步，不在 ACK 路径上）。 */
+  resolveGrantApprover?: typeof resolveGrantApprover;
 }
 
 /**
@@ -87,6 +90,7 @@ export function requestGrantForAskClicker(
   const readConfig = deps.getBotConfig ?? ((appId: string) => getBot(appId).config);
   const resolveName = deps.resolveTargetName ?? defaultResolveTargetName;
   const deliver = deps.deliverCard ?? defaultDeliverCard;
+  const approverResolver = deps.resolveGrantApprover ?? resolveGrantApprover;
 
   const { larkAppId, chatId } = ask;
   try {
@@ -108,10 +112,13 @@ export function requestGrantForAskClicker(
     // 取名字 + 发卡都不在 ACK 路径上：失败只回滚 pending，不影响本次 toast。
     void (async () => {
       try {
-        const name = await resolveName(larkAppId, chatId, clickerOpenId);
+        const [name, approver] = await Promise.all([
+          resolveName(larkAppId, chatId, clickerOpenId),
+          approverResolver(larkAppId, chatId).catch(() => undefined),
+        ]);
         const cardJson = buildGrantCard(
           {
-            ownerOpenId: owner,
+            ownerOpenId: approver ?? owner,
             targets: [{ openId: clickerOpenId, name }],
             chatId,
             nonce,

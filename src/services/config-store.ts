@@ -6,6 +6,7 @@ import { promises as fsp } from 'node:fs';
 import { getLoadedConfigPath } from '../bot-registry.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
   const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
@@ -14,6 +15,9 @@ export async function readRawConfig(path: string): Promise<any[]> {
 }
 
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
+  let previous: any[] = [];
+  try { previous = await readRawConfig(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  assertCodexInstanceConfigWrite(previous, raw);
   // Validate the complete next generation, not the currently loaded registry.
   // Callers invoke this while holding the cross-process lock.
   assertQuotaFallbackGraphAcyclic(raw);

@@ -119,6 +119,14 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     expect(block).toContain('.filter(notApiOnly)');
   });
 
+  it('normalizes legacy document watches before restoring sessions can close them', () => {
+    const block = region(daemonSource, 'reapOrphanWorkers();', '// Close CoT thinking bubbles');
+    expect(block).toContain('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)');
+    expect(block).toContain('restoreSessionsAndScheduleStartupRecovery({');
+    expect(block.indexOf('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)'))
+      .toBeLessThan(block.indexOf('restoreSessionsAndScheduleStartupRecovery({'));
+  });
+
   it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
     const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
     expect(block).toContain('if (!cfg.apiOnly) {');
@@ -313,7 +321,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
     // The central gate is defined once and keys on apiOnly bot OR virtual chatId.
     const helper = region(cliSource, 'function currentTurnHasNoTransport(', 'function assertTurnTransportOrExit(');
-    expect(helper).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(helper).toContain('isHttpVirtualSession(chatId)');
     expect(helper).toContain('currentBotIsApiOnly(appId)');
     // Region-scoped per command (NOT file-wide contains): deleting the gate from
     // any ONE command's body must fail this test. Map op → (fn start, fn end).
@@ -352,8 +360,9 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const originGate = region(cliSource, 'function managedOriginHasNoTransport(', '\n}\n');
     expect(originGate).toContain('resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)');
     expect(originGate).toContain('loadSessions().get(ctx.sessionId)');
+    expect(originGate).toContain('isHttpVirtualSession(chatId)');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
-    expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(sessGate).toContain('isHttpVirtualSession(chatId)');
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
   });
 
@@ -435,7 +444,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
-    expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
+    expect(gate).toContain('isHttpVirtualSession(session?.chatId)');
   });
 });
 
@@ -801,7 +810,10 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
     );
     expect(helperCall).toContain(
-      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),',
+      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
+    );
+    expect(helperCall).toContain(
+      'prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
     );
     expect(helperCall).toContain('markSessionsRestored: () => {');
     expect(helperCall).toContain('sessionsRestored = true;');

@@ -280,6 +280,23 @@ export interface Session {
   /** This chat-scoped automation deliberately has no topic seed. Prevents the
    *  chat-mode conversion guard from treating chatId as a replyable message id. */
   externalTriggerTopicless?: boolean;
+  /** Session created by `botmux headless`: no Lark chat is bound until an
+   *  explicit publish/bind command provides one. The synthetic chat/root ids
+   *  keep the existing session store and worker lifecycle reusable while every
+   *  Lark-facing path can fail closed through larkTransportEnabled(). */
+  headless?: {
+    id: string;
+    createdAt: string;
+    source: 'cli';
+    latestTriggerId?: string;
+    lastRunAt?: string;
+    lastPublishedAt?: string;
+    lastPublishedMessageId?: string;
+    boundAt?: string;
+    boundChatId?: string;
+    boundRootMessageId?: string;
+    boundScope?: 'thread' | 'chat';
+  };
   /** A silent `executionPosition='new-topic'` schedule starts without a Lark
    *  root message. `routingAnchor` is the durable daemon-internal identity for
    *  that one run; the first successful `botmux send` materializes a real root
@@ -314,6 +331,23 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /**
+   * Crash-safe host-owned state for a human message that arrived while another
+   * human's interactive turn owned this session.  The message is deliberately
+   * kept outside the CLI transcript until the proposer classifies it and, for
+   * advice, the exact original owner approves it.
+   *
+   * This record may contain only the inbound/public message envelope.  Hidden
+   * CLI transcript or tool output must never be copied into it or into an
+   * independently-created session.
+   */
+  crossPrincipalInterruptions?: CrossPrincipalInterruption[];
+  /** Sessions sharing this id point at the same writable cwd and therefore
+   * admit at most one interactive turn across the whole group. */
+  cwdSerializationGroup?: string;
+  /** Crash-safe FIFO for turns admitted while a sibling in the cwd group owns
+   * execution. Items stay in their own Session and never see sibling CLI output. */
+  cwdSerializedTurns?: CwdSerializedTurn[];
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
@@ -674,6 +708,9 @@ export interface Session {
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
+  /** Durable account-directory routing, independent of the live bot defaults. */
+  cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  creationSource?: import('./services/codex-instance-pool.js').SessionCreationSource;
   /** Concrete CLI distribution frozen with cliId. New sessions carry this
    * structured snapshot while cliPathOverride remains shadow-written for
    * downgrade compatibility with older botmux builds. */
@@ -832,6 +869,55 @@ export interface Session {
     paneCols?: number;
     paneRows?: number;
   };
+}
+
+export interface CrossPrincipalInterruptionMessage {
+  turnId: string;
+  text: string;
+  userPrompt: string;
+  createdAt: string;
+  proposerName?: string;
+  replyRootId?: string;
+  inThread?: boolean;
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+}
+
+export interface CrossPrincipalInterruption {
+  version: 1;
+  /** Stable identity used by restart-safe host asks and Lark send UUIDs. */
+  id: string;
+  ownerTurnId: string;
+  owner: TrustedCaller;
+  proposer: TrustedCaller;
+  phase:
+    | 'awaiting_classification'
+    | 'awaiting_owner'
+    | 'owner_approved'
+    | 'preparing_independent'
+    | 'independent_queued';
+  /** Legacy field retained for restore compatibility. New records start the
+   *  classification clock only after the classification card is delivered. */
+  classificationDeadlineAt?: number;
+  /** Separate bound for waiting until the active owner turn finishes. This is
+   *  not the owner's confirmation timeout. */
+  ownerWaitDeadlineAt?: number;
+  /** Increments whenever the proposer elects to continue waiting, giving every
+   *  recovery ask its own restart-safe request identity. */
+  waitDecisionRound?: number;
+  /** Legacy field retained for restore compatibility. New owner-confirmation
+   *  clocks are owned by the ask broker and start after card delivery. */
+  ownerDeadlineAt?: number;
+  messages: CrossPrincipalInterruptionMessage[];
+  independentRootMessageId?: string;
+  independentChildSessionId?: string;
+  independentWorkingDir?: string;
+  /** Present only when the child must serialize all cwd access with the source. */
+  cwdSerializationGroup?: string;
+}
+
+export interface CwdSerializedTurn extends CrossPrincipalInterruptionMessage {
+  caller: TrustedCaller;
 }
 
 export interface SessionCliLaunchSnapshotV1 {
@@ -1201,11 +1287,18 @@ export interface CliTurnPayload {
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
+  /** Daemon-authenticated stable task/session controller. This is transport
+   * authority metadata, never supplied by an IM client or model. */
+  trustedController?: TrustedCaller;
   /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
    * ONCE by the daemon at admission (real human interactive turn only) and COPIED
    * verbatim into every opening/queued/fork/restore path — never re-inferred
    * downstream, never derived from the delivery sink. Absent ⇒ forced serial. */
   codexAppSteerable?: true;
+  /** Daemon-authenticated public ingress facts retained only so a worker's
+   * deterministic pre-admission principal rejection can be durably rerouted.
+   * Never contains CLI transcript or tool output. */
+  rerouteEnvelope?: CrossPrincipalInterruptionMessage;
 }
 
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
@@ -1228,6 +1321,11 @@ export interface PendingRepoSetup {
   rawInput?: string;
   turnId?: string;
   baseDir?: string;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
+  targetSubdir?: string;
   repoCardMessageId?: string;
   codexAppText?: string;
   codexAppApplicationContext?: string;
@@ -1240,20 +1338,20 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch }
+  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -1334,7 +1432,7 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy }
+    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
     : Message
   : never;
 
@@ -1414,7 +1512,7 @@ export type WorkerToDaemon =
   | { type: 'turn_input_received'; turnId: string }
   /** The worker received an ordinary turn but could not place it into its CLI
    * input queue. This is safe to retry within the same worker generation. */
-  | { type: 'turn_input_rejected'; turnId: string; reason: string }
+  | { type: 'turn_input_rejected'; turnId: string; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */
@@ -1579,6 +1677,15 @@ export type WorkerToDaemon =
         generation: string;
         seq: number;
         dispatchId: string;
+        /** Real completion instant / native execution span for the terminal the
+         *  daemon synthesizes from this settlement. The daemon persists that
+         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+         *  these the durable path would durably win with a timing-less row and
+         *  permanently mask the worker's real numbers. Same optional-means-
+         *  unknown contract as `turn_terminal`. */
+        completedAtMs?: number;
+        durationMs?: number;
       };
       /** The model already delivered through botmux send; settle without fallback output. */
       suppressDelivery?: boolean;
@@ -1624,6 +1731,18 @@ export type WorkerToDaemon =
        *  emits `completed` with no final_output after fs-lag and must NOT be
        *  read as silence (that would mask a real, still-arriving answer). */
       outputDisposition?: 'nothing_to_send';
+      /** Wall-clock epoch ms at which the CLI turn actually reached its native
+       *  terminal. Absent when the emitter cannot vouch for a real instant, in
+       *  which case the recorder falls back to its own write time (which is NOT
+       *  the completion time — that fallback is exactly why this field exists). */
+      completedAtMs?: number;
+      /** True native execution time: from the moment this turn's input was
+       *  literally written to the CLI, to `completedAtMs`. Deliberately excludes
+       *  daemon/worker queueing before the write, so it measures the CLI, not the
+       *  backlog. Omitted (never guessed, never zero-filled) whenever the start
+       *  instant is unknown — an absent duration is honest, a fabricated one is
+       *  not. Always a non-negative integer when present. */
+      durationMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

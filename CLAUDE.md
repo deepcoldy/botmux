@@ -12,6 +12,14 @@ bun run daemon:logs          # 查看日志
 
 - 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
 
+⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
+（`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
+PATH 解析，那不是写它的环境：2026-09-08 某次 restart 的 PATH 把 `/usr/bin` 排在 fnm shim
+之前 ⟹ 解析成 v18.20.4 ⟹ **55 个 bot daemon 全部启动即崩**，飞书里所有话题看似全丢（57 个
+SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照常打印「✅ daemon 已重启」**
+—— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
+现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
+
 **包管理器是 bun**（`packageManager: bun@1.4.2`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。

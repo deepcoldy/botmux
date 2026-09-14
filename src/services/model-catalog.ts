@@ -2,8 +2,8 @@
  * model-catalog.ts
  *
  * Dashboard 模型选择器的后端目录服务：把「某个 CLI 选择键能用哪些模型」拆成两层——
- *   - static：适配器自带的 modelChoices（或 ttadk 网关的建议列表），shell-free、
- *     同步、构造适配器即取（适配器的 resolvedBin 是懒解析，构造不 shell out）；
+ *   - static：与适配器共用的模型元数据（或 ttadk 网关的建议列表），shell-free、
+ *     同步读取，不构造适配器（部分构造器会同步解析 CLI 路径）；
  *   - live：适配器可选的 detectModels() 按需探测（如 `traex debug models`），
  *     单进程短超时、fail-soft，成功结果按 key 缓存 10 分钟。
  *
@@ -18,6 +18,7 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from '../setup/cli-selection.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 
 export type ModelSource = 'static' | 'live';
@@ -39,7 +40,7 @@ export interface DetectModelsOptions {
  * 按 CLI 选择键取静态模型候选（shell-free，同步，绝不抛异常）。
  * key 来自 CLI_SELECT_OPTIONS（普通 cliId 或 'ttadk-x-claude' 这类网关键）。
  *  - ttadk 网关项：ttadkAcceptsModel(wrapperCli) 为真 → [...TTADK_MODEL_SUGGESTIONS]，否则 []
- *  - 其它：createCliAdapterSync(cliId).modelChoices ?? []（构造失败/无候选 → []）
+ *  - 其它：读取 CLI_MODEL_CHOICES 元数据（无候选 → []）
  *  - 未知 key → []
  */
 export function staticModelChoices(key: string): readonly string[] {
@@ -51,8 +52,7 @@ export function staticModelChoices(key: string): readonly string[] {
     if (isTtadkWrapper(opt.wrapperCli)) {
       return ttadkAcceptsModel(opt.wrapperCli) ? [...TTADK_MODEL_SUGGESTIONS] : [];
     }
-    const adapter = createCliAdapterSync(opt.cliId);
-    return adapter.modelChoices ? [...adapter.modelChoices] : [];
+    return [...(CLI_MODEL_CHOICES[opt.cliId] ?? [])];
   } catch {
     return [];
   }

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -149,7 +150,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     mcpGateway: {
-      configPath: '~/.codex/config.toml',
+      get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
     },
     // codex 0.137's own filesystem profile can't express a read blocklist, so
@@ -188,7 +189,16 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // enter to continue" dialog would block the resume forever and freeze the
         // Web terminal. Disable the check at the PROCESS level (never the user's
         // global config). The bounded startup-dialog watcher is only a fail-safe.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        //
+        // -c notice.hide_rate_limit_model_nudge=true: the viewer is itself a TUI
+        // and renders the low-usage luna switch popup. botmux never injects keys
+        // here, so it cannot be confirmed by accident, but the modal still covers
+        // the pane and confuses screen-state detection / manual inspection; keep
+        // it suppressed like the startup update picker.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen',
+          '-c', 'check_for_update_on_startup=false',
+          '-c', 'notice.hide_rate_limit_model_nudge=true',
+          remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
@@ -220,6 +230,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // not); the host-side daily monitor reports newer versions to the owner.
         '-c',
         'check_for_update_on_startup=false',
+        // Codex 0.151+ opens a "Switch to <luna-tier model> for lower credit
+        // usage?" selection view once the primary usage limit is >=90% used
+        // (upstream RATE_LIMIT_SWITCH_PROMPT_THRESHOLD). Its first item is the
+        // default selection and performs the switch, so this paste path's
+        // trailing submit Enter confirms the popup instead of sending the Lark
+        // message — the session silently downgrades model AND reasoning effort,
+        // or the Enter is swallowed and the message never runs (see #1281).
+        // Process-level opt-out, equivalent to the popup's "Keep current model
+        // (never show again)"; never written to the user's global config. Added
+        // on BOTH TUI launch shapes (this plain pane and the --remote viewer
+        // above); app-server/runner CLIs render no TUI popup and need no flag.
+        '-c',
+        'notice.hide_rate_limit_model_nudge=true',
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by
@@ -473,7 +496,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     get skillsDir(): string { return join(codexHome(), 'skills'); },
     // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
     // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
-    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    modelChoices: CLI_MODEL_CHOICES['codex'],
     // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
     // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
     // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中

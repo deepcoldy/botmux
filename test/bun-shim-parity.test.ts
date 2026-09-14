@@ -136,6 +136,30 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     }
   });
 
+  // ⚠️ `interval` MUST equal `timeout` here. Not style — the alternative is a race
+  // that the REFERENCE implementation loses, and it is worth spelling out because
+  // the obvious "tighten the interval" edit silently reintroduces it.
+  //
+  // vitest's waitFor mixes the two clocks: the deadline is a REAL
+  // `setTimeout(handleTimeout, timeout)` taken from `getSafeTimers()`, while the
+  // faked clock only moves by `interval` per REAL interval tick. Reaching fake
+  // time T therefore burns about `T - interval` of REAL time, so the margin
+  // before the real deadline fires is one interval — minus the per-tick
+  // scheduling overhead, paid `T / interval` times. It fails once
+  //
+  //     overhead >= interval² / timeout
+  //
+  // which for the original `interval: 10, timeout: 100` is 1ms per tick: ordinary
+  // scheduling jitter, so this assertion failed on the reference side in every run
+  // on a loaded machine, with no bug anywhere in this repo. Measured with the old
+  // parameters: `bun test` (the shim, bounded purely by pumped fake time) 0 fail,
+  // `vitest` (the reference) 1 fail — the flaky side was vitest, not the shim.
+  //
+  // With `interval === timeout` the condition is reached by the single advance
+  // inside waitFor's synchronous pre-check, so it resolves before any real timer
+  // is installed at all: no wall-clock dependency remains, rather than a wider
+  // window. The multi-tick polling loop stays covered by the "arrives in time"
+  // case above, whose margin is 460ms by the same arithmetic.
   it('waitFor under fake timers still observes a condition arriving exactly at the timeout', async () => {
     vi.useFakeTimers();
     try {
@@ -143,7 +167,7 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
       setTimeout(() => { ready = true; }, 100);
       const got = await vi.waitFor(
         () => { if (!ready) throw new Error('not yet'); return 'boundary'; },
-        { interval: 10, timeout: 100 },
+        { interval: 100, timeout: 100 },
       );
       expect(got).toBe('boundary');
     } finally {

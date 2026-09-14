@@ -16,6 +16,7 @@ import {
   findPendingAskByAnchor,
   invalidateAll,
   registerAsk,
+  registerHostAsk,
   setCardDispatcher,
   setCanTalkChecker,
   submitAsk,
@@ -146,6 +147,30 @@ describe('registerAsk happy path', () => {
 });
 
 describe('tryResolveAsk gating', () => {
+  it('pins a host-owned approval ask to one exact responder', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const pending = registerAsk(makeInput({ answererOpenId: 'ou_a' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const ask = d.sendCalls[0]!;
+
+    expect(ask.answererOpenId).toBe('ou_a');
+    expect(tryResolveAsk({
+      askId: ask.askId,
+      nonce: ask.nonce,
+      selected: 'yes',
+      by: 'ou_b',
+    })).toBe('unauthorized');
+    expect(tryResolveAsk({
+      askId: ask.askId,
+      nonce: ask.nonce,
+      selected: 'yes',
+      by: 'ou_a',
+    })).toBe('accepted');
+    await expect(pending).resolves.toMatchObject({ kind: 'answered', by: 'ou_a' });
+  });
+
   it('persists chatType and forwards it to the canTalk checker', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
@@ -300,6 +325,36 @@ describe('canTalk authorization (遵循 canTalk 权限)', () => {
 });
 
 describe('timeout', () => {
+  it('host ask starts its timeout only after the card is confirmed delivered', async () => {
+    let confirmDelivery!: (value: { messageId: string }) => void;
+    const d = mockDispatcher({
+      send: () => new Promise<{ messageId: string }>((resolve) => {
+        confirmDelivery = resolve;
+      }),
+    });
+    setCardDispatcher(d);
+
+    const p = registerHostAsk(makeInput({
+      originKind: 'host_cross_principal_classification',
+      requestId: 'classification-1',
+      timeoutMs: 1_000,
+    }));
+    await Promise.resolve();
+    expect(d.sendCalls).toHaveLength(1);
+
+    vi.advanceTimersByTime(60_000);
+    expect(_pendingCount()).toBe(1);
+
+    confirmDelivery({ messageId: 'om_delivered' });
+    await Promise.resolve();
+    await Promise.resolve();
+    vi.advanceTimersByTime(999);
+    expect(_pendingCount()).toBe(1);
+    vi.advanceTimersByTime(1);
+
+    await expect(p).resolves.toMatchObject({ kind: 'timedOut', timedOut: true });
+  });
+
   it('settles with kind:timedOut after deadlineMs elapses', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);

@@ -154,6 +154,8 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;

@@ -344,6 +344,19 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
   });
 
+  it('strips the luna-nudge override alongside the startup-update one (aiden x codex)', () => {
+    // aiden 1.8.38+ rejects passthrough -c outright; without whitelisting this
+    // botmux-injected value the launch would abort instead of merely losing it.
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
@@ -407,6 +420,16 @@ describe('buildWrappedLaunch', () => {
       'check_for_update_on_startup=false',
     ]);
     expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
+  });
+
+  it('rewrites the luna-nudge override to --config for cjadk codex', () => {
+    // Same -c → --config passthrough requirement as the startup-update override;
+    // cjadk's code subcommand claims -c as --command otherwise.
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'notice.hide_rate_limit_model_nudge=true']);
   });
 
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {

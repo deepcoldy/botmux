@@ -186,9 +186,15 @@ import {
   initWorkerPool,
   promoteQueuedActivationTail,
   restartCounts,
+  setActiveSessionsRegistry,
   sendWorkerInput,
   suspendWorker,
 } from '../src/core/worker-pool.js';
+import {
+  acquireDeviceIsolationFreeze,
+  releaseDeviceIsolationFreeze,
+  resetDeviceIsolationActivationForTest,
+} from '../src/core/device-isolation-activation.js';
 import {
   managedOriginCapabilityDirectory,
   readManagedOriginCapability,
@@ -263,6 +269,7 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+  vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
   __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
@@ -314,11 +321,15 @@ describe('host memory pressure worker admission', () => {
     });
     const ds = makeDs({ hasHistory: true });
 
-    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' })).toBe(true);
+    const admissions: string[] = [];
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' }, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
     await Promise.resolve();
 
     expect(forkMock).not.toHaveBeenCalled();
     expect(ds.worker).toBeNull();
+    expect(admissions).toEqual(['rejected']);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringMatching(/memory pressure.*retry/i),
@@ -327,6 +338,45 @@ describe('host memory pressure worker admission', () => {
       'om_retry',
       undefined,
     );
+  });
+
+  it('reports accepted after a worker receives its init message', () => {
+    const ds = makeDs();
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'hello', false, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['accepted']);
+  });
+
+  it('leaves explicit retry ownership with the caller during device isolation', async () => {
+    const ds = makeDs({ hasHistory: true });
+    setActiveSessionsRegistry(new Map([['active', ds]]));
+    acquireDeviceIsolationFreeze({
+      nonce: 'n'.repeat(32),
+      inventoryGeneration: 'g1',
+      leaseIdFactory: () => 'lease-1',
+    });
+    const admissions: string[] = [];
+
+    try {
+      expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_deferred' }, {
+        onAdmission: admission => admissions.push(admission),
+        deferDuringDeviceIsolation: false,
+      })).toBe(true);
+      expect(admissions).toEqual(['rejected']);
+      releaseDeviceIsolationFreeze({ nonce: 'n'.repeat(32), leaseId: 'lease-1' });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(admissions).toEqual(['rejected']);
+    } finally {
+      setActiveSessionsRegistry(undefined);
+      resetDeviceIsolationActivationForTest();
+    }
   });
 });
 
@@ -513,6 +563,97 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(2);
+  });
+
+  it('hands a deterministic pre-admission rejection back exactly once without retrying the worker input', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    let acceptHandoff: (() => void) | undefined;
+    const handoffAccepted = new Promise<void>(resolve => { acceptHandoff = resolve; });
+    const onOrdinaryImInputRejected = vi.fn(async () => {
+      await handoffAccepted;
+      return true;
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    const trustedCaller = {
+      requestUserOpenId: 'ou_b',
+      requestUserUnionId: 'on_b',
+      requestLarkAppId: 'app_test',
+      senderType: 'user' as const,
+    };
+    expect(sendWorkerInput(ds, {
+      content: 'business turn',
+      rerouteEnvelope: {
+        turnId: 'om_business',
+        text: 'business turn',
+        userPrompt: 'business turn',
+        senderName: 'B',
+        createdAt: 1,
+      },
+    }, 'om_business', { trustedCaller })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'om_active_a',
+      activeCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1));
+    // A concurrent duplicate reject attempt must join the same in-flight
+    // handoff rather than invoke the daemon callback again.
+    worker.emit('message', rejection);
+    await Promise.resolve();
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    acceptHandoff?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    // A later duplicate after durable acceptance also finds no delivery record.
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledWith(ds, expect.objectContaining({
+      turnId: 'om_business',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'om_active_a',
+      message: expect.objectContaining({
+        type: 'message',
+        turnId: 'om_business',
+        trustedCaller,
+        rerouteEnvelope: expect.objectContaining({ turnId: 'om_business' }),
+      }),
+    }));
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
@@ -3328,6 +3469,61 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     }));
     expect(init.turnId).toBeUndefined();
   });
+
+  it('refuses external adoption when the session carries a pinned Codex instance binding', () => {
+    const ds = makeAdoptDs();
+    ds.session.cliInstanceBinding = {
+      version: 1,
+      source: 'default',
+      instanceId: 'a',
+      cliId: 'codex',
+      codexHome: '/tmp/codex-a',
+      authMode: 'isolated',
+    };
+
+    expect(() => forkAdoptWorker(ds)).toThrow(
+      'External adoption cannot carry a Codex instance binding',
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an adopted turn accepted when post-init pid persistence fails', () => {
+    const ds = makeAdoptDs();
+    vi.mocked(sessionStore.updateSessionPid).mockImplementationOnce(() => {
+      throw new Error('pid persistence failed');
+    });
+
+    expect(forkAdoptWorker(ds, {
+      prompt: '<bridge>accepted once</bridge>',
+      turnId: 'om_adopt_pid_failure',
+    })).toBe('accepted');
+
+    const worker = ds.worker as any;
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      prompt: '<bridge>accepted once</bridge>',
+      turnId: 'om_adopt_pid_failure',
+    }));
+  });
+
+  it('cleans up and reports a synchronous adopt init send failure', () => {
+    const ds = makeAdoptDs();
+    const worker = makeFakeWorker();
+    worker.send.mockImplementationOnce(() => {
+      throw new Error('init send failed');
+    });
+    forkMock.mockReturnValueOnce(worker);
+
+    expect(() => forkAdoptWorker(ds, {
+      prompt: '<bridge>not accepted</bridge>',
+      turnId: 'om_adopt_send_failure',
+    })).toThrow('init send failed');
+
+    expect(ds.worker).toBeNull();
+    expect(ds.initConfig).toBeUndefined();
+    expect(worker.kill).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('session.start lifecycle integration', () => {
@@ -3909,7 +4105,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
     const ds = adopt();
     ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
-    forkAdoptWorker(ds);
+    expect(forkAdoptWorker(ds)).toBe('rejected');
     expect(forkMock).not.toHaveBeenCalled();
     expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
     expect(ds.adoptedFrom).toBeUndefined();
@@ -3927,7 +4123,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 
   it('no sandbox anywhere → adopt proceeds (fork + session.start)', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot());
-    forkAdoptWorker(adopt());
+    expect(forkAdoptWorker(adopt())).toBe('accepted');
     expect(forkMock).toHaveBeenCalled();
     expect(emitHookEventMock).toHaveBeenCalledWith('session.start', expect.objectContaining({
       reason: 'adopt',
@@ -3937,7 +4133,16 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 
 describe('managed turn authority worker generations', () => {
   it('keeps policy authority but invalidates live authority across claude_exit auto-restart', async () => {
-    const ds = makeDs();
+    const ds = makeDs({
+      activeInteractiveTurn: {
+        turnId: 'turn-before-crash',
+        caller: {
+          requestUserOpenId: 'ou_a',
+          requestLarkAppId: 'app_test',
+          senderType: 'user',
+        },
+      },
+    });
     forkWorker(ds, 'first', false);
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', {
@@ -3959,6 +4164,7 @@ describe('managed turn authority worker generations', () => {
       policyCapability: 'policy-worker-generation',
     });
     expect(ds.managedTurnOrigin?.capability).not.toBe('live-before-crash');
+    expect(ds.activeInteractiveTurn).toBeUndefined();
   });
 
   it('clears policy authority when a remote backend exits without restart', async () => {
@@ -4196,7 +4402,16 @@ describe('managed turn authority worker generations', () => {
   });
 
   it('revokes a live origin across an intentional CLI restart and accepts only the next turn token', () => {
-    const ds = makeDs();
+    const ds = makeDs({
+      activeInteractiveTurn: {
+        turnId: 'turn-before-restart',
+        caller: {
+          requestUserOpenId: 'ou_a',
+          requestLarkAppId: 'app_test',
+          senderType: 'user',
+        },
+      },
+    });
     forkWorker(ds, 'first', false);
     const worker = forkMock.mock.results.at(-1)!.value;
 
@@ -4228,6 +4443,7 @@ describe('managed turn authority worker generations', () => {
       policyCapability: 'policy-before-restart',
     });
     expect(ds.managedTurnOrigin?.capability).not.toBe('before-restart');
+    expect(ds.activeInteractiveTurn).toBeUndefined();
 
     // The first real turn on the replacement CLI rotates/re-publishes.
     worker.emit('message', {
@@ -4244,6 +4460,14 @@ describe('managed turn authority worker generations', () => {
       turnId: 'turn-after-restart',
       dispatchAttempt: 5,
     });
+    ds.activeInteractiveTurn = {
+      turnId: 'turn-after-restart',
+      caller: {
+        requestUserOpenId: 'ou_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    };
 
     // A late duplicate revoke for the old token cannot erase the new turn.
     worker.emit('message', {
@@ -4259,6 +4483,7 @@ describe('managed turn authority worker generations', () => {
       turnId: 'turn-after-restart',
       dispatchAttempt: 5,
     });
+    expect(ds.activeInteractiveTurn?.turnId).toBe('turn-after-restart');
   });
 
   it('keeps session-lifetime policy authority when turn terminal clears the live send capability', async () => {

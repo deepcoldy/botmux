@@ -613,7 +613,8 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(_ask: PendingAsk, locale?: Locale): string {
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

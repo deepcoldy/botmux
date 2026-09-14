@@ -470,6 +470,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -527,6 +528,7 @@ import {
   sessionAnchorId,
   storedSessionAnchorId,
   isDocNativeSession,
+  isHttpVirtualSession,
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
@@ -691,6 +693,8 @@ export interface WorkerPoolCallbacks {
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
+  /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
+  prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
   /** Close a stale session (message withdrawn, etc.). `false` means the
    * authoritative close failed and the active owner must remain retryable.
    * `void` is retained for older embedders/tests that implement a synchronous
@@ -713,6 +717,21 @@ export interface WorkerPoolCallbacks {
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
+  /** Worker-authoritative deterministic rejection handoff. Returning true
+   * means the daemon durably took ownership, so the original delivery record
+   * may be cleared without emitting the ambiguous-failure terminal. */
+  onOrdinaryImInputRejected?: (
+    ds: DaemonSession,
+    context: {
+      message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
+      turnId: string;
+      reason: string;
+      rejectedBeforeAdmission: boolean;
+      activeTurnId?: string;
+      activeCaller?: TrustedCaller;
+      activeController?: TrustedCaller;
+    },
+  ) => boolean | Promise<boolean>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -877,6 +896,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
     && ds.pendingRawInput === undefined
     && !ds.adoptedFrom
     && !ds.session.adoptedFrom
+    && !ds.session.headless
     && !ds.session.queued
     && !isRelayableRealSession(ds);
 }
@@ -7539,6 +7559,10 @@ type OrdinaryImDelivery = {
   received: boolean;
   transportConfirmed: boolean;
   delayNotified: boolean;
+  /** At most one daemon ownership handoff may run for a logical delivery.
+   * Duplicate worker reject events join this promise instead of creating a
+   * second durable record. */
+  rejectionHandoff?: Promise<boolean>;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -7806,16 +7830,56 @@ function completeStaleWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: str
   }
 }
 
-function rejectOrdinaryImDelivery(
+async function rejectOrdinaryImDelivery(
   ds: DaemonSession,
   turnId: string,
   workerGeneration: number,
-  reason: string,
-): void {
+  rejection: {
+    reason: string;
+    rejectedBeforeAdmission?: true;
+    activeTurnId?: string;
+    activeCaller?: TrustedCaller;
+    activeController?: TrustedCaller;
+  },
+): Promise<void> {
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
   const record = pendingOrdinaryImDeliveries.get(key);
   if (!record) return;
-  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
+  if (rejection.rejectedBeforeAdmission && requireCallbacks().onOrdinaryImInputRejected) {
+    if (record.rejectionHandoff) {
+      await record.rejectionHandoff;
+      return;
+    }
+    const handoff = Promise.resolve().then(() => requireCallbacks().onOrdinaryImInputRejected!(ds, {
+      message: record.message,
+      turnId,
+      reason: rejection.reason,
+      rejectedBeforeAdmission: true,
+      ...(rejection.activeTurnId ? { activeTurnId: rejection.activeTurnId } : {}),
+      ...(rejection.activeCaller ? { activeCaller: rejection.activeCaller } : {}),
+      ...(rejection.activeController ? { activeController: rejection.activeController } : {}),
+    }));
+    record.rejectionHandoff = handoff;
+    try {
+      const accepted = await handoff;
+      if (accepted) {
+        clearOrdinaryImDelivery(record);
+        logger.info(
+          `[${tag(ds)}] Ordinary IM rejection durably handed back to daemon `
+          + `turn=${turnId.substring(0, 16)} reason=${rejection.reason}`,
+        );
+        return;
+      }
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Ordinary IM rejection handoff failed turn=${turnId.substring(0, 16)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      if (record.rejectionHandoff === handoff) record.rejectionHandoff = undefined;
+    }
+  }
+  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${rejection.reason}`);
 }
 
 function settleOrdinaryImDeliveriesForWorker(
@@ -8702,6 +8766,7 @@ export async function forkSession(
     childTitle,
     targetChatType,
     targetScope,
+    { source: 'fork', inherit: ds.session },
   );
   // Provenance + fork wiring. cliSessionId points at the SOURCE's CLI id: the
   // child's first spawn resumes it and forks forward (pendingForkSession), then
@@ -8943,6 +9008,11 @@ function codexAppDeliverySinkForTurn(
   return 'lark';
 }
 
+function virtualDeliverySinkForChatId(chatId: string | undefined | null): CodexAppDeliverySink | undefined {
+  if (!isHttpVirtualSession(chatId)) return undefined;
+  return chatId?.startsWith('http_wait_') ? 'http_wait' : 'http_async';
+}
+
 /** A recovered transient/non-IM sink has no safe provider to replay into.
  * Treat it as consumed so the runner can advance, but never fall through to a
  * Lark card. Doc-comment replay also fails closed: chunk posting has no durable
@@ -8954,11 +9024,7 @@ function codexAppDeliveryMustFailClosed(
   const sink = entry.deliverySink
     ?? (ds.session.docCommentTargets?.[entry.turnId]
       ? 'doc_comment'
-      : ds.chatId.startsWith('http_wait_')
-        ? 'http_wait'
-        : ds.chatId.startsWith('http_async_')
-          ? 'http_async'
-          : 'lark');
+      : virtualDeliverySinkForChatId(ds.chatId) ?? 'lark');
   if (sink === 'suppressed') return true;
   if (sink === 'doc_comment') return !ds.docCommentTurns?.has(entry.turnId);
   if (sink === 'http_wait') return !ds.pendingWaitPromises?.has(entry.turnId);
@@ -9423,6 +9489,7 @@ export function sendWorkerInput(
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
+  const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
@@ -9470,6 +9537,7 @@ export function sendWorkerInput(
           // (admission computed once; never re-inferred downstream).
           ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          ...(trustedController ? { trustedController } : {}),
         },
         turnId: queuedTurnId,
         ...(opts.dispatchAttempt !== undefined
@@ -9539,6 +9607,8 @@ export function sendWorkerInput(
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(trustedController ? { trustedController } : {}),
+    ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
@@ -9854,6 +9924,7 @@ export function promoteQueuedActivationTail(
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
     ...(head.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
     ...(head.cliInput.trustedCaller ? { trustedCaller: head.cliInput.trustedCaller } : {}),
+    ...(head.cliInput.trustedController ? { trustedController: head.cliInput.trustedController } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
 
@@ -9929,6 +10000,7 @@ export function promoteQueuedActivationTail(
       // legitimate superseded settlement would be wrongly rejected.
       ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       ...(exactInput.trustedCaller ? { trustedCaller: exactInput.trustedCaller } : {}),
+      ...(exactInput.trustedController ? { trustedController: exactInput.trustedController } : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
@@ -9997,6 +10069,7 @@ export function admitQueuedActivationTail(
       // every queued/opening turn — the strip point that defeated the R4 fix.
       ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
+      ...(entry.cliInput.trustedController ? { trustedController: entry.cliInput.trustedController } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -10043,6 +10116,12 @@ export type ForkResumeOrTurnId = boolean | string | {
    *  finding #1). */
   atMostOnce?: boolean;
   trustedCaller?: TrustedCaller;
+};
+
+export type WorkerForkAdmission = 'accepted' | 'deferred' | 'rejected';
+export type ForkWorkerOptions = {
+  onAdmission?: (admission: WorkerForkAdmission) => void;
+  deferDuringDeviceIsolation?: boolean;
 };
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -10125,7 +10204,14 @@ export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
   resumeOrTurnId: ForkResumeOrTurnId = false,
+  opts: ForkWorkerOptions = {},
 ): boolean {
+  let admissionReported = false;
+  const reportAdmission = (admission: WorkerForkAdmission): void => {
+    if (admissionReported) return;
+    admissionReported = true;
+    opts.onAdmission?.(admission);
+  };
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
@@ -10156,6 +10242,7 @@ export function forkWorker(
     );
     // The request was handled by the retirement fence; false is reserved for
     // tail-only quarantine promotion failures by this function's contract.
+    reportAdmission('rejected');
     return true;
   }
   const transferGate = transferInputGates.get(ds);
@@ -10209,6 +10296,7 @@ export function forkWorker(
     // Buffered/deferred behind the routing transfer: no live worker started
     // now, but the turn is durably staged, so this is not the quarantine
     // refusal that boolean-false signals to callers.
+    reportAdmission('deferred');
     return true;
   }
 
@@ -10217,12 +10305,18 @@ export function forkWorker(
   // ANY session mutation or child fork. One deferred spawn per logical session
   // is replayed after the exact freeze lease is released; a session closed by
   // the activation transaction is deliberately not revived.
+  if (opts.deferDuringDeviceIsolation === false && currentDeviceIsolationFreezeLease()) {
+    logger.info(`[${tag(ds)}] worker spawn left retryable during device credential activation`);
+    reportAdmission('rejected');
+    return true;
+  }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    reportAdmission('deferred');
     return true;
   }
 
@@ -10231,12 +10325,18 @@ export function forkWorker(
   // before ANY prompt derivation or session mutation so a refusal is side-effect
   // free, and so a recovered plan rewrites the prompt/resume args used below.
   const quarantinePlan = resolveQuarantinedForkPlan(ds, promptInput, resumeOrTurnId);
-  if (!quarantinePlan.fork) return false;
+  if (!quarantinePlan.fork) {
+    reportAdmission('rejected');
+    return false;
+  }
   promptInput = quarantinePlan.promptInput;
   resumeOrTurnId = quarantinePlan.resumeOrTurnId;
 
   // Refuse a closed or superseded session before any mutation (master guard).
-  if (!canForkRegisteredSession(ds)) return false;
+  if (!canForkRegisteredSession(ds)) {
+    reportAdmission('rejected');
+    return false;
+  }
 
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const prompt = promptPayload.content;
@@ -10268,6 +10368,10 @@ export function forkWorker(
     ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
       ? resumeOrTurnId.trustedCaller
       : undefined);
+  // The controller is daemon-derived from the frozen session owner, never from
+  // a caller-supplied prompt envelope. It lets the real task owner regain
+  // control even when a bot/schedule currently owns the CLI turn.
+  const initTrustedController = trustedSessionController(ds);
   if (ds.session.queuedActivationPending && ds.session.queuedActivationResume !== undefined) {
     resume = ds.session.queuedActivationResume;
   }
@@ -10280,6 +10384,7 @@ export function forkWorker(
     && hasProtectedSessionMutationOwnership(ds)) {
     if (prompt.length === 0) {
       logger.warn(`[${tag(ds)}] Refused empty worker refork while durable activation ownership is non-empty`);
+      reportAdmission('rejected');
       return true;
     }
     if (hasQueuedActivationAdmissionGate(ds)) {
@@ -10297,6 +10402,7 @@ export function forkWorker(
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
           ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+          ...(initTrustedController ? { trustedController: initTrustedController } : {}),
         },
         turnId,
         ...(initDispatchAttempt !== undefined
@@ -10307,6 +10413,7 @@ export function forkWorker(
         `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
         + `(turn=${turnId})`,
       );
+      reportAdmission('deferred');
       return true;
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
@@ -10322,6 +10429,7 @@ export function forkWorker(
     logger[routed ? 'info' : 'warn'](
       `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,
     );
+    reportAdmission(routed ? 'accepted' : 'rejected');
     return true;
   }
 
@@ -10332,12 +10440,12 @@ export function forkWorker(
   for (const warning of admission.pressure.warnings) {
     if (hostPressureWarningsLogged.has(warning)) continue;
     hostPressureWarningsLogged.add(warning);
-    logger.warn(`[${tag(ds)}] Host memory pressure check degraded (fail-open): ${warning}`);
+    logger.warn(`[${tag(ds)}] Memory pressure check degraded (fail-open): ${warning}`);
   }
   if (!admission.allowed) {
     const reason = admission.reasons.join('; ');
-    logger.warn(`[${tag(ds)}] Worker admission blocked by host memory pressure: ${reason}`);
-    const retry = `Host memory pressure is critical: ${reason}. `
+    logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
+    const retry = `Memory pressure is critical: ${reason}. `
       + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
       + `(reserve ${formatMemoryBytes(admission.policy.minAvailableMemoryBytes)}, `
       + `PSI limit ${admission.policy.maxMemoryFullAvg10.toFixed(2)}%).`;
@@ -10352,6 +10460,7 @@ export function forkWorker(
       `[${tag(ds)}] Failed to report blocked worker admission: `
       + `${error instanceof Error ? error.message : String(error)}`,
     ));
+    reportAdmission('rejected');
     return true;
   }
   if (
@@ -10693,6 +10802,8 @@ export function forkWorker(
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+      ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     };
     ds.session.queuedActivationTurnId = initAttributionTurnId;
     ds.session.queuedActivationDispatchAttempt = initDispatchAttempt;
@@ -10896,7 +11007,10 @@ export function forkWorker(
       ? false
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
-    codexAuthSync: botCfg.codexAuthSync ?? 'shared',
+    codexAuthSync: ds.session.cliInstanceBinding
+      ? (ds.session.cliInstanceBinding.authMode === 'isolated' ? 'isolated' : 'shared')
+      : botCfg.codexAuthSync ?? 'shared',
+    cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
@@ -10907,7 +11021,7 @@ export function forkWorker(
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
+    env: ds.session.cliLaunchSnapshot || ds.session.cliInstanceBinding ? undefined : botCfg.env,
     // Freeze the normalized sparse reply style at worker spawn. Both the
     // session-rendered botmux-send guide and the CLI card renderer consume the
     // same env snapshot, so a dashboard edit cannot split their behavior inside
@@ -11030,6 +11144,7 @@ export function forkWorker(
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+    ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
@@ -11181,6 +11296,7 @@ export function forkWorker(
   } catch (err) {
     logger.error(`[${t}] Failed to record attached worker ownership: ${err instanceof Error ? err.message : String(err)}`);
   }
+  reportAdmission('accepted');
   return true;
 }
 
@@ -11624,7 +11740,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
-        rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
+        await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         break;
       }
       case 'turn_input_committed': {
@@ -12174,9 +12290,14 @@ function setupWorkerHandlers(
           const followUpCodexAppInput = followUp?.codexAppInputGateFrozen
             ? followUp.codexAppInput
             : codexAppInputForSession(ds, followUp?.codexAppInput);
+          if (rawTurnId) await requireCallbacks().prepareRawInputTurn?.(ds, rawTurnId);
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
+            ...(trustedSessionController(ds)
+              ? { trustedController: trustedSessionController(ds) }
+              : {}),
             // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
             // so they must carry the same credential snapshot a normal message
             // does — otherwise a cleared or rotated JWT simply did not apply here.
@@ -13152,6 +13273,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        ds.activeInteractiveTurn = undefined;
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
         // still eligible for same-worker crash recovery. Branches that cannot
@@ -13681,7 +13803,8 @@ function setupWorkerHandlers(
           }
 
           const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
-          const asyncSink = !!asyncResult || ds.chatId.startsWith('http_async_');
+          const asyncSink = !!asyncResult
+            || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
             nonLarkFailureHandled = true;
             const failedAt = Date.now();
@@ -13999,6 +14122,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
+        // Same-generation exact-turn revocation is positive idle evidence for
+        // daemon-side pre-routing. Never let historical caller/session fields
+        // keep this optimistic hint alive after the worker released authority.
+        if (ds.activeInteractiveTurn?.turnId === msg.turnId) {
+          ds.activeInteractiveTurn = undefined;
+        }
         // Same-worker IPC is ordered, but exact-match both authorities so a
         // delayed revoke can never clear a token already rotated by the next
         // turn. Live-send and policy authority are independent: a stale token
@@ -14276,6 +14405,16 @@ function setupWorkerHandlers(
                     turnId: msg.turnId,
                     dispatchAttempt: msg.dispatchAttempt,
                     status: 'completed',
+                    // The worker measured this turn; carry its numbers onto the
+                    // synthesized terminal. This row is written FIRST and the
+                    // store's INSERT OR IGNORE keeps it, so omitting the timing
+                    // here would permanently shadow the worker's real terminal.
+                    ...(settlement.completedAtMs !== undefined
+                      ? { completedAtMs: settlement.completedAtMs }
+                      : {}),
+                    ...(settlement.durationMs !== undefined
+                      ? { durationMs: settlement.durationMs }
+                      : {}),
                   }, { workerGeneration });
                 } catch (err) {
                   logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
@@ -14466,6 +14605,7 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
       }
@@ -14683,18 +14823,32 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
-async function persistFinalOutputFeedback(
+/** Record the canonical final-answer delivery for this turn.
+ *
+ * This is turn-completion bookkeeping, NOT a feedback side effect: the row is
+ * what a later `turn_terminal` correlates against to emit `turn.completed` with
+ * the real completion time and native duration. It is therefore written whether
+ * or not a feedback control rides on the card — `policy`/`baseCard` are the only
+ * parts that depend on the feedback policy, and their absence simply means the
+ * card has no clickable control.
+ *
+ * Best-effort: the answer is already delivered, so a persistence failure is
+ * logged, never thrown. */
+async function persistFinalOutputDelivery(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   content: string,
   effectiveCliId: string,
   messageId: string,
-  policy: import('../services/feedback-policy.js').FeedbackPolicy,
-  baseCard: Record<string, unknown>,
+  policy: import('../services/feedback-policy.js').FeedbackPolicy | undefined,
+  baseCard: Record<string, unknown> | undefined,
   requesterSubjectId: string | undefined,
   webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
 ): Promise<void> {
+  // A control needs BOTH the policy and the card snapshot to stay clickable
+  // after a restart; either one missing means "record the delivery, no control".
+  const carriesFeedbackControl = !!policy && !!baseCard;
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
@@ -14714,18 +14868,18 @@ async function persistFinalOutputFeedback(
       cliVersion: ds.cliVersion,
       model: ds.session.model,
       reasoningEffort: ds.session.reasoningEffort,
-      cardMode: 'feedback',
+      cardMode: carriesFeedbackControl ? 'feedback' : 'card',
       status: 'delivered',
       usage: msg.usage,
-      policy,
-      baseCard,
-      requesterSubjectId,
+      ...(carriesFeedbackControl ? { policy, baseCard, requesterSubjectId } : {}),
+      // turn.completed webhooks are a completion concern, not a feedback one:
+      // they must keep firing with the feedback card turned off.
       webhookDestinations,
       context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
     });
   } catch (error) {
     logger.warn(
-      `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
+      `[${logTag}] Failed to persist final-output turn delivery: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -15159,8 +15313,11 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
-        if (feedbackPolicy && baseFeedbackCard) {
-          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        // Managed VC receivers are accounted in their own delivery store and
+        // never correlate to a feedback turn_terminal; skip them. Every other
+        // fallback final is recorded regardless of the feedback policy.
+        if (!managedReceiver) {
+          await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
@@ -15217,8 +15374,10 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
-      if (feedbackPolicy && baseFeedbackCard && messageId) {
-        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+      if (messageId && !managedReceiver) {
+        // Normal fallback final only; managed VC receivers have their own
+        // delivery accounting and no feedback turn_terminal to correlate to.
+        await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
       }
       onComplete?.(true);
     } catch (err: any) {
@@ -15333,18 +15492,26 @@ export function adoptSandboxBlocked(
     // so it could read this host's bots.json / sibling creds on behalf of a
     // no-transport turn. Convert to cold-start instead (same as sandbox adopt).
     || botCfg.apiOnly === true
-    || (typeof session?.chatId === 'string'
-        && (session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')))
+    || isHttpVirtualSession(session?.chatId)
     || session?.sandbox === true
     || sandboxEnabled();
 }
 
-export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
+export function forkAdoptWorker(
+  ds: DaemonSession,
+  opts?: {
+    restoredFromMetadata?: boolean;
+    prompt?: string;
+    turnId?: string;
+    trustedCaller?: TrustedCaller;
+  },
+): 'accepted' | 'rejected' {
+  if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);
-    return;
+    return 'rejected';
   }
-  if (!canForkRegisteredSession(ds)) return;
+  if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
   const cb = requireCallbacks();
   const t = tag(ds);
@@ -15376,7 +15543,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       ds.session.adoptedFrom = undefined;
       try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
     }
-    return;
+    return 'rejected';
   }
 
   // Reserve before replacing an existing bridge worker for the same reason as
@@ -15424,7 +15591,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     } as NodeJS.ProcessEnv,
   });
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
+  const adoptedCliId = adopted.cliId ?? 'claude-code';
+  let initMsg!: DaemonToWorker;
 
+  try {
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
   // Adopt has no worker IPC in this case either, so reply from the daemon just
   // like the normal-session fork guard.
@@ -15482,7 +15652,6 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     the append-only agent-transcript JSONL, then harvests final replies
   //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
-  const adoptedCliId = adopted.cliId ?? 'claude-code';
   // Claude adopt needs a sessionId to compute bridgeJsonlPath (the worker's
   // claude branch starts its transcript bridge ONLY from bridgeJsonlPath — it
   // has no by-pid fallback like codex/traex/cursor). Discovery resolves the
@@ -15517,7 +15686,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
-  const initMsg: DaemonToWorker = {
+  initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
@@ -15548,6 +15717,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     // wrapper leaks into the user's un-injected external CLI.
     prompt: opts?.prompt ?? '',
     turnId: opts?.turnId,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(trustedSessionController(ds)
+      ? { trustedController: trustedSessionController(ds) }
+      : {}),
     resume: false,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
@@ -15595,52 +15768,75 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
+  ds.worker = worker;
   worker.send(initMsg);
+  } catch (err) {
+    if (ds.worker === worker) ds.worker = null;
+    try { worker.kill(); } catch { /* best-effort pre-init child fence */ }
+    throw err;
+  }
+
+  // init is now accepted by the child. Everything below is projection only and
+  // must not turn this prompt back into a retryable delivery.
   ds.initConfig = initMsg;
-  // New generation ledger. NOT a plain reset: the previous generation's keys are
-  // parked until its worker is observed to exit, because the double-fork guard
-  // kills asynchronously and spawns the replacement synchronously.
-  startNewGenerationEnvLedger(ds, initMsg.env);
-  // Stamp cliId on the persisted session so the dashboard can show a CLI badge
-  // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
-  // Do this before installing worker handlers: a fast worker can emit `ready`
-  // immediately after init, and card rendering must use the adopted CLI identity.
+  try {
+    startNewGenerationEnvLedger(ds, initMsg.env);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
+  }
   const adoptedCliIdTyped = adoptedCliId as CliId;
   if (ds.session.cliId !== adoptedCliIdTyped) {
     ds.session.cliId = adoptedCliIdTyped;
-    sessionStore.updateSession(ds.session);
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      logger.error(`[${t}] Failed to persist adopted CLI identity: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
-
-  // Use shared handler
-  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
-
-  ds.worker = worker;
   ds.spawnedAt = Date.now();
   ds.cliVersion = '';
-  // Persist the bridge worker's pid, exactly like forkWorker. Without it the
-  // session row keeps pid=null, so `botmux list` (and killStalePids) judge an
-  // adopt session by "process dead AND no bmx-<id> tmux" — but adopt attaches to
-  // the user's OWN tmux/zellij pane, never a bmx-* session, so the heuristic
-  // always reported it unrecoverable and auto-pruned it to "closed" right after
-  // /adopt. Storing the worker pid (botmux's bridge, NOT the user's CLI) makes
-  // liveness consistent with normal sessions and leaves the user's CLI alone.
-  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  try {
+    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  } catch (err) {
+    logger.error(`[${t}] Failed to persist adopt worker pid: ${err instanceof Error ? err.message : String(err)}`);
+  }
   logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
 
   ds.exitEventEmitted = false;
-  dashboardEventBus.publish({
-    type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
-  });
-  cb.enforceLiveSessionCap?.();
-  emitSessionLifecycleHook(ds, 'session.start', {
-    reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
-    pid: worker.pid ?? null,
-    adoptedFrom: adopted.tmuxTarget,
-  });
-  // Adopted CLIs come with pre-botmux history — anchor it out of the ledger.
-  anchorUsageForDaemonSession(ds);
-  recordOwnershipForDaemonSession(ds);
+  try {
+    dashboardEventBus.publish({
+      type: 'session.spawned',
+      body: { session: composeRowFromActive(ds) },
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to publish adopt worker state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    cb.enforceLiveSessionCap?.();
+  } catch (err) {
+    logger.error(`[${t}] Failed to enforce live-session cap after adopt: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    emitSessionLifecycleHook(ds, 'session.start', {
+      reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
+      pid: worker.pid ?? null,
+      adoptedFrom: adopted.tmuxTarget,
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to emit adopt worker lifecycle hook: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    anchorUsageForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize adopt worker usage state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    recordOwnershipForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to record adopt worker ownership: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return 'accepted';
 }
 
 // ─── Reap orphan workers ────────────────────────────────────────────────────
@@ -15942,7 +16138,7 @@ function cleanupPersistentBackendSessions(
       .map(s => backend.sessionName(s.sessionId)),
   );
   const runtimeNames = new Set(
-    runtimeSessionRows.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
   );
   const ownedSessions = [
     ...storedSessions.filter(belongsToBackend),
@@ -16091,6 +16287,7 @@ function cleanupPersistentBackendSessions(
     killManagedExactHerdrTargets(true);
     for (const session of activeSessions_) {
       if (!belongsToBackend(session)) continue;
+      if (session.cliInstanceBinding) continue;
       // The remote TUI deliberately uses cliId=codex even when the Bot's
       // default/new-session runtime remains codex-app. This is a shared-adopt
       // binding, not a stale CLI selection, so keep its bmx-* client alive for

@@ -357,7 +357,15 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(ds.session.pendingRepoSetup?.turnId).toBe('om_msg_pr2');
   });
 
-  it('new topic staged + queued durably: failing repo card keeps exactly one queue item and never advises a resend', async () => {
+  // A failing repo card used to escape this handler and land here as an
+  // "admitted, do not resend" notice. That was the least-bad reading of a wedge:
+  // the turn was durably staged behind a picker that did not exist, so every
+  // follow-up hit 「请先在上方卡片中选择仓库」 and a restart re-published the same
+  // card. The publish sites now degrade instead — no picker means fork with the
+  // default cwd — so the turn actually runs. The invariant this case was written
+  // for still holds and is what it now pins: a failed card never advises a
+  // resend and never duplicates the queue item.
+  it('new topic staged + queued durably: a failing repo card degrades to a working session instead of wedging', async () => {
     const anchor = 'om_msg_nt_admitted';
     mocks.scanMultipleProjects.mockReturnValue([
       { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
@@ -372,13 +380,72 @@ describe('durable admission then failing status reply → no resend advice (PR #
       return 'om_top';
     });
 
-    await expect(
-      handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor)),
-    ).rejects.toThrow('lark card send failure');
+    await handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor));
 
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(repliedText()).not.toContain(resendNotice());
-    expect(repliedText()).toContain(admittedNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
     expect(messageQueue.readUnread(anchor).length).toBe(1);
+  });
+
+  // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走
+  // forkReservedInitialRawSession，auto-create 走 noteTurnReceived +
+  // forkReservedInitialSession），所以分别钉住，避免只在一处补了兜底。
+  it('initial raw passthrough: a failing repo card runs the command on the default cwd', async () => {
+    const anchor = 'om_msg_raw_passthrough';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // /goal is claude-code's adapter default passthrough → initial raw passthrough route.
+    await handleNewTopic(makeEventData(anchor, '/goal ship the fix'), makeCtx(anchor, anchor));
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    // The raw command survives the degradation — it is what gets executed.
+    expect(ds?.pendingRawInput).toBe('/goal ship the fix');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+  });
+
+  it('thread auto-create: a failing repo card forks the new session on the default cwd', async () => {
+    const anchor = 'om_autocreate_root';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // A reply under a root with no session → auto-create takes the picker route.
+    await handleThreadReply(
+      makeEventData('om_autocreate_msg', 'auto create me', anchor),
+      makeCtx(anchor, 'om_autocreate_msg'),
+    );
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
   });
 
   it('a failing admitted-notice never masks the original status-reply error', async () => {

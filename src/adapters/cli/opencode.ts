@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -502,12 +503,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     asksViaHook: true,
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
-    modelChoices: [
-      'anthropic/claude-sonnet-4',
-      'anthropic/claude-opus-4',
-      'openai/gpt-5',
-      'google/gemini-2.5-pro',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['opencode'],
   };
 }
 

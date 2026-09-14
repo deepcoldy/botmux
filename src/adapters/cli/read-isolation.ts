@@ -363,7 +363,9 @@ export function buildSeatbeltProfile(
 // would keep failing TLS on UnknownIssuer with no output at all.
 // 14 pins canonical SESSION_DATA_DIR and matching managed-origin mounts on
 // Linux. Warm reattach would retain the old lexical env/mount namespace split.
-export const ISOLATION_PANE_MARKER_VERSION = 14;
+// 15 adds an inherited Linux seccomp isolation probe. Existing processes cannot
+// acquire it on warm reattach and must cold-spawn under the new contract.
+export const ISOLATION_PANE_MARKER_VERSION = 15;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
