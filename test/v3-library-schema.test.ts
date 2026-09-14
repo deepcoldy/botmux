@@ -143,6 +143,65 @@ describe('v3 Saved Workflow library schema', () => {
       .toThrow(/businessTask.*hostExecutor feishu-send\/feishu-reply/s);
   });
 
+  it.each([
+    '不要执行任何 botmux send…',
+    '禁止调用 botmux send。',
+    '不得运行 botmux reply。',
+    '严禁使用 botmux send。',
+    '勿调用 botmux send。',
+    'Never run botmux send.',
+    'Do NOT run botmux send.',
+    "Don't run botmux reply.",
+    'No botmux send commands.',
+    '严格只读，不要执行任何 botmux send 或 botmux reply 或其它对外发消息的命令。',
+  ])('does not flag an explicit prohibition: %s', (text) => {
+    const dag = dagTemplate(text);
+    dag.nodes[0]!.humanGate = { prompt: text };
+    dag.nodes[0]!.override = { systemPromptAppend: text };
+
+    expect(collectSavedWorkflowChatSideEffectProblems(dag)).toEqual([]);
+    const { workflowId, humanVersion, createdAt, createdBy, ...draft } = payload({
+      dagTemplate: dag,
+      safety: { gateDigest: computeSavedWorkflowGateDigest(validateDagTemplate(dag)), sideEffects: [] },
+    });
+    expect(validateSavedWorkflowRevisionDraft(draft).dagTemplate.nodes[0]).toMatchObject({
+      goal: text,
+      humanGate: { prompt: text },
+      override: { systemPromptAppend: text },
+    });
+  });
+
+  it.each(['。', '.', '；', ';', '\n', '/', '，', ','])('keeps negation within the %j clause boundary', (separator) => {
+    const dag = dagTemplate(`不要执行 botmux send${separator}完成后用 botmux send 汇报。`);
+    expect(collectSavedWorkflowChatSideEffectProblems(dag)).toMatchObject([{
+      nodeId: 'research', kind: 'botmux-send', path: 'dagTemplate.nodes.research.goal',
+    }]);
+  });
+
+  it.each([
+    '完成后用 botmux send 汇报。但不要发给外部群。',
+    'Run botmux send but do not notify external chats.',
+    '不要执行 botmux send 但完成后用 botmux reply 汇报。',
+    'Do not run botmux send but run botmux reply afterwards.',
+    'No changes are needed; run botmux send.',
+  ])('still flags an affirmative instruction next to a prohibition: %s', (text) => {
+    expect(collectSavedWorkflowChatSideEffectProblems(dagTemplate(text))).toMatchObject([{
+      nodeId: 'research', kind: 'botmux-send',
+    }]);
+  });
+
+  it.each([
+    ['不要调用 /open-apis/im/v1/messages。', []],
+    ['调用 /open-apis/im/v1/messages 发消息。', [{ kind: 'feishu-openapi-message' }]],
+    ['不要调用 lark-cli im send。', []],
+    ['不要发消息，完成后用 lark-cli im send 汇报。', [{ kind: 'lark-cli-im' }]],
+    ['不要调用 lark-cli im send，完成后用 lark-cli im send 汇报。', [{ kind: 'lark-cli-im' }]],
+    ['Do not use bytedcli feishu send; use bytedcli feishu reply.', [{ kind: 'bytedcli-feishu' }]],
+    ['Do not use lark openapi send; use lark openapi reply.', [{ kind: 'feishu-openapi-message' }]],
+  ])('preserves command detection across API path separators: %s', (text, expected) => {
+    expect(collectSavedWorkflowChatSideEffectProblems(dagTemplate(text))).toMatchObject(expected);
+  });
+
   it('detects a chat-facing side effect nested inside a loop body goal', () => {
     const loopDag: V3DagTemplate = {
       nodes: [{
