@@ -44,6 +44,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { noteTurnReceived } from '../src/daemon.js';
+import * as sessionStore from '../src/services/session-store.js';
 import {
   initWorkerPool,
   __testOnly_finishTurnReactions as finishTurnReactions,
@@ -81,6 +82,7 @@ describe('two-phase turn reactions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-'));
+    sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
   });
@@ -397,6 +399,7 @@ describe('turn reaction screen_update behavioral gate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
+    sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
     registerWith(true);
