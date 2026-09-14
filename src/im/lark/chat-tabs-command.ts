@@ -3,7 +3,7 @@ import { logger } from '../../utils/logger.js';
 import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
 import { replyMessage } from './client.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { addUrlChatTab, deleteChatTab, listChatTabs, renameChatTab, sortChatTabs, type ChatTab } from './chat-tabs.js';
+import { deleteChatTab, ensureUrlChatTab, listChatTabs, renameChatTab, sortChatTabs, type ChatTab } from './chat-tabs.js';
 
 type TabsCommand =
   | { action: 'list' }
@@ -109,8 +109,8 @@ export async function tryHandleChatTabsCommand(
       const tabs = await listChatTabs(larkAppId, chatId);
       await reply(tabs.length ? `${s.heading}\n${tabs.map(tabLine).join('\n')}` : s.empty);
     } else if (command.action === 'add') {
-      const tabs = await addUrlChatTab(larkAppId, chatId, command.url, command.name);
-      await reply(`${s.added}${tabs[0]?.tab_id ? `：${tabs[0].tab_id}` : ''}`);
+      const result = await ensureUrlChatTab(larkAppId, chatId, command.url, command.name);
+      await reply(`${s.added}${result.tab.tab_id ? `：${result.tab.tab_id}` : ''}`);
     } else if (command.action === 'rename') {
       await renameChatTab(larkAppId, chatId, command.tabId, command.name);
       await reply(s.renamed);

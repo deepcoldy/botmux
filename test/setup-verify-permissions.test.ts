@@ -340,6 +340,12 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(entry?.critical).toBe(true);
   });
 
+  it('checks the optional chat-tab scopes at startup', () => {
+    const scopes = new Map(BOTMUX_REQUIRED_SCOPES.map(scope => [scope.name, scope]));
+    expect(scopes.get('im:chat.tabs:read')?.critical).toBe(false);
+    expect(scopes.get('im:chat.tabs:write_only')?.critical).toBe(false);
+  });
+
   it('every required scope exists in lark-scopes.json manifest (no bare names that Lark API would never return)', async () => {
     // Regression: BOTMUX_REQUIRED_SCOPES used bare names `im:chat` /
     // `im:message.group_at_msg` that don't exist in Lark's scope catalog —

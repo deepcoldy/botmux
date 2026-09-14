@@ -90,6 +90,8 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
   { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
   { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
+  { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
+  { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

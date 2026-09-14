@@ -763,10 +763,13 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 42 = master 的 40 条 + /tabs + /tab。
+    // /tabs 与 /tab 由 Lark pre-routing 拦截，不属于 daemon command；否则
+    // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(42);
+    expect(DAEMON_COMMANDS.size).toBe(40);
+    expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
