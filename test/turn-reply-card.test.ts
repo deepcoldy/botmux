@@ -505,6 +505,28 @@ describe('public process and fallback compatibility', () => {
     expect(turnReplyCardRequestBytes(buildTurnReplyCard(record, presentation), record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
   });
 
+  it('borrows unused narration space for tools when the whole card overflows', () => {
+    const record = processRecord(100, 0);
+    const output = 'x'.repeat(800);
+    record.tools.forEach(tool => { tool.result = output; });
+    const narration = ['NARRATION_A', 'NARRATION_B', 'NARRATION_C'];
+    record.activity!.push(...narration.map(text => ({ kind: 'thinking' as const, id: text, text })));
+    const card = buildTurnReplyCard(record, presentation);
+    const panel = JSON.parse(card).body.elements.find((element: any) => element.tag === 'collapsible_panel');
+    const history: string = panel.elements[0].content;
+    const shownTools = (history.match(/\*\*TOOL_\d+\*\*/g) ?? []).length;
+    // Even without labels or card overhead, half the entire request cannot
+    // hold more than this many outputs. Showing more requires budget lending.
+    const halfCardToolLimit = Math.floor(TURN_REPLY_CARD_MAX_BYTES / 2 / Buffer.byteLength(output));
+    expect(shownTools).toBeGreaterThan(halfCardToolLimit);
+    expect(history.split(output).length - 1).toBe(shownTools);
+    expect(history).toContain('**TOOL_99**');
+    for (const text of narration) expect(history).toContain(text);
+    expect(history).toContain('已截断');
+    expect(panel.header.title.content).toBe(`📋 执行过程（已展示 ${shownTools} / 100 次工具调用）`);
+    expect(turnReplyCardRequestBytes(card, record.chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+
   it.each(['```', '~~~~'])( 'closes a truncated %s code fence before later tools and the notice', fence => {
     const record = processRecord(1, 0);
     record.activity = [
