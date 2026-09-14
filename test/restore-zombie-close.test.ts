@@ -784,7 +784,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     s.agentFrozen = true;
     s.cliInstanceBinding = { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: '/private/legacy-home', authMode: 'global' };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     bot.cliId = 'traex';
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
