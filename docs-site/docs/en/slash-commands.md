@@ -107,7 +107,7 @@ The group-level setting overrides the dashboard "Bot Config → Regular Group Mo
 
 | Command | Description |
 |------|------|
-| `/tabs` / `/tabs list` | List every tab in the current chat and its Tab ID |
+| `/tabs` / `/tab` / `/tabs list` | List every tab in the current chat and its Tab ID (`/tab` is a compatibility alias) |
 | `/tabs add <url> [name]` | Add a URL tab (owner or authorized operator required) |
 | `/tabs rename <tab_id> <name>` | Rename an editable URL or document tab |
 | `/tabs delete <tab_id>` | Delete an editable URL or document tab |

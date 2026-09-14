@@ -107,7 +107,7 @@ botmux 日常运维
 
 | 命令 | 说明 |
 |------|------|
-| `/tabs` / `/tabs list` | 查看当前群的全部标签页及其 Tab ID |
+| `/tabs` / `/tab` / `/tabs list` | 查看当前群的全部标签页及其 Tab ID（`/tab` 是兼容别名） |
 | `/tabs add <网址> [名称]` | 新增 URL 标签页（修改需 owner 或获授权的操作人） |
 | `/tabs rename <tab_id> <新名称>` | 重命名可编辑的 URL / 文档标签页 |
 | `/tabs delete <tab_id>` | 删除可编辑的 URL / 文档标签页 |
