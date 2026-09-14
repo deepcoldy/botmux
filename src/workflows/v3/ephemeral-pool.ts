@@ -13,6 +13,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { WorkerToDaemon } from '../../types.js';
+import type { BackendType } from '../../adapters/backend/types.js';
+import { config } from '../../config.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -247,7 +249,9 @@ async function runNodeImpl(
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,
     ...workflowSandboxInitFields(req.botSnapshot),
-    backendType: 'pty' as const,
+    // Local terminal backend only: tmux when the daemon runs tmux, otherwise
+    // PTY (see v3WorkerBackendType for why it is never the daemon backend as-is).
+    backendType: v3WorkerBackendType(),
     prompt: '',
     resume: false,
     larkAppId: req.botSnapshot.larkAppId,
@@ -548,6 +552,26 @@ export const spawnWorkerFactory: WorkerProcessFactory = {
  * `worker.js` exists on disk and this path is ignored). `deps.workerPath` stays
  * injectable for tests.
  */
+/**
+ * Terminal backend for a v3 ephemeral worker.
+ *
+ * Previously hardcoded to `'pty'`, which forced every workflow worker onto
+ * node-pty. Under the compiled single-file binary on macOS that path is
+ * unusable (even with the spawn-helper materialized, the helper stalls in
+ * `open(ttyname(stdin))` under the Bun host), so when the daemon runs tmux the
+ * worker follows it — the daemon's own sessions already run there and
+ * workflow-worker mode has a dedicated non-PTY branch.
+ *
+ * Any other daemon backend keeps the old PTY behavior. In particular the pool
+ * must never inherit a remote backend (riff/mojo): it has no DaemonSession and
+ * sends raw_input without a credential snapshot (see the exemption in
+ * test/mojo-wiring.test.ts), and the other multiplexers are not exercised by
+ * goal-mode workers.
+ */
+export function v3WorkerBackendType(daemonBackend: BackendType = config.daemon.backendType): 'tmux' | 'pty' {
+  return daemonBackend === 'tmux' ? 'tmux' : 'pty';
+}
+
 function defaultWorkerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   // src/workflows/v3 → dist root (matches worker-pool.ts `join(__dirname, '..')`).

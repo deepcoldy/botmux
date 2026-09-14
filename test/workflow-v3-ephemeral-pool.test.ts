@@ -5,7 +5,8 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory } from '../src/workflows/v3/ephemeral-pool.js';
+import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
+import { config } from '../src/config.js';
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
@@ -68,6 +69,15 @@ afterEach(async () => {
   }
 });
 
+describe('v3WorkerBackendType', () => {
+  it('follows a tmux daemon and keeps PTY for every other backend, never a remote one', () => {
+    expect(v3WorkerBackendType('tmux')).toBe('tmux');
+    for (const backend of ['pty', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'] as const) {
+      expect(v3WorkerBackendType(backend), backend).toBe('pty');
+    }
+  });
+});
+
 describe('v3 ephemeral pool', () => {
   it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
     const home = join(dir, 'codex-a');
@@ -91,7 +101,7 @@ describe('v3 ephemeral pool', () => {
     const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret' });
     const running = pool.runNode(req);
     await worker.waitForInit();
-    expect(worker.init).toMatchObject({ backendType: 'pty', cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
+    expect(worker.init).toMatchObject({ backendType: v3WorkerBackendType(), cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
     worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
     worker.emitMessage({ type: 'prompt_ready' });
     worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
@@ -179,6 +189,9 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.cliId).toBe('claude-code');
     expect(worker.init?.larkAppSecret).toBe('secret');
     expect(worker.init?.prompt).toBe('');
+    // Worker init follows the daemon's resolved backend (tmux by default),
+    // never the old hardcoded 'pty' which is unusable in the compiled binary.
+    expect(worker.init?.backendType).toBe(v3WorkerBackendType(config.daemon.backendType));
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
