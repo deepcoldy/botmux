@@ -7,15 +7,15 @@
  * determined later by validating BOTMUX_GOAL_MANIFEST_PATH.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { WorkerToDaemon } from '../../types.js';
+import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
-  forkWorkerJsFactory,
   syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
@@ -57,7 +57,7 @@ export interface EphemeralPoolDeps {
 }
 
 export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode } {
-  const factory = deps.factory ?? forkWorkerJsFactory;
+  const factory = deps.factory ?? spawnWorkerFactory;
   const workerPath = deps.workerPath ?? defaultWorkerPath();
   const quiesceMs = deps.quiesceMs ?? 500;
   const cancelGraceMs = deps.cancelGraceMs ?? 5000;
@@ -492,11 +492,66 @@ export function buildGoalCommand(req: RunNodeRequest): string {
   return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
 }
 
+/**
+ * Default worker factory for the v3 pool.
+ *
+ * Delegates to {@link spawnWorker}, which is the ONLY correct way to launch our
+ * own worker entry across both runtime shapes:
+ *   • Node (npm/dev): `fork(<distDir>/worker.js)` — byte-for-byte the old
+ *     `forkWorkerJsFactory` behavior.
+ *   • Bun single-file binary: there is no `worker.js` on disk, so re-exec THIS
+ *     binary with the hidden `__worker` subcommand over the same IPC channel.
+ *
+ * The pre-fix `forkWorkerJsFactory` blindly `fork()`ed `deps.workerPath`, and
+ * in a compiled binary `defaultWorkerPath()` resolved that to a bogus
+ * `.../src/worker.ts`; `fork` then re-exec'd the binary with that path as a
+ * subcommand, which the workflow worker-fence allowlist rejected (exit 2). Here
+ * `opts.workerPath` is the dist directory (see {@link defaultWorkerPath}); a
+ * standalone binary ignores it and uses the `__worker` subcommand instead.
+ */
+export const spawnWorkerFactory: WorkerProcessFactory = {
+  spawn(opts) {
+    const child = spawnWorker({
+      distDir: opts.workerPath,
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    return {
+      send: (message) => child.send(message as never),
+      on: (event: string, cb: (...args: unknown[]) => void) => {
+        child.on(event as never, cb);
+      },
+      kill: (signal) => {
+        // `child.killed` flips to true when kill(2) is *sent*, not when the
+        // process exits; guarding on it would suppress TERM/KILL escalation
+        // after an ignored SIGINT. Only an observed exit is terminal.
+        if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+      },
+      get pid() {
+        return child.pid;
+      },
+      get stdout() {
+        return child.stdout;
+      },
+      get stderr() {
+        return child.stderr;
+      },
+    } as WorkerHandle;
+  },
+};
+
+/**
+ * The dist directory whose `worker.js` the Node path forks. `spawnWorker`
+ * resolves the actual entry: `<distDir>/worker.js` under Node, or the hidden
+ * `__worker` subcommand of the running binary when standalone (where no
+ * `worker.js` exists on disk and this path is ignored). `deps.workerPath` stays
+ * injectable for tests.
+ */
 function defaultWorkerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
-  const candidate = join(here, '..', '..', 'worker.js');
-  if (existsSync(candidate)) return candidate;
-  return join(here, '..', '..', '..', 'src', 'worker.ts');
+  // src/workflows/v3 → dist root (matches worker-pool.ts `join(__dirname, '..')`).
+  return join(here, '..', '..');
 }
 
 function stdoutPath(req: RunNodeRequest): string {
