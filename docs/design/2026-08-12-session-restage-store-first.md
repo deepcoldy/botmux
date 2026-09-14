@@ -193,6 +193,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 - `session-store` 对每个 store 给出三态：`ready`（有 `.db`）、`unmigrated`（无 `.db`、有 `sessions-<appId>.json`）、`absent`（两者都无）。判别只做 `existsSync`，不解析 JSON。**只对仍然存在的 bot 判 `unmigrated`**：bots.json 里配置的、当前有 descriptor 在线的、以及本进程所属的 appId（`services/known-bot-app-ids.ts`）。被移出 bots.json 的 bot 留下的 `sessions-<appId>.json` 是废弃数据，没有任何 daemon 会再导入它，不能让 `botmux list` 永远提示「请重启 daemon」（dogfooding 时本机就有 4 份这样的残留）。这是删除 JSON 读路径后 store 对 JSON 文件名仅存的两处认知之一（另一处是导入源）。
 - `UnownedRowBlocked` 增加 `unmigrated` 判别值，与 `missing`（行不存在）分开；`loadAllSessionsSnapshot` 的返回带上 `unmigratedAppIds`。
+- 破坏性路径不做「不计入」：#956 的 worktree 回收清单（`findActiveSessionsByWorkingDirStrict`，`/close` 删 worktree 与延迟清理任务）在读任何 store 之前先按上一条的「仍然存在的 bot」判定（该判定在此处必须是结论性的：bots.json 或 descriptor 目录读不到时直接抛错，不把「无法判定」折成「废弃」），任一 store 仍为 `unmigrated` 即抛 `SessionStoreUnmigratedError`，调用方转成「无法完整读取同 worktree 会话清单，已取消删除」。原因：未重启的 bot 在该 worktree 上的活动会话只存在于它尚未导入的 JSON 里，跳过等于删掉别人正在用的目录。已移出 bots.json 的残留 JSON 仍按上一条视为废弃数据，不阻塞。
 - 一条共享文案常量，三个落点：`cli.ts#loadSessions()` 之上做一次「本次命令涉及哪些 appId」的统一判定并打印；`offlineBlockedError` 映射 `unmigrated`；`whiteboard-store#deleteWhiteboard` 的返回增加 reason 通道（今天只有 `unresolvedSessions` 计数，dashboard 看不到原因）。
 - 「没有活跃会话。」这句话有 4 个出口（`cli.ts:4960` cmdList、`4985` cmdDelete、`6061` cmdTermLink、`4565` TUI 空态）；有 `unmigrated` store 时都不得打它。
 - 跨 bot **读**路径（`inherit-peer.ts:62-63` 继承 workingDir、`schedule-follow-active.ts:126` 落点选择、`command-handler.ts:5259` /adopt 去重、`restart-report.ts:132` 计数）在删除 JSON 读后对未迁移 bot 静默降级：不继承、不排除、少计。它们不是话题接管判定，接受降级，但 `restart-report` 要接住 `SessionStoreSqliteUnavailableError`（`countActiveSessionsOnDisk` 会把它抛出）。
@@ -238,6 +239,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - 提示只给**写命令**：`botmux delete`、`botmux list` 的自动 prune（按命令去重，只打一次）、`botmux whiteboard` 绑定、dashboard 删板。`botmux send` 不写会话行，它的失败只有 `unmigrated` 一种（§3.3）。`restart / stop / start / status / upgrade / setup / dashboard` 必须无条件放行。
 - 按「是否会话子进程」分流：有 `BOTMUX_SESSION_ID` 或 origin channel 的进程只陈述状态（「daemon 当前不接受会话库写入，本次未做任何修改」），**不给 `botmux restart` 这样的 fleet 级指令**，也不带 pid / 端口 / 版本号——完全不开沙盒的会话里 CLI 子进程是合法宿主，会读到这段文案，一个照做的 agent 会重启整个 bot。带版本号与命令的文案只在操作员 shell 输出。
 - 隔离判定（`isolatedCliProcess()`）前移到 `cli.ts:3850` / `3915` 的 `occupancyHeld` 之前，保证隔离会话只看到通用文案。
+- 编译版二进制里 dashboard 进程读到的 `current` 是自身烘焙的版本而不是磁盘上的（`install-info.ts` 的 baked 遮蔽），「运行中 daemon vs 磁盘」在 dashboard 侧一律按无法判定处理（不出提示、不给历史弹层 staleHint）；编译态的重启提示由 install.sh 的安装后输出与 `botmux status` 的 VERSION 列承担（后者由磁盘上的新二进制自己运行，版本即磁盘版本）。
 - 本机多 checkout 场景：CLI 的 dist 与 daemon 的 dist 经常来自不同 checkout（`bun run build` 故意不认领全局指向）。文案要说清是「运行中的 daemon」旧，不能一律建议 `botmux restart`（那会让 review worktree 抢走全局指向）；`0.0.0` 一律按「无法判定」处理。
 - 现成先例：`cli.ts:3690` `ISOLATED_CLI_OFFLINE_ERROR`、`core/session-marker.ts:118`。
 
