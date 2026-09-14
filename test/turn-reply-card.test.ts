@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
-import { buildTurnReplyCard, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import type { CotEntry } from '../src/types.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
@@ -56,6 +57,47 @@ describe('one reply card per turn', () => {
     await store.update(nextKey, { kind: 'start' }, io);
     expect(cards.size).toBe(2);
     expect(cards.get(start.messageId!)).toBe(body);
+  });
+
+  it.each([false, true])('preserves interim narration in the same card with extended thinking=%s', async withThinking => {
+    const entries: CotEntry[] = [
+      { kind: 'text', text: '先检查项目配置' },
+      { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'config.ts' },
+      { kind: 'tool_result', id: 'read', result: 'config contents' },
+      { kind: 'text', text: '配置已确认，继续运行测试' },
+      { kind: 'tool_call', id: 'test', name: 'Bash', args: '{}', subject: 'bun run test' },
+      ...(withThinking ? [{ kind: 'thinking' as const, text: '确认两项检查的结果一致' }] : []),
+    ];
+    const update = (snapshot: CotEntry[]) => store.update(key, {
+      kind: 'tools', tools: publicReplyCardTools(snapshot, true), activity: publicReplyCardActivity(snapshot),
+    }, io);
+    const started = await update(entries.slice(0, 3));
+    await update(entries);
+    await update(entries); // Repeated cumulative snapshots must not duplicate narration.
+
+    const persisted = new TurnReplyCardStore(dir).read(key)!;
+    expect(persisted.activity?.map(item => item.kind)).toEqual([
+      'thinking', 'tool', 'thinking', 'tool', ...(withThinking ? ['thinking'] : []),
+    ]);
+    const narration = ['先检查项目配置', '配置已确认，继续运行测试', ...(withThinking ? ['确认两项检查的结果一致'] : [])];
+    expect(persisted.activity?.flatMap(item => item.kind === 'thinking' ? [item.text] : [])).toEqual(narration);
+    expect(persisted.tools).toEqual([
+      { id: 'read', name: 'Read', subject: 'config.ts', completed: true, result: 'config contents' },
+      { id: 'test', name: 'Bash', subject: 'bun run test' },
+    ]);
+    for (const text of narration) expect(cards.get(started.messageId!)).toContain(text);
+
+    await store.update(key, finalEvent(), io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    const finished = new TurnReplyCardStore(dir).read(key)!;
+    expect(finished.messageId).toBe(started.messageId);
+    expect(finished.finalText).toBe('完整答复');
+    const history = extractCardContent(cards.get(started.messageId!)!);
+    for (const text of narration) expect(history.split(text)).toHaveLength(2);
+    const hidden = buildTurnReplyCard(finished, { ...presentation, showProcess: false });
+    expect(hidden).toContain('完整答复');
+    for (const text of narration) expect(hidden).not.toContain(text);
   });
 
   it('serializes independent publishers and fences progress after final delivery', async () => {

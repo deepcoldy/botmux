@@ -67,7 +67,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
-import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -4446,9 +4446,9 @@ const THINKING_EMIT_INTERVAL_MS = 1_500;
 const THINKING_ACCUMULATED_CAP = 60_000;
 let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
-/** Thinking paragraphs + tool calls/results in transcript order — each
- *  becomes its own node in the native CoT message. Append-only within a
- *  turn. */
+/** Thinking paragraphs, interim assistant narration and tool calls/results
+ *  in transcript order — each becomes its own node in the native CoT message.
+ *  Append-only within a turn. */
 let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
@@ -4456,6 +4456,7 @@ let thinkingCapNoted = false;
 function cotEntryChars(e: CotEntry): number {
   switch (e.kind) {
     case 'thinking': return e.text.length;
+    case 'text': return e.text.length;
     case 'tool_call': return e.name.length + e.args.length + (e.subject?.length ?? 0);
     case 'tool_result': return e.result.length;
   }
@@ -4467,6 +4468,34 @@ let thinkingLastEmitMs = 0;
  *  timeline (resetting when the turn changes) and schedule a throttled emit.
  *  Claude feeds this via transcript attribution, Codex via the structured
  *  bridge queue's cot observer. */
+/**
+ * Drop the nothing-to-send sentinel from a narration entry before it reaches
+ * the bubble.
+ *
+ * The sentinel travels as an ordinary `text` block, so once the CoT timeline
+ * started carrying `text` it would render the bare token to the user — on a
+ * silent turn the bubble would consist of nothing else. The reply card never
+ * shows it (`bridge-fallback-gate` strips it downstream); the bubble is a
+ * separate channel and had no such filter.
+ *
+ * Filtering here rather than in `extractCotEntries` is deliberate:
+ * `claude-transcript.ts` sits at the bottom of the dependency graph
+ * (bridge-fallback-gate → bridge-turn-queue → claude-transcript), so importing
+ * the gate there would close a cycle. This module already imports the gate, and
+ * is the accumulation core BOTH Claude and Codex feed — so a sentinel filtered
+ * here never enters the timeline, the 60KB budget, or the IPC payload.
+ *
+ * Returns null when nothing survives (skip the entry), otherwise the entry with
+ * a trailing sentinel line removed. `stripTrailingBridgeSentinelLine` only
+ * matches a trailing line, so an inline mention stays untouched.
+ */
+function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
+  if (entry.kind !== 'text') return entry;
+  const stripped = stripTrailingBridgeSentinelLine(entry.text);
+  if (stripped.trim().length === 0) return null;
+  return stripped === entry.text ? entry : { kind: 'text', text: stripped };
+}
+
 function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
   if (entries.length === 0) return;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
@@ -4485,9 +4514,16 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     }
     return;
   }
+  // Adopt mode keeps the literal token: the adopted CLI does not know botmux
+  // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
+  // the reply card shows it verbatim. Stripping it from the bubble alone would
+  // make the two messages of one turn contradict each other.
+  const adoptMode = lastInitConfig?.adoptMode === true;
   for (const entry of entries) {
-    thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    const kept = adoptMode ? entry : cotEntryWithoutSentinel(entry);
+    if (!kept) continue;
+    thinkingEntries.push(kept);
+    thinkingTotalChars += cotEntryChars(kept);
   }
   scheduleThinkingEmit();
 }
@@ -4545,11 +4581,12 @@ let codexBridgeBaselineDone = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
-// Codex CoT: rollout reasoning/tool events attributed to the collecting turn
-// feed the same thinking channel as Claude's transcript attribution. Other
-// structured bridges (traex/cursor/pi/…) never emit 'cot' events, so this
-// observer is inert for them. Local (adopt) turns are skipped for the same
-// reason as Claude's: no Lark turn to anchor the bubble to.
+// Structured rollout CoT: Codex response items and TraeX history mutations emit
+// rollout reasoning/tool events attributed to the collecting turn, feeding
+// the same thinking channel as Claude's transcript attribution. Other
+// structured bridges (cursor/pi/…) never emit 'cot' events, so this observer
+// is inert for them. Local (adopt) turns are skipped for the same reason as
+// Claude's: no Lark turn to anchor the bubble to.
 codexBridgeQueue.setCotObserver((entries, turn) => {
   if (turn.isLocal) return;
   observeCotEntries(entries, turn);
@@ -14573,6 +14610,7 @@ async function spawnCli(
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.
     // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
     bypassHookTrust: config.bypassCodexHookTrust,
+    hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
     skillPluginDir: cfg.skillPluginDir,
     // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
     // needs Codex's read-isolation shell-env behavior.

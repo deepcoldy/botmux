@@ -493,6 +493,7 @@ describe('codex buildArgs', () => {
 
   it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
     const args = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
       // even with BOTH bypass toggles on, the --remote viewer early-returns before
@@ -561,7 +562,7 @@ describe('codex buildArgs', () => {
   });
 
   it('passes the effective working directory as Codex agent root', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', bypassHookTrust: true });
+    const args = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false, workingDir: '/repo/root', bypassHookTrust: true });
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--dangerously-bypass-hook-trust',
@@ -578,7 +579,7 @@ describe('codex buildArgs', () => {
   });
 
   it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
+    const args = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
     expect(args).toEqual([
       '--no-alt-screen',
       '-c',
@@ -605,13 +606,14 @@ describe('codex buildArgs', () => {
     // Codex 0.151+ shows a "Switch to <luna> for lower credit usage?" popup at
     // >=90% primary usage; its default item switches models, and the paste
     // path's submit Enter would confirm it (#1281). Process-level -c only.
-    const fresh = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    const fresh = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false });
     const idx = fresh.indexOf('notice.hide_rate_limit_model_nudge=true');
     expect(idx).toBeGreaterThan(0);
     expect(fresh[idx - 1]).toBe('-c');
 
     // Must survive resume as well, placed before the resumed session id.
     const resumed = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'sess-4',
       resume: true,
       resumeSessionId: 'codex-session-id',
@@ -626,6 +628,7 @@ describe('codex buildArgs', () => {
     // is itself a TUI that renders the modal; keep the pane free of it like the
     // startup update picker, before the resumed thread id.
     const args = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
     });

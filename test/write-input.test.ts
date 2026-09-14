@@ -1348,6 +1348,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
@@ -1370,6 +1371,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
@@ -1395,7 +1397,7 @@ describe('codex writeInput submission confirmation', () => {
     appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
@@ -1417,7 +1419,7 @@ describe('codex writeInput submission confirmation', () => {
       resetCodexHistory();
       appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
       const adapter = createCodexAdapter('/bin/codex');
-      expect(adapter.buildArgs({ sessionId: 'custom-botmux-session', resume: true })).toEqual([
+      expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
         'resume',
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
@@ -1445,7 +1447,7 @@ describe('codex writeInput submission confirmation', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
       '-c',
@@ -1462,6 +1464,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       workingDir: '/repo/root',

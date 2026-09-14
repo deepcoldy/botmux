@@ -29,6 +29,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -179,6 +180,7 @@ function parseSettings(s: any): DashboardSettings {
     codexRpcInput: s?.codexRpcInput === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -720,7 +722,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -869,6 +871,13 @@ function SettingsBody(props: {
             checked={settings.bypassCodexHookTrust}
             disabled={dis || savingKey === 'bypassCodexHookTrust'}
             onChange={value => saveBoolean('bypassCodexHookTrust', value)}
+          />
+          <ToggleRow
+            title={tr('settings.hideCodexRateLimitModelNudge')}
+            help={tr('settings.hideCodexRateLimitModelNudgeHelp')}
+            checked={settings.hideCodexRateLimitModelNudge}
+            disabled={dis || savingKey === 'hideCodexRateLimitModelNudge'}
+            onChange={value => saveBoolean('hideCodexRateLimitModelNudge', value)}
           />
           <CodexNotifierSettingsEditor
             value={settings.codexNotifier}

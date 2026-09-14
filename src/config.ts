@@ -368,6 +368,7 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

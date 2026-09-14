@@ -38,7 +38,7 @@ export function publicReplyCardTools(entries: readonly CotEntry[], showResults: 
 
 /** Only text already emitted by the CLI is available here (often a summary). */
 export function publicReplyCardActivity(entries: readonly CotEntry[]): ReplyCardActivity[] {
-  return entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking'
+  return entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking' || entry.kind === 'text'
     ? [{ kind: 'thinking', id: `thinking:${index}`, text: bounded(entry.text, 4000) }]
     : entry.kind === 'tool_call' ? [{ kind: 'tool', id: entry.id }] : []);
 }

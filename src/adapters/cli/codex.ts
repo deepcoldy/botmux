@@ -178,11 +178,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
       // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
+      // A submit Enter can accept Codex's low-quota picker (default: switch).
+      // Suppress it at the TUI boundary, including the RPC viewer. Keep this
+      // independent of approval/sandbox bypass and leave user config untouched.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       if (remoteWsUrl && remoteThreadId) {
         // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
         // NO terminal input path, so codex's interactive "Update available … Press
@@ -197,7 +203,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // it suppressed like the startup update picker.
         return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen',
           '-c', 'check_for_update_on_startup=false',
-          '-c', 'notice.hide_rate_limit_model_nudge=true',
+          ...modelNudgeArgs,
           remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
@@ -241,8 +247,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // (never show again)"; never written to the user's global config. Added
         // on BOTH TUI launch shapes (this plain pane and the --remote viewer
         // above); app-server/runner CLIs render no TUI popup and need no flag.
-        '-c',
-        'notice.hide_rate_limit_model_nudge=true',
+        ...modelNudgeArgs,
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by
