@@ -330,8 +330,8 @@ function terminalSourceStatus(runDir: string, runId: string): TerminalSourceStat
     throw new SavedWorkflowServiceError(
       'source_not_terminal',
       waitingNode
-        ? `最近的 run ${runId} 还没结束，status=${status}（正在等待 ${waitingNode} 的人工审批），跑完后再 save`
-        : `最近的 run ${runId} 还没结束，status=${status}，跑完后再 save`,
+        ? `run ${runId} 还没结束，status=${status}（正在等待 ${waitingNode} 的人工审批），跑完后再 save`
+        : `run ${runId} 还没结束，status=${status}，跑完后再 save`,
       [],
       { runId, runStatus: status, ...(waitingNode ? { waitingNode } : {}) },
     );
