@@ -150,3 +150,20 @@ git diff --check
 ```
 
 另用临时目录、真实 `buildFsPolicy`/`compileToSeatbelt` 和 `sandbox-exec` 做了 macOS 内核探针：共享记录内容读取报 `EPERM`，自身 `turn-sends/sid.jsonl` 可写，`bots-info.json` 可读。Bun 1.4.2 下记录的 `existsSync` 为 `true`，因此本机不能复现“existsSync=false 后另发消息”的具体推导，更可能在读取阶段报错；Linux 又有宿主 relay，不能声称两端必然表现相同。实际确认的是权限缺口与错误的功能资格。探针只访问临时测试数据，未在真实 sandbox Bot 的飞书对话中做端到端验证。
+
+### 同步 master 后的兼容验证
+
+合并 `1352ad80`，保留宿主 Ask 的来源字段、送达后计时和跨身份打断校验，同时保留单卡交付结果。Ask/恢复/身份权限定向 6 文件 **126 项通过**；扩展到单卡、沙盒、会话启动、队列、转移和中断的 32 文件批量回归：**1404 项通过、1 项失败、10 项跳过**，完整构建通过。
+
+唯一失败是已有 `/tw` worktree 用例中 `/var` 与 `/private/var` 的路径比较。在独立的未修改 master 副本中运行以下同一用例，同样失败；本分支将 `TMPDIR` 设为规范的 `/private/var/.../T` 后复跑，**1 项通过**。未为这个既有路径问题修改业务代码或测试预期。
+
+```bash
+bun run test test/ask-broker.test.ts test/ask-resume-restart.test.ts \
+  test/turn-reply-ask.test.ts test/turn-reply-card-runtime.test.ts \
+  test/active-turn-authority.test.ts test/cross-principal-interruption-store.test.ts \
+  --no-file-parallelism --silent
+# 以下命令分别在 master 对照副本和本分支运行；本分支复跑时使用规范化 TMPDIR。
+bun run test test/daemon-rename-route.test.ts \
+  -t 'creates a topic that starts from a worktree' --silent
+bun run build
+```
