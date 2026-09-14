@@ -14219,6 +14219,13 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // workflow, deployment, or external messaging effect.
     'preview',
     'session-ready',
+    // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
+    // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
+    // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
+    // a workflow subagent submits — omitting it makes the fence reject
+    // `botmux user-prompt-hook` (exit 2), which Claude surfaces as the whole
+    // prompt being "blocked by hook", so a v3 worker's `/goal` never lands.
+    'user-prompt-hook',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
     'schedule',
