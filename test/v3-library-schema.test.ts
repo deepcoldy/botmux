@@ -202,6 +202,66 @@ describe('v3 Saved Workflow library schema', () => {
     expect(collectSavedWorkflowChatSideEffectProblems(dagTemplate(text))).toMatchObject(expected);
   });
 
+  describe.each(['goal', 'humanGate', 'override'] as const)('enumerations in %s', (field) => {
+    function withText(text: string): V3DagTemplate {
+      const dag = dagTemplate();
+      if (field === 'goal') dag.nodes[0]!.goal = text;
+      if (field === 'humanGate') dag.nodes[0]!.humanGate = { prompt: text };
+      if (field === 'override') dag.nodes[0]!.override = { systemPromptAppend: text };
+      return dag;
+    }
+
+    it.each([
+      ['不要执行任何 botmux send / botmux reply 或其它对外发消息的命令', false],
+      ['不要执行任何 botmux send/botmux reply', false],
+      ['禁止 botmux send / botmux reply', false],
+      ['不要执行 botmux send/完成后用 botmux send 汇报。', true],
+      ['禁止在 A/B 测试中调用 botmux send', false],
+      ['不要输出文件2.完成后用 botmux send 汇报。', true],
+      ['不要运行 v1.2 版本的 botmux send', false],
+      ['完成后用 botmux send 汇报', true],
+      ['执行 botmux send --mention xxx 通知用户', true],
+      ['不要执行 botmux send、botmux reply / 不要执行 botmux send 和 botmux reply', false],
+      ['不要执行 botmux send.完成后用 botmux send 汇报', true],
+      ['Do not run botmux send/run botmux reply afterwards.', true],
+      ['不要写文件/botmux send 汇报', true],
+      ['Do not run botmux send. botmux reply', true],
+      ['禁止 `botmux send` / `botmux reply`', false],
+      ['不要执行 botmux send/botmux reply/botmux send', false],
+      ['不要执行 botmux send/botmux reply 和 botmux send', false],
+      ['禁止调用 lark-cli version/完成后用 botmux send 汇报。', true],
+      ['禁止运行 bytedcli feishu --version; 完成后用 botmux send 汇报。', true],
+    ])('classifies %s', (text, blocked) => {
+      const problems = collectSavedWorkflowChatSideEffectProblems(withText(text));
+      expect(problems).toHaveLength(blocked ? 1 : 0);
+      if (blocked) expect(problems[0]!.kind).toBe('botmux-send');
+    });
+
+    it.each([
+      ['botmux send', 'botmux reply', 'botmux-send'],
+      ['bytedcli feishu send', 'bytedcli feishu reply', 'bytedcli-feishu'],
+      ['lark-cli im send', 'lark-cli im reply', 'lark-cli-im'],
+      ['/open-apis/im/v1/messages', '/open-apis/im/v1/chats', 'feishu-openapi-message'],
+      ['lark openapi send', 'lark openapi reply', 'feishu-openapi-message'],
+      ['im.v1.message.create', 'im.v1.message.reply', 'feishu-openapi-message'],
+    ])('preserves negation for %s / %s but not a new instruction', (first, second, kind) => {
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(`禁止调用 ${first} / ${second}`))).toEqual([]);
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(`禁止调用 ${first}/完成后调用 ${second}`)))
+        .toMatchObject([{ kind }]);
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(`调用 ${first} / ${second}`)))
+        .toMatchObject([{ kind }]);
+    });
+
+    it('inherits negation across command families', () => {
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(
+        '禁止 botmux send / lark-cli im reply / /open-apis/im/v1/messages / im.v1.message.create',
+      ))).toEqual([]);
+      expect(collectSavedWorkflowChatSideEffectProblems(withText(
+        '禁止 botmux send / lark-cli im reply/完成后调用 im.v1.message.create',
+      ))).toMatchObject([{ kind: 'feishu-openapi-message' }]);
+    });
+  });
+
   it('detects a chat-facing side effect nested inside a loop body goal', () => {
     const loopDag: V3DagTemplate = {
       nodes: [{

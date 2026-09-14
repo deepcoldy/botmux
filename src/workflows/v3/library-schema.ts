@@ -414,7 +414,7 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   const botProblems: string[] = [];
   validateDirectBotSelectors(nodes, undefined, 'dagTemplate.nodes', botProblems);
   if (botProblems.length > 0) throw new SavedWorkflowSchemaError(botProblems);
-  // Keep text lint at authoring boundaries so existing revisions remain loadable.
+  // Read-path deserialization must not retroactively reject pre-lint revisions; exact save confirms warnings separately.
   return {
     ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion as 1 | 2 } : {}),
     nodes,
@@ -465,10 +465,10 @@ function gateProjection(nodes: V3Node[], prefix = ''): unknown[] {
 
 const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [
   { kind: 'botmux-send', re: /\bbotmux\s+(?:send|reply)\b/i },
-  { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*\b(?:send|reply|message|im|chat)\b/i },
-  { kind: 'lark-cli-im', re: /\blark-cli\b.*\b(?:send|reply|message|im|chat)\b/i },
+  { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*?\b(?:send|reply|message|im|chat)\b(?:[ \t]+(?:send|reply|message|im|chat)\b)*/i },
+  { kind: 'lark-cli-im', re: /\blark-cli\b.*?\b(?:send|reply|message|im|chat)\b(?:[ \t]+(?:send|reply|message|im|chat)\b)*/i },
   { kind: 'feishu-openapi-message', re: /\/open-apis\/im\/v1\/(?:messages|chats)\b/i },
-  { kind: 'feishu-openapi-message', re: /\b(?:feishu|lark)\b.*\bopenapi\b.*\b(?:send|reply|message)\b/i },
+  { kind: 'feishu-openapi-message', re: /\b(?:feishu|lark)\b.*?\bopenapi\b.*?\b(?:send|reply|message)\b/i },
   { kind: 'feishu-openapi-message', re: /\bim\.v1\.message\.(?:create|reply|patch)\b/i },
 ];
 
@@ -488,17 +488,31 @@ function collectStrings(value: unknown, path: string, out: Array<{ path: string;
   }
 }
 
-function hasAffirmativeChatSideEffect(text: string, pattern: RegExp): boolean {
-  // Look ahead so a greedy pattern cannot hide a later affirmative command.
-  for (const match of text.matchAll(new RegExp(`(?=${pattern.source})`, `${pattern.flags}g`))) {
-    // Split only the prefix so slashes/dots inside an API command stay intact.
-    const clausePrefix = text.slice(0, match.index)
-      .split(/[。；;，,\r\n.!?！？/]|但是|但|然而|\b(?:but|however)\b/i).at(-1)!;
-    if (!/(?:不要|禁止|不得|严禁|勿|\b(?:never|do\s+not|don['’]t|no)\b)/i.test(clausePrefix)) {
-      return true;
+function findAffirmativeChatSideEffect(text: string): string | undefined {
+  const commands = CHAT_SIDE_EFFECT_PATTERNS.flatMap(({ kind, re }) =>
+    [...text.matchAll(new RegExp(`(?=(${re.source}))`, `${re.flags}g`))].map((match) => ({
+      start: match.index,
+      end: match.index + match[1]!.length,
+      kind,
+    })))
+    .sort((a, b) => a.start - b.start || b.end - a.end)
+    // A broad CLI pattern must not swallow a separately named command.
+    .filter((command, index, matches) => command.end <= (matches[index + 1]?.start ?? Infinity));
+  let previousEnd: number | undefined;
+  for (const command of commands) {
+    const prefix = text.slice(previousEnd ?? 0, command.start);
+    // Only bare list connectors inherit a preceding command's prohibition.
+    const continuesList = previousEnd !== undefined &&
+      /^[ \t`"'“”‘’]*(?:(?:\/|、|和|或(?:者)?|以及|与|\b(?:and|or)\b)[ \t`"'“”‘’]*)+$/i.test(prefix);
+    // Command spans are excluded; keep word-internal slashes and decimal points intact.
+    const clausePrefix = prefix
+      .split(/(?<!\d)\.|\.(?!\d)|[。；;，,\r\n!?！？]|(?<![A-Za-z0-9])\/|\/(?![A-Za-z0-9])|但是|但|然而|\b(?:but|however)\b/i).at(-1)!;
+    if (!continuesList && !/(?:不要|禁止|不得|严禁|勿|\b(?:never|do\s+not|don['’]t|no)\b)/i.test(clausePrefix)) {
+      return command.kind;
     }
+    previousEnd = command.end;
   }
-  return false;
+  return undefined;
 }
 
 function pushChatSideEffectProblems(
@@ -518,19 +532,17 @@ function pushChatSideEffectProblems(
     strings,
   );
   for (const item of strings) {
-    for (const pattern of CHAT_SIDE_EFFECT_PATTERNS) {
-      if (!hasAffirmativeChatSideEffect(item.value, pattern.re)) continue;
-      problems.push({
-        nodeId,
-        path: item.path,
-        kind: pattern.kind,
-        guidance:
-          `Move chat notification out of goal node "${nodeId}": split it into ` +
-          'businessTask (write result.json/final_message.md) plus a hostExecutor ' +
-          'feishu-send/feishu-reply node that reads the upstream result.',
-      });
-      break;
-    }
+    const kind = findAffirmativeChatSideEffect(item.value);
+    if (!kind) continue;
+    problems.push({
+      nodeId,
+      path: item.path,
+      kind,
+      guidance:
+        `Move chat notification out of goal node "${nodeId}": split it into ` +
+        'businessTask (write result.json/final_message.md) plus a hostExecutor ' +
+        'feishu-send/feishu-reply node that reads the upstream result.',
+    });
   }
 }
 
