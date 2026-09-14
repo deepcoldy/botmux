@@ -458,6 +458,16 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           }
         }
       }
+      // Rich-text uploads made through some Lark clients are not inline nodes.
+      // They arrive beside the localized post body as a top-level `files` array.
+      // Resolve that body first (above), then append these descriptors; pushIfNew
+      // collapses a file that Lark happens to represent in both places.
+      const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
+      for (const file of topLevelFiles) {
+        if (file?.file_key) {
+          pushIfNew(resources, { type: 'file', key: file.file_key, name: file.file_name ?? file.file_key });
+        }
+      }
       return resources;
     }
 
