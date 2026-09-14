@@ -2683,6 +2683,34 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
   });
 
+  it('/th 与 /tw 生命周期别名在路由层翻成新话题（普通群 @bot /th 不再落进 chat-scope）', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    // 真实事故形态：普通群里「@bot /th @另一个bot 正文」被当普通消息，/th 失效。
+    const withMention = {
+      content: JSON.stringify({ text: '/th @_user_1 看下这个' }),
+      mentions: [{ key: '@_user_1', name: 'Worker Claude Pro', id: { openId: OTHER_BOT_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r1, withMention, 'om_th', MY_APP_ID)).toBe(true);
+    expect(r1).toEqual({ scope: 'thread', anchor: 'om_th', forceTopicApplied: true });
+
+    // /tw 同样翻 scope（worktree 模式由 daemon 在归一后的 /t worktree 上解析）。
+    const tw = { content: JSON.stringify({ text: '/tw 修复登录' }), mentions: [] };
+    const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r2, tw, 'om_tw', MY_APP_ID)).toBe(true);
+    expect(r2).toEqual({ scope: 'thread', anchor: 'om_tw', forceTopicApplied: true });
+  });
+
+  it('/th /tw 必须是行首完整 token，正文里提到 /the 或 /two 不触发翻话题', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    for (const text of ['请看 /the 文档', '/two issues', '前缀 /th 不在行首']) {
+      const message = { content: JSON.stringify({ text }), mentions: [] };
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(routing, message, 'om_x', MY_APP_ID)).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
+  });
+
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
     // /t 和 /topic 走同一条 parseTopicHeader，别让别名成为绕过 vetting 的后门。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效

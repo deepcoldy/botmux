@@ -2733,6 +2733,25 @@ function stripHeaderMentions(rawText: string, message: any, larkAppId: string): 
  * Already-thread messages (real Lark 话题, p2p, 话题群) are left alone:
  * the prefix is still stripped downstream by handleNewTopic.
  */
+/**
+ * 把生命周期兼容别名 `/th`、`/tw` 归一成路由层认得的裸 `/t`。
+ *
+ * daemon 的新话题处理器会自己做这层归一（见 command-handler 的
+ * parseForceTopicInvocation / daemon 里的 lifecycleAlias），但**路由层**
+ * （maybeApplyForceTopicOverride）在它之前就要决定 chat→thread 是否翻 scope，
+ * 那里只认 parseTopicHeader 的哨兵 `/t` `/topic`。若路由不归一，普通群里
+ * 「@bot /th …」「@bot /tw …」就不会被翻成新话题，而是落进 chat-scope 的
+ * 普通消息车道，别名永远到不了 daemon 的归一逻辑——表现为 /th /tw 失效。
+ *
+ * 只做**行首**、且必须是完整 token（`/th` 不匹配 `/the`）；别名后面的正文原样保留，
+ * here/worktree 模式由 daemon 在归一后的 `/t …` 上照旧解析（`/t here|worktree` 与
+ * 由 `/th` `/tw` 推导出的 forceTopicMode）。
+ */
+function normalizeLifecycleAliasForRouting(text: string): string {
+  return text.replace(/^\s*\/(th|tw)(?=\s|$)/i, (match, alias: string) =>
+    alias.toLowerCase() === 'tw' ? '/t worktree' : '/t here');
+}
+
 export function maybeApplyForceTopicOverride(
   routing: { scope: 'thread' | 'chat'; anchor: string; forceTopicApplied?: boolean },
   message: any,
@@ -2742,7 +2761,9 @@ export function maybeApplyForceTopicOverride(
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
-  const stripped = stripHeaderMentions(rawText, message, larkAppId);
+  const stripped = normalizeLifecycleAliasForRouting(
+    stripHeaderMentions(rawText, message, larkAppId),
+  );
   // 指令头（`[标题] /t …`）与裸 `/t` 走同一条判定。只认**解析成功**的头部：写错了的
   // 头部要留在原地被拒绝（回一句用法错误），不能先把 scope 改成新话题——那已经是副作用。
   // 这里只需要 yes/no，所以沿用按位置剥前导 @ 即可；daemon 侧会按身份重新精确解析。
