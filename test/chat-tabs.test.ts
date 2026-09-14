@@ -16,6 +16,7 @@ import {
   addUrlChatTab,
   deleteChatTab,
   ensureUrlChatTab,
+  isCompleteChatTabOrder,
   listChatTabs,
   renameChatTab,
   sortChatTabs,
@@ -82,6 +83,18 @@ describe('chat tabs API', () => {
     await sortChatTabs('app', 'chat', ['msg', 'tab-2']);
     expect(chatTab.deleteTabs).toHaveBeenCalledWith({ path: { chat_id: 'chat' }, data: { tab_ids: ['tab-2'] } });
     expect(chatTab.sortTabs).toHaveBeenCalledWith({ path: { chat_id: 'chat' }, data: { tab_ids: ['msg', 'tab-2'] } });
+  });
+
+  it('accepts only a duplicate-free permutation of every current tab ID', () => {
+    const current = [
+      { tab_id: 'msg', tab_type: 'message' as const },
+      { tab_id: 'url-1', tab_type: 'url' as const },
+    ];
+    expect(isCompleteChatTabOrder(current, ['url-1', 'msg'])).toBe(true);
+    expect(isCompleteChatTabOrder(current, ['msg', 'msg'])).toBe(false);
+    expect(isCompleteChatTabOrder(current, ['msg'])).toBe(false);
+    expect(isCompleteChatTabOrder(current, ['msg', 'unknown'])).toBe(false);
+    expect(isCompleteChatTabOrder([...current, { tab_type: 'url' as const }], ['msg', 'url-1'])).toBe(false);
   });
 
   it('surfaces non-zero API responses', async () => {

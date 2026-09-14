@@ -126,6 +126,18 @@ export async function deleteChatTab(larkAppId: string, chatId: string, tabId: st
   assertOk(result);
 }
 
+/** Return true only when requested IDs are a duplicate-free permutation of
+ * every current tab ID. Tabs without an ID make a complete order impossible. */
+export function isCompleteChatTabOrder(current: ChatTab[], requested: string[]): boolean {
+  const currentIds = current.map(tab => tab.tab_id);
+  if (currentIds.some((id): id is undefined => !id)) return false;
+  const known = new Set(currentIds as string[]);
+  const ordered = new Set(requested);
+  return requested.length === ordered.size
+    && ordered.size === known.size
+    && requested.every(id => known.has(id));
+}
+
 export async function sortChatTabs(larkAppId: string, chatId: string, tabIds: string[]): Promise<ChatTab[]> {
   const result = await api(larkAppId).sortTabs({
     path: { chat_id: chatId },

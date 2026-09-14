@@ -1,6 +1,7 @@
 import {
   deleteChatTab,
   ensureUrlChatTab,
+  isCompleteChatTabOrder,
   listChatTabs,
   sortChatTabs,
   updateChatTab,
@@ -113,8 +114,7 @@ export async function executeChatTabsCli(
     return { action: 'removed', tabId: input.tabId };
   }
   const current = await listChatTabs(larkAppId, chatId);
-  const known = new Set(current.map(tab => tab.tab_id).filter((id): id is string => !!id));
-  if (input.tabIds!.length !== known.size || input.tabIds!.some(id => !known.has(id))) {
+  if (!isCompleteChatTabOrder(current, input.tabIds!)) {
     throw new Error('sort 必须包含当前群全部 Tab ID（包括内置消息标签页）');
   }
   return { action: 'sorted', tabs: await sortChatTabs(larkAppId, chatId, input.tabIds!) };

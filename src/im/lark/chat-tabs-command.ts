@@ -3,7 +3,7 @@ import { logger } from '../../utils/logger.js';
 import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
 import { replyMessage } from './client.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { deleteChatTab, ensureUrlChatTab, listChatTabs, renameChatTab, sortChatTabs, type ChatTab } from './chat-tabs.js';
+import { deleteChatTab, ensureUrlChatTab, isCompleteChatTabOrder, listChatTabs, renameChatTab, sortChatTabs, type ChatTab } from './chat-tabs.js';
 
 type TabsCommand =
   | { action: 'list' }
@@ -120,8 +120,7 @@ export async function tryHandleChatTabsCommand(
     } else {
       // Feishu requires the built-in message tab ID in the complete order.
       const current = await listChatTabs(larkAppId, chatId);
-      const known = new Set(current.map(tab => tab.tab_id).filter((id): id is string => !!id));
-      if (command.tabIds.some(id => !known.has(id)) || command.tabIds.length !== known.size) {
+      if (!isCompleteChatTabOrder(current, command.tabIds)) {
         throw new Error('sort_requires_all_tab_ids');
       }
       await sortChatTabs(larkAppId, chatId, command.tabIds);
