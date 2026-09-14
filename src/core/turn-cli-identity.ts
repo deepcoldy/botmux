@@ -22,7 +22,6 @@ import { larkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
-  unauthorizedOutcomeFor,
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthTool,
 } from '../services/trigger-user-auth.js';
@@ -143,26 +142,6 @@ async function withholdIdentity(
   locale: Locale | undefined,
   turnId: string | undefined,
 ): Promise<ToolIdentityOutcome> {
-  if (
-    unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) !== 'fail'
-    && tool === 'lark-cli'
-    && botConfig.larkAppId
-    && botConfig.larkAppSecret
-  ) {
-    try {
-      writeSessionIdentity(sessionDataDir, sessionId, {
-        tool: 'lark-cli',
-        mode: 'bot',
-        appId: botConfig.larkAppId,
-        appSecret: botConfig.larkAppSecret,
-        ...(turnId ? { turnId } : {}),
-      });
-      return { tool, state: 'bot-identity' };
-    } catch {
-      // Fall through to the refusal: no file at all is refused by the wrapper,
-      // which is the safe end of this failure.
-    }
-  }
   // Pre-fetch a ready, valid authorization link for either tool so the moment a
   // governed command is actually refused, the agent has a link to relay instead
   // of asking the person to type a command. Beginning only mints a link and

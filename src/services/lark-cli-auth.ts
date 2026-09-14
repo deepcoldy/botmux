@@ -60,25 +60,36 @@ export function __setMachineHomeForTest(home: string | null): void {
 const LARK_CLI_HOME_ROOT_DEFAULT = join(homedir(), '.botmux', 'data', 'lark-cli-home');
 
 /**
- * Where the issuing app's material (config + master.key + appsecret) comes from.
+ * Resolve the HOME that holds the issuing app for a given person.
  *
  * Device login has no built-in public app: it MUST bind a real self-built app,
- * and that app's availability scope decides who can authorize. Resolution order:
+ * and that app's availability scope decides who can authorize. The only way to
+ * guarantee a person sees a link they can actually approve (rather than a
+ * "you do not have permission to use this app" page) is to mint their device
+ * code with an app THEY can access — best, an app they created. Resolution:
  *
  *   1. test override (`__setMachineHomeForTest`)
- *   2. BOTMUX_LARK_CLI_ISSUER_HOME (explicit env)
- *   3. the botmux-managed issuer HOME (~/.botmux/data/lark-cli-app-bootstrap),
- *      if it has a configured app — provision it once with
- *      `HOME=<dir> lark-cli config init --new` and set that app's scope
- *   4. the operator's own lark-cli HOME (back-compat)
+ *   2. BOTMUX_LARK_CLI_ISSUER_HOME (explicit env; shared by everyone)
+ *   3. the per-person issuer HOME: ~/.botmux/data/lark-cli-issuer-<openId>,
+ *      if provisioned (created via `lark-cli config init --new` with HOME there)
+ *   4. the botmux-managed shared issuer HOME (~/.botmux/data/lark-cli-app-bootstrap)
+ *   5. the operator's own lark-cli HOME (back-compat)
  *
- * Point it at a dedicated provisioning HOME whose app has the intended
- * availability scope (all-staff or a named set).
+ * A per-person issuer wins over the shared one so each person's link is bound
+ * to an app they own/are scoped into; the shared issuer is only the fallback
+ * when nobody has provisioned a personal app.
  */
-function issuerMachineHome(): string {
+function issuerMachineHome(openId?: string): string {
   if (machineHomeOverride) return machineHomeOverride;
   const env = process.env.BOTMUX_LARK_CLI_ISSUER_HOME?.trim();
   if (env) return env;
+  if (openId) {
+    // Defensive: only accept a sane open-id-shaped segment, never a traversal.
+    if (/^[A-Za-z0-9_-]{8,128}$/.test(openId)) {
+      const personal = join(LARK_CLI_HOME_ROOT_DEFAULT, '..', `lark-cli-issuer-${openId}`);
+      if (existsSync(join(personal, '.lark-cli', 'config.json'))) return personal;
+    }
+  }
   const managed = join(LARK_CLI_HOME_ROOT_DEFAULT, '..', 'lark-cli-app-bootstrap');
   if (existsSync(join(managed, '.lark-cli', 'config.json'))) return managed;
   return homedir();
@@ -224,10 +235,10 @@ async function runAsUser(openId: string, args: string[]): Promise<LarkCliResult>
  * Resolved from the REAL (daemon) HOME at call time, never from the per-person
  * HOME we hand to the child — otherwise the first lookup is circular.
  */
-function machineLarkCliPaths(): {
+function machineLarkCliPaths(openId?: string): {
   config: string; dataDir: string; appId: string;
 } | null {
-  const root = issuerMachineHome();
+  const root = issuerMachineHome(openId);
   const config = join(root, '.lark-cli', 'config.json');
   const dataDir = join(root, '.local', 'share', 'lark-cli');
   if (!existsSync(config) || !existsSync(dataDir)) return null;
@@ -246,7 +257,7 @@ function machineLarkCliPaths(): {
  * seed from (the caller turns that into a clear "lark-cli not set up" message).
  */
 function ensureBootstrapped(openId: string): boolean {
-  const machine = machineLarkCliPaths();
+  const machine = machineLarkCliPaths(openId);
   if (!machine) return false;
   const home = larkCliHomeFor(openId);
   const dataDir = larkCliDataDir(home);

@@ -106,31 +106,30 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
 // leftover would make the next command run as the previous person — silently,
 // and with the wrong name in the audit trail.
 describe('publishTurnCliIdentity — withholding removes, never inherits', () => {
-  it('clears when the new sender has not authorized', async () => {
+  it('denies with a device link when the new sender has not authorized', async () => {
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     await publish(botConfig(), ALICE);
     expect(existsSync(larkPath())).toBe(true);
 
-    // Bob has no token: Alice's must be gone. Under the default fallback the
-    // file is rewritten to the bot identity rather than deleted — deleting it
-    // would make the wrapper refuse, and leaving it would run Bob's command as
-    // Alice.
+    // Bob has no identity: lark-cli (whose docs/drive/wiki surface is user-only)
+    // must not silently run as the bot or inherit Alice. It is refused with a
+    // ready device-code link, exactly like bytedcli.
     const outcomes = await publish(botConfig(), BOB);
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     const body = readFileSync(larkPath(), 'utf8');
     expect(body).not.toContain('tok-alice');
-    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'bot\'');
-    expect(body).toContain('LARKSUITE_CLI_APP_SECRET');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).toContain('https://example.com/lark-device');
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
   // trigger user. Reaching for the session creator's or owner's credentials to
   // fill that gap is exactly the borrowing this feature removes.
-  it('clears when the turn has no human sender', async () => {
+  it('denies (no link) when the turn has no human sender', async () => {
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     await publish(botConfig(), ALICE);
     const outcomes = await publish(botConfig(), undefined);
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
   });
 
@@ -264,9 +263,9 @@ describe('publishTurnCliIdentity — failures fail closed', () => {
     vi.mocked(resolveUserToken).mockRejectedValueOnce(new Error('keychain unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
     // The turn survives, and the stale identity is gone. A store outage lands on
-    // the same policy as "never authorized" — otherwise a transient failure
-    // would quietly grant a different identity than a missing token does.
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    // the same policy as "never authorized" — a refusal with a link, never a
+    // borrowed or machine identity.
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
   });
 
