@@ -18,6 +18,7 @@ import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { larkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -162,13 +163,20 @@ async function withholdIdentity(
       // which is the safe end of this failure.
     }
   }
+  // Pre-fetch a ready, valid authorization link for either tool so the moment a
+  // governed command is actually refused, the agent has a link to relay instead
+  // of asking the person to type a command. Beginning only mints a link and
+  // messages nobody, so non-CLI turns are not disturbed. Uses a fresh, still
+  // unexpired challenge when one exists.
   let authUrl: string | undefined;
-  if (tool === 'bytedcli' && senderOpenId) {
+  if (senderOpenId) {
     try {
-      authUrl = (await beginBytedcliLogin(senderOpenId))?.authUrl;
+      authUrl = tool === 'bytedcli'
+        ? (await beginBytedcliLogin(senderOpenId))?.authUrl
+        : (await beginLarkCliLogin(senderOpenId))?.authUrl;
     } catch (e) {
       logger.warn(
-        `[trigger-user-auth] could not auto-start bytedcli login for session ${sessionId}: `
+        `[trigger-user-auth] could not pre-fetch ${tool} auth link for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
     }
@@ -227,12 +235,13 @@ function writeDenial(
       ...(turnId ? { turnId } : {}),
       message: [
         head,
-        // Name the right command: ByteCloud and Feishu are separate providers,
-        // so telling a refused bytedcli user to send `/login` would send them
-        // to authorize the wrong thing and fail again.
-        ...(tool === 'bytedcli' && authUrl
+        // A ready device-code link for either tool: lead with the self-serve,
+        // one-tap instruction and a clear "authorize once" framing so it reads
+        // as "one step left", not as a broken bot. Without a link (fetch failed
+        // or no human sender), fall back to the /login instructions.
+        ...(authUrl
           ? [
-              t('trigger_user_auth.denied_auto_login', undefined, locale),
+              t('trigger_user_auth.denied_auto_login', { tool, provider }, locale),
               authUrl,
               t('trigger_user_auth.denied_auto_retry', undefined, locale),
             ]
@@ -240,10 +249,8 @@ function writeDenial(
               'trigger_user_auth.denied_howto',
               { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
               locale,
-            )]),
-        ...(tool === 'bytedcli' && authUrl
-          ? []
-          : [t('trigger_user_auth.denied_howto_status', undefined, locale)]),
+            ),
+            t('trigger_user_auth.denied_howto_status', undefined, locale)]),
       ].join('\n'),
     });
   } catch (e) {
@@ -261,6 +268,16 @@ async function resolveIdentityFor(
   senderOpenId: string,
 ): Promise<CliIdentity | null> {
   if (tool === 'lark-cli') {
+    // Preferred path: the per-person HOME created by the lark-cli device-code
+    // flow. lark-cli then acts as that person using the provisioned app bound
+    // inside that HOME — no token is injected into the environment, and the
+    // acting identity is a directory isolated per sender (mirrors bytedcli).
+    // No appId is passed: the HOME's own lark-cli config already names the app.
+    const home = larkCliHomeForTurn(senderOpenId);
+    if (home) {
+      return { tool: 'lark-cli', mode: 'user-home', home };
+    }
+    // Back-compat: a bot-app OAuth user token already stored server-side.
     if (!botConfig.larkAppId || !botConfig.larkAppSecret) return null;
     const token = await resolveUserToken(
       botConfig.larkAppId,

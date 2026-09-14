@@ -36,6 +36,13 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   })),
 }));
 
+// lark-cli per-person HOME (device-code). No HOME in tests → identity null;
+// auto-begin is scripted so withholding never touches the real lark-cli/FS.
+vi.mock('../src/services/lark-cli-auth.js', () => ({
+  larkCliHomeForTurn: vi.fn(() => null),
+  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+}));
+
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
@@ -136,7 +143,8 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     // whose command just failed reads, including how to authorize.
     const body = readFileSync(larkPath(), 'utf8');
     expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
-    expect(body).toContain('/login');
+    // A ready device-code link is embedded directly (no typed /login needed).
+    expect(body).toContain('https://example.com/lark-device');
     expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
   });
 
@@ -162,7 +170,9 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).toContain('ByteCloud');
     expect(body).not.toContain('飞书');
     expect(body).toContain('https://cloud.example.com/auth?state=auto');
-    expect(body).toContain('不需要再发送 /login bytedcli');
+    // Friendly one-time framing: it names the tool/provider and says authorize once.
+    expect(body).toContain('bytedcli');
+    expect(body).toMatch(/只需授权这一次|authorize just once/i);
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.
