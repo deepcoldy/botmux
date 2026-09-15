@@ -14542,6 +14542,31 @@ async function spawnCli(
   const buildArgsWorkingDir = sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
+  // Per-bot env 提升通道（claude 家族）：把 bots.json `env` 交给适配器写进进程级
+  // --settings 文件。背景：Claude 会把各 settings 源的 `env` 覆盖到进程 env 之上，
+  // 用户级 ~/.claude/settings.json 的 env（如 ANTHROPIC_BASE_URL/AUTH_TOKEN）会在 CLI
+  // 启动时盖掉 pane 注入的 per-bot 进程 env，bot 自配的第三方供应商被静默改写；
+  // --settings 优先级高于用户/项目 settings 文件，能把 bot env 顶到最上。文件落 CLI
+  // 在各模式下都一定能读的位置：数据重定向/沙盒下放有效 CLI 数据根（bwrap 已 bind
+  // canonical 路径），其余放 per-bot BOT_HOME；密钥走 0600 文件而非 inline argv
+  // （argv 可被 ps 读到）。wrapperCli 会剥 --settings，该场景自然退化为旧行为。
+  let perBotSettingsEnv: Record<string, string> | undefined;
+  let perBotSettingsFilePath: string | undefined;
+  if (cliAdapter.claudeDataDir && cfg.env && process.env.SESSION_DATA_DIR) {
+    const sanitized = sanitizePerBotEnv(cfg.env);
+    if (Object.keys(sanitized).length > 0) {
+      perBotSettingsEnv = sanitized;
+      const settingsDir = willRedirectCliData && claudeDataDir
+        ? claudeDataDir
+        : join(botHomePath(dirname(process.env.SESSION_DATA_DIR), cfg.larkAppId), 'launch-settings');
+      let canonDir = settingsDir;
+      if (sandboxRequested) {
+        try { canonDir = realpathSync(settingsDir); } catch { /* 目录可能尚未创建，保留 lexical */ }
+      }
+      perBotSettingsFilePath = join(canonDir, 'botmux-launch-settings.json');
+
+    }
+  }
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
   // buildArgs runs first; these are pure path derivations, so naming them early
@@ -14605,6 +14630,8 @@ async function spawnCli(
     dshProfile: cfg.dshProfile,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
+    settingsEnv: perBotSettingsEnv,
+    settingsFilePath: perBotSettingsFilePath,
     codexBrowser: cfg.codexBrowser,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.

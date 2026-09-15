@@ -224,6 +224,25 @@ export interface CliAdapter {
     /** TraeCode only: process-scoped PreToolUse command for native spawn_agent.
      *  The worker supplies this for every managed model-owning Trae process. */
     nativeSubagentRuntimeHookCommand?: string;
+    /** This bot's own `env` from bots.json (already sanitized by the worker).
+     *  The same vars always reach the CLI as process env (pane injectEnv), but
+     *  for CLIs whose SETTINGS-file `env` map is applied ON TOP of inherited
+     *  process env (claude family: the user's ~/.claude/settings.json env
+     *  overwrites pane env at startup), that delivery loses to whatever the
+     *  user's global settings say — a bot configured with its own
+     *  ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL silently runs on the user's default
+     *  provider instead. Adapters with such a settings source SHOULD promote
+     *  these vars into their highest-precedence one (claude: `--settings`).
+     *  Other adapters ignore the field. */
+    settingsEnv?: Record<string, string>;
+    /** Host path where the adapter may persist a settings FILE carrying
+     *  settingsEnv (secrets like ANTHROPIC_AUTH_TOKEN must never travel via
+     *  inline `--settings <json>` — argv is world-readable through `ps`). The
+     *  worker only supplies a path whose location the CLI can read in every
+     *  mode (redirected/sandboxed → inside the effective CLI data dir; plain →
+     *  per-bot BOT_HOME). Absent ⇒ the adapter must NOT inline secrets into
+     *  argv; it falls back to process-env-only delivery (the old behavior). */
+    settingsFilePath?: string;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees

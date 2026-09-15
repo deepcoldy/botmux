@@ -15,6 +15,7 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -853,7 +854,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -909,11 +910,34 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
-      // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
-      // 注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉 memory carve-out。）
+      // Per-bot env（bots.json `env`，如 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL）提升进
+      // --settings：Claude 会把 settings 源的 `env` 覆盖到进程环境之上（用户级
+      // ~/.claude/settings.json 的 env 会盖掉 pane 注入的进程 env），只走进程 env
+      // 的 bot 供应商配置会被用户全局 settings 静默改写。--settings 优先级高于
+      // 用户/项目 settings 文件，是能把 bot env 顶到最上面的最稳渠道。
+      const hasSettingsEnv = !!settingsEnv && Object.keys(settingsEnv).length > 0;
+      if (hasSettingsEnv) inlineSettings.env = settingsEnv;
+      // 仅在有内容（bypass 键 / env）时才传 --settings；disableCliBypass 且无 env 下
+      // 没东西可传就不传。（读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入
+      // 任何 sandbox 设置——注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉
+      // memory carve-out。）
       if (Object.keys(inlineSettings).length > 0) {
-        args.push('--settings', JSON.stringify(inlineSettings));
+        if (hasSettingsEnv && settingsFilePath) {
+          // env 含 AUTH_TOKEN 类密钥：写文件（0600）传路径，不走 inline JSON——
+          // argv 可被 `ps` 读到。同 bot 内容恒定，覆写幂等。
+          try {
+            mkdirSync(dirname(settingsFilePath), { recursive: true });
+            writeFileSync(settingsFilePath, JSON.stringify(inlineSettings), { mode: 0o600 });
+            args.push('--settings', settingsFilePath);
+          } catch {
+            // 写不进去则放弃 --settings：env 仍经 pane injectEnv 走进程环境（旧行为），
+            // 绝不把密钥 fallback 进 argv。
+          }
+        } else if (!hasSettingsEnv) {
+          args.push('--settings', JSON.stringify(inlineSettings));
+        }
+        // hasSettingsEnv 但 worker 没给 settingsFilePath：不内联（防密钥进 argv），
+        // env 仍经进程 env 传递，与旧行为一致。
       }
       const disallowedTools = ['EnterPlanMode', 'ExitPlanMode'];
       if (process.env[GOAL_ENV.V3_MARKER] === '1') {
