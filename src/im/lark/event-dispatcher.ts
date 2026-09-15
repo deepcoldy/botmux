@@ -62,6 +62,7 @@ import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
@@ -3946,6 +3947,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
+      // Trusted creator metadata affects addressing only; all existing talk and
+      // operation gates below remain in force. Also covers missed join events.
+      await ensureSignedChatDefault(larkAppId, chatId, chatType).catch(err =>
+        logger.warn(`[signed-chat-default] lookup failed: ${err instanceof Error ? err.message : String(err)}`),
+      );
       // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
       // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
       // 自助授权申请卡。ensureDefaultOncallBound 本身带 fast-path 短路且 idempotent。

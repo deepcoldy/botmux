@@ -1707,6 +1707,10 @@ export interface BotConfig {
   defaultWorkingDirAutoWorktree?: boolean;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
+  /** Opt-in: accept app/chat-bound signed ambient defaults from a trusted creator. No grants. */
+  signedChatDefaults?: boolean;
+  /** Optional trusted HTTPS registry for private self-service room metadata. */
+  signedChatDefaultsRegistryUrl?: string;
   /**
    * Chat IDs that have ever been auto-bound by `defaultOncall`. Append-only.
    * Once a chat appears here, the default is permanently "spent" for it — even
@@ -3618,6 +3622,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       allowedChatGroups,
       oncallChats,
       defaultOncall,
+      signedChatDefaults: entry.signedChatDefaults === true || undefined,
+      signedChatDefaultsRegistryUrl: typeof entry.signedChatDefaultsRegistryUrl === 'string' && entry.signedChatDefaultsRegistryUrl.startsWith('https://') ? entry.signedChatDefaultsRegistryUrl : undefined,
       defaultOncallAutoboundChats,
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
