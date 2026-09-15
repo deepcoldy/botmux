@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   additionalConnectorBotIds,
+  buildConnectorLifecycleGroupNameConfig,
   buildConnectorTargetBody,
   buildConnectorInstructionUpdateBody,
   buildConnectorKindOptions,
@@ -148,6 +149,38 @@ describe('dashboard trusted topic templates', () => {
     expect(buildConnectorTopicMessageConfig('none', '', '{bad json')).toEqual({
       ok: true,
       value: { mode: 'none' },
+    });
+  });
+});
+
+describe('dashboard connector lifecycle group names', () => {
+  it('builds fixed and template group name configs', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('default', 'ignored')).toEqual({
+      ok: true,
+      value: { mode: 'default' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  固定处理群  ')).toEqual({
+      ok: true,
+      value: { mode: 'fixed', text: '固定处理群' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{alert.name}}')).toEqual({
+      ok: true,
+      value: { mode: 'template', text: '告警 {{alert.name}}' },
+    });
+  });
+
+  it('requires text for fixed and template group names', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  ')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{alert.*}}')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupNameTemplate',
     });
   });
 });

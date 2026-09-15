@@ -2986,15 +2986,9 @@ function lifecycleBotIds(connector: ConnectorDefinition): string[] {
   return Array.from(new Set([connector.target.botId, ...(connector.target.botIds ?? [])].filter(Boolean)));
 }
 
-function lifecycleGroupName(connector: ConnectorDefinition, dedupKey: string): string {
-  const cleanKey = dedupKey.replace(/\s+/g, ' ').trim();
-  const name = `${connector.name}: ${cleanKey}`;
-  return name.length <= 58 ? name : `${name.slice(0, 55)}...`;
-}
-
 async function createLifecycleGroupForWebhook(
   connector: ConnectorDefinition,
-  args: { dedupKey: string },
+  args: { dedupKey: string; groupName: string },
 ): Promise<{ chatId: string; creatorLarkAppId?: string }> {
   const selectedIds = lifecycleBotIds(connector);
   const pick = pickCreatorForGroup(selectedIds, (id) => {
@@ -3015,7 +3009,7 @@ async function createLifecycleGroupForWebhook(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      name: lifecycleGroupName(connector, args.dedupKey),
+      name: args.groupName,
       larkAppIds: selectedIds,
       ...(ownerUnionIds.length > 0 ? { ownerUnionIds } : {}),
       ...(userOpenIds.length > 0 ? { userOpenIds } : {}),
