@@ -74,6 +74,8 @@ const mocks = vi.hoisted(() => {
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+    findPendingAskByAnchor: vi.fn(() => undefined as any),
+    submitAsk: vi.fn((..._args: any[]): any => 'stale'),
   };
 });
 
@@ -142,6 +144,15 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+vi.mock('../src/core/ask-broker.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/ask-broker.js');
+  return {
+    ...actual,
+    findPendingAskByAnchor: (...args: any[]) => mocks.findPendingAskByAnchor(...args),
+    submitAsk: (...args: any[]) => mocks.submitAsk(...args),
+  };
+});
+
 import { mkdirSync } from 'node:fs';
 
 import { registerBot } from '../src/bot-registry.js';
@@ -155,6 +166,7 @@ import {
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
 } from '../src/daemon.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
+import { formatAddressedAskAnswerCommand } from '../src/core/ask-answer-protocol.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -163,9 +175,22 @@ const CHAT = 'oc_ingress_notice_chat';
 const OWNER = 'ou_owner';
 const NOW = new Date().toISOString();
 
-function makeEventData(messageId: string, text: string, rootId?: string): any {
+function makeEventData(
+  messageId: string,
+  text: string,
+  rootId?: string,
+  senderOpenId = OWNER,
+  senderType = 'user',
+  senderUnionId?: string,
+): any {
   return {
-    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    sender: {
+      sender_id: {
+        open_id: senderOpenId,
+        ...(senderUnionId ? { union_id: senderUnionId } : {}),
+      },
+      sender_type: senderType,
+    },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -186,6 +211,42 @@ function makeCtx(anchor: string, messageId: string): any {
     anchor,
     larkAppId: APP,
   };
+}
+
+function makeAddressedAskAnswerEvent(args: {
+  messageId: string;
+  rootId: string;
+  key: string;
+  targetOpenId: string;
+  senderOpenId: string;
+  senderType: string;
+  senderUnionId?: string;
+}): any {
+  const outbound = formatAddressedAskAnswerCommand(args.key, args.targetOpenId);
+  expect(outbound).toBe(
+    `<at user_id="${args.targetOpenId}"></at> /botmux-ask-answer ${args.key}`,
+  );
+  const event = makeEventData(
+    args.messageId,
+    '',
+    args.rootId,
+    args.senderOpenId,
+    args.senderType,
+    args.senderUnionId,
+  );
+  // Lark turns the outbound <at> element into a keyed placeholder plus a
+  // structured mention. Feed that exact receiver-side transport shape through
+  // parseEventMessage → resolveMentions → stripLeadingMentions → protocol parse.
+  event.message.content = JSON.stringify({
+    text: `@_user_1 /botmux-ask-answer ${args.key}`,
+  });
+  event.message.mentions = [{
+    key: '@_user_1',
+    id: args.targetOpenId,
+    id_type: 'open_id',
+    name: 'Question Bot',
+  }];
+  return event;
 }
 
 function seedThreadSession(anchor: string, title: string): DaemonSession {
@@ -241,6 +302,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    mocks.findPendingAskByAnchor.mockReturnValue(undefined);
+    mocks.submitAsk.mockReturnValue('stale');
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -293,6 +356,152 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('wires a bot structured ask answer to the exact anchor with its authenticated actor tuple', async () => {
+    const anchor = 'om_structured_bot_answer';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-bot', nonce: 'nonce-bot' });
+    mocks.submitAsk.mockReturnValue('accepted');
+
+    await handleThreadReply(
+      makeAddressedAskAnswerEvent({
+        messageId: 'om_structured_bot_turn',
+        rootId: anchor,
+        key: 'accept',
+        targetOpenId: 'ou_question_bot',
+        senderOpenId: 'ou_answering_bot',
+        senderType: 'app',
+        senderUnionId: 'on_answering_bot',
+      }),
+      makeCtx(anchor, 'om_structured_bot_turn'),
+    );
+
+    expect(mocks.findPendingAskByAnchor).toHaveBeenCalledWith({
+      larkAppId: APP,
+      chatId: CHAT,
+      anchor,
+    });
+    expect(mocks.submitAsk).toHaveBeenCalledWith({
+      askId: 'ask-bot',
+      nonce: 'nonce-bot',
+      by: 'ou_answering_bot',
+      selections: [['accept']],
+      actor: {
+        botSender: true,
+        senderUnionId: 'on_answering_bot',
+        memberUnionId: 'on_answering_bot',
+      },
+    });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(repliedText()).toBe('');
+  });
+
+  it('keeps a human union identity on the member leg of a structured ask answer', async () => {
+    const anchor = 'om_structured_human_answer';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-human', nonce: 'nonce-human' });
+    mocks.submitAsk.mockReturnValue('accepted');
+
+    await handleThreadReply(
+      makeEventData(
+        'om_structured_human_turn',
+        '/botmux-ask-answer reject',
+        anchor,
+        'ou_answering_human',
+        'user',
+        'on_answering_human',
+      ),
+      makeCtx(anchor, 'om_structured_human_turn'),
+    );
+
+    expect(mocks.submitAsk).toHaveBeenCalledWith(expect.objectContaining({
+      by: 'ou_answering_human',
+      selections: [['reject']],
+      actor: {
+        botSender: false,
+        senderUnionId: undefined,
+        memberUnionId: 'on_answering_human',
+      },
+    }));
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('consumes bot structured-answer misses and rejected keys without replying into the chat', async () => {
+    const anchor = 'om_structured_bot_miss';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    const event = (messageId: string) => makeEventData(
+      messageId,
+      '/botmux-ask-answer wrong_key',
+      anchor,
+      'ou_answering_bot',
+      'app',
+      'on_answering_bot',
+    );
+
+    await handleThreadReply(event('om_structured_bot_no_pending'), makeCtx(anchor, 'om_structured_bot_no_pending'));
+    expect(mocks.submitAsk).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-bot', nonce: 'nonce-bot' });
+    mocks.submitAsk.mockReturnValue('stale');
+    await handleThreadReply(event('om_structured_bot_stale'), makeCtx(anchor, 'om_structured_bot_stale'));
+    expect(mocks.submitAsk).toHaveBeenCalledWith(expect.objectContaining({
+      selections: [['wrong_key']],
+    }));
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('tells a human when no pending ask exists for a structured answer', async () => {
+    const anchor = 'om_structured_human_no_pending';
+    seedThreadSession(anchor, 'seeded');
+
+    await handleThreadReply(
+      makeEventData(
+        'om_structured_human_no_pending_turn',
+        '/botmux-ask-answer accept',
+        anchor,
+        'ou_answering_human',
+      ),
+      makeCtx(anchor, 'om_structured_human_no_pending_turn'),
+    );
+
+    expect(mocks.submitAsk).not.toHaveBeenCalled();
+    expect(repliedText()).toContain(
+      '<at id=ou_answering_human></at> 当前没有待回答的选择，该指令未执行。',
+    );
+  });
+
+  it.each([
+    ['unauthorized', '你无权回答当前选择'],
+    ['already_settled', '当前选择已结束'],
+    ['stale', '选项无效或当前选择已失效'],
+  ] as const)('replies to a human when a structured answer is %s', async (outcome, reason) => {
+    const anchor = `om_structured_human_${outcome}`;
+    seedThreadSession(anchor, 'seeded');
+    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-human', nonce: 'nonce-human' });
+    mocks.submitAsk.mockReturnValue(outcome);
+
+    await handleThreadReply(
+      makeEventData(
+        `om_structured_human_${outcome}_turn`,
+        '/botmux-ask-answer accept',
+        anchor,
+        'ou_answering_human',
+      ),
+      makeCtx(anchor, `om_structured_human_${outcome}_turn`),
+    );
+
+    expect(repliedText()).toContain(`<at id=ou_answering_human></at> ${reason}，该指令未执行。`);
   });
 
   it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {

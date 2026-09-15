@@ -54,6 +54,7 @@ import {
   type DispatchTransportState,
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
+import { formatAddressedAskAnswerCommand, isValidAskAnswerKey } from './core/ask-answer-protocol.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
@@ -6506,6 +6507,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --layout result|progress|risk|blocked|handoff
                                        可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
+       --ask-answer <option-key>       用结构化选项回答当前话题里待处理的 ask；自动 @ 回本轮 ask 发起方
        --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
                                        allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
                                        自动解析并校验其为目标群成员，否则拒发
@@ -7982,7 +7984,7 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--plugin-card-action']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--ask-answer', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -8813,6 +8815,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
   const effectiveResponseKind = responseKind ?? 'progress';
+  const askAnswerOccurrences = rest.filter(token => token === '--ask-answer' || token.startsWith('--ask-answer=')).length;
+  if (askAnswerOccurrences > 1) {
+    console.error('botmux send: --ask-answer 只能指定一次');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--ask-answer')) {
+    console.error('botmux send: --ask-answer 需要 option key');
+    process.exit(2);
+  }
+  const askAnswer = argValue(rest, '--ask-answer');
+  if (askAnswer !== undefined && !isValidAskAnswerKey(askAnswer)) {
+    console.error('botmux send: --ask-answer 仅支持小写字母开头、最长 64 字符的 option key');
+    process.exit(2);
+  }
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -8901,6 +8917,25 @@ async function cmdSend(rest: string[]): Promise<void> {
   // needs-you column for this session. Parsed specially (not argValue) so a bare
   // `--attention "我卡住了"` doesn't eat the message as the flag value.
   const attention = parseAttentionFlag(rest);
+  if (askAnswer && (
+    customCardRequested
+    || asVoice
+    || images.length > 0
+    || files.length > 0
+    || videos.length > 0
+    || videoCovers.length > 0
+    || sendTopLevel
+    || !!overrideChatId
+    || !!sendInto
+    || attention.requested
+    || responseKind !== undefined
+    || mentionArgs.length > 0
+    || mentionBack
+    || noMention
+  )) {
+    console.error('botmux send: --ask-answer 只能回答当前会话的 ask，并自动寻址本轮 ask 发起方；不能与卡片/附件/语音/改道/反馈/@ 选项混用');
+    process.exit(2);
+  }
   const managedControlError = managedVcSendControlError({
     managed: !!vcMeetingManagedSendOrigin,
     sendTopLevel,
@@ -8928,6 +8963,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // deliberately exclusive with every richer payload — a slash command is one
   // line of text, nothing else.
   const isSlashSend = rest.includes('--slash');
+  if (askAnswer && isSlashSend) {
+    console.error('botmux send: --ask-answer 不能与 --slash 混用');
+    process.exit(2);
+  }
   if (isSlashSend) {
     if (customCardRequested || asVoice) {
       console.error('botmux send: --slash 不能与 --card-file/--card-json/--voice 混用（斜杠命令只发单行纯文本）');
@@ -8942,8 +8981,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
   }
-  if (replyLayout && (customCardRequested || asVoice || isSlashSend)) {
-    const mode = customCardRequested ? '自定义卡片' : asVoice ? '语音气泡' : '原生斜杠命令';
+  if (replyLayout && (customCardRequested || asVoice || isSlashSend || !!askAnswer)) {
+    const mode = customCardRequested ? '自定义卡片' : asVoice ? '语音气泡' : askAnswer ? '结构化 ask 回答' : '原生斜杠命令';
     console.error(`botmux send: --layout 不作用于${mode}，本次已忽略`);
     replyLayout = undefined;
   }
@@ -9262,6 +9301,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     const normalizedCard = normalizeInteractiveCardInput(rawCard, { callbackPolicy });
     if (!normalizedCard.ok) { console.error(`botmux send: ${normalizedCard.error}`); process.exit(2); }
     customCard = normalizedCard.card;
+  } else if (askAnswer) {
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--slash']);
+    if (contentFile || unexpectedText.length > 0) {
+      console.error('botmux send: --ask-answer 不接收消息正文或 --content-file，请只传 option key');
+      process.exit(2);
+    }
+    content = '';
   } else if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
@@ -9292,7 +9338,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  if (!customCard && !content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
+  if (!askAnswer && !customCard && !content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
     process.exit(1);
   }
@@ -9593,6 +9639,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     // quoteTargetId===currentTurnId for its own hit.
     ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
 
+  if (askAnswer && !replyTargetSenderOpenId) {
+    console.error('botmux send: --ask-answer 找不到本轮 ask 发起方，未发送；请在收到 ask 的原会话轮次内重试');
+    process.exit(2);
+  }
+
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
   // is exempt. The error text adapts to who is being replied to (人 / bot).
@@ -9600,7 +9651,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     enabled: config.send.requireMentionDecision,
     sendTopLevel,
     hasMentionArgs: mentionArgs.length > 0,
-    mentionBack,
+    mentionBack: mentionBack || !!askAnswer,
     noMention,
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
@@ -9761,7 +9812,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
-  if (mentionBack && replyTargetSenderOpenId
+  if ((mentionBack || !!askAnswer) && replyTargetSenderOpenId
       && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
   }
@@ -10363,6 +10414,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (askAnswer) {
+      // Structured ask answers deliberately bypass the reply-card path. The
+      // receiving daemon consumes the reserved command and submits the option
+      // key directly to the broker; visible prose and footer text are never
+      // interpreted as the answer.
+      const protocolText = formatAddressedAskAnswerCommand(askAnswer, replyTargetSenderOpenId!);
+      messageId = await dispatchPrimary(protocolText, 'text');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the

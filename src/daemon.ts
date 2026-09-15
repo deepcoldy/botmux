@@ -593,8 +593,10 @@ import {
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
+  submitAsk,
   submitCustomReply,
 } from './core/ask-broker.js';
+import { allowsHumanAskChoiceText, submitStructuredAskAnswer } from './core/ask-answer-protocol.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
 import { parseAskBody } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
@@ -18344,9 +18346,12 @@ async function stageCrossPrincipalInterruption(args: {
   // original delivery record only after this function returns true.
   persistCrossPrincipalQueue(ds);
   const proposerOpenId = proposer.requestUserOpenId;
+  const agentChoiceHint = proposer.senderType === 'bot'
+    ? '机器人请在收到选择卡后使用 `botmux send --ask-answer independent` 或 `botmux send --ask-answer suggestion`；命令会自动回复给本轮提问方。'
+    : '请在随后的选择卡中点击处理方式。';
   void sessionReply(
     sessionAnchorId(ds),
-    `${proposerOpenId ? `<at id=${proposerOpenId}></at> ` : ''}消息已安全暂存，不会打断当前任务；请选择“独立任务”或“对当前任务的建议”（机器人也必须明确选择）。`,
+    `${proposerOpenId ? `<at id=${proposerOpenId}></at> ` : ''}消息已安全暂存，不会打断当前任务。${agentChoiceHint}`,
     'text',
     ds.larkAppId,
     message.turnId,
@@ -18820,7 +18825,10 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         // proposer can actually see the choice card.
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: `<at id=${proposerId}></at> 当前有其他成员的任务正在执行。请选择这条消息的处理方式：`,
+          prompt: `<at id=${proposerId}></at> 当前有其他成员的任务正在执行。请选择这条消息的处理方式：`
+            + (record.proposer.senderType === 'bot'
+              ? '\n机器人回答：`botmux send --ask-answer independent` 或 `botmux send --ask-answer suggestion`；命令会自动回复给本轮提问方。'
+              : ''),
           multiSelect: false,
           options: [
             { key: 'independent', label: '独立任务' },
@@ -21746,6 +21754,50 @@ async function handleThreadReplyAdmitted(
     }
   }
 
+  // Agent answers use a reserved native-text command emitted by
+  // `botmux send --ask-answer <key>`. Consume it before the generic slash
+  // router and submit the option key directly to the broker. This avoids
+  // interpreting reply-card prose/footer chrome as a semantic choice.
+  const structuredAskAnswer = threadSenderOpenId && threadChatId
+    ? submitStructuredAskAnswer({
+        text: cmdContent,
+        by: threadSenderOpenId,
+        actor: {
+          botSender: isBotSenderType || isForeignBot,
+          senderUnionId: threadTeamTrustUnionId,
+          memberUnionId: threadSenderUnionId,
+        },
+        findPending: () => findPendingAskByAnchor({ larkAppId, chatId: threadChatId, anchor }),
+        submit: submitAsk,
+      })
+    : { kind: 'not_protocol' as const };
+  if (structuredAskAnswer.kind !== 'not_protocol') {
+    if (structuredAskAnswer.kind === 'no_pending') {
+      if (isBotSenderType || isForeignBot) {
+        logger.warn(`[${anchor.substring(0, 12)}] bot structured ask answer found no pending ask sender=${threadSenderOpenId!.substring(0, 12)}`);
+      } else {
+        await sessionReply(anchor, `<at id=${threadSenderOpenId}></at> 当前没有待回答的选择，该指令未执行。`, 'text', larkAppId);
+      }
+      return;
+    }
+    const outcome = structuredAskAnswer.outcome;
+    if (outcome === 'accepted') {
+      logger.info(`[${anchor.substring(0, 12)}] structured ask answer accepted from ${threadSenderOpenId.substring(0, 12)} key=${structuredAskAnswer.key}`);
+      return;
+    }
+    const reason = outcome === 'unauthorized'
+      ? '你无权回答当前选择'
+      : outcome === 'already_settled'
+        ? '当前选择已结束'
+        : '选项无效或当前选择已失效';
+    if (isBotSenderType || isForeignBot) {
+      logger.warn(`[${anchor.substring(0, 12)}] bot structured ask answer rejected sender=${threadSenderOpenId!.substring(0, 12)} outcome=${outcome}`);
+    } else {
+      await sessionReply(anchor, `<at id=${threadSenderOpenId}></at> ${reason}，该指令未执行。`, 'text', larkAppId);
+    }
+    return;
+  }
+
   const threadHeaderParse = parseTopicHeader(stripBotMentions(
     cmdContent,
     parsed.mentions,
@@ -22131,13 +22183,7 @@ async function handleThreadReplyAdmitted(
     const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
     if (pendingAsk) {
       const hostChoiceText = askCandidate.text.trim();
-      const hostChoiceAllowsText = pendingAsk.originKind === 'host_cross_principal_classification'
-        ? /^(?:独立任务|对\s*A\s*的建议|建议)$/i.test(hostChoiceText)
-        : pendingAsk.originKind === 'host_cross_principal_wait'
-          ? /^(?:继续等待|独立任务)$/i.test(hostChoiceText)
-        : pendingAsk.originKind === 'host_cross_principal_owner'
-          ? /^(?:采纳并重新执行|不采纳|采纳|同意|拒绝)$/i.test(hostChoiceText)
-          : true;
+      const hostChoiceAllowsText = allowsHumanAskChoiceText(pendingAsk.originKind, hostChoiceText);
       // A host-owned cross-principal card is a classification/approval gate,
       // not a blanket "next text answers the ask" prompt.  Arbitrary business
       // text must keep flowing to the interruption staging path; otherwise a

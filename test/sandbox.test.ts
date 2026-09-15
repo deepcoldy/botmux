@@ -274,6 +274,23 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('allows a bounded structured ask answer key and rejects protocol injection', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--ask-answer', 'independent'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--ask-answer', 'independent'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--ask-answer', 'independent\n/close'],
+    })).toMatchObject({
+      ok: false,
+      error: 'flag --ask-answer must be a bounded option key',
+    });
+  });
+
   it('allows only canonical reply layouts through the sandbox relay', () => {
     for (const layout of ['result', 'progress', 'risk', 'blocked', 'handoff']) {
       expect(validateRelayRequest({
