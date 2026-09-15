@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
-import { IdleDetector } from '../src/utils/idle-detector.js';
+import { IdleDetector, stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { readFileSync } from 'node:fs';
 
 const LOADING = `╭───────────────────────────────────────╮
@@ -36,8 +36,10 @@ describe('Codex startup readiness', () => {
     for (const chunkSize of [Infinity, 4096, 79]) {
       it(`releases ${name} restored history without a loaded banner, chunks=${chunkSize}`, () => {
         const fixture = JSON.parse(readFileSync(new URL(`./fixtures/codex-resume/${name}.json`, import.meta.url), 'utf8'));
+        expect(fixture.screen).toContain('\x1b[');
+        expect(stripAnsiScreenText(fixture.screen)).toContain('› Ask Codex to do anything');
         detector.dispose();
-        detector = new IdleDetector(createCodexAdapter(), () => fixture.screen);
+        detector = new IdleDetector(createCodexAdapter(), () => stripAnsiScreenText(fixture.screen));
         detector.onIdle(idle);
         for (let i = 0; i < fixture.output.length; i += chunkSize) {
           detector.feed(fixture.output.slice(i, i + chunkSize));
@@ -51,6 +53,17 @@ describe('Codex startup readiness', () => {
       });
     }
   }
+
+  it('ignores SGR-only blank footer rows after normalizing the viewport', () => {
+    detector.dispose();
+    const screen = '\x1b[1m›\x1b[0m Ask Codex to do anything\n\x1b[0m\x1b[39m\x1b[49m\n  \x1b[32mcustom-model · /tmp\x1b[0m';
+    detector = new IdleDetector(createCodexAdapter(), () => stripAnsiScreenText(screen));
+    detector.onIdle(idle);
+    detector.feed(`${LOADING}\nEarlier messages are available — press ctrl + t to view the full transcript`);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+    expect(detector.isStartupPending()).toBe(false);
+  });
 
   it.each([
     '',

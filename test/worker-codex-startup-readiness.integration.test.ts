@@ -4,15 +4,19 @@ import { join, resolve } from 'node:path';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
-it.each(['banner', 'resume', 'slow-resume'])('holds input during loading, submits once after %s, and commits only after confirmation', async mode => {
+const tmuxAvailable = probeTmuxFunctional().ok;
+it.each(['banner', 'resume', 'slow-resume', 'tmux-resume', 'coloured-resume'])('holds input during loading, submits once after %s, and commits only after confirmation', async (mode, context) => {
+  const backendType = process.env.BOTMUX_TEST_WORKER_BINARY || mode === 'tmux-resume' || mode === 'coloured-resume' ? 'tmux' : 'pty';
+  if (backendType === 'tmux' && !tmuxAvailable) context.skip();
   // The unit runner owns this disposable home. Linux devboxes can have umask
   // 0002; the second worker must not inherit a group-writable credential dir.
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
-  const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-startup-'));
+  const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-startup-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
   const loadingFile = join(root, 'loading');
@@ -45,7 +49,9 @@ const poll = setInterval(() => {
   if (!fs.existsSync(${JSON.stringify(releaseFile)})) return;
   clearInterval(poll);
   process.stdout.write(${JSON.stringify(mode !== 'banner'
-    ? '\x1b[2J\x1b[H Earlier messages are available — press ctrl + t to view the full transcript\r\n› Ask Codex to do anything\r\n  custom-model · /tmp'
+    ? '\x1b[2J\x1b[H Earlier messages are available — press ctrl + t to view the full transcript\r\n' + (mode === 'coloured-resume'
+      ? '\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\r\n\x1b[0m\x1b[39m\x1b[49m\r\n  \x1b[36mcustom-model\x1b[0m · \x1b[32m/tmp\x1b[0m'
+      : '› Ask Codex to do anything\r\n\r\n  custom-model · /tmp')
     : '\x1b[2J\x1b[H│ model: custom-model /model to change │\r\n│ directory: /tmp │\r\n› Ask Codex to do anything\r\n  custom-model · /tmp')});
 }, 50);
 setInterval(() => {}, 1000);
@@ -76,7 +82,7 @@ setInterval(() => {}, 1000);
     child.send({
       type: 'init', sessionId: 'sid-startup-test', chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli,
-      backendType: process.env.BOTMUX_TEST_WORKER_BINARY ? 'tmux' : 'pty',
+      backendType,
       prompt: 'only-this-startup-prompt', turnId: 'om_test', larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(loadingFile));
@@ -91,6 +97,16 @@ setInterval(() => {}, 1000);
       expect(messages.some(m => m.type === 'turn_input_committed')).toBe(false);
     }
     writeFileSync(releaseFile, 'loaded');
+    if (backendType === 'tmux') {
+      let viewport = '';
+      await waitFor(() => {
+        viewport = execFileSync('tmux', ['capture-pane', '-e', '-p'], {
+          env: { ...process.env, TMUX_TMPDIR: root }, encoding: 'utf8',
+        });
+        return viewport.includes('custom-model');
+      });
+      if (mode === 'coloured-resume') expect(viewport).toMatch(/\x1b\[[0-9;]*m›/);
+    }
     await waitFor(() => existsSync(inputFile));
     const text = readFileSync(inputFile, 'utf8');
     expect(text.match(/only-this-startup-prompt/g)).toHaveLength(1);
@@ -108,7 +124,7 @@ setInterval(() => {}, 1000);
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
-    if (process.env.BOTMUX_TEST_WORKER_BINARY) {
+    if (backendType === 'tmux') {
       try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
     }
     rmSync(root, { recursive: true, force: true });
