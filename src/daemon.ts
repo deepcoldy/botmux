@@ -92,7 +92,8 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
-import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, getExplicitChatReplyMode } from './services/chat-reply-mode-store.js';
+import { isForkDestinationChat } from './services/fork-destination-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -21075,6 +21076,19 @@ async function handleBotAdded(
   const forced = typeof opts?.forcePrompt === 'string';
   if (!forced && botCfg.autoStartOnGroupJoin !== true) {
     logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
+    return;
+  }
+  // `/fork --create` 刚建出的分身专属群：fork 流程已同步把分身会话注册到该群
+  // chatId（chat-scope），bot.added 自动开工必须让位，否则在 new-topic 默认下它会
+  // 另发 seed、按 messageId 注册一个空白 thread 会话，与分身争抢（issue #1400）。
+  // forcePrompt（Issue 领取等显式动作）不受影响——那些流程不会指向 fork 专属群。
+  // 与路由层同源：用户对该群有显式 per-chat /reply-mode 设置时以用户为准，marker
+  // 已在 setChatReplyMode 摘除；这里的 getExplicitChatReplyMode 是 restore 重建
+  // marker 场景下的对称兜底。
+  if (!forced
+      && isForkDestinationChat(larkAppId, chatId)
+      && !getExplicitChatReplyMode(larkAppId, chatId)) {
+    logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 是 /fork --create 分身专属群，让位给分身会话`);
     return;
   }
 

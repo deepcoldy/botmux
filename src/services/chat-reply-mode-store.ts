@@ -29,6 +29,7 @@
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode, type GroupMentionMode } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import { unmarkForkDestinationChat } from './fork-destination-store.js';
 
 export type { ChatReplyMode, GroupMentionMode } from '../bot-registry.js';
 
@@ -103,6 +104,22 @@ export function normalizeGroupMentionMode(raw: string | undefined): GroupMention
 }
 
 /**
+ * Per-chat override ONLY (no fallback to the per-bot default). Used where the
+ * caller distinguishes "the user explicitly configured THIS chat" from "the bot
+ * default applies" — specifically fork-destination routing (issue #1400): a fork
+ * marker must yield to an explicit per-chat `/reply-mode` choice but still cover
+ * a chat that merely inherits the per-bot new-topic default.
+ */
+export function getExplicitChatReplyMode(larkAppId: string, chatId: string | undefined): ChatReplyMode | undefined {
+  if (!chatId) return undefined;
+  try {
+    return getBot(larkAppId).config.chatReplyModes?.[chatId];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Effective regular-group reply mode for a chat — the SINGLE source of truth for
  * routing. Per-chat override first, then the per-bot default. Both the
  * `regularGroupRouting` (new-topic) and `maybeApplySharedTopicSeed` (shared)
@@ -120,6 +137,18 @@ export async function setChatReplyMode(
   larkAppId: string,
   chatId: string,
   mode: ChatReplyMode,
+  opts?: {
+    /** Persist the per-chat entry even when it equals the per-bot default
+     *  (normally such redundant entries are deleted for tidy bots.json). Needed
+     *  when "an explicit per-chat choice" must stay distinguishable from
+     *  "inherits the bot default" — fork-destination routing reads that
+     *  distinction (issue #1400). */
+    force?: boolean;
+    /** Who is making this write. `'user'` is an explicit `/reply-mode` (or
+     *  dashboard) choice, which releases fork-destination routing protection;
+     *  `'fork-pin'` is `/fork --create` seeding its own pin and must keep it. */
+    source?: 'user' | 'fork-pin';
+  },
 ): Promise<{ ok: true; mode: ChatReplyMode } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
@@ -127,8 +156,9 @@ export async function setChatReplyMode(
   // Persist only when the per-chat mode differs from the per-bot default, so
   // bots.json stays tidy in the common default-off case while an explicit
   // opt-out (e.g. per-bot default new-topic, this chat pinned back to chat)
-  // still sticks instead of being silently dropped.
-  const redundant = mode === regularGroupDefaultMode(larkAppId);
+  // still sticks instead of being silently dropped. `force` callers (explicit
+  // user choice; fork pin) always keep the entry.
+  const redundant = mode === regularGroupDefaultMode(larkAppId) && opts?.force !== true;
 
   const r = await rmwBotEntry<ChatReplyMode>(larkAppId, (entry) => {
     if (!entry.chatReplyModes || typeof entry.chatReplyModes !== 'object' || Array.isArray(entry.chatReplyModes)) {
@@ -148,7 +178,14 @@ export async function setChatReplyMode(
   if (redundant) delete next[chatId];
   else next[chatId] = mode;
   bot.config.chatReplyModes = Object.keys(next).length > 0 ? next : undefined;
-  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}`);
+  // An explicit user `/reply-mode` choice in a fork-destination chat releases
+  // the fork routing protection (user's per-chat config wins, including back to
+  // new-topic — issue #1400). The fork pin writes with source 'fork-pin' and
+  // keeps the marker; non-sourced legacy callers also release it.
+  if (opts?.source !== 'fork-pin') {
+    unmarkForkDestinationChat(larkAppId, chatId);
+  }
+  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}${opts?.force ? ' (forced)' : ''}`);
   return { ok: true, mode };
 }
 

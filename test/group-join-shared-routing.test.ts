@@ -89,6 +89,8 @@ vi.mock('../src/core/worker-pool.js', async () => {
 let tempRoot = '';
 let modules: Awaited<ReturnType<typeof loadModules>>;
 
+import { markForkDestinationChat, __clearForkDestinationChatsForTest } from '../src/services/fork-destination-store.js';
+
 function tempDir(name: string): string {
   const dir = join(tempRoot, name);
   mkdirSync(dir, { recursive: true });
@@ -139,6 +141,7 @@ beforeEach(() => {
 
 afterEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
+  __clearForkDestinationChatsForTest();
 });
 
 afterAll(() => {
@@ -1391,5 +1394,52 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
     await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
     expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleBotAdded — /fork --create 分身专属群让位（issue #1400）', () => {
+  it('new-topic 默认 + fork marker：不自动开工，分身 chat-scope 会话不被争抢', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_fork_dst';
+    const chatId = 'oc_join_fork_dst';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      // 即使在 new-topic 默认（bot.added 原本会发 seed 开 thread 会话）下也必须让位。
+      regularGroupReplyMode: 'new-topic',
+    });
+    // /fork --create 在 createChat 返回时即打上的进程内 marker。
+    markForkDestinationChat(appId, chatId);
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))).toBeUndefined();
+  });
+
+  it('无 fork marker 的新群在 new-topic 默认下仍照常自动开工（thread seed）', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_plain_newtopic';
+    const chatId = 'oc_join_plain_newtopic';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir('repo-newtopic-join'),
+      regularGroupReplyMode: 'new-topic',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 发了 seed、按 seed messageId 注册 thread-scope 会话。
+    expect(mocks.sendMessage).toHaveBeenCalledWith(appId, chatId, expect.any(String), 'text');
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(ds?.scope).toBe('thread');
   });
 });

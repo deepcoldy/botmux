@@ -288,20 +288,32 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
-  createGroupWithBots: vi.fn(async (opts: any) => ({
-    ok: true,
-    chatId: 'oc_new_group',
-    creator: opts.creatorLarkAppId,
-    invalidBotIds: [],
-    invalidUserIds: [],
-    ownerTransferredTo: opts.transferOwnerTo ?? null,
-    transferError: null,
-    notifyMessageId: 'om_notify',
-    notifyError: null,
-    oncallBindings: [],
-    roleProfileBootstrapMessageId: null,
-    roleProfileBootstrapError: null,
-  })),
+  createGroupWithBots: vi.fn(async (opts: any) => {
+    const chatId = 'oc_new_group';
+    // Mirror the real service: the progress hook fires synchronously right
+    // after createChat returns the id (the fork flow uses it to register the
+    // fork-destination routing marker before any further awaits).
+    opts.onChatCreated?.(chatId);
+    return {
+      ok: true,
+      chatId,
+      creator: opts.creatorLarkAppId,
+      invalidBotIds: [],
+      invalidUserIds: [],
+      ownerTransferredTo: opts.transferOwnerTo ?? null,
+      transferError: null,
+      notifyMessageId: 'om_notify',
+      notifyError: null,
+      oncallBindings: [],
+      roleProfileBootstrapMessageId: null,
+      roleProfileBootstrapError: null,
+    };
+  }),
+}));
+
+vi.mock('../src/services/chat-reply-mode-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/chat-reply-mode-store.js')>()),
+  setChatReplyMode: vi.fn(async () => ({ ok: true as const, mode: 'chat-topic' as const })),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -580,6 +592,8 @@ import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
+import { setChatReplyMode } from '../src/services/chat-reply-mode-store.js';
+import { isForkDestinationChat, __clearForkDestinationChatsForTest } from '../src/services/fork-destination-store.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
@@ -1738,6 +1752,8 @@ describe('handleCommand', () => {
     vi.mocked(getChatModeStrict).mockResolvedValue('topic');
     vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
     vi.mocked(forkSession).mockResolvedValue({ ok: true, childSessionId: 'child-sess-1' });
+    vi.mocked(setChatReplyMode).mockResolvedValue({ ok: true, mode: 'chat-topic' });
+    __clearForkDestinationChatsForTest();
     vi.mocked(isForkCapableSession).mockReturnValue(true);
     vi.mocked(sessionStore.getSession).mockReturnValue(undefined);
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
@@ -1915,11 +1931,78 @@ describe('handleCommand', () => {
         'chat',
         expect.objectContaining({ forkTaskText: '直播开发备份' }),
       );
+      // The new chat is registered as a fork destination the instant createChat
+      // returns, and pinned to per-chat chat-topic (force, fork-pin) so top-level
+      // messages keep hitting the chat-scope child under a new-topic default
+      // (issue #1400).
+      expect(isForkDestinationChat(LARK_APP_ID, 'oc_new_group')).toBe(true);
+      expect(setChatReplyMode).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        'oc_new_group',
+        'chat-topic',
+        { force: true, source: 'fork-pin' },
+      );
       // The load-bearing assertion: lineage persisted despite the notice throwing.
       expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
       expect(sessionStore.updateSession).toHaveBeenCalledWith(
         expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
       );
+    });
+
+    it('registers the fork-destination marker from onChatCreated before any other await (race window)', async () => {
+      // The marker must be set inside createGroupWithBots' onChatCreated hook —
+      // the moment createChat returns the id — not after group-creator finishes
+      // bot invites / owner transfer. We observe the hook argument directly.
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 竞态窗口群'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      const createOpts = vi.mocked(createGroupWithBots).mock.calls[0][0];
+      expect(createOpts.onChatCreated).toEqual(expect.any(Function));
+      __clearForkDestinationChatsForTest();
+      expect(isForkDestinationChat(LARK_APP_ID, 'oc_race')).toBe(false);
+      createOpts.onChatCreated!('oc_race');
+      expect(isForkDestinationChat(LARK_APP_ID, 'oc_race')).toBe(true);
+    });
+
+    it('still completes the fork when the chat-topic pin fails (in-memory marker + restore fallback)', async () => {
+      vi.mocked(setChatReplyMode).mockResolvedValueOnce({ ok: false, reason: 'bot_not_in_config' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 落盘失败也成'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        'oc_new_group',
+        'oc_new_group',
+        'group',
+        'chat',
+        expect.any(Object),
+      );
+      expect(isForkDestinationChat(LARK_APP_ID, 'oc_new_group')).toBe(true);
+      expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
     });
   });
 

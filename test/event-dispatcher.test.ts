@@ -146,6 +146,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { markForkDestinationChat, __clearForkDestinationChatsForTest } from '../src/services/fork-destination-store.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -174,6 +175,7 @@ const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
   __resetPeerCrossRefCacheForTest();
+  __clearForkDestinationChatsForTest();
   mockCrossRefStatSync.mockReset().mockReturnValue({
     dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1,
   });
@@ -1307,6 +1309,57 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
       message_id: 'msg-nt-seed', chat_id: 'oc_group', chat_type: 'group',
       root_id: undefined, thread_id: 'omt_native_topic',
     })).toEqual({ scope: 'thread', anchor: 'msg-nt-seed' });
+  });
+
+  // Regression for #1400: `/fork --create` registers the child session
+  // chat-scope at the NEW group's chatId. When the bot's regular-group default
+  // is new-topic, top-level inbound messages would route thread-scope at each
+  // messageId and never hit the fork child. A marked fork-destination chat must
+  // flatten top-level routing back to chatId regardless of the configured mode.
+  it('fork-destination chat: top-level message stays chat-scope at chatId even under per-bot new-topic default', async () => {
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    markForkDestinationChat(MY_APP_ID, 'oc_fork_dst');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-fork-first', chat_id: 'oc_fork_dst', chat_type: 'group',
+      root_id: undefined, thread_id: undefined,
+    })).toEqual({ scope: 'chat', anchor: 'oc_fork_dst' });
+  });
+
+  it('fork-destination marker yields to an explicit per-chat mode: a user-set new-topic override forks per message again', async () => {
+    // Priority: explicit per-chat /reply-mode > fork marker > per-bot default.
+    // After the user explicitly switches this chat back to new-topic, the marker
+    // must not force flat routing (issue #1400 review contract).
+    setupBotState({ chatReplyModes: { oc_fork_dst: 'new-topic' } });
+    mockGetChatMode.mockResolvedValue('group');
+    markForkDestinationChat(MY_APP_ID, 'oc_fork_dst');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-fork-later', chat_id: 'oc_fork_dst', chat_type: 'group',
+      root_id: undefined, thread_id: undefined,
+    })).toEqual({ scope: 'thread', anchor: 'msg-fork-later' });
+  });
+
+  it('fork-destination marker stays flat under the other non-new-topic modes (chat / chat-topic / shared) regardless of marker', async () => {
+    mockGetChatMode.mockResolvedValue('group');
+    for (const mode of ['chat', 'chat-topic', 'shared'] as const) {
+      setupBotState({ regularGroupReplyMode: mode });
+      markForkDestinationChat(MY_APP_ID, 'oc_fork_dst_modes');
+      expect(await decideRouting(MY_APP_ID, {
+        message_id: 'msg-fork-modes', chat_id: 'oc_fork_dst_modes', chat_type: 'group',
+        root_id: undefined, thread_id: undefined,
+      })).toEqual({ scope: 'chat', anchor: 'oc_fork_dst_modes' });
+      __clearForkDestinationChatsForTest();
+    }
+  });
+
+  it('fork-destination marker is bot-scoped: another bot still follows new-topic in the same chat', async () => {
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    markForkDestinationChat('app-other-bot', 'oc_fork_dst');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-fork-other-bot', chat_id: 'oc_fork_dst', chat_type: 'group',
+      root_id: undefined, thread_id: undefined,
+    })).toEqual({ scope: 'thread', anchor: 'msg-fork-other-bot' });
   });
 });
 
@@ -5461,6 +5514,62 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
       anchor: 'chat-tri-flat',
       larkAppId: MY_APP_ID,
     }));
+  });
+
+  // Regression #1400: a `/fork --create` child is registered chat-scope at the
+  // new group's chatId. Under a per-bot new-topic default the FIRST and every
+  // later top-level message must still route flat to that chat-scope child —
+  // not spawn a blank session with a repo picker.
+  it('fork-destination chat under new-topic default: @bot top-level message continues the chat-scope fork child', async () => {
+    setupBotState({ regularGroupReplyMode: 'new-topic', allowedUsers: [USER_OPEN_ID] });
+    markForkDestinationChat(MY_APP_ID, 'chat-fork-dst');
+    // The fork child is owned at the chat anchor.
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-fork-dst');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA 继续分身任务' }),
+      messageId: 'msg-fork-first-turn',
+      chatId: 'chat-fork-dst',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-fork-dst',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('fork-destination chat under new-topic default: a non-@ message (mention-mode never) also hits the fork child', async () => {
+    setupBotState({
+      regularGroupReplyMode: 'new-topic',
+      regularGroupMentionMode: 'never',
+      allowedUsers: [USER_OPEN_ID],
+    });
+    markForkDestinationChat(MY_APP_ID, 'chat-fork-dst-bare');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-fork-dst-bare');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '直接发消息继续分身' }),
+      messageId: 'msg-fork-bare-turn',
+      chatId: 'chat-fork-dst-bare',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-fork-dst-bare',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 });
 
