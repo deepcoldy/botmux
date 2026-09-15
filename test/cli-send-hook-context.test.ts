@@ -624,6 +624,15 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,300}getGroupStats/);
   });
 
+  it('routes --ask-answer to the exact turn sender without the generic mention-back ambiguity gate', () => {
+    expect(cliSource).toContain('mentionBack: mentionBack || !!askAnswer');
+    expect(cliSource).toContain('if (askAnswer && !replyTargetSenderOpenId)');
+    expect(cliSource).toContain('if ((mentionBack || !!askAnswer) && replyTargetSenderOpenId');
+    expect(cliSource).toContain('formatAddressedAskAnswerCommand(askAnswer, replyTargetSenderOpenId!)');
+    expect(cliSource).toMatch(/if \(mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel\)/);
+    expect(cliSource).not.toMatch(/if \(\(mentionBack \|\| !!askAnswer\).*mentionBackAmbiguity/);
+  });
+
   it('freezes VC listener replay content and indexes only the successful primary output', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);

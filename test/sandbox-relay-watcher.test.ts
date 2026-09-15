@@ -20,6 +20,40 @@ afterEach(() => {
 });
 
 describe('sandbox relay watcher host handoff', () => {
+  it('re-execs a structured ask answer without attaching the relay content file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-ask-answer-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'ask-answer-echo.mjs');
+    writeFileSync(fixture, `
+      const argv = process.argv.slice(2);
+      process.stdout.write(JSON.stringify({ argv }));
+    `);
+    const id = 'ask-answer-1';
+    writeFileSync(join(outbox, `${id}.content`), '');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      flags: ['--ask-answer', 'independent'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const child = JSON.parse(response.stdout) as { argv: string[] };
+      expect(child.argv).toEqual([
+        'send',
+        '--ask-answer', 'independent',
+        '--session-id', 'forced-source',
+      ]);
+      expect(child.argv).not.toContain('--content-file');
+    } finally {
+      stop();
+    }
+  });
+
   it('re-execs dispatch on the host with a forced source session and bounded routing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-'));
     roots.push(root);

@@ -133,7 +133,7 @@ export interface AskAnswerActor {
  *  address the bot in this chat may answer its `botmux ask`. Returns false until
  *  wired, so an unwired broker authorizes no one (daemon always wires it).
  *  `actor` carries optional union / bot context (see AskAnswerActor); omitted on
- *  card-click paths, supplied on the text-reply path. */
+ *  card-click paths, supplied on native-text reply paths. */
 let canTalkChecker:
   | ((larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p', actor?: AskAnswerActor) => boolean)
   | null = null;
@@ -148,7 +148,7 @@ export function setCanTalkChecker(
 /** A click is authorized iff the clicker may `canTalk` to the bot in this chat.
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
- *  `actor` is only supplied by the text-reply path; card clicks omit it. */
+ *  `actor` is only supplied by native-text reply paths; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
@@ -568,6 +568,8 @@ export function submitAsk(args: {
   nonce: string;
   by: string;
   selections?: ReadonlyArray<ReadonlyArray<string>>;
+  /** Full message actor context for structured IM answers. Card clicks omit it. */
+  actor?: AskAnswerActor;
   /** 空提交二次确认已通过（用户在 arm 卡片上再点了一次）。仅影响「全多选 + 全空」
    *  这一种可确认的空提交；其它情形不看它。缺省 false。 */
   confirmEmpty?: boolean;
@@ -577,7 +579,7 @@ export function submitAsk(args: {
   if (!ask) return 'stale';
   if (ask.nonce !== args.nonce) return 'stale';
   if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
+  if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;

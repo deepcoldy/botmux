@@ -1028,6 +1028,7 @@ const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
   '--response-kind',
+  '--ask-answer',
   '--layout',
   '--plugin-card-action',
 ]);
@@ -1136,6 +1137,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--ask-answer' && !/^[a-z][a-z0-9_-]{0,63}$/.test(v)) {
+        return { ok: false, error: 'flag --ask-answer must be a bounded option key' };
       }
       if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
         return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
@@ -1372,11 +1376,15 @@ export function startOutboxWatcher(
       });
       if (coverBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video cover not a regular file in outbox'); continue; }
 
+      const structuredAskAnswer = v.value.command === 'send'
+        && v.value.flags.includes('--ask-answer');
       const hostArgs = [
         ...v.value.flags,
         ...(v.value.command === 'dispatch'
           ? ['--brief-file', contentDest]
-          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+          : structuredAskAnswer
+            ? []
+            : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
         ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
         ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
         ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),

@@ -14,6 +14,7 @@ import {
   _pendingCount,
   _resetForTest,
   findPendingAskByAnchor,
+  getAskSnapshot,
   invalidateAll,
   registerAsk,
   registerHostAsk,
@@ -895,7 +896,7 @@ describe('submitCustomReply actor context — bot / union 身份透传给 checke
   // 回归 PR #685 复审的同型残留：ask-broker 的 canTalkChecker 被卡片点击和文字作答
   // 共用，但只拿 open_id/chatType，拿不到 bot/union 身份。文字作答路径（daemon 有完整
   // 消息事件）必须透传 actor，让 checker 与 dispatcher 外层闸 / quota 复查同源：
-  //   - bot 发送方 → evaluateBotTalk（覆盖团队拉群没带 union_id 的场景）
+  //   - bot 发送方 → evaluateBotTalk（覆盖团队拉群未携带 union_id 的场景）
   //   - 平台 teamMember 真人 → evaluateTalk 的 memberUnionId 腿
   // 否则跨部署 team bot / teamMember 真人的文字作答会被 checker 拒。
 
@@ -923,6 +924,70 @@ describe('submitCustomReply actor context — bot / union 身份透传给 checke
       openId: 'ou_bot',
       actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
     });
+  });
+
+  it('submitAsk 允许团队群中未携带 union_id 的 bot actor 完成结构化回答', async () => {
+    const seen: Array<{ openId: string; actor: unknown }> = [];
+    setCanTalkChecker((_app, _chat, openId, _chatType, actor) => {
+      seen.push({ openId, actor });
+      // Team-group bot events may omit union_id. The bot actor leg must still
+      // authorize the structured answer instead of degrading to openId-only.
+      return actor?.botSender === true && actor.senderUnionId === undefined;
+    });
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const pending = registerHostAsk(makeInput({
+      requestId: 'structured-answer',
+      originKind: 'host_cross_principal_classification',
+      answererOpenId: 'ou_teambot',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    const actor = {
+      botSender: true,
+      senderUnionId: undefined,
+      memberUnionId: undefined,
+    };
+
+    expect(submitAsk({
+      askId,
+      nonce,
+      by: 'ou_teambot',
+      selections: [['yes']],
+      actor,
+    })).toBe('accepted');
+    await expect(pending).resolves.toMatchObject({
+      kind: 'answered',
+      answers: [['yes']],
+      by: 'ou_teambot',
+    });
+    expect(seen.at(-1)).toEqual({ openId: 'ou_teambot', actor });
+  });
+
+  it('submitAsk 仍拒绝 answererOpenId 不匹配的 bot actor', async () => {
+    setCanTalkChecker(() => true);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const pending = registerHostAsk(makeInput({
+      requestId: 'structured-answer-wrong-bot',
+      originKind: 'host_cross_principal_classification',
+      answererOpenId: 'ou_expected_bot',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+
+    expect(submitAsk({
+      askId,
+      nonce,
+      by: 'ou_other_bot',
+      selections: [['yes']],
+      actor: { botSender: true },
+    })).toBe('unauthorized');
+    expect(getAskSnapshot(askId)?.settled).toBe(false);
+    invalidateAll('test cleanup');
+    await expect(pending).resolves.toMatchObject({ kind: 'invalidated' });
   });
 
   it('对照①：团队拉群里无 union 的 bot（botSender=true, 无 union）→ 由 checker 的 bot 腿放行', async () => {
