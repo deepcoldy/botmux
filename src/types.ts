@@ -983,6 +983,7 @@ export interface XpiSharedCwdQuarantine {
     | 'lease_outside_coordinator'
     | 'ambiguous_lease'
     | 'inflight_lease_after_restart'
+    | 'restore_quarantined_member'
     | 'close_migration_unproven'
     | 'recovery_persistence_failure';
   detail: string;

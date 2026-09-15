@@ -35,6 +35,18 @@ export type XpiSharedCwdStartupNotice =
   | XpiSharedCwdQuarantineNotice
   | XpiSharedCwdDispatchUnknownStartupNotice;
 
+/** A grouped turn is already a durable copy of user input. Keep the queue
+ * bounded so a wedged or deliberately flooded group cannot grow sessions.db
+ * without limit while preserving the oldest FIFO entries for recovery. */
+export const MAX_XPI_SHARED_CWD_QUEUED_TURNS = 32;
+
+export class XpiSharedCwdQueueFullError extends Error {
+  constructor(readonly sessionId: string) {
+    super(`XPI shared-cwd queue is full for session ${sessionId}`);
+    this.name = 'XpiSharedCwdQueueFullError';
+  }
+}
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
@@ -154,6 +166,7 @@ function quarantineGroup(
 export function reconcileXpiSharedCwdRecovery(
   sessions: readonly Session[],
   now: number,
+  options: { containRestoreQuarantinedSessionIds?: ReadonlySet<string> } = {},
 ): XpiSharedCwdRecoveryResult {
   const result: XpiSharedCwdRecoveryResult = {
     changedSessionIds: new Set(),
@@ -185,6 +198,23 @@ export function reconcileXpiSharedCwdRecovery(
           detail: existingQuarantine.detail,
         });
       }
+    }
+    // A later restore phase can quarantine a persisted row after the initial
+    // XPI reconcile has run. If it still owns a grouped FIFO entry but never
+    // becomes a runtime DaemonSession, silently selecting that entry forever
+    // blocks every healthy peer. Park it explicitly and detach it below: the
+    // durable queue remains available for inspection, an owner notice is
+    // emitted, and only then may the healthy remainder elect a coordinator.
+    if (options.containRestoreQuarantinedSessionIds?.has(session.sessionId)
+      && !existingQuarantine
+      && session.restoreQuarantinedAt
+      && session.xpiSharedCwdAdmissionGroupId) {
+      const queued = session.xpiSharedCwdQueuedTurns?.length ?? 0;
+      addQuarantine(result, session, {
+        scope: 'session',
+        reason: 'restore_quarantined_member',
+        detail: `session ${session.sessionId} was quarantined during restore with ${queued} queued turn(s); those turns remain parked and will not be dispatched`,
+      }, detectedAt);
     }
     const stale = staleLegacyXpiDetail(session, now);
     if (stale) {
@@ -357,6 +387,9 @@ export function enqueueXpiSharedCwdTurn(args: {
     ?? (args.session.xpiSharedCwdQueuedTurns = []);
   const existing = queue.find(item => item.id === id);
   if (existing) return { record: existing, inserted: false };
+  if (queue.length >= MAX_XPI_SHARED_CWD_QUEUED_TURNS) {
+    throw new XpiSharedCwdQueueFullError(args.session.sessionId);
+  }
   const record: XpiSharedCwdQueuedTurn = {
     version: 1,
     id,

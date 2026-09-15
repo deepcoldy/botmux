@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   enqueueXpiSharedCwdTurn,
   finalizeXpiSharedCwdMemberClose,
+  MAX_XPI_SHARED_CWD_QUEUED_TURNS,
   reconcileXpiSharedCwdRecovery,
   releaseXpiSharedCwdAdmission,
   selectNextXpiSharedCwdTurn,
@@ -261,6 +262,92 @@ describe('narrow XPI shared-cwd admission', () => {
 
     expect(selectNextXpiSharedCwdTurn([laterSession!, coordinator!], 'xpi-admission:test')?.record.turnId)
       .toBe('turn_first');
+  });
+
+  it('parks a restore-quarantined FIFO head visibly before advancing the healthy group', () => {
+    const [blocked, healthy] = group(session('blocked'), session('healthy'));
+    blocked!.restoreQuarantinedAt = '2026-01-01T00:00:01.000Z';
+    enqueueXpiSharedCwdTurn({
+      session: blocked!,
+      turnId: 'turn_blocked',
+      caller,
+      userPrompt: 'park me visibly',
+      cliInput: { content: 'park me visibly' },
+      resume: true,
+      createdAt: '2026-01-01T00:00:02.000Z',
+    });
+    enqueueXpiSharedCwdTurn({
+      session: healthy!,
+      turnId: 'turn_healthy',
+      caller,
+      userPrompt: 'still runnable',
+      cliInput: { content: 'still runnable' },
+      resume: true,
+      createdAt: '2026-01-01T00:00:03.000Z',
+    });
+
+    const result = reconcileXpiSharedCwdRecovery(
+      [blocked!, healthy!],
+      Date.now(),
+      { containRestoreQuarantinedSessionIds: new Set(['blocked']) },
+    );
+
+    expect(blocked!.xpiSharedCwdQuarantine).toMatchObject({
+      scope: 'session',
+      reason: 'restore_quarantined_member',
+      noticePending: true,
+    });
+    expect(result.notices).toEqual([expect.objectContaining({
+      sessionId: 'blocked',
+      reason: 'restore_quarantined_member',
+      detail: expect.stringContaining('1 queued turn(s)'),
+    })]);
+    expect(blocked!.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect(blocked!.xpiSharedCwdQueuedTurns?.[0]?.turnId).toBe('turn_blocked');
+    expect(healthy!.xpiSharedCwdAdmissionCoordinatorSessionId).toBe('healthy');
+    expect(selectNextXpiSharedCwdTurn([blocked!, healthy!], 'xpi-admission:test')?.record.turnId)
+      .toBe('turn_healthy');
+  });
+
+  it('does not preempt a restore-quarantined member before restore has tried to reclaim it', () => {
+    const [member, peer] = group(session('reclaimable'), session('peer'));
+    member!.restoreQuarantinedAt = '2026-01-01T00:00:01.000Z';
+
+    const result = reconcileXpiSharedCwdRecovery([member!, peer!], Date.now());
+
+    expect(result.quarantinedSessionIds.size).toBe(0);
+    expect(member!.xpiSharedCwdQuarantine).toBeUndefined();
+    expect(member!.xpiSharedCwdAdmissionGroupId).toBe('xpi-admission:test');
+  });
+
+  it('rejects a new grouped turn once the durable per-session FIFO is full', () => {
+    const member = session('bounded');
+    member.xpiSharedCwdQueuedTurns = Array.from(
+      { length: MAX_XPI_SHARED_CWD_QUEUED_TURNS },
+      (_, index) => ({
+        version: 1 as const,
+        id: xpiSharedCwdQueuedTurnId(member.sessionId, `turn_${index}`),
+        turnId: `turn_${index}`,
+        caller,
+        userPrompt: `queued ${index}`,
+        cliInput: { content: `queued ${index}` },
+        resume: true,
+        createdAt: new Date(index).toISOString(),
+        dispatchState: 'queued' as const,
+      }),
+    );
+
+    expect(() => enqueueXpiSharedCwdTurn({
+      session: member,
+      turnId: 'turn_overflow',
+      caller,
+      userPrompt: 'must not be silently accepted',
+      cliInput: { content: 'must not be silently accepted' },
+      resume: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    })).toThrow('XPI shared-cwd queue is full');
+    expect(member.xpiSharedCwdQueuedTurns).toHaveLength(MAX_XPI_SHARED_CWD_QUEUED_TURNS);
+    expect(member.xpiSharedCwdQueuedTurns?.some(record => record.turnId === 'turn_overflow')).toBe(false);
   });
 
   it('migrates a closed coordinator only after its exact holder generation is proven exited', () => {

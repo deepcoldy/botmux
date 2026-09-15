@@ -368,6 +368,7 @@ import {
 import {
   enqueueXpiSharedCwdTurn,
   finalizeXpiSharedCwdMemberClose,
+  reconcileXpiSharedCwdRecovery,
   releaseXpiSharedCwdAdmission,
   removeXpiSharedCwdTurn,
   selectNextXpiSharedCwdTurn,
@@ -17820,10 +17821,13 @@ async function notifyXpiSharedCwdQuarantine(
   if (!durableNoticePending && !bootLocalPersistenceFailure) return;
   const ownerAt = session.ownerOpenId ? `<at id=${session.ownerOpenId}></at> ` : '';
   const scopeText = notice.scope === 'group' ? '该 XPI 共享目录协调组' : '该会话';
+  const actionText = notice.reason === 'restore_quarantined_member'
+    ? '其中尚未派发的轮次已保留但不会执行；请关闭该会话，并在新会话中重新发送。'
+    : '当前没有自动解除入口；请关闭相关会话，完成检查后重建。';
   try {
     await sessionReply(
       storedSessionAnchorId(session),
-      `${ownerAt}${scopeText}的恢复状态无法安全证明，已仅隔离相关会话；其他会话仍正常恢复。请先完成迁移或清理，再解除隔离。`,
+      `${ownerAt}${scopeText}的恢复状态无法安全证明，已仅隔离相关会话；其他会话仍正常恢复。${actionText}`,
       'text',
       session.larkAppId ?? larkAppId,
     );
@@ -17953,7 +17957,49 @@ async function finalizeClosedXpiSharedCwdMember(
 
 export const __testOnly_finalizeClosedXpiSharedCwdMember = finalizeClosedXpiSharedCwdMember;
 
-async function driveNextXpiSharedCwdTurn(groupId: string): Promise<boolean> {
+type XpiSharedCwdDriveDependencies = {
+  forkAdoptWorker: typeof forkAdoptWorker;
+  notifyQuarantine: typeof notifyXpiSharedCwdQuarantine;
+};
+
+const xpiSharedCwdDriveDependencies: XpiSharedCwdDriveDependencies = {
+  forkAdoptWorker,
+  notifyQuarantine: notifyXpiSharedCwdQuarantine,
+};
+
+function forkXpiSharedCwdTurn(
+  ds: DaemonSession,
+  args: {
+    cliInput: CliTurnPayload;
+    resume: boolean;
+    turnId: string;
+    caller: TrustedCaller;
+    onWorkerGenerationReserved: (workerGeneration: number) => void;
+  },
+  forkAdopt: typeof forkAdoptWorker = forkAdoptWorker,
+): boolean {
+  if (ds.adoptedFrom) {
+    return forkAdopt(ds, {
+      prompt: args.cliInput.content,
+      turnId: args.turnId,
+      atMostOnce: true,
+      trustedCaller: args.caller,
+      onWorkerGenerationReserved: args.onWorkerGenerationReserved,
+    }) === 'accepted';
+  }
+  return forkWorker(ds, args.cliInput, {
+    resume: args.resume,
+    turnId: args.turnId,
+    atMostOnce: true,
+    trustedCaller: args.caller,
+    onWorkerGenerationReserved: args.onWorkerGenerationReserved,
+  });
+}
+
+async function driveNextXpiSharedCwdTurn(
+  groupId: string,
+  dependencies: XpiSharedCwdDriveDependencies = xpiSharedCwdDriveDependencies,
+): Promise<boolean> {
   const runtimeMembers = [...activeSessions.values()]
     .filter(ds => ds.session.status === 'active'
       && ds.session.xpiSharedCwdAdmissionGroupId === groupId
@@ -17975,11 +18021,62 @@ async function driveNextXpiSharedCwdTurn(groupId: string): Promise<boolean> {
     return false;
   }
   const ds = runtimeMembers.find(candidate => candidate.session.sessionId === next.session.sessionId);
-  if (!ds || isSessionTransferring(ds)) return false;
+  if (!ds) {
+    // Missing runtime state is normally temporary during restore, so preserve
+    // strict FIFO and wait. The one provably non-runnable case is a row already
+    // marked by restore quarantine. Convert that into an explicit, durable XPI
+    // quarantine (with owner notice) before allowing the healthy group to move.
+    if (!next.session.restoreQuarantinedAt) return false;
+    const ids = rows.map(row => row.sessionId);
+    let recovery: ReturnType<typeof sessionStore.mutateOwnedSessionsAtomically<
+      ReturnType<typeof reconcileXpiSharedCwdRecovery>
+    >>;
+    try {
+      recovery = sessionStore.mutateOwnedSessionsAtomically(
+        ids,
+        fresh => reconcileXpiSharedCwdRecovery(
+          [...fresh.values()],
+          Date.now(),
+          { containRestoreQuarantinedSessionIds: new Set([next.session.sessionId]) },
+        ),
+        { nonblocking: true },
+      );
+    } catch (error) {
+      if (error instanceof sessionStore.SessionStoreBusyError) {
+        scheduleXpiSessionStoreBusyRetry(
+          {
+            key: `dispatch:${groupId}`,
+            operation: 'dispatch',
+            sessionId: next.session.sessionId,
+            groupId,
+            turnId: next.record.turnId,
+          },
+          () => driveNextXpiSharedCwdTurn(groupId, dependencies),
+        );
+      } else {
+        logger.error(
+          `[xpi-shared-cwd] failed to quarantine non-runnable queue head ${next.record.turnId.slice(0, 12)}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return false;
+    }
+    const { result, rows: recoveredRows } = recovery;
+    for (const runtime of runtimeMembers) syncXpiSession(runtime, recoveredRows.get(runtime.session.sessionId));
+    for (const notice of result.notices) {
+      logger.error(`[xpi-shared-cwd] dispatch_quarantine ${JSON.stringify(notice)}`);
+      void dependencies.notifyQuarantine(next.session.larkAppId ?? '', notice);
+    }
+    if (result.quarantinedSessionIds.has(next.session.sessionId)) {
+      return driveNextXpiSharedCwdTurn(groupId, dependencies);
+    }
+    return false;
+  }
+  if (isSessionTransferring(ds)) return false;
   const freeze = currentDeviceIsolationFreezeLease();
   if (freeze) {
     const retryMs = Math.max(50, Math.min(1_000, freeze.expiresAt - Date.now() + 10));
-    setTimeout(() => { void driveNextXpiSharedCwdTurn(groupId); }, retryMs).unref?.();
+    setTimeout(() => { void driveNextXpiSharedCwdTurn(groupId, dependencies); }, retryMs).unref?.();
     return false;
   }
 
@@ -18004,12 +18101,12 @@ async function driveNextXpiSharedCwdTurn(groupId: string): Promise<boolean> {
         atMostOnce: true,
         trustedCaller: next.record.caller,
       });
-    } else if (!ds.adoptedFrom) {
-      accepted = forkWorker(ds, next.record.cliInput, {
+    } else {
+      accepted = forkXpiSharedCwdTurn(ds, {
+        cliInput: next.record.cliInput,
         resume: next.record.resume,
         turnId: next.record.turnId,
-        atMostOnce: true,
-        trustedCaller: next.record.caller,
+        caller: next.record.caller,
         onWorkerGenerationReserved(workerGeneration) {
           admission = claimExactXpiSharedCwdAdmission({
             ds,
@@ -18024,7 +18121,7 @@ async function driveNextXpiSharedCwdTurn(groupId: string): Promise<boolean> {
             throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
           }
         },
-      });
+      }, dependencies.forkAdoptWorker);
     }
     if (!accepted || admission.kind !== 'acquired') {
       rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
@@ -18051,7 +18148,7 @@ async function driveNextXpiSharedCwdTurn(groupId: string): Promise<boolean> {
           groupId,
           turnId: next.record.turnId,
         },
-        () => driveNextXpiSharedCwdTurn(groupId),
+        () => driveNextXpiSharedCwdTurn(groupId, dependencies),
       );
     }
     logger.error(
@@ -18319,7 +18416,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
       atMostOnce: true,
       trustedCaller: record.owner,
     });
-  } else if (!ds.adoptedFrom) {
+  } else {
     if (ds.session.xpiSharedCwdAdmissionGroupId && xpiSharedCwdUnavailableOrBusy(ds)) {
       queueXpiSharedCwdTurn({
         ds,
@@ -18332,29 +18429,26 @@ async function dispatchApprovedCrossPrincipalSuggestion(
       removeCrossPrincipalRecord(ds, record.id);
       return true;
     }
-    accepted = forkWorker(ds, cliInput, {
+    accepted = forkXpiSharedCwdTurn(ds, {
+      cliInput,
       resume: ds.hasHistory,
       turnId,
-      atMostOnce: true,
-      trustedCaller: record.owner,
-      ...(ds.session.xpiSharedCwdAdmissionGroupId
-        ? {
-            onWorkerGenerationReserved(workerGeneration: number) {
-              admission = claimExactXpiSharedCwdAdmission({
-                ds,
-                turnId,
-                workerGeneration,
-                caller: record.owner,
-                userPrompt: prompt,
-                cliInput,
-                resume: ds.hasHistory,
-              });
-              if (admission.kind !== 'acquired') {
-                throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
-              }
-            },
-          }
-        : {}),
+      caller: record.owner,
+      onWorkerGenerationReserved(workerGeneration: number) {
+        if (!ds.session.xpiSharedCwdAdmissionGroupId) return;
+        admission = claimExactXpiSharedCwdAdmission({
+          ds,
+          turnId,
+          workerGeneration,
+          caller: record.owner,
+          userPrompt: prompt,
+          cliInput,
+          resume: ds.hasHistory,
+        });
+        if (admission.kind !== 'acquired') {
+          throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
+        }
+      },
     });
   }
   if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired')) {

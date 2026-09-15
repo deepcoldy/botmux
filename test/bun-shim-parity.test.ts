@@ -190,7 +190,10 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     vi.useFakeTimers();
     try {
       const seen: string[] = [];
-      setTimeout(async () => { await Promise.resolve(); seen.push('fired'); }, 10);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      setTimeout(async () => { await gate; seen.push('fired'); }, 10);
+      void Promise.resolve().then(release);
       await vi.runAllTimersAsync();
       expect(seen).toEqual(['fired']);
     } finally {
@@ -202,7 +205,10 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     vi.useFakeTimers();
     try {
       const seen: string[] = [];
-      setTimeout(async () => { await Promise.resolve(); seen.push('fired'); }, 10);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      setTimeout(async () => { await gate; seen.push('fired'); }, 10);
+      void Promise.resolve().then(release);
       await vi.advanceTimersByTimeAsync(20);
       expect(seen).toEqual(['fired']);
     } finally {
@@ -214,8 +220,11 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     vi.useFakeTimers();
     try {
       const seen: string[] = [];
-      setTimeout(async () => { await Promise.resolve(); seen.push('first'); }, 10);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      setTimeout(async () => { await gate; seen.push('first'); }, 10);
       setTimeout(() => { seen.push('second'); }, 20);
+      void Promise.resolve().then(release);
       await vi.advanceTimersToNextTimerAsync();
       expect(seen).toEqual(['first']);
       expect(vi.getTimerCount()).toBe(1);
