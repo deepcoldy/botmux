@@ -20091,7 +20091,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Workflow 保留动词必须先于即兴 grill，避免 `run/save/cancel/list/show`
   // 被当成自由文本目标；v2 runtime 已没有回退路径。
   if (await handleV3SavedWorkflowCommandIfAny({
-    content: cmdContent,
+    // 与话题指令头同理（D8）：剥掉本 bot 在任意位置的 @。只剥前导 @ 时，
+    // 结尾的 `@机器人` 会作为文本进入 `/workflow save` 的名称或 `run` 的引用。
+    content: stripBotMentions(
+      cmdContent,
+      followupMentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
     anchor,
     replyRootId,
     messageId: parsed.messageId,
@@ -21818,7 +21824,12 @@ async function handleThreadReplyAdmitted(
 
   // v3 Workflow 命令在 thread 内同样由 host 直接处理，不转发给 CLI。
   if (await handleV3SavedWorkflowCommandIfAny({
-    content: cmdContent,
+    // 同上（D8）：结尾的 `@机器人` 不能进入 Saved Workflow 的名称或引用。
+    content: stripBotMentions(
+      cmdContent,
+      parsed.mentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
     anchor,
     replyRootId,
     messageId: parsed.messageId,
