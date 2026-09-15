@@ -43,18 +43,12 @@ export function defaultGatewayEntry(): GatewayEntry {
 }
 
 function stripCommentBlock(text: string, start: string, end: string): string {
-  let next = text;
-  while (true) {
-    const startIdx = next.indexOf(start);
-    if (startIdx < 0) break;
-    const endIdx = next.indexOf(end, startIdx);
-    if (endIdx < 0) break;
-    let after = endIdx + end.length;
-    if (next.slice(after, after + 2) === '\r\n') after += 2;
-    else if (next[after] === '\n') after += 1;
-    next = `${next.slice(0, startIdx)}${next.slice(after)}`;
-  }
-  return next;
+  // TOML editors can insert unrelated tables (e.g. hooks.state) before the
+  // trailing end comment. Markers are not ownership boundaries: remove only
+  // the marker lines, then let stripCodexBotmuxSections remove our MCP tables.
+  return text.split(/\r?\n/)
+    .filter(line => line.trim() !== start && line.trim() !== end)
+    .join('\n');
 }
 
 function stripLegacyPluginBlocks(text: string): string {

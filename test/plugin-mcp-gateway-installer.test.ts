@@ -83,6 +83,53 @@ describe('plugin MCP Gateway installer', () => {
     expect(readFileSync(path, 'utf8')).not.toContain('mcp_servers.botmux');
   });
 
+  it.each(['\n', '\r\n'])('preserves tables inserted before the gateway end marker (%j)', (newline) => {
+    const path = join(home, '.codex', 'config.toml');
+    mkdirSync(dirname(path), { recursive: true });
+    const adapter = { id: 'codex', mcpGateway: { format: 'codex-toml' as const, configPath: path } };
+    const userTables = [
+      '[hooks.state]',
+      '[hooks.state."/tmp/hooks.json:session_start:0:0"]',
+      'trusted_hash = "sha256:first"',
+      '[hooks.state."/tmp/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:second"',
+      '[projects."/tmp/work"]',
+      'trust_level = "trusted"',
+      '[mcp_servers.keep]',
+      'command = "keep"',
+    ].join('\n');
+    const initial = [
+      'model = "test-model"',
+      '# >>> botmux mcp gateway',
+      '[mcp_servers.botmux]',
+      'command = "old-gateway"',
+      '[mcp_servers.botmux.env]',
+      'OWNED = "old"',
+      userTables,
+      '# <<< botmux mcp gateway',
+      '',
+    ].join('\n').replace(/\n/g, newline);
+
+    writeFileSync(path, initial);
+    expect(ensureGatewayEntry(adapter).state).toBe('installed');
+    const updated = readFileSync(path, 'utf8');
+    expect(updated).toContain(userTables);
+    expect(updated).toContain('model = "test-model"');
+    expect(updated).not.toContain('old-gateway');
+    expect(updated).not.toContain('OWNED = "old"');
+    expect(updated.indexOf('[hooks.state]')).toBeLessThan(updated.indexOf('# >>> botmux mcp gateway'));
+    expect(ensureGatewayEntry(adapter).state).toBe('unchanged');
+
+    // Removal must also preserve a file that has not gone through repair yet.
+    writeFileSync(path, initial);
+    expect(removeGatewayEntry(adapter).state).toBe('removed');
+    const removed = readFileSync(path, 'utf8');
+    expect(removed).toContain(userTables);
+    expect(removed).not.toContain('mcp_servers.botmux');
+    expect(removed).not.toContain('botmux mcp gateway');
+    expect(removeGatewayEntry(adapter).state).toBe('absent');
+  });
+
   it('merges and removes only the owned Claude gateway entry', () => {
     const path = join(home, '.claude.json');
     writeFileSync(path, JSON.stringify({ mcpServers: { keep: { command: 'keep' } }, theme: 'dark' }));
