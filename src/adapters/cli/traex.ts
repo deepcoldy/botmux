@@ -433,7 +433,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
     deferFirstPromptTimeoutUntilReady: true,
-    buildSessionRenameCommand: (title) => `/rename ${title}`,
+    // TraeX treats a literal "@" in the composer as a file-mention trigger.
+    // If an automatic title contains a Lark mention (for example "@Bot"), the
+    // Enter meant to submit /rename selects a file instead and the next user
+    // message is appended to the still-open rename command. Preserve the title
+    // text with a full-width at sign so the command remains a single submit.
+    buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`

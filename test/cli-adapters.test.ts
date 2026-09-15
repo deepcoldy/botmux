@@ -3085,6 +3085,8 @@ describe('native session rename capability', () => {
       .toBe('/rename 新的标题');
     expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('TraeX 标题'))
       .toBe('/rename TraeX 标题');
+    expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('排查问题 @希儿'))
+      .toBe('/rename 排查问题 ＠希儿');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
