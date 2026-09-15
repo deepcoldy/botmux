@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -11,6 +12,8 @@ const backendType = process.env.BOTMUX_TEST_WORKER_BINARY ? 'tmux' : 'pty';
 it.skipIf(backendType === 'tmux' && !probeTmuxFunctional().ok)(
   'queues collaborative inputs across principals until real Codex turn completion',
   async () => {
+  // Linux systemd scopes are host-wide, even with an isolated HOME/TMPDIR.
+  const sessionId = randomUUID();
   // The unit runner owns this disposable home. Linux devboxes can have umask
   // 0002; the second worker must not inherit a group-writable credential dir.
   const botmuxDir = join(homedir(), '.botmux');
@@ -77,7 +80,7 @@ setInterval(() => {}, 1000);
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: { ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 'sid-startup-test', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
+      env: { ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
@@ -89,7 +92,7 @@ setInterval(() => {}, 1000);
     const owner = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app_test', senderType: 'user' as const };
     const other = { ...owner, requestUserOpenId: 'ou_b' };
     child.send({
-      type: 'init', sessionId: 'sid-startup-test', chatId: 'oc_test', rootMessageId: 'om_root',
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli, backendType,
       prompt: 'first-task', turnId: 'om_first', trustedCaller: owner,
       larkAppId: 'app_test', larkAppSecret: 'secret',
