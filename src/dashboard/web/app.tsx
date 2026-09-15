@@ -36,6 +36,7 @@ import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   readDashboardClientShell,
+  readDashboardWorkbenchShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
 import { ToastStack } from './toast.js';
@@ -117,8 +118,8 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
   {
-    // 驾驶舱（Agent Workbench）：桌面/移动壳内仍是无边框壳（见 workbenchSurface），
-    // 从侧边栏进入时走正常壳。不属于 manage 项。
+    // 驾驶舱（Agent Workbench）：桌面/移动壳内与带沉浸式标记的直达入口是无边框壳
+    // （见 workbenchSurface），从侧边栏进入时走正常壳。不属于 manage 项。
     id: 'agent-workbench',
     href: '#/agent-workbench',
     labelKey: 'nav.workbench',
@@ -1231,11 +1232,13 @@ function DashboardShell(): React.JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
-  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给桌面 / 移动客户端
-  // （botmuxClientShell）：从侧边栏等网页入口点进 #/agent-workbench 时必须保持正常
-  // 壳，否则导航一去不回。client-shell 参数可能挂在 search 也可能挂在 hash（桌面端
-  // 为过登录重定向把壳标记放在 hash 里），readDashboardClientShell 两种都认。
-  const workbenchSurface = readDashboardClientShell()
+  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给两类入口：桌面 / 移动
+  // 客户端（botmuxClientShell），以及带沉浸式标记的直达入口（botmuxWorkbenchShell，
+  // `/workbench`、短票兑换、卡片按钮与 CLI 打印的链接都 302 到这种 hash，见
+  // core/workbench-shell.ts）。从侧边栏等网页入口点进 #/agent-workbench 时必须保持
+  // 正常壳，否则导航一去不回。两种标记都可能挂在 search 或 hash（为过登录重定向把
+  // 标记放在 hash 里，启动时再提升进 search），reader 两种都认。
+  const workbenchSurface = (readDashboardClientShell() || readDashboardWorkbenchShell())
     ? activeHash.startsWith('#/agent-workbench-dock')
       ? 'dock'
       : activeHash.startsWith('#/agent-workbench')
