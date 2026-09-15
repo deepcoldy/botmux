@@ -53,7 +53,12 @@ setInterval(() => {
     fs.appendFileSync(path.join(codexDir, 'history.jsonl'), JSON.stringify({session_id:sid, text:match[1], ts:Date.now()/1000})+'\\n');
   }
 }, 25);
-process.stdout.write('\\x1b[?2004h│ model: loading /model to change │\\n│ directory: loading │\\n› Ask Codex to do anything\\n  ? for shortcuts');
+const banner = '\\x1b[?2004h│ model: loading /model to change │\\n│ directory: loading │\\n› Ask Codex to do anything\\n  ? for shortcuts';
+process.stdout.write(banner);
+// Redraw after tmux subscribes to pipe-pane so the worker observes startup loading.
+for (const delay of [200, 400, 700, 1000]) {
+  setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[H' + banner), delay);
+}
 fs.writeFileSync(${JSON.stringify(loadingFile)}, 'ready');
 const poll = setInterval(() => {
   if (!fs.existsSync(${JSON.stringify(releaseFile)})) return;
