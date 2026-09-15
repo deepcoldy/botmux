@@ -6457,6 +6457,56 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   process.exit(1);
 }
 
+/**
+ * `botmux send` 的帮助正文（单一来源）。
+ *
+ * 全局 `botmux --help` 与 `botmux send --help` 共用这一份，避免两处各写一遍后漂移。
+ * 之前只有全局帮助内联了这段文本，`send --help` 没有任何拦截：`--help` 会被
+ * `positionals()` 当 flag 滤掉 ⟹ 零位置参数 ⟹ 落进 `readStdin()`，于是
+ * 「打印帮助」变成「等 stdin」——stdin 是未关闭的 socket 时永久挂起。
+ */
+const SEND_HELP_BODY = [
+  '  send [content]                       发消息到当前话题（支持 stdin / --content-file）',
+  '       --help, -h                      打印本帮助并退出',
+  '       --images <path>                 内联图片（可重复）',
+  '       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny',
+  '                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪',
+  '       --files <path>                  附件（可重复）',
+  '       --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）',
+  '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
+  '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
+  '       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串',
+  '       --plugin-card-action <plugin-id>',
+  '                                       显式允许该已启用插件声明的 callback action',
+  '       --layout result|progress|risk|blocked|handoff',
+  '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
+  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
+  '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
+  '                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，',
+  '                                       自动解析并校验其为目标群成员，否则拒发',
+  '       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）',
+  '       --no-mention                    明确声明本条不@任何人',
+  '       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）',
+  '       --no-quote                      不引用，发独立消息（普通群）',
+  '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
+  '       --top-level                     发顶层消息（不回复进当前话题）',
+  '       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）',
+  '       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard',
+  '                                       「需要你」列并通知你——撞到只有你能解的硬阻碍',
+  '                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板',
+  '                                       原因。kind=authz|decision|blocked(默认)|help。',
+  '                                       仅限回复当前会话，不能与 --top-level/--chat-id/--into',
+  '                                       /--voice 混用；用户回复后自动撤下。',
+  '       --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）',
+  '    @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。',
+  '    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；',
+  '    纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。',
+  '    Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成',
+  '    正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。',
+  '    （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）',
+].join('\n');
+
 function showHelp(): void {
   console.log(`
 botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
@@ -6562,44 +6612,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
-  send [content]                       发消息到当前话题（支持 stdin / --content-file）
-       --images <path>                 内联图片（可重复）
-       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny
-                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪
-       --files <path>                  附件（可重复）
-       --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）
-       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
-       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
-       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
-       --plugin-card-action <plugin-id>
-                                       显式允许该已启用插件声明的 callback action
-       --layout result|progress|risk|blocked|handoff
-                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
-       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
-       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务
-       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
-                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
-                                       自动解析并校验其为目标群成员，否则拒发
-       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
-       --no-mention                    明确声明本条不@任何人
-       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）
-       --no-quote                      不引用，发独立消息（普通群）
-       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）
-       --top-level                     发顶层消息（不回复进当前话题）
-       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
-       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard
-                                       「需要你」列并通知你——撞到只有你能解的硬阻碍
-                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板
-                                       原因。kind=authz|decision|blocked(默认)|help。
-                                       仅限回复当前会话，不能与 --top-level/--chat-id/--into
-                                       /--voice 混用；用户回复后自动撤下。
-       --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）
-    @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
-    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
-    纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
-    Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
-    正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
-    （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
+${SEND_HELP_BODY}
   card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
                        原地更新之前用 send --card-file/--card-json 发出的自定义卡片
                        （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
@@ -8519,6 +8532,18 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
+  // `--help` wins over every other flag and over all content resolution.
+  // It must stay the FIRST statement in cmdSend: content resolution below
+  // falls through to readStdin() when there is no positional/--content-file,
+  // and positionals() filters `--help` out as a flag, so anything placed
+  // after it turns `botmux send --help` into a stdin wait instead of help —
+  // and stdin that never reaches EOF (an open socket) hangs the process
+  // indefinitely, taking the calling shell with it. Printing help is a
+  // success, so this exits 0 rather than falling into the usage error.
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
   const ancestorCtx = findAncestorSessionContext();
   // Workflow subagents cannot own chat-facing effects: those belong to a
   // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
