@@ -1198,14 +1198,18 @@ describe('createV3GateRunner — in-flight 锁 + coldAttach 顺序', () => {
         postCard: async () => {},
       };
       const runnerA = createV3GateRunner(common);
-      const runnerB = createV3GateRunner(common);
+      // cancelAndDrive is detached: a committed terminal does not mean the
+      // second runner has released its drive lease or stopped writing files.
+      let finishSecondDrive!: () => void;
+      const secondDrive = new Promise<void>(resolve => { finishSecondDrive = resolve; });
+      const runnerB = createV3GateRunner({ ...common, onDriveEnd: () => finishSecondDrive() });
       const a = runnerA.drive('lease-cancel');
       await vi.waitFor(() => expect(workerStarted).toBe(true));
 
       const request = requestV3RunCancel(base, 'lease-cancel', { by: 'ou_user' });
       if (request.kind !== 'requested') throw new Error(`unexpected cancel outcome ${request.kind}`);
       runnerB.cancelAndDrive('lease-cancel', request.cancelRequestId);
-      await a;
+      await Promise.all([a, secondDrive]);
       await vi.waitFor(() => {
         expect(readJournal(journalPath).filter((event) => event.type === 'runCancelled')).toHaveLength(1);
       });

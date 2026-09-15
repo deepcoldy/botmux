@@ -650,7 +650,10 @@ function truncate(s: string, maxChars: number, locale?: Locale): string {
 }
 
 function escapeMd(s: string): string {
-  return s.replace(/[*_~`\[\]\\]/g, (c) => `\\${c}`);
+  // A mention is structured Lark markup: escaping the underscore in its ID
+  // makes the entire card invalid. Keep complete user/bot mentions atomic.
+  return s.replace(/<at\s+id=(?:"ou_[\w]+"|'ou_[\w]+'|ou_[\w]+)\s*><\/at>|[*_~`\[\]\\]/g,
+    (token) => token.startsWith('<at') ? token : `\\${token}`);
 }
 
 function short(s: string, n: number): string {

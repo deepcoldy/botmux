@@ -470,7 +470,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
-import { trustedSessionController } from './trusted-session-controller.js';
+import { isCollaborativeOncallInput, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -7799,9 +7799,14 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
+    // Native Codex now commits after history confirms submission, rather than
+    // on enqueue. Its normal two-second screen settle already exceeds the IPC
+    // receipt budget; keep that budget for transport, not for CLI startup.
+    const commitWaitMs = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput
+      ? 90_000 : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
     record.timer = setTimeout(() => {
       delayOrdinaryImDelivery(record);
-    }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+    }, commitWaitMs);
     record.timer.unref?.();
   }
   logger.info(
@@ -9614,6 +9619,8 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
+    ...(opts.dispatchAttempt === undefined && isCollaborativeOncallInput(ds, opts.trustedCaller)
+      ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),

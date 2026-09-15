@@ -1,6 +1,8 @@
 import type { TrustedCaller } from '../types.js';
 
 export interface TurnAuthorityIdentity {
+  /** Authenticated collaborative input must wait even when sent by the same caller. */
+  queueAfterActiveTurn?: true;
   turnId?: string;
   dispatchAttempt?: number;
   caller?: TrustedCaller;
@@ -103,8 +105,7 @@ export class ActiveTurnAuthority {
   reserve(identity: TurnAuthorityIdentity, nowMs = Date.now()): boolean {
     if (!identity.turnId) return false;
     if (this.active) {
-      return this.matches(identity)
-        || mayControlActiveTurn(this.active, identity);
+      return !this.blocks(identity);
     }
     this.active = Object.freeze({
       turnId: identity.turnId,
@@ -123,7 +124,7 @@ export class ActiveTurnAuthority {
   markStarted(identity: TurnAuthorityIdentity): boolean {
     if (!this.active) return false;
     if (!this.matches(identity)) {
-      if (!mayControlActiveTurn(this.active, identity)) return false;
+      if (this.blocks(identity)) return false;
       this.active = Object.freeze({
         turnId: identity.turnId,
         ...(identity.dispatchAttempt !== undefined
@@ -147,7 +148,7 @@ export class ActiveTurnAuthority {
   blocks(identity: TurnAuthorityIdentity): boolean {
     return !!this.active
       && !this.matches(identity)
-      && !mayControlActiveTurn(this.active, identity);
+      && (identity.queueAfterActiveTurn === true || !mayControlActiveTurn(this.active, identity));
   }
 
   /**

@@ -342,6 +342,8 @@ export interface Session {
    * independently-created session.
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
+  /** Host-created group bootstrap, not an individual user's task. */
+  autoStartedOnGroupJoin?: boolean;
   /** Sessions sharing this id point at the same writable cwd and therefore
    * admit at most one interactive turn across the whole group. */
   cwdSerializationGroup?: string;
@@ -889,6 +891,9 @@ export interface CrossPrincipalInterruption {
   version: 1;
   /** Stable identity used by restart-safe host asks and Lark send UUIDs. */
   id: string;
+  /** Persisted retry identity/deadline for a confirmation that could not be delivered. */
+  confirmationRetryCount?: number;
+  confirmationRetryAt?: number;
   ownerTurnId: string;
   owner: TrustedCaller;
   proposer: TrustedCaller;
@@ -1346,7 +1351,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
