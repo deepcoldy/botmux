@@ -65,6 +65,43 @@ function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig 
   try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
 }
 
+/**
+ * `/api/bots` 的**协管者投影**:只保留「选 agent」这一个用途需要的字段。
+ *
+ * 为什么必须白名单而不是删几个字段:{@link botDefaultsPayload} 是 owner 的
+ * Bot Defaults 编辑器数据源,逐字透传 daemon 的 `env`(明文,可能含各类密钥)、
+ * `launchShell` / `startupCommands` / `customPassthroughCommands` /
+ * `canTalkDaemonCommands` / `defaultWorkingDir`。它的 daemon 侧注释写明前提是
+ * 「dashboard is owner-authenticated」—— 平台协管者进入这条路由后该前提不再成立。
+ *
+ * 白名单而非黑名单,是因为这个 payload 还在长:owner 那边新加一个字段,黑名单
+ * 会默默把它漏给协管者,白名单只会让新字段拿不到(可发现、可修)。
+ *
+ * 字段取自调用方(riff 这类外部平台)实际读的那几个:bot 身份、绑定的 CLI、
+ * 模型、在线与否。与 {@link botSummaryPayload} 的区别是多了 `displayName` /
+ * `model` / `online` / `error` —— 那张表服务的是 dashboard 自己的 summary。
+ */
+export function botCoManagerPayload(row: Record<string, unknown>) {
+  const pick = <T>(key: string, guard: (v: unknown) => v is T): T | undefined => {
+    const v = row[key];
+    return guard(v) ? v : undefined;
+  };
+  const isStr = (v: unknown): v is string => typeof v === 'string';
+  return {
+    larkAppId: String(row.larkAppId ?? ''),
+    ...(isStr(row.botName) || row.botName === null ? { botName: row.botName as string | null } : {}),
+    ...(isStr(row.displayName) || row.displayName === null
+      ? { displayName: row.displayName as string | null }
+      : {}),
+    ...(pick('cliId', isStr) ? { cliId: row.cliId as string } : {}),
+    ...(pick('wrapperCli', isStr) ? { wrapperCli: row.wrapperCli as string } : {}),
+    ...(pick('model', isStr) ? { model: row.model as string } : {}),
+    ...(pick('brand', isStr) ? { brand: row.brand as string } : {}),
+    online: row.online !== false,
+    ...(pick('error', isStr) ? { error: row.error as string } : {}),
+  };
+}
+
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
   return {
     larkAppId: bot.larkAppId,

@@ -1584,3 +1584,225 @@ describe('P1-7 dual-cookie identity (real requests)', () => {
     expect(platform.headers.get('x-botmux-auth-scope')).toBe('workbench');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 平台 OpenAPI 会话链路：协管者可派任务 / 查结果，H5 访客一条都拿不到。
+//
+// 这组的核心不是「新路由能通」，而是**隔离**：两类身份共用 `workbenchOnlyIdentity`
+// 这一个布尔，而 `decideWorkbenchH5Auth` 只收 method + pathname、不看身份。所以
+// 把这五条路径加进 workbenchH5Capability 会让每个扫码进工作台的人都能在别人的
+// 机器上派任务 —— 隔离只能做在「表」这一层，由 scopes 算出的 tier 决定查哪张表。
+//
+// 跑的是与 dashboard.ts 同一对生产函数（resolveDashboardIdentity +
+// resolveDashboardRequestGate），不是复刻品。
+describe('平台会话链路（协管者经 OpenAPI 派任务）', () => {
+  const ACTIVE = 'active-management-token';
+  const MACHINE = 'machine-1';
+  const DEFAULT_SCOPES = 'machines:read,sessions:open,terminal:control';
+  let gateServer: Server | null = null;
+
+  afterEach(async () => {
+    if (gateServer) await new Promise<void>(resolve => gateServer!.close(() => resolve()));
+    gateServer = null;
+  });
+
+  async function startGate(sessions: DashboardSessionStore): Promise<string> {
+    gateServer = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      const h5Token = parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE);
+      const identity = resolveDashboardIdentity({
+        legacyCookie: parseCookie(req.headers.cookie),
+        activeToken: ACTIVE,
+        roleHeader: req.headers['x-botmux-role'],
+        actorHeader: req.headers['x-botmux-actor'],
+        scopesHeader: req.headers['x-botmux-scopes'],
+        platformMachineId: MACHINE,
+        platformActorScope: (machineId: string) => `scope-${machineId}`,
+        legacyAuthSessionId: (token: string) => `legacy-${token}`,
+        h5: sessions.resolveToken(h5Token),
+      });
+      const gate = resolveDashboardRequestGate({
+        method: req.method ?? 'GET',
+        pathname: url.pathname,
+        hasTokenParam: url.searchParams.has('t'),
+        identity,
+        tokenFromRequest: parseCookie(req.headers.cookie),
+        activeToken: ACTIVE,
+        publicReadOnly: false,
+      });
+      if (gate.decision.kind === 'deny401') {
+        res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('denied');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        legacyAuthed: gate.legacyAuthed,
+        canManageHost: gate.canManageHost,
+        tier: identity?.platformSessionsTier ?? null,
+      }));
+    });
+    await new Promise<void>(resolve => gateServer!.listen(0, '127.0.0.1', resolve));
+    return `http://127.0.0.1:${(gateServer.address() as { port: number }).port}`;
+  }
+
+  /** 平台反代注入的三元组：活跃 cookie 证明「经过平台」，role/actor/scopes 是权威头。 */
+  function platformHeaders(scopes: string, role = 'owner'): Record<string, string> {
+    return {
+      cookie: `botmux_dashboard_token=${ACTIVE}`,
+      'x-botmux-role': role,
+      'x-botmux-actor': 'u-comanager',
+      'x-botmux-scopes': scopes,
+    };
+  }
+
+  // riff 实际调的五条。close 与 trigger 归 dispatch（让机器跑东西），其余 observe。
+  const DISPATCH_ROUTES: Array<[string, string]> = [
+    ['POST', '/api/trigger'],
+    ['POST', '/api/sessions/s1/close'],
+  ];
+  const OBSERVE_ROUTES: Array<[string, string]> = [
+    ['GET', '/api/sessions/s1/trigger-result'],
+    ['GET', '/api/sessions/s1/insight'],
+    // insight 的子路径:洞察页点开某一轮的 prompt 详情走这条(见 web/insights.ts
+    // 的 fetchTurnPrompt)。锚死 `insight$` 会让 dispatch 档点开 turn 也 401。
+    ['GET', '/api/sessions/s1/insight/turn/3'],
+    ['GET', '/api/bots'],
+  ];
+
+  it('默认档协管者（sessions:open + terminal:control）：五条全通', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const [method, pathname] of [...DISPATCH_ROUTES, ...OBSERVE_ROUTES]) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: platformHeaders(DEFAULT_SCOPES),
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(200);
+      expect(await r.json(), `${method} ${pathname}`).toMatchObject({ tier: 'dispatch' });
+    }
+  });
+
+  it('只读档（只有 sessions:open）：能查不能派 —— fail-closed 的乘法', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const [method, pathname] of OBSERVE_ROUTES) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: platformHeaders('machines:read,sessions:open'),
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(200);
+      expect(await r.json(), `${method} ${pathname}`).toMatchObject({ tier: 'observe' });
+    }
+    for (const [method, pathname] of DISPATCH_ROUTES) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: platformHeaders('machines:read,sessions:open'),
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(401);
+    }
+  });
+
+  it('guest 即便被勾了 terminal:control 也只到 observe（角色与 scope 都要满足）', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    const r = await fetch(`${base}/api/trigger`, {
+      method: 'POST',
+      headers: platformHeaders(DEFAULT_SCOPES, 'guest'),
+      redirect: 'manual',
+    });
+    expect(r.status).toBe(401);
+  });
+
+  it('没有 sessions:open：五条全 401（tier=none，等价于改动前）', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const [method, pathname] of [...DISPATCH_ROUTES, ...OBSERVE_ROUTES]) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: platformHeaders('machines:read'),
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(401);
+    }
+  });
+
+  // 这一条是整组的理由。H5 身份永远算不出 tier —— 它不经平台反代、没有权威头。
+  it('H5 工作台访客：五条一条都拿不到（新表不能顺带放宽 H5）', async () => {
+    const sessions = new DashboardSessionStore({ ttlMs: 600_000 });
+    const { token: h5Token } = sessions.create('ou_workbench_user');
+    const base = await startGate(sessions);
+    for (const [method, pathname] of [...DISPATCH_ROUTES, ...OBSERVE_ROUTES]) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: { cookie: `${DASHBOARD_SESSION_COOKIE}=${h5Token}` },
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(401);
+    }
+  });
+
+  // 自带 x-botmux-scopes 但没有活跃 cookie = 没经过平台反代，权威头一个字都不作数。
+  it('伪造 scopes 头但无平台 cookie → 仍然 401', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    const r = await fetch(`${base}/api/trigger`, {
+      method: 'POST',
+      headers: { 'x-botmux-role': 'owner', 'x-botmux-scopes': DEFAULT_SCOPES, 'x-botmux-actor': 'u-x' },
+      redirect: 'manual',
+    });
+    expect(r.status).toBe(401);
+  });
+
+  // 放开会话链路绝不能顺带放开「拿到就等于拿到整台机器」的三个面。
+  it('协管者仍然拿不到 debug shell / write-link / spawn-command / settings', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const [method, pathname] of [
+      ['POST', '/api/debug-terminal'],
+      ['GET', '/api/sessions/s1/write-link'],
+      ['POST', '/api/spawn-command'],
+      ['GET', '/api/settings'],
+    ] as Array<[string, string]>) {
+      const r = await fetch(`${base}${pathname}`, {
+        method,
+        headers: platformHeaders(DEFAULT_SCOPES),
+        redirect: 'manual',
+      });
+      expect(r.status, `${method} ${pathname}`).toBe(401);
+    }
+  });
+
+  // dashboard:manage 走的是宽门禁（canManageHost），与本表正交：两者互不影响。
+  it('勾了 dashboard:manage 的协管者：管理面 + 会话链路都有，但 legacyAuthed 仍为 false', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    const settings = await fetch(`${base}/api/settings`, {
+      headers: platformHeaders(`${DEFAULT_SCOPES},dashboard:manage`),
+      redirect: 'manual',
+    });
+    expect(settings.status).toBe(200);
+    expect(await settings.json()).toMatchObject({ canManageHost: true, legacyAuthed: false });
+
+    const trigger = await fetch(`${base}/api/trigger`, {
+      method: 'POST',
+      headers: platformHeaders(`${DEFAULT_SCOPES},dashboard:manage`),
+      redirect: 'manual',
+    });
+    expect(trigger.status).toBe(200);
+  });
+
+  // 放宽 insight 的子路径不等于「后面随便跟什么都行」。trigger-result 没有子路由,
+  // 保持精确匹配;insight 的子路径只覆盖 daemon 真有的那一条(turn/:i)。
+  it('子路径放宽只给了 insight:trigger-result 后面挂东西仍 401', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const pathname of [
+      '/api/sessions/s1/trigger-result/extra',
+      '/api/sessions/s1/insightful',
+      '/api/sessions/s1/insight-export',
+    ]) {
+      const r = await fetch(`${base}${pathname}`, {
+        headers: platformHeaders(DEFAULT_SCOPES),
+        redirect: 'manual',
+      });
+      expect(r.status, `GET ${pathname}`).toBe(401);
+    }
+  });
+});

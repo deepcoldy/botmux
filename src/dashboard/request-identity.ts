@@ -23,7 +23,13 @@
 import type { IncomingMessage } from 'node:http';
 import type { DashboardAuthIdentity } from './h5-auth.js';
 import type { TerminalDashboardActor } from './terminal-control.js';
-import { decideDashboardAuth, decideWorkbenchH5Auth, type AuthDecision } from './auth.js';
+import {
+  decideDashboardAuth,
+  decidePlatformSessionsAuth,
+  decideWorkbenchH5Auth,
+  type AuthDecision,
+  type PlatformSessionsTier,
+} from './auth.js';
 
 export interface DashboardRequestIdentity extends TerminalDashboardActor {
   kind: 'legacy-dashboard' | 'platform-dashboard' | DashboardAuthIdentity['kind'];
@@ -40,6 +46,15 @@ export interface DashboardRequestIdentity extends TerminalDashboardActor {
    * 二者原本是同一个变量，机器协管者要求把它们分开。
    */
   canManageHost: boolean;
+  /**
+   * 平台 OpenAPI 会话链路的能力档（见 auth.ts 的 `platformSessionsCapability`）。
+   *
+   * 与 `canManageHost` 一样是**平台协管者专属**的一维，从注入的 scopes 算出：
+   * `sessions:open` → observe，再有 `terminal:control` → dispatch。legacy owner
+   * 恒 `dispatch`（本机 owner 本就能做任何事），H5 恒 `none`（它的能力只由那张
+   * 窄表描述，不能因为新增一条外部 API 就跟着变宽）。
+   */
+  platformSessionsTier: PlatformSessionsTier;
 }
 
 export interface DashboardIdentityInput {
@@ -190,6 +205,12 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       // 只有能操作终端的身份才谈得上管理本机：guest 拿到 dashboard:manage 也不放行，
       // 避免平台侧一个组合失误就把只读访客提成配置管理员（fail-closed 的乘法而非加法）。
       const canManageHost = platformRole === 'owner' && scopes.includes('dashboard:manage');
+      // 会话链路档位：同样是 fail-closed 的乘法 —— 只读角色（guest）即便被勾了
+      // sessions:open 也只到 observe，派任务要的是「能让机器跑东西」这一层，与
+      // terminal:control 同量级（那个 scope 本就等于能直接往 CLI 里打字）。
+      const platformSessionsTier: PlatformSessionsTier = scopes.includes('sessions:open')
+        ? (platformRole === 'owner' && scopes.includes('terminal:control') ? 'dispatch' : 'observe')
+        : 'none';
       return {
         kind: 'platform-dashboard',
         // 带上人 → 同机多个协管者在审计里可区分、租约互斥不再误判为同一登录。
@@ -199,6 +220,7 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
         terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
         canManageHost,
+        platformSessionsTier,
       };
     }
     return {
@@ -211,6 +233,9 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       previewCapability: 'operate',
       // 本机管理 cookie 恒有全部管理能力（它本身就是 owner 凭据）。
       canManageHost: true,
+      // 本机 owner 走的是宽门禁 decideDashboardAuth，这一项对它不起作用；
+      // 填 dispatch 只为让「能力投影」类的消费方读到一致的结论。
+      platformSessionsTier: 'dispatch',
     };
   }
   return input.h5 ? {
@@ -219,6 +244,9 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
     previewCapability: 'operate',
     // H5 会话是 workbench 身份，从不继承本机管理能力（P1-7 的既有口径）。
     canManageHost: false,
+    // 同上：H5 的能力只由 workbenchH5Capability 那张窄表描述。外部平台的会话
+    // 链路与它无关，恒 none —— 否则新增一条 OpenAPI 路由就会顺带放宽 H5。
+    platformSessionsTier: 'none',
   } : null;
 }
 
@@ -266,8 +294,15 @@ export function resolveDashboardRequestGate(input: {
   const canManageHost = legacyAuthed || managementCredential || platformManages;
   const workbenchOnlyIdentity = !legacyAuthed && !managementCredential && !platformManages
     && (platformIdentity || input.identity?.kind === 'feishu-h5');
+  // 窄门禁分两种：平台协管者额外获得外部 OpenAPI 会话链路那张表（派任务/查结果/
+  // 列 bot），H5 访客只有工作台那张。两者共用 `workbenchOnlyIdentity`，所以区分
+  // 只能靠身份自带的 tier —— H5 恒 'none'，走下去等价于原来的 decideWorkbenchH5Auth。
   const decision = workbenchOnlyIdentity
-    ? decideWorkbenchH5Auth({ method: input.method, pathname: input.pathname })
+    ? decidePlatformSessionsAuth({
+      method: input.method,
+      pathname: input.pathname,
+      tier: input.identity?.platformSessionsTier ?? 'none',
+    })
     : decideDashboardAuth({
       method: input.method,
       pathname: input.pathname,
