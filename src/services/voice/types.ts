@@ -3,7 +3,7 @@
  * bot-registry.ts can import them (type-only) without a runtime import cycle
  * with the engine adapters in ./index.ts.
  */
-export type VoiceEngine = 'sami' | 'openai';
+export type VoiceEngine = 'sami' | 'openai' | 'minimax';
 
 export interface VoiceSamiCreds {
   accessKey?: string;
@@ -19,6 +19,13 @@ export interface VoiceOpenAIConfig {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+}
+
+export interface VoiceMiniMaxConfig {
+  apiKey?: string;
+  model?: string;
+  /** Selects the matching official API endpoint. Defaults to `global`. */
+  region?: 'global' | 'cn';
 }
 
 /** ASR (语音转文字) 配置，走 OpenAI 兼容 `POST {baseUrl}/audio/transcriptions`
@@ -39,12 +46,13 @@ export interface VoiceAsrConfig {
  *  bots.json. A per-bot block is merged over the global one. */
 export interface VoiceConfig {
   engine?: VoiceEngine;
-  /** Default speaker/voice id (SAMI speaker or OpenAI `voice`). */
+  /** Default speaker or voice id for the selected engine. */
   speaker?: string;
   /** Speech rate multiplier (1.0 = normal). */
   rate?: number;
   sami?: VoiceSamiCreds;
   openai?: VoiceOpenAIConfig;
+  minimax?: VoiceMiniMaxConfig;
   /** 语音消息转写（ASR）。与 TTS 字段相互独立：可只配 ASR 不配 TTS。 */
   asr?: VoiceAsrConfig;
 }

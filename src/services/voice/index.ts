@@ -4,13 +4,17 @@
  * (gates the "🔊 语音总结" button), and synthesize text → a ready-to-send
  * ogg/opus file.
  *
- * Engine is pluggable behind a tiny contract (text → PCM): `sami` (in-tree
- * JSON-over-WS, internal) and `openai` (OpenAI-compatible HTTP, open-source
- * default). Neither pulls a heavyweight dependency into the package.
+ * Engines are pluggable behind a tiny text-to-PCM contract and do not add
+ * heavyweight dependencies to the package.
  */
 import { encodePcmToOpus, toSpoken, type OpusResult, type Pcm } from './audio.js';
 import { samiSynthesizePcm, type SamiCreds, type VoiceProviderEffectOptions } from './sami.js';
 import { openaiSynthesizePcm, type OpenAITtsConfig } from './openai.js';
+import {
+  minimaxSynthesizePcm,
+  DEFAULT_MINIMAX_SPEAKER,
+  type MiniMaxTtsConfig,
+} from './minimax.js';
 import type { ResolvedAsrConfig } from './asr.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -18,6 +22,12 @@ import type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
 
 export type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
 export type { ResolvedAsrConfig } from './asr.js';
+export {
+  DEFAULT_MINIMAX_SPEAKER,
+  DEFAULT_MINIMAX_TTS_MODEL,
+  MINIMAX_CN_TTS_ENDPOINT,
+  MINIMAX_GLOBAL_TTS_ENDPOINT,
+} from './minimax.js';
 
 /** Default SAMI voice — 灿灿 (bigtts), the product-chosen default. */
 export const DEFAULT_SAMI_SPEAKER = 'zh_female_cancan_mars_bigtts';
@@ -31,19 +41,22 @@ function mergeVoice(base: VoiceConfig | undefined, over: VoiceConfig | undefined
     ...over,
     sami: { ...base?.sami, ...over?.sami },
     openai: { ...base?.openai, ...over?.openai },
+    minimax: { ...base?.minimax, ...over?.minimax },
   };
 }
 
 function hasUsableCreds(v: VoiceConfig | undefined): VoiceConfig | null {
   if (!v) return null;
-  const engine = v.engine ?? (v.sami ? 'sami' : v.openai ? 'openai' : undefined);
+  const engine = v.engine ?? (v.sami ? 'sami' : v.openai ? 'openai' : v.minimax ? 'minimax' : undefined);
   if (!engine) return null;
   if (engine === 'sami') {
     const { accessKey, secretKey, appkey } = v.sami ?? {};
     if (!accessKey || !secretKey || !appkey) return null;
-  } else {
+  } else if (engine === 'openai') {
     const { baseUrl, model } = v.openai ?? {};
     if (!baseUrl || !model) return null;
+  } else if (!v.minimax?.apiKey) {
+    return null;
   }
   return { ...v, engine };
 }
@@ -123,7 +136,9 @@ export function isAsrConfigured(larkAppId?: string): boolean {
 
 function effectiveSpeaker(v: VoiceConfig): string {
   if (v.speaker) return v.speaker;
-  return v.engine === 'openai' ? DEFAULT_OPENAI_SPEAKER : DEFAULT_SAMI_SPEAKER;
+  if (v.engine === 'openai') return DEFAULT_OPENAI_SPEAKER;
+  if (v.engine === 'minimax') return DEFAULT_MINIMAX_SPEAKER;
+  return DEFAULT_SAMI_SPEAKER;
 }
 
 /**
@@ -136,14 +151,18 @@ export async function synthesizeVoicePcmForMessage(
   effects: VoiceProviderEffectOptions = {},
 ): Promise<Pcm> {
   const cfg = resolveVoiceConfig(larkAppId);
-  if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容引擎。');
+  if (!cfg) throw new Error('No usable voice engine is configured in config.json or bots.json.');
   const spoken = toSpoken(text);
   if (!spoken) throw new Error('精简后没有可朗读的内容');
   const speaker = effectiveSpeaker(cfg);
 
-  return cfg.engine === 'openai'
-    ? await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate }, effects)
-    : await samiSynthesizePcm(cfg.sami as SamiCreds, spoken, { speaker, rate: cfg.rate }, effects);
+  if (cfg.engine === 'openai') {
+    return await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate }, effects);
+  }
+  if (cfg.engine === 'minimax') {
+    return await minimaxSynthesizePcm(cfg.minimax as MiniMaxTtsConfig, spoken, { speaker, rate: cfg.rate }, effects);
+  }
+  return await samiSynthesizePcm(cfg.sami as SamiCreds, spoken, { speaker, rate: cfg.rate }, effects);
 }
 
 /**
