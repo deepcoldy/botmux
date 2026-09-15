@@ -18965,7 +18965,8 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       // confirmation record. Keep that record durable until the terminal
       // notice is actually delivered; otherwise a transport failure would
       // turn explicit backpressure into a silent drop. A failed notice gets a
-      // bounded retry and remains restart-recoverable through the same record.
+      // fixed-cadence retry and remains restart-recoverable through the same
+      // record; successful delivery is the only terminal condition.
       try {
         await notifyCrossPrincipalTerminal(
           ds,
@@ -19691,7 +19692,7 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
     ? `⚠️ ${err.message}\n\n可直接发给当前 agent：\n请帮我修复 botmux 的 CLI 选择配置：检查当前 bot 的 env、Riff 和 codexRpcInput 设置，移除与会话级 /cli <cliId> 选择冲突的配置；不要修改代码，完成后告诉我具体改了什么。`
     : xpiQueueFull
       ? tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(ctx.larkAppId))
-    : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
+      : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
   try {
     await sessionReply(
       replyAnchor,
