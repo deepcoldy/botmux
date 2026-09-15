@@ -12,6 +12,7 @@ export interface MessageListenerMatch {
   replyCardTitle?: string;
   prompt: string;
   workingDir?: string;
+  replyMode: 'thread' | 'chat';
   messageText: string;
   messageTitle?: string;
   msgType: string;
@@ -252,10 +253,22 @@ export function matchesContentPolicy(text: string, policy: MessageListenerConten
 }
 
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
-  const listener = bot.config.messageListeners?.[chatId];
+  const listener = resolveEffectiveMessageListener(bot, chatId);
   if (!listener?.enabled) return undefined;
   if (!listener.prompt?.trim()) return undefined;
   return listener;
+}
+
+/** Resolve the one listener policy that applies to a bot in a chat.
+ * Absence deliberately means inherit, so newly joined chats adopt the global
+ * policy without requiring a persisted record. */
+export function resolveEffectiveMessageListener(bot: BotState, chatId: string): MessageListenerConfig | undefined {
+  const override = bot.config.groupMessageListenerOverrides?.[chatId];
+  if (override?.mode === 'disabled') return undefined;
+  if (override?.mode === 'custom') return override.listener;
+  // Keep this fallback for unit callers and rolling deployments that still
+  // construct the legacy shape before bot-registry has normalized it.
+  return bot.config.globalMessageListener ?? bot.config.messageListeners?.[chatId];
 }
 
 export function evaluateMessageListener(input: {
@@ -319,6 +332,7 @@ export function evaluateMessageListener(input: {
     replyCardTitle: listener.replyCardTitle,
     prompt: listener.prompt,
     workingDir: listener.workingDir,
+    replyMode: listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread',
     messageText,
     messageTitle,
     msgType,
