@@ -406,6 +406,7 @@ import {
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
+import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -11307,6 +11308,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
+/** still_active 只是弱证据（屏幕没有门、但 PTY 刚有活动）：在 20s 弱证据
+ *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
+ *  机制自然终止链，这是保险上限。 */
+const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -11429,6 +11434,7 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   };
   let deferredRecheckAttempts = 0;
+  let activeSilenceExtra = 0;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
@@ -11499,6 +11505,32 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
+    // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
+    // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
+    let submitDiagnosisScreen = '';
+    if (effectiveBackendType !== 'zmx') {
+      try {
+        submitDiagnosisScreen = backend
+          ? captureBackendScreen(backend)
+          : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+      } catch { submitDiagnosisScreen = ''; }
+    }
+    const submitDiagnosis = diagnoseSubmitFailure({
+      screenText: submitDiagnosisScreen,
+      lastActivityAtMs: lastPtyActivityAtMs,
+    });
+    if (
+      submitDiagnosis.reason === 'still_active'
+      && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
+      && chainIsCurrent()
+    ) {
+      activeSilenceExtra += 1;
+      log(`Deferred recheck still sees fresh CLI activity (${submitDiagnosis.evidence}) — silencing submit card once more. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+    log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
+
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -11510,7 +11542,13 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : 'worker.submit_unconfirmed',
+            : submitDiagnosis.reason === 'logged_out'
+              ? 'submitDiag.logged_out'
+              : submitDiagnosis.reason === 'interactive_menu'
+                ? 'submitDiag.interactive_menu'
+                : submitDiagnosis.reason === 'draft_parked'
+                  ? 'submitDiag.draft_parked'
+                  : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -14204,7 +14242,9 @@ async function spawnCli(
         throw new Error(
           `[read-isolation] refusing to start session ${cfg.sessionId}: `
           + `could not verify existing ${effectiveBackendType} pane `
-          + `(liveness probe: ${paneProbe})`,
+          + `(liveness probe: ${paneProbe})\n\n`
+          + `宿主机 tmux server 当前不可达：探测结果不确定时，botmux 会保持现状，不会清理或重建 pane。`
+          + `请不要执行 kill-server；后端恢复后会自动重新探测，也可稍后重发消息重试。`,
         );
       },
     };
@@ -21434,21 +21474,43 @@ process.on('exit', () => {
   teardownSandboxBestEffort();
   stopCodexRpcEngine();
 });
+let workerFatalReported = false;
+/** Best-effort one-shot terminal crash report. The 1s flush timeout means a
+ *  daemon that stopped draining can never delay the fail-closed exit; delivery
+ *  failure is swallowed. Both fatal handlers share this so a rejection that
+ *  immediately causes an exception (or vice versa) reports only once. */
+async function reportWorkerFatal(prefix: string, err: unknown): Promise<void> {
+  if (workerFatalReported) return;
+  workerFatalReported = true;
+  const detail = typeof err === 'object' && err !== null && 'stack' in err && (err as any).stack
+    ? String((err as any).stack)
+    : String(err);
+  const message = `${prefix}: ${detail}`.slice(0, 4096);
+  try {
+    await sendAndFlush({ type: 'worker_fatal', message });
+  } catch { /* best-effort — never delay exit */ }
+}
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.
   if (isIgnorableStreamError(err)) return;
-  try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
+    await reportWorkerFatal('Uncaught exception', err);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 process.on('unhandledRejection', (reason: any) => {
   if (isIgnorableStreamError(reason)) return;
-  try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
+    await reportWorkerFatal('Unhandled rejection', reason);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 
 log('Worker started, waiting for init...');

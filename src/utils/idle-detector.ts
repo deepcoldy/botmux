@@ -47,6 +47,11 @@ export class IdleDetector {
   private lastSpinnerAt = 0;
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
+  /** One-shot latch: true forever after this IdleDetector instance publishes
+   *  its first idle (screen or external). Gates the opt-in extended
+   *  first-prompt quiescence and intentionally survives reset() — one
+   *  IdleDetector exists per spawn, so "first" happens only once. */
+  private firstIdlePublished = false;
   private idleCallback: ((source: IdleEvidenceSource) => void) | null = null;
   private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
@@ -58,6 +63,7 @@ export class IdleDetector {
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
+  private firstPromptQuiescenceMs: number | undefined;
   private startupTail = '';
   private startupPending = false;
   private startupComplete = false;
@@ -80,6 +86,7 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
+    this.firstPromptQuiescenceMs = cli.firstPromptQuiescenceMs;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -247,7 +254,19 @@ export class IdleDetector {
     if (this.readyPattern && !this.readySeen) return;
 
     this.clearTimer();
-    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
+    // Adapters without a prompt anchor (Bubble Tea TUIs such as OpenCode) can
+    // still be booting when the default 2s quiet window expires; an opt-in
+    // longer window applies only before THIS process's first idle. It buys a
+    // couple more cold-start cycles but changes no readiness criterion: the
+    // startup hold, spinner guard and static-busy latch all still apply, and
+    // the completion branch above keeps its fixed 500ms.
+    const quiescenceMs = !this.firstIdlePublished
+      && !this.readyPattern
+      && typeof this.firstPromptQuiescenceMs === 'number'
+      && this.firstPromptQuiescenceMs > QUIESCENCE_MS
+      ? this.firstPromptQuiescenceMs
+      : QUIESCENCE_MS;
+    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), quiescenceMs);
   }
 
   reset(): void {
@@ -329,6 +348,9 @@ export class IdleDetector {
 
   private markIdle(source: IdleEvidenceSource): void {
     this.isIdle = true;
+    // One-shot, permanent for this spawn: reset()/resetReadyEvidence() do not
+    // clear it, so the extended first-prompt window never applies twice.
+    this.firstIdlePublished = true;
     // Arm before the callback: markPromptReady may synchronously flush queued
     // botmux input and call reset(), which must win and disarm this edge.
     this.busyTransitionArmed = true;

@@ -106,6 +106,10 @@ export function canonicalScheduleInput(t: {
   followActive?: boolean;
   model?: string;
   reasoningEffort?: ScheduleReasoningEffort;
+  /** Human creator whose scheduled turns authenticate workflow commands (see
+   *  scheduled-turn-provenance). Part of canonical input: the same workflow
+   *  attempt run as a different creator is a different schedule. */
+  ownerOpenId?: string;
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
@@ -150,6 +154,10 @@ export function canonicalScheduleInput(t: {
     // and their canonical JSON stays byte-for-byte what it was.
     model: t.model?.trim() || undefined,
     reasoningEffort: t.reasoningEffort,
+    // Absent/blank on every pre-existing and ownerless task, so the undefined
+    // slot is dropped by computeInputHash and their canonical JSON is
+    // byte-for-byte unchanged.
+    ownerOpenId: t.ownerOpenId?.trim() || undefined,
   };
 }
 
@@ -307,7 +315,7 @@ function migrate(raw: any): ScheduledTask | null {
   }
 
   const executionPosition: ScheduleExecutionPosition | undefined =
-    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic' || raw.executionPosition === 'task'
       ? raw.executionPosition
       : raw.deliver === 'new-topic'
         ? 'new-topic'
@@ -546,6 +554,19 @@ function load(appId?: string): void {
   installSnapshot(nextMap, fp);
 }
 
+/** Allowed task id alphabet/width. Producers are the 8-hex legacy ids and the
+ *  workflow idempotency keys (`wf_`/`wf3_` + truncated sha256 hex, width 50);
+ *  task ids are used as schedules.json keys and per-task output-dir segments,
+ *  so anything outside [0-9a-z_] (path separators, dots, spaces) is rejected
+ *  up front. */
+const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
+
+function assertValidTaskId(id: string): void {
+  if (!TASK_ID_RE.test(id)) {
+    throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
+  }
+}
+
 /**
  * Create a scheduled task — or return the existing one with the same input
  * when called with a workflow-supplied `id` that already exists.
@@ -592,6 +613,7 @@ export function createTask(params: {
   reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
+  if (params.id) assertValidTaskId(params.id);
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
   // its daemon (the only one that executes it) can see it. Sandboxed callers
@@ -623,6 +645,7 @@ export function createTask(params: {
 
     let id = params.id ?? randomUUID().substring(0, 8);
     while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
+    assertValidTaskId(id);
     const task: ScheduledTask = {
       id,
       preconditionRef: params.preconditionRef,

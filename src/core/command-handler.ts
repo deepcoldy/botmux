@@ -1076,10 +1076,11 @@ async function handleScheduleCommand(
     const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
     // Default to group top-level: a schedule created inside a topic (including
     // an adopted one) must not pin its results to that topic. NL 路径的
-    // extractScheduleModifiers 只有 top-level/new-topic 关键词，没有 topic
-    // 修饰符；topic 执行只能经 CLI --topic 或 Dashboard 表单显式指定。
+    // extractScheduleModifiers 只有 top-level/new-topic/task（独立话题/专属
+    // 话题）关键词，没有 topic 修饰符；topic 执行只能经 CLI --topic 或
+    // Dashboard 表单显式指定。
     const executionPosition = (requestedPosition ?? 'top-level') as ScheduleExecutionPosition;
-    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
@@ -1125,9 +1126,11 @@ async function handleScheduleCommand(
     const positionNote = '\n' + t(
       executionPosition === 'new-topic'
         ? 'schedule.deliver_new_topic'
-        : executionPosition === 'top-level'
-          ? 'schedule.position_top_level'
-          : 'schedule.position_topic',
+        : executionPosition === 'task'
+          ? 'schedulePos.positionNote'
+          : executionPosition === 'top-level'
+            ? 'schedule.position_top_level'
+            : 'schedule.position_topic',
       undefined,
       loc,
     );

@@ -6280,6 +6280,64 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── 成员授权 / 黑名单 / 整群授权（proxy to daemon；管理写路径，不在
+    // PUBLIC_READ_PATHS，非 manager 已在 resolveDashboardRequestGate 被 deny401）───
+    let mBotBlockedUsers: RegExpMatchArray | null;
+    if ((mBotBlockedUsers = url.pathname.match(/^\/api\/bots\/([^/]+)\/blocked-users$/))) {
+      const appId = decodeURIComponent(mBotBlockedUsers[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mBotChatGrant: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mBotChatGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/grants\/chat$/))) {
+      const appId = decodeURIComponent(mBotChatGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/grants/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mBotChatGroupGrant: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotChatGroupGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/chat-group-grant$/))) {
+      const appId = decodeURIComponent(mBotChatGroupGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/chat-group-grant', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
     // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
     if (url.pathname === '/api/vc-meeting/consumer-profiles') {

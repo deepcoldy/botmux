@@ -1106,7 +1106,7 @@ export interface ParsedSchedule {
   display: string;
 }
 
-export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
+export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 'task';
 
 export interface ScheduledTask {
   id: string;
@@ -1137,7 +1137,10 @@ export interface ScheduledTask {
   scope?: 'thread' | 'chat';
   /** Explicit task-level routing. `new-topic` posts a fresh top-level seed on
    *  every run and then executes in the new thread, independent of the Bot's
-   *  ordinary-group reply mode. Older rows derive this from scope/root. */
+   *  ordinary-group reply mode. `task` owns one dedicated topic per task: the
+   *  first fire creates it (lazily, when a silent run first sends) and writes
+   *  the root back here, later fires continue in that same thread. Older rows
+   *  derive this from scope/root. */
   executionPosition?: ScheduleExecutionPosition;
   /** Optional first-message text for `new-topic`; Lark uses the seed message
    *  as the visible topic title. Blank/absent falls back to the standard task
@@ -1903,4 +1906,8 @@ export type WorkerToDaemon =
        * Absent is derived from `recovery`. See SessionDestroyResult.
        */
       admission?: 'restorable' | 'fenced';
-    };
+    }
+  /** Worker is dying on an uncaught exception/rejection. Best-effort terminal
+   *  diagnostic (sendAndFlush, truncated) so the daemon can surface the real
+   *  crash cause on the card instead of a generic worker-exit message. */
+  | { type: 'worker_fatal'; message: string };

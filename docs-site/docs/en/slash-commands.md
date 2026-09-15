@@ -20,8 +20,9 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
 | `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family / Codex terminal mode; invoke inside the source session's topic) |
-| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override |
-| `/cot` | Thinking-process message switch: `/cot off` mutes this chat's thinking bubble, `/cot on` restores it, `/cot show` summons a one-off peek at the current turn's bubble while the switches are off, `/cot status` reports the state (bot-level master switch `thinkingCard`, on by default; supports claude-code / codex / traex) |
+| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override. `allowedUsers` only (the switch affects the whole chat — Lark has no per-person card view) |
+| `/cot` | Thinking-process message switch: `/cot off` mutes this chat's thinking bubble, `/cot on` restores it, `/cot show` summons a one-off peek at the current turn's bubble while the switches are off, `/cot status` reports the state (bot-level master switch `thinkingCard`, on by default; supports claude-code / codex / traex). `allowedUsers` only |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | The regular-group mention policy: when the bot answers without an @. Querying needs talk access, changing needs operate rights; **regular groups only** (rejected in DMs, topic groups, and session groups). The four modes and the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
 | `/quote` | Pop a picker of this chat's topics; choosing one reads that topic's transcript into the current session. This fills a gap in Feishu itself — its quote-reply UI can only reference a single message, never a whole topic. The bot replies with a short acknowledgement (how many messages, time span, subject) and waits for your next instruction |
 | `/quote <instruction>` | Same, but runs your instruction as soon as you pick a topic, saving a round trip. The transcript is still injected explicitly labelled as material rather than instructions |
@@ -102,6 +103,13 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 The group-level setting overrides the dashboard "Bot Config → Regular Group Mode" default.
 
 `/substitute [status|on|off]` — show or toggle **substitute mode** for the current group (owner-only to change).
+
+## 📢 Mention Policy (`/mention-mode`, regular groups only)
+
+`/mention-mode always|topic|never|ambient` switches this chat's policy; `/mention-mode status` (or no argument) reports it. Regular groups only: DMs never need @, and topic groups and `/group` session groups reject the command. Querying needs only talk access; changing needs operate rights (`allowedUsers`).
+
+- `always`: @ required to get an answer (default); `topic`: replies inside the bot's own topics skip @; `never`: no @ required anywhere in the group; `ambient`: no @ required, but the bot yields when a message explicitly @-mentions someone else.
+- Skipping @ never skips the permission gate, and 8 no-@ exceptions still apply (in-topic replies, substitute triggers, the message listener, and more) — see [Mention Policy](/en/mention-mode) for the full semantics.
 
 ## 📑 Chat Tabs
 
@@ -192,13 +200,15 @@ See [Session Relay](/en/relay) for details.
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
-## 🔑 Usage Authorization (owner-only)
+## 🔑 Usage Authorization (owner / admins)
 
 | Command | Description |
 |------|------|
-| `@bot /grant @someone` | Authorize that person to chat in this group; `/grant` (without a person) authorizes **all members of this group** to chat |
-| `@bot /revoke @someone` | Revoke that person's chat permission in this group; `/revoke` (without a person) revokes the whole group's authorization |
+| `@bot /grant` (or `/grant all`) | Authorize **all members of this group** to talk (writes `allowedChatGroups`; no quota, no expiry; in a topic group keyed by the `oc_` group and covers all topics); bare `/revoke` removes it |
+| `@bot /grant @someone [N]` | Open a grant card authorizing **talk in this group** for specific members, defaulting to 3 messages / 1 hour each; the card offers 1 hour / 8 hours / 1 day / 7 days / permanent and a quota field (blank = unlimited). The owner-initiated card also offers **global talk**. `@bot /revoke @someone` removes the per-group and global guest grants together, and also removes the person from `allowedUsers` if listed there (revoking the owner themselves, or a revoke that would leave no admin, is refused; the reply names the affected scopes) |
 | `/vc-auth @someone` | While meeting-listening is on, temporarily trust an in-meeting instruction source; `/vc-auth revoke @someone` revokes; `/vc-auth list` shows current grants |
+
+Layers, quotas, grant request cards, and the block list are documented in [Permissions & Access](/en/permissions). Note: **being added to a group is not authorization** — a restricted bot still accepts only listed members.
 
 ## ⚙️ Remote Config & Skills (owner-only)
 

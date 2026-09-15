@@ -1059,6 +1059,7 @@ export const messages: Record<string, string> = {
   'worker.input_commit_delayed': '⏳ The Worker received this message, but has not confirmed that it entered the execution queue yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
   'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'workerDiag.recentStderr': 'Recent worker output (may include the failure cause):',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',
   'worker.raw_input_failed_command_only': '⚠️ The slash command could not be confirmed as delivered to {cliName}. Check the terminal state, then resend.',
@@ -1654,4 +1655,13 @@ export const messages: Record<string, string> = {
   'cot.tool.result_done': '✓ Done',
   'cot.thinking_placeholder': 'Thinking…',
   'cot.interrupted': '⚠️ Interrupted by a service restart — this turn\'s thinking never finished',
+  'submitDiag.logged_out': '⚠️ Message never reached the model: {cliName} is stuck on a login/auth screen\nStage: input submission\nError code: submit_unconfirmed\nThe terminal is parked on {cliName}\'s sign-in or authorization page (sign-in required, or the session has expired), so this message never reached the model. CLI sign-in and Feishu authorization are two separate layers — neither implies the other.\nOpen the Web terminal, finish signing in, then resend this message.\nOriginal message: {preview}',
+  'submitDiag.interactive_menu': '⚠️ Message never reached the model: {cliName} is waiting on a keyboard choice\nStage: input submission\nError code: submit_unconfirmed\nThe terminal is parked on a screen that requires a keyboard selection (update, data migration, hooks review, or a confirmation prompt), so this message never reached the model.\nOpen the Web terminal and make the selection, or press Esc to dismiss that screen before resending. BotMux will not choose for you.\nOriginal message: {preview}',
+  'submitDiag.draft_parked': '⚠️ Message pasted but not submitted: the text is parked in the {cliName} composer\nStage: input submission\nError code: submit_unconfirmed\nThe message body was pasted into the composer (shown as [Pasted Content …]) but Enter was never pressed, so it never reached the model.\nOpen the Web terminal and press Enter to submit; or, once you have confirmed it should not run, resend it from Feishu.\nOriginal message: {preview}',
+  // ─── schedulePos: scheduled-task dedicated-topic execution position (opt-in per-task isolation) ─────
+  'schedulePos.positionNote': 'Execution position: a topic dedicated to this task (created automatically on the first fire; every later fire of this task continues inside that same topic, while different tasks stay isolated from each other; single-group schedules only)',
+  'schedulePos.cardDeliveryTask': 'dedicated topic (this task only)',
+  'schedulePos.cardBtnUseTaskTopic': 'Use dedicated topic',
+  'schedulePos.cardAlreadyTask': 'Already running in this task\'s dedicated topic',
+  'schedulePos.cardTaskMultiChatUnsupported': 'A dedicated topic is only available for single-group schedules',
 };

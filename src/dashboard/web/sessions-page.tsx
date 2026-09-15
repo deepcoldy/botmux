@@ -23,7 +23,7 @@ import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from 
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   parseIdleCleanupHours,
-  selectIdleCleanupCandidates,
+  selectCleanupCandidates,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -193,11 +193,13 @@ function imageFileDataUrl(file: File): Promise<string> {
   });
 }
 
+type IdleCleanupCounts = { idle: number; dormant: number };
+
 type IdleCleanupBarProps = {
   busy: boolean;
   hours: IdleCleanupHours;
   status: string;
-  countForHours: (hours: IdleCleanupHours) => number;
+  countForHours: (hours: IdleCleanupHours) => IdleCleanupCounts;
   onRun: (hours: IdleCleanupHours) => Promise<void>;
 };
 
@@ -1037,7 +1039,8 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const count = props.countForHours(draftHours);
+  const counts = props.countForHours(draftHours);
+  const count = counts.idle + counts.dormant;
 
   useEffect(() => {
     if (open) setDraftHours(props.hours);
@@ -1131,9 +1134,14 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
             <span className="idle-cleanup-pop-title">{t('sessions.idleCleanupRun')}</span>
             <span id="idle-cleanup-count" className="idle-cleanup-count">
               <span className="idle-cleanup-dot" aria-hidden="true" />
-              {t('sessions.idleCleanupCount', { count })}
+              {t('cleanupDormant.countIdle', { count: counts.idle })}
+              {' · '}
+              {t('cleanupDormant.countDormant', { count: counts.dormant })}
             </span>
           </div>
+          <p style={{ margin: 0, color: 'var(--muted)', fontSize: 12, lineHeight: 1.5 }}>
+            {t('cleanupDormant.semanticsHint')}
+          </p>
           <div className="idle-cleanup-pop-field">
             <span className="idle-cleanup-label">{t('sessions.idleCleanupOlderThan')}</span>
             <div
@@ -3157,7 +3165,7 @@ function SessionsPage(): React.JSX.Element {
     return rows;
   }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, rows, teamChatIdsFor, viewMode]);
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectIdleCleanupCandidates(currentCleanupVisibleRows, hours),
+    (hours: IdleCleanupHours) => selectCleanupCandidates(currentCleanupVisibleRows, hours),
     [currentCleanupVisibleRows],
   );
 
@@ -3668,7 +3676,8 @@ function SessionsPage(): React.JSX.Element {
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
     if (!nextHours) return;
-    const candidates = idleCleanupCandidatesFor(nextHours);
+    const groups = idleCleanupCandidatesFor(nextHours);
+    const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
     setIdleCleanupHours(nextHours);
     setIdleCleanupBusy(true);
@@ -4048,7 +4057,10 @@ function SessionsPage(): React.JSX.Element {
           busy: idleCleanupBusy,
           hours: idleCleanupHours,
           status: idleCleanupStatus,
-          countForHours: hours => idleCleanupCandidatesFor(hours).length,
+          countForHours: (hours) => {
+            const groups = idleCleanupCandidatesFor(hours);
+            return { idle: groups.idle.length, dormant: groups.dormant.length };
+          },
           onRun: runIdleCleanup,
         }}
       />

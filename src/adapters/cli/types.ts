@@ -475,6 +475,18 @@ export interface CliAdapter {
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
 
+  /**
+   * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
+   * (per IdleDetector instance; per-turn reset() does not restore it). Intended
+   * for adapters with readyPattern===undefined whose Bubble Tea style TUI can
+   * still be booting after the default 2s quiet window (OpenCode): the first
+   * queued message then waits this long before being pasted; every later cycle
+   * uses the normal quiescence. Ignored for adapters that define readyPattern
+   * (their prompt anchor gates quiescence already). The worker's first-prompt
+   * soft/hard timeouts remain the outer bound.
+   */
+  readonly firstPromptQuiescenceMs?: number;
+
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —
    *  Claude-family via its effective settings.json, Grok via its global

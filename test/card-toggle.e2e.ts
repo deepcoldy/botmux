@@ -60,6 +60,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),

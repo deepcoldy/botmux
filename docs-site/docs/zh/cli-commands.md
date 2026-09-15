@@ -49,3 +49,5 @@ session 信息通过祖先进程标记自动推断，agent 直接调：
 | `botmux history [--limit N]` | 拉会话历史（JSON） |
 | `botmux quoted <message_id>` | 拉被引用的单条消息（JSON） |
 | `botmux schedule add/list/remove/pause/resume/run` | 管理定时任务 |
+| `botmux session rename "<标题>"` | 改**当前会话**的 botmux 规范标题（会话自动识别，不接受 `--session-id` 指定他人会话）；Dashboard 与 `/sessions` 列表即时更新，并 best-effort 同步 CLI 原生会话名。飞书群名、omt 话题名均不变（话题名平台无接口）。建议「类型｜具体事项」，最长 200 字符 |
+| `botmux chat rename <新群名称> [--proactive]` | 改**当前会话所在飞书群**的群名（话题群里是整个 `oc_` 群，全部话题/成员可见）；`--proactive` 用于 agent 因阶段变化主动改名，带 10 分钟防抖 |

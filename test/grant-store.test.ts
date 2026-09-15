@@ -93,6 +93,32 @@ describe('grant-store', () => {
     expect(bot.resolvedAllowedUsers).toEqual(['ou_owner']);
   });
 
+  it('revokeGrant prunes only the revoked allowed key, never blockedUsers keys in shared sidecar (P1c)', async () => {
+    writeConfig({ allowedUsers: ['owner@x.com', 'guest@x.com'], blockedUsers: ['banned@x.com'] });
+    const { registry, store } = await freshModules();
+    const bot = registry.getBot('a1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_guest'];
+    bot.rawAllowedUserResolution = new Map([['owner@x.com', 'ou_owner'], ['guest@x.com', 'ou_guest']]);
+    bot.resolvedBlockedUsers = ['ou_banned'];
+    // Seed the shared sidecar with BOTH legs' raw→ou_ cache (as a healthy prior
+    // resolve would leave it).
+    const dataDir = process.env.SESSION_DATA_DIR!;
+    const { writeAllowedUsersResolveCache, readAllowedUsersResolveCache } = await import('../src/utils/allowed-users-cache.js');
+    writeAllowedUsersResolveCache(dataDir, 'a1', {
+      map: { 'owner@x.com': 'ou_owner', 'guest@x.com': 'ou_guest', 'banned@x.com': 'ou_banned' },
+    });
+
+    const r = await store.revokeGrant('a1', 'oc_1', 'ou_guest');
+    expect(r.ok).toBe(true);
+
+    const cacheAfter = readAllowedUsersResolveCache(dataDir, 'a1');
+    // revoked allowed key is pruned …
+    expect(cacheAfter['guest@x.com']).toBeUndefined();
+    // … but the blockedUsers key (shared sidecar) must survive the /revoke write.
+    expect(cacheAfter['banned@x.com']).toBe('ou_banned');
+    expect(cacheAfter['owner@x.com']).toBe('ou_owner');
+  });
+
   it('addGlobalGrant persists & syncs in-memory; idempotent; never touches allowedUsers', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();

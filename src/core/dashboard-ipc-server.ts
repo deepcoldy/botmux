@@ -106,12 +106,14 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
+import { addAllowedChatGroup, removeAllowedChatGroup } from '../services/grant-store.js';
+import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../services/grant-policy.js';
 import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
 import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -796,7 +798,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|project|project-dispatch-policy)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -4139,7 +4141,8 @@ ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
 // Backward-compatible route used by Lark cards and cached dashboard clients.
 // Modern callers send an exact target; body-less legacy callers keep the
-// historical toggle behavior, now cycling topic → top-level → fresh topic.
+// historical toggle behavior, now cycling topic → top-level → fresh topic →
+// dedicated task topic.
 ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -4151,7 +4154,7 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
     ? (body as Record<string, unknown>).executionPosition
     : undefined;
   if (requested !== undefined) {
-    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
+    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic' && requested !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     const result = updateTaskWithOptionalPrecondition(
@@ -4212,7 +4215,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     executionPosition = b.executionPosition;
@@ -4249,8 +4252,20 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       field: 'chatIds',
     });
   }
+  if (executionPosition === 'task' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_task_unsupported',
+      field: 'chatIds',
+    });
+  }
   if (executionPosition === 'topic' && !rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
+  }
+  // The dedicated task topic is materialised lazily on first fire; a client-
+  // supplied root would only adopt a foreign topic into the task session.
+  if (executionPosition === 'task' && rootMessageId) {
+    return jsonRes(res, 400, { ok: false, error: 'task_root_not_user_settable', field: 'rootMessageId' });
   }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
@@ -4271,7 +4286,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // root is dropped so it can never pull execution back into the topic the
       // schedule was created from (e.g. an adopted one).
       rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
-      scope: executionPosition === 'topic' ? 'thread' : 'chat',
+      scope: executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
@@ -4349,7 +4364,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     updates.deliver = b.deliver;
   }
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     updates.executionPosition = b.executionPosition;
@@ -4541,6 +4556,8 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
     chatId?: unknown;
     subjectOpenIds?: unknown;
     subjectLarkAppIds?: unknown;
+    quota?: unknown;
+    durationMs?: unknown;
   };
   try {
     body = await readJsonBody(req);
@@ -4570,24 +4587,123 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'subjectLarkAppIds may only be used with operation=grant',
     });
   }
+  // Optional quota/validity window. Absent keys keep the legacy CLI wire shape
+  // exactly (no quota/expiry written); 'unlimited'/'permanent'/'' normalize to
+  // undefined and are likewise omitted. Illegal option strings are rejected
+  // before the service runs. durationMs is relative; the service computes the
+  // absolute expiresAt to avoid client clock skew.
+  const grantExtras: { quota?: number; durationMs?: number } = {};
+  if (Object.prototype.hasOwnProperty.call(body, 'quota')) {
+    const quota = normalizeGrantQuotaOption(body.quota);
+    if (quota === null) return jsonRes(res, 400, { ok: false, error: 'invalid_quota' });
+    if (quota !== undefined) grantExtras.quota = quota;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'durationMs')) {
+    const durationMs = normalizeGrantDurationOption(body.durationMs);
+    if (durationMs === null) return jsonRes(res, 400, { ok: false, error: 'invalid_duration' });
+    if (durationMs !== undefined) grantExtras.durationMs = durationMs;
+  }
   const result = hasSubjectLarkAppIds
     ? await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectLarkAppIds: body.subjectLarkAppIds,
+        ...grantExtras,
       })
     : await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectOpenIds: body.subjectOpenIds,
+        ...grantExtras,
       });
   if (!result.ok) {
     const { status, ...responseBody } = result;
     return jsonRes(res, status, responseBody);
   }
   return jsonRes(res, 200, result);
+});
+
+// ─── blockedUsers (talk/operate deny list, P1c) ───────────────────────────
+
+// Read the raw config entries plus the resolved receiver-scoped open_ids.
+// Bare loopback route: the global trusted-host HMAC gate protects it.
+ipcRoute('GET', '/api/blocked-users', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let bot;
+  try { bot = getBot(cachedLarkAppId); } catch {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    raw: bot.config.blockedUsers ?? [],
+    resolved: bot.resolvedBlockedUsers ?? [],
+  });
+});
+
+// Replace the whole blocklist. Empty array clears it. Owner/admin guards live
+// in setBotBlockedUsers (cannot_block_admin carries the conflicting ou_ list).
+// {removeOpenIds} instead unblocks those open_ids by identity, also lifting raw
+// entries written as email/on_/mobile — the row-unblock button uses this route.
+ipcRoute('PUT', '/api/blocked-users', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { entries?: unknown; removeOpenIds?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.entries !== undefined && body.removeOpenIds !== undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'entries_and_removeOpenIds_conflict' });
+  }
+  const isStringArray = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every(item => typeof item === 'string');
+  let result: SetBlockedUsersResult;
+  if (body.removeOpenIds !== undefined) {
+    if (!isStringArray(body.removeOpenIds)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_remove_open_ids' });
+    }
+    result = await removeBlockedUsers(cachedLarkAppId, body.removeOpenIds);
+  } else {
+    if (!isStringArray(body.entries)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_entries' });
+    }
+    result = await setBotBlockedUsers(cachedLarkAppId, body.entries);
+  }
+  if (result.ok) return jsonRes(res, 200, result);
+  if (result.reason === 'cannot_block_admin') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'cannot_block_admin',
+      conflicting: result.conflicting ?? [],
+    });
+  }
+  if (result.reason === 'empty_resolved') {
+    return jsonRes(res, 422, { ok: false, error: 'empty_resolved' });
+  }
+  if (result.reason === 'bot_not_registered') {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 400, { ok: false, error: result.reason });
+});
+
+// Whole-chat talk grant toggle: allowedChatGroups makes EVERY current member
+// pass canTalk in that chat (talk-only; canOperate is untouched).
+ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { chatId?: unknown; granted?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.chatId !== 'string' || !isValidRoleChatId(body.chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  if (typeof body.granted !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_granted' });
+  }
+  const result = body.granted
+    ? await addAllowedChatGroup(cachedLarkAppId, body.chatId)
+    : await removeAllowedChatGroup(cachedLarkAppId, body.chatId);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  if ('created' in result) return jsonRes(res, 200, { ok: true, created: result.created });
+  return jsonRes(res, 200, { ok: true, removed: result.removed });
 });
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────

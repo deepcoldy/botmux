@@ -43,6 +43,35 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 - **每轮一张新卡片**：上一轮卡片冻结存档，对话历史清晰可回溯；会话用 [`/relay`](/relay) 搬到别的群后，原卡片也会自动冻结为存档（移除按钮）。
 - **关闭时给「可恢复」卡片**：带「▶️ 恢复会话」按钮随时点回来继续；**该 CLI 若支持原生 resume**（adapter 实现了 `buildResumeCommand` 且有原生 session id），还会附上原生命令（如 `claude --resume <id>`）方便手动恢复；不支持时只给 botmux 的恢复按钮 + 一句提示。
 
+## 一轮 turn 的四层展示
+
+botmux 在飞书里的「存在感」分四层，各自独立开关：
+
+| 层 | 是什么 | 关闭方式 |
+|----|--------|----------|
+| **流式状态卡** | 每轮一张、实时截图刷新的主卡片（本文主体） | bot 级 `disableStreamingCard`，或本群 `/card off` |
+| **思考气泡（CoT）** | CLI 工作过程中的中间叙述 / 思考消息 | bot 级 `thinkingCard: false`，或本群 `/cot off`；`/cot show` 临时看一次 |
+| **✋ → ✅ 反应** | 落在你**触发消息**上的进度反应：受理时 ✋、空闲时翻 ✅ | bot 级 `silentTurnReactions: true` |
+| **CLI 主动消息** | agent 通过 `botmux send` 主动发的富文本 / 图文消息 | 无开关，按需发送（见下） |
+
+反应与流式卡**互斥**：✋→✅ 只在「本群已关流式卡」时出现——关了卡就没有实时状态窗，反应是唯一的轻量进度信号；卡片开着的群不刷反应。
+
+## 卡片 / 思考开关：bot 级与按群
+
+| 显示层 | bot 级默认（Bot 配置 / Dashboard「Bot 默认」） | 本群覆盖（群内斜杠命令） | 默认 |
+|--------|-----------------------------------------------|--------------------------|------|
+| 流式状态卡 | `disableStreamingCard` | `/card off` / `/card on`（写入 `noCardChats`）；裸 `/card` 立即召唤一张；`/card pin …` 控制置顶 | 开 |
+| 思考气泡 | `thinkingCard` | `/cot off` / `/cot on`（写入 `noCotChats`）；`/cot show` 临时看一次；`/cot`（不带参数）查状态 | 开 |
+| ✋ → ✅ 反应 | `silentTurnReactions` | 无按群命令 | 关卡的群自动有反应；`silentTurnReactions: true` 后连反应也静默 |
+| 卡面控件 | `hiddenStreamingCardButtons`（选定要藏起的按钮） | — | 全部显示 |
+| 卡片置顶 | `pinStreamingCard`（默认关） | `/card pin off｜on｜status` | 关 |
+
+按群覆盖优先于 bot 级，且只影响当前群。
+
+**`/card`、`/cot` 只有管理员（`allowedUsers`，canOperate）能执行**，查询类子命令也一样。原因：飞书卡片没有「按人显示不同视图」的能力，这些开关是 bot 级 / 群级的，一改**全群所有人**看到的界面都变，因此只交给管理员；访客（有对话权、无操作权）执行会收到「仅授权用户可用」提示。
+
+**精简预设**（Dashboard「Bot 默认」页，本批次新增）：一键做**一次联动写入**——`thinkingCard:false` + `silentTurnReactions:true` + `disableStreamingCard:true`，适合只想安静看结论的群。注意它**不是持续绑定**：本质是把这三个已有开关一次性写成上述值并 toast 提示；之后关掉预设**不会**把三个值回改，想恢复哪一项就手动开哪一项。
+
 ## 置顶当前实时卡片
 
 如果某个 bot 开启了 `pinStreamingCard`，Botmux 会尝试把**当前公开实时状态卡片**置顶到聊天顶部，方便随时点「关闭会话」或打开终端。

@@ -5429,7 +5429,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'project',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5585,6 +5585,91 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+const SESSION_RENAME_USAGE = '用法: botmux session rename "<标题>"（只改当前会话；会话自动识别，不接受 --session-id 等参数指定其他会话）';
+
+/** `botmux session rename "<标题>"`：agent 在会话内更新 botmux canonical 标题。
+ *  会话 id 只来自会话环境（祖先 pid marker / BOTMUX_SESSION_ID），与
+ *  botmux chat rename / preview 同一路径——绝不接受参数指定他人会话。 */
+async function cmdSessionRename(argv: string[]): Promise<void> {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(`botmux session rename — 更新当前会话的 botmux 标题
+
+${SESSION_RENAME_USAGE}
+
+标题为 rename 之后的全部参数（空格拼接），建议命名「类型｜具体事项」，
+如「排障｜支付链路超时」。`);
+    return;
+  }
+  // 任何 flag 都是用法错误：本命令没有也不允许会话选择参数。
+  const flags = argv.filter(arg => arg.length > 1 && arg.startsWith('-'));
+  if (flags.length > 0) {
+    console.error(`未知参数: ${flags.join(' ')}\n${SESSION_RENAME_USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+  const title = argv.join(' ').trim();
+  if (!title) {
+    console.error(SESSION_RENAME_USAGE);
+    process.exitCode = 2;
+    return;
+  }
+  const ctx = findAncestorSessionContext();
+  const sid = ctx?.sessionId;
+  if (!sid) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const sessions = loadSessions();
+  const session = [...sessions.values()].find(x => x.sessionId === sid || x.sessionId.startsWith(sid));
+  if (!session) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const daemon = findDaemon(session.larkAppId);
+  if (!daemon) {
+    console.error(JSON.stringify({ ok: false, error: 'daemon_offline' }));
+    process.exitCode = 1;
+    return;
+  }
+  let response: Response;
+  try {
+    response = await postSessionCliIpc(
+      daemon.ipcPort,
+      session.sessionId,
+      'rename',
+      { title, source: 'agent' },
+    );
+  } catch {
+    console.error('✗ 无法连接当前会话的 daemon');
+    process.exitCode = 1;
+    return;
+  }
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    title?: string;
+    agentSync?: string;
+  };
+  if (!response.ok || !body.ok) {
+    console.error(JSON.stringify(body, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`✓ botmux 会话标题已更新为「${body.title ?? title}」（Dashboard 与 /sessions 列表生效）。`);
+  if (body.agentSync === 'requested') {
+    console.log('已请求运行中的 CLI 同步其原生会话名。');
+  } else if (body.agentSync === 'not_running') {
+    console.log('当前没有运行中的 CLI（CLI 不在线），原生会话名未同步；不影响标题更新。');
+  } else if (body.agentSync === 'unsupported') {
+    console.log('运行中的 CLI 不支持原生会话改名，原生会话名未同步；不影响标题更新。');
+  } else if (body.agentSync === 'failed') {
+    console.log('运行中的 CLI 原生会话名同步失败，原生会话名可能未更新；不影响标题更新。');
+  }
+  console.log('飞书话题（omt）标题平台无开放接口，不会改变，话题列表仍显示首条消息；`botmux chat rename` 改的是整个群名，与本命令不同。');
 }
 
 async function cmdProject(argv: string[]): Promise<void> {
@@ -15403,6 +15488,13 @@ switch (command) {
     break;
   }
   case 'session': {
+    // `botmux session rename` lives in cli.ts (same file as
+    // postSessionCliIpc/findAncestorSessionContext, no import cycle); every
+    // other session subcommand stays in cli/session-command.ts.
+    if (process.argv[3] === 'rename') {
+      await cmdSessionRename(process.argv.slice(4));
+      break;
+    }
     const { cmdSession } = await import('./cli/session-command.js');
     process.exitCode = await cmdSession(process.argv.slice(3));
     break;

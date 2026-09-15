@@ -23,6 +23,7 @@ import {
   type ProjectProgressCardTemplateId,
 } from './groups-api.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { MemberAccessSection } from './member-access-section.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
@@ -1727,6 +1728,11 @@ export function ManageDialog(props: {
             onSaved={() => props.onReloadGroups({ force: true })}
           />
         ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('grantAdmin.sectionTitle')}</legend>
+        <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
       </fieldset>
 
       <fieldset>

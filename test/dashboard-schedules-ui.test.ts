@@ -19,6 +19,7 @@ import {
   scheduleRunHistoryForBackdrop,
   schedulePreconditionEditorInitialState,
   scheduleExecutionPlacement,
+  initialScheduleEditPosition,
   scheduleTargetChatIds,
 } from '../src/dashboard/web/schedules-page.js';
 
@@ -797,6 +798,28 @@ describe('dashboard schedules React page helpers', () => {
     expect(scheduleExecutionPlacement({ id: 'fresh', executionPosition: 'new-topic', rootMessageId: 'om_root' })).toBe('new-topic');
     expect(scheduleExecutionPlacement({ id: 'legacy-fresh', deliver: 'new-topic' })).toBe('new-topic');
     expect(scheduleExecutionPlacement({ id: 'local', deliver: 'local' })).toBe('local');
+  });
+
+  it('edit form keeps the dedicated-task identity for a materialized task row', () => {
+    // A materialized dedicated task projects to 'thread' for display, but the
+    // edit dialog must initialize to 'task': saving an unrelated field with the
+    // form state otherwise PATCHes executionPosition:'topic' and silently
+    // downgrades the task (its first-fire root then pins the wrong semantics).
+    expect(initialScheduleEditPosition({
+      id: 'task-materialized', executionPosition: 'task', rootMessageId: 'om_task_root',
+    } as never)).toBe('task');
+    expect(initialScheduleEditPosition({
+      id: 'task-rootless', executionPosition: 'task',
+    } as never)).toBe('task');
+    // Non-task positions keep following the display placement.
+    expect(initialScheduleEditPosition({
+      id: 'topic', executionPosition: 'topic', scope: 'thread', rootMessageId: 'om_root',
+    } as never)).toBe('topic');
+    expect(initialScheduleEditPosition({
+      id: 'fresh', executionPosition: 'new-topic', rootMessageId: 'om_root',
+    } as never)).toBe('new-topic');
+    expect(initialScheduleEditPosition({ id: 'top', scope: 'chat' } as never)).toBe('top-level');
+    expect(initialScheduleEditPosition(null)).toBe('top-level');
   });
 
   it('formats in the given schedule timezone, not the browser zone', () => {

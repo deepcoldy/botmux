@@ -1658,6 +1658,20 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   /**
+   * 黑名单（纯增量「否决腿」，与 allowedUsers 白名单独立）：原始条目形态与
+   * allowedUsers 完全一致（邮箱 / 手机号 / on_ / ou_ 混写），daemon 启动期复用
+   * 同一套 resolveAllowedUsersWithMap + sidecar 缓存解析成**本 app 视角**的
+   * open_id（resolvedBlockedUsers）。注意 `ou_` 与 allowedUsers 一样是
+   * app-scoped：只对本飞书应用有效，不能从别的 Bot 配置复制。
+   *
+   * 语义：命中黑名单的 sender 在 evaluateTalk 里于 allowedUser 命中腿**之后**、
+   * 其它所有放行腿（oncall / peer / team / grants / open …）**之前**被否决，
+   * canOperate 同腿；黑名单不进 dashboard owner 描述符。owner / 管理员
+   * （resolvedAllowedUsers）不可被拉黑——写入口 setBotBlockedUsers 有守卫，
+   * 判定顺序是双保险。空/缺省 = 不否决任何人。
+   */
+  blockedUsers?: string[];
+  /**
    * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
    * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
    * email entries needing a contact-API resolve every boot), this is stored raw
@@ -2168,6 +2182,9 @@ export interface BotState {
   resolvedAllowedUsers: string[];
   /** raw allowedUsers 条目 → 解析后的 open_id。供 /revoke 反查并删除 email 形式的 raw 条目。 */
   rawAllowedUserResolution: Map<string, string>;
+  /** blockedUsers 原始条目解析后的本 app open_id（纯否决腿，启动期 best-effort 解析，
+   *  缺省 [] = 不否决任何人）。与 resolvedAllowedUsers 共用同一 sidecar 缓存。 */
+  resolvedBlockedUsers: string[];
 }
 
 export type NativeSubagentRuntimeConfigState =
@@ -2394,6 +2411,7 @@ export function registerBot(cfg: BotConfig): BotState {
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
+    resolvedBlockedUsers: [],
   };
   // p2pOpen 是一次显式的权限边界声明（进入限制态），但它只授 talk。没有 allowedUsers 就
   // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
@@ -3609,6 +3627,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // 与 allowedUsers 同款原始条目（邮箱/手机/on_/ou_），daemon 启动期复用同一套
+      // 解析缓存换成本 app open_id；非数组 / 空归一为 undefined，保持 bots.json 干净。
+      blockedUsers: Array.isArray(entry.blockedUsers)
+        ? (normalizeStringList(entry.blockedUsers) || undefined)
+        : undefined,
       // Only a well-formed native open_id is trusted; anything else (stray on_/
       // email/garbage) is dropped so the fail-safe recipient can never be a
       // value that itself needs resolving.

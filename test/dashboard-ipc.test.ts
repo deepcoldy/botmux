@@ -5175,7 +5175,7 @@ describe('GET /api/schedules/:id/logs', () => {
       setLarkAppId(appId);
       setIpcAuthSecret(TEST_IPC_SECRET);
       const task = scheduleStore.createTask({
-        id: 'schedule-run-logs-owned',
+        id: 'schedule_run_logs_owned',
         name: '巡检执行日志',
         schedule: '0 0 * * *',
         parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
@@ -5285,7 +5285,7 @@ describe('GET /api/schedules/:id/logs', () => {
       setLarkAppId(appId);
       setIpcAuthSecret(TEST_IPC_SECRET);
       const task = scheduleStore.createTask({
-        id: 'schedule-run-logs-owner-check',
+        id: 'schedule_run_logs_owner_check',
         name: '归属校验',
         schedule: '0 0 * * *',
         parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
@@ -5534,7 +5534,7 @@ describe('schedule target cap', () => {
   it('allows PATCH of an unchanged legacy six-target binding and reduction to five', async () => {
     // Loading or restoring existing rows bypasses the configuration-write cap.
     const legacy = scheduleStore.createTask({
-      id: 'legacy-six-targets',
+      id: 'legacy_six_targets',
       name: 'Legacy target cap fixture',
       schedule: 'every 1h',
       parsed: { kind: 'interval', minutes: 60, display: 'every 1h' },
@@ -5569,6 +5569,272 @@ describe('schedule target cap', () => {
       name: 'Renamed legacy fixture',
       chatId: fiveChats[0],
       chatIds: fiveChats,
+    });
+  });
+});
+
+describe('schedule dedicated task execution position', () => {
+  const appId = 'cli_schedule_task_pos_test';
+  let dir: string;
+  let previousDataDir: string;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-task-pos-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = join(dir, 'data');
+    scheduleStore.setScheduleScope(appId);
+    setLarkAppId(appId);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    config.session.dataDir = previousDataDir;
+    scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function taskBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      name: '专属话题任务',
+      schedule: 'every 1h',
+      prompt: '在本任务专属话题里执行',
+      workingDir: dir,
+      chatId: 'oc_one',
+      ...overrides,
+    };
+  }
+
+  function seedTask(id: string, overrides: Record<string, unknown> = {}) {
+    return scheduleStore.createTask({
+      id,
+      name: '既有任务',
+      schedule: 'every 1h',
+      parsed: { kind: 'interval', minutes: 60, display: 'every 1h' },
+      prompt: 'Do not execute this fixture',
+      workingDir: dir,
+      chatId: 'oc_one',
+      larkAppId: appId,
+      executionPosition: 'top-level',
+      scope: 'chat',
+      ...overrides,
+    } as any);
+  }
+
+  it('POST accepts task for one chat: thread scope, rootless, projected as task', async () => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(taskBody({ executionPosition: 'task' })),
+    });
+    expect(response.status).toBe(200);
+    expect(response.json.task).toMatchObject({
+      executionPosition: 'task',
+      scope: 'thread',
+      chatId: 'oc_one',
+    });
+    expect(response.json.task.rootMessageId).toBeUndefined();
+    const stored = scheduleStore.listTasks(appId);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ executionPosition: 'task', scope: 'thread' });
+    expect(stored[0].rootMessageId).toBeUndefined();
+  });
+
+  it('POST rejects an unknown execution position enum', async () => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(taskBody({ executionPosition: 'thread' })),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'invalid_execution_position',
+      field: 'executionPosition',
+    });
+    expect(scheduleStore.listTasks(appId)).toEqual([]);
+  });
+
+  it('POST rejects task position for multiple target chats', async () => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(taskBody({ chatIds: ['oc_one', 'oc_two'], executionPosition: 'task' })),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'multiple_chats_task_unsupported',
+      field: 'chatIds',
+    });
+    expect(scheduleStore.listTasks(appId)).toEqual([]);
+  });
+
+  it('POST rejects a client-supplied root for task position', async () => {
+    const response = await requestJson(handle!.port, '/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(taskBody({ executionPosition: 'task', rootMessageId: 'om_foreign' })),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'task_root_not_user_settable',
+      field: 'rootMessageId',
+    });
+    expect(scheduleStore.listTasks(appId)).toEqual([]);
+  });
+
+  it('PATCH moves a top-level single-chat task into its dedicated topic rootlessly', async () => {
+    const task = seedTask('seed_move_to_task');
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'task' }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.json.task).toMatchObject({ executionPosition: 'task', scope: 'thread' });
+    expect(scheduleStore.getTask(task.id, appId)).toMatchObject({
+      executionPosition: 'task',
+      scope: 'thread',
+    });
+    expect(scheduleStore.getTask(task.id, appId)?.rootMessageId).toBeUndefined();
+  });
+
+  it('PATCH entering task position drops a retained foreign topic root', async () => {
+    const task = seedTask('seed_topic_to_task', {
+      executionPosition: 'topic',
+      scope: 'thread',
+      rootMessageId: 'om_retained',
+    });
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'task' }),
+    });
+    expect(response.status).toBe(200);
+    expect(scheduleStore.getTask(task.id, appId)?.rootMessageId).toBeUndefined();
+  });
+
+  it('PATCH rejects task position for a multi-chat task without mutating it', async () => {
+    const task = seedTask('seed_multi_to_task', {
+      chatId: 'oc_one',
+      chatIds: ['oc_one', 'oc_two'],
+    });
+    const before = structuredClone(scheduleStore.getTask(task.id, appId));
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'task' }),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: 'multiple_chats_task_unsupported' });
+    expect(scheduleStore.getTask(task.id, appId)).toEqual(before);
+  });
+
+  it('PATCH rejects an injected root on a stored task-position task without mutating it', async () => {
+    const task = seedTask('seed_task_root_inject', {
+      executionPosition: 'task',
+      scope: 'thread',
+    });
+    const before = structuredClone(scheduleStore.getTask(task.id, appId));
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ rootMessageId: 'om_injected' }),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: 'task_root_not_user_settable' });
+    expect(scheduleStore.getTask(task.id, appId)).toEqual(before);
+  });
+
+  it('PATCH keeps the runtime-written root when renaming a materialized task', async () => {
+    const task = seedTask('seed_materialized_task', {
+      executionPosition: 'task',
+      scope: 'thread',
+      rootMessageId: 'om_runtime_root',
+    });
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: '改名不影响专属话题' }),
+    });
+    expect(response.status).toBe(200);
+    const stored = scheduleStore.getTask(task.id, appId);
+    expect(stored?.name).toBe('改名不影响专属话题');
+    expect(stored?.rootMessageId).toBe('om_runtime_root');
+    // A materialized task still projects to ordinary topic execution.
+    expect(response.json.task).toMatchObject({
+      executionPosition: 'topic',
+      rootMessageId: 'om_runtime_root',
+    });
+  });
+
+  it('PATCH rejects an unknown execution position enum', async () => {
+    const task = seedTask('seed_bad_enum');
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'thread' }),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'invalid_execution_position',
+      field: 'executionPosition',
+    });
+  });
+
+  it('delivery route accepts task target and clears the retained root', async () => {
+    const task = seedTask('seed_delivery_to_task', {
+      executionPosition: 'new-topic',
+      scope: 'chat',
+      rootMessageId: 'om_stale',
+    });
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}/delivery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'task' }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.json).toMatchObject({ ok: true, executionPosition: 'task' });
+    const stored = scheduleStore.getTask(task.id, appId);
+    expect(stored).toMatchObject({ executionPosition: 'task', scope: 'thread' });
+    expect(stored?.rootMessageId).toBeUndefined();
+  });
+
+  it('delivery route refuses task target for a multi-chat task', async () => {
+    const task = seedTask('seed_delivery_multi', {
+      executionPosition: 'new-topic',
+      scope: 'chat',
+      chatIds: ['oc_one', 'oc_two'],
+    });
+    const before = structuredClone(scheduleStore.getTask(task.id, appId));
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}/delivery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'task' }),
+    });
+    // The delivery route keeps its legacy status-200 ok:false envelope for
+    // scheduler-side precondition failures.
+    expect(response.status).toBe(200);
+    expect(response.json).toEqual({ ok: false, error: 'multiple_chats_task_unsupported' });
+    expect(scheduleStore.getTask(task.id, appId)).toEqual(before);
+  });
+
+  it('delivery route rejects an unknown execution position enum', async () => {
+    const task = seedTask('seed_delivery_bad_enum');
+    const response = await requestJson(handle!.port, `/api/schedules/${task.id}/delivery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ executionPosition: 'thread' }),
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'invalid_execution_position',
+      field: 'executionPosition',
     });
   });
 });

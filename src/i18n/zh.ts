@@ -1055,6 +1055,7 @@ export const messages: Record<string, string> = {
   'worker.input_commit_delayed': '⏳ Worker 已收到这条消息，但暂未确认它已进入执行队列。机器可能较忙；消息仍可能继续执行，请勿重发。\nturn: {turnId}',
   'worker.input_retired_unconfirmed': '⚠️ 会话在处理这条消息期间被主动休眠或更换，Botmux 未能确认它是否已进入执行队列。请先查看会话记录确认结果；若未执行，再重新发送这条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
+  'workerDiag.recentStderr': '最近的 worker 输出（可能含死因）：',
   'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
   'worker.raw_input_failed': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。请检查当前终端状态后重发。',
   'worker.raw_input_failed_command_only': '⚠️ Slash 命令未能确认送达 {cliName}。请检查当前终端状态后重发。',
@@ -1656,4 +1657,13 @@ export const messages: Record<string, string> = {
   'cot.tool.result_done': '✓ 已完成',
   'cot.thinking_placeholder': '思考中…',
   'cot.interrupted': '⚠️ 服务重启，本轮思考已中断',
+  'submitDiag.logged_out': '⚠️ 消息没有进入模型：{cliName} 停在登录/鉴权页面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在 {cliName} 的登录或鉴权页面（要求先登录，或登录态已失效），这条消息没有进入模型。CLI 自身登录与飞书授权是两层，互不代表。\n请打开 Web 终端完成登录后，再重发这条消息。\n原消息：{preview}',
+  'submitDiag.interactive_menu': '⚠️ 消息没有进入模型：{cliName} 停在等待键盘选择的界面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在需要键盘选择的界面（更新、数据迁移、hooks review 或确认框等），这条消息没有进入模型。\n请打开 Web 终端完成选择，或按 Esc 取消该界面后再重发；BotMux 不会替你做选择。\n原消息：{preview}',
+  'submitDiag.draft_parked': '⚠️ 消息已粘贴但没有提交：正文停在 {cliName} 输入框\n阶段：输入提交\n错误码：submit_unconfirmed\n消息正文已经粘贴进输入框（显示为 [Pasted Content …]），但没有按 Enter 提交，因此没有进入模型。\n请打开 Web 终端按 Enter 提交；若确认不需要执行，再回到飞书重发。\n原消息：{preview}',
+  // ─── schedulePos: 定时任务「本任务专属话题」执行位置（opt-in 任务级隔离） ─────
+  'schedulePos.positionNote': '执行位置：本任务专属话题（首次触发时自动创建；同一任务之后每次触发都在该话题内继续，不同任务各自独立、互不串扰；仅支持单个群聊）',
+  'schedulePos.cardDeliveryTask': '专属话题（本任务独立）',
+  'schedulePos.cardBtnUseTaskTopic': '改为专属话题',
+  'schedulePos.cardAlreadyTask': '已在本任务的专属话题中执行',
+  'schedulePos.cardTaskMultiChatUnsupported': '专属话题仅支持单个群聊的定时任务',
 };
