@@ -19224,6 +19224,58 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .connector-dedup-field { display: grid; gap: 7px; }
 
+.connector-group-name-config,
+.connector-group-name-input {
+  display: grid;
+  gap: 7px;
+}
+
+.connector-group-name-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.connector-group-name-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--fg);
+  text-align: left;
+  box-shadow: none;
+}
+
+.connector-group-name-option:hover,
+.connector-group-name-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  transform: none;
+}
+
+.connector-group-name-option > span:last-child { display: grid; gap: 4px; min-width: 0; }
+.connector-group-name-option b { color: var(--fg); font-size: 12px; }
+.connector-group-name-option small { color: var(--muted); font-size: 11px; font-weight: 600; line-height: 1.4; }
+.connector-group-name-option.selected .connector-strategy-radio { border: 4px solid var(--accent); }
+
+.connector-group-name-input > small {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.connector-group-name-input > small span {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
 .connector-new-group-note {
   margin: 0;
   padding: 9px 11px;

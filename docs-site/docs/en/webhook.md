@@ -145,6 +145,10 @@ You can optionally fill in an "allowed groups" whitelist — only group IDs on t
 
 Each incoming event automatically gets a new group to handle it, and the bot's authorized users are **automatically pulled into the group** (so it's not just the bot alone).
 
+- **New group name (optional)**:
+  - **Default name**: keeps `Webhook name: dedup value/call id`.
+  - **Fixed name**: every created group uses the same name.
+  - **Template string**: build the name from request body fields, for example `Alert {{alert.name}} #{{dedupKey}}`. Supports `{{source}}`, `{{dedupKey}}`, `{{requestId}}`, and JSON paths such as `{{alert.name}}` / `{{$.alert.name}}`.
 - **Dedup field (optional)**: take a value from the event body as the dedup key, written as a dot path (e.g. `alert.id` or `$.alert.id`, with the root being the body you POST).
   - **If set** → every event hitting the **same dedup value** is delivered to the **same group** (the first one creates the group, later ones reuse it).
   - **If empty** → every event **creates a new group**.
