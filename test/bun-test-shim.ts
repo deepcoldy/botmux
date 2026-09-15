@@ -140,6 +140,15 @@ fill('advanceTimersByTimeAsync', async (ms: number) => {
   return vi;
 });
 
+// Bun implements the sync "next timer" helper but not Vitest's async variant.
+// Advance exactly one pending timer, then drain microtasks so an async callback
+// reaches the same observable state as it does under Vitest.
+fill('advanceTimersToNextTimerAsync', async () => {
+  jest.advanceTimersToNextTimer();
+  await Promise.resolve();
+  return vi;
+});
+
 // Same sync-to-async relationship as advanceTimersByTimeAsync. Bun has the sync
 // `runAllTimers`; the async variants additionally drain the microtask queue so a
 // timer callback that awaits can finish before the assertion runs.

@@ -210,6 +210,20 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     }
   });
 
+  it('advanceTimersToNextTimerAsync advances one timer and settles its async callback', async () => {
+    vi.useFakeTimers();
+    try {
+      const seen: string[] = [];
+      setTimeout(async () => { await Promise.resolve(); seen.push('first'); }, 10);
+      setTimeout(() => { seen.push('second'); }, 20);
+      await vi.advanceTimersToNextTimerAsync();
+      expect(seen).toEqual(['first']);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('clearAllTimers is a NO-OP when fake timers were never installed', () => {
     // REGRESSION for the single largest cause of the bun-test leg being red.
     // Bun's `vi.clearAllTimers` THROWS `Fake timers are not active. Call
