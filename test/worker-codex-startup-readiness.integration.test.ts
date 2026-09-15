@@ -8,9 +8,16 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
-it.each(['banner', 'resume', 'slow-resume', 'tmux-resume', 'coloured-resume'])('holds input during loading, submits once after %s, and commits only after confirmation', async (mode, context) => {
+for (const mode of ['banner', 'resume', 'slow-resume', 'tmux-resume', 'coloured-resume']) {
   const backendType = process.env.BOTMUX_TEST_WORKER_BINARY || mode === 'tmux-resume' || mode === 'coloured-resume' ? 'tmux' : 'pty';
-  if (backendType === 'tmux' && !tmuxAvailable) context.skip();
+  it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
+    `holds input during loading, submits once after ${mode}, and commits only after confirmation`,
+    () => runStartupScenario(mode, backendType),
+    115_000,
+  );
+}
+
+async function runStartupScenario(mode: string, backendType: 'tmux' | 'pty'): Promise<void> {
   // The unit runner owns this disposable home. Linux devboxes can have umask
   // 0002; the second worker must not inherit a group-writable credential dir.
   const botmuxDir = join(homedir(), '.botmux');
@@ -129,4 +136,4 @@ setInterval(() => {}, 1000);
     }
     rmSync(root, { recursive: true, force: true });
   }
-}, 115_000);
+}
