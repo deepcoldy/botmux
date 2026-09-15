@@ -373,6 +373,7 @@ import {
   removeXpiSharedCwdTurn,
   selectNextXpiSharedCwdTurn,
   tryAcquireXpiSharedCwdAdmission,
+  XpiSharedCwdQueueFullError,
   xpiSharedCwdQueuedTurnId,
   type XpiSharedCwdQuarantineNotice,
   type XpiSharedCwdDispatchUnknownStartupNotice,
@@ -18959,6 +18960,28 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (!(await dispatchApprovedCrossPrincipalSuggestion(ds, current))) return;
     }
   } catch (err) {
+    if (err instanceof XpiSharedCwdQueueFullError) {
+      // This branch runs while the owner is actively resolving the durable
+      // confirmation record. Keep that record durable until the terminal
+      // notice is actually delivered; otherwise a transport failure would
+      // turn explicit backpressure into a silent drop. A failed notice gets a
+      // bounded retry and remains restart-recoverable through the same record.
+      try {
+        await notifyCrossPrincipalTerminal(
+          ds,
+          record,
+          '建议已确认，但共享目录等待队列已满；本次未接收也不会执行，请稍后重新发起。',
+        );
+        removeCrossPrincipalRecord(ds, record.id);
+      } catch (noticeErr) {
+        logger.warn(
+          `[${tag(ds)}] failed to notify owner about full XPI shared-cwd queue: `
+          + `${noticeErr instanceof Error ? noticeErr.message : String(noticeErr)}`,
+        );
+        scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+      }
+      return;
+    }
     if (err instanceof sessionStore.SessionStoreBusyError) {
       scheduleXpiSessionStoreBusyRetry(
         {
@@ -18982,6 +19005,8 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     }
   }
 }
+
+export const __testOnly_driveCrossPrincipalInterruptions = driveCrossPrincipalInterruptions;
 
 /**
  * Ask the exact owner of the completed turn whether to execute another human's
@@ -19661,8 +19686,11 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
     : 'daemon.ordinary_ingress_failed';
   const cliSelectionRejected = err instanceof Error && err.message.startsWith('CLI selection rejected:');
+  const xpiQueueFull = err instanceof XpiSharedCwdQueueFullError;
   const notice = cliSelectionRejected
     ? `⚠️ ${err.message}\n\n可直接发给当前 agent：\n请帮我修复 botmux 的 CLI 选择配置：检查当前 bot 的 env、Riff 和 codexRpcInput 设置，移除与会话级 /cli <cliId> 选择冲突的配置；不要修改代码，完成后告诉我具体改了什么。`
+    : xpiQueueFull
+      ? tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(ctx.larkAppId))
     : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
   try {
     await sessionReply(
@@ -19679,6 +19707,8 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
   }
   throw err;
 }
+
+export const __testOnly_notifyOrdinaryIngressFailure = notifyOrdinaryIngressFailure;
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   ctx.ingressAdmission ??= { admitted: false };

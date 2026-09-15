@@ -1134,6 +1134,7 @@ export const messages: Record<string, string> = {
   'daemon.prompt_gate_denied_reason': '🚫 本条消息被前置校验拦截，未提交给 CLI：{reason}',
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
   'daemon.ordinary_ingress_failed': '⚠️ 这条消息没有送达 CLI，请重发一次；若持续失败，可 /close 后重开话题。',
+  'daemon.xpi_shared_cwd_queue_full': '⚠️ 共享工作目录的等待队列已满，这条消息未被接收、不会执行。请稍后重新发送。',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ 这条消息已接收，请勿原样重发（重发会重复执行）；失败发生在接收之后的状态回复/收尾步骤。若话题迟迟没有动静，可 /close 后重开话题再继续。',
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.cmd_activation_pending': '{cmd} 暂不能发送：上一条消息仍在提交中，请稍后重试。',

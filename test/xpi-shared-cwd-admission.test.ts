@@ -337,6 +337,19 @@ describe('narrow XPI shared-cwd admission', () => {
       }),
     );
 
+    const before = structuredClone(member.xpiSharedCwdQueuedTurns);
+    const duplicate = enqueueXpiSharedCwdTurn({
+      session: member,
+      turnId: 'turn_0',
+      caller,
+      userPrompt: 'a retry must remain idempotent even while full',
+      cliInput: { content: 'a retry must remain idempotent even while full' },
+      resume: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect(duplicate.inserted).toBe(false);
+    expect(member.xpiSharedCwdQueuedTurns).toEqual(before);
+
     expect(() => enqueueXpiSharedCwdTurn({
       session: member,
       turnId: 'turn_overflow',
@@ -346,8 +359,7 @@ describe('narrow XPI shared-cwd admission', () => {
       resume: true,
       createdAt: '2026-01-01T00:00:00.000Z',
     })).toThrow('XPI shared-cwd queue is full');
-    expect(member.xpiSharedCwdQueuedTurns).toHaveLength(MAX_XPI_SHARED_CWD_QUEUED_TURNS);
-    expect(member.xpiSharedCwdQueuedTurns?.some(record => record.turnId === 'turn_overflow')).toBe(false);
+    expect(member.xpiSharedCwdQueuedTurns).toEqual(before);
   });
 
   it('migrates a closed coordinator only after its exact holder generation is proven exited', () => {

@@ -57,6 +57,13 @@ const mocks = vi.hoisted(() => {
     }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
+    listSessionsStrict: vi.fn(() => [...sessions.values()]),
+    mutateOwnedSessionsAtomically: vi.fn((ids: string[], mutate: (fresh: Map<string, any>) => unknown) => {
+      const fresh = new Map(ids.map(id => [id, structuredClone(sessions.get(id))]));
+      const result = mutate(fresh);
+      for (const [id, session] of fresh) sessions.set(id, session);
+      return { result, rows: fresh };
+    }),
     closeSession: vi.fn((sessionId: string) => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
@@ -104,6 +111,9 @@ vi.mock('../src/services/session-store.js', async () => {
     createSession: mocks.createSession,
     updateSession: mocks.updateSession,
     getSession: mocks.getSession,
+    getOwnedSession: mocks.getSession,
+    listSessionsStrict: mocks.listSessionsStrict,
+    mutateOwnedSessionsAtomically: mocks.mutateOwnedSessionsAtomically,
     closeSession: mocks.closeSession,
   };
 });
@@ -141,7 +151,10 @@ import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
+  __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
 } from '../src/daemon.js';
+import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -280,6 +293,101 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
+    const ctx = makeCtx('om_thread_queue_full', 'om_msg_queue_full');
+    ctx.ingressAdmission = { admitted: false };
+    const error = new XpiSharedCwdQueueFullError('sess-full');
+
+    await expect(notifyOrdinaryIngressFailure(ctx, error)).rejects.toBe(error);
+
+    expect(ctx.ingressAdmission.admitted).toBe(false);
+    expect(repliedText()).toContain(tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(APP)));
+  });
+
+  it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
+    const ds = seedThreadSession('om_thread_owner_queue_full', 'seeded') as any;
+    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-queue-full';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `queued-${index}`,
+      turnId: `queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi-owner-approved-full',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const beforeQueue = structuredClone(ds.session.xpiSharedCwdQueuedTurns);
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    expect(repliedText()).toContain('本次未接收也不会执行');
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual(beforeQueue);
+  });
+
+  it('retains an approved cross-principal record when its queue-full notice fails', async () => {
+    const ds = seedThreadSession('om_thread_owner_notice_retry', 'seeded') as any;
+    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-notice-retry';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `retry-queued-${index}`,
+      turnId: `retry-queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi-owner-approved-retry',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
+    mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    expect(ds.session.crossPrincipalInterruptions).toEqual([
+      expect.objectContaining({ id: 'xpi-owner-approved-retry', phase: 'owner_approved' }),
+    ]);
+    expect(ds.crossPrincipalWaitTimer).toBeDefined();
+    clearTimeout(ds.crossPrincipalWaitTimer);
+    ds.crossPrincipalWaitTimer = undefined;
   });
 });
 

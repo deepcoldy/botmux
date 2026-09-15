@@ -1136,6 +1136,7 @@ export const messages: Record<string, string> = {
   'daemon.prompt_gate_denied_reason': '🚫 This message was blocked by a pre-submit check and was not sent to the CLI: {reason}',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.ordinary_ingress_failed': '⚠️ This message did not reach the CLI. Please resend; if it keeps failing, `/close` and reopen the topic.',
+  'daemon.xpi_shared_cwd_queue_full': '⚠️ The shared-workspace queue is full. This message was not accepted and will not run. Please resend it later.',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ This message was received — do not resend it as-is (a resend would run it twice); the failure happened in a follow-up status reply or post-accept step. If nothing happens in this topic, `/close` and reopen the topic to continue.',
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.cmd_activation_pending': '{cmd} cannot be sent yet because the previous turn is still being submitted. Retry shortly.',
