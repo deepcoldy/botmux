@@ -157,10 +157,13 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
 | Command | Description |
 |------|------|
-| `/login` | Lark user authorization; once authorized, you can download third-party card images and call cloud docs/calendar and other APIs as yourself |
+| `/login` | Basic Lark user authorization: read messages, access resources, and renew authorization; does not request docs, contacts, or calendar permissions by default |
+| `/login --scope <scope> [more scopes]` | Add only the requested permissions to the basic scopes, e.g. `/login --scope docx:document:readonly` |
 | `/login status` | View authorization status |
 | `/login tags` | Session-group tag authorization (feed-group scopes); once granted, new session groups auto-join your sidebar feed group (for p2pMode=group with the feed-group tag mode — the default) |
 | `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
+
+Basic authorization requires the app to enable `im:message:readonly`, `im:resource`, and `offline_access`. If another operation returns `missing_scope`, request the names reported by the error with `/login --scope ...`; the app administrator must first enable those user permissions in the developer console. Resource visibility/access errors require access to that resource, not another `/login`.
 
 ## 🎭 Roles (Personas)
 
