@@ -105,6 +105,9 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
     operatorSubjectId = verifiedOperator.unionId ?? operatorOpenId;
     if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
   } else {
+    if (!delivery.requesterSubjectId) {
+      return { toast: { type: 'error', content: '无法验证本次提问者，无法提交反馈' } };
+    }
     operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
       ? operatorOpenId
       : verifiedOperator.unionId ?? (data.operator?.union_id === undefined ? operatorOpenId : undefined);
