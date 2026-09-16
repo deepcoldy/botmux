@@ -3838,11 +3838,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
             logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
           );
+          logger.info(`[${tag(ds)}] Display mode → ${next}`);
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
         } else {
           scheduleCardPatch(ds, cardJson);
         }
         logger.info(`[${tag(ds)}] Display mode → ${next}`);
-        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        // The live card is published exclusively by scheduleCardPatch. Returning
+        // the same card here would make Lark apply a second, synchronous update
+        // outside that queue; an older in-flight PATCH could then land after it
+        // and temporarily restore stale display state.
+        return {
+          toast: {
+            type: 'info',
+            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
       }
       logger.info(`[${tag(ds)}] Display mode → ${next}`);
       return;
