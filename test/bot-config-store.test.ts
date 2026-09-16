@@ -429,6 +429,21 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('crossPrincipalInterruptionGuard is an immediate default-off boolean', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('crossPrincipalInterruptionGuard')!;
+    expect(spec.effect).toBe('immediate');
+    expect(spec.defaultOn).not.toBe(true);
+
+    await store.applyConfigField('app_default', spec, true);
+    expect(readConfig().crossPrincipalInterruptionGuard).toBe(true);
+    expect(registry.getBot('app_default').config.crossPrincipalInterruptionGuard).toBe(true);
+
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().crossPrincipalInterruptionGuard).toBeUndefined();
+    expect(registry.getBot('app_default').config.crossPrincipalInterruptionGuard).toBeUndefined();
+  });
+
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('hiddenStreamingCardButtons')!;
