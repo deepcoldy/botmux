@@ -15,6 +15,12 @@ const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
+// A local terminal submit bypasses botmux's input gate. Only active footer
+// shapes may revive an idle cycle; plain "Working..." can be transcript text.
+// Match ANSI-stripped lines (IdleDetector and the viewport probe strip them).
+const OMP_ACTIVE_FOOTER_PATTERN =
+  /^[ \t]*(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏][ \t]+\d+(?:\.\d+)?(?:ms|s|m|h)[ \t]+│[^\r\n]*%┃|●[ \t]+🐴[ \t]+ponytail:)/m;
+const OMP_BUSY_PATTERN = new RegExp(`Working(?:\\.\\.\\.|…)|${OMP_ACTIVE_FOOTER_PATTERN.source}`, 'm');
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -217,7 +223,8 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
-    busyPattern: /Working(?:\.\.\.|…)/,
+    busyPattern: OMP_BUSY_PATTERN,
+    idleToBusyPattern: OMP_ACTIVE_FOOTER_PATTERN,
     supportsTypeAhead: true,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

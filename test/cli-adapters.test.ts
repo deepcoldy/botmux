@@ -2556,6 +2556,32 @@ describe('busyPattern', () => {
 });
 
 describe('idleToBusyPattern', () => {
+  it('oh-my-pi only revives idle from an active footer, not legacy Working prose', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const active = [
+      '⠇ 1h │ ⬢ model · xhigh │ 📁 …/repo ─────67%┃─272K─',
+      '  ⠋ 1.5s │ model │ 12%┃',
+      '● 🐴 ponytail: ⚡ FULL',
+    ];
+    for (const footer of active) {
+      expect(adapter.busyPattern!.test(footer)).toBe(true);
+      expect(adapter.idleToBusyPattern!.test(footer)).toBe(true);
+    }
+    for (const text of [
+      'Working... on the fix',
+      'The previous log contained Working… but the task is finished.',
+      'π │ model │ 📁 …/repo ─────67%┃─272K─',
+      '○ 🐴 ponytail: ⚡ FULL',
+      'The log said ● 🐴 ponytail: ⚡ FULL',
+      'Quoted footer: ⠇ 1h │ model │ 67%┃',
+      '⠇ 1h │ model\n67%┃',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+    // Preserve the legacy viewport guard without using it as a new-turn edge.
+    expect(adapter.busyPattern!.test('Working…')).toBe(true);
+  });
+
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const busy = adapter.idleToBusyPattern;

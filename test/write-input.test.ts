@@ -263,6 +263,43 @@ function decodeRunnerLine(line: string, prefix: string): any {
 // 1. Single-line content
 // =========================================================================
 
+describe('Pi paste submission', () => {
+  it.each(['tmux', 'raw'] as const)('%s preserves trailing backslashes and submits exactly once', async (mode) => {
+    for (const content of ['path\\', '\\', 'path\\\\', '第一行\n\npath\\', 'x'.repeat(2_000) + '\\', 'plain\ntext', 'path\\\n']) {
+      let composer = '';
+      const submitted: string[] = [];
+      // Model Pi's editor boundary, not the adapter's write sequence: Enter
+      // after a backslash inserts a newline; otherwise submit trims the value.
+      const enter = () => {
+        if (composer.endsWith('\\')) composer = composer.slice(0, -1) + '\n';
+        else {
+          submitted.push(composer.trim());
+          composer = '';
+        }
+      };
+      const write = (text: string) => {
+        if (text === '\r') enter();
+        else {
+          expect(text.startsWith('\x1b[200~')).toBe(true);
+          expect(text.endsWith('\x1b[201~')).toBe(true);
+          composer += text.slice(6, -6);
+        }
+      };
+      const pty: PtyHandle = mode === 'raw' ? { write } : {
+        write,
+        pasteText: text => { composer += text; },
+        sendSpecialKeys: key => {
+          expect(key).toBe('Enter');
+          enter();
+        },
+      };
+      await createPiAdapter('/bin/pi').writeInput(pty, content);
+      expect(submitted).toEqual([content.trim()]);
+      expect(composer).toBe('');
+    }
+  });
+});
+
 describe('writeInput: single-line, tmux mode', () => {
   it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();
