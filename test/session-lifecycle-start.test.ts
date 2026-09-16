@@ -2,11 +2,18 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
-const { emitHookEventMock, forkMock, execSyncMock, checkWorkerAdmissionMock } = vi.hoisted(() => ({
+const {
+  emitHookEventMock,
+  forkMock,
+  execSyncMock,
+  checkWorkerAdmissionMock,
+  standaloneBinaryMock,
+} = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
   checkWorkerAdmissionMock: vi.fn(),
+  standaloneBinaryMock: vi.fn(() => false),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -21,6 +28,14 @@ vi.mock('node:child_process', async (importOriginal) => {
 vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
 }));
+
+vi.mock('../src/core/self-spawn.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/self-spawn.js')>();
+  return {
+    ...actual,
+    isStandaloneBinary: () => standaloneBinaryMock(),
+  };
+});
 
 vi.mock('../src/core/worker-budget.js', () => ({
   checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
@@ -274,6 +289,7 @@ beforeEach(() => {
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
   restartCounts.clear();
+  standaloneBinaryMock.mockReturnValue(false);
   forkMock.mockImplementation(() => makeFakeWorker());
   checkWorkerAdmissionMock.mockReturnValue({
     allowed: true,
@@ -407,6 +423,71 @@ describe('host memory pressure worker admission', () => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
+  it('starts standalone init delivery only after the Worker IPC bootstrap is ready', async () => {
+    vi.useFakeTimers();
+    standaloneBinaryMock.mockReturnValue(true);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'hello', { turnId: 'om_business' })).toBe(true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])).toEqual([
+      { type: 'worker_ipc_probe' },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(vi.mocked(worker.send).mock.calls).toHaveLength(1);
+
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    const init = vi.mocked(worker.send).mock.calls.at(-1)?.[0];
+    expect(init).toMatchObject({
+      type: 'init',
+      prompt: 'hello',
+      turnId: 'om_business',
+    });
+
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('releases standalone init delivery after the bounded bootstrap fallback', async () => {
+    vi.useFakeTimers();
+    standaloneBinaryMock.mockReturnValue(true);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'hello', { turnId: 'om_fallback' })).toBe(true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(vi.mocked(worker.send).mock.calls).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'init',
+      prompt: 'hello',
+      turnId: 'om_fallback',
+    });
+
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_fallback' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_fallback' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('settles tracking when the exact live worker generation commits the turn', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');

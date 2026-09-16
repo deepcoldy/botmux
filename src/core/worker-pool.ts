@@ -120,6 +120,75 @@ const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
+type WorkerIpcBootstrapState = {
+  ready: boolean;
+  pending: Array<() => void>;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const workerIpcBootstrapStates = new WeakMap<ChildProcess, WorkerIpcBootstrapState>();
+const STANDALONE_WORKER_IPC_BOOTSTRAP_TIMEOUT_MS = 30_000;
+
+function initializeWorkerIpcBootstrap(worker: ChildProcess): void {
+  if (!isStandaloneBinary()) return;
+  const state: WorkerIpcBootstrapState = {
+    ready: false,
+    pending: [],
+    timer: setTimeout(() => {
+      logger.warn('Standalone worker IPC bootstrap timed out; releasing queued messages');
+      releaseWorkerIpcBootstrap(worker, state);
+    }, STANDALONE_WORKER_IPC_BOOTSTRAP_TIMEOUT_MS),
+  };
+  state.timer.unref?.();
+  workerIpcBootstrapStates.set(worker, state);
+  const onMessage = (message: WorkerToDaemon): void => {
+    if (message.type !== 'worker_ipc_ready') return;
+    worker.off('message', onMessage);
+    releaseWorkerIpcBootstrap(worker, state);
+  };
+  worker.on('message', onMessage);
+  worker.once('exit', () => {
+    worker.off('message', onMessage);
+    clearTimeout(state.timer);
+    state.pending.length = 0;
+    workerIpcBootstrapStates.delete(worker);
+  });
+  worker.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
+}
+
+function releaseWorkerIpcBootstrap(
+  worker: ChildProcess,
+  state: WorkerIpcBootstrapState,
+): void {
+  if (workerIpcBootstrapStates.get(worker) !== state || state.ready) return;
+  state.ready = true;
+  clearTimeout(state.timer);
+  workerIpcBootstrapStates.delete(worker);
+  const pending = state.pending.splice(0);
+  for (const dispatch of pending) {
+    try {
+      dispatch();
+    } catch (error) {
+      logger.error(
+        `Failed to flush standalone worker IPC bootstrap queue: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
+function afterWorkerIpcBootstrap(worker: ChildProcess, dispatch: () => void): boolean {
+  const state = workerIpcBootstrapStates.get(worker);
+  if (!state || state.ready) {
+    dispatch();
+    return true;
+  }
+  if (worker.killed || worker.connected === false) return false;
+  state.pending.push(dispatch);
+  return true;
+}
+
 /** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
 function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefined {
   if (!larkAppId) return undefined;
@@ -7795,6 +7864,11 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
     failOrdinaryImDelivery(record, 'worker_generation_changed');
     return false;
   }
+  if (workerIpcBootstrapStates.has(record.worker)) {
+    return afterWorkerIpcBootstrap(record.worker, () => {
+      sendOrdinaryImDeliveryAttempt(record);
+    });
+  }
 
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
@@ -8097,9 +8171,9 @@ export function sendWorkerSessionInput(
   message: TransferBufferedInput,
 ): boolean {
   if (bufferTransferInput(ds, message)) return true;
-  if (!ds.worker || ds.worker.killed) return false;
-  ds.worker.send(message);
-  return true;
+  const worker = ds.worker;
+  if (!worker || worker.killed) return false;
+  return afterWorkerIpcBootstrap(worker, () => worker.send(message));
 }
 
 function settleTransferInputGate(
@@ -8204,7 +8278,9 @@ function releaseTransferInputGate(
             throw new Error('replacement worker rejected tracked IM delivery');
           }
         } else {
-          worker.send(message);
+          if (!afterWorkerIpcBootstrap(worker, () => worker.send(message))) {
+            throw new Error('replacement worker IPC bootstrap is unavailable');
+          }
         }
         gate.messages.shift();
       } catch (err) {
@@ -11305,10 +11381,11 @@ export function forkWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
+  initializeWorkerIpcBootstrap(worker);
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
     sendOrdinaryImDeliveryTracked(ds, initMsg);
   } else {
-    worker.send(initMsg);
+    afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
   }
   if (prompt.length > 0 && isOrdinaryRecoveryTurnId(initAttributionTurnId)) {
     recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId, { beginRecovery: true });
@@ -11821,6 +11898,9 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'worker_ipc_ready':
+        // Consumed by the standalone bootstrap listener installed at spawn.
+        break;
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -15956,7 +16036,8 @@ export function forkAdoptWorker(
   };
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
   ds.worker = worker;
-  worker.send(initMsg);
+  initializeWorkerIpcBootstrap(worker);
+  afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
   } catch (err) {
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }
