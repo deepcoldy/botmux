@@ -113,7 +113,8 @@ describe('registration loser command handoff', () => {
     expect(end).toBeGreaterThan(start);
     const region = src.slice(start, end);
     expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
-    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
+    // runtime 级联的正文重入（cascadeBodyReentry）同样跳过这两处一次性副作用。
+    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

@@ -308,7 +308,11 @@ import {
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { classifySlash, isCommandDecision } from './core/command-router.js';
+import { deriveSessionPhase } from './core/session-phase.js';
+import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
+import type { CascadeItem } from './core/command-router.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
@@ -5109,15 +5113,6 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   void postTurnStartingCard(ds, sessionReply, turnId);
 }
 
-/**
- * `/watch-comment <doc>` 是会话型操作：即使命令族的 list/off/pending 可以无会话
- * 运行，真正开始监听时也要创建/复用当前话题 session 并立即预热 CLI。
- */
-function isSessionlessCommandInvocation(cmd: string, content: string): boolean {
-  if (!SESSIONLESS_DAEMON_COMMANDS.has(cmd)) return false;
-  if (cmd !== '/watch-comment') return true;
-  return !docWatchCommandNeedsSession(content);
-}
 
 async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription): Promise<void> {
   const generation = captureRoutingGeneration(ds);
@@ -19376,8 +19371,8 @@ async function replyInvalidWorkingDirs(
   return true;
 }
 
-function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
-  return resolveAdapterDefaultPassthroughCommands(larkAppId).includes(cmd);
+function coldStartPassthroughCommands(larkAppId: string): ReadonlySet<string> {
+  return new Set(resolveAdapterDefaultPassthroughCommands(larkAppId));
 }
 
 /** `/fast` is a passthrough keystroke to Codex's native tier toggle — it only
@@ -19448,6 +19443,114 @@ function buildTurnParticipants(
 
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
+/**
+ * runtime 级联定序器（设计 docs/design/2026-09-11-command-router.md §6，PR-3）。
+ *
+ * 一条消息里的 `透传命令行 ⏎ … ⏎ 正文` 按书写顺序逐条送出，每条之前等 CLI 空闲、每条透传
+ * 之后等它执行完（core/cli-idle-wait.ts 的两个等待原语）。每条透传仍走今天的
+ * deliverPassthroughToExistingSession（turn 记账、写入闸、卡片一概不变），正文则以本条消息的
+ * 正文重新进入 handleThreadReply（配额、附件、ledger 与普通消息完全一致）。
+ *
+ * 刻意 detached（调用方 `void` 掉、立即返回）：等待可能长达 idleTimeoutMs，不能拿 ingress
+ * 的 admission 锁去等（session-turn-queue.ts 的原则）。超时按今天的 busy delivery 语义把剩余
+ * 条目直接发出并提示一句；worker 中途没了则停止并提示剩余条数。
+ */
+async function runPassthroughCascade(args: {
+  ds: DaemonSession;
+  items: readonly CascadeItem[];
+  anchor: string;
+  larkAppId: string;
+  data: any;
+  ctx: RoutingContext;
+  parsed: { messageId: string; threadId?: string };
+  replyRootId?: string;
+  senderOpenId?: string;
+  senderIsBot: boolean;
+  substitute: boolean;
+}): Promise<void> {
+  const { ds, items, anchor, larkAppId, data, ctx, parsed } = args;
+  const loc = localeForBot(larkAppId);
+  const tag8 = anchor.substring(0, 12);
+  // 提示是 best-effort：飞书抖动不能中断剩余条目的投递。
+  const notify = async (text: string): Promise<void> => {
+    try { await sessionReply(anchor, text, 'text', larkAppId); } catch (e) {
+      logger.warn(`[${tag8}] cascade notice failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  const remainingAfter = (i: number) => items.length - i;
+  let delivered = 0;
+  let timedOut = false;
+  try {
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i]!;
+      const last = i === items.length - 1;
+      if (!timedOut) {
+        const idle = await waitForCliIdle(ds);
+        if (idle === 'gone') {
+          logger.warn(`[${tag8}] cascade stopped: worker gone before item ${i + 1}/${items.length}`);
+          await notify(tr('daemon.cascade_worker_gone', { n: remainingAfter(i) }, loc));
+          return;
+        }
+        if (idle === 'timeout' || idle === 'blocked') {
+          // 超时或限流/卡住：按今天的 busy delivery 语义把剩余条目直接发出。
+          timedOut = true;
+          logger.warn(`[${tag8}] cascade: CLI ${idle} before item ${i + 1}/${items.length}, delivering remaining busy`);
+          await notify(tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: remainingAfter(i) }, loc));
+        }
+      }
+      if (item.kind === 'passthrough') {
+        const sentAt = ds.cliReadyGeneration ?? 0;
+        deliverPassthroughToExistingSession(ds, item.cmd, item.content, anchor, larkAppId, {
+          messageId: parsed.messageId,
+          replyRootId: args.replyRootId,
+          senderOpenId: args.senderOpenId,
+          senderIsBot: args.senderIsBot,
+          substitute: args.substitute,
+          inThread: !!parsed.threadId,
+          // 最后一条沿用真实 messageId（与单条透传逐字相同）；之前的用派生 id。
+          ...(last ? {} : { turnId: `${parsed.messageId}#c${i + 1}` }),
+        });
+        delivered += 1;
+        logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: ${item.cmd}`);
+        if (!last && !timedOut) {
+          const settled = await waitForCommandSettled(ds, sentAt);
+          if (settled === 'gone') {
+            await notify(tr('daemon.cascade_worker_gone', { n: remainingAfter(i + 1) }, loc));
+            return;
+          }
+          if (settled === 'timeout' || settled === 'blocked') {
+            timedOut = true;
+            await notify(tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: remainingAfter(i + 1) }, loc));
+          }
+        }
+        continue;
+      }
+      // 正文：以同一条消息（同 messageId → 同 turn / 引用目标）重新进入 thread 入口，正文里
+      // 没有命令 token，路由器判 forward，走与普通消息完全相同的转发链。ctx 原样透传——同一条
+      // inbound 共享同一个接纳状态（入口已 markIngressAdmitted，失败提示不再诱导整条重发）；
+      // cascadeBodyReentry 让入口跳过已跑过的一次性副作用，并绕过级联在飞的推迟闸。
+      const bodyData = {
+        ...data,
+        message: { ...(data?.message ?? {}), content: JSON.stringify({ text: item.text }), message_type: 'text' },
+      };
+      logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: body (${item.text.length} chars)`);
+      await handleThreadReply(bodyData, { ...ctx, cascadeBodyReentry: true });
+      delivered += 1;
+    }
+  } catch (err) {
+    logger.error(`[${tag8}] cascade failed after ${delivered}/${items.length}: ${err instanceof Error ? err.message : String(err)}`);
+    await notify(tr('daemon.cascade_failed', { done: delivered, remaining: items.length - delivered }, loc));
+  } finally {
+    // 定序器收尾：解除在飞标记，把等待期间到达的同话题消息按到达顺序重入。
+    ds.cascadeInFlight = false;
+    const deferred = ds.cascadeDeferred ?? [];
+    ds.cascadeDeferred = undefined;
+    for (const d of deferred) {
+      await handleThreadReply(d.data, d.ctx as RoutingContext);
+    }
+  }
+}
+
 function deliverPassthroughToExistingSession(
   ds: DaemonSession,
   cmd: string,
@@ -19467,8 +19570,14 @@ function deliverPassthroughToExistingSession(
      *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
     onDelivered?: () => void;
+    /** runtime 级联（§6）里第 1..N-1 条的派生 turn 标识（`<messageId>#c<i>`）：worker 的
+     *  turn 终态去重按 turnId 键，同一条飞书消息的多条透传不能共用一个 id。缺省 = messageId。
+     *  `quoteTargetId` 仍指向真实消息，所以派生 turn 期间 current-turn provenance 的
+     *  `quoteTargetId === turnId` 校验不成立——级联里的透传本就不产生需要归属的 CLI 回复。 */
+    turnId?: string;
   },
 ): void {
+  const turnId = turn.turnId ?? turn.messageId;
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
@@ -19481,7 +19590,7 @@ function deliverPassthroughToExistingSession(
       : 'thread';
     // Passthrough is a raw CLI command (no @-mentions) — window is the sender only.
     const passthroughWindow = buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined);
-    beginReplyTargetTurn(ds, turn.replyRootId, turn.messageId, new Date().toISOString(), {
+    beginReplyTargetTurn(ds, turn.replyRootId, turnId, new Date().toISOString(), {
       quoteOnly: substituteReplyMode === 'quote',
       substitute: turn.substitute,
       senderOpenId: turn.senderOpenId,
@@ -19510,13 +19619,13 @@ function deliverPassthroughToExistingSession(
       // Same reason as the worker-pool raw_input send: a passthrough is a real
       // mojo turn, so it needs the live credential snapshot too.
       ...(mojoLivePatchForSession(ds) ?? {}),
-      turnId: turn.messageId,
+      turnId,
     });
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       return;
     }
-    beginNewTurn(ds, commandContent, turn.messageId);
+    beginNewTurn(ds, commandContent, turnId);
     turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
@@ -20116,20 +20225,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     followupMentions,
     { botOpenId: selfBotForHeader.botOpenId, larkAppId },
   );
-  const lifecycleAlias = /^\s*\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(strippedTopicHeader);
-  const lifecycleVariant = /^\s*\/(t|topic)\s+(here|worktree)(?:\s+([\s\S]*))?$/i.exec(strippedTopicHeader);
-  const forceTopicMode: 'default' | 'here' | 'worktree' = lifecycleAlias
-    ? (lifecycleAlias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here')
-    : lifecycleVariant
-      ? (lifecycleVariant[2]!.toLowerCase() === 'worktree' ? 'worktree' : 'here')
-      : 'default';
-  const normalizedTopicHeader = lifecycleAlias
-    ? `/t ${lifecycleAlias[2] ?? ''}`.trimEnd()
-    : lifecycleVariant
-      ? `/${lifecycleVariant[1]} ${lifecycleVariant[3] ?? ''}`.trimEnd()
-      : strippedTopicHeader;
-  const headerParse = parseTopicHeader(normalizedTopicHeader);
+  // `/th` `/tw` `/t here|worktree` 生命周期变体由解析器给出（`header.lifecycle`），与 `/repo` 相斥
+  // 的组合由 resolveTopicSpec 拒绝——入口这里不再对原文做任何正则预判。
+  const headerParse = parseTopicHeader(strippedTopicHeader);
   const forceTopic = isTopicHeader(headerParse) ? headerParse : null;
+  const forceTopicMode: 'default' | 'here' | 'worktree' = forceTopic?.lifecycle ?? 'default';
   let topicSpec: TopicSpec | undefined;
   if (headerParse !== null) {
     // 授权闸在校验之前：没资格开话题的人，连用法提示都不该拿到。
@@ -20149,7 +20249,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     return;
   }
   if (forceTopic) {
-    const resolved = resolveTopicSpec(forceTopic, {
+    const resolved = await resolveTopicSpec(forceTopic, {
       botCfg: selfBotForHeader.config,
       scanDirs: getProjectScanDirsForBot(larkAppId),
     });
@@ -20273,11 +20373,30 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // ordinary message handling — the peer bot can still talk, it just can't drive
   // /clear /model /close … into this bot. Human senders are never gated here.
   const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
-  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
-    ? null
-    : parseSlashCommandInvocation(cmdContent);
-  if (invocation) {
-    const { cmd, content: commandContent } = invocation;
+  // 分类交给纯函数路由器（core/command-router.ts，设计 R1）：bot 门、parse、前置特判、
+  // 透传闸、DAEMON_COMMANDS 与会话政策全在 schema 驱动的一处判定里；下面只按决策执行。
+  // 新话题入口不查 activeSessions，相位恒为 none；透传集按 live bot 配置求值（R2）。
+  const slashDecision = classifySlash({
+    text: cmdContent,
+    context: 'new-topic',
+    phase: 'none',
+    passthrough: resolvePassthroughCommands(larkAppId),
+    coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
+    senderIsBot: senderIsBotForSlashGate,
+    acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+  });
+  // grant 限制闸对**认不出**的 `/xxx` 同样要查（改造前 parseSlashCommandInvocation 成功即查，
+  // 与命令是否注册无关）：受限成员的 CLI 自定义斜杠命令不能绕过这道闸进 CLI。
+  if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, slashDecision.cmd);
+    if (restrictedText) {
+      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId })
+        .sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
+  }
+  if (isCommandDecision(slashDecision)) {
+    const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
       scope,
       chatId,
@@ -20294,7 +20413,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // metadata already visible in this group. Authorize it at canTalk level so
     // ordinary permitted members can use the MVP without a per-bot downgrade
     // list, while keeping every other daemon command on canOperate by default.
-    if (cmd === '/sessions') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       // `/sessions` is group-level, sessionless UI. In a regular group whose
       // conversation mode is `new-topic`, routing has already rewritten this
       // top-level command to a fresh thread. Put this one reply back at the
@@ -20329,7 +20448,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       );
       return;
     }
-    if (cmd === '/vc-auth') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
       if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
@@ -20351,24 +20470,26 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // /card needs no fresh session: off/on only toggle per-chat config, and a
     // summon has nothing to show in a brand-new topic. Route here so the generic
     // daemon-command block below does not pre-create a worker=null session.
-    if (cmd === '/card') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'card') {
       await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     // /cot likewise only toggles per-chat config — never needs a session.
-    if (cmd === '/cot') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'cot') {
       await handleCotCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     // /term needs a live session's terminal; in a brand-new topic there's none.
     // Route here (own owner-gate inside) so the generic block below doesn't
     // pre-create a worker=null phantom session just to reply "no session".
-    if (cmd === '/term') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'term') {
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
-    if (forceTopicMode !== 'worktree' && resolvePassthroughCommands(larkAppId).has(cmd)) {
-      if (isInitialSessionPassthrough(larkAppId, cmd)) {
+    // `/tw /<passthrough>`：主干的 worktree 生命周期变体要先建 worktree 再起 CLI，所以不走
+    // 冷启动透传（那条路会直接在基目录 fork）；落到下面的常规建会话路径。
+    if (forceTopicMode !== 'worktree' && slashDecision.kind === 'passthrough') {
+      if (slashDecision.delivery === 'cold_start') {
         await startInitialPassthroughSession({
           promptResources: resources,
           larkAppId,
@@ -20408,7 +20529,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await invocationDeps.sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
-    if (DAEMON_COMMANDS.has(cmd)) {
+    if (slashDecision.kind === 'daemon') {
       // Daemon commands (incl. /oncall) ALWAYS require canOperate, in every chat.
       // No-op for allowedUsers (they pass canOperate anyway); the point is to deny
       // chat-granted users (who only pass canTalk) management commands like
@@ -20424,7 +20545,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // record for it would surface a phantom session in the dashboard. Run it
       // without a session; pass chatId on the message so the handler can reach
       // the chat roster (it normally reads it from the active session's ds).
-      if (isSessionlessCommandInvocation(cmd, commandContent)) {
+      if (slashDecision.sessionPolicy === 'sessionless') {
         // Fast-ACK: run detached so the WS event ack isn't blocked on /group's
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
@@ -20444,7 +20565,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // and /term special cases, but UNLIKE those (which carry their own
       // permission gates inside their handlers) this branch MUST stay after
       // the canOperate gate above — their handlers do not repeat that gate.
-      if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
+      if (slashDecision.sessionPolicy === 'existing_only') {
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return;
       }
@@ -20536,7 +20657,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 于是照常建会话，把 CLI 空跑起来等下一条，与 `/repo` 冷启动的 emptyStart 同语义。
   const topicHeaderIdleStart = isBareForceTopic && !!topicSpec && (
     !!topicSpec.title || !!topicSpec.workingDir || !!topicSpec.repoStartInDefaultDir
-    || !!topicSpec.model || !!topicSpec.reasoningEffort
+    || !!topicSpec.worktree || !!topicSpec.model || !!topicSpec.reasoningEffort
   );
   // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
   // (a quota denial must have zero external side effects), so by the time the
@@ -20659,14 +20780,20 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const headerDefaultStartDir = headerStartInDefaultDir
     ? getSessionWorkingDir({ workingDir: configPinnedWorkingDir, larkAppId } as DaemonSession)
     : undefined;
-  const pinnedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
-  const pinnedFromBotDefault = (lifecycleWorkingDir || topicSpec?.workingDir || headerStartInDefaultDir)
+  // 头部 `/repo wt <目标> [分支]`：基目录先钉成用户点名的仓库，会话以 pendingRepo 建立，
+  // 话题建好后走与 auto-worktree / `/tw` 同一条 pre-fork 路径（force + branch）建 worktree，
+  // 再由 commitRepoSelection 把 workingDir 改钉到新 worktree 并 fork（设计 R9 / §8）。
+  // 它同样是用户显式选仓，所以 pinnedFromBotDefault 也翻成 false。
+  // `/th` `/tw` 生命周期变体与头部 `/repo …` 相斥的组合已在 resolveTopicSpec 被拒，这里两者互斥成立。
+  const headerWorktree = topicSpec?.worktree;
+  const pinnedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
+  const pinnedFromBotDefault = (lifecycleWorkingDir || headerWorktree || topicSpec?.workingDir || headerStartInDefaultDir)
     ? false
     : configPinnedFromBotDefault;
   // 写进会话记录（会被兄弟 bot 的 inherit 层继承）的只有「真的钉了目录」那两种来源。
   // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
   // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
-  const persistedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const persistedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -20721,9 +20848,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
+  // 头部 `/repo wt` 与 auto-worktree / `/tw` 共用同一条「pendingRepo → 建 worktree → commit → fork」
+  // 路径：force 让失败 fail closed（不退回基目录），branch 让 git 腿按用户点名的分支建。
   const autoWt = forceTopicMode === 'worktree'
     ? !!pinnedWorkingDir
-    : willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+    : !!headerWorktree || willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
 
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
@@ -20908,6 +21037,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
       ...(forceTopicMode === 'worktree' ? { force: true } : {}),
       ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+      // 头部 `/repo wt` 与 `/tw` 同形落盘：daemon 若在创建窗口内重启，restore 按 force+branch
+      // 重建；分支目录已存在时 fail closed 停在 pendingRepo，用 `/repo <路径>` 选即可。
+      ...(headerWorktree ? { force: true, ...(headerWorktree.branch ? { branch: headerWorktree.branch } : {}) } : {}),
       // Persisted turn identity feeds the eventual fork's turnId; it must be the
       // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
       // session-group first turns that go through the repo picker / worktree.
@@ -20928,10 +21060,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
+    // 头部只交代规格、没写任务（`/t /repo wt X` 这类）：commitRepoSelection 判"有没有开场输入"时
+    // 把 `pendingCodexAppText !== undefined` 也算在内，而这里它是空串——不清掉就会烧一个空的
+    // `<user_message>` 开场且不打 initialUserTurnPending。清成 undefined 让它走 emptyStart：
+    // 空 prompt fork + 下一条真实消息才是开场，与 pinned 分支的 forkReservedIdleSession 同义。
+    if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) ds.pendingCodexAppText = undefined;
     startAutoWorktreePending(ds, {
       anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
-      force: forceTopicMode === 'worktree',
+      force: forceTopicMode === 'worktree' || !!headerWorktree,
       ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+      ...(headerWorktree?.branch ? { branch: headerWorktree.branch } : {}),
     });
     return;
   }
@@ -21704,7 +21842,7 @@ async function handleThreadReplyAdmitted(
     resources.push(...extraResources);
   }
 
-  if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);
 
   // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
   // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
@@ -21782,7 +21920,7 @@ async function handleThreadReplyAdmitted(
     + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  if (!prepared) {
+  if (!prepared && !ctx.cascadeBodyReentry) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
     emitHookEvent('thread.reply', {
       larkAppId,
@@ -21998,11 +22136,107 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
-  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
-    ? null
-    : parseSlashCommandInvocation(cmdContent);
-  if (invocation) {
-    const { cmd, content: commandContent } = invocation;
+  const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
+  // Existing sessions freeze their CLI independently from the bot's current
+  // config. Route passthrough capability from that frozen runtime so changing
+  // `/botconfig cli` cannot make an old Codex App session receive raw_input
+  // (or make an old interactive TUI lose its native slash commands).
+  const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
+    ?? existingDs?.session.cliId
+    ?? getBot(larkAppId).config.cliId;
+  // 分类交给纯函数路由器（core/command-router.ts）：相位按 existingDs 推导，透传集按
+  // 冻结的会话 CLI 求值（R2）。thread 入口今天与新话题入口的差异（/card /cot 无前置特判、
+  // /term 在透传闸之后）由 schema 的 special.thread 如实保留。
+  const slashDecision = classifySlash({
+    text: cmdContent,
+    context: 'thread',
+    phase: deriveSessionPhase(existingDs),
+    passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
+    coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
+    senderIsBot: isBotSenderType || isForeignBot,
+    acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    // runtime 级联（§6）只在 PTY 家族后端、非 adopt 会话上跑：riff / mojo 一条透传是两次
+    // write、turn 边界与命令不是 1:1；adopt 会话人机输入交错。带附件的消息整条按今天转发。
+    cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
+      && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
+    hasAttachments: resources.length > 0,
+  });
+  // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
+  // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
+  if (existingDs?.cascadeInFlight && !ctx.cascadeBodyReentry) {
+    if (slashDecision.kind === 'cascade' || slashDecision.kind === 'cascade_unsupported') {
+      await sessionReply(anchor, tr('daemon.cascade_busy', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (slashDecision.kind === 'forward' || slashDecision.kind === 'passthrough') {
+      (existingDs.cascadeDeferred ??= []).push({ data, ctx: { ...ctx, ingressAdmission: undefined } });
+      markIngressAdmitted(ctx);
+      logger.info(`[${anchor.substring(0, 12)}] deferred ${parsed.messageId.substring(0, 12)} behind an in-flight cascade`);
+      return;
+    }
+  }
+  if (slashDecision.kind === 'cascade' || slashDecision.kind === 'cascade_unsupported') {
+    const cascadeDs = existingDs!; // 路由器只在活 worker 的相位上给出级联决策
+    const cascadeDeps = commandDepsForInvocation({
+      scope,
+      chatId: ctxChatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
+    const cascadeChatId = cascadeDs.chatId ?? threadChatId;
+    // 与单条透传同一组闸，逐条命令过一遍：grant 限制、排队激活提交闸、/fast 后端门。
+    for (const item of slashDecision.items) {
+      if (item.kind !== 'passthrough') continue;
+      const restrictedText = grantRestrictedSlashCommandText(larkAppId, cascadeChatId, threadSenderOpenId, item.cmd);
+      if (restrictedText) {
+        await cascadeDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
+        return;
+      }
+    }
+    if (slashDecision.kind === 'cascade_unsupported') {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.cascade_unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (cascadeDs.worker && !cascadeDs.worker.killed && hasQueuedActivationAdmissionGate(cascadeDs)) {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.cmd_activation_pending', { cmd: slashDecision.items[0]!.kind === 'passthrough' ? slashDecision.items[0]!.cmd : '' }, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (slashDecision.items.some(it => it.kind === 'passthrough' && it.cmd === '/fast') && fastToggleUnsupportedBackend(cascadeDs)) {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    // 消息已被 detached 的定序器接管：之后的失败由它自己在话题里提示，不再诱导重发。
+    markIngressAdmitted(ctx);
+    cascadeDs.cascadeInFlight = true;
+    void runPassthroughCascade({
+      ds: cascadeDs,
+      items: slashDecision.items,
+      anchor,
+      larkAppId,
+      data,
+      ctx,
+      parsed,
+      replyRootId,
+      senderOpenId: threadSenderOpenId,
+      senderIsBot: isForeignBot,
+      substitute: !!substituteTrigger,
+    }).catch(err => {
+      logger.error(`[${anchor.substring(0, 12)}] cascade failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return;
+  }
+  // grant 限制闸对认不出的 `/xxx` 同样要查（与新话题入口、改造前一致）。
+  if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? threadChatId, threadSenderOpenId, slashDecision.cmd);
+    if (restrictedText) {
+      await commandDepsForInvocation({ scope, chatId: ctxChatId, anchor, messageId: parsed.messageId, replyRootId })
+        .sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
+  }
+  if (isCommandDecision(slashDecision)) {
+    const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
       scope,
       chatId: ctxChatId,
@@ -22010,14 +22244,13 @@ async function handleThreadReplyAdmitted(
       messageId: parsed.messageId,
       replyRootId,
     });
-    const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
-    if (cmd === '/sessions') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       const botSender = isBotSenderType || isForeignBot;
       if (!canTalkForGroupSessions(
         larkAppId,
@@ -22040,7 +22273,7 @@ async function handleThreadReplyAdmitted(
       );
       return;
     }
-    if (cmd === '/vc-auth') {
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
@@ -22058,15 +22291,25 @@ async function handleThreadReplyAdmitted(
       });
       return;
     }
-    // Existing sessions freeze their CLI independently from the bot's current
-    // config. Route passthrough capability from that frozen runtime so changing
-    // `/botconfig cli` cannot make an old Codex App session receive raw_input
-    // (or make an old interactive TUI lose its native slash commands).
-    const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
-      ?? existingDs?.session.cliId
-      ?? getBot(larkAppId).config.cliId;
-    if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
-      if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
+    // /card /cot 只改每群配置或召唤已有会话的卡片，从不需要新会话：与新话题入口同一张
+    // schema 表（special.thread），不再落进下面的 DAEMON_COMMANDS 块预建 worker:null 幽灵会话。
+    // 有会话时两个 handler 内部按 anchor 自己取 ds，效果与原先经 handleCommand 的 switch 一致。
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'card') {
+      await handleCardCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'cot') {
+      await handleCotCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
+    // /term only hands out a writable link for an ALREADY-live session — it must never
+    // pre-create one; its own canOperate gate (inside the handler) is the sole authority.
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'term') {
+      await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
+    if (slashDecision.kind === 'passthrough') {
+      if (slashDecision.delivery === 'cold_start' && threadChatId) {
         await startInitialPassthroughSession({
           promptResources: resources,
           larkAppId,
@@ -22146,17 +22389,7 @@ async function handleThreadReplyAdmitted(
       else void invocationDeps.sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
-    if (DAEMON_COMMANDS.has(cmd)) {
-      // /term only hands out a writable link for an ALREADY-live session — it must
-      // never pre-create one. Special-case it before the canOperate gate + the
-      // pre-create block below (mirrors the new-topic route + /card). Its own
-      // canOperate gate (inside the handler) is the sole authority; without this,
-      // /term in a thread with no existingDs would spawn a worker:null phantom
-      // session and pollute the dashboard before replying not_ready/owner_only.
-      if (cmd === '/term') {
-        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
-        return;
-      }
+    if (slashDecision.kind === 'daemon') {
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
@@ -22174,8 +22407,7 @@ async function handleThreadReplyAdmitted(
       // commands (/rename) must NOT get one — a pre-created worker:null session
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
-      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)
-        && !EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
+      if (threadChatId && slashDecision.sessionPolicy === 'precreate') {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
         const now = Date.now();
         if (ctxChatType === 'p2p') {
@@ -22229,7 +22461,7 @@ async function handleThreadReplyAdmitted(
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
       const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
-      if (isSessionlessCommandInvocation(cmd, commandContent)) {
+      if (slashDecision.sessionPolicy === 'sessionless') {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId, invocationDeps);
         return;
@@ -22679,7 +22911,7 @@ async function handleThreadReplyAdmitted(
       markIngressAdmitted(ctx);
       const pendingReplyKey = ds.worktreeCreating
         ? 'daemon.worktree_building_wait'
-        : 'daemon.choose_repo_first';
+        : ds.repoCardMessageId ? 'daemon.choose_repo_first' : 'daemon.choose_repo_no_card';
       await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
@@ -22743,9 +22975,10 @@ async function handleThreadReplyAdmitted(
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
+    // 头部 `/repo wt` 失败后会停在 pendingRepo 但从没发过选仓卡：别指着一张不存在的卡。
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
+      : ds.repoCardMessageId ? 'daemon.choose_repo_first' : 'daemon.choose_repo_no_card';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }

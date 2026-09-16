@@ -301,7 +301,9 @@ describe('指令头：拒绝路径零副作用', () => {
     { name: '未知头部指令', text: '日常运维 /t /repo botmux /clear' },
     { name: '指令缺参数', text: '日常运维 /t /model' },
     { name: '同一指令重复', text: '/t /repo botmux /repo homelab 干活' },
-    { name: 'worktree 子命令（头部吃不下它的多个参数）', text: '/t /repo wt botmux feat/x' },
+    { name: '/repo wt 缺目标', text: '/t /repo wt' },
+    { name: '/repo wt 分支名不合法', text: '/t /repo wt botmux a.lock 干活' },
+    { name: '/repo wt 目标不是 git 仓库', text: '/t /repo wt scan-root feat/x 干活' },
     { name: '参数是空的双引号', text: '/t /repo "" 干活' },
   ];
 
@@ -900,5 +902,100 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
     expect(ds.workingDir).toBe(botmuxRepo);        // /repo homelab 没有落地
     expect(ds.session.title).not.toBe('协作标题');  // 标题没有落地
     expect(ds.spawnModelOverride).toBeUndefined();
+  });
+});
+
+/**
+ * 头部 `/repo wt <目标> [分支]`（设计 docs/design/2026-09-11-command-router.md R9 / §8）：
+ * 会话以 pendingRepo 建立、按 auto_worktree + force(+branch) 落盘（与 `/tw` 同形，重启可恢复），
+ * 走与 auto-worktree 同一条 pre-fork 路径（runAutoWorktreeCommit），只是 force 让失败 fail closed、
+ * branch 让 git 腿按用户点名的分支建。这里断言的是交给那条路径的东西，git 腿本身由
+ * test/default-worktree.test.ts 用真仓库钉。
+ */
+describe('指令头：/repo wt 建 worktree 再开会话', () => {
+  it('显式分支：pendingRepo + auto_worktree/force 落盘，仓库/分支交给 pre-fork worktree 路径', async () => {
+    await handleNewTopic(
+      groupEvent('日常运维 /t /repo wt botmux ci/temp_split /model sonnet 简单确认下 bun 版本', 'om_wt'),
+      groupCtx('om_wt'),
+    );
+
+    // 不同步 fork：worktree 建好之后才由 commitRepoSelection fork。
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledTimes(1);
+    const args = mocks.runAutoWorktreeCommit.mock.calls[0][0];
+    expect(args).toMatchObject({
+      baseDir: botmuxRepo,
+      force: true,
+      branch: 'ci/temp_split',
+      title: '日常运维',
+    });
+    expect(args.worktreePath).toBeUndefined();
+    expect(args.reuseExisting).toBeUndefined();
+    expect(String(args.prompt)).toContain('简单确认下 bun 版本');
+    const ds = args.ds;
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.workingDir).toBe(botmuxRepo);
+    expect(ds.session.pendingRepoSetup).toMatchObject({ mode: 'auto_worktree', baseDir: botmuxRepo, force: true, branch: 'ci/temp_split' });
+    expect(ds.spawnModelOverride).toBe('sonnet');
+    expect(ds.session.title).toBe('日常运维');
+    expect(ds.scope).toBe('thread');
+    expect(sentCardCount()).toBe(0);
+  });
+
+  it('无分支：只交仓库，分支由标题/正文自动命名', async () => {
+    await handleNewTopic(groupEvent('/t /repo wt botmux 简单确认', 'om_wt_auto'), groupCtx('om_wt_auto'));
+
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledTimes(1);
+    const args = mocks.runAutoWorktreeCommit.mock.calls[0][0];
+    expect(args).toMatchObject({ baseDir: botmuxRepo, force: true });
+    expect(args.branch).toBeUndefined();
+    expect(args.ds.session.pendingRepoSetup).toMatchObject({ mode: 'auto_worktree', force: true });
+    expect(args.ds.session.pendingRepoSetup?.branch).toBeUndefined();
+  });
+
+  it('没写首轮任务也照常建会话并建 worktree（CLI 建好后空跑等下一条）', async () => {
+    await handleNewTopic(groupEvent('/t /repo wt botmux ci/x', 'om_wt_idle'), groupCtx('om_wt_idle'));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledTimes(1);
+    expect(mocks.runAutoWorktreeCommit.mock.calls[0][0]).toMatchObject({ baseDir: botmuxRepo, force: true, branch: 'ci/x' });
+  });
+
+  it('bot 开了 auto-worktree 时不会重复建：只走一次、且带显式分支落盘', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo, defaultWorkingDirAutoWorktree: true });
+
+    await handleNewTopic(groupEvent('/t /repo wt botmux ci/x 干活', 'om_wt_autowt'), groupCtx('om_wt_autowt'));
+
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledTimes(1);
+    const args = mocks.runAutoWorktreeCommit.mock.calls[0][0];
+    expect(args).toMatchObject({ baseDir: botmuxRepo, force: true, branch: 'ci/x' });
+    expect(args.ds.session.pendingRepoSetup).toMatchObject({ mode: 'auto_worktree', force: true, branch: 'ci/x' });
+  });
+
+  it('目标目录已存在 → 开话题前拒绝，零副作用', async () => {
+    mkdirSync(join(scanRoot, 'botmux-feat-taken'), { recursive: true });
+
+    await handleNewTopic(groupEvent('/t /repo wt botmux feat/taken 干活', 'om_wt_exists'), groupCtx('om_wt_exists'));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(mocks.createdSessions).toHaveLength(0);
+    expect(activeSessions.size).toBe(0);
+    const texts = sentContents();
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('已存在');
+  });
+
+  it('/tw 与 /repo 同写 → 开话题前拒绝，零副作用（不再静默让生命周期目录优先）', async () => {
+    await handleNewTopic(groupEvent('/tw /repo wt botmux ci/x 干活', 'om_tw_repo'), groupCtx('om_tw_repo'));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(mocks.createdSessions).toHaveLength(0);
+    expect(activeSessions.size).toBe(0);
+    const texts = sentContents();
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('/tw');
+    expect(texts[0]).toContain('/repo');
   });
 });

@@ -547,7 +547,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -1647,11 +1647,16 @@ describe('parseTopicHeader（取代 parseForceTopicInvocation 的路由元命令
 
   });
 
-  it('retains cwd and worktree lifecycle aliases', () => {
-    expect(parseForceTopicInvocation('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
-    expect(parseForceTopicInvocation('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+  it('retains cwd and worktree lifecycle aliases (now parsed by parseTopicHeader as `lifecycle`)', () => {
+    const lifecycle = (content: string) => {
+      const parsed = parseTopicHeader(content);
+      return isTopicHeader(parsed) ? { prompt: parsed.prompt, mode: parsed.lifecycle ?? 'default' } : null;
+    };
+    expect(lifecycle('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(lifecycle('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+    expect(lifecycle('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(lifecycle('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+    expect(lifecycle('/t 检查实现')).toEqual({ prompt: '检查实现', mode: 'default' });
   });
 
   it('does not match similar prefixes', () => {

@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
 
@@ -545,4 +546,34 @@ export async function isLinkedWorktree(dir: string): Promise<boolean> {
 export async function removeRepoWorktree(repo: string, worktreePath: string): Promise<void> {
   await git(['worktree', 'remove', '--force', worktreePath], repo, 30_000);
   logger.info(`[git-worktree] removed worktree ${worktreePath}`);
+}
+
+/**
+ * `git check-ref-format --branch` — the ONLY branch-name validity check in the
+ * repo. `createRepoWorktree` itself never validates: an illegal name only fails
+ * later inside `git worktree add -b` (60s window, after the topic exists). The
+ * topic header's `/repo wt <目标> [分支]` runs this BEFORE opening the topic so a
+ * typo fails closed with zero side effects. Needs no repository (any cwd works);
+ * a leading `-` is rejected up front because git would parse it as an option.
+ */
+export async function isValidBranchName(name: string): Promise<boolean> {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.startsWith('-')) return false;
+  // cwd 用 tmpdir：check-ref-format 不需要仓库，而 daemon 的 cwd 可能已被删除（ENOENT）。
+  return (await tryGit(['check-ref-format', '--branch', trimmed], tmpdir())) !== null;
+}
+
+/**
+ * The directory {@link createRepoWorktree} WILL use for an explicit `branch` —
+ * `<main checkout's parent>/<repo>-<dirSuffixForBranch(branch)>` (no `wt-`
+ * prefix; that is reserved for auto-named worktrees). Exposed so a caller can
+ * fail closed on "target already exists" before doing anything else; keep it in
+ * lockstep with the explicit-branch arm of `createRepoWorktree`. Throws when
+ * `repoPath` is not inside a git work tree.
+ */
+export async function resolveWorktreePathForBranch(repoPath: string, branch: string): Promise<string> {
+  const startDir = resolve(repoPath);
+  await git(['rev-parse', '--git-dir'], startDir);
+  const repo = await resolveMainWorktree(startDir);
+  return join(dirname(repo), `${basename(repo)}-${dirSuffixForBranch(branch)}`);
 }

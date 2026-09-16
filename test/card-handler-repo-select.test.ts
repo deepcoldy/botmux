@@ -2010,8 +2010,10 @@ describe('auto-worktree detached commit admission', () => {
 
     expect(ds.pendingRepo).toBe(true);
     expect(ds.worker).toBeNull();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('cannot create worktree'));
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('/repo'));
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/tw'));
+    // 不再建议「重发 /tw」：thread 入口把 `/tw` 当指令头，在已有会话里只会回「只在新话题第一条生效」。
+    for (const call of notify.mock.calls) expect(String(call[0])).not.toContain('/tw');
   });
 
   it('holds the delayed commit/fork behind a same-bot mutation after the caller lease ended', async () => {

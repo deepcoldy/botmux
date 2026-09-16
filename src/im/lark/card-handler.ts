@@ -986,7 +986,13 @@ export async function runAutoWorktreeCommit(deps: {
     const error = e instanceof Error ? e.message : String(e);
     logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${error}`);
     if (force && ds.pendingRepo) {
-      await notify(`⚠️ worktree 创建失败，任务仍在等待中。可发送 \`/tw\` 重试，或发送 \`/repo\` 选择/直接启动仓库。\n${error}`);
+      // 显式 worktree（`/tw` 或头部 `/repo wt`）失败 fail closed：会话停在 pendingRepo，而这条
+      // 路径从没发过选仓卡，所以把下一步说清楚——在话题内发 `/repo …` 选仓即可，消息已暂存。
+      // （不提示「重发 /tw」：thread 入口不识别生命周期别名，那样发会被当普通输入暂存。）
+      try {
+        await notify(t('cmd.repo.worktree_failed', { error }, localeForBot(larkAppId)));
+        await notify(t('daemon.choose_repo_no_card', undefined, localeForBot(larkAppId)));
+      } catch { /* best-effort */ }
     }
   } finally {
     ds.worktreeCreating = false;

@@ -406,7 +406,9 @@ function failRepliesMatching(predicate: (content: string) => boolean, message: s
 describe('durable admission then failing status reply → no resend advice (PR #846 review)', () => {
   const resendNotice = () => tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
   const admittedNotice = () => tr('daemon.ordinary_ingress_admitted_reply_failed', undefined, localeForBot(APP));
-  const chooseRepoNotice = () => tr('daemon.choose_repo_first', undefined, localeForBot(APP));
+  // 这些用例里的 pendingRepo 会话从没发过选仓卡（repoCardMessageId 缺席），daemon 的待选仓
+  // 回复走不指卡片的那条文案；有卡时才是 daemon.choose_repo_first。
+  const chooseRepoNotice = () => tr('daemon.choose_repo_no_card', undefined, localeForBot(APP));
 
   beforeEach(() => {
     vi.clearAllMocks();

@@ -435,7 +435,8 @@ describe('attention signals', () => {
       'handleV3SavedWorkflowCommandIfAny',
       'parseWorkflowGrillTrigger',
       'isLegacyTemplateCommand',
-      'parseSlashCommandInvocation',
+      // 斜杠命令的分类点（core/command-router.ts 的 classifySlash 取代了原地的 parseSlashCommandInvocation）
+      'classifySlash(',
       'findPendingAskByAnchor',
     ]) {
       const markerIdx = region.indexOf(marker);

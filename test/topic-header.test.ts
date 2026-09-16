@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { parseTopicHeader, type TopicHeaderParse } from '../src/core/topic-header.js';
+import { parseTopicHeader, isTopicHeader, topicHeaderDeclaresSpec, type TopicHeaderParse } from '../src/core/topic-header.js';
 
 /** 头部对象的可断言快照（省掉 ok/sentinel 噪音，直接比语义三件套）。 */
 function shape(parsed: TopicHeaderParse) {
@@ -20,7 +20,12 @@ function shape(parsed: TopicHeaderParse) {
     const { sentinel: _sentinel, ...reason } = parsed;
     return reason;
   }
-  return { title: parsed.title, directives: parsed.directives, prompt: parsed.prompt };
+  return {
+    title: parsed.title,
+    directives: parsed.directives,
+    ...(parsed.worktree ? { worktree: parsed.worktree } : {}),
+    prompt: parsed.prompt,
+  };
 }
 
 describe('parseTopicHeader —— §3 边界情况表', () => {
@@ -260,13 +265,11 @@ describe('parseTopicHeader —— 指令参数细节', () => {
     }
   });
 
-  it('/repo wt 只吃得下 wt 这一个 token（拒绝发生在语义层）', () => {
-    // 会话中途的 `/repo wt <编号|项目名> [分支]` 吃整行；头部里只吃一个 token，
-    // 所以 `wt` 会落到仓库名位置。语义层显式拒绝，见 topic-spec 的用例。
-    expect(shape(parseTopicHeader('/t /repo wt botmux feat/x'))).toEqual({
+  it('引号包裹的 "wt" 是字面量仓库名，不是子命令', () => {
+    expect(shape(parseTopicHeader('/t /repo "wt" 干活'))).toEqual({
       title: undefined,
       directives: { repo: 'wt' },
-      prompt: 'botmux feat/x',
+      prompt: '干活',
     });
   });
 
@@ -292,5 +295,163 @@ describe('parseTopicHeader —— 指令参数细节', () => {
       directives: { repo: 'botmux' },
       prompt: '帮我看看 /adopt 这个命令怎么用',
     });
+  });
+});
+
+/**
+ * `/repo wt <目标> [分支]`：设计 docs/design/2026-09-11-command-router.md §13 的 PR-1 行。
+ * 可选分支两条规则（R5）：只在下一个 token 匹配分支粗模式时才吃，且不跨行。
+ */
+describe('parseTopicHeader —— /repo wt <目标> [分支]', () => {
+  const cases: Array<{ row: string; input: string; expected: ReturnType<typeof shape> }> = [
+    {
+      row: '单行 + 中文正文：分支模式命中 → 分支；正文从中文起',
+      input: '/t /repo wt botmux ci/temp_split 简单确认下当前依赖的 bun 的版本号',
+      expected: {
+        title: undefined,
+        directives: {},
+        worktree: { target: 'botmux', branch: 'ci/temp_split' },
+        prompt: '简单确认下当前依赖的 bun 的版本号',
+      },
+    },
+    {
+      row: '无分支：中文正文不匹配分支模式 → 无分支',
+      input: '/t /repo wt botmux 简单确认',
+      expected: { title: undefined, directives: {}, worktree: { target: 'botmux' }, prompt: '简单确认' },
+    },
+    {
+      row: '单行 latin 正文：第一个词被当成分支（行为确定，用法串提示换行）',
+      input: '/t /repo wt botmux fix login bug',
+      expected: {
+        title: undefined,
+        directives: {},
+        worktree: { target: 'botmux', branch: 'fix' },
+        prompt: 'login bug',
+      },
+    },
+    {
+      row: '可选分支不跨行：换行后的 latin 正文是正文',
+      input: '/t\n/repo wt botmux\nfix login bug',
+      expected: { title: undefined, directives: {}, worktree: { target: 'botmux' }, prompt: 'fix login bug' },
+    },
+    {
+      row: '不匹配粗模式的 token（以 - 开头、含 ..）是正文',
+      input: '/t /repo wt botmux -bad..name',
+      expected: { title: undefined, directives: {}, worktree: { target: 'botmux' }, prompt: '-bad..name' },
+    },
+    {
+      row: '与其它指令并存，顺序无关',
+      input: '日常运维 /t /model sonnet /repo wt botmux ci/temp_split /effort high 干活',
+      expected: {
+        title: '日常运维',
+        directives: { model: 'sonnet', effort: 'high' },
+        worktree: { target: 'botmux', branch: 'ci/temp_split' },
+        prompt: '干活',
+      },
+    },
+    {
+      row: '带空格的目标用双引号；引号后的分支照常吃',
+      input: '/t /repo wt "~/Code/my project" feat/x 干活',
+      expected: {
+        title: undefined,
+        directives: {},
+        worktree: { target: '~/Code/my project', branch: 'feat/x' },
+        prompt: '干活',
+      },
+    },
+    {
+      row: '分支位上出现另一条指令 → 不当分支吃，无分支',
+      input: '/t /repo wt botmux /model sonnet 干活',
+      expected: {
+        title: undefined,
+        directives: { model: 'sonnet' },
+        worktree: { target: 'botmux' },
+        prompt: '干活',
+      },
+    },
+    {
+      row: '缺目标（/t /repo wt 结尾）→ 拒绝',
+      input: '/t /repo wt',
+      expected: { ok: false, kind: 'missing_worktree_target' },
+    },
+    {
+      row: '目标位上出现另一条指令 → 拒绝：缺目标',
+      input: '/t /repo wt /model sonnet',
+      expected: { ok: false, kind: 'missing_worktree_target' },
+    },
+    {
+      row: 'wt 形式与普通 /repo 重复 → 拒绝',
+      input: '/t /repo wt botmux ci/x /repo other',
+      expected: { ok: false, kind: 'duplicate_directive', directive: 'repo' },
+    },
+    {
+      row: '普通 /repo 之后再写 wt 形式 → 拒绝',
+      input: '/t /repo botmux /repo wt other',
+      expected: { ok: false, kind: 'duplicate_directive', directive: 'repo' },
+    },
+    {
+      row: 'wt 形式之后的未知 /xxx 同样 fail closed（与普通 /repo 形式一致）',
+      input: '/t /repo wt botmux /goal 干活',
+      expected: { ok: false, kind: 'unknown_directive', token: '/goal' },
+    },
+    {
+      row: 'wt 大小写不敏感',
+      input: '/t /repo WT botmux ci/x',
+      expected: { title: undefined, directives: {}, worktree: { target: 'botmux', branch: 'ci/x' }, prompt: '' },
+    },
+  ];
+
+  for (const { row, input, expected } of cases) {
+    it(row, () => {
+      expect(shape(parseTopicHeader(input))).toEqual(expected);
+    });
+  }
+});
+
+describe('parseTopicHeader —— 生命周期变体（/th /tw /t here|worktree）', () => {
+  it('/th /tw 是分隔符别名，自带 lifecycle', () => {
+    expect(parseTopicHeader('/th 检查实现')).toMatchObject({ ok: true, sentinel: '/th', lifecycle: 'here', prompt: '检查实现' });
+    expect(parseTopicHeader('/tw 检查实现')).toMatchObject({ ok: true, sentinel: '/tw', lifecycle: 'worktree', prompt: '检查实现' });
+    expect(parseTopicHeader('/TW')).toMatchObject({ ok: true, sentinel: '/tw', lifecycle: 'worktree', prompt: '' });
+  });
+
+  it('/t /topic 紧跟的裸 here / worktree 一词被吃成变体，大小写不敏感', () => {
+    expect(parseTopicHeader('/t here 检查实现')).toMatchObject({ sentinel: '/t', lifecycle: 'here', prompt: '检查实现' });
+    expect(parseTopicHeader('/topic worktree 检查实现')).toMatchObject({ sentinel: '/topic', lifecycle: 'worktree', prompt: '检查实现' });
+    expect(parseTopicHeader('/t Worktree')).toMatchObject({ lifecycle: 'worktree', prompt: '' });
+  });
+
+  it('变体词只认紧跟分隔符的那一个；别名之后不再吃', () => {
+    expect(parseTopicHeader('/th here')).toMatchObject({ lifecycle: 'here', prompt: 'here' });
+    expect(parseTopicHeader('/t /model sonnet here')).toMatchObject({ directives: { model: 'sonnet' }, prompt: 'here' });
+    expect(parseTopicHeader('/t /model sonnet here')).not.toHaveProperty('lifecycle');
+  });
+
+  it('引号包裹的 "here" 是字面量正文', () => {
+    const parsed = parseTopicHeader('/t "here" 干活');
+    expect(parsed).toMatchObject({ prompt: '"here" 干活' });
+    expect(parsed).not.toHaveProperty('lifecycle');
+  });
+
+  it('标题、/model、/effort 可与变体同用；/repo 的相斥留给语义层', () => {
+    expect(parseTopicHeader('日常 /tw /model sonnet 干活')).toMatchObject({
+      title: '日常', lifecycle: 'worktree', directives: { model: 'sonnet' }, prompt: '干活',
+    });
+    // 语法层照常解析出 /repo，让 resolveTopicSpec 一次收齐全部错误。
+    expect(parseTopicHeader('/tw /repo botmux 干活')).toMatchObject({ lifecycle: 'worktree', directives: { repo: 'botmux' } });
+  });
+
+  it('写了变体就算「已写头部」：未知 /xxx fail closed', () => {
+    expect(parseTopicHeader('/tw /modle sonnet 干活')).toEqual({ ok: false, sentinel: '/tw', kind: 'unknown_directive', token: '/modle' });
+  });
+
+  it('/two /three 不是分隔符', () => {
+    expect(parseTopicHeader('/two 干活')).toBeNull();
+    expect(parseTopicHeader('/three 干活')).toBeNull();
+  });
+
+  it('在已有会话里，变体算作声明了规格（thread 路径会提示只在新话题第一条生效）', () => {
+    const parsed = parseTopicHeader('/tw 干活');
+    expect(isTopicHeader(parsed) && topicHeaderDeclaresSpec(parsed)).toBe(true);
   });
 });

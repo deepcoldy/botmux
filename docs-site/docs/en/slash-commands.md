@@ -32,7 +32,8 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
-| `[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository, model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
+| `[title] /t [/repo <repo> \| /repo wt <repo> [branch]] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository (or a fresh worktree on it), model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
+| `/th [<first task>]`, `/tw [<first task>]` (same as `/t here …` / `/t worktree …`) | Lifecycle variants: `/th` opens the topic in the **current group session working directory**; `/tw` first creates a deterministically named, multi-bot-shareable worktree from that directory. They combine with a title, `/model` and `/effort`, but **not with `/repo`** (one says "use the current directory", the other names a repo, so the header is rejected) |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
@@ -44,10 +45,11 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 
 See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`.
 
-The three header directives:
+The header directives:
 
 - `/repo <path|project name>` — pin the repository directly, skipping the picker card. Note it takes **exactly one token**: quote a path containing spaces, as in `/repo "~/Code/my project"`.
 - `/repo` (no argument) — start right away in the default working directory, the same as the picker card's start-directly button.
+- `/repo wt <path|project name> [branch]` — create a fresh worktree on that repository (off the remote default branch) and start the session inside it. The branch may be omitted (auto-named from the title / first task); when given, it is **only taken from the next word on the same line as the repo that looks like a branch name** (`ci/temp_split` and the like), so a Chinese first task is never swallowed, but start a latin first task on a new line. An invalid branch name or an existing target directory is rejected before the topic is opened; if git itself fails, the topic exists and the session waits in repo selection — resend `/repo wt …` inside it.
 - `/model <model>` — the model to launch with this time. Only available on CLIs that can actually carry a model in their launch arguments; the rest reject it rather than ignoring it silently.
 - `/effort <level>` — reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`ultra`), validated against the model this launch will actually use.
 
@@ -71,7 +73,7 @@ With no first task (e.g. `/t /repo botmux`), the CLI boots idle and waits for yo
 A few boundaries:
 
 - A header only takes effect on the **first message of a new topic**. To change repository/model/reasoning effort inside a running topic, send `/repo`, `/model` or `/effort` on their own; use `/rename` to change the title.
-- Creating a worktree cannot be expressed in the header (`/repo` takes a single token). Open the topic with `/t` first, then send `/repo wt <N|project name> [branch]` inside it.
+- The header's `/repo wt` does not accept the numeric form (numbers only mean something on the picker card); the in-session `/repo wt <N|project name> [branch]` still does.
 - A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
 ## 💬 Reply Mode (`/reply-mode`)
@@ -133,6 +135,16 @@ The CLI resolves the bot and chat from the current `BOTMUX_SESSION_ID`. Use `--s
 Some CLIs also declare adapter-default passthrough commands: Claude Code and Codex default-allow `/goal`, so a new topic whose first message is `/goal ...` will start/select the repository first and then send `/goal ...` to the CLI literally.
 
 To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
+
+**Cascading several passthrough commands in one message** (inside a running session): put one passthrough command per line, optionally followed by a task body, and botmux sends them in order, waiting for the CLI to become idle between items —
+
+```text
+/model opus
+/clear
+Now go through the review comments on PR #1361
+```
+
+Rules: only a leading run of passthrough lines forms a cascade (a botmux command such as `/cd` or an unknown `/xxx` inside that run makes the whole message ordinary text, as today); the body starts at the first line not beginning with `/`, and any later `/xxx` is part of the body; a single line such as `/model opus then continue` is still sent verbatim as one line. The idle wait is capped at 120 s, after which the remaining items are sent immediately with a notice. Remote sandbox backends (riff / mojo) and adopted external sessions do not support cascades and reply "send them one by one"; messages with attachments are not split either.
 
 ## 🧩 View Available Commands
 

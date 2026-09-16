@@ -47,16 +47,18 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // 所以逐条钉住「值来自 inbound 本身」，而不是只钉「字段存在」。
     const inThreadFromInbound = /inThread: !!parsed\.threadId/g;
     // initial passthrough / new-topic / existing-session / auto-create 四条
-    // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传；
-    // 跨 principal 的 daemon 预分流与 worker 拒绝回流两条 durable envelope
-    // 同样必须保留 inbound 的真实 thread 形态。
-    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(7);
+    // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传（单条 + runtime
+    // 级联 runPassthroughCascade 两处调用方）；跨 principal 的 daemon 预分流与 worker 拒绝
+    // 回流两条 durable envelope 同样必须保留 inbound 的真实 thread 形态。
+    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(8);
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete, inThread: !!parsed\.threadId/);
     // passthrough 走 turn 结构体：调用方读 inbound，helper 原样转交。
     expect(daemonSource).toMatch(/substitute: !!substituteTrigger,\s*inThread: !!parsed\.threadId,/);
+    // runtime 级联：定序器同样从 inbound 读，再经 turn 结构体转交。
+    expect(daemonSource).toMatch(/substitute: args\.substitute,\s*inThread: !!parsed\.threadId,/);
     expect(daemonSource).toMatch(/participantsIncomplete: passthroughWindow\.incomplete,\s*inThread: turn\.inThread,/);
   });
 
