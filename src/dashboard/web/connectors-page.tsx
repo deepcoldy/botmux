@@ -7,6 +7,10 @@ import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
 import { confirm } from './confirm-modal.js';
+import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../../services/connector-lifecycle-group-name.js';
 
 interface Connector {
   id: string;
@@ -162,21 +166,8 @@ export function buildConnectorTopicMessageConfig(
   }
 }
 
-const GROUP_NAME_TEMPLATE_TOKEN = /{{\s*([^{}]+?)\s*}}/g;
-const GROUP_NAME_TEMPLATE_PATH = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
-
-function isValidConnectorGroupNameTemplate(text: string): boolean {
-  const stripped = text.replace(GROUP_NAME_TEMPLATE_TOKEN, (_token, rawName: string) => {
-    const name = rawName.trim();
-    if (name === 'source' || name === 'dedupKey' || name === 'requestId') return '';
-    const path = name.startsWith('payload.') ? name.slice('payload.'.length) : name;
-    if (!GROUP_NAME_TEMPLATE_PATH.test(path)) return '{{invalid}}';
-    const normalized = path.startsWith('$.') ? path.slice(2) : path;
-    return normalized.split('.').some(segment => ['__proto__', 'prototype', 'constructor'].includes(segment))
-      ? '{{invalid}}'
-      : '';
-  });
-  return !stripped.includes('{{') && !stripped.includes('}}');
+export function trimConnectorLifecycleGroupNameInput(text: string): string {
+  return Array.from(text).slice(0, CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH).join('');
 }
 
 export function buildConnectorLifecycleGroupNameConfig(
@@ -188,7 +179,7 @@ export function buildConnectorLifecycleGroupNameConfig(
   const text = rawText.trim();
   if (mode === 'default') return { ok: true, value: { mode } };
   if (!text) return { ok: false, error: 'connectors.errGroupName' };
-  if (mode === 'template' && !isValidConnectorGroupNameTemplate(text)) {
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
     return { ok: false, error: 'connectors.errGroupNameTemplate' };
   }
   return { ok: true, value: { mode, text } };
@@ -1095,9 +1086,8 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                     <input
                       id="cn-group-name"
                       type="text"
-                      maxLength={60}
                       value={form.groupNameText}
-                      onChange={event => patchForm({ groupNameText: event.currentTarget.value })}
+                      onChange={event => patchForm({ groupNameText: trimConnectorLifecycleGroupNameInput(event.currentTarget.value) })}
                       placeholder={tr(form.groupNameMode === 'template'
                         ? 'connectors.groupNameTemplatePh'
                         : 'connectors.groupNameFixedPh')}
@@ -1106,7 +1096,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                       {tr(form.groupNameMode === 'template'
                         ? 'connectors.groupNameTemplateHelp'
                         : 'connectors.groupNameFixedHelp')}
-                      <span>{Array.from(form.groupNameText).length}/60</span>
+                      <span>{Array.from(form.groupNameText).length}/{CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH}</span>
                     </small>
                   </label>
                 ) : null}

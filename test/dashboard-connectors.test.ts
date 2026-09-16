@@ -9,6 +9,7 @@ import {
   buildConnectorTopicMessageConfig,
   normalizeConnectorBotIds,
   replaceConnectorById,
+  trimConnectorLifecycleGroupNameInput,
 } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
@@ -163,9 +164,9 @@ describe('dashboard connector lifecycle group names', () => {
       ok: true,
       value: { mode: 'fixed', text: '固定处理群' },
     });
-    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{alert.name}}')).toEqual({
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{payload.name}} {{$.payload.id}}')).toEqual({
       ok: true,
-      value: { mode: 'template', text: '告警 {{alert.name}}' },
+      value: { mode: 'template', text: '告警 {{payload.name}} {{$.payload.id}}' },
     });
   });
 
@@ -182,5 +183,12 @@ describe('dashboard connector lifecycle group names', () => {
       ok: false,
       error: 'connectors.errGroupNameTemplate',
     });
+  });
+
+  it('trims group name input by Unicode code point, not UTF-16 code unit', () => {
+    const text = trimConnectorLifecycleGroupNameInput('😀'.repeat(61));
+
+    expect(text).toBe('😀'.repeat(60));
+    expect(Array.from(text)).toHaveLength(60);
   });
 });

@@ -805,11 +805,13 @@ describe('webhook new-group lifecycle', () => {
     const { upsertConnector } = await import('../src/services/connector-store.js');
     upsertConnector({
       ...connector,
-      lifecycleGroupName: { mode: 'template', text: '告警 {{alert.name}} #{{dedupKey}} {{source}}' },
+      lifecycleGroupName: { mode: 'template', text: '告警 {{payload.name}} #{{$.payload.id}} {{source}}' },
     });
 
     const result = await postWebhook('conn_new_group', 'nonce_group_name_template', {
-      alert: { id: 'cpu-high', name: 'CPU 过高' },
+      name: 'ROOT_NAME',
+      alert: { id: 'cpu-high' },
+      payload: { id: 'wi_1', name: 'CPU 过高' },
     });
 
     expect(result.status).toBe(200);
@@ -817,7 +819,7 @@ describe('webhook new-group lifecycle', () => {
       expect.objectContaining({ id: 'conn_new_group' }),
       expect.objectContaining({
         dedupKey: 'cpu-high',
-        groupName: '告警 CPU 过高 #cpu-high alerts',
+        groupName: '告警 CPU 过高 #wi_1 alerts',
       }),
     );
   });

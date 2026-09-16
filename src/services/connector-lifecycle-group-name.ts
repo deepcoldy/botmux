@@ -11,6 +11,17 @@ function codepoints(value: string): string[] {
   return Array.from(value);
 }
 
+function truncateUtf16(value: string, maxLength: number, suffix = ''): string {
+  if (value.length <= maxLength) return value;
+  const budget = Math.max(0, maxLength - suffix.length);
+  let truncated = '';
+  for (const character of value) {
+    if (truncated.length + character.length > budget) break;
+    truncated += character;
+  }
+  return `${truncated}${suffix}`;
+}
+
 function truncateGroupName(value: string): string {
   return codepoints(value).slice(0, CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH).join('');
 }
@@ -26,7 +37,7 @@ function scalarText(value: unknown): string | undefined {
 }
 
 function normalizePathToken(token: string): string | null {
-  const path = token.startsWith('payload.') ? token.slice('payload.'.length) : token;
+  const path = token;
   if (!VALID_PATH.test(path)) return null;
   const normalized = path.startsWith('$.') ? path.slice(2) : path;
   if (normalized.split('.').some(segment => UNSAFE_PATH_SEGMENTS.has(segment))) return null;
@@ -36,7 +47,7 @@ function normalizePathToken(token: string): string | null {
 export function defaultConnectorLifecycleGroupName(connector: ConnectorDefinition, dedupKey: string): string {
   const cleanKey = compactGroupName(dedupKey);
   const name = `${connector.name}: ${cleanKey}`;
-  return codepoints(name).length <= 58 ? name : `${codepoints(name).slice(0, 55).join('')}...`;
+  return truncateUtf16(name, 58, '...');
 }
 
 export function isValidConnectorLifecycleGroupNameTemplate(text: string): boolean {
