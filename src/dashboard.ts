@@ -48,6 +48,7 @@ import {
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
+import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
@@ -1680,26 +1681,11 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 async function disableCrossPrincipalInterruptionOnAllDaemons(): Promise<void> {
-  const daemons = registry.list();
-  const results = await Promise.all(daemons.map(async (d) => {
-    try {
-      const res = await fetchDaemonIpc(d.ipcPort, '/api/xpi/disable', { method: 'POST' });
-      const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok && typeof body.cancelled === 'number') return true;
-      logger.warn(`[xpi-disable] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
-      return false;
-    } catch (err) {
-      logger.warn(
-        `[xpi-disable] daemon ${d.larkAppId} unreachable: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
-    }
-  }));
-  const failed = results.filter(ok => !ok).length;
-  if (failed > 0) {
-    throw new Error(`xpi disable: ${failed}/${daemons.length} daemon(s) did not ack — cleanup incomplete`);
-  }
+  await fanoutCrossPrincipalInterruptionDisable(
+    registry.list(),
+    fetchDaemonIpc,
+    message => logger.warn(message),
+  );
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
   resolveDashboardSettings,

@@ -344,6 +344,43 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(repliedText()).toBe('');
   });
 
+  it('cancels the pending XPI wait timer when the switch is disabled', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'false';
+    vi.useFakeTimers();
+    const timerFired = vi.fn();
+    const ds = seedThreadSession('om_thread_xpi_timer_disabled', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_dddddddddddddddddddddddd',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'bot' as const },
+      phase: 'owner_waiting',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'historical input',
+        userPrompt: 'historical input',
+        createdAt: NOW,
+      }],
+    }];
+    ds.crossPrincipalWaitTimer = setTimeout(timerFired, 1_000);
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(timerFired).not.toHaveBeenCalled();
+      expect(repliedText()).toBe('');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      vi.useRealTimers();
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
   it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
     const previousXpi = process.env.BOTMUX_XPI_ENABLED;
     process.env.BOTMUX_XPI_ENABLED = 'true';
