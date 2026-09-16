@@ -28,6 +28,12 @@ import { MAX_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import {
+  discardPrivateReply,
+  PRIVATE_REPLY_DISCARD_ACTION,
+  PRIVATE_REPLY_PUBLISH_ACTION,
+  publishPrivateReply,
+} from '../../services/private-reply-review.js';
+import {
   checkNonce,
   clearPending,
   getPendingGrantLimits,
@@ -1110,6 +1116,45 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  if (
+    larkAppId
+    && (value?.action === PRIVATE_REPLY_PUBLISH_ACTION || value?.action === PRIVATE_REPLY_DISCARD_ACTION)
+  ) {
+    const publishId = value.publish_id;
+    const nonce = value.nonce;
+    if (typeof publishId !== 'string' || typeof nonce !== 'string') {
+      return { toast: { type: 'error', content: '审核卡参数无效' } };
+    }
+    if (!operatorOpenId) return { toast: { type: 'error', content: '无法确认操作者身份' } };
+    if (value.action === PRIVATE_REPLY_PUBLISH_ACTION) {
+      const result = await publishPrivateReply({ larkAppId, publishId, nonce, operatorOpenId });
+      if (result.ok) {
+        return { toast: { type: 'success', content: result.already ? '这条回复已经公开' : '已公开到群里' } };
+      }
+      const message = result.reason === 'forbidden'
+        ? '你没有权限公开这条回复'
+        : result.reason === 'discarded'
+          ? '这条回复已被丢弃'
+          : result.reason === 'expired'
+            ? '审核卡已过期'
+            : result.reason === 'publishing'
+              ? '这条回复正在公开，请稍后查看'
+              : `公开失败：${result.reason}`;
+      return { toast: { type: 'error', content: message } };
+    }
+    const result = await discardPrivateReply({ larkAppId, publishId, nonce, operatorOpenId });
+    if (result.ok) return { toast: { type: 'success', content: result.already ? '这条回复已经丢弃' : '已丢弃' } };
+    const message = result.reason === 'forbidden'
+      ? '你没有权限丢弃这条回复'
+      : result.reason === 'published'
+        ? '这条回复已经公开'
+        : result.reason === 'expired'
+          ? '审核卡已过期'
+          : result.reason === 'publishing'
+            ? '这条回复正在公开，不能再丢弃'
+          : `丢弃失败：${result.reason}`;
+    return { toast: { type: 'error', content: message } };
+  }
   // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
   // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
   // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。

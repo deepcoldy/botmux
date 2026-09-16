@@ -1333,6 +1333,49 @@ describe('parseBotConfigsFromText — replyStyle', () => {
   });
 });
 
+describe('parseBotConfigsFromText — privateReplyReview', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps a valid private reply review config', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      privateReplyReview: {
+        enabled: true,
+        audience: 'allowedUsers',
+        fallback: 'drop',
+        expireHours: 8,
+      },
+    }]));
+
+    expect(cfg.privateReplyReview).toEqual({
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 8,
+    });
+  });
+
+  it('drops the all-default disabled config to keep bots.json sparse', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      privateReplyReview: {
+        enabled: false,
+        audience: 'requester',
+        fallback: 'dm',
+        expireHours: 24,
+      },
+    }]));
+
+    expect(cfg.privateReplyReview).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -1614,6 +1657,7 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     brand: process.env.BOTMUX_BRAND_LABEL,
     usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
     replyStyle: process.env.BOTMUX_REPLY_STYLE,
+    privateReplyReview: process.env.BOTMUX_PRIVATE_REPLY_REVIEW,
   };
   beforeEach(async () => { mod = await freshImport(); });
   afterEach(() => {
@@ -1625,6 +1669,8 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
     if (saved.replyStyle === undefined) delete process.env.BOTMUX_REPLY_STYLE;
     else process.env.BOTMUX_REPLY_STYLE = saved.replyStyle;
+    if (saved.privateReplyReview === undefined) delete process.env.BOTMUX_PRIVATE_REPLY_REVIEW;
+    else process.env.BOTMUX_PRIVATE_REPLY_REVIEW = saved.privateReplyReview;
   });
 
   it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {

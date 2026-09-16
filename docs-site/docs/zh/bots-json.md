@@ -244,6 +244,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
+| `privateReplyReview` | 最终回复审核发布配置，默认关闭。`{ "enabled": true, "audience": "requester" \| "owners" \| "allowedUsers", "fallback": "dm" \| "public" \| "drop", "expireHours": 24 }`。开启后，群聊/话题群的普通最终回复先发给审核人；点击审核卡上的「公开到群里」后，才按原落点发为公开消息。只控制最终回复，不隐藏实时状态卡、CoT 或手动 `/card`；单聊不改变现有直接回复体验 |
 
 Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同一配置的可视化开关：
 

@@ -13613,6 +13613,11 @@ async function spawnCli(
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
+    if (cfg.privateReplyReview) {
+      (riffBackendConfig as EffectiveMojoConfig).env!.BOTMUX_PRIVATE_REPLY_REVIEW = JSON.stringify(cfg.privateReplyReview);
+    } else {
+      delete (riffBackendConfig as EffectiveMojoConfig).env!.BOTMUX_PRIVATE_REPLY_REVIEW;
+    }
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
   }
@@ -13647,6 +13652,7 @@ async function spawnCli(
     // Feishu. Thread the flag so the reconstructed config keeps the boundary.
     if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
     if (cfg.feedback) sessionEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
+    if (cfg.privateReplyReview) sessionEnv.BOTMUX_PRIVATE_REPLY_REVIEW = JSON.stringify(cfg.privateReplyReview);
     // Session scope for `botmux send` inside the sandbox. Thread sessions
     // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
     // the chat id as anchor (sessionAnchorId), which is NOT a message id —
@@ -13685,6 +13691,8 @@ async function spawnCli(
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
+    if (cfg.privateReplyReview) mergedEnv.BOTMUX_PRIVATE_REPLY_REVIEW = JSON.stringify(cfg.privateReplyReview);
+    else delete mergedEnv.BOTMUX_PRIVATE_REPLY_REVIEW;
     // Reply style is likewise a host-normalized spawn snapshot. Riff's raw
     // backendConfig.env merges last and is intentionally permissive, so freeze
     // it again here to prevent a stale/forged remote value from desynchronising
@@ -14789,7 +14797,7 @@ async function spawnCli(
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback, privateReplyReview: cfg.privateReplyReview }),
         { mode: 0o600 },
       );
     } catch (e) {
@@ -15219,6 +15227,8 @@ async function spawnCli(
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  if (cfg.privateReplyReview) childEnv.BOTMUX_PRIVATE_REPLY_REVIEW = JSON.stringify(cfg.privateReplyReview);
+  else delete childEnv.BOTMUX_PRIVATE_REPLY_REVIEW;
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.

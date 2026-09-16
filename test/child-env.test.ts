@@ -532,6 +532,7 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('__OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_SESSION_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PRIVATE_REPLY_REVIEW');
   });
 
   it('covers session-only capabilities AND routing keys the pane transport never carries', () => {
@@ -760,6 +761,7 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PRIVATE_REPLY_REVIEW');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
   });

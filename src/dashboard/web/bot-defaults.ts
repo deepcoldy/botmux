@@ -4,6 +4,7 @@ import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolve
 import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
 import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
+import type { PrivateReplyReviewConfig } from '../../services/private-reply-review-config.js';
 
 export type CliOption = {
   id: string;
@@ -119,6 +120,7 @@ export type BotDefaultsRow = {
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  privateReplyReview?: PrivateReplyReviewConfig;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   thinkingCard?: boolean;

@@ -18,6 +18,11 @@ const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
 const updateSessionMock = vi.fn();
+const stagePrivateReplyForReviewMock = vi.fn(async () => ({
+  staged: true,
+  publishId: 'prv_0000000000000000000000000000000000000000',
+  privateMessageIds: ['om_private_review'],
+}));
 const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: string[]) => ({
   resolved: entries,
   map: new Map(entries.map(entry => [entry, entry])),
@@ -34,6 +39,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
   },
+}));
+
+vi.mock('../src/services/private-reply-review.js', () => ({
+  stagePrivateReplyForReview: (...args: any[]) => stagePrivateReplyForReviewMock(...args),
 }));
 
 vi.mock('../src/im/lark/doc-comment.js', () => ({
@@ -249,6 +258,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    stagePrivateReplyForReviewMock.mockResolvedValue({
+      staged: true,
+      publishId: 'prv_0000000000000000000000000000000000000000',
+      privateMessageIds: ['om_private_review'],
+    });
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
       map: new Map(entries.map(entry => [entry, entry])),
@@ -569,6 +583,81 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String((sessionReply as any).mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('uses the worker-start private reply review snapshot after live config is disabled', async () => {
+    const sessionReply = vi.fn(async () => 'om_public_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.privateReplyReview = {
+      enabled: true,
+      audience: 'requester',
+      fallback: 'dm',
+      expireHours: 24,
+    };
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(stagePrivateReplyForReviewMock).toHaveBeenCalledWith(expect.objectContaining({
+      larkAppId: 'app_test',
+      sessionId: 'sid-final-out',
+      requesterOpenId: 'ou_requester',
+      reviewConfig: ds.privateReplyReview,
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('continues public daemon final_output delivery when review snapshot returns public fallback', async () => {
+    stagePrivateReplyForReviewMock.mockResolvedValueOnce({ staged: false, reason: 'public_fallback' });
+    const sessionReply = vi.fn(async () => 'om_public_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.privateReplyReview = {
+      enabled: true,
+      audience: 'requester',
+      fallback: 'public',
+      expireHours: 24,
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(stagePrivateReplyForReviewMock).toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('does not gate daemon final_output in p2p chats', async () => {
+    const sessionReply = vi.fn(async () => 'om_public_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.chatType = 'p2p';
+    ds.session.chatType = 'p2p';
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.privateReplyReview = {
+      enabled: true,
+      audience: 'requester',
+      fallback: 'dm',
+      expireHours: 24,
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(stagePrivateReplyForReviewMock).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('does not render feedback when no requester identity can be proven', async () => {

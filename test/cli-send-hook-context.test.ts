@@ -701,9 +701,10 @@ describe('cmdSend hook context wiring', () => {
     // The delivery record is written AFTER the message is actually sent.
     expect(deliveryIndex).toBeGreaterThan(primarySend);
     expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
-    // Turn-completion recording is gated on the response KIND, not on the
-    // feedback policy — feedback off must still produce a correlatable record.
-    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    // Turn-completion recording is gated on the response KIND and actual public
+    // delivery, not on the feedback policy — feedback off must still produce a
+    // correlatable record, while private-review staging is not yet public.
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && !privateReviewStaged && messageId)");
     // The feedback control (policy + card snapshot) rides along only when a
     // policy actually applies; the record itself is unconditional.
     expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');
@@ -711,5 +712,36 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
     expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
+  });
+
+  it('uses a stable private-reply-review idempotency seed for final sends', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const stageAt = cmdSend.indexOf('const contentHash = createHash');
+    expect(stageAt).toBeGreaterThanOrEqual(0);
+    const stageBlock = cmdSend.slice(stageAt, cmdSend.indexOf('});', stageAt));
+
+    expect(stageBlock).toContain("createHash('sha256').update(cardJson, 'utf8')");
+    expect(stageBlock).toContain('idempotencySeed: `cli:${sid}:${currentTurnId ?? originTurnId ??');
+    expect(stageBlock).toContain('${JSON.stringify(reviewPlacement)}:${contentHash}`');
+    expect(stageBlock).not.toContain('sentAtMs');
+  });
+
+  it('loads private-reply-review policy before early final-send side effects', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+
+    const registerAt = cmdSend.indexOf('let privateReplyReviewConfig = resolvedPrivateReplyReviewConfig(undefined)');
+    const gateAt = cmdSend.indexOf('const privateReviewAppliesToCurrentFinal');
+    const voiceAt = cmdSend.indexOf('// ── Voice mode');
+    const uploadAt = cmdSend.indexOf('if (images.length > 0)');
+    expect(registerAt).toBeGreaterThanOrEqual(0);
+    expect(gateAt).toBeGreaterThan(registerAt);
+    expect(gateAt).toBeLessThan(voiceAt);
+    expect(gateAt).toBeLessThan(uploadAt);
+    expect(cmdSend.slice(gateAt, voiceAt)).toContain('asVoice || isSlashSend || files.length > 0 || videoAttachments.length > 0');
+    expect(cmdSend.slice(gateAt, voiceAt)).toContain("(s.chatType ?? 'group') !== 'p2p'");
   });
 });

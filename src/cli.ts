@@ -34,7 +34,7 @@ import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
@@ -7827,6 +7827,8 @@ import {
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
+import { stagePrivateReplyForReview } from './services/private-reply-review.js';
+import { normalizePrivateReplyReviewConfig, resolvedPrivateReplyReviewConfig, type PrivateReplyReviewConfig } from './services/private-reply-review-config.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
@@ -8306,7 +8308,13 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
+  let cred: {
+    larkAppSecret?: string;
+    brand?: string;
+    apiOnly?: boolean;
+    feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput;
+    privateReplyReview?: PrivateReplyReviewConfig;
+  };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -8327,6 +8335,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
+    privateReplyReview: normalizePrivateReplyReviewConfig(cred.privateReplyReview),
     replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
@@ -8354,6 +8363,16 @@ async function registerSelfFromCredFile(): Promise<void> {
  *  `loadBotConfigs()` 重载会把沙箱残留的 stale bots.json（可能是同 appId 的旧
  *  secret）覆盖到注册表上——每次本地重载后必须把 env bot 重新注册回去压轴。 */
 let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
+
+function privateReplyReviewConfigFromEnv(): PrivateReplyReviewConfig | undefined {
+  try {
+    const raw = process.env.BOTMUX_PRIVATE_REPLY_REVIEW;
+    if (!raw) return undefined;
+    return normalizePrivateReplyReviewConfig(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
 
 /** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
 function resolvePricingForCli(larkAppId: string): ResolvedModelPricing | undefined {
@@ -8413,6 +8432,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     cliId: 'riff',
     allowedUsers: [],
     feedback,
+    privateReplyReview: privateReplyReviewConfigFromEnv(),
     replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
@@ -9041,6 +9061,18 @@ async function cmdSend(rest: string[]): Promise<void> {
   // transport-capable, and regardless of any `--chat-id` override — a no-transport
   // turn may not originate ANY Feishu write. Closes the env-only gap for send.
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
+  // Register bots before any outbound-shape gate so bot-scoped policies can
+  // reject unsupported final sends before uploads or other provider effects.
+  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
+  // clobbered by a stale bots.json entry for the same app.
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+  let privateReplyReviewConfig = resolvedPrivateReplyReviewConfig(undefined);
+  try {
+    privateReplyReviewConfig = resolvedPrivateReplyReviewConfig(getBot(s.larkAppId).config.privateReplyReview);
+  } catch { /* keep disabled default */ }
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
@@ -9323,6 +9355,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  const privateReviewAppliesToCurrentFinal = effectiveResponseKind === 'final'
+    && !sendTopLevel
+    && !overrideChatId
+    && !sendInto
+    && !vcMeetingManagedSendOrigin
+    && (s.chatType ?? 'group') !== 'p2p'
+    && privateReplyReviewConfig.enabled;
+  if (privateReviewAppliesToCurrentFinal && (asVoice || isSlashSend || files.length > 0 || videoAttachments.length > 0)) {
+    throw new Error('private reply review does not support voice, slash, file, or video final sends yet; send the final answer as text/card or disable review for this bot');
+  }
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
     process.exit(1);
@@ -9637,15 +9679,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the downstream Lark client works. registerBot is
-  // idempotent, so all send paths reuse these same clients.
-  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
-  // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
-  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
-
   // ── --mention resolution + group-membership gate ──────────────────────────
   // Turn each raw --mention identifier into a { open_id, name } entry.
   //   • Literal open_id (ou_…): kept as-is, always allowed (pre-existing
@@ -9758,6 +9791,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  if (feedbackPolicy && privateReviewAppliesToCurrentFinal) {
+    feedbackPolicy = undefined;
+  }
   // `reviewers`/`everyone` audiences gate clicks without a human requester —
   // this is the bot-triggered auto-analysis case (issue #1178) where the exact
   // turn sender is another bot. Only the `requester` audience needs a resolvable
@@ -9770,7 +9806,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
     process.exit(2);
   }
-
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
   // turn's window had a single counterpart. Once 2+ distinct people/bots took
@@ -10367,6 +10402,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // we committed to sending — that's the boundary the gate cares about.
     const sentAtMs = Date.now();
     let messageId: string;
+    let privateReviewStaged = false;
     let feedbackBaseCard: Record<string, unknown> | undefined;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
@@ -10392,8 +10428,43 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error('botmux send: --layout 不作用于纯视频消息，本次已忽略');
       replyLayout = undefined;
     }
+    const reviewPlacement = sendTarget.mode === 'plain'
+      ? { mode: 'plain' as const, chatId: sendTarget.chatId }
+      : sendTarget.mode === 'thread'
+        ? { mode: 'thread' as const, rootMessageId: sendTarget.rootMessageId, replyInThread: true as const }
+        : { mode: 'reply' as const, rootMessageId: sendTarget.rootMessageId, replyInThread: false as const };
+    const maybeStageFinalReview = async (cardJson: string): Promise<string | undefined> => {
+      if (!privateReviewAppliesToCurrentFinal) return undefined;
+      const contentHash = createHash('sha256').update(cardJson, 'utf8').digest('hex').slice(0, 32);
+      const review = await stagePrivateReplyForReview({
+        larkAppId: appId,
+        chatId: targetChatId,
+        chatType: s.chatType ?? 'group',
+        sessionId: sid,
+        ...(currentTurnId ? { turnId: currentTurnId } : {}),
+        ...(replyTargetSenderOpenId ?? s.ownerOpenId ? { requesterOpenId: (replyTargetSenderOpenId ?? s.ownerOpenId)! } : {}),
+        placement: reviewPlacement,
+        msgType: 'interactive',
+        content: cardJson,
+        idempotencySeed: `cli:${sid}:${currentTurnId ?? originTurnId ?? ''}:${JSON.stringify(reviewPlacement)}:${contentHash}`,
+        reviewConfig: privateReplyReviewConfig,
+        locale: localeForBot(appId),
+      });
+      if (review.staged) {
+        privateReviewStaged = true;
+        return review.privateMessageIds[0] ?? review.publishId;
+      }
+      if (review.reason === 'disabled' || review.reason === 'public_fallback') return undefined;
+      throw new Error(`private reply review staging failed: ${review.reason}`);
+    };
     if (customCard) {
-      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+      const cardJson = JSON.stringify(customCard);
+      const stagedMessageId = await maybeStageFinalReview(cardJson);
+      if (stagedMessageId) {
+        messageId = stagedMessageId;
+      } else {
+        messageId = await dispatchPrimary(cardJson, 'interactive');
+      }
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
@@ -10555,61 +10626,67 @@ async function cmdSend(rest: string[]): Promise<void> {
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
-      const replyStore = new TurnReplyCardStore(resolveDataDir());
-      const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
-      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
-        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
-        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
-      // Mentioning this turn's human requester is still an ordinary reply.
-      // Peer bots, other recipients and unknown identities need a new message
-      // so their notification/automation cannot be swallowed by a PATCH.
-      const onlyRequesterMentions = !explicitKnownBotMention && mentions.every(mention =>
-        mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
-      // A restored record can remain readable (for example via the Linux host
-      // relay). Match the daemon's sandbox exclusion instead of reviving it.
-      const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
-        || process.env.BOTMUX_SANDBOX === '1';
-      const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
-        && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
-        && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
-        && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
-      const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
-      if (replyRecord && replyKey) {
-        if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
-        const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
-          ? { kind: 'final', text, card: JSON.stringify(canonicalCard), source: 'explicit',
-              ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
-          : { kind: 'progress', text }, {
-          beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
-          send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
-          patch: async (id, body) => {
-            const { updateMessage } = await import('./im/lark/client.js');
-            await updateMessage(appId, id, body);
-          },
-          isWithdrawn: error => error instanceof MessageWithdrawnError,
-          render: record => buildTurnReplyCard(record, {
-            ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
-            showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
-            canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
-          }),
-          sendOverflow: async (fullText, uuid) => {
-            const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
-            writeFileSync(path, fullText, { mode: 0o600 });
-            await revalidateIsolatedOriginBeforeEffect();
-            const fileKey = await uploadFile(appId, path);
-            return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
-          },
-        });
-        unifiedReplyUsed = true;
-        if (!delivered.delivered || !delivered.messageId) {
-          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
-          console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
-          return;
-        }
-        messageId = delivered.messageId;
+      const cardJson = JSON.stringify(canonicalCard);
+      const stagedMessageId = await maybeStageFinalReview(cardJson);
+      if (stagedMessageId) {
+        messageId = stagedMessageId;
       } else {
-        messageId = await dispatchPrimary(JSON.stringify(canonicalCard), 'interactive');
+        const replyStore = new TurnReplyCardStore(resolveDataDir());
+        const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
+        const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
+          ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+          ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+          ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
+        // Mentioning this turn's human requester is still an ordinary reply.
+        // Peer bots, other recipients and unknown identities need a new message
+        // so their notification/automation cannot be swallowed by a PATCH.
+        const onlyRequesterMentions = !explicitKnownBotMention && mentions.every(mention =>
+          mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
+        // A restored record can remain readable (for example via the Linux host
+        // relay). Match the daemon's sandbox exclusion instead of reviving it.
+        const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
+          || process.env.BOTMUX_SANDBOX === '1';
+        const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
+          && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
+          && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
+          && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
+        const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
+        if (replyRecord && replyKey) {
+          if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
+          const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
+            ? { kind: 'final', text, card: cardJson, source: 'explicit',
+                ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
+            : { kind: 'progress', text }, {
+            beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+            send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
+            patch: async (id, body) => {
+              const { updateMessage } = await import('./im/lark/client.js');
+              await updateMessage(appId, id, body);
+            },
+            isWithdrawn: error => error instanceof MessageWithdrawnError,
+            render: record => buildTurnReplyCard(record, {
+              ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
+              showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
+              canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
+            }),
+            sendOverflow: async (fullText, uuid) => {
+              const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
+              writeFileSync(path, fullText, { mode: 0o600 });
+              await revalidateIsolatedOriginBeforeEffect();
+              const fileKey = await uploadFile(appId, path);
+              return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+            },
+          });
+          unifiedReplyUsed = true;
+          if (!delivered.delivered || !delivered.messageId) {
+            console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+            console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
+            return;
+          }
+          messageId = delivered.messageId;
+        } else {
+          messageId = await dispatchPrimary(cardJson, 'interactive');
+        }
       }
     }
 
@@ -10623,7 +10700,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // canonical final-answer cards — and they are exactly the shapes the
     // feedback gate above rejects outright, so the recorded set stays identical
     // whether feedback is on or off.
-    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && !privateReviewStaged && messageId) {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
@@ -10680,7 +10757,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
-    if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
+    if (!pureVideoSend && !vcMeetingListenerReplyReplay && !privateReviewStaged) {
       ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
         { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));
@@ -10720,7 +10797,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     const atSummary = mentions.length > 0
       ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
       : '未@任何人';
-    console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+    console.error(privateReviewStaged
+      ? `✓ 已进入最终回复审核 ${messageId} ｜确认后公开｜ ${atSummary}`
+      : `✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
     // Sentinel guidance is surfaced HERE — in the send-success output the model
     // reads back — rather than only in the injected system prompt. A model only
     // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
@@ -10728,22 +10807,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
-    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
-      ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
-      : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
-    const sendLocale = localeForBot(appId);
-    if (asChoice) {
-      console.error(t(
-        asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
-        undefined,
-        sendLocale,
-      ));
-    } else if (config.crossPrincipalInterruption
-      && rest.some(tok => tok === '--mention' || tok.startsWith('--mention='))) {
-      // Only advertise `--as` while cross-principal isolation is actually
-      // enforced; with the experimental switch off nothing is ever staged, so
-      // the flag would classify nothing.
-      console.error(t('xpi.send.as_needed_hint', undefined, sendLocale));
+    if (!privateReviewStaged) {
+      console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
+        ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
+        : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
+      const sendLocale = localeForBot(appId);
+      if (asChoice) {
+        console.error(t(
+          asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
+          undefined,
+          sendLocale,
+        ));
+      } else if (config.crossPrincipalInterruption
+        && rest.some(tok => tok === '--mention' || tok.startsWith('--mention='))) {
+        // Only advertise `--as` while cross-principal isolation is actually
+        // enforced; with the experimental switch off nothing is ever staged, so
+        // the flag would classify nothing.
+        console.error(t('xpi.send.as_needed_hint', undefined, sendLocale));
+      }
     }
 
     // --attention: message is already delivered above; now flip the dashboard
@@ -10810,6 +10891,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       success: true,
       messageId,
       sessionId: sid,
+      ...(privateReviewStaged ? { privateReplyReview: true } : {}),
       quotedMessageId: primaryQuotedId,
       mentioned: mentions.map(m => ({ open_id: m.open_id, name: m.name })),
       ...(deferredTopicRootMessageIdForOutput

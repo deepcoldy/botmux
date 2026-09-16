@@ -407,6 +407,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
   'BOTMUX_REPLY_STYLE',
+  // Per-bot final-answer private review gate. The worker freezes this for the
+  // session so sandboxed/remote `botmux send` follows the same review policy
+  // without reading credential-bearing bots.json.
+  'BOTMUX_PRIVATE_REPLY_REVIEW',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
@@ -533,6 +537,8 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',
+  // Spawn-time final-answer review policy; same boundary as reply style.
+  'BOTMUX_PRIVATE_REPLY_REVIEW',
   // One-shot per-session artifacts/paths.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',

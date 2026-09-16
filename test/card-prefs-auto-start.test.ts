@@ -249,6 +249,58 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
   });
 
+  it('privateReplyReview round-trips as a structured per-bot card preference', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').privateReplyReview).toEqual({
+      enabled: false,
+      audience: 'requester',
+      fallback: 'dm',
+      expireHours: 24,
+    });
+
+    const on = await store.updateBotCardPrefs('app_default', {
+      privateReplyReview: {
+        enabled: true,
+        audience: 'allowedUsers',
+        fallback: 'drop',
+        expireHours: 8,
+      },
+    });
+    expect(on.ok && on.prefs.privateReplyReview).toEqual({
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 8,
+    });
+    expect(readConfig().privateReplyReview).toEqual({
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 8,
+    });
+    expect(registry.getBot('app_default').config.privateReplyReview).toEqual({
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 8,
+    });
+
+    const off = await store.updateBotCardPrefs('app_default', {
+      privateReplyReview: {
+        enabled: false,
+        audience: 'requester',
+        fallback: 'dm',
+        expireHours: 24,
+      },
+    });
+    expect(off.ok && off.prefs.privateReplyReview.enabled).toBe(false);
+    expect(readConfig().privateReplyReview).toBeUndefined();
+    expect(registry.getBot('app_default').config.privateReplyReview).toBeUndefined();
+  });
+
   it('pinStreamingCard is default-off and round-trips without a restart', async () => {
     writeConfig();
     const { registry, store } = await freshModules();

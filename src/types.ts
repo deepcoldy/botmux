@@ -1514,7 +1514,11 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
+    ? Message & {
+        feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
+        cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+        privateReplyReview?: import('./services/private-reply-review-config.js').PrivateReplyReviewConfig;
+      }
     : Message
   : never;
 

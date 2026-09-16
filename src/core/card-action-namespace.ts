@@ -38,6 +38,7 @@ const BOTMUX_CARD_ACTION_PREFIXES = [
   'issue_',
   'open_',
   'overload_',
+  'private_reply_',
   'refresh_',
   'relay_',
   'repo_',

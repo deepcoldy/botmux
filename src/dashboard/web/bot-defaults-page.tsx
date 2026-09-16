@@ -68,6 +68,7 @@ import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
 } from '../../im/lark/streaming-card-buttons.js';
+import type { PrivateReplyReviewConfig } from '../../services/private-reply-review-config.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
@@ -116,7 +117,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
+type CardPrefPatch = Record<string, unknown>;
 
 type JsonResponse = {
   ok: boolean;
@@ -748,6 +749,10 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
     : tr('botDefaults.maxLiveWorkersStateOn', { count: cap });
 }
 
+function defaultPrivateReplyReview(): PrivateReplyReviewConfig {
+  return { enabled: false, audience: 'requester', fallback: 'dm', expireHours: 24 };
+}
+
 function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
@@ -760,6 +765,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    privateReplyReview: body.privateReplyReview,
     thinkingCard: body.thinkingCard,
     thinkingCardToolResult: body.thinkingCardToolResult,
     senderTag: body.senderTag,
@@ -4272,6 +4278,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
+  const [privateReplyReview, setPrivateReplyReview] = useState<PrivateReplyReviewConfig>(bot.privateReplyReview ?? defaultPrivateReplyReview());
   const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
   const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -4286,9 +4293,10 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
+    setPrivateReplyReview(bot.privateReplyReview ?? defaultPrivateReplyReview());
     setThinkingCard(bot.thinkingCard !== false);
     setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.privateReplyReview, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4334,6 +4342,27 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
       void savePatch({ pinStreamingCard: checked }, 'pin-streaming', () => setPinStreamingCard(previous));
     }}
   />;
+  const reviewAudienceOptions: DropdownFieldOption<'requester' | 'owners' | 'allowedUsers'>[] = [
+    { value: 'requester', label: tr('botDefaults.privateReplyReviewAudienceRequester') },
+    { value: 'owners', label: tr('botDefaults.privateReplyReviewAudienceOwners') },
+    { value: 'allowedUsers', label: tr('botDefaults.privateReplyReviewAudienceAllowedUsers') },
+  ];
+  const reviewFallbackOptions: DropdownFieldOption<'dm' | 'public' | 'drop'>[] = [
+    { value: 'dm', label: tr('botDefaults.privateReplyReviewFallbackDm') },
+    { value: 'public', label: tr('botDefaults.privateReplyReviewFallbackPublic') },
+    { value: 'drop', label: tr('botDefaults.privateReplyReviewFallbackDrop') },
+  ];
+  const saveReview = (next: typeof privateReplyReview): void => {
+    const previous = privateReplyReview;
+    const normalized: PrivateReplyReviewConfig = {
+      enabled: next.enabled === true,
+      audience: next.audience === 'owners' || next.audience === 'allowedUsers' ? next.audience : 'requester',
+      fallback: next.fallback === 'public' || next.fallback === 'drop' ? next.fallback : 'dm',
+      expireHours: Math.max(1, Math.min(168, Math.floor(Number(next.expireHours) || 24))),
+    };
+    setPrivateReplyReview(normalized);
+    void savePatch({ privateReplyReview: normalized }, 'private-reply-review', () => setPrivateReplyReview(previous));
+  };
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
@@ -4458,6 +4487,62 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             })}
           </div>
           {replyMode !== 'legacy' && pinToggle}
+          <div className="bd-card-control-list">
+            <ToggleRow
+              checked={privateReplyReview.enabled}
+              disabled={busy !== null}
+              dataAction="toggle-private-reply-review"
+              title={tr('botDefaults.privateReplyReview')}
+              description={tr('botDefaults.privateReplyReviewDescription')}
+              help={tr('botDefaults.privateReplyReviewHelp')}
+              onChange={checked => saveReview({ ...privateReplyReview, enabled: checked })}
+            />
+          </div>
+          {privateReplyReview.enabled ? (
+            <div className="bd-card-dependent" data-private-reply-review-options>
+              <div className="bd-row">
+                <div className="bd-field">
+                  <FieldTitle help={tr('botDefaults.privateReplyReviewAudienceHelp')}>{tr('botDefaults.privateReplyReviewAudience')}</FieldTitle>
+                  <DropdownField
+                    dataInput="privateReplyReviewAudience"
+                    ariaLabel={tr('botDefaults.privateReplyReviewAudience')}
+                    value={privateReplyReview.audience}
+                    disabled={busy !== null}
+                    options={reviewAudienceOptions}
+                    onChange={audience => saveReview({ ...privateReplyReview, audience })}
+                  />
+                </div>
+                <div className="bd-field">
+                  <FieldTitle help={tr('botDefaults.privateReplyReviewFallbackHelp')}>{tr('botDefaults.privateReplyReviewFallback')}</FieldTitle>
+                  <DropdownField
+                    dataInput="privateReplyReviewFallback"
+                    ariaLabel={tr('botDefaults.privateReplyReviewFallback')}
+                    value={privateReplyReview.fallback}
+                    disabled={busy !== null}
+                    options={reviewFallbackOptions}
+                    onChange={fallback => saveReview({ ...privateReplyReview, fallback })}
+                  />
+                </div>
+                <label className="bd-field">
+                  <span><FieldTitle help={tr('botDefaults.privateReplyReviewExpireHelp')}>{tr('botDefaults.privateReplyReviewExpire')}</FieldTitle></span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={168}
+                    step={1}
+                    data-input="privateReplyReviewExpireHours"
+                    value={privateReplyReview.expireHours}
+                    disabled={busy !== null}
+                    onChange={event => {
+                      const expireHours = Math.max(1, Math.min(168, Math.floor(Number(event.currentTarget.value) || 24)));
+                      saveReview({ ...privateReplyReview, expireHours });
+                    }}
+                  />
+                </label>
+              </div>
+              <p className="bd-card-mode-note">{tr('botDefaults.privateReplyReviewNote')}</p>
+            </div>
+          ) : null}
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
