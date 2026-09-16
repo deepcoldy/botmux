@@ -20,6 +20,33 @@ export type CrossPrincipalChoice =
 
 export type CrossPrincipalChoiceKind = 'classification' | 'wait' | 'owner';
 
+export type CrossPrincipalControlNoticeKind = 'classification' | 'wait' | 'terminal';
+
+const XPI_CONTROL_NOTICE_RE = /^\[botmux-xpi-control:v1:(classification|wait|terminal):(xpi_[a-f0-9]{24})\](?:\n|$)/;
+
+export function crossPrincipalControlNotice(
+  kind: CrossPrincipalControlNoticeKind,
+  recordId: string,
+  text: string,
+): string {
+  if (!/^xpi_[a-f0-9]{24}$/.test(recordId)) {
+    throw new Error('invalid_cross_principal_record_id');
+  }
+  return `[botmux-xpi-control:v1:${kind}:${recordId}]\n${text}`;
+}
+
+export function parseCrossPrincipalControlNotice(text: string): {
+  kind: CrossPrincipalControlNoticeKind;
+  recordId: string;
+} | undefined {
+  const match = text.match(XPI_CONTROL_NOTICE_RE);
+  if (!match) return undefined;
+  return {
+    kind: match[1] as CrossPrincipalControlNoticeKind,
+    recordId: match[2],
+  };
+}
+
 const AS_TOKEN_RE = /(?:^|\n)\s*<!--botmux-as:(independent|suggestion)-->\s*$/;
 
 /**
@@ -218,14 +245,24 @@ export function crossPrincipalAgentHint(locale?: Locale): string {
 
 export function crossPrincipalBotClassifyNotice(
   proposerOpenId: string,
+  recordId: string,
   locale?: Locale,
 ): string {
-  return `${t('xpi.bot.classify.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`;
+  return crossPrincipalControlNotice(
+    'classification',
+    recordId,
+    `${t('xpi.bot.classify.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`,
+  );
 }
 
 export function crossPrincipalBotWaitNotice(
   proposerOpenId: string,
+  recordId: string,
   locale?: Locale,
 ): string {
-  return `${t('xpi.bot.wait.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`;
+  return crossPrincipalControlNotice(
+    'wait',
+    recordId,
+    `${t('xpi.bot.wait.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`,
+  );
 }

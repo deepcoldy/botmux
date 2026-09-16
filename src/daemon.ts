@@ -273,7 +273,7 @@ import {
   recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -361,6 +361,7 @@ import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRoo
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { trustedSessionController } from './core/trusted-session-controller.js';
 import {
+  cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
@@ -369,6 +370,7 @@ import {
 import {
   crossPrincipalBotClassifyNotice,
   crossPrincipalBotWaitNotice,
+  crossPrincipalControlNotice,
   crossPrincipalClassificationOptions,
   crossPrincipalClassificationPrompt,
   crossPrincipalStagedNotice,
@@ -376,6 +378,7 @@ import {
   crossPrincipalWaitPrompt,
   isCrossPrincipalChoiceOnlyText,
   parseCrossPrincipalChoiceText,
+  parseCrossPrincipalControlNotice,
   stripCrossPrincipalAsToken,
   type CrossPrincipalChoice,
 } from './core/cross-principal-choice.js';
@@ -18387,6 +18390,58 @@ function persistCrossPrincipalQueue(ds: DaemonSession): void {
   sessionStore.updateSession(ds.session);
 }
 
+function cancelDisabledCrossPrincipalInterruptions(ds: DaemonSession): number {
+  const cancelled = cancelCrossPrincipalInterruptionsForFeatureDisable(ds.session);
+  if (cancelled.length === 0) return 0;
+  clearTimeout(ds.crossPrincipalWaitTimer);
+  ds.crossPrincipalWaitTimer = undefined;
+  sessionStore.updateSession(ds.session);
+  logger.warn(
+    `[${tag(ds)}] XPI disabled: terminalised ${cancelled.length} staged interruption(s) `
+    + `ids=${cancelled.map(item => item.id).join(',')}`,
+  );
+  return cancelled.length;
+}
+
+function cancelAllCrossPrincipalInterruptionsForFeatureDisable(): number {
+  let total = 0;
+  const cancelledSessionIds = new Set<string>();
+  for (const ds of activeSessions.values()) {
+    total += cancelDisabledCrossPrincipalInterruptions(ds);
+    cancelledSessionIds.add(ds.session.sessionId);
+  }
+  // An inactive row can still carry staged input. Leaving it behind would
+  // make OFF look clean until XPI is re-enabled, at which point reopening the
+  // session could resurrect historical business input. Use the strict view:
+  // cleanup is a destructive state transition and must fail closed when the
+  // backing store cannot be proven readable.
+  for (const session of sessionStore.listSessionsStrict()) {
+    if (cancelledSessionIds.has(session.sessionId)) continue;
+    const cancelled = cancelCrossPrincipalInterruptionsForFeatureDisable(session);
+    if (cancelled.length === 0) continue;
+    sessionStore.updateSession(session);
+    total += cancelled.length;
+    logger.warn(
+      `[${session.sessionId.substring(0, 8)}] XPI disabled: terminalised `
+      + `${cancelled.length} inactive staged interruption(s) `
+      + `ids=${cancelled.map(item => item.id).join(',')}`,
+    );
+  }
+  return total;
+}
+
+function crossPrincipalNoticeUuid(
+  kind: 'classification' | 'wait' | 'terminal',
+  record: CrossPrincipalInterruption,
+  discriminator = '',
+): string {
+  const suffix = kind === 'wait' ? `-${record.waitDecisionRound ?? 0}` : '';
+  const digest = discriminator
+    ? `-${createHash('sha256').update(discriminator).digest('hex').slice(0, 8)}`
+    : '';
+  return `xpi-${kind[0]}-${record.id.slice(4)}${suffix}${digest}`;
+}
+
 function removeCrossPrincipalRecord(ds: DaemonSession, id: string): void {
   const queue = ds.session.crossPrincipalInterruptions;
   if (!queue) return;
@@ -18533,10 +18588,11 @@ async function stageCrossPrincipalInterruption(args: {
     if (proposerOpenId) {
       void sessionReply(
         sessionAnchorId(ds),
-        crossPrincipalBotClassifyNotice(proposerOpenId, loc),
+        crossPrincipalBotClassifyNotice(proposerOpenId, staged.record.id, loc),
         'text',
         ds.larkAppId,
         message.turnId,
+        { uuid: crossPrincipalNoticeUuid('classification', staged.record) },
       ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
     }
     staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
@@ -18565,7 +18621,14 @@ async function notifyCrossPrincipalTerminal(
   const ats = [...new Set([ownerId, proposerId].filter((v): v is string => !!v))]
     .map(id => `<at id=${id}></at>`)
     .join(' ');
-  await sessionReply(sessionAnchorId(ds), `${ats}${ats ? ' ' : ''}${text}`, 'text', ds.larkAppId);
+  await sessionReply(
+    sessionAnchorId(ds),
+    crossPrincipalControlNotice('terminal', record.id, `${ats}${ats ? ' ' : ''}${text}`),
+    'text',
+    ds.larkAppId,
+    undefined,
+    { uuid: crossPrincipalNoticeUuid('terminal', record, text) },
+  );
 }
 
 async function dispatchApprovedCrossPrincipalSuggestion(
@@ -18988,6 +19051,10 @@ function scheduleCrossPrincipalOwnerWait(ds: DaemonSession, deadlineAt: number):
 
 async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void> {
   if (ds.crossPrincipalInterruptionDriving) return;
+  if (!config.crossPrincipalInterruption) {
+    cancelDisabledCrossPrincipalInterruptions(ds);
+    return;
+  }
   const record = ds.session.crossPrincipalInterruptions?.[0];
   if (!record) {
     clearTimeout(ds.crossPrincipalWaitTimer);
@@ -19017,9 +19084,11 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         if (!record.botClassifyDeadlineAt) {
           await sessionReply(
             sessionAnchorId(ds),
-            crossPrincipalBotClassifyNotice(proposerId, loc),
+            crossPrincipalBotClassifyNotice(proposerId, record.id, loc),
             'text',
             ds.larkAppId,
+            undefined,
+            { uuid: crossPrincipalNoticeUuid('classification', record) },
           );
           record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
           persistCrossPrincipalQueue(ds);
@@ -19088,9 +19157,11 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           }
           await sessionReply(
             sessionAnchorId(ds),
-            crossPrincipalBotWaitNotice(proposerId, loc),
+            crossPrincipalBotWaitNotice(proposerId, record.id, loc),
             'text',
             ds.larkAppId,
+            undefined,
+            { uuid: crossPrincipalNoticeUuid('wait', record) },
           );
           continueCrossPrincipalOwnerWait(record, Date.now(), CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS);
           persistCrossPrincipalQueue(ds);
@@ -23108,6 +23179,22 @@ async function handleThreadReplyAdmitted(
   // the existing-owner route below, i.e. deliver the message like any other —
   // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
   // message that is not diverted here is also not rejected there.
+  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
+    ? parseCrossPrincipalControlNotice(parsed.content)
+    : undefined;
+  if (xpiControlNotice) {
+    // XPI protocol traffic is control-plane data, never a business turn. It is
+    // authenticated by the transport-level bot sender fact plus a strict
+    // record marker. Consuming it here prevents two bots from classifying each
+    // other's notices forever; human-authored lookalikes continue normally.
+    markIngressAdmitted(ctx);
+    logger.info(
+      `[${tag(ds)}] consumed XPI control notice kind=${xpiControlNotice.kind} `
+      + `record=${xpiControlNotice.recordId}`,
+    );
+    return;
+  }
+
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn
@@ -25448,6 +25535,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
     throw err instanceof Error ? err : new Error(String(err));
   }
+  // A daemon may have been offline when Dashboard persisted XPI=false, so it
+  // could not acknowledge the live cleanup fan-out. Sweep its owned store on
+  // every OFF boot before IPC or session restore can revive historical staged
+  // input. The explicit disable IPC below is unconditional on purpose: another
+  // process may still hold the 2s global-config cache from before the write.
+  if (!config.crossPrincipalInterruption) {
+    cancelAllCrossPrincipalInterruptionsForFeatureDisable();
+  }
   // Release durable mojo containment handles a REBOOT provably killed, BEFORE the
   // device-isolation activation inventory ever synthesises a blocker from them —
   // otherwise a post-reboot handle keeps blocking activation forever (round-11
@@ -25506,6 +25601,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // could slip past the 503 barrier. Armed-first means the very first accepted
   // connection already sees the not-ready gate.
   if (coreOnly) armCoreOnlyReadinessGate();
+  setCrossPrincipalInterruptionDisableHandler(() => cancelAllCrossPrincipalInterruptionsForFeatureDisable());
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
@@ -26851,6 +26947,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
+    setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);

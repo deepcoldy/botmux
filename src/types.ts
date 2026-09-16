@@ -342,6 +342,11 @@ export interface Session {
    * independently-created session.
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
+  /** Bounded audit trail for staged XPI messages that were made permanently
+   * non-runnable when the feature was disabled. Keeping these outside the
+   * active queue prevents restart/re-enable from resurrecting old work while
+   * preserving an inspectable terminal reason. */
+  crossPrincipalInterruptionCancellations?: CrossPrincipalInterruptionCancellation[];
   /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.
@@ -951,6 +956,16 @@ export interface CrossPrincipalInterruption {
   /** Present only when this XPI independent child fell back to the source cwd.
    * It does not claim that non-XPI writers to the same directory participate. */
   xpiSharedCwdAdmissionGroupId?: string;
+}
+
+export interface CrossPrincipalInterruptionCancellation {
+  version: 1;
+  id: string;
+  ownerTurnId: string;
+  proposer: TrustedCaller;
+  messageTurnIds: string[];
+  cancelledAt: string;
+  reason: 'feature_disabled';
 }
 
 export interface XpiSharedCwdAdmissionLease {

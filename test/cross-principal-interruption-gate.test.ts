@@ -113,6 +113,35 @@ describe('XPI switch — accessor (config file + env override)', () => {
   });
 });
 
+describe('XPI control-notice loop guard wiring', () => {
+  it('consumes only authenticated bot control notices before generic XPI staging', () => {
+    const parseAt = daemonSource.indexOf("threadTrustedCaller?.senderType === 'bot'");
+    const consumeAt = daemonSource.indexOf('consumed XPI control notice');
+    const stageGateAt = daemonSource.indexOf('if (config.crossPrincipalInterruption', consumeAt);
+    expect(parseAt).toBeGreaterThan(0);
+    expect(consumeAt).toBeGreaterThan(parseAt);
+    expect(stageGateAt).toBeGreaterThan(consumeAt);
+  });
+
+  it('cleans strict persisted session rows as well as active sessions when disabled', () => {
+    const start = daemonSource.indexOf('function cancelAllCrossPrincipalInterruptionsForFeatureDisable(): number {');
+    expect(start).toBeGreaterThan(0);
+    const body = daemonSource.slice(start, daemonSource.indexOf('\n}\n', start));
+    expect(body).not.toContain('config.crossPrincipalInterruption');
+    expect(body).toContain('activeSessions.values()');
+    expect(body).toContain('sessionStore.listSessionsStrict()');
+    expect(body).toContain('cancelledSessionIds.has(session.sessionId)');
+    expect(body).toContain('sessionStore.updateSession(session)');
+  });
+
+  it('sweeps persisted XPI records on an OFF daemon boot before IPC binds', () => {
+    const bootSweepAt = daemonSource.indexOf('cancelAllCrossPrincipalInterruptionsForFeatureDisable();');
+    const ipcBindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer');
+    expect(bootSweepAt).toBeGreaterThan(0);
+    expect(ipcBindAt).toBeGreaterThan(bootSweepAt);
+  });
+});
+
 describe('XPI switch — agent-facing `--as` guidance', () => {
   afterEach(() => { delete process.env.BOTMUX_XPI_ENABLED; });
 

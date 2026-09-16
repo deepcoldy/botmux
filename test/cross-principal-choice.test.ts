@@ -4,11 +4,13 @@ import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choic
 import {
   crossPrincipalAgentHint,
   crossPrincipalBotClassifyNotice,
+  crossPrincipalControlNotice,
   crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
   parseCrossPrincipalAsFlag,
   parseCrossPrincipalChoiceText,
+  parseCrossPrincipalControlNotice,
   stripCrossPrincipalAsToken,
 } from '../src/core/cross-principal-choice.js';
 import { messages as enMessages } from '../src/i18n/en.js';
@@ -150,10 +152,26 @@ describe('cross-principal choice copy', () => {
     expect(zhHint).toContain('另开任务');
     expect(zhHint).toContain('留给当前任务');
 
-    const notice = crossPrincipalBotClassifyNotice('ou_bot', 'zh');
+    const recordId = 'xpi_0123456789abcdef01234567';
+    const notice = crossPrincipalBotClassifyNotice('ou_bot', recordId, 'zh');
     expect(notice).toContain('<at id=ou_bot></at>');
     expect(notice).toContain(zhHint);
     expect(notice).not.toContain('请选一种处理方式');
+    expect(parseCrossPrincipalControlNotice(notice)).toEqual({
+      kind: 'classification',
+      recordId,
+    });
+  });
+
+  it('only recognizes a strict, leading XPI control marker', () => {
+    const recordId = 'xpi_0123456789abcdef01234567';
+    expect(parseCrossPrincipalControlNotice(
+      crossPrincipalControlNotice('terminal', recordId, '未执行'),
+    )).toEqual({ kind: 'terminal', recordId });
+    expect(parseCrossPrincipalControlNotice(`普通业务消息\n[botmux-xpi-control:v1:terminal:${recordId}]`))
+      .toBeUndefined();
+    expect(() => crossPrincipalControlNotice('wait', 'xpi_not_valid', '等待'))
+      .toThrow('invalid_cross_principal_record_id');
   });
 
   it('keeps zh/en send-hint keys aligned', () => {

@@ -1679,7 +1679,33 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
     fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
   ));
 }
-const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+async function disableCrossPrincipalInterruptionOnAllDaemons(): Promise<void> {
+  const daemons = registry.list();
+  const results = await Promise.all(daemons.map(async (d) => {
+    try {
+      const res = await fetchDaemonIpc(d.ipcPort, '/api/xpi/disable', { method: 'POST' });
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok && typeof body.cancelled === 'number') return true;
+      logger.warn(`[xpi-disable] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
+      return false;
+    } catch (err) {
+      logger.warn(
+        `[xpi-disable] daemon ${d.larkAppId} unreachable: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }));
+  const failed = results.filter(ok => !ok).length;
+  if (failed > 0) {
+    throw new Error(`xpi disable: ${failed}/${daemons.length} daemon(s) did not ack — cleanup incomplete`);
+  }
+}
+const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
+  resolveDashboardSettings,
+  reloadLocaleOnAllDaemons,
+  disableCrossPrincipalInterruptionOnAllDaemons,
+);
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 

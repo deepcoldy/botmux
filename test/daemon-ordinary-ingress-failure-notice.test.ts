@@ -306,7 +306,47 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(repliedText()).toContain(tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(APP)));
   });
 
+  it('terminalises historical XPI records without notifying when the switch is off', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'false';
+    const ds = seedThreadSession('om_thread_xpi_disabled', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cccccccccccccccccccccccc',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'bot' as const },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'historical input',
+        userPrompt: 'historical input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.crossPrincipalInterruptionCancellations).toEqual([
+      expect.objectContaining({
+        id: 'xpi_cccccccccccccccccccccccc',
+        reason: 'feature_disabled',
+        messageTurnIds: ['proposer-turn'],
+      }),
+    ]);
+    expect(repliedText()).toBe('');
+  });
+
   it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
     const ds = seedThreadSession('om_thread_owner_queue_full', 'seeded') as any;
     const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
     ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-queue-full';
@@ -324,7 +364,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }));
     ds.session.crossPrincipalInterruptions = [{
       version: 1,
-      id: 'xpi-owner-approved-full',
+      id: 'xpi_aaaaaaaaaaaaaaaaaaaaaaaa',
       ownerTurnId: 'owner-turn',
       owner: caller,
       proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
@@ -339,7 +379,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.sessions.set(ds.session.sessionId, ds.session);
     const beforeQueue = structuredClone(ds.session.xpiSharedCwdQueuedTurns);
 
-    await driveCrossPrincipalInterruptions(ds);
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
 
     expect(repliedText()).toContain('本次未接收也不会执行');
     expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
@@ -347,6 +392,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
   });
 
   it('retains an approved cross-principal record when its queue-full notice fails', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
     const ds = seedThreadSession('om_thread_owner_notice_retry', 'seeded') as any;
     const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
     ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-notice-retry';
@@ -364,7 +411,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }));
     ds.session.crossPrincipalInterruptions = [{
       version: 1,
-      id: 'xpi-owner-approved-retry',
+      id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb',
       ownerTurnId: 'owner-turn',
       owner: caller,
       proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
@@ -380,10 +427,15 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
     mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
 
-    await driveCrossPrincipalInterruptions(ds);
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
 
     expect(ds.session.crossPrincipalInterruptions).toEqual([
-      expect.objectContaining({ id: 'xpi-owner-approved-retry', phase: 'owner_approved' }),
+      expect.objectContaining({ id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb', phase: 'owner_approved' }),
     ]);
     expect(ds.crossPrincipalWaitTimer).toBeDefined();
     clearTimeout(ds.crossPrincipalWaitTimer);
