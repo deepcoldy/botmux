@@ -63,13 +63,21 @@ export interface FleetProcState {
    * same semantics, different storage.
    */
   configHash?: string;
-  /** Birth identity for recovering external children after supervisor death. */
+  /** Durable birth identity for reclaiming this exact process generation after
+   * supervisor death without ever signaling a recycled or cross-namespace PID. */
   processStart?: string;
 }
 
 export interface FleetState {
   supervisorPid: number;
   supervisorStartedAt: string;
+  /** Durable birth identity; prevents stale/PID-namespace state from signaling
+   * an unrelated process that happens to reuse supervisorPid. */
+  supervisorProcessStart?: string;
+  /** Linux PID namespace inode (pid:[...]); absent on other platforms. */
+  supervisorPidNamespace?: string;
+  /** Exact OS command line sampled for the same supervisor generation. */
+  supervisorCommand?: string;
   /** Real entry path, used by Desktop to identify the owning installation. */
   supervisorEntry?: string;
   procs: FleetProcState[];

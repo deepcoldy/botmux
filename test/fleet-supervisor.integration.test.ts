@@ -377,7 +377,7 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(pidAlive(startBotPid)).toBe(false);
   });
 
-  it('REGRESSION #3: a new supervisor taking over a live-but-unowned fleet reclaims it instead of self-exiting', async () => {
+  it('REGRESSION #3: a new supervisor safely reclaims a legacy live-but-unowned fleet', async () => {
     // A prior supervisor died hard (SIGKILL/OOM) while its daemon kept running.
     // The state still says that proc is 'online' with a live pid. A new supervisor
     // must NOT trust that and skip it — if it spawned nothing it would hold no
@@ -387,16 +387,23 @@ describe('FleetSupervisor (live, integration)', () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');
     // Orphan daemon from the "previous" supervisor generation (still alive).
-    const orphan = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    const distDir = fakeDist(root, STAY);
+    const orphan = spawn(process.execPath, [join(distDir, 'index-daemon.js')], { stdio: 'ignore' });
     killLater(orphan.pid!);
     await waitFor(() => pidAlive(orphan.pid!));
     // State records it online, under a prior (now-dead) supervisor pid.
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
-      procs: [{ name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T' }],
+      procs: [{
+        name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
+        // Deliberately legacy: old releases did not persist processStart. The
+        // new supervisor must migrate this row using a stable sampled identity
+        // plus the expected daemon command, rather than fail the takeover.
+        restarts: 0, lastExitCode: null, startedAt: 'T',
+      }],
     }));
 
-    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
     sup.start([bots[0]]); // takeover
     // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
     // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
@@ -412,6 +419,34 @@ describe('FleetSupervisor (live, integration)', () => {
     // handler, so it dies) — no longer running unsupervised.
     await waitFor(() => !pidAlive(orphan.pid!));
     expect(pidAlive(orphan.pid!)).toBe(false);
+
+    await sup.stopAll();
+  });
+
+  it('never signals an unrelated live pid from a legacy unowned row', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const distDir = fakeDist(root, STAY);
+    const unrelated = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    killLater(unrelated.pid!);
+    await waitFor(() => pidAlive(unrelated.pid!));
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
+      procs: [{
+        name: 'botmux-0', appId: 'cli_a', pid: unrelated.pid!, generation: 1, status: 'online',
+        restarts: 0, lastExitCode: null, startedAt: 'T',
+      }],
+    }));
+
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]);
+    const replaced = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== unrelated.pid && p.pid > 1 && pidAlive(p.pid);
+    });
+    expect(replaced).toBe(true);
+    expect(pidAlive(unrelated.pid!)).toBe(true);
+    killLater(readFleetState(statePath)!.procs[0].pid);
 
     await sup.stopAll();
   });
