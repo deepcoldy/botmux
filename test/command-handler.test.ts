@@ -146,6 +146,7 @@ vi.mock('../src/bot-registry.js', () => ({
       },
     },
   ]),
+  getBotBrand: vi.fn(() => 'feishu'),
   getBotOpenId: vi.fn((id: string = 'app-1') => (id === 'app-2' ? 'ou_codex' : 'ou_claude')),
   // /term (and /card) gate on this. Default owner is ou_owner; tests flip the
   // sender to ou_owner / a non-owner to exercise the gate.
@@ -198,6 +199,12 @@ vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: vi.fn(() => []),
   describeProjectDir: vi.fn(() => null),
+  projectDisplayName: vi.fn((project: { name: string; branch: string }) =>
+    project.branch && project.branch !== project.name ? `${project.name} (${project.branch})` : project.name),
+  worktreeDisplayName: vi.fn((path: string, branch: string) => {
+    const name = path.split('/').filter(Boolean).pop() ?? path;
+    return branch && branch !== name ? `${name} (${branch})` : name;
+  }),
 }));
 
 vi.mock('../src/services/git-worktree.js', () => ({
@@ -412,6 +419,10 @@ vi.mock('../src/core/command-discovery.js', () => ({
   listMcpServerNames: vi.fn(() => []),
 }));
 
+vi.mock('../src/core/forge-availability.js', () => ({
+  checkForgeTraexStartupAvailability: vi.fn(() => ({ available: true })),
+}));
+
 vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
@@ -601,6 +612,7 @@ import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeF
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
+import { checkForgeTraexStartupAvailability } from '../src/core/forge-availability.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -1719,6 +1731,7 @@ describe('handleCommand', () => {
     // its default here, or the last override leaks into subsequent tests.
     vi.mocked(readGlobalConfig).mockReturnValue({});
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
+    vi.mocked(checkForgeTraexStartupAvailability).mockReturnValue({ available: true });
     vi.mocked(findOncallChat).mockReturnValue(undefined);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
     vi.mocked(scheduler.extractDeliveryMode).mockImplementation((prompt: string) => ({ deliver: 'origin' as const, prompt }));
@@ -3776,6 +3789,96 @@ describe('handleCommand', () => {
       );
       expect(selected, 'no 已选择 confirmation was sent').toBeDefined();
       expect(selected![4]).toBe('msg_prime');
+    });
+
+    it('pending TraeX initialization shows startup mode card after text repo selection', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '实现需求',
+        worker: null,
+        repoCardMessageId: 'om_repo_card',
+        session: makeSession({ cliId: undefined, pendingRepoSetup: undefined }),
+        pendingTraexInitialization: {
+          nonce: 'nonce-traex',
+          ownerOpenId: 'ou_sender',
+          originalPrompt: '实现需求',
+          promptPrefix: 'PREFIX\n',
+          phase: 'repo',
+          selection: {
+            kind: 'directory',
+            path: '/home/testuser/projects',
+            label: '/home/testuser/projects',
+            pinWorkingDir: false,
+          },
+        },
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(buildNewTopicCliInput).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingRepoCommitInFlight).toBe(false);
+      expect(ds.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.session.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.session.pendingRepoSetup).toBeUndefined();
+      expect(ds.session.traexForgeMode).toBeUndefined();
+      expect(ds.repoCardMessageId).toBe('reply-msg-id');
+      expect(ds.pendingTraexInitialization).toMatchObject({
+        phase: 'mode',
+        selection: {
+          kind: 'directory',
+          path: '/home/testuser/project-a',
+          label: 'project-a (main)',
+          pinWorkingDir: true,
+        },
+      });
+      const modeCard = vi.mocked(deps.sessionReply).mock.calls.find(c => c[2] === 'interactive');
+      expect(modeCard?.[1]).toContain('选择 TraeX 启动方式');
+      expect(modeCard?.[1]).toContain('forge-pilot');
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_repo_card');
+    });
+
+    it('pending TraeX initialization falls back to master repo launch when Forge is unavailable', async () => {
+      vi.mocked(checkForgeTraexStartupAvailability).mockReturnValue({ available: false, reason: 'forge not found' });
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        worker: null,
+        repoCardMessageId: 'om_repo_card',
+        session: makeSession({ cliId: undefined, pendingRepoSetup: undefined }),
+        pendingTraexInitialization: {
+          nonce: 'nonce-traex',
+          ownerOpenId: 'ou_sender',
+          originalPrompt: '实现需求',
+          promptPrefix: '',
+          phase: 'repo',
+          selection: {
+            kind: 'directory',
+            path: '/home/testuser/projects',
+            label: '/home/testuser/projects',
+            pinWorkingDir: false,
+          },
+        },
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.pendingTraexInitialization).toBeUndefined();
+      expect(ds.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.session.workingDir).toBe('/home/testuser/project-a');
+      expect(vi.mocked(deps.sessionReply).mock.calls.some(c => c[2] === 'interactive')).toBe(false);
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_repo_card');
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {

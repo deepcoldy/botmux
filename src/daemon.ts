@@ -214,8 +214,10 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
-import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, projectDisplayName } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildTraexStartupModeCard } from './im/lark/traex-initialization-card.js';
+import { checkForgeTraexStartupAvailability } from './core/forge-availability.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
@@ -357,7 +359,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, markInitialUserTurnPend
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, resolveThreadReplyRootMessageId, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -3790,6 +3792,10 @@ async function sessionReply(
     ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
     : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
 
+  if (opts?.replyInThreadToMessageId) {
+    return replyWithHookPolicy(opts.replyInThreadToMessageId, content, msgType, true, opts.uuid);
+  }
+
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
   // values, so handleCardAction routes back via sessionKey(chatId).
@@ -5629,6 +5635,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
   ds.repoCardMessageId = undefined;
+  ds.pendingTraexInitialization = undefined;
   ds.pendingPrompt = undefined;
   ds.pendingTurnId = undefined;
   ds.pendingRawInput = undefined;
@@ -6573,6 +6580,19 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+function bindAskToActiveSession<T extends object>(
+  payload: T,
+  ds: DaemonSession,
+  originTurnId?: string,
+): T & { sessionId: string; larkAppId: string; chatId: string; rootMessageId: string | null } {
+  return bindSessionScopedIpcIdentity(payload, {
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    rootMessageId: resolveThreadReplyRootMessageId(ds, originTurnId),
+  });
+}
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -6584,6 +6604,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
   const askSession = findActiveBySessionId(parsed.sessionId);
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
   // Startup window (codex P1-2): IPC is listening but sessions aren't restored
   // yet, so a reconnecting ask hook's session lookup misses and would otherwise
   // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
@@ -6600,15 +6629,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }
   let boundAsk = parsed;
-  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-    ? raw as Record<string, unknown>
-    : {};
   if (!isTrustedHostIpcRequest(req)) {
-    const claimedAttempt = typeof body.originDispatchAttempt === 'number'
-      && Number.isSafeInteger(body.originDispatchAttempt)
-      && body.originDispatchAttempt > 0
-      ? body.originDispatchAttempt
-      : undefined;
     const verified = authorizeSessionScopedIpc({
       trustedHost: false,
       sessionExists: !!askSession,
@@ -6619,7 +6640,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       claimedCapability: typeof body.originCapability === 'string'
         ? body.originCapability
         : undefined,
-      claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
+      claimedTurnId,
       claimedDispatchAttempt: claimedAttempt,
     });
     if (!verified.ok) {
@@ -6631,14 +6652,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // A session capability authenticates exactly one daemon session; it does
     // not let the caller choose another bot/chat/root. Bind every observable
     // ask route to that authenticated session before registering the card.
-    boundAsk = bindSessionScopedIpcIdentity(parsed, {
-      sessionId: askSession!.session.sessionId,
-      larkAppId: askSession!.larkAppId,
-      chatId: askSession!.chatId,
-      rootMessageId: askSession!.session.scope === 'chat'
-        ? null
-        : askSession!.session.rootMessageId,
-    });
+    boundAsk = bindAskToActiveSession(parsed, askSession!, claimedTurnId);
+  } else if (askSession) {
+    // Trusted-host calls still originate from a specific live session. Route
+    // observable ask cards with the same session-owned reply target as normal
+    // daemon output instead of the static process env captured at spawn time.
+    boundAsk = bindAskToActiveSession(parsed, askSession, claimedTurnId);
   }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
@@ -17216,13 +17235,14 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
   anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string; force?: boolean;
   worktreePath?: string; branch?: string; reuseExisting?: boolean; targetSubdir?: string;
 }): void {
+  const replyTurnId = fallbackTurnId(ds, undefined);
   void runAutoWorktreeCommit({
     ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
     title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId, force: args.force,
     worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
     targetSubdir: args.targetSubdir,
     activeSessions,
-    notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
+    notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId, replyTurnId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
 }
@@ -20087,10 +20107,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const newTopicCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  const newTopicPromptOverride = ctx.promptOverride?.trim() || undefined;
+  const newTopicHostPrompt = newTopicPromptOverride ?? newTopicCommandPrompt;
   // 改写前的原文 = 命令解析车道。没有模板时它与 followupContent 逐字相同，
   // 所以这里不需要分支。
   const newTopicCommandLane = parsed.content.trim();
-  if (newTopicCommandPrompt) parsed.content = newTopicCommandPrompt;
+  if (newTopicHostPrompt) parsed.content = newTopicHostPrompt;
 
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
@@ -20243,7 +20265,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // legacy model prompt. Codex App clean-input must keep those original bytes
   // as the visible UserMessage and move the generated skill prompt into hidden
   // untrusted context.
-  const codexAppVisibleText = content;
+  const codexAppVisibleText = newTopicHostPrompt ? newTopicCommandLane : content;
   let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
@@ -20591,7 +20613,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : '';
   // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
   // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
-  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
+  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? newTopicHostPrompt ?? '');
   const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
@@ -20835,8 +20857,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // R7-B1: positive real-human gate — senderType must be 'user' AND not a
       // known peer bot (cross-ref fallback, matching the thread twin's foreign-bot
       // definition; an anomalous/missing sender_type from a known peer must not
-      // be authorized). controlRewrite reflects the ACTUAL v3-grill trigger, not
-      // a hardcoded false — a rewritten /workflow prompt stays serial.
+      // be authorized). controlRewrite reflects actual host prompt rewrites
+      // (/workflow, /summary, command trigger templates), not a hardcoded false.
       humanSender: parsed.senderType === 'user'
         && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId),
       adopted: false,
@@ -20845,7 +20867,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       isBotSenderType,
       explicitBotSteer: botSteerDirective.requested,
       substituteTrigger: !!substituteTrigger,
-      controlRewrite: !!newTopicGrill,
+      controlRewrite: !!newTopicGrill || !!newTopicHostPrompt,
       messageListener: !!messageListener,
       vcMeetingReceiver: false,
       vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -20899,10 +20921,32 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  // Forge 可用时，TraeX 人工首轮改为两段确认：先复用 master repo card，
+  // 工作目录确定后再发启动方式卡；确认前绝不 fork worker。Forge 不可用则沿用
+  // master 的普通 TraeX 启动路径。
+  // Bot/监听器/替身/显式 Forge 指令保留既有直达路径，避免自动化入口等待一个
+  // 永远不会发生的人工点击，也保留专家快捷用法。
+  const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(content);
+  const traexInitializationCandidate =
+    botCfg.cliId === 'traex'
+    && !isBotSenderType
+    && !messageListener
+    && !substituteTrigger
+    && !ctx.commandTrigger
+    && !ctx.promptOverride
+    && !workflowGrillPrompt
+    && !explicitForgePrompt
+    && !topicHeaderIdleStart
+    && !isExistingLarkThreadReply(parsed);
+  const forgeAvailability = traexInitializationCandidate
+    ? checkForgeTraexStartupAvailability()
+    : undefined;
+  const shouldShowTraexInitialization = forgeAvailability?.available === true
+    && !(pinnedWorkingDir && autoWt);
   const sharedWorktree = autoWt && pinnedWorkingDir && forceTopicMode === 'worktree'
     ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
     : undefined;
-  if (ds.pendingRepo) {
+  if (ds.pendingRepo && !shouldShowTraexInitialization) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
@@ -20939,6 +20983,32 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (shouldShowTraexInitialization) {
+      await postTraexStartupModeCard({
+        ds,
+        anchor,
+        larkAppId,
+        triggerMessageId: messageId,
+        replyRootId,
+        pending: {
+          nonce: randomUUID(),
+          ownerOpenId: senderOpenId,
+          originalPrompt: content,
+          promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+          phase: 'mode',
+          selection: {
+            kind: 'directory',
+            path: pinnedWorkingDir,
+            label: pinnedWorkingDir,
+            pinWorkingDir: true,
+          },
+        },
+        logContext: `pinned cwd=${pinnedWorkingDir}`,
+      });
+      markIngressAdmitted(ctx);
+      logger.info(`[${tag(ds)}] Waiting for TraeX startup mode (cwd=${pinnedWorkingDir})`);
+      return;
+    }
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
@@ -20988,6 +21058,23 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    if (shouldShowTraexInitialization) {
+      const currentCwd = getSessionWorkingDir(ds);
+      const currentProject = projects.find(project => project.path === currentCwd);
+      ds.pendingTraexInitialization = {
+        nonce: randomUUID(),
+        ownerOpenId: senderOpenId,
+        originalPrompt: content,
+        promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+        phase: 'repo',
+        selection: {
+          kind: 'directory',
+          path: currentCwd,
+          label: currentProject ? projectDisplayName(currentProject) : currentCwd,
+          pinWorkingDir: false,
+        },
+      };
+    }
     // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
     //（重发会在 pendingRepo 缓冲里再入一份）。
     markIngressAdmitted(ctx);
@@ -21012,6 +21099,33 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
   }
   if (!repoCardPublished) {
+    if (shouldShowTraexInitialization) {
+      const currentCwd = getSessionWorkingDir(ds);
+      await postTraexStartupModeCard({
+        ds,
+        anchor,
+        larkAppId,
+        triggerMessageId: messageId,
+        replyRootId,
+        pending: {
+          nonce: randomUUID(),
+          ownerOpenId: senderOpenId,
+          originalPrompt: content,
+          promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+          phase: 'mode',
+          selection: {
+            kind: 'directory',
+            path: currentCwd,
+            label: currentCwd,
+            pinWorkingDir: false,
+          },
+        },
+        logContext: `no projects, cwd=${currentCwd}`,
+      });
+      markIngressAdmitted(ctx);
+      logger.info(`[${tag(ds)}] Waiting for TraeX startup mode (no projects, cwd=${currentCwd})`);
+      return;
+    }
     // No projects found (or the picker could not be published) — skip repo
     // selection, spawn directly.
     // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
@@ -21665,6 +21779,129 @@ interface PreparedThreadReply {
   postParticipantMentions?: LarkMention[];
 }
 
+function isExistingLarkThreadReply(parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>): boolean {
+  return !!parsed.rootId && !!parsed.threadId && parsed.rootId !== parsed.messageId;
+}
+
+function isTraexInitializationSeedThreadMessage(
+  ds: DaemonSession,
+  parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>,
+  replyRootId?: string,
+): boolean {
+  const seedMessageId = ds.session.rootMessageId;
+  return !!seedMessageId && (
+    parsed.messageId === seedMessageId
+    || parsed.rootId === seedMessageId
+    || parsed.threadId === seedMessageId
+    || replyRootId === seedMessageId
+  );
+}
+
+function shouldReplaceChatScopedTraexInitializationDraft(
+  ds: DaemonSession,
+  parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>,
+  scope: 'thread' | 'chat',
+  replyRootId?: string,
+): boolean {
+  return scope === 'chat'
+    && ds.scope === 'chat'
+    && ds.pendingRepo === true
+    && !!ds.pendingTraexInitialization
+    && !ds.worker
+    && !ds.pendingRepoCommitInFlight
+    && !ds.worktreeCreating
+    && !isTraexInitializationSeedThreadMessage(ds, parsed, replyRootId);
+}
+
+function closeUnstartedTraexInitializationDraft(ds: DaemonSession, reason: string): void {
+  const key = sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  if (activeSessions.get(key) === ds) {
+    activeSessions.delete(key);
+  }
+  ds.pendingRepo = false;
+  ds.pendingTraexInitialization = undefined;
+  ds.repoCardMessageId = undefined;
+  sessionStore.closeSession(ds.session.sessionId);
+  publishClosedSessionPatch(
+    ds.session.sessionId,
+    ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+  );
+  logger.info(`[${tag(ds)}] Closed unstarted TraeX initialization draft: ${reason}`);
+}
+
+async function postTraexStartupModeCard(input: {
+  ds: DaemonSession;
+  anchor: string;
+  larkAppId: string;
+  triggerMessageId: string;
+  replyRootId?: string;
+  pending: NonNullable<DaemonSession['pendingTraexInitialization']>;
+  logContext: string;
+}): Promise<void> {
+  const { ds, anchor, larkAppId, triggerMessageId, replyRootId, pending, logContext } = input;
+  const previousPendingRepo = ds.pendingRepo;
+  const previousInitialStartPending = ds.initialStartPending;
+  const previousPendingTraexInitialization = ds.pendingTraexInitialization;
+  const previousRepoCardMessageId = ds.repoCardMessageId;
+  const previousReplyThreadAliases = ds.replyThreadAliases;
+  const previousCurrentReplyTarget = ds.currentReplyTarget;
+  const previousSessionReplyThreadAliases = ds.session.replyThreadAliases;
+  const previousSessionCurrentReplyTarget = ds.session.currentReplyTarget;
+  const previousSessionReplyTargets = ds.session.replyTargets;
+
+  ds.pendingRepo = true;
+  ds.initialStartPending = false;
+  ds.pendingTraexInitialization = pending;
+  ds.repoCardMessageId = undefined;
+  beginReplyTargetTurn(
+    ds,
+    replyRootId,
+    ds.pendingTurnId ?? triggerMessageId,
+    new Date().toISOString(),
+  );
+  sessionStore.updateSession(ds.session);
+  try {
+    const cardJson = buildTraexStartupModeCard({
+      rootId: anchor,
+      pending,
+      locale: localeForBot(larkAppId),
+    });
+    ds.repoCardMessageId = await sessionReply(
+      anchor,
+      cardJson,
+      'interactive',
+      larkAppId,
+      undefined,
+      replyRootId ? { replyInThreadToMessageId: replyRootId } : undefined,
+    );
+  } catch (error) {
+    ds.pendingRepo = previousPendingRepo;
+    ds.initialStartPending = previousInitialStartPending;
+    ds.pendingTraexInitialization = previousPendingTraexInitialization;
+    ds.repoCardMessageId = previousRepoCardMessageId;
+    ds.replyThreadAliases = previousReplyThreadAliases;
+    ds.currentReplyTarget = previousCurrentReplyTarget;
+    ds.session.replyThreadAliases = previousSessionReplyThreadAliases;
+    ds.session.currentReplyTarget = previousSessionCurrentReplyTarget;
+    ds.session.replyTargets = previousSessionReplyTargets;
+    if (activeSessions.get(sessionKey(anchor, larkAppId)) === ds) {
+      activeSessions.delete(sessionKey(anchor, larkAppId));
+    }
+    sessionStore.closeSession(ds.session.sessionId);
+    publishClosedSessionPatch(
+      ds.session.sessionId,
+      ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+    );
+    logger.warn(
+      `[${tag(ds)}] Failed to post TraeX startup mode card; rolled back pending draft `
+      + `(${logContext}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+    throw error;
+  }
+
+  announcePendingRepoSession(ds);
+}
+
 async function handleThreadReply(
   data: any,
   ctx: RoutingContext,
@@ -21760,13 +21997,16 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
-  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同理由——模板渲染结果只进 CLI
-  // 正文，命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
+  // Host-owned command rewrite（续聊路径）：模板 / summary prompt 只进 CLI 正文；
+  // 命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  const threadPromptOverride = ctx.promptOverride?.trim() || undefined;
+  const threadHostPrompt = threadPromptOverride ?? threadCommandPrompt;
   const threadCommandLane = parsed.content.trim();
-  if (threadCommandPrompt) parsed.content = threadCommandPrompt;
+  if (threadHostPrompt) parsed.content = threadHostPrompt;
+  const threadCodexAppVisibleText = threadHostPrompt ? threadCommandLane : parsed.content;
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -21781,7 +22021,9 @@ async function handleThreadReplyAdmitted(
     + initialCodexAppApplicationContext
     + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
-  let rewrittenCodexAppMessageContext: string | undefined;
+  let rewrittenCodexAppMessageContext: string | undefined = threadHostPrompt
+    ? initialCodexAppMessageContext + threadHostPrompt
+    : undefined;
   if (!prepared) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
     emitHookEvent('thread.reply', {
@@ -22301,6 +22543,20 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
+  if (ds && shouldReplaceChatScopedTraexInitializationDraft(ds, parsed, scope, replyRootId)) {
+    const previousSessionId = ds.session.sessionId;
+    const previousSeed = ds.session.rootMessageId;
+    closeUnstartedTraexInitializationDraft(
+      ds,
+      `new chat-scope message ${parsed.messageId} should get its own initialization card (previous seed=${previousSeed})`,
+    );
+    logger.info(
+      `[${previousSessionId.substring(0, 8)}] Re-routing chat-scope TraeX message ` +
+      `${parsed.messageId} as a fresh initialization card instead of buffering into ${previousSeed}`,
+    );
+    await handleNewTopic(data, { ...ctx, scope, anchor, messageId: parsed.messageId });
+    return;
+  }
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -22470,7 +22726,7 @@ async function handleThreadReplyAdmitted(
   // of them return before the later existing-owner branch. Explicit positive
   // only for a plain-human-interactive turn or a foreign bot carrying an
   // explicit `@steer` directive. Plain @mentions, reports, other bot traffic,
-  // substitute-rewrite, v3-grill, message-listener, VC and adopt stay serial.
+  // substitute-rewrite, host prompt rewrites, message-listener, VC and adopt stay serial.
   // Never inferred from the delivery sink;
   // ignored by acceptCodexAppDispatch for non-codex-app CLIs. A new-topic root
   // must FREEZE this into its opening payload — forkReservedInitialSession is
@@ -22485,7 +22741,7 @@ async function handleThreadReplyAdmitted(
     isBotSenderType,
     explicitBotSteer: botSteerDirective.requested,
     substituteTrigger: !!substituteTrigger,
-    controlRewrite: !!threadGrill,
+    controlRewrite: !!threadGrill || !!threadHostPrompt,
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -22519,7 +22775,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
@@ -22612,7 +22868,7 @@ async function handleThreadReplyAdmitted(
         codexAppFollowUpContextParts.unshift(followUpSenderBlock);
       }
     }
-    if (ds.pendingRepo) {
+    if (ds.pendingRepo && !ds.pendingTraexInitialization) {
       const hasOpening = (ds.pendingPrompt?.trim().length ?? 0) > 0
         || (ds.pendingAttachments?.length ?? 0) > 0
         || !!ds.pendingRawInput;
@@ -22622,7 +22878,7 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
-        ds.pendingCodexAppText = parsed.content;
+        ds.pendingCodexAppText = threadCodexAppVisibleText;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -22655,7 +22911,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
@@ -22677,8 +22933,10 @@ async function handleThreadReplyAdmitted(
       // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
       // 失败也不得诱导重发（PR #846 review）。
       markIngressAdmitted(ctx);
-      const pendingReplyKey = ds.worktreeCreating
+      const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
         ? 'daemon.worktree_building_wait'
+        : ds.pendingTraexInitialization
+          ? 'daemon.complete_traex_init_first'
         : 'daemon.choose_repo_first';
       await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
       return;
@@ -22720,7 +22978,7 @@ async function handleThreadReplyAdmitted(
     if (!ds.pendingFollowUpTurnIds) ds.pendingFollowUpTurnIds = [];
     ds.pendingFollowUpTurnIds.push(parsed.messageId);
     if (!ds.pendingCodexAppFollowUps) ds.pendingCodexAppFollowUps = [];
-    ds.pendingCodexAppFollowUps.push(parsed.content);
+    ds.pendingCodexAppFollowUps.push(threadCodexAppVisibleText);
     if (!ds.pendingCodexAppFollowUpContexts) ds.pendingCodexAppFollowUpContexts = [];
     ds.pendingCodexAppFollowUpContexts.push(codexAppFollowUpContextParts.join('\n\n'));
     if (!ds.pendingCodexAppFollowUpGateAccepted) {
@@ -22745,8 +23003,17 @@ async function handleThreadReplyAdmitted(
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
-    await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      : ds.pendingTraexInitialization
+        ? 'daemon.complete_traex_init_first'
+        : 'daemon.choose_repo_first';
+    await sessionReply(
+      anchor,
+      tr(pendingReplyKey, undefined, localeForBot(larkAppId)),
+      'text',
+      larkAppId,
+      undefined,
+      replyRootId ? { replyInThreadToMessageId: replyRootId } : undefined,
+    );
     return;
   }
 
@@ -22850,7 +23117,7 @@ async function handleThreadReplyAdmitted(
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
-      pendingCodexAppText: parsed.content,
+      pendingCodexAppText: threadCodexAppVisibleText,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -22902,7 +23169,22 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
-    if (newDs.pendingRepo) {
+    const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(parsed.content);
+    const traexInitializationCandidate =
+      botCfg.cliId === 'traex'
+      && !isForeignBot
+      && !substituteTrigger
+      && !ctx.commandTrigger
+      && !ctx.promptOverride
+      && !explicitForgePrompt
+      && !threadGrill
+      && !isExistingLarkThreadReply(parsed);
+    const forgeAvailability = traexInitializationCandidate
+      ? checkForgeTraexStartupAvailability()
+      : undefined;
+    const shouldShowTraexInitialization = forgeAvailability?.available === true
+      && !(pinnedWorkingDir && autoWt);
+    if (newDs.pendingRepo && !shouldShowTraexInitialization) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
         ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
@@ -22929,6 +23211,32 @@ async function handleThreadReplyAdmitted(
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      if (shouldShowTraexInitialization) {
+        await postTraexStartupModeCard({
+          ds: newDs,
+          anchor,
+          larkAppId,
+          triggerMessageId: parsed.messageId,
+          replyRootId,
+          pending: {
+            nonce: randomUUID(),
+            ownerOpenId,
+            originalPrompt: parsed.content,
+            promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+            phase: 'mode',
+            selection: {
+              kind: 'directory',
+              path: pinnedWorkingDir,
+              label: pinnedWorkingDir,
+              pinWorkingDir: true,
+            },
+          },
+          logContext: `reply auto-create pinned cwd=${pinnedWorkingDir}`,
+        });
+        markIngressAdmitted(ctx);
+        logger.info(`[${tag(newDs)}] Waiting for TraeX startup mode after reply auto-create (cwd=${pinnedWorkingDir})`);
+        return;
+      }
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -22955,6 +23263,23 @@ async function handleThreadReplyAdmitted(
     if (projects.length > 0) {
       newDs.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(autoCreateChatId, projects);
+      if (shouldShowTraexInitialization) {
+        const currentCwd = getSessionWorkingDir(newDs);
+        const currentProject = projects.find(project => project.path === currentCwd);
+        newDs.pendingTraexInitialization = {
+          nonce: randomUUID(),
+          ownerOpenId,
+          originalPrompt: parsed.content,
+          promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+          phase: 'repo',
+          selection: {
+            kind: 'directory',
+            path: currentCwd,
+            label: currentProject ? projectDisplayName(currentProject) : currentCwd,
+            pinWorkingDir: false,
+          },
+        };
+      }
       // 已 durable staging（picker）且通过放弃闸；卡片发送失败不得诱导重发。
       markIngressAdmitted(ctx);
       const currentCwd = getSessionWorkingDir(newDs);
@@ -22978,6 +23303,33 @@ async function handleThreadReplyAdmitted(
       }
     }
     if (!repoCardPublished) {
+      if (shouldShowTraexInitialization) {
+        const currentCwd = getSessionWorkingDir(newDs);
+        await postTraexStartupModeCard({
+          ds: newDs,
+          anchor,
+          larkAppId,
+          triggerMessageId: parsed.messageId,
+          replyRootId,
+          pending: {
+            nonce: randomUUID(),
+            ownerOpenId,
+            originalPrompt: parsed.content,
+            promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+            phase: 'mode',
+            selection: {
+              kind: 'directory',
+              path: currentCwd,
+              label: currentCwd,
+              pinWorkingDir: false,
+            },
+          },
+          logContext: `reply auto-create no projects, cwd=${currentCwd}`,
+        });
+        markIngressAdmitted(ctx);
+        logger.info(`[${tag(newDs)}] Waiting for TraeX startup mode after reply auto-create (no projects, cwd=${currentCwd})`);
+        return;
+      }
       // No projects found (or the picker could not be published) — skip repo
       // selection, spawn directly.
       // 已 durable staging（picker）：fork 失败后 opening 仍由会话 durable 持有，
@@ -23104,7 +23456,7 @@ async function handleThreadReplyAdmitted(
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
-            codexAppText: parsed.content,
+            codexAppText: threadCodexAppVisibleText,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -23124,7 +23476,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
@@ -23270,7 +23622,7 @@ async function handleThreadReplyAdmitted(
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
-            codexAppText: parsed.content,
+            codexAppText: threadCodexAppVisibleText,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,

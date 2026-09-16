@@ -19,11 +19,11 @@ describe('daemon Codex App workflow prompt lanes', () => {
       'const autoStartJoinInFlight',
     );
 
-    expect(block.indexOf('const codexAppVisibleText = content;'))
+    expect(block.indexOf('const codexAppVisibleText = newTopicHostPrompt ? newTopicCommandLane : content;'))
       .toBeLessThan(block.indexOf('content = workflowGrillPrompt;'));
     // 话题上下文 (topicThreadContext) 必须双 lane 下发：既进 legacy promptContent，
     // 也进 codex-app 结构化 sidecar codexAppMessageContext，否则 codex-app bot 静默丢话题历史。
-    expect(block).toContain("const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');");
+    expect(block).toContain("const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? newTopicHostPrompt ?? '');");
     expect(block).toContain('const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
     expect(source).toContain('codexAppText: ds.pendingCodexAppText');
@@ -57,6 +57,8 @@ describe('daemon Codex App workflow prompt lanes', () => {
     );
     expect(block).toContain('if (ds?.pendingRepo || initialStartPending) {');
     expect(block).not.toContain('if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending)');
+    expect(block).toContain('ds.pendingCodexAppFollowUps.push(threadCodexAppVisibleText);');
+    expect(block).not.toContain('ds.pendingCodexAppFollowUps.push(parsed.content);');
   });
 
   it('does not use the raw owner DM fallback for notifier card authorization', () => {

@@ -1079,6 +1079,7 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   const cfg = lastInitConfig;
   const trimmed = title?.trim();
   if (!cfg || cfg.adoptMode || !trimmed) return false;
+  if (cfg.cliId === 'traex' && cfg.traexForgeMode) return false;
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
@@ -6619,6 +6620,25 @@ function structuredBridgeIsGrok(): boolean {
 
 function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
+}
+
+function quoteForgeAgentArg(value: string): string {
+  if (value.length === 0) return "''";
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildTraexForgeLaunch(traexArgs: readonly string[]): { bin: string; args: string[] } {
+  const agentArgs = traexArgs.map(quoteForgeAgentArg).join(' ');
+  return {
+    bin: locateOnPath('forge') ?? 'forge',
+    args: [
+      'run',
+      '--agent',
+      'traex',
+      ...(agentArgs ? ['--agent-args', agentArgs] : []),
+    ],
+  };
 }
 
 function currentHermesBridgeDbPath(): string {
@@ -14857,7 +14877,7 @@ async function spawnCli(
     remoteThreadId,
     // The remote TUI is only a viewer; its app-server received the same hook in
     // engageCodexRpc. Plain Trae TUI processes own the model and get it here.
-    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
+    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !cfg.traexForgeMode && !remoteWsUrl
       ? nativeSubagentRuntimeHookCommand()
       : undefined,
   });
@@ -14876,6 +14896,11 @@ async function spawnCli(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
+  const traexForgeLaunch = cfg.cliId === 'traex' && cfg.traexForgeMode
+    ? buildTraexForgeLaunch(args)
+    : undefined;
+  const baseLaunchBin = traexForgeLaunch?.bin ?? cliAdapter.resolvedBin;
+  const baseLaunchArgs = traexForgeLaunch?.args ?? args;
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
@@ -14909,9 +14934,9 @@ async function spawnCli(
   // debugging time. (CliId-mismatch reattach is now blocked upstream in
   // restoreActiveSessions / killStalePids.)
   if (willReattachPersistent) {
-    log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${cliAdapter.resolvedBin})`);
+    log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${baseLaunchBin})`);
   } else {
-    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+    log(`Spawning fresh CLI: ${baseLaunchBin} ${baseLaunchArgs.join(' ')} (cwd: ${cfg.workingDir})`);
 
     // Pre-flight the ACTUAL launch dependency, not merely adapter.resolvedBin:
     // wrapperCli replaces that binary, while Codex App / Mir use a bundled Node
@@ -14921,11 +14946,13 @@ async function spawnCli(
     // "starting" card with no CLI behind it.
     const unavailable = effectiveBackendType === 'riff'
       ? undefined
-      : cliUnavailableMessage({
-          cliId: cfg.cliId as CliId,
-          cliPathOverride: cfg.cliPathOverride,
-          wrapperCli: cfg.wrapperCli,
-        }, cliName());
+      : (!traexForgeLaunch || locateOnPath('forge')
+          ? cliUnavailableMessage({
+              cliId: cfg.cliId as CliId,
+              cliPathOverride: cfg.cliPathOverride,
+              wrapperCli: traexForgeLaunch ? undefined : cfg.wrapperCli,
+            }, cliName())
+          : 'Forge CLI not found in PATH for TraeX Forge startup');
     if (unavailable) {
       log(`${unavailable} (PATH=${process.env.PATH ?? ''})`);
       throw new Error(unavailable);
@@ -15283,13 +15310,13 @@ async function spawnCli(
   // per-session project copy + de-identified config. The agent's `botmux send`
   // routes through a daemon-side outbox watcher (creds never enter the sandbox).
   // PTY backend only for the spike; falls back to direct spawn on any failure.
-  let spawnBin = cliAdapter.resolvedBin;
-  let spawnArgs = args;
+  let spawnBin = baseLaunchBin;
+  let spawnArgs = [...baseLaunchArgs];
   let spawnCwd = cfg.workingDir;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
-  // credential-only）之前，记下**基础 CLI** 的 bin/args（cliAdapter.resolvedBin +
-  // buildArgs 产出）。独立维护、绝不从已被外层包装的 spawnBin/spawnArgs 回推。最终
+  // credential-only）之前，记下**基础启动**的 bin/args（Plain=adapter 裸命令，
+  // Forge=forge run --agent traex）。独立维护、绝不从已被外层包装的 spawnBin/spawnArgs 回推。最终
   // 复现形态（是否套 wrapperCli）由 selectReproduceLaunch 在 spawn 时统一决策——见
   // reproduce-command.ts。这里只锁定"包装前的基础"这个事实。
   const reproduceBaseBin = spawnBin;
@@ -15424,7 +15451,7 @@ async function spawnCli(
     // Every executable spawned INSIDE the sandbox must be readable: the CLI
     // binary's dir, the daemon's own node (fnm farms under /run land here),
     // adapter second-stage bins, plus the standalone-codex package tree.
-    const execDirs = [cliAdapter.resolvedBin, process.execPath, ...(cliAdapter.sandboxExtraExecPaths?.() ?? [])]
+    const execDirs = [cliAdapter.resolvedBin, ...(traexForgeLaunch ? [baseLaunchBin] : []), process.execPath, ...(cliAdapter.sandboxExtraExecPaths?.() ?? [])]
       .filter((p): p is string => typeof p === 'string' && !!p)
       .map(p => dirname(canonical(p)));
     const execCarve = buildCliExecutableReadCarveOuts({
@@ -15852,8 +15879,8 @@ async function spawnCli(
         policy,
         chdir: canonical(cfg.workingDir),
         home: sandboxHome,
-        cliBin: cliAdapter.resolvedBin,
-        cliArgs: args,
+        cliBin: spawnBin,
+        cliArgs: spawnArgs,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
@@ -16020,7 +16047,9 @@ async function spawnCli(
     log(`mojo extra CLI args deferred to per-turn append: ${spawnArgs.join(' ')}`);
     spawnArgs = [];
   }
-  if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
+  if (cfg.wrapperCli && cfg.wrapperCli.trim() && traexForgeLaunch) {
+    log(`wrapperCli="${cfg.wrapperCli}" ignored: TraeX Forge startup uses forge run --agent traex`);
+  } else if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxRequested) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
     } else {
@@ -16255,7 +16284,7 @@ async function spawnCli(
     const reproduceLaunch = selectReproduceLaunch({
       baseBin: reproduceBaseBin,
       baseArgs: reproduceBaseArgs,
-      wrapperCli: cfg.wrapperCli,
+      wrapperCli: traexForgeLaunch ? undefined : cfg.wrapperCli,
       sandboxOn: sandboxRequested,
       binResolver: (b) => locateOnPath(b) ?? b,
       ttadkModel: cfg.model,

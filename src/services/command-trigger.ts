@@ -22,13 +22,31 @@
 import { getBot, type CommandTriggerCommand, type CommandTriggerConfig } from '../bot-registry.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../core/passthrough-commands.js';
 
-export type ReservedCommandKind = 'daemon' | 'passthrough' | 'force-topic';
+export type ReservedCommandKind = 'daemon' | 'passthrough' | 'force-topic' | 'host';
 
 /**
  * 路由元命令：`parseTopicHeader` 在命令表之前拦截，不在 DAEMON_COMMANDS
  * 里，所以必须单列，否则 `/t` 会成为一个可配置的免@ 命令并强制开新话题。
  */
-const FORCE_TOPIC_COMMANDS = new Set(['/t', '/topic']);
+const FORCE_TOPIC_COMMANDS = new Set(['/t', '/topic', '/th', '/tw']);
+
+/**
+ * Host-side commands intercepted outside DAEMON_COMMANDS/PASSTHROUGH_COMMANDS.
+ * They must stay unavailable as no-@ commandTriggers, otherwise a custom trigger
+ * can steal their syntax before the daemon-specific handler sees the turn.
+ */
+const HOST_COMMANDS = new Set([
+  '/reply-mode',
+  '/mention-mode',
+  '/substitute',
+  '/grant',
+  '/revoke',
+  '/invite',
+  '/introduce',
+  '/summary',
+  '/workflow',
+  '/template',
+]);
 
 /**
  * 该命令是否属于 botmux 保留命令（→ 必须 @ 才能触发）。
@@ -49,6 +67,7 @@ export function reservedCommandKind(
   const c = cmd.trim().toLowerCase();
   if (DAEMON_COMMANDS.has(c)) return 'daemon';
   if (FORCE_TOPIC_COMMANDS.has(c)) return 'force-topic';
+  if (HOST_COMMANDS.has(c)) return 'host';
   if (PASSTHROUGH_COMMANDS.has(c) || extraPassthrough?.has(c)) return 'passthrough';
   return null;
 }

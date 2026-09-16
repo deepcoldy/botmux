@@ -3897,6 +3897,30 @@ describe('session.start lifecycle integration', () => {
     expect(init.nativeSessionTitle).toContain('/product/alpha/content/videoTag');
   });
 
+  it('does not override the Forge TraeX native title with the Lark prompt title', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', wrapperCli: undefined }));
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliId: 'traex',
+        traexForgeMode: 'forge-pilot',
+        title: '$forge-pilot 详细阅读',
+        nativeSessionTitle: '[BotMux·Lark] $forge-pilot 详细阅读',
+      },
+    });
+
+    forkWorker(ds, '<user_message>$forge-pilot 详细阅读</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      traexForgeMode: 'forge-pilot',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitle');
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+  });
+
   it.each([
     ['codex'],
     ['traex'],

@@ -38,6 +38,18 @@ describe('reserved command tables', () => {
     expect(reservedCommandKind('/clear')).toBe('passthrough');
     expect(reservedCommandKind('/t')).toBe('force-topic');
     expect(reservedCommandKind('/topic')).toBe('force-topic');
+    expect(reservedCommandKind('/th')).toBe('force-topic');
+    expect(reservedCommandKind('/tw')).toBe('force-topic');
+    expect(reservedCommandKind('/summary')).toBe('host');
+    expect(reservedCommandKind('/reply-mode')).toBe('host');
+    expect(reservedCommandKind('/mention-mode')).toBe('host');
+    expect(reservedCommandKind('/substitute')).toBe('host');
+    expect(reservedCommandKind('/grant')).toBe('host');
+    expect(reservedCommandKind('/revoke')).toBe('host');
+    expect(reservedCommandKind('/invite')).toBe('host');
+    expect(reservedCommandKind('/introduce')).toBe('host');
+    expect(reservedCommandKind('/workflow')).toBe('host');
+    expect(reservedCommandKind('/template')).toBe('host');
     expect(reservedCommandKind('/solve')).toBe(null);
   });
 
@@ -146,11 +158,13 @@ describe('matchCommandTrigger', () => {
   it('fails closed on reserved commands smuggled into the whitelist', () => {
     mockGetBot.mockReturnValue(botWith({
       enabled: true,
-      commands: ['/close', '/clear', '/t', '/solve'],
+      commands: ['/close', '/clear', '/t', '/summary', '/reply-mode', '/solve'],
     }));
     expect(matchCommandTrigger('app', 'oc_a', '/close')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/clear')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/t')).toBeUndefined();
+    expect(matchCommandTrigger('app', 'oc_a', '/summary')).toBeUndefined();
+    expect(matchCommandTrigger('app', 'oc_a', '/reply-mode')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/solve')).toBeDefined();
   });
 

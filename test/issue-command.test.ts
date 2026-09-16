@@ -21,6 +21,12 @@ import {
 vi.mock('../src/services/project-scanner.js', () => ({
   describeProjectDir: vi.fn(() => null),
   scanMultipleProjects: vi.fn(() => []),
+  projectDisplayName: vi.fn((project: { name: string; branch: string }) =>
+    project.branch && project.branch !== project.name ? `${project.name} (${project.branch})` : project.name),
+  worktreeDisplayName: vi.fn((path: string, branch: string) => {
+    const name = path.split('/').filter(Boolean).pop() ?? path;
+    return branch && branch !== name ? `${name} (${branch})` : name;
+  }),
 }));
 
 const APP = 'cli_worker';

@@ -70,6 +70,12 @@ vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: vi.fn(() => []),
   describeProjectDir: vi.fn(() => ''),
+  projectDisplayName: vi.fn((project: { name: string; branch: string }) =>
+    project.branch && project.branch !== project.name ? `${project.name} (${project.branch})` : project.name),
+  worktreeDisplayName: vi.fn((path: string, branch: string) => {
+    const name = path.split('/').filter(Boolean).pop() ?? path;
+    return branch && branch !== name ? `${name} (${branch})` : name;
+  }),
 }));
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),

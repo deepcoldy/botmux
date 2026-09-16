@@ -32,7 +32,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
-| `[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository, model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
+| `[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`; `/th` = `/t here`, `/tw` = `/t worktree`) | Force a new topic inside a regular group, declaring the title, repository, model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
@@ -102,6 +102,8 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 The group-level setting overrides the dashboard "Bot Config → Regular Group Mode" default.
 
 `/substitute [status|on|off]` — show or toggle **substitute mode** for the current group (owner-only to change).
+
+`/mention-mode [status|always|topic|never|ambient]` — show or change the current regular group's @-mention policy (owner-only to change).
 
 ## 📑 Chat Tabs
 
@@ -198,6 +200,7 @@ See [Session Relay](/en/relay) for details.
 |------|------|
 | `@bot /grant @someone` | Authorize that person to chat in this group; `/grant` (without a person) authorizes **all members of this group** to chat |
 | `@bot /revoke @someone` | Revoke that person's chat permission in this group; `/revoke` (without a person) revokes the whole group's authorization |
+| `@bot /invite @bot` | Pull an out-of-chat bot into this group; `@bot /invite --app cli_xxx` can add directly by app id |
 | `/vc-auth @someone` | While meeting-listening is on, temporarily trust an in-meeting instruction source; `/vc-auth revoke @someone` revokes; `/vc-auth list` shows current grants |
 
 ## ⚙️ Remote Config & Skills (owner-only)

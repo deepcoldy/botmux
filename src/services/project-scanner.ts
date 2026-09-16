@@ -54,6 +54,17 @@ export interface ProjectScanOptions {
   onBudgetExceeded?: (info: { reason: 'dirs' | 'time'; dirsVisited: number; baseDir: string }) => void;
 }
 
+export function projectDisplayName(project: Pick<ProjectInfo, 'name' | 'branch'>): string {
+  const name = project.name.trim();
+  const branch = project.branch.trim();
+  if (!branch || branch === name) return name || branch || 'unknown';
+  return `${name} (${branch})`;
+}
+
+export function worktreeDisplayName(path: string, branch: string): string {
+  return projectDisplayName({ name: basename(path), branch });
+}
+
 /** Upper bound on directories a single `scanProjects` walk will visit before
  *  bailing out. `scanProjects` is fully synchronous (readdirSync + a `git`
  *  subprocess per repo), so an unbounded walk over a huge root such as the

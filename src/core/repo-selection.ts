@@ -9,7 +9,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 
-import { scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
+import { scanMultipleProjects, describeProjectDir, projectDisplayName } from '../services/project-scanner.js';
 import { expandHome } from './working-dir.js';
 
 /**
@@ -59,7 +59,7 @@ export function resolveRepoSelection(
     }
     const desc = describeProjectDir(cand);
     return desc
-      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
+      ? { path: cand, displayName: projectDisplayName(desc) }
       : { path: cand, displayName: basename(cand) };
   }
 
@@ -71,7 +71,7 @@ export function resolveRepoSelection(
   const existingScanDirs = scanDirs.filter((d) => existsSync(d));
   const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
   const byName = projects.find((p) => p.name === repoArg);
-  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
+  if (byName) return { path: byName.path, displayName: projectDisplayName(byName) };
 
   return null;
 }

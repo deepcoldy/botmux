@@ -1,6 +1,6 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import type { ProjectInfo } from '../../services/project-scanner.js';
+import { projectDisplayName, type ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
@@ -1365,7 +1365,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
     const currentTag = p.path === currentPath ? currentMarker : '';
     const typeTag = p.type === 'worktree' ? ' [worktree]' : '';
     return {
-      text: { tag: 'plain_text' as const, content: `${i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
+      text: { tag: 'plain_text' as const, content: `${i + 1}. ${projectDisplayName(p)}${typeTag}${currentTag}` },
       value: p.path,
     };
   });
@@ -1376,7 +1376,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
   const worktreeOptions = projects
     .filter(p => p.type === 'repo')
     .map(p => ({
-      text: { tag: 'plain_text' as const, content: `${p.name} (${p.branch})` },
+      text: { tag: 'plain_text' as const, content: projectDisplayName(p) },
       value: p.path,
     }));
 

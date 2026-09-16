@@ -5012,7 +5012,7 @@ type CommandTriggerCheck = {
   input: string;
   valid: boolean;
   cmd?: string;
-  kind: 'daemon' | 'passthrough' | 'force-topic' | null;
+  kind: 'daemon' | 'passthrough' | 'force-topic' | 'host' | null;
 };
 
 type CommandTriggerRow = { key: number; cmd: string; prompt: string };
@@ -5082,6 +5082,7 @@ function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
       case 'daemon': return tr('botDefaults.commandTriggerConflictDaemon');
       case 'passthrough': return tr('botDefaults.commandTriggerConflictPassthrough');
       case 'force-topic': return tr('botDefaults.commandTriggerConflictForceTopic');
+      case 'host': return tr('botDefaults.commandTriggerConflictHost');
       default: return tr('botDefaults.commandTriggerOk');
     }
   }

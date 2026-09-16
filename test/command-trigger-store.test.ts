@@ -49,6 +49,19 @@ describe('validateCommandTriggerUpdate', () => {
       .toEqual({ ok: false, reason: 'reserved_command', conflicts: [{ cmd: '/t', kind: 'force-topic' }] });
   });
 
+  it('rejects host-side commands handled before ordinary prompt routing', () => {
+    expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/summary', '/reply-mode', '/mention-mode'] }))
+      .toEqual({
+        ok: false,
+        reason: 'reserved_command',
+        conflicts: [
+          { cmd: '/summary', kind: 'host' },
+          { cmd: '/reply-mode', kind: 'host' },
+          { cmd: '/mention-mode', kind: 'host' },
+        ],
+      });
+  });
+
   it('rejects a CLI-specific passthrough command when the caller supplies the set', () => {
     expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/goal'] })).toEqual({ ok: true });
     expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/goal'] }, new Set(['/goal'])))

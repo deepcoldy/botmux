@@ -91,7 +91,7 @@ export interface CreateAskInput {
   replyCardTarget?: { turnId: string; dispatchAttempt?: number };
   larkAppId: string;
   chatId: string;
-  /** thread-scope ask → root message_id; chat-scope ask → null. */
+  /** Visible Lark thread target for the ask card; null means post flat to chat. */
   rootMessageId: string | null;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
@@ -143,6 +143,7 @@ export interface PendingAsk {
   nonce: string;
   larkAppId: string;
   chatId: string;
+  /** Visible Lark thread target for the ask card; null means post flat to chat. */
   rootMessageId: string | null;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */

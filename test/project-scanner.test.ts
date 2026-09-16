@@ -28,7 +28,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 // Import after mock setup
-import { scanProjects, scanMultipleProjects, DEFAULT_MAX_SCAN_DIRS, DEFAULT_MAX_SCAN_MS, type ProjectInfo } from '../src/services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, projectDisplayName, worktreeDisplayName, DEFAULT_MAX_SCAN_DIRS, DEFAULT_MAX_SCAN_MS, type ProjectInfo } from '../src/services/project-scanner.js';
 import { execSync } from 'node:child_process';
 
 const mockedExecSync = vi.mocked(execSync);
@@ -77,6 +77,20 @@ function mkDir(relPath: string): string {
   mkdirSync(full, { recursive: true });
   return full;
 }
+
+describe('project display names', () => {
+  it('omits the branch suffix when name and branch are identical', () => {
+    expect(projectDisplayName({ name: 'forge-pilot_saas_prehire_2_wd_19', branch: 'forge-pilot_saas_prehire_2_wd_19' }))
+      .toBe('forge-pilot_saas_prehire_2_wd_19');
+    expect(worktreeDisplayName('/repos/forge-pilot_saas_prehire_2_wd_19', 'forge-pilot_saas_prehire_2_wd_19'))
+      .toBe('forge-pilot_saas_prehire_2_wd_19');
+  });
+
+  it('keeps branch suffixes when they add information', () => {
+    expect(projectDisplayName({ name: 'botmux', branch: 'feat_support_forge' }))
+      .toBe('botmux (feat_support_forge)');
+  });
+});
 
 // ─── Setup / Teardown ────────────────────────────────────────────────────
 

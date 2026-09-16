@@ -110,7 +110,7 @@ import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js'
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
-import type { ProjectInfo } from '../../services/project-scanner.js';
+import { projectDisplayName, worktreeDisplayName, type ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
@@ -126,6 +126,24 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
+import {
+  buildTraexInitializationPrompt,
+  normalizeTraexInitialPrompt,
+  normalizeTraexInitializationMode,
+  type TraexInitializationMode,
+  type TraexInitializationSelection,
+} from '../../core/traex-initialization.js';
+import { checkForgeTraexStartupAvailability } from '../../core/forge-availability.js';
+import {
+  buildTraexInitializationCancelledCard,
+  buildTraexStartupModeCard,
+  TRAEX_INIT_ACTION_CANCEL,
+  TRAEX_INIT_ACTION_MANUAL_SELECT,
+  TRAEX_INIT_ACTION_START,
+  TRAEX_INIT_ACTION_WORKTREE_MULTI_SELECT,
+  TRAEX_INIT_KEY_MODE,
+  TRAEX_INIT_KEY_TARGET,
+} from './traex-initialization-card.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
@@ -426,6 +444,65 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
   return [...dupes];
 }
 
+function resolveTraexTargetSelection(
+  selectedTarget: string,
+  projects: ProjectInfo[],
+  locale?: Locale,
+): { ok: true; selection: TraexInitializationSelection } | { ok: false; message: string } {
+  if (selectedTarget.startsWith('worktree:')) {
+    const selectedWorktreePath = selectedTarget.slice('worktree:'.length);
+    const project = projects.find(item => item.path === selectedWorktreePath && item.type === 'repo');
+    if (!project) {
+      return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
+    }
+    return {
+      ok: true,
+      selection: { kind: 'worktree', repoPaths: [project.path], label: project.name },
+    };
+  }
+
+  if (selectedTarget.startsWith('dir:')) {
+    const selectedRepoPath = selectedTarget.slice('dir:'.length);
+    const project = projects.find(item => item.path === selectedRepoPath);
+    if (!project) {
+      return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
+    }
+    return {
+      ok: true,
+      selection: {
+        kind: 'directory',
+        path: project.path,
+        label: projectDisplayName(project),
+        pinWorkingDir: true,
+      },
+    };
+  }
+
+  return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
+}
+
+function traexStartupModeLabel(mode: TraexInitializationMode, locale?: Locale): string {
+  if (mode === 'forge-pipeline') return t('card.traex_init.start_pipeline', undefined, locale);
+  if (mode === 'forge-pilot') return t('card.traex_init.start_pilot', undefined, locale);
+  return t('card.traex_init.start_traex', undefined, locale);
+}
+
+function traexStartupModeConfirmText(mode: TraexInitializationMode, locale?: Locale): string {
+  return t('card.traex_init.mode_selected_with_mode', {
+    mode: traexStartupModeLabel(mode, locale),
+  }, locale);
+}
+
+function canOperateTraexInitialization(
+  ds: DaemonSession,
+  pending: NonNullable<DaemonSession['pendingTraexInitialization']>,
+  operatorOpenId: string | undefined,
+): boolean {
+  if (!operatorOpenId) return false;
+  if (operatorOpenId === pending.ownerOpenId || operatorOpenId === ds.session.ownerOpenId) return true;
+  return canOperate(ds.larkAppId, ds.chatId, operatorOpenId);
+}
+
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
   if (!larkAppId || !messageId) return;
   // Let the card-action promise resolve so the SDK can send its callback ACK
@@ -437,6 +514,103 @@ function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string 
   });
 }
 
+type RepoCommitContext = {
+  ds: DaemonSession;
+  rootId: string;
+  cardMessageId?: string;
+  larkAppId?: string;
+  operatorOpenId?: string;
+  activeSessions: Map<string, DaemonSession>;
+  sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+};
+
+async function postTraexStartupModeCardAfterRepoSelection(
+  ctx: RepoCommitContext,
+  dirPath: string,
+  dirLabel: string,
+  opts?: {
+    pinWorkingDir?: boolean;
+    riffRepoDirs?: string[];
+  },
+): Promise<boolean> {
+  const { ds, rootId, cardMessageId, larkAppId, sessionReply } = ctx;
+  const pending = ds.pendingTraexInitialization;
+  if (!pending || pending.phase === 'mode' || pending.mode) return false;
+  const forgeAvailability = checkForgeTraexStartupAvailability();
+  if (!forgeAvailability.available) {
+    ds.pendingTraexInitialization = undefined;
+    delete ds.session.traexForgeMode;
+    sessionStore.updateSession(ds.session);
+    return false;
+  }
+
+  const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+  const previousWorkingDir = ds.workingDir;
+  const previousSessionWorkingDir = ds.session.workingDir;
+  const previousRiffRepoDirs = ds.session.riffRepoDirs;
+  const previousPending = ds.pendingTraexInitialization;
+  const previousRepoCardMessageId = ds.repoCardMessageId;
+  const modePending: typeof pending = {
+    ...pending,
+    phase: 'mode',
+    selection: {
+      kind: 'directory',
+      path: dirPath,
+      label: dirLabel,
+      pinWorkingDir: opts?.pinWorkingDir !== false,
+    },
+    commitInFlight: undefined,
+  };
+  delete modePending.mode;
+
+  let modeCardMessageId: string | undefined;
+  try {
+    if (opts?.pinWorkingDir !== false) {
+      ds.workingDir = dirPath;
+      ds.session.workingDir = dirPath;
+    }
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
+    ds.pendingTraexInitialization = modePending;
+    delete ds.session.traexForgeMode;
+    sessionStore.updateSession(ds.session);
+    modeCardMessageId = await sessionReply(
+      rootId,
+      buildTraexStartupModeCard({
+        rootId,
+        pending: modePending,
+        locale: localeForBot(ds.larkAppId),
+      }),
+      'interactive',
+      fallbackTurnId(ds, undefined),
+    );
+    persistPendingRepoCardMessageId(ds, modeCardMessageId);
+    markRepoCardConsumed(ds, cardToWithdraw);
+    ds.repoCardMessageId = modeCardMessageId;
+    ds.initialStartPending = false;
+    announcePendingRepoSession(ds);
+    deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+    logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, waiting for TraeX startup mode`);
+    return true;
+  } catch (err) {
+    ds.workingDir = previousWorkingDir;
+    ds.session.workingDir = previousSessionWorkingDir;
+    ds.session.riffRepoDirs = previousRiffRepoDirs;
+    ds.pendingTraexInitialization = previousPending;
+    ds.repoCardMessageId = previousRepoCardMessageId;
+    delete ds.session.traexForgeMode;
+    sessionStore.updateSession(ds.session);
+    if (modeCardMessageId) {
+      deferRepoCardWithdraw(larkAppId, modeCardMessageId);
+    }
+    logger.warn(
+      `[${tag(ds)}] Failed to post TraeX startup mode card after repo selection: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
+  }
+}
+
 /**
  * Commit a resolved working directory onto a repo-select session: pin it, then
  * either fork the pending CLI (first selection) or close + recreate the session
@@ -446,16 +620,7 @@ function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string 
  * reuse the exact same spawn/switch path instead of duplicating it.
  */
 export async function commitRepoSelection(
-  ctx: {
-    ds: DaemonSession;
-    rootId: string;
-    cardMessageId?: string;
-    larkAppId?: string;
-    operatorOpenId?: string;
-    activeSessions: Map<string, DaemonSession>;
-    sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
-    prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
-  },
+  ctx: RepoCommitContext,
   dirPath: string,
   dirLabel: string,
   // The worktree flow already posted a precise "worktree 已创建：path 分支 …"
@@ -515,6 +680,7 @@ export async function commitRepoSelection(
 
   if (ds.pendingRepo) {
     const targetSessionId = ds.session.sessionId;
+    let deferredToTraexMode = false;
     ds.pendingRepoCommitInFlight = true;
     try {
       const started = await withBotTurnMutation(ds.larkAppId, async () => {
@@ -523,6 +689,18 @@ export async function commitRepoSelection(
           && candidate.session.status === 'active',
       );
       if (!current || current !== ds || !current.pendingRepo) return false;
+      if (await postTraexStartupModeCardAfterRepoSelection(
+        ctx,
+        dirPath,
+        dirLabel,
+        {
+          pinWorkingDir,
+          riffRepoDirs: opts?.riffRepoDirs,
+        },
+      )) {
+        deferredToTraexMode = true;
+        return true;
+      }
       // "Start directly" launches in the resolved default cwd without pinning
       // HOME onto the session for sibling-bot inheritance.
       if (pinWorkingDir) {
@@ -650,6 +828,7 @@ export async function commitRepoSelection(
       // Bare `/repo` idle-booted above (empty prompt, no turn); mark the session
       // so the user's NEXT real message becomes the new-topic first turn.
       if (emptyStart) markInitialUserTurnPending(ds);
+      ds.pendingTraexInitialization = undefined;
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
@@ -669,6 +848,7 @@ export async function commitRepoSelection(
       return true;
       });
       if (!started) return false;
+      if (deferredToTraexMode) return true;
       // Invalidate synchronously at the successful commit boundary. Card
       // withdrawal and confirmation are best effort and may await/fail;
       // neither may leave a replayable mutation capability behind.
@@ -679,17 +859,17 @@ export async function commitRepoSelection(
       // settles. This prevents a second picker action from reinterpreting the
       // freshly-started session as a mid-session repository switch.
       try {
-        if (!opts?.suppressConfirmReply) {
-          await sessionReply(
-            rootId,
-            t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget),
-            undefined,
-            fallbackTurnId(ds, undefined),
-          );
-        } else if (opts.confirmReplyText) {
+        if (opts?.confirmReplyText) {
           await sessionReply(
             rootId,
             opts.confirmReplyText,
+            undefined,
+            fallbackTurnId(ds, undefined),
+          );
+        } else if (!opts?.suppressConfirmReply) {
+          await sessionReply(
+            rootId,
+            t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget),
             undefined,
             fallbackTurnId(ds, undefined),
           );
@@ -2329,7 +2509,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', TRAEX_INIT_ACTION_START, TRAEX_INIT_ACTION_CANCEL, TRAEX_INIT_ACTION_MANUAL_SELECT, TRAEX_INIT_ACTION_WORKTREE_MULTI_SELECT, 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2356,7 +2536,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
     // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo'
+        || value.action === 'repo_manual_submit'
+        || value.action === 'repo_worktree_submit'
+        || value.action === TRAEX_INIT_ACTION_START
+        || value.action === TRAEX_INIT_ACTION_CANCEL
+        || value.action === TRAEX_INIT_ACTION_MANUAL_SELECT
+        || value.action === TRAEX_INIT_ACTION_WORKTREE_MULTI_SELECT) && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -2416,6 +2602,323 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         content: 'v2 workflow 已下线；旧卡片不再可操作，请迁移定义后使用 /workflow。',
       },
     };
+  }
+
+  if (value?.key === TRAEX_INIT_KEY_TARGET || value?.key === TRAEX_INIT_KEY_MODE) {
+    const rootId = value.root_id;
+    const ds = rootId && larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, undefined)
+      : undefined;
+    const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+    const pending = ds?.pendingTraexInitialization;
+    if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
+    }
+    if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (pending.commitInFlight || ds.pendingRepoCommitInFlight || ds.worktreeCreating) {
+      return { toast: { type: 'info', content: t('card.traex_init.in_progress', undefined, loc) } };
+    }
+
+    const selected = action?.option;
+    if (typeof selected !== 'string') {
+      return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+
+    if (value.key === TRAEX_INIT_KEY_MODE) {
+      const mode = normalizeTraexInitializationMode(selected);
+      if (!mode) {
+        return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+      }
+      if (mode !== 'traex' && !checkForgeTraexStartupAvailability().available) {
+        pending.mode = 'traex';
+        return { toast: { type: 'error', content: t('card.traex_init.forge_unavailable', undefined, loc) } };
+      }
+      pending.mode = mode;
+      if (pending.phase === 'mode') {
+        const normalizedPrompt = normalizeTraexInitialPrompt(pending.originalPrompt);
+        if (!normalizedPrompt.ok) {
+          const key = normalizedPrompt.error === 'empty'
+            ? 'card.traex_init.prompt_empty'
+            : 'card.traex_init.prompt_too_long';
+          return { toast: { type: 'error', content: t(key, undefined, loc) } };
+        }
+        pending.commitInFlight = true;
+        if (mode === 'traex') delete ds.session.traexForgeMode;
+        else ds.session.traexForgeMode = mode;
+        sessionStore.updateSession(ds.session);
+        ds.pendingPrompt = pending.promptPrefix + buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+        ds.pendingCodexAppText = buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+        pending.originalPrompt = normalizedPrompt.prompt;
+        ds.currentTurnTitle = normalizedPrompt.prompt.substring(0, 50);
+        try {
+          const selection = pending.selection;
+          if (selection.kind === 'worktree') {
+            pending.commitInFlight = false;
+            return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+          }
+          const started = await commitRepoSelection(
+            { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+            selection.path,
+            selection.label,
+            {
+              confirmReplyText: traexStartupModeConfirmText(mode, loc),
+              pinWorkingDir: selection.kind === 'directory' ? selection.pinWorkingDir : true,
+            },
+          );
+          if (!started) {
+            pending.commitInFlight = false;
+            return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+          }
+          return { toast: { type: 'success', content: t('card.traex_init.mode_selected', undefined, loc) } };
+        } catch (error) {
+          pending.commitInFlight = false;
+          logger.warn(`[${tag(ds)}] TraeX startup mode selection failed before worker start: ${error instanceof Error ? error.message : String(error)}`);
+          return { toast: { type: 'error', content: error instanceof Error ? error.message : String(error) } };
+        }
+      }
+      return { toast: { type: 'success', content: t('card.traex_init.mode_selected', undefined, loc) } };
+    }
+
+    const resolved = resolveTraexTargetSelection(selected, lastRepoScan.get(ds.chatId) ?? [], loc);
+    if (!resolved.ok) {
+      return { toast: { type: 'error', content: resolved.message } };
+    }
+    pending.selection = resolved.selection;
+    const key = resolved.selection.kind === 'worktree'
+      ? 'card.traex_init.worktree_selected'
+      : 'card.traex_init.repo_selected';
+    const label = resolved.selection.kind === 'worktree'
+      ? resolved.selection.label
+      : resolved.selection.path;
+    return { toast: { type: 'success', content: t(key, { path: label, name: label }, loc) } };
+  }
+
+  if (
+    value?.action === TRAEX_INIT_ACTION_MANUAL_SELECT
+    || value?.action === TRAEX_INIT_ACTION_WORKTREE_MULTI_SELECT
+  ) {
+    const rootId = value.root_id;
+    const ds = rootId && larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, value.action)
+      : undefined;
+    const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+    const pending = ds?.pendingTraexInitialization;
+    if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
+    }
+    if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (pending.commitInFlight || ds.pendingRepoCommitInFlight || ds.worktreeCreating) {
+      return { toast: { type: 'info', content: t('card.traex_init.in_progress', undefined, loc) } };
+    }
+
+    if (value.action === TRAEX_INIT_ACTION_MANUAL_SELECT) {
+      const rawPath = typeof action?.form_value?.traex_init_manual_path === 'string'
+        ? action.form_value.traex_init_manual_path.trim()
+        : '';
+      if (!rawPath) {
+        return { toast: { type: 'error', content: t('card.repo.manual_empty', undefined, loc) } };
+      }
+      const validation = validateWorkingDir(rawPath, loc);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+      pending.selection = {
+        kind: 'directory',
+        path: validation.resolvedPath,
+        label: validation.resolvedPath,
+        pinWorkingDir: true,
+      };
+      return { toast: { type: 'success', content: t('card.traex_init.repo_selected', { path: validation.resolvedPath }, loc) } };
+    }
+
+    const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
+    if (selectedPaths.length === 0) {
+      return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, loc) } };
+    }
+    const projects = lastRepoScan.get(ds.chatId) ?? [];
+    const selectedRepos = selectedPaths.map(repoPath => projects.find(p => p.path === repoPath && p.type === 'repo'));
+    if (selectedRepos.some(project => !project)) {
+      return { toast: { type: 'error', content: t('card.traex_init.repo_not_found', undefined, loc) } };
+    }
+    const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
+    const multiParent = selectedPaths.length > 1
+      ? multiWorktreeParentPath(
+          selectedPaths,
+          branch ?? await worktreeSlugFromContextAI(ds.session.title, pending.originalPrompt) ?? 'worktree',
+        )
+      : undefined;
+    if (multiParent) {
+      const duplicateNames = duplicateMultiWorktreeChildNames(selectedPaths, projects);
+      if (duplicateNames.length > 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, loc) } };
+      }
+    }
+    const label = selectedRepos
+      .map((project, index) => project?.name ?? pathBasename(selectedPaths[index] ?? ''))
+      .join(', ');
+    pending.selection = {
+      kind: 'worktree',
+      repoPaths: selectedPaths,
+      label,
+      ...(branch ? { branch } : {}),
+      ...(multiParent ? { parentPath: multiParent } : {}),
+    };
+    return { toast: { type: 'success', content: t('card.traex_init.worktree_selected', { name: label }, loc) } };
+  }
+
+  if (value?.action && (
+    value.action === TRAEX_INIT_ACTION_START
+    || value.action === TRAEX_INIT_ACTION_CANCEL
+  )) {
+    const rootId = value.root_id;
+    const ds = rootId && larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, value.action)
+      : undefined;
+    const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+    const pending = ds?.pendingTraexInitialization;
+    if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
+    }
+    if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (pending.commitInFlight || ds.pendingRepoCommitInFlight || ds.worktreeCreating) {
+      return { toast: { type: 'info', content: t('card.traex_init.in_progress', undefined, loc) } };
+    }
+
+    if (value.action === TRAEX_INIT_ACTION_CANCEL) {
+      pending.commitInFlight = true;
+      ds.pendingTraexInitialization = undefined;
+      ds.pendingRepo = false;
+      markRepoCardConsumed(ds, cardMessageId ?? ds.repoCardMessageId);
+      ds.repoCardMessageId = undefined;
+      activeSessions.delete(sessionKey(rootId, ds.larkAppId));
+      sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
+      return JSON.parse(buildTraexInitializationCancelledCard(loc));
+    }
+
+    const formValue = action?.form_value ?? {};
+    const mode = normalizeTraexInitializationMode(value.mode ?? formValue.traex_init_mode ?? pending.mode ?? 'traex');
+    const normalizedPrompt = normalizeTraexInitialPrompt(pending.originalPrompt);
+    if (!mode) {
+      return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (mode !== 'traex' && !checkForgeTraexStartupAvailability().available) {
+      pending.mode = 'traex';
+      delete ds.session.traexForgeMode;
+      sessionStore.updateSession(ds.session);
+      return { toast: { type: 'error', content: t('card.traex_init.forge_unavailable', undefined, loc) } };
+    }
+    if (!normalizedPrompt.ok) {
+      const key = normalizedPrompt.error === 'empty'
+        ? 'card.traex_init.prompt_empty'
+        : 'card.traex_init.prompt_too_long';
+      return { toast: { type: 'error', content: t(key, undefined, loc) } };
+    }
+
+    const manualPath = typeof formValue.traex_init_manual_path === 'string'
+      ? formValue.traex_init_manual_path.trim()
+      : '';
+    const selectedTarget = typeof formValue.traex_init_target === 'string'
+      ? formValue.traex_init_target
+      : '';
+    const projects = lastRepoScan.get(ds.chatId) ?? [];
+    if (manualPath) {
+      const validation = validateWorkingDir(manualPath, loc);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+      pending.selection = {
+        kind: 'directory',
+        path: validation.resolvedPath,
+        label: validation.resolvedPath,
+        pinWorkingDir: true,
+      };
+    } else if (selectedTarget) {
+      const resolved = resolveTraexTargetSelection(selectedTarget, projects, loc);
+      if (!resolved.ok) {
+        return { toast: { type: 'error', content: resolved.message } };
+      }
+      pending.selection = resolved.selection;
+    }
+
+    pending.mode = mode;
+    if (mode === 'traex') delete ds.session.traexForgeMode;
+    else ds.session.traexForgeMode = mode;
+    sessionStore.updateSession(ds.session);
+    ds.pendingPrompt = pending.promptPrefix + buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+    ds.pendingCodexAppText = buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+    pending.originalPrompt = normalizedPrompt.prompt;
+    ds.currentTurnTitle = normalizedPrompt.prompt.substring(0, 50);
+    const selection = pending.selection;
+
+    if (selection.kind === 'worktree') {
+      return await handleCardAction({
+        ...data,
+        action: {
+          option: selection.repoPaths[0],
+          value: {
+            key: 'repo_worktree',
+            root_id: rootId,
+            repo_worktree_paths_json: JSON.stringify(selection.repoPaths),
+            ...(selection.branch ? { branch: selection.branch } : {}),
+            ...(selection.parentPath ? { parent_path: selection.parentPath } : {}),
+          },
+        },
+      }, deps, larkAppId);
+    }
+
+    if (selection.kind === 'auto-worktree') {
+      const replyTurnId = fallbackTurnId(ds, undefined);
+      void runAutoWorktreeCommit({
+        ds,
+        anchor: rootId,
+        larkAppId: ds.larkAppId,
+        baseDir: selection.path,
+        title: normalizedPrompt.prompt,
+        prompt: ds.pendingPrompt,
+        operatorOpenId,
+        activeSessions,
+        notify: message => sessionReply(rootId, message, undefined, replyTurnId),
+      });
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, loc) } };
+    }
+
+    pending.commitInFlight = true;
+    try {
+      await commitRepoSelection(
+        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+        selection.path,
+        selection.label,
+        {
+          confirmReplyText: traexStartupModeConfirmText(mode, loc),
+          suppressConfirmReply: true,
+          pinWorkingDir: selection.pinWorkingDir,
+        },
+      );
+      return { toast: { type: 'success', content: t('card.status.starting', undefined, loc) } };
+    } catch (error) {
+      pending.commitInFlight = false;
+      logger.warn(`[${tag(ds)}] TraeX initialization failed before worker start: ${error instanceof Error ? error.message : String(error)}`);
+      return { toast: { type: 'error', content: t('card.status.failed', undefined, loc) } };
+    }
   }
 
   // Handle session card button actions (restart/close)
@@ -4114,7 +4617,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         );
         if (started) {
-          logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
+          logger.info(
+            `[${tag(ds)}] Skip repo, `
+            + (ds.pendingTraexInitialization?.phase === 'mode'
+              ? `waiting for TraeX startup mode in ${cwd}`
+              : `spawning CLI in ${cwd}`),
+          );
         }
       } else {
         await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
@@ -4388,7 +4896,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Resolve the project name from cached scan
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);
-  const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
+  const displayName = project ? projectDisplayName(project) : selectedPath;
   let selectedWorktreePaths = [selectedPath];
   if (isWorktreeOpen && typeof action?.value?.repo_worktree_paths_json === 'string') {
     try {
@@ -4442,9 +4950,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       !sessionStillActive() ||
       targetDs.session.sessionId !== startSessionId ||
       !!targetDs.pendingRepo !== wasPending;
+    const worktreeReplyTurnId = fallbackTurnId(targetDs, undefined);
+    const replyWorktreeStatus = (message: string) =>
+      sessionReply(rootId, message, undefined, worktreeReplyTurnId);
     const notSwitched = async (creation: { path: string; branch: string }, when: string) => {
       logger.info(`[${tag(targetDs)}] Worktree ${creation.path} created but session changed ${when} — not switching`);
-      await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));
+      await replyWorktreeStatus(t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));
     };
     void (async () => {
       try {
@@ -4483,7 +4994,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             try { await removeRepoWorktree(c.repo, c.result.path); rolledBack++; }
             catch (re) { logger.warn(`[${tag(targetDs)}] rollback of ${c.result.path} failed: ${re instanceof Error ? re.message : re}`); }
           }
-          await sessionReply(rootId, rolledBack > 0
+          await replyWorktreeStatus(rolledBack > 0
             ? t('card.repo.worktree_rolled_back', { repo: pathBasename(failedRepo), error: errMsg, count: rolledBack }, locTarget)
             : t('cmd.repo.worktree_failed', { error: errMsg }, locTarget));
           return;
@@ -4499,11 +5010,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             } catch (e) {
               const errMsg = e instanceof Error ? e.message : String(e);
               logger.warn(`[${tag(targetDs)}] riff worktree branch push failed (${c.result.branch}): ${errMsg}`);
-              await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
+              await replyWorktreeStatus(t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
             }
           }
         }
-        await sessionReply(rootId, t('cmd.repo.worktree_created', {
+        await replyWorktreeStatus(t('cmd.repo.worktree_created', {
           path: creation.path, branch: creation.branch, base: creation.baseRef,
         }, locTarget));
         // The reply above awaited a Lark round-trip — a plain switch (which is
@@ -4513,7 +5024,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try {
           // The "worktree 已创建：…" notice above already confirms the switch —
           // suppress commitRepoSelection's own "已选择/已切换" to avoid a dup.
-          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, {
+          await commitRepoSelection(commitCtx, creation.path, worktreeDisplayName(creation.path, creation.branch), {
             suppressConfirmReply: true,
             // 多仓：把按用户选择顺序创建的 worktree 目录 stamp 到 session，
             // riff 按此显式列表（而非目录扫描）推导 repos，首仓为 primary。
@@ -4524,7 +5035,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // Don't report it as a creation failure, or the user retries and
           // trips over "worktree target already exists".
           logger.warn(`[${tag(targetDs)}] Worktree ${creation.path} created but switching failed: ${e instanceof Error ? e.message : e}`);
-          await sessionReply(rootId, t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, locTarget));
+          await replyWorktreeStatus(t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, locTarget));
         }
       } finally {
         targetDs.worktreeCreating = false;

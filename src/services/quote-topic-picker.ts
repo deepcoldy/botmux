@@ -244,4 +244,3 @@ export function takeQuoteFollowUp(token: string | undefined): string | undefined
   pendingFollowUps.delete(token);
   return entry.text;
 }
-

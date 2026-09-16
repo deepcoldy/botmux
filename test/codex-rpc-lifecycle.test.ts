@@ -141,6 +141,7 @@ describe('codexRpcEligible — every fail-closed gate degrades to paste', () => 
     ['has startupCommands (/effort ordering)', { startupCommands: ['/effort high'] }],
     ['wrapperCli launcher', { wrapperCli: 'aiden x codex' }],
     ['cliPathOverride launcher', { cliPathOverride: '/opt/wrap/codex' }],
+    ['TraeX Forge launcher', { cliId: 'traex', traexForgeMode: 'forge-pipeline' }],
     ['no prompt and not a resume', { prompt: '' }],
     ['resume flag but no cliSessionId', { prompt: '', resume: true }],
   ];

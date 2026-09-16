@@ -22,6 +22,35 @@ describe('worker pipe initial screen ordering', () => {
     );
   });
 
+  it('launches TraeX Forge sessions through forge run --agent traex', () => {
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const poolSource = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
+
+    const helperStart = workerSource.indexOf('function buildTraexForgeLaunch');
+    const helperEnd = workerSource.indexOf('function currentHermesBridgeDbPath', helperStart);
+    const helper = workerSource.slice(helperStart, helperEnd);
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain("'run'");
+    expect(helper).toContain("'--agent'");
+    expect(helper).toContain("'traex'");
+    expect(helper).toContain("'--agent-args'");
+
+    const launchIdx = workerSource.indexOf("const traexForgeLaunch = cfg.cliId === 'traex' && cfg.traexForgeMode");
+    const baseBinIdx = workerSource.indexOf('const baseLaunchBin = traexForgeLaunch?.bin ?? cliAdapter.resolvedBin;', launchIdx);
+    const spawnBinIdx = workerSource.indexOf('let spawnBin = baseLaunchBin;', baseBinIdx);
+    const wrapperIgnoreIdx = workerSource.indexOf('TraeX Forge startup uses forge run --agent traex', spawnBinIdx);
+    expect(launchIdx).toBeGreaterThan(-1);
+    expect(baseBinIdx).toBeGreaterThan(launchIdx);
+    expect(spawnBinIdx).toBeGreaterThan(baseBinIdx);
+    expect(wrapperIgnoreIdx).toBeGreaterThan(spawnBinIdx);
+
+    expect(poolSource).toContain("agentCfg.cliId === 'traex' && ds.session.traexForgeMode");
+    expect(poolSource).toContain('traexForgeMode: ds.session.traexForgeMode');
+    expect(poolSource).toContain("const keepForgeTraexSessionTitle = agentCfg.cliId === 'traex' && !!ds.session.traexForgeMode");
+    expect(workerSource).toContain("cfg.cliId === 'traex' && !cfg.traexForgeMode && !remoteWsUrl");
+    expect(workerSource).toContain("if (cfg.cliId === 'traex' && cfg.traexForgeMode) return false");
+  });
+
   it('fences bridge markers before worker-side close teardown can race fallback reads', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const readMarkersStart = source.indexOf('function readSendMarkers');

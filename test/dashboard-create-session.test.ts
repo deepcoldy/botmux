@@ -65,6 +65,12 @@ vi.mock('../src/im/lark/client.js', () => ({
 const scanMultipleProjectsMock = vi.fn(() => [] as Array<Record<string, unknown>>);
 vi.mock('../src/services/project-scanner.js', () => ({
   scanMultipleProjects: (...a: any[]) => scanMultipleProjectsMock(...a),
+  projectDisplayName: (project: { name: string; branch: string }) =>
+    project.branch && project.branch !== project.name ? `${project.name} (${project.branch})` : project.name,
+  worktreeDisplayName: (path: string, branch: string) => {
+    const name = path.split('/').filter(Boolean).pop() ?? path;
+    return branch && branch !== name ? `${name} (${branch})` : name;
+  },
 }));
 
 const forkWorkerMock = vi.fn();

@@ -120,10 +120,12 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/asks'",
       "ipcRoute('POST', '/api/attention'",
     );
-    const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
+    const bindAt = route.indexOf('boundAsk = bindAskToActiveSession(');
     const registerAt = route.indexOf('registerAskBroker({');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(registerAt).toBeGreaterThan(bindAt);
+    expect(route.match(/boundAsk = bindAskToActiveSession/g)?.length).toBe(2);
+    expect(source).toContain('rootMessageId: resolveThreadReplyRootMessageId(ds, originTurnId)');
     expect(route).toContain('const askChatType = askSession?.chatType;');
     expect(route).toMatch(
       /registerAskBroker\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,

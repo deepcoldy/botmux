@@ -104,6 +104,8 @@ export class RpcEngagementFence {
  *     app-server`, which an ambiguous wrapper/alternate launcher won't satisfy
  *     the same way the TUI's buildArgs does. A structured compatible runtime is
  *     the only path override allowed through this gate (P1-2).
+ *   - traexForgeMode: Forge must own the agent process (`forge run --agent traex`)
+ *     so it can inject its session id; an RPC viewer would bypass that launcher.
  *   - backendType !== 'tmux': the pane-ownership detection + controlled respawn
  *     are only wired for tmux. On herdr/zellij a surviving dead `--remote` pane
  *     would be misjudged as native and reattached, and pty has no persistent
@@ -142,6 +144,7 @@ export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
     !cfg.wrapperCli && runtimeExecutableEligible &&
+    !cfg.traexForgeMode &&
     (!!cfg.prompt || wantResume)
   );
 }

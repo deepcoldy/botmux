@@ -148,7 +148,7 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
 
-  it('group `/reply-mode shared` remains a compatibility alias for topic/shared semantics', async () => {
+  it('group `/reply-mode shared` selects explicit topic-display session reuse', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode shared', 'group'), USER, true);
     expect(handled).toBe(true);
     expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared');

@@ -21,4 +21,3 @@ describe('group sessions card store', () => {
     expect(replaceLatestGroupSessionsCard(dataDir, 'app-a', 'chat-a', 'user-a', 'msg-2', 4)).toBe('msg-1');
   });
 });
-
