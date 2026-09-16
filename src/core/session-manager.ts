@@ -86,6 +86,7 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
+import { markForkDestinationChatsFromSessions } from '../services/fork-destination-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
@@ -2244,6 +2245,16 @@ export async function restoreActiveSessions(
   const stillOwnsRestoreRegistration = (ds: DaemonSession): boolean =>
     ds.session.status === 'active'
     && activeSessions.get(activeSessionKey(ds)) === ds;
+
+  // Re-mark `/fork --create` destination chats from the persisted child rows.
+  // The per-chat chat-topic pin written at creation is the durable truth, but
+  // if that pin ever failed to land, the restored chat-scope child would again
+  // lose top-level messages to new-topic's per-messageId routing (issue #1400).
+  // The child row itself is sufficient evidence; this also covers a daemon that
+  // restarted before the pin write completed. In-memory state only — no config
+  // writes from the restore path. Routing still yields to any explicit per-chat
+  // reply mode the user set afterwards (getExplicitChatReplyMode gate).
+  markForkDestinationChatsFromSessions(active);
 
   for (const session of active) {
     try {

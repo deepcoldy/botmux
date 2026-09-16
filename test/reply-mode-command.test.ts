@@ -143,7 +143,7 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
   it('group `/reply-mode topic` (owner) → setChatReplyMode("shared") + updated', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode topic', 'group'), USER, true);
     expect(handled).toBe(true);
-    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared');
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared', { force: true });
     expect(mockApplyConfigField).not.toHaveBeenCalled(); // group path never touches p2pMode
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
@@ -151,7 +151,7 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
   it('group `/reply-mode shared` remains a compatibility alias for topic/shared semantics', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode shared', 'group'), USER, true);
     expect(handled).toBe(true);
-    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared');
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared', { force: true });
     expect(mockApplyConfigField).not.toHaveBeenCalled(); // group path never touches p2pMode
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
@@ -159,14 +159,14 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
   it('group `/reply-mode new-topic` is the explicit independent-session mode', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode new-topic', 'group'), USER, true);
     expect(handled).toBe(true);
-    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'new-topic');
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'new-topic', { force: true });
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
 
   it('group `/reply-mode chat-topic` sets the hybrid flat-top/per-native-topic mode', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode chat-topic', 'group'), USER, true);
     expect(handled).toBe(true);
-    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'chat-topic');
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'chat-topic', { force: true });
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
 

@@ -31,6 +31,8 @@ import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
+import { setChatReplyMode } from '../services/chat-reply-mode-store.js';
+import { markForkDestinationChat } from '../services/fork-destination-store.js';
 import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
@@ -5049,6 +5051,14 @@ export async function handleCommand(
             name: forkGroupName,
             userOpenIds: [forkSenderOpenId],
             transferOwnerTo: forkSenderOpenId,
+            // Synchronously mark the new chat as a fork destination the instant
+            // createChat returns the id — before bot invites and before this
+            // function's own awaits. The child session is registered chat-scope
+            // at this chatId; the marker makes inbound top-level routing and the
+            // bot.added auto-start path yield to it even inside the hundreds-of-ms
+            // window before the per-chat reply-mode pin below is durable
+            // (issue #1400).
+            onChatCreated: (createdChatId) => markForkDestinationChat(forkAppId, createdChatId),
           });
           forkChatId = result.chatId;
           const applink = chatAppLink(result.chatId, normalizeBrand(getBot(forkAppId).config.brand));
@@ -5057,6 +5067,29 @@ export async function handleCommand(
           logger.error(`[${logTag}] /fork --create: createGroup failed: ${err?.message ?? err}`);
           await sessionReply(rootId, t('cmd.fork.failed', { error: err?.message ?? String(err) }, loc));
           break;
+        }
+
+        // Pin the new chat's effective reply mode to `chat-topic`: the child is
+        // chat-scope at chatId, and chat-topic keeps top-level messages flat on
+        // that one chat-scope session (while still isolating native Lark topics,
+        // matching the user-verified workaround `/reply-mode chat-topic`). This is
+        // a PER-CHAT pin, never the bot-global default, and remains user-editable
+        // via `/reply-mode` afterwards — an explicit later switch (even back to
+        // new-topic) force-persists its own entry and releases the fork routing
+        // marker. force:true keeps the pin distinguishable from "inherits the
+        // bot default" even if the bot default happens to be chat-topic.
+        // Best-effort: on failure the in-memory marker covers this daemon
+        // lifetime and restoreActiveSessions re-marks the chat from the child row.
+        try {
+          const pinResult = await setChatReplyMode(forkAppId, forkChatId, 'chat-topic', {
+            force: true,
+            source: 'fork-pin',
+          });
+          if (!pinResult.ok) {
+            logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} failed: ${pinResult.reason}`);
+          }
+        } catch (err: any) {
+          logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} threw: ${err?.message ?? err}`);
         }
 
         // Fork the session into the new chat (chat-scope, group). The new chat

@@ -2998,7 +2998,10 @@ ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
   const mode = normalizeChatReplyMode(typeof (body as any)?.mode === 'string' ? (body as any).mode : undefined);
   if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
   if (!mode) return jsonRes(res, 400, { ok: false, reason: 'invalid_mode' });
-  const result = await setChatReplyMode(cachedLarkAppId, chatId, mode);
+  // Explicit dashboard choice: force-persist so it remains distinguishable from
+  // the per-bot default (fork-destination routing reads that distinction,
+  // issue #1400) and release any fork routing marker.
+  const result = await setChatReplyMode(cachedLarkAppId, chatId, mode, { force: true });
   if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
   jsonRes(res, 200, { ok: true, mode: result.mode });
 });

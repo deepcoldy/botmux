@@ -116,7 +116,11 @@ export async function tryHandleReplyModeCommand(
     await reply(t('cmd.reply_mode.owner_only', undefined, loc));
     return true;
   }
-  const res = await setChatReplyMode(larkAppId, chatId, mode);
+  // force: an explicit user choice must stay distinguishable from "inherits
+  // the per-bot default" — in a /fork --create chat the routing layer uses that
+  // distinction to decide whether fork protection still applies (issue #1400).
+  // Default source ('user') also releases the fork marker on success.
+  const res = await setChatReplyMode(larkAppId, chatId, mode, { force: true });
   if (!res.ok) {
     await reply(t('cmd.reply_mode.failed', { reason: res.reason }, loc));
     return true;

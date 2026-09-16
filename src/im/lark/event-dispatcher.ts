@@ -63,7 +63,8 @@ import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from 
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
-import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, resolveGroupMentionMode, getExplicitChatReplyMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { isForkDestinationChat } from '../../services/fork-destination-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -2917,6 +2918,19 @@ type RoutingDecision = {
 };
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
+  // `/fork --create` 分身专属群：子会话固定注册为 chat-scope(anchor=chatId)。
+  // 即使 Bot 的普通群默认解析为 new-topic，顶层消息也必须平铺到 chatId，否则每条
+  // 顶层消息都会按 messageId 开一个空白 thread 会话（弹仓库选择卡），永远命不中
+  // 分身（issue #1400）。这是建群→钉模式落盘竞态窗口的进程内安全网（restore 后
+  // 也兜底重建）；持久真相是 /fork --create 写入的 per-chat chat-topic 钉模式。
+  //
+  // 优先级：用户对该群的显式 per-chat /reply-mode 设置 > fork marker > Bot 全局
+  // 默认。用户显式切换（含切回 new-topic）后 setChatReplyMode 会摘掉 marker 并
+  // 持久化显式条目；这里再判一次「无显式 per-chat 条目」，覆盖 restore 重建
+  // marker 但用户曾显式改模式的情况。
+  if (isForkDestinationChat(larkAppId, chatId) && !getExplicitChatReplyMode(larkAppId, chatId)) {
+    return { scope: 'chat', anchor: chatId, source: 'regular-group-chat' };
+  }
   // Only `new-topic` forks a fresh thread-scope session for a TOP-LEVEL @.
   // `shared` stays chat-scope here (the topic fold happens post-routing, see
   // maybeApplySharedTopicSeed); `chat` is flat top-level; `chat-topic` (the
