@@ -33,7 +33,7 @@ describe('dashboard bot payload helpers', () => {
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
-      'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
+      'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'crossPrincipalInterruptionGuard', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'autoStartOnNewTopic',
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
@@ -68,6 +68,13 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ codexAuthSync: 'shared' });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { codexAuthSync: 'isolated' }))
       .toMatchObject({ codexAuthSync: 'isolated' });
+  });
+
+  it('keeps cross-principal confirmation opt-in', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}))
+      .toMatchObject({ crossPrincipalInterruptionGuard: false });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { crossPrincipalInterruptionGuard: true }))
+      .toMatchObject({ crossPrincipalInterruptionGuard: true });
   });
 
   it('exposes feedback policy only in private Bot Defaults payloads', () => {

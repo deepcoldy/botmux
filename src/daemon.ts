@@ -22997,7 +22997,8 @@ async function handleThreadReplyAdmitted(
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
   const activePrincipalTurn = ds.activeInteractiveTurn;
-  if (activePrincipalTurn
+  if (getBot(ds.larkAppId).config.crossPrincipalInterruptionGuard === true
+    && activePrincipalTurn
     && threadTrustedCaller
     && !sameTrustedPrincipal(activePrincipalTurn.caller, threadTrustedCaller)
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
@@ -23131,7 +23132,8 @@ async function handleThreadReplyAdmitted(
         turnId: parsed.messageId,
         });
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    if (threadTrustedCaller) {
+    if (threadTrustedCaller
+      && dsBotCfgForMsg.crossPrincipalInterruptionGuard === true) {
       cliInput.rerouteEnvelope = {
         turnId: parsed.messageId,
         text: parsed.content,

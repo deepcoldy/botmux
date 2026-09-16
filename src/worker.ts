@@ -3133,7 +3133,9 @@ function activeTurnBlocks(input: {
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
+  crossPrincipalInterruptionGuard?: true;
 }): boolean {
+  if (input.crossPrincipalInterruptionGuard !== true) return false;
   return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
 }
 
@@ -3160,9 +3162,14 @@ function markActiveTurnStarted(input: {
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
+  crossPrincipalInterruptionGuard?: true;
 }): void {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
+  if (input.crossPrincipalInterruptionGuard !== true
+    && activeTurnAuthority.blocks(identity)) {
+    releaseActiveTurnAuthority('cross_principal_compat');
+  }
   if (!activeTurnAuthority.reserve(identity) || !activeTurnAuthority.markStarted(identity)) {
     throw new Error(`turn authority mismatch before CLI write (${identity.turnId})`);
   }
@@ -12545,6 +12552,7 @@ function sendToPty(
     replyTurnId?: string;
     trustedCaller?: import('./types.js').TrustedCaller;
     trustedController?: import('./types.js').TrustedCaller;
+    crossPrincipalInterruptionGuard?: true;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     nativeSessionTitle?: string;
     nativeSessionTitlePrompt?: string;
@@ -12571,6 +12579,7 @@ function sendToPty(
     ...(opts.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: opts.nativeSessionTitlePrompt } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
+    ...(opts.crossPrincipalInterruptionGuard ? { crossPrincipalInterruptionGuard: true } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -20276,14 +20285,15 @@ process.on('message', async (raw: unknown) => {
           break;
         }
       }
-      // Cross-principal turns are rejected at this worker boundary. The daemon
-      // normally isolates them before worker IPC; this closes races/restarts so
-      // another human can never steer the active turn directly.
+      // The reroute envelope is the daemon's explicit opt-in signal for the
+      // cross-principal confirmation guard. Without it, preserve the legacy
+      // shared-topic follow-up path.
       if (activeTurnBlocks({
         turnId: msg.turnId,
         dispatchAttempt: msg.dispatchAttempt,
         trustedCaller: msg.trustedCaller,
         trustedController: msg.trustedController,
+        ...(msg.rerouteEnvelope ? { crossPrincipalInterruptionGuard: true } : {}),
       })) {
         if (ordinaryImTurnId) {
           rejectOrdinaryImTurn(
@@ -20384,6 +20394,7 @@ process.on('message', async (raw: unknown) => {
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
           trustedCaller: msg.trustedCaller,
           trustedController: msg.trustedController,
+          ...(msg.rerouteEnvelope ? { crossPrincipalInterruptionGuard: true } : {}),
           codexAppInput,
           nativeSessionTitle: postSubmitNativeSessionTitle,
         };

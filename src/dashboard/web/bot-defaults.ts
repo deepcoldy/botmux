@@ -128,6 +128,8 @@ export type BotDefaultsRow = {
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
+  /** Whether cross-principal messages require classification while a turn runs. */
+  crossPrincipalInterruptionGuard?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {

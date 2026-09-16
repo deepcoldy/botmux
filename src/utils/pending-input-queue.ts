@@ -19,6 +19,8 @@ export interface PendingCliInput {
   trustedCaller?: TrustedCaller;
   /** Stable authenticated controller of the surrounding session/task. */
   trustedController?: TrustedCaller;
+  /** Explicit opt-in to the cross-principal confirmation barrier. */
+  crossPrincipalInterruptionGuard?: true;
   codexAppInput?: CodexAppTurnInput;
   /** Best-effort CLI-native title to apply after this exact user input has
    * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
@@ -108,11 +110,10 @@ export function mergeQueuedCliInput(
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent) return false;
-  // Caller attribution is part of the logical envelope. Older code merged two
-  // queued messages and kept only the later turnId while silently retaining no
-  // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
-  // legacy callers fail closed and stay as separate turns.
-  if (!sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
+  // With the confirmation guard enabled, cross-principal items must stay
+  // separate. Otherwise preserve the pre-3.22 shared-conversation behavior.
+  if ((tail.crossPrincipalInterruptionGuard || next.crossPrincipalInterruptionGuard)
+    && !sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;

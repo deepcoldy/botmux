@@ -5557,6 +5557,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     thinkingCard: cardPrefs.thinkingCard,
     thinkingCardToolResult: cardPrefs.thinkingCardToolResult,
     senderTag: cardPrefs.senderTag,
+    crossPrincipalInterruptionGuard: cardPrefs.crossPrincipalInterruptionGuard,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
@@ -5687,6 +5688,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    crossPrincipalInterruptionGuard?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -5702,6 +5704,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    crossPrincipalInterruptionGuard?: boolean;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (body.replyCardMode !== undefined) {
@@ -5724,6 +5727,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.crossPrincipalInterruptionGuard === 'boolean') {
+    patch.crossPrincipalInterruptionGuard = body.crossPrincipalInterruptionGuard;
+  }
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;

@@ -2312,6 +2312,56 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
   });
 });
 
+describe('PUT /api/bot-card-prefs — cross-principal confirmation guard', () => {
+  it('defaults OFF, persists explicit true, and clears the key when disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-cross-principal-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-cross-principal-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ crossPrincipalInterruptionGuard: false });
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ crossPrincipalInterruptionGuard: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, crossPrincipalInterruptionGuard: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0])
+        .toMatchObject({ crossPrincipalInterruptionGuard: true });
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ crossPrincipalInterruptionGuard: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, crossPrincipalInterruptionGuard: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].crossPrincipalInterruptionGuard)
+        .toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — thinkingCardToolResult (思考气泡工具输出开关)', () => {
   it('defaults ON, persists only an explicit false, and clears the key when turned back on', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-thinking-tool-result-'));

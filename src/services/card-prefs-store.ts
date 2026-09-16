@@ -79,6 +79,9 @@ export interface BotCardPrefs {
    *  convention as thinkingCard. Off also drops the cursor anti-echo note (it is
    *  gated on the tag) and costs two observability signals — see BotConfig.senderTag. */
   senderTag: boolean;
+  /** Require explicit classification for another principal's message while a
+   * turn is active. Default false preserves shared-topic follow-ups. */
+  crossPrincipalInterruptionGuard: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -125,6 +128,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       thinkingCard: c.thinkingCard !== false,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
       senderTag: c.senderTag !== false,
+      crossPrincipalInterruptionGuard: c.crossPrincipalInterruptionGuard === true,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
@@ -152,6 +156,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       thinkingCard: true,
       thinkingCardToolResult: true,
       senderTag: true,
+      crossPrincipalInterruptionGuard: false,
       overloadAlert: false,
       botToBotSameDir: true,
       autoStartOnGroupJoin: false,
@@ -266,6 +271,7 @@ async function updateBotCardPrefsInternal(
     applyDefaultTrue(entry, 'thinkingCard', patch.thinkingCard);
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
+    apply(entry, 'crossPrincipalInterruptionGuard', patch.crossPrincipalInterruptionGuard);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
@@ -292,6 +298,7 @@ async function updateBotCardPrefsInternal(
         thinkingCard: entry.thinkingCard !== false,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         senderTag: entry.senderTag !== false,
+        crossPrincipalInterruptionGuard: entry.crossPrincipalInterruptionGuard === true,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
@@ -355,6 +362,9 @@ async function updateBotCardPrefsInternal(
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.senderTag = patch.senderTag === false ? false : undefined;
   }
+  if (patch.crossPrincipalInterruptionGuard !== undefined) {
+    bot.config.crossPrincipalInterruptionGuard = patch.crossPrincipalInterruptionGuard || undefined;
+  }
   if (patch.overloadAlert !== undefined) {
     bot.config.overloadAlert = patch.overloadAlert || undefined;
   }
@@ -407,6 +417,7 @@ async function updateBotCardPrefsInternal(
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `thinkingCard=${r.result.thinkingCard} thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
+    `crossPrincipalInterruptionGuard=${r.result.crossPrincipalInterruptionGuard} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +

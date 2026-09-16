@@ -1533,6 +1533,12 @@ export interface BotConfig {
    */
   senderTag?: boolean;
   /**
+   * Require explicit classification when a different authenticated principal
+   * sends a message during an active turn. Default OFF preserves the pre-3.22
+   * shared-topic follow-up and type-ahead behavior.
+   */
+  crossPrincipalInterruptionGuard?: boolean;
+  /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
    * attached to a botmux-owned app-server thread, so input can't be dropped by
@@ -3672,6 +3678,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
+      // Default OFF: explicit opt-in to the cross-principal classification flow.
+      crossPrincipalInterruptionGuard: entry.crossPrincipalInterruptionGuard === true || undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
         ? (() => {
           const filtered = entry.noPinStreamingCardChats

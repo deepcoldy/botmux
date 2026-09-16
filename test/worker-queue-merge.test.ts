@@ -38,16 +38,34 @@ describe('mergeQueuedCliInput', () => {
     expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
   });
 
-  it('never merges queue items across trusted caller boundaries', () => {
+  it('keeps queue items separate across trusted caller boundaries when the guard is enabled', () => {
     const pending = [{
       content: 'first', turnId: 't1',
       trustedCaller: { requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const },
+      crossPrincipalInterruptionGuard: true as const,
     }];
     expect(mergeQueuedCliInput(pending, {
       content: 'second', turnId: 't2',
       trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
+      crossPrincipalInterruptionGuard: true,
     })).toBe(false);
     expect(pending).toHaveLength(1);
+  });
+
+  it('preserves pre-3.22 cross-caller merging when the guard is disabled', () => {
+    const caller = {
+      requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    const pending = [{ content: 'first', turnId: 't1', trustedCaller: caller }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second',
+      turnId: 't2',
+      trustedCaller: {
+        requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const,
+      },
+    })).toBe(true);
+    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller: caller }]);
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {

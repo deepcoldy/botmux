@@ -117,11 +117,14 @@ const inputLog = process.env.FAKE_INPUT_LOG;
 let firstSeen = false;
 let firstDone = false;
 let secondSeen = false;
+let openModeSeen = false;
+let observedInput = '';
 setTimeout(() => process.stdout.write('Ready\\n'), 100);
 process.stdin.on('data', chunk => {
   const text = chunk.toString();
+  observedInput += text;
   fs.appendFileSync(inputLog, text);
-  if (!firstSeen && text.includes('PRINCIPAL_A_MARKER')) {
+  if (!firstSeen && observedInput.includes('PRINCIPAL_A_MARKER')) {
     firstSeen = true;
     fs.appendFileSync(inputLog, '\\nA_SEEN\\n');
     process.stdout.write('Working...\\n');
@@ -129,11 +132,15 @@ process.stdin.on('data', chunk => {
       firstDone = true;
       fs.appendFileSync(inputLog, '\\nA_DONE\\n');
       process.stdout.write('\\x1b[2J\\x1b[HReady\\n');
-    }, 500);
+    }, 1_500);
   }
-  if (!secondSeen && text.includes('PRINCIPAL_B_MARKER')) {
+  if (!secondSeen && observedInput.includes('PRINCIPAL_B_MARKER')) {
     secondSeen = true;
     fs.appendFileSync(inputLog, firstDone ? '\\nB_AFTER_A\\n' : '\\nB_BEFORE_A\\n');
+  }
+  if (!openModeSeen && observedInput.includes('PRINCIPAL_C_OPEN_MODE')) {
+    openModeSeen = true;
+    fs.appendFileSync(inputLog, firstDone ? '\\nC_AFTER_A\\n' : '\\nC_BEFORE_A\\n');
   }
 });
 setInterval(() => {}, 1_000);
@@ -231,16 +238,32 @@ setInterval(() => {}, 1_000);
       },
     } satisfies DaemonToWorker);
 
+    // No rerouteEnvelope means the confirmation guard is disabled. Preserve
+    // the pre-3.22 type-ahead path even when another principal owns the turn.
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_C_OPEN_MODE',
+      turnId: 'om_principal_c',
+      trustedCaller: {
+        requestUserOpenId: 'ou_c',
+        requestUserUnionId: 'on_c',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+
     await waitFor(() => messages.some(message =>
       message.type === 'turn_input_rejected' && message.turnId === 'om_principal_b'), logs);
     await waitFor(() => messages.some(message =>
       message.type === 'turn_input_rejected' && message.turnId === 'om_principal_bot'), logs);
+    await waitFor(() => readFileSync(inputLog, 'utf8').includes('C_BEFORE_A'), logs);
     await waitFor(() => existsSync(inputLog)
       && readFileSync(inputLog, 'utf8').includes('A_DONE'), logs);
     const input = readFileSync(inputLog, 'utf8');
     expect(input).not.toContain('B_BEFORE_A');
     expect(input).not.toContain('PRINCIPAL_B_MARKER');
     expect(input).not.toContain('PRINCIPAL_BOT_MARKER');
+    expect(input).not.toContain('C_AFTER_A');
     const rejected = messages.filter(message => message.type === 'turn_input_rejected');
     expect(rejected).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -260,9 +283,12 @@ setInterval(() => {}, 1_000);
     ]));
     expect(rejected.filter(message => message.turnId === 'om_principal_b')).toHaveLength(1);
     expect(rejected.filter(message => message.turnId === 'om_principal_bot')).toHaveLength(1);
+    expect(rejected).not.toContainEqual(expect.objectContaining({ turnId: 'om_principal_c' }));
 
     await waitFor(() => messages.some(message =>
       message.type === 'managed_turn_origin_revoked' && message.turnId === 'om_principal_a'), logs);
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_committed' && message.turnId === 'om_principal_c'), logs);
     child.send({
       type: 'message',
       content: 'PRINCIPAL_B_MARKER_AFTER_A',

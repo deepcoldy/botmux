@@ -15,10 +15,18 @@ describe('bot defaults focused layout', () => {
 
     expect(page).toContain('<BotAgentSection');
     expect(page).toContain('<SessionModeSection');
+    expect(page).toContain('<CrossPrincipalInterruptionSection');
     expect(page).toContain('<SandboxSection');
     expect(page).toContain('<CardBehaviorSection');
     expect(page).toContain('<section className="bd-tile bd-tile-wide"><CardBehaviorSection');
     expect(page).toContain('<RuntimeEnvironmentSection');
+  });
+
+  it('exposes the cross-principal confirmation guard as a self-service session toggle', () => {
+    expect(page).toContain('data-cross-principal-interruption');
+    expect(page).toContain('dataAction="toggle-cross-principal-interruption"');
+    expect(page).toContain('crossPrincipalInterruptionGuard: next');
+    expect(i18n).toContain("'botDefaults.crossPrincipalGuard': '启用跨成员任务确认'");
   });
 
   it('lays task tiles out as a two-column waterfall so short tiles do not strand a gap', () => {

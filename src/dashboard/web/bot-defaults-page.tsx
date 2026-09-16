@@ -763,6 +763,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     thinkingCard: body.thinkingCard,
     thinkingCardToolResult: body.thinkingCardToolResult,
     senderTag: body.senderTag,
+    crossPrincipalInterruptionGuard: body.crossPrincipalInterruptionGuard,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -1111,6 +1112,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><CrossPrincipalInterruptionSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile">
@@ -4711,6 +4713,57 @@ function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPr
         onChange={checked => void save(checked)}
       />
       <div className="actions"><StatusSpan status={status} attr={{ 'data-crossbot-status': '' }} /></div>
+    </section>
+  );
+}
+
+function CrossPrincipalInterruptionSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [enabled, setEnabled] = useState(props.bot.crossPrincipalInterruptionGuard === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(
+    () => setEnabled(props.bot.crossPrincipalInterruptionGuard === true),
+    [props.bot.crossPrincipalInterruptionGuard],
+  );
+
+  async function save(next: boolean): Promise<void> {
+    const previous = enabled;
+    setEnabled(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ crossPrincipalInterruptionGuard: next });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setEnabled(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setEnabled(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-cross-principal-interruption>
+      <h3 className="bd-section-title">{tr('botDefaults.crossPrincipalGuardSection')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-cross-principal-interruption"
+        title={tr('botDefaults.crossPrincipalGuard')}
+        help={tr('botDefaults.crossPrincipalGuardHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.crossPrincipalGuardNote')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-cross-principal-status': '' }} />
+      </div>
     </section>
   );
 }

@@ -96,6 +96,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
+    expect(prefs.crossPrincipalInterruptionGuard).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
     expect(prefs.autoStartOnGroupJoinSeed).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
@@ -247,6 +248,24 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(off.ok && off.prefs.codexAppCleanInput).toBe(false);
     expect(readConfig().codexAppCleanInput).toBeUndefined();
     expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
+  });
+
+  it('crossPrincipalInterruptionGuard is opt-in and hot-updates without a restart', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').crossPrincipalInterruptionGuard).toBe(false);
+
+    const on = await store.updateBotCardPrefs('app_default', { crossPrincipalInterruptionGuard: true });
+    expect(on.ok && on.prefs.crossPrincipalInterruptionGuard).toBe(true);
+    expect(readConfig().crossPrincipalInterruptionGuard).toBe(true);
+    expect(registry.getBot('app_default').config.crossPrincipalInterruptionGuard).toBe(true);
+
+    const off = await store.updateBotCardPrefs('app_default', { crossPrincipalInterruptionGuard: false });
+    expect(off.ok && off.prefs.crossPrincipalInterruptionGuard).toBe(false);
+    expect(readConfig().crossPrincipalInterruptionGuard).toBeUndefined();
+    expect(registry.getBot('app_default').config.crossPrincipalInterruptionGuard).toBeUndefined();
   });
 
   it('pinStreamingCard is default-off and round-trips without a restart', async () => {

@@ -145,6 +145,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     thinkingCard: j?.thinkingCard !== false,
     thinkingCardToolResult: j?.thinkingCardToolResult !== false,
     senderTag: j?.senderTag !== false,
+    crossPrincipalInterruptionGuard: j?.crossPrincipalInterruptionGuard === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
