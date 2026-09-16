@@ -659,7 +659,7 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(mocks.closeSession).not.toHaveBeenCalled();
     } finally {
       mocks.createSession.mockImplementation(original!);
-      actual.init();
+      actual.init(APP);
       rmSync(home, { recursive: true, force: true });
     }
   });

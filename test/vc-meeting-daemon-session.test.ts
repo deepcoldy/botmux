@@ -426,6 +426,7 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
 
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { __testOnly_activeSessions, __vcMeetingAgentTest } from '../src/daemon.js';
 import {
   acceptVcMeetingDelivery,
@@ -835,6 +836,7 @@ describe('VC meeting daemon session lifecycle', () => {
     dataDirBeforeTest = config.session.dataDir;
     testDataDir = mkdtempSync(join(tmpdir(), 'botmux-vc-daemon-session-'));
     config.session.dataDir = testDataDir;
+    sessionStore.init(APP_ID);
     __testOnly_activeSessions.clear();
     __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
     __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
