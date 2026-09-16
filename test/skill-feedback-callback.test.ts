@@ -88,7 +88,8 @@ describe('feedback callback state machine', () => {
   it('records reason against latest negative result and renders selection', async () => {
     const { store, delivery } = await setup();
     await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
-    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_reason', reason_key: 'wrong_result' }), 'app', { store });
+    const feedbackId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_reason', reason_key: 'wrong_result', expected_feedback_id: feedbackId }), 'app', { store });
     expect(JSON.stringify(result.card.data)).toContain('✓ 结论错误');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect', reasonKey: 'wrong_result' });
     store.close();
@@ -97,12 +98,13 @@ describe('feedback callback state machine', () => {
   it('validates required comments and never coerces non-string values', async () => {
     const { store, delivery } = await setup({ required: true, maxLength: 5 });
     await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    const feedbackId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
     for (const value of [{ comment: '   ' }, { comment: {} }, { comment: '123456' }]) {
-      const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', value), 'app', { store });
+      const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment', expected_feedback_id: feedbackId }, 'ou_user', value), 'app', { store });
       expect(result.toast.type).toBe('warning');
     }
     expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(1);
-    const ok = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', { comment: ' ok ' }), 'app', { store });
+    const ok = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment', expected_feedback_id: feedbackId }, 'ou_user', { comment: ' ok ' }), 'app', { store });
     expect(JSON.stringify(ok.card.data)).toContain('已补充说明');
     expect(JSON.stringify(ok.card.data)).not.toContain('ok');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ comment: 'ok' });
@@ -126,11 +128,38 @@ describe('feedback callback state machine', () => {
     const response = store.createResponse({ interactionId: 'int-reselect', content: 'answer' });
     const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
     const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
-    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
-    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
-    const back = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const first = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const firstId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    expect(JSON.stringify(first.card.data)).toContain(`"expected_feedback_id":"${firstId}"`);
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect', expected_feedback_id: firstId }), 'app', { store });
+    const secondId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    const back = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable', expected_feedback_id: secondId }), 'app', { store });
     expect(JSON.stringify(back.card.data)).toContain('已选择：**结论可用**');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'conclusive_usable', revision: 3 });
+    store.close();
+  });
+
+  it('does not let a redelivered old choice overwrite a newer selection', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-stale-replay', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+
+    const oldLike = event({ action: 'feedback_submit', result: 'conclusive_usable' });
+    await handleSkillFeedbackCardAction(oldLike, 'app', { store });
+    const firstId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'incorrect', expected_feedback_id: firstId }),
+      'app',
+      { store },
+    );
+
+    const replay = await handleSkillFeedbackCardAction(oldLike, 'app', { store });
+    expect(JSON.stringify(replay.deferredCard.data)).toContain('已选择：**结论有误**');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect', revision: 2 });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(2);
     store.close();
   });
 
