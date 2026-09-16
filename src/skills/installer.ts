@@ -6,6 +6,7 @@ import { logger } from '../utils/logger.js';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from './definitions.js';
 import { effectiveBuiltinSkills, isBuiltinSkillBodyOverridden } from './effective-builtins.js';
 import { SEND_SKILL_SESSION_LOADER } from './reply-style-guide.js';
+import { isMultiTopicOrchestrationEnabled } from '../global-config.js';
 
 // This module only manages botmux-owned bridge/ask skills. User-defined skills
 // live in src/core/skills/* and services/skill-registry-store.ts so their
@@ -207,7 +208,10 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
   // shared skill dirs receive a stable loader, while `botmux skill show` renders
   // the per-session guide from BOTMUX_REPLY_STYLE. Explicit user bodies still
   // win and are written verbatim.
-  const effective = effectiveBuiltinSkills([...BUILTIN_SKILLS]).map((skill) => {
+  const shippedBuiltins = isMultiTopicOrchestrationEnabled()
+    ? [...BUILTIN_SKILLS]
+    : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
+  const effective = effectiveBuiltinSkills(shippedBuiltins).map((skill) => {
     if (skill.name !== 'botmux-send' || isBuiltinSkillBodyOverridden(skill.name)) return skill;
     return { ...skill, content: SEND_SKILL_SESSION_LOADER };
   });

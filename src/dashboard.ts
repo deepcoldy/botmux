@@ -1080,6 +1080,8 @@ interface ResolvedDashboardSettings {
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. */
   workflow: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1659,6 +1661,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
+    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
