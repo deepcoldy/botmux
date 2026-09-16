@@ -21780,6 +21780,19 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    if (structuredAskAnswer.kind === 'unsupported_multi_question') {
+      if (isBotSenderType || isForeignBot) {
+        logger.warn(`[${anchor.substring(0, 12)}] bot structured ask answer cannot settle a multi-question ask sender=${threadSenderOpenId!.substring(0, 12)}`);
+      } else {
+        await sessionReply(
+          anchor,
+          `<at id=${threadSenderOpenId}></at> 结构化命令暂不支持多问题，请通过卡片完成，该指令未执行。`,
+          'text',
+          larkAppId,
+        );
+      }
+      return;
+    }
     const outcome = structuredAskAnswer.outcome;
     if (outcome === 'accepted') {
       logger.info(`[${anchor.substring(0, 12)}] structured ask answer accepted from ${threadSenderOpenId.substring(0, 12)} key=${structuredAskAnswer.key}`);

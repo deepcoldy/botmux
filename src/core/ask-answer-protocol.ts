@@ -56,6 +56,7 @@ export function allowsHumanAskChoiceText(originKind: string | undefined, text: s
 export type StructuredAskAnswerResult =
   | { kind: 'not_protocol' }
   | { kind: 'no_pending'; key: string }
+  | { kind: 'unsupported_multi_question'; key: string }
   | { kind: 'submitted'; key: string; outcome: AskClickOutcome };
 
 /**
@@ -80,6 +81,11 @@ export function submitStructuredAskAnswer(args: {
   if (!key) return { kind: 'not_protocol' };
   const pending = args.findPending();
   if (!pending) return { kind: 'no_pending', key };
+  // The wire command carries exactly one option key and therefore cannot
+  // faithfully represent answers for more than one question. Fail closed
+  // before touching the broker: submitting [[key]] would otherwise pad every
+  // trailing multi-select question with [] and silently settle the whole ask.
+  if (pending.questions.length > 1) return { kind: 'unsupported_multi_question', key };
   return {
     kind: 'submitted',
     key,

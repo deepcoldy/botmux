@@ -363,7 +363,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     const ds = seedThreadSession(anchor, 'seeded') as any;
     const workerSend = vi.fn();
     ds.worker = { killed: false, send: workerSend };
-    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-bot', nonce: 'nonce-bot' });
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-bot', nonce: 'nonce-bot',
+      questions: [{ prompt: 'q', options: [{ key: 'accept', label: 'Accept' }], multiSelect: false }],
+    });
     mocks.submitAsk.mockReturnValue('accepted');
 
     await handleThreadReply(
@@ -404,7 +407,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     const ds = seedThreadSession(anchor, 'seeded') as any;
     const workerSend = vi.fn();
     ds.worker = { killed: false, send: workerSend };
-    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-human', nonce: 'nonce-human' });
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-human', nonce: 'nonce-human',
+      questions: [{ prompt: 'q', options: [{ key: 'reject', label: 'Reject' }], multiSelect: false }],
+    });
     mocks.submitAsk.mockReturnValue('accepted');
 
     await handleThreadReply(
@@ -450,12 +456,47 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(mocks.replyMessage).not.toHaveBeenCalled();
     expect(mocks.sendMessage).not.toHaveBeenCalled();
 
-    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-bot', nonce: 'nonce-bot' });
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-bot', nonce: 'nonce-bot',
+      questions: [{ prompt: 'q', options: [{ key: 'wrong_key', label: 'Wrong' }], multiSelect: false }],
+    });
     mocks.submitAsk.mockReturnValue('stale');
     await handleThreadReply(event('om_structured_bot_stale'), makeCtx(anchor, 'om_structured_bot_stale'));
     expect(mocks.submitAsk).toHaveBeenCalledWith(expect.objectContaining({
       selections: [['wrong_key']],
     }));
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps a bot multi-question answer silent without submitting it', async () => {
+    const anchor = 'om_structured_bot_multi_question';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-bot-multi', nonce: 'nonce-bot-multi',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'accept', label: 'Accept' }], multiSelect: true },
+        { prompt: 'q2', options: [{ key: 'other', label: 'Other' }], multiSelect: true },
+      ],
+    });
+
+    await handleThreadReply(
+      makeAddressedAskAnswerEvent({
+        messageId: 'om_structured_bot_multi_question_turn',
+        rootId: anchor,
+        key: 'accept',
+        targetOpenId: 'ou_question_bot',
+        senderOpenId: 'ou_answering_bot',
+        senderType: 'app',
+        senderUnionId: 'on_answering_bot',
+      }),
+      makeCtx(anchor, 'om_structured_bot_multi_question_turn'),
+    );
+
+    expect(mocks.submitAsk).not.toHaveBeenCalled();
     expect(workerSend).not.toHaveBeenCalled();
     expect(mocks.replyMessage).not.toHaveBeenCalled();
     expect(mocks.sendMessage).not.toHaveBeenCalled();
@@ -481,6 +522,33 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     );
   });
 
+  it('keeps a multi-question ask pending and tells a human to use the card', async () => {
+    const anchor = 'om_structured_human_multi_question';
+    seedThreadSession(anchor, 'seeded');
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-human-multi', nonce: 'nonce-human-multi',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'accept', label: 'Accept' }], multiSelect: false },
+        { prompt: 'q2', options: [{ key: 'reject', label: 'Reject' }], multiSelect: false },
+      ],
+    });
+
+    await handleThreadReply(
+      makeEventData(
+        'om_structured_human_multi_question_turn',
+        '/botmux-ask-answer accept',
+        anchor,
+        'ou_answering_human',
+      ),
+      makeCtx(anchor, 'om_structured_human_multi_question_turn'),
+    );
+
+    expect(mocks.submitAsk).not.toHaveBeenCalled();
+    expect(repliedText()).toContain(
+      '<at id=ou_answering_human></at> 结构化命令暂不支持多问题，请通过卡片完成，该指令未执行。',
+    );
+  });
+
   it.each([
     ['unauthorized', '你无权回答当前选择'],
     ['already_settled', '当前选择已结束'],
@@ -488,7 +556,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
   ] as const)('replies to a human when a structured answer is %s', async (outcome, reason) => {
     const anchor = `om_structured_human_${outcome}`;
     seedThreadSession(anchor, 'seeded');
-    mocks.findPendingAskByAnchor.mockReturnValue({ askId: 'ask-human', nonce: 'nonce-human' });
+    mocks.findPendingAskByAnchor.mockReturnValue({
+      askId: 'ask-human', nonce: 'nonce-human',
+      questions: [{ prompt: 'q', options: [{ key: 'accept', label: 'Accept' }], multiSelect: false }],
+    });
     mocks.submitAsk.mockReturnValue(outcome);
 
     await handleThreadReply(

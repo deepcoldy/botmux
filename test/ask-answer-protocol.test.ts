@@ -90,4 +90,50 @@ describe('structured ask answer protocol', () => {
       actor: { botSender: true, senderUnionId: 'on_bot' },
     });
   });
+
+  it.each([
+    ['two single-select questions', false],
+    ['two multi-select questions', true],
+  ] as const)('rejects %s before submit so the ask remains pending', (_label, multiSelect) => {
+    const pending = {
+      askId: 'ask-multi-question',
+      nonce: 'nonce-multi-question',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'session-1',
+      questions: [
+        {
+          prompt: 'first',
+          options: [{ key: 'prod', label: 'Production' }],
+          multiSelect,
+        },
+        {
+          prompt: 'second',
+          options: [{ key: 'confirm', label: 'Confirm' }],
+          multiSelect,
+        },
+      ],
+      selections: [[], []],
+      createdAt: 1,
+      deadlineAt: 2,
+      settled: false,
+    };
+    const submit = vi.fn(() => {
+      pending.settled = true;
+      return 'accepted' as const;
+    });
+
+    const result = submitStructuredAskAnswer({
+      text: '/botmux-ask-answer prod',
+      by: 'ou_bot',
+      findPending: () => pending,
+      submit,
+    });
+
+    expect(result).toEqual({ kind: 'unsupported_multi_question', key: 'prod' });
+    expect(submit).not.toHaveBeenCalled();
+    expect(pending.settled).toBe(false);
+    expect(pending.selections).toEqual([[], []]);
+  });
 });
