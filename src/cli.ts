@@ -6496,8 +6496,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        普通群项目控制面与置顶进度卡（详见 \`botmux project --help\`）
 
 新建飞书群:
-  create-group --bot <name> [--bot ...] [--name "群名"]
-                                       用指定 bot 起新群；详见 \`botmux create-group --help\`
+  create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
+                                       用指定 bot 起新群（--chat-mode topic 建话题群）；详见 \`botmux create-group --help\`
 
 精确群对话授权（talk-only）:
   grant chat --bot <receiver> --chat-id <oc_...> --subject-bot <larkAppId>
@@ -11876,6 +11876,7 @@ botmux create-group — 用一组机器人新建飞书群
 
 用法:
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
+                      [--chat-mode group|topic]
                       [--working-dir <path>]
                       [--kickoff-bot <open_id> --kickoff-prompt "文本"]
                       [--json-status]
@@ -11886,6 +11887,10 @@ botmux create-group — 用一组机器人新建飞书群
                   bots.json 中第一个。重名 → 取 bots.json 中第一个匹配，stderr 打 warning。
                   重复 ref → 自动去重保留首次顺序。
   --name <群名>   可选；不传则用飞书默认无名群。
+  --chat-mode <group|topic>
+                 可选；建群时的群形态，仅在建群那一刻生效且之后不可通过接口更改。
+                 topic = 话题群（每条顶层消息自成一个话题）；group = 普通群（默认）。
+                 不传则不带 chat_mode，沿用飞书默认普通群。
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
@@ -11902,7 +11907,8 @@ botmux create-group — 用一组机器人新建飞书群
   用途：把「同团队、已 opt-in」的**别人机器上的** agent（用 bots list --scope team 发现到的 appId）
   和它们各自的 owner 一起拉进一个平台代建的聚焦新群，全程 machine-auth。
   正因为发起人在别人 bot 进群前 @不到它，这条只认 appId、不依赖任何飞书 @，天然绕开视角问题。
-  --agent 至少一个、可多次、按 appId 去重。团队模式忽略 --bot/--kickoff/--working-dir（那些是本机建群用的）。
+  --agent 至少一个、可多次、按 appId 去重。团队模式忽略 --bot/--chat-mode/--kickoff/--working-dir
+  （那些是本机建群用的）。
   未传 --team：本机唯一团队则自动用它，多个要求显式指定。
   （往**已存在**的团队群补人是独立命令：botmux bots invite --chat <chatId> --team X --agent ...）
 
@@ -11950,6 +11956,7 @@ botmux create-group — 用一组机器人新建飞书群
 
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
+  const chatModeArg = argValue(rest, '--chat-mode');
   const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
   const kickoffBot = argValue(rest, '--kickoff-bot');
   const kickoffPrompt = argValue(rest, '--kickoff-prompt');
@@ -11998,9 +12005,17 @@ botmux create-group — 用一组机器人新建飞书群
   const {
     resolveBotRefs,
     resolveKickoff,
+    resolveChatMode,
     createGroupCompletionStatus,
     shouldWriteCreateGroupCompletionStatus,
   } = await import('./cli/create-group-resolver.js');
+
+  const resolvedChatMode = resolveChatMode(chatModeArg);
+  if (!resolvedChatMode.ok) {
+    console.error(resolvedChatMode.error);
+    process.exit(1);
+  }
+
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
@@ -12068,6 +12083,7 @@ botmux create-group — 用一组机器人新建飞书群
       creatorLarkAppId,
       larkAppIds: resolved.larkAppIds,
       name: name?.trim() || undefined,
+      chatMode: resolvedChatMode.chatMode,
       userOpenIds: targetOpenId ? [targetOpenId] : [],
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,
