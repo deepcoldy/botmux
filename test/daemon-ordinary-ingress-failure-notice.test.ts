@@ -169,6 +169,7 @@ import {
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
   __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
+  __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
 } from '../src/daemon.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
@@ -706,6 +707,82 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.crossPrincipalWaitTimer).toBeDefined();
     clearTimeout(ds.crossPrincipalWaitTimer);
     ds.crossPrincipalWaitTimer = undefined;
+  });
+});
+
+describe('XPI human terminal alert delivery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.sessions.clear();
+    activeSessions.clear();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  function seedAlertRecord(ds: DaemonSession): any {
+    return {
+      version: 1,
+      id: 'xpi_alert_test_123456789012',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+      proposer: { requestLarkAppId: 'proposer-app', requestUserOpenId: 'ou_proposer', senderType: 'bot' },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'turn-with-secret',
+        text: 'secret-original-body-should-not-leak',
+        userPrompt: 'secret-original-body-should-not-leak',
+        createdAt: NOW,
+      }],
+    };
+  }
+
+  it('records delivery_failed for three failures and then delivery_exhausted', async () => {
+    const ds = seedThreadSession('om_alert_retry', 'seeded');
+    const record = seedAlertRecord(ds);
+    mocks.replyMessage.mockRejectedValue(new Error('alert transport down'));
+    mocks.sendMessage.mockRejectedValue(new Error('alert transport down'));
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, 'secret-original-body-should-not-leak')).resolves.toBe(false);
+
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
+      .toEqual(['delivery_failed', 'delivery_failed', 'delivery_failed', 'delivery_exhausted']);
+    expect(repliedText()).not.toContain('secret-original-body-should-not-leak');
+  });
+
+  it('records recovery on the second attempt and does not exhaust', async () => {
+    const ds = seedThreadSession('om_alert_recover', 'seeded');
+    const record = seedAlertRecord(ds);
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce('om_recovered');
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, 'generic terminal reason')).resolves.toBe(true);
+
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
+      .toEqual(['delivery_failed', 'delivery_recovered']);
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.some((item: any) => item.event === 'delivery_exhausted')).toBe(false);
+    expect(repliedText()).toContain('来源应用: proposer-app');
+    expect(repliedText()).not.toContain('generic terminal reason');
+  });
+
+  it('fails closed outside a group/topic and records the route reason without sending', async () => {
+    const ds = seedThreadSession('om_alert_private', 'seeded');
+    ds.chatType = 'p2p';
+    const record = seedAlertRecord(ds);
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, 'generic terminal reason')).resolves.toBe(false);
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.reason))
+      .toEqual(['alert route is not a group/topic', 'alert route is not a group/topic']);
   });
 });
 

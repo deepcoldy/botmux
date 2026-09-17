@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choice.js';
 import {
+  crossPrincipalBotSendGate,
   crossPrincipalBotSendNeedsChoice,
   crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
@@ -18,6 +19,22 @@ const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 
 const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 
 describe('cross-principal choice vocabulary', () => {
+  it('returns a fixed nonzero gate result before any send side effect', () => {
+    expect(crossPrincipalBotSendGate({
+      enabled: true,
+      hasKnownBotMention: true,
+    })).toEqual({ allowed: false, exitCode: 64 });
+    expect(crossPrincipalBotSendGate({
+      enabled: true,
+      hasKnownBotMention: true,
+      choice: 'independent',
+    })).toEqual({ allowed: true });
+    expect(crossPrincipalBotSendGate({
+      enabled: true,
+      hasKnownBotMention: false,
+    })).toEqual({ allowed: true });
+  });
+
   it('parses --as aliases for the two agent options', () => {
     expect(parseCrossPrincipalAsFlag('independent')).toBe('independent');
     expect(parseCrossPrincipalAsFlag('另开任务')).toBe('independent');
@@ -156,7 +173,7 @@ describe('cross-principal choice wiring', () => {
     expect(daemonSource).toContain("record.proposer.senderType === 'bot'");
     expect(cliSource).toContain("argValue(rest, '--as')");
     expect(cliSource).toContain('embedCrossPrincipalAsToken');
-    expect(cliSource).toContain('crossPrincipalBotSendNeedsChoice');
+    expect(cliSource).toContain('crossPrincipalBotSendGate');
     expect(cliSource).toContain('xpi.send.as_required');
     expect(cliSource).toContain('xpi.send.as_needed_hint');
     expect(cliSource).toContain('controlLane: isSlashSend');
@@ -169,7 +186,7 @@ describe('cross-principal choice wiring', () => {
     expect(daemonSource).toContain('请升级发送端 botmux');
     expect(daemonSource).toContain('ds.chatType === \'group\'');
     expect(daemonSource).toContain('no executable protocol marker or original message body');
-    const guardAt = cliSource.indexOf('if (crossPrincipalBotSendNeedsChoice({');
+    const guardAt = cliSource.indexOf('const xpiSendGate = crossPrincipalBotSendGate({');
     const uploadAt = cliSource.indexOf('await upload', guardAt);
     expect(guardAt).toBeGreaterThan(0);
     expect(uploadAt).toBeGreaterThan(guardAt);

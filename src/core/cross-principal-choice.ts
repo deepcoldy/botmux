@@ -99,6 +99,22 @@ export function crossPrincipalBotSendNeedsChoice(args: {
   return args.enabled && args.hasKnownBotMention && !args.controlLane && !args.choice;
 }
 
+/**
+ * Host-side send decision. Keeping the fixed usage exit code beside the
+ * policy makes it testable without spawning the CLI or touching a provider.
+ * Callers must evaluate this before uploads, outbox writes, or API dispatch.
+ */
+export function crossPrincipalBotSendGate(args: {
+  enabled: boolean;
+  hasKnownBotMention: boolean;
+  choice?: CrossPrincipalAsChoice;
+  controlLane?: boolean;
+}): { allowed: true } | { allowed: false; exitCode: 64 } {
+  return crossPrincipalBotSendNeedsChoice(args)
+    ? { allowed: false, exitCode: 64 }
+    : { allowed: true };
+}
+
 /** Parse `botmux send --as <value>`. Unknown values stay undefined. */
 export function parseCrossPrincipalAsFlag(raw: string | undefined): CrossPrincipalAsChoice | undefined {
   if (!raw) return undefined;

@@ -270,7 +270,7 @@ import {
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
-  crossPrincipalBotSendNeedsChoice,
+  crossPrincipalBotSendGate,
   embedCrossPrincipalAsToken,
   parseCrossPrincipalAsFlag,
 } from './core/cross-principal-choice.js';
@@ -10423,14 +10423,15 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: XPI 开启时暂不支持向 Bot 发送自定义卡片；请改用普通文本并携带 --as independent|suggestion');
     process.exit(64);
   }
-  if (crossPrincipalBotSendNeedsChoice({
+  const xpiSendGate = crossPrincipalBotSendGate({
     enabled: config.crossPrincipalInterruption,
     hasKnownBotMention: knownBotTextTarget,
     choice: asChoice,
     controlLane: isSlashSend,
-  })) {
+  });
+  if (!xpiSendGate.allowed) {
     console.error(t('xpi.send.as_required', undefined, localeForBot(appId)));
-    process.exit(64);
+    process.exit(xpiSendGate.exitCode);
   }
 
   try {

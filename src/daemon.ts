@@ -18631,7 +18631,7 @@ async function notifyCrossPrincipalTerminal(
   ds: DaemonSession,
   record: CrossPrincipalInterruption,
   text: string,
-): Promise<void> {
+): Promise<boolean> {
   const humanIds = [...new Set([record.owner, record.proposer]
     .filter(principal => principal.senderType !== 'bot')
     .map(principal => principal.requestUserOpenId)
@@ -18648,23 +18648,33 @@ async function notifyCrossPrincipalTerminal(
       ? 'topic'
       : 'group';
   const hasGroupTransport = ds.chatType === 'group';
+  // Keep the original terminal text out of the human alert. Some callers pass
+  // user-derived text; only a fixed reason category may be posted to the
+  // group/topic. The full failure detail remains bounded in the local audit.
   const reason = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 240) || 'XPI terminal notice';
   if (!hasGroupTransport || recipients.length === 0) {
     const why = !hasGroupTransport ? 'alert route is not a group/topic' : 'no human recipient resolved';
     recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, 0, why);
     recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, 0, why);
     logger.error(`[${tag(ds)}] XPI human alert not delivered: ${why} record=${record.id}`);
-    return;
+    return false;
   }
 
   const ats = recipients.map(id => `<at id=${id}></at>`).join(' ');
   const sourceApp = record.proposer.requestLarkAppId ?? ds.larkAppId;
   const turnSummary = record.messages.map(message => message.turnId.slice(0, 12)).filter(Boolean).join(', ') || 'unknown';
+  const visibleReason = text.includes('未选择处理方式')
+    ? '未选择处理方式'
+    : text.includes('原任务仍在执行')
+      ? '原任务仍在执行'
+      : text.includes('本次未接收也不会执行')
+        ? '本次未接收也不会执行'
+        : '发送端未声明处理方式';
   const alert = `${ats} XPI 消息未执行\n`
     + `来源应用: ${sourceApp}\n`
     + '版本能力: 未携带 --as（旧版本/绕过发送端门禁）\n'
     + `turnId 摘要: ${turnSummary}\n`
-    + `原因: ${reason}\n`
+    + `原因: ${visibleReason}\n`
     + '处理: 请升级发送端 botmux，并按要求使用 --as independent 或 --as suggestion。';
   const uuid = crossPrincipalNoticeUuid('terminal', record, 'human-alert');
   let failures = 0;
@@ -18686,7 +18696,7 @@ async function notifyCrossPrincipalTerminal(
       if (failures > 0) {
         recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_recovered', channel, attempt, reason);
       }
-      return;
+      return true;
     } catch (error) {
       failures += 1;
       const detail = error instanceof Error ? error.message : String(error);
@@ -18696,7 +18706,10 @@ async function notifyCrossPrincipalTerminal(
   }
   recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, failures, reason);
   logger.error(`[${tag(ds)}] XPI human alert delivery exhausted after ${failures} attempts record=${record.id}`);
+  return false;
 }
+
+export const __testOnly_notifyCrossPrincipalTerminal = notifyCrossPrincipalTerminal;
 
 async function dispatchApprovedCrossPrincipalSuggestion(
   ds: DaemonSession,
@@ -19296,12 +19309,16 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       // fixed-cadence retry and remains restart-recoverable through the same
       // record; successful delivery is the only terminal condition.
       try {
-        await notifyCrossPrincipalTerminal(
+        const delivered = await notifyCrossPrincipalTerminal(
           ds,
           record,
           '建议已确认，但共享目录等待队列已满；本次未接收也不会执行，请稍后重新发起。',
         );
-        removeCrossPrincipalRecord(ds, record.id);
+        if (delivered) {
+          removeCrossPrincipalRecord(ds, record.id);
+        } else {
+          scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+        }
       } catch (noticeErr) {
         logger.warn(
           `[${tag(ds)}] failed to notify owner about full XPI shared-cwd queue: `
