@@ -371,7 +371,8 @@ import type {
   SessionShutdownDetachResult,
 } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
-import { probeZmxVersion } from './setup/ensure-zmx.js';
+import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
@@ -834,16 +835,16 @@ function stopCodexRpcEngine(): void {
  *  handler BEFORE spawnCli runs (effectiveBackendType is stale there). A wrong
  *  guess is safe: an assumed-tmux session that is really pty just has no live
  *  session → treated as fresh. Returns null for non-persistent backends. */
-function persistentPaneInfo(backendType: string, sessionId: string): { name: string; live: boolean } | null {
+function persistentPaneInfo(backendType: string, sessionId: string, target?: PersistentBackendTarget): { name: string; live: boolean } | null {
   let name: string | undefined;
   if (backendType === 'tmux') name = TmuxBackend.sessionName(sessionId);
   else if (backendType === 'herdr') name = HerdrBackend.sessionName(sessionId);
   else if (backendType === 'zellij') name = ZellijBackend.sessionName(sessionId);
-  else if (backendType === 'zmx') name = ZmxBackend.sessionName(sessionId);
+  else if (backendType === 'zmx') name = target?.backendType === 'zmx' ? target.sessionName : ZmxBackend.sessionName(sessionId);
   if (!name) return null;
   const live = backendType === 'tmux' ? TmuxBackend.hasSession(name)
     : backendType === 'zellij' ? ZellijBackend.hasSession(name)
-      : backendType === 'zmx' ? ZmxBackend.probeManagedSession(name, sessionId).state === 'compatible'
+      : backendType === 'zmx' ? ZmxBackend.probeManagedSession(name, sessionId, zmxEnv(process.env, target?.backendType === 'zmx' ? target.socketDir : undefined)).state === 'compatible'
       : HerdrBackend.hasSession(name);
   return { name, live };
 }
@@ -857,8 +858,9 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
 function persistentPaneProbe(
   backendType: PersistentBackendType,
   name: string,
+  target?: PersistentBackendTarget,
 ): 'live' | 'gone' | 'unknown' {
-  const probe: SessionProbe = backendType === 'tmux' ? TmuxBackend.probeSession(name)
+  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : backendType === 'tmux' ? TmuxBackend.probeSession(name)
     : backendType === 'zellij' ? ZellijBackend.probeSession(name)
       : backendType === 'herdr' ? HerdrBackend.probeSession(name)
         : ZmxBackend.probeSession(name);
@@ -871,8 +873,9 @@ function probeOwnedZmxSession(
   name: string,
   sessionId: string,
   expectedPid?: number,
+  socketDir?: string,
 ): { probe: SessionProbe; pid?: number; reason?: string } {
-  const managed = ZmxBackend.probeManagedSession(name, sessionId);
+  const managed = ZmxBackend.probeManagedSession(name, sessionId, zmxEnv(process.env, socketDir));
   if (managed.state === 'missing') return { probe: 'missing' };
   if (managed.state === 'unknown') return { probe: 'unknown', reason: managed.reason };
   if (managed.state === 'incompatible') {
@@ -899,10 +902,11 @@ async function killPersistentSessionVerified(
   backendType: PersistentBackendType,
   name: string,
   sessionId?: string,
+  target?: PersistentBackendTarget,
 ): Promise<boolean> {
   return killAndVerifyPersistentPane(name, {
-    kill: (resolvedName) => killPersistentSession(backendType, resolvedName, sessionId),
-    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName),
+    kill: (resolvedName) => target ? killPersistentBackendTarget(target, sessionId) : killPersistentSession(backendType, resolvedName, sessionId),
+    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName, target),
     wait: delay,
   });
 }
@@ -13504,6 +13508,7 @@ async function spawnCli(
   }
   let resolvedZmxSessionProbe: SessionProbe | undefined;
   let resolvedZmxSessionPid: number | undefined;
+  let resolvedZmxSocketDir: string | undefined;
   // Frozen zellij existence decision, mirroring resolvedZmxSessionProbe: the
   // gate resolves the tri-state probe ONCE (biasing an indeterminate answer
   // toward reattach) and every teardown below refreshes it to 'missing', so a
@@ -13564,15 +13569,30 @@ async function spawnCli(
       // The local controller version is a protocol requirement even when the
       // backing session already exists: 0.6 has the old send semantics. Only a
       // transient functional probe may be exempted for a verified live session.
-      const version = probeZmxVersion();
+      const recorded = cfg.persistentBackendTarget?.backendType === 'zmx'
+        ? cfg.persistentBackendTarget : undefined;
+      const version = probeZmxRuntime(zmxEnv(process.env, recorded?.socketDir));
       if (!version.ok) {
         available = false;
         reason = version.reason;
         resolvedZmxSessionProbe = 'unknown';
       } else {
+        resolvedZmxSocketDir = recorded?.socketDir ?? version.socketDir;
+        if (!resolvedZmxSocketDir) {
+          throw new Error('无法解析 zmx version 的 socket_dir，已拒绝创建未固定地址的会话');
+        }
+        // Freeze before the first liveness decision; selection and every later
+        // control command must address the same namespace, even after restart.
+        cfg.persistentBackendTarget = {
+          backendType: 'zmx',
+          sessionName: recorded?.sessionName ?? ZmxBackend.sessionName(cfg.sessionId),
+          socketDir: resolvedZmxSocketDir,
+        };
         const resolved = probeOwnedZmxSession(
-          ZmxBackend.sessionName(cfg.sessionId),
+          cfg.persistentBackendTarget.sessionName,
           cfg.sessionId,
+          undefined,
+          resolvedZmxSocketDir,
         );
         resolvedZmxSessionProbe = resolved.probe;
         resolvedZmxSessionPid = resolved.pid;
@@ -14165,7 +14185,7 @@ async function spawnCli(
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
-      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, resolvedZmxSocketDir)
       : undefined;
     // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe is not
     // proof of anything. Other persistent backends: their target probe returning
@@ -14256,7 +14276,7 @@ async function spawnCli(
           // helper: only this path holds the frozen PID, which makes the
           // ownership check stricter than the name+label check.
           if (effectiveBackendType === 'zmx') {
-            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid);
+            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir));
           } else if (stalePersistentTarget) {
             killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
           } else {
@@ -14268,7 +14288,7 @@ async function spawnCli(
       },
       confirmPaneGone: () => {
         const postKillProbe = effectiveBackendType === 'zmx'
-          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
+          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
           : (stalePersistentTarget
             ? probePersistentBackendTarget(stalePersistentTarget)
             : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
@@ -14378,7 +14398,7 @@ async function spawnCli(
     // ZMX ownership is label/PID-sensitive, so only its inconclusive probe
     // fails closed. Other backends keep the pre-ZMX target-probe semantics.
     const paneProbe = effectiveBackendType === 'zmx'
-      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid).probe
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, resolvedZmxSocketDir).probe
       : (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
       effectiveBackendType === 'zmx'
@@ -14447,6 +14467,7 @@ async function spawnCli(
           persistentSessionName,
           cfg.sessionId,
           resolvedZmxSessionPid,
+          zmxEnv(process.env, resolvedZmxSocketDir),
         );
       } else if (persistentTarget) {
         killPersistentBackendTarget(persistentTarget, cfg.sessionId);
@@ -14457,7 +14478,7 @@ async function spawnCli(
       // below decides reattach-vs-fresh from this probe, so an unconfirmed kill
       // would let the new backend reattach to the pane we just tried to remove.
       const postKillProbe = effectiveBackendType === 'zmx'
-        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
         : (persistentTarget
           ? probePersistentBackendTarget(persistentTarget)
           : probePersistentSession(persistentBackendType, persistentSessionName));
@@ -16492,7 +16513,7 @@ async function spawnCli(
         });
         try {
           if (killKind === 'zmx') {
-            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid);
+            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir));
           } else if (killKind === 'target') {
             killPersistentBackendTarget(teardownTarget!, cfg.sessionId);
           } else {
@@ -16505,7 +16526,7 @@ async function spawnCli(
           );
         }
         const postKill = killKind === 'zmx'
-          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
           : (killKind === 'target'
             ? probePersistentBackendTarget(teardownTarget!)
             : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
@@ -20091,9 +20112,11 @@ process.on('message', async (raw: unknown) => {
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        const rpcPersistentTarget = rpcBackendType === 'zmx' && msg.persistentBackendTarget?.backendType === 'zmx'
+          ? msg.persistentBackendTarget : undefined;
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
-          paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
+          paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid, rpcPersistentTarget),
           paneIsRemote: (name) => paneRunsRemoteTui(name, {}, msg.cliRuntime?.executable),
           prepare: async () => {
             const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
@@ -20105,6 +20128,7 @@ process.on('message', async (raw: unknown) => {
             rpcBackendType as PersistentBackendType,
             name,
             msg.sessionId,
+            rpcPersistentTarget,
           ),
           teardownEngine: () => stopCodexRpcEngine(),
           log: (m) => log(m),

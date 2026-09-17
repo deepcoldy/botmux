@@ -7284,7 +7284,12 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
           backendType,
           session.sessionId,
         );
-        if (persistentBackend.probePersistentSession(backendType, backingName) !== 'missing') {
+        const probe = backendType === 'zmx'
+          ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
+            backendType, session.sessionId, session.persistentBackendTarget,
+          ))
+          : persistentBackend.probePersistentSession(backendType, backingName);
+        if (probe !== 'missing') {
           return jsonRes(res, 409, {
             ok: false,
             error: 'read_isolation_teardown_unverified',

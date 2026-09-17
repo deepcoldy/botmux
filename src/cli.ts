@@ -135,6 +135,7 @@ import {
   wakeDormantBackendForAttach,
 } from './cli/session-list-wake.js';
 import { SESSION_WAKE_DEADLINE_HEADER } from './core/session-wake-deadline.js';
+import { zmxEnv } from './setup/ensure-zmx.js';
 import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
@@ -338,7 +339,8 @@ import {
   isSuspendableBackendType,
   killPersistentBackendTarget,
   probePersistentBackendTarget,
-  probePersistentSessions,
+  probePersistentBackendTargets,
+  persistentBackendTargetKey,
   resolvePersistentBackendTarget,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
@@ -4352,11 +4354,6 @@ function sessionStatusLabel(s: SessionData): string {
 
 type BackingProbeSnapshot = ReadonlyMap<string, SessionProbe>;
 
-function backingProbeKey(target: PersistentBackendTarget): string {
-  const agentName = target.backendType === 'herdr' ? target.agentName ?? '' : '';
-  return `${target.backendType}\0${target.sessionName}\0${agentName}`;
-}
-
 function sessionPersistentTarget(s: SessionData): PersistentBackendTarget | undefined {
   if (isSuspendableBackendType(s.backendType)) {
     return resolvePersistentBackendTarget(
@@ -4383,45 +4380,20 @@ function persistentTargetDisplay(target: PersistentBackendTarget): string {
 }
 
 function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingProbeSnapshot {
-  const namesByBackend = new Map<PersistentBackendType, Set<string>>();
-  const directTargets = new Map<string, PersistentBackendTarget>();
-  const add = (target: PersistentBackendTarget) => {
-    if (target.backendType === 'herdr' && target.agentName) {
-      directTargets.set(backingProbeKey(target), target);
-      return;
-    }
-    const backendType = target.backendType;
-    const name = target.sessionName;
-    const names = namesByBackend.get(backendType) ?? new Set<string>();
-    names.add(name);
-    namesByBackend.set(backendType, names);
-  };
-
+  const targets: PersistentBackendTarget[] = [];
   for (const session of sessions) {
     if (isAdoptedSession(session) || session.backendType === 'pty') continue;
     const target = sessionPersistentTarget(session);
-    if (target) add(target);
+    if (target) targets.push(target);
   }
-
-  const snapshot = new Map<string, SessionProbe>();
-  // Agent-scoped Herdr targets cannot be collapsed into a host-session probe:
-  // the shared host may be healthy after this exact Botmux agent exited.
-  for (const [key, target] of directTargets) {
-    snapshot.set(key, probePersistentBackendTarget(target));
-  }
-  for (const [backendType, names] of namesByBackend) {
-    for (const [name, probe] of probePersistentSessions(backendType, names)) {
-      snapshot.set(backingProbeKey({ backendType, sessionName: name } as PersistentBackendTarget), probe);
-    }
-  }
-  return snapshot;
+  return probePersistentBackendTargets(targets);
 }
 
 function backingProbe(
   snapshot: BackingProbeSnapshot | undefined,
   target: PersistentBackendTarget,
 ): SessionProbe {
-  return snapshot?.get(backingProbeKey(target))
+  return snapshot?.get(persistentBackendTargetKey(target))
     ?? probePersistentBackendTarget(target);
 }
 
@@ -4982,9 +4954,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           // First prove both complete Botmux labels while the picker is still
           // active, then freeze the PTY root generation across terminal
           // cleanup and re-prove it immediately before attach.
+          const attachDeps = { env: zmxEnv(process.env, target.socketDir) };
           const frozen = freezeManagedZmxAttachTarget(
             target.sessionName,
             selected.session.sessionId,
+            attachDeps,
           );
           if (!frozen.ok) {
             flash = { style: 'error', text: frozen.message };
@@ -4996,6 +4970,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             target.sessionName,
             selected.session.sessionId,
             frozen.pid,
+            attachDeps,
           );
           if (!attached.ok) console.error(attached.message);
         } else {
@@ -5028,19 +5003,20 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
  * name-only shell pipelines.
  */
 function cmdManagedZmxAttach(args: string[]): void {
-  const [name, sessionId, ...extra] = args;
+  const [name, sessionId, socketDir, ...extra] = args;
   if (!name?.trim() || !sessionId?.trim() || extra.length > 0) {
-    console.error('internal usage: __zmx-attach-managed <session-name> <complete-session-id>');
+    console.error('internal usage: __zmx-attach-managed <session-name> <complete-session-id> [socket-dir]');
     process.exitCode = 2;
     return;
   }
-  const frozen = freezeManagedZmxAttachTarget(name, sessionId);
+  const attachDeps = { env: zmxEnv(process.env, socketDir) };
+  const frozen = freezeManagedZmxAttachTarget(name, sessionId, attachDeps);
   if (!frozen.ok) {
     console.error(frozen.message);
     process.exitCode = 1;
     return;
   }
-  const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid);
+  const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid, attachDeps);
   if (!attached.ok) {
     console.error(attached.message);
     process.exitCode = 1;
