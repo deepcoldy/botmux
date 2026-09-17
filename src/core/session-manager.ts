@@ -583,6 +583,23 @@ export function getSessionWorkingDir(ds?: DaemonSession): string {
   if (ds?.workingDir) return expandHome(ds.workingDir);
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
+    // Same layering as every other bot-default lookup — resolvePinnedWorkingDir
+    // (new-session spawn), the VC-meeting session, the doc-comment session and
+    // trigger-session's resolveWorkingDir all read `effectiveDefaultWorkingDir`
+    // BEFORE the legacy `workingDir`. An UNPINNED session is exactly one that never
+    // got the spawn-path resolution, so it must land where that path would have
+    // pinned it. Reading `workingDir` first instead sends it to the repo-scan root
+    // (a repo CONTAINER for most bots, `$HOME` when the field is unset) while the
+    // configured default sits right there unused.
+    //
+    // Auto-worktree bots are the exception: there `defaultWorkingDir` is a worktree
+    // BASE that a spawn path turns into a per-session worktree, never a launch dir.
+    // Handing it out as a plain fallback would drop an unpinned session straight
+    // into the shared repo, defeating the isolation the flag buys.
+    if (!botAutoWorktreeEnabled(ds.larkAppId)) {
+      const botDefault = effectiveDefaultWorkingDir(bot.config);
+      if (botDefault) return expandHome(botDefault);
+    }
     return expandHome(bot.config.workingDir ?? '~');
   }
   // Fallback for calls without a session (e.g. during restore)

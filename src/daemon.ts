@@ -20470,20 +20470,48 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       session.scope = scope;
       fillNativeTopicId(session, scope, parsed.threadId);
 
-      // First-message `/repo`: seed the same pending-repo state the card flow
-      // uses, so the `/repo` handler launches the CLI straight away —
-      // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
-      // instead of taking the mid-session close+recreate path or re-showing the
-      // card. Use the SAME pinned-dir resolver as the normal spawn path (incl.
-      // defaultOncall auto-bind) so a bound/auto-bound chat still launches in the
-      // right place when no arg is given.
+      // Pin the working dir with the SAME resolver as the normal spawn path
+      // (oncall binding → defaultOncall auto-bind → inheritable same-anchor peer
+      // → defaultWorkingDir). This session is a REAL conversation — every later
+      // turn in this topic/chat routes into it and forks a CLI from it — so it
+      // must resolve its dir exactly like a session born from an ordinary
+      // message. Resolving only for `/repo` (the historical shape) left a
+      // session born from e.g. `/status` with NO workingDir at all: it silently
+      // ignored the chat's oncall binding and the bot's defaultWorkingDir and
+      // launched in whatever getSessionWorkingDir() fell back to. The layer-2
+      // defaultOncall auto-bind WRITES state and "must run identically on every
+      // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
+      // that write undone for the whole life of the chat, since later turns
+      // reuse this session and never re-enter a spawn path.
+      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      // …EXCEPT when that dir would have triggered auto-worktree. There the bot
+      // default is a worktree BASE, not a launch dir: the ordinary spawn paths
+      // answer it with `pendingRepo` + a detached worktree build, which a daemon
+      // command (no CLI prompt of its own) must not start on the user's behalf.
+      // Pinning the base dir here instead would silently launch every later turn
+      // of this session INSIDE the shared repo — exactly the isolation the flag
+      // buys. Leave those unpinned (unchanged behaviour) so nothing lands in the
+      // base repo, and the row stays an evictable command scratch.
+      // `/repo` keeps its historical shape untouched: it owns the repo flow and
+      // its handler re-decides the dir straight away.
+      const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+      const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
+      if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
       let cmdPending: Partial<DaemonSession> | undefined;
       if (cmd === '/repo') {
-        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
-        if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+        // First-message `/repo`: seed the same pending-repo state the card flow
+        // uses, so the `/repo` handler launches the CLI straight away —
+        // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
+        // instead of taking the mid-session close+recreate path or re-showing the
+        // card.
         // pendingPrompt is empty (the message *is* the command), so the CLI just
         // boots and waits for the user's next message; no sender tag needed.
         cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+      } else if (cmdPinnedWorkingDir) {
+        // Every other command only inherits the dir: no pendingRepo — they must
+        // not raise a repo-select card, and they fork no CLI of their own (the
+        // first real turn of this session does, from this dir).
+        cmdPending = { workingDir: cmdPinnedWorkingDir };
       }
       sessionStore.updateSession(session);
       const cmdDs: DaemonSession = {
@@ -22193,11 +22221,19 @@ async function handleThreadReplyAdmitted(
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
         fillNativeTopicId(session, scope, parsed.threadId);
+        // Twin of the new-topic pre-create block above: resolve the pinned dir
+        // for EVERY session-needing daemon command, not just `/repo`, and skip
+        // the pin when it would have meant auto-worktree. Same reasoning — this
+        // record becomes the thread's real session.
+        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
+        const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+        const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
+        if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
-          const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
-          if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+        } else if (cmdPinnedWorkingDir) {
+          cmdPending = { workingDir: cmdPinnedWorkingDir };
         }
         sessionStore.updateSession(session);
         const cmdDs: DaemonSession = {
