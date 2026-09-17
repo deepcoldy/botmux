@@ -30,7 +30,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -4288,6 +4288,20 @@ function flushCardPatch(ds: DaemonSession): void {
           persistStreamCardState(ds);
         } else {
           logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
+        }
+        return;
+      }
+      if (err instanceof MessageExpiredError) {
+        // Past Feishu's 14-day update window — this card can never be PATCHed
+        // again. Drop the reference so periodic refreshes stop re-scheduling a
+        // doomed PATCH (left unhandled it retried indefinitely, every few
+        // minutes, for the life of the daemon).
+        if (ds.streamCardId === cardId) {
+          logger.warn(`[${tag(ds)}] Stream card past 14-day update window, giving up`);
+          ds.streamCardId = undefined;
+          persistStreamCardState(ds);
+        } else {
+          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} expired (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
         }
         return;
       }

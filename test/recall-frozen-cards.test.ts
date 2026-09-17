@@ -28,12 +28,16 @@ vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
   }
+  class MessageExpiredError extends Error {
+    constructor(id: string) { super(`expired: ${id}`); this.name = 'MessageExpiredError'; }
+  }
   return {
     updateMessage: (...args: any[]) => updateMessageMock(args[0], args[1], args[2]),
     deleteMessage: (...args: any[]) => deleteMessageMock(args[0], args[1]),
     pinMessage: (...args: any[]) => pinMessageMock(args[0], args[1]),
     unpinMessage: (...args: any[]) => unpinMessageMock(args[0], args[1]),
     MessageWithdrawnError,
+    MessageExpiredError,
   };
 });
 
@@ -129,7 +133,7 @@ import {
   syncUsageRefreshTimer,
   USAGE_REFRESH_INTERVAL_MS,
 } from '../src/core/worker-pool.js';
-import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { MessageWithdrawnError, MessageExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
 
@@ -1194,6 +1198,52 @@ describe('scheduleCardPatch withdrawn handling', () => {
 
     expect(ds.streamCardId).toBeUndefined();
     expect(persistStreamCardStateMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Stream card past Feishu's 14-day update window (code 230031) ────────────
+//
+// Feishu rejects PATCH on a message older than 14 days with code 230031. Left
+// unclassified it threw a generic Error, the periodic refresh never cleared
+// ds.streamCardId, and the doomed PATCH re-scheduled every few minutes for the
+// life of the daemon. Treating it as terminal (like a withdraw) breaks the loop.
+describe('scheduleCardPatch expired handling', () => {
+  it('DOES clear ds.streamCardId when the active card is past the update window', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_OLD';
+    ds.streamCardNonce = 'nonce';
+
+    let rejectPatch!: (err: Error) => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectPatch = reject; }),
+    );
+
+    scheduleCardPatch(ds, '{"any":true}');
+    rejectPatch(new MessageExpiredError('om_OLD'));
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(persistStreamCardStateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT clear ds.streamCardId when the expired cardId is no longer active', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_OLD';
+    ds.streamCardNonce = 'nonce_old';
+
+    let rejectPatch!: (err: Error) => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectPatch = reject; }),
+    );
+
+    scheduleCardPatch(ds, '{"freeze":true}');
+    ds.streamCardId = 'om_NEW';
+
+    rejectPatch(new MessageExpiredError('om_OLD'));
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_NEW');
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
   });
 });
 

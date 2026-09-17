@@ -186,6 +186,16 @@ export class MessageWithdrawnError extends Error {
   }
 }
 
+/** Thrown when the target message is past Feishu's 14-day update window (Lark
+ *  code 230031). Unlike a transient failure, this is permanent — callers that
+ *  periodically PATCH a card must treat it as terminal and stop retrying. */
+export class MessageExpiredError extends Error {
+  constructor(messageId: string) {
+    super(`Message ${messageId} is past the 14-day update window`);
+    this.name = 'MessageExpiredError';
+  }
+}
+
 /**
  * Re-exported from bot-registry (defined there to avoid an import cycle with
  * getBotClient). apiOnly bots throw this on any Feishu client request.
@@ -232,6 +242,7 @@ function getLarkErrorCode(err: any): number | undefined {
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+const LARK_CODE_MESSAGE_EXPIRED = 230031;
 // Capability cache for the undocumented `/members/bots` endpoint. It prevents
 // repeated hits while the tenant/gateway cannot serve the API, but per-request
 // business errors (bad chat id, permission denial) must not poison other chats.
@@ -1142,10 +1153,14 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw new MessageWithdrawnError(messageId);
       }
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_EXPIRED) {
+        throw new MessageExpiredError(messageId);
+      }
       throw err;
     }
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_EXPIRED) throw new MessageExpiredError(messageId);
       throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
     }
   });
