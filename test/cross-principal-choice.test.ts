@@ -163,6 +163,12 @@ describe('cross-principal choice wiring', () => {
     expect(cliSource).toContain('const knownBotTextTarget = !asVoice');
     expect(cliSource).toContain('customCardKnownBotTarget');
     expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送自定义卡片');
+    expect(cliSource).toContain('process.exit(64)');
+    expect(daemonSource).toContain('crossPrincipalInterruptionDeliveryAudits');
+    expect(daemonSource).toContain("'delivery_exhausted'");
+    expect(daemonSource).toContain('请升级发送端 botmux');
+    expect(daemonSource).toContain('ds.chatType === \'group\'');
+    expect(daemonSource).toContain('no executable protocol marker or original message body');
     const guardAt = cliSource.indexOf('if (crossPrincipalBotSendNeedsChoice({');
     const uploadAt = cliSource.indexOf('await upload', guardAt);
     expect(guardAt).toBeGreaterThan(0);

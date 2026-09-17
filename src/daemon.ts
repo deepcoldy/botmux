@@ -142,7 +142,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionMessage, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
+import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
@@ -18387,6 +18387,32 @@ function persistCrossPrincipalQueue(ds: DaemonSession): void {
   sessionStore.updateSession(ds.session);
 }
 
+const XPI_TERMINAL_ALERT_MAX_ATTEMPTS = 3;
+const XPI_TERMINAL_ALERT_RETRY_DELAYS_MS = [0, 250, 1_000];
+const XPI_TERMINAL_ALERT_AUDIT_LIMIT = 50;
+
+function recordCrossPrincipalDeliveryAudit(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  event: CrossPrincipalInterruptionDeliveryAudit['event'],
+  channel: CrossPrincipalInterruptionDeliveryAudit['channel'],
+  attempts: number,
+  reason: string,
+): void {
+  const audit: CrossPrincipalInterruptionDeliveryAudit = {
+    version: 1,
+    id: `${record.id}:${event}:${Date.now()}`,
+    event,
+    channel,
+    attempts,
+    reason: reason.slice(0, 240),
+    at: new Date().toISOString(),
+  };
+  const previous = ds.session.crossPrincipalInterruptionDeliveryAudits ?? [];
+  ds.session.crossPrincipalInterruptionDeliveryAudits = [...previous, audit].slice(-XPI_TERMINAL_ALERT_AUDIT_LIMIT);
+  sessionStore.updateSession(ds.session);
+}
+
 function cancelDisabledCrossPrincipalInterruptions(ds: DaemonSession): number {
   const cancelled = cancelCrossPrincipalInterruptionsForFeatureDisable(ds.session);
   if (cancelled.length === 0) return 0;
@@ -18611,19 +18637,65 @@ async function notifyCrossPrincipalTerminal(
     .map(principal => principal.requestUserOpenId)
     .filter((id): id is string => !!id))];
 
-  if (humanIds.length > 0) {
-    const ats = humanIds.map(id => `<at id=${id}></at>`).join(' ');
-    // Human-facing terminal text may remain in the original topic, but the
-    // executable protocol marker must never be published to the whole topic.
-    await sessionReply(
-      sessionAnchorId(ds),
-      `${ats} ${text}`,
-      'text',
-      ds.larkAppId,
-      undefined,
-      { uuid: crossPrincipalNoticeUuid('terminal', record, text) },
-    );
+  // XPI alerts are human-visible group/topic notices only. Never fall back to
+  // a private chat: private delivery would recreate the silent-loss path when
+  // direct messages are disabled. The configured owner is only a recipient
+  // fallback; it is not used as an identity or authorization proof.
+  const ownerFallback = getOwnerOpenId(ds.larkAppId);
+  const recipients = [...new Set([...humanIds, ...(ownerFallback ? [ownerFallback] : [])])];
+  const channel: CrossPrincipalInterruptionDeliveryAudit['channel'] =
+    (ds.scope === 'thread')
+      ? 'topic'
+      : 'group';
+  const hasGroupTransport = ds.chatType === 'group';
+  const reason = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 240) || 'XPI terminal notice';
+  if (!hasGroupTransport || recipients.length === 0) {
+    const why = !hasGroupTransport ? 'alert route is not a group/topic' : 'no human recipient resolved';
+    recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, 0, why);
+    recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, 0, why);
+    logger.error(`[${tag(ds)}] XPI human alert not delivered: ${why} record=${record.id}`);
+    return;
   }
+
+  const ats = recipients.map(id => `<at id=${id}></at>`).join(' ');
+  const sourceApp = record.proposer.requestLarkAppId ?? ds.larkAppId;
+  const turnSummary = record.messages.map(message => message.turnId.slice(0, 12)).filter(Boolean).join(', ') || 'unknown';
+  const alert = `${ats} XPI 消息未执行\n`
+    + `来源应用: ${sourceApp}\n`
+    + '版本能力: 未携带 --as（旧版本/绕过发送端门禁）\n'
+    + `turnId 摘要: ${turnSummary}\n`
+    + `原因: ${reason}\n`
+    + '处理: 请升级发送端 botmux，并按要求使用 --as independent 或 --as suggestion。';
+  const uuid = crossPrincipalNoticeUuid('terminal', record, 'human-alert');
+  let failures = 0;
+  for (let attempt = 1; attempt <= XPI_TERMINAL_ALERT_MAX_ATTEMPTS; attempt += 1) {
+    const delay = XPI_TERMINAL_ALERT_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    try {
+      // Human-facing terminal text may remain in the original group/topic,
+      // but no executable protocol marker or original message body is posted.
+      const deliveredMessageId = await sessionReply(
+        sessionAnchorId(ds),
+        alert,
+        'text',
+        ds.larkAppId,
+        undefined,
+        { uuid },
+      );
+      if (!deliveredMessageId) throw new Error('group/topic transport returned no message id');
+      if (failures > 0) {
+        recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_recovered', channel, attempt, reason);
+      }
+      return;
+    } catch (error) {
+      failures += 1;
+      const detail = error instanceof Error ? error.message : String(error);
+      recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, attempt, detail);
+      logger.warn(`[${tag(ds)}] XPI human alert attempt ${attempt}/${XPI_TERMINAL_ALERT_MAX_ATTEMPTS} failed: ${detail}`);
+    }
+  }
+  recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, failures, reason);
+  logger.error(`[${tag(ds)}] XPI human alert delivery exhausted after ${failures} attempts record=${record.id}`);
 }
 
 async function dispatchApprovedCrossPrincipalSuggestion(

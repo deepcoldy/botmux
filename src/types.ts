@@ -347,6 +347,10 @@ export interface Session {
    * active queue prevents restart/re-enable from resurrecting old work while
    * preserving an inspectable terminal reason. */
   crossPrincipalInterruptionCancellations?: CrossPrincipalInterruptionCancellation[];
+  /** Bounded audit trail for human-alert delivery failures. These records are
+   * deliberately separate from the XPI queue so a failed alert can never
+   * resurrect or re-run the original message. */
+  crossPrincipalInterruptionDeliveryAudits?: CrossPrincipalInterruptionDeliveryAudit[];
   /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.
@@ -953,6 +957,16 @@ export interface CrossPrincipalInterruption {
   /** Present only when this XPI independent child fell back to the source cwd.
    * It does not claim that non-XPI writers to the same directory participate. */
   xpiSharedCwdAdmissionGroupId?: string;
+}
+
+export interface CrossPrincipalInterruptionDeliveryAudit {
+  version: 1;
+  id: string;
+  event: 'delivery_failed' | 'delivery_recovered' | 'delivery_exhausted';
+  channel: 'group' | 'topic';
+  attempts: number;
+  reason: string;
+  at: string;
 }
 
 export interface CrossPrincipalInterruptionCancellation {

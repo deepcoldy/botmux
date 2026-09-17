@@ -10421,7 +10421,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   );
   if (config.crossPrincipalInterruption && customCardRequested && knownBotTextTarget) {
     console.error('botmux send: XPI 开启时暂不支持向 Bot 发送自定义卡片；请改用普通文本并携带 --as independent|suggestion');
-    process.exit(2);
+    process.exit(64);
   }
   if (crossPrincipalBotSendNeedsChoice({
     enabled: config.crossPrincipalInterruption,
@@ -10430,7 +10430,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     controlLane: isSlashSend,
   })) {
     console.error(t('xpi.send.as_required', undefined, localeForBot(appId)));
-    process.exit(2);
+    process.exit(64);
   }
 
   try {
