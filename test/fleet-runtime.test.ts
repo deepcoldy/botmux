@@ -9,6 +9,7 @@ import {
   waitFleetOnline,
   resolveFleetDaemonEnv,
   inspectSupervisorState,
+  liveSupervisorTarget,
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
@@ -73,7 +74,7 @@ describe('inspectSupervisorState', () => {
 
   it('accepts only the exact persisted supervisor generation and command', () => {
     expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
-    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor'))).toEqual({ status: 'stale' });
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor')).status).toBe('exact');
   });
 
   it('rejects an otherwise identical supervisor from another PID namespace', () => {
@@ -92,6 +93,27 @@ describe('inspectSupervisorState', () => {
   it('fails closed for old live state without enough process identity metadata', () => {
     const malformed = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined, supervisorEntry: undefined };
     expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor'))).toEqual({ status: 'unverifiable' });
+  });
+});
+
+describe('liveSupervisorTarget', () => {
+  it('fails closed on a live legacy pid with no supervisor identity metadata', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(() => liveSupervisorTarget(p, runtime)).toThrow(
+      `fleet: 无法核验 supervisor pid ${process.pid} 的进程身份；为避免双实例，已中止操作`,
+    );
   });
 });
 

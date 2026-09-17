@@ -26,12 +26,12 @@ describe('fleet process identity', () => {
     expect(builtinFleetEntryMatches('daemon', '/tmp/index-daemon.js.backup')).toBe(false);
     expect(builtinFleetEntryMatches('dashboard', '/usr/bin/node /new/dist/index-dashboard.js')).toBe(true);
   });
-  it('accepts a persisted birth identity only when command and generation both match', () => {
+  it('accepts a persisted birth identity without consulting a recomputed command', () => {
     const result = inspectFleetProcess(61, 'boot-a:123', undefined, cmd => cmd.includes('__supervisor'),
-      runtime(['boot-a:123', 'boot-a:123'], ['/opt/botmux __supervisor']));
+      runtime(['boot-a:123', 'boot-a:123'], ['/different/checkout/index-supervisor.js']));
     expect(result).toEqual({
       status: 'exact',
-      attestation: { pid: 61, processStart: 'boot-a:123', commandLine: '/opt/botmux __supervisor' },
+      attestation: { pid: 61, processStart: 'boot-a:123' },
     });
   });
 
@@ -65,6 +65,11 @@ describe('fleet process identity', () => {
   it('fails closed when identity evidence is unreadable', () => {
     expect(inspectFleetProcess(61, 'boot-a:123', undefined, () => true,
       runtime([undefined], ['/opt/botmux __supervisor']))).toEqual({ status: 'unverifiable' });
+  });
+
+  it('does not require command-line access for a persisted birth identity', () => {
+    expect(inspectFleetProcess(61, 'boot-a:123', undefined, () => false,
+      runtime(['boot-a:123', 'boot-a:123'], [undefined])).status).toBe('exact');
   });
 
   it('treats an unreadable pid as stale only when the OS confirms it is gone', () => {

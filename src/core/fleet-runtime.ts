@@ -278,11 +278,14 @@ export function inspectSupervisorState(
   );
 }
 
-function liveSupervisorTarget(): FleetProcessAttestation | undefined {
-  const state = readFleetState(fleetStatePath());
+export function liveSupervisorTarget(
+  statePath: string = fleetStatePath(),
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessAttestation | undefined {
+  const state = readFleetState(statePath);
   const pid = state?.supervisorPid ?? 0;
   if (!state) return undefined;
-  const inspection = inspectSupervisorState(state);
+  const inspection = inspectSupervisorState(state, runtime);
   if (inspection.status === 'unverifiable') {
     throw new Error(`fleet: 无法核验 supervisor pid ${pid} 的进程身份；为避免双实例，已中止操作`);
   }

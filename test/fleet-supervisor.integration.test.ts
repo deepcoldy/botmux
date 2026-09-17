@@ -454,6 +454,34 @@ describe('FleetSupervisor (live, integration)', () => {
     await sup.stopAll();
   });
 
+  it('trusts a persisted birth identity even when the old command has no current role marker', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const distDir = fakeDist(root, STAY);
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    killLater(orphan.pid!);
+    await waitFor(() => pidAlive(orphan.pid!));
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
+      procs: [{
+        name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
+        restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: readDurableProcessIdentity(orphan.pid!),
+      }],
+    }));
+
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]);
+    const reclaimed = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+    });
+    expect(reclaimed).toBe(true);
+    expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    await sup.stopAll();
+  });
+
   it('isolates an unverifiable orphan and still starts other fleet members', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

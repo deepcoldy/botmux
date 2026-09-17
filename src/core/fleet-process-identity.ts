@@ -5,7 +5,8 @@ import { readDurableProcessIdentity } from '../utils/process-identity.js';
 export interface FleetProcessAttestation {
   pid: number;
   processStart: string;
-  commandLine: string;
+  /** Present only for legacy rows whose ownership was established by command. */
+  commandLine?: string;
   pidNamespace?: string;
 }
 
@@ -103,10 +104,10 @@ export const fleetProcessIdentityRuntime: FleetProcessIdentityRuntime = {
 };
 
 /**
- * Bind a persisted PID to one exact process generation and expected command.
- * The matcher also provides a one-release compatibility bridge for old state:
- * identity is sampled on both sides of the command-line read, so a PID recycled
- * during inspection is stale.
+ * Bind a persisted PID to one exact process generation. The command matcher is
+ * only a one-release compatibility bridge for old rows without processStart; a
+ * newly-computed checkout path must never override a persisted birth identity.
+ * Identity is sampled twice so a PID recycled during inspection is stale.
  */
 export function inspectFleetProcess(
   pid: number,
@@ -120,15 +121,27 @@ export function inspectFleetProcess(
   if (recordedProcessStart && first && first !== recordedProcessStart) return { status: 'stale' };
   const pidNamespace = runtime.readPidNamespace(pid);
   if (recordedPidNamespace && pidNamespace && pidNamespace !== recordedPidNamespace) return { status: 'stale' };
-  const commandLine = runtime.readCommandLine(pid);
-  if (!first || commandLine === undefined || (recordedPidNamespace && !pidNamespace)) {
+  if (!first || (recordedPidNamespace && !pidNamespace)) {
     return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   }
-  if (!legacyCommandMatches(commandLine)) return { status: 'stale' };
+  const commandLine = recordedProcessStart ? undefined : runtime.readCommandLine(pid);
+  if (!recordedProcessStart && (commandLine === undefined || !legacyCommandMatches(commandLine))) {
+    return commandLine === undefined && runtime.pidExists(pid)
+      ? { status: 'unverifiable' }
+      : { status: 'stale' };
+  }
   const second = runtime.readIdentity(pid);
   if (!second) return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   return first === second
-    ? { status: 'exact', attestation: { pid, processStart: first, commandLine, ...(pidNamespace ? { pidNamespace } : {}) } }
+    ? {
+      status: 'exact',
+      attestation: {
+        pid,
+        processStart: first,
+        ...(commandLine !== undefined ? { commandLine } : {}),
+        ...(pidNamespace ? { pidNamespace } : {}),
+      },
+    }
     : { status: 'stale' };
 }
 
@@ -140,7 +153,7 @@ export function signalAttestedFleetProcess(
 ): boolean {
   if (runtime.readIdentity(target.pid) !== target.processStart) return false;
   if (target.pidNamespace && runtime.readPidNamespace(target.pid) !== target.pidNamespace) return false;
-  if (runtime.readCommandLine(target.pid) !== target.commandLine) return false;
+  if (target.commandLine !== undefined && runtime.readCommandLine(target.pid) !== target.commandLine) return false;
   // Narrow the remaining PID-reuse window once more after the command read. A
   // true atomic guarantee would require pidfd (not exposed by Node/Bun); this
   // second generation check prevents a replacement during either read from
