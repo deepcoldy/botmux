@@ -65,6 +65,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
+  mimo: 'mimocode',
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',

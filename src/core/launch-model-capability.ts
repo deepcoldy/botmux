@@ -26,7 +26,7 @@ import type { CliId } from '../adapters/cli/types.js';
 /** 启动参数（或远端后端配置）里真的会带上 model 的 CLI。 */
 export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
   'claude-code', 'seed', 'relay', 'coco', 'codex', 'codex-app', 'cursor', 'gemini',
-  'genius', 'opencode', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok',
+  'genius', 'opencode', 'mimocode', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok',
   'reasonix', 'dsh', 'minimax',
   // PTY 之外：MojoBackend 把 botmux 解析出的 model 拼进 `mojo -p --model`。
   'mojo',
