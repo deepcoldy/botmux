@@ -115,6 +115,7 @@ export function inspectFleetProcess(
   recordedPidNamespace: string | undefined,
   legacyCommandMatches: (commandLine: string) => boolean,
   runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+  verifyPersistedCommand = true,
 ): FleetProcessInspection {
   if (!Number.isSafeInteger(pid) || pid <= 1) return { status: 'stale' };
   const first = runtime.readIdentity(pid);
@@ -124,12 +125,13 @@ export function inspectFleetProcess(
   if (!first || (recordedPidNamespace && !pidNamespace)) {
     return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   }
-  const commandLine = recordedProcessStart ? undefined : runtime.readCommandLine(pid);
-  if (!recordedProcessStart && (commandLine === undefined || !legacyCommandMatches(commandLine))) {
-    return commandLine === undefined && runtime.pidExists(pid)
-      ? { status: 'unverifiable' }
-      : { status: 'stale' };
+  const commandLine = recordedProcessStart && !verifyPersistedCommand
+    ? undefined
+    : runtime.readCommandLine(pid);
+  if (commandLine === undefined && (!recordedProcessStart || verifyPersistedCommand)) {
+    return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   }
+  if (commandLine !== undefined && !legacyCommandMatches(commandLine)) return { status: 'stale' };
   const second = runtime.readIdentity(pid);
   if (!second) return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   return first === second

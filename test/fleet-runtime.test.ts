@@ -74,7 +74,7 @@ describe('inspectSupervisorState', () => {
 
   it('accepts only the exact persisted supervisor generation and command', () => {
     expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
-    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor'))).toEqual({ status: 'stale' });
   });
 
   it('rejects an otherwise identical supervisor from another PID namespace', () => {

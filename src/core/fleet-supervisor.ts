@@ -200,6 +200,7 @@ export class FleetSupervisor {
             ? commandLine.includes(expected.command) && expected.args.every(arg => commandLine.includes(arg))
             : builtinFleetEntryMatches(builtInEntry, commandLine),
           identityRuntime,
+          /* verifyPersistedCommand */ false,
         );
         if (inspection.status === 'unverifiable') {
           unreclaimable.add(p.name);
@@ -217,8 +218,9 @@ export class FleetSupervisor {
               p.pid,
               inspection.attestation.processStart,
               inspection.attestation.pidNamespace,
-              commandLine => commandLine === inspection.attestation.commandLine,
+              () => true,
               identityRuntime,
+              /* verifyPersistedCommand */ false,
             );
             if (after.status !== 'stale') {
               unreclaimable.add(p.name);

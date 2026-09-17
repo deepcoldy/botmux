@@ -28,7 +28,7 @@ describe('fleet process identity', () => {
   });
   it('accepts a persisted birth identity without consulting a recomputed command', () => {
     const result = inspectFleetProcess(61, 'boot-a:123', undefined, cmd => cmd.includes('__supervisor'),
-      runtime(['boot-a:123', 'boot-a:123'], ['/different/checkout/index-supervisor.js']));
+      runtime(['boot-a:123', 'boot-a:123'], ['/different/checkout/index-supervisor.js']), false);
     expect(result).toEqual({
       status: 'exact',
       attestation: { pid: 61, processStart: 'boot-a:123' },
@@ -69,7 +69,7 @@ describe('fleet process identity', () => {
 
   it('does not require command-line access for a persisted birth identity', () => {
     expect(inspectFleetProcess(61, 'boot-a:123', undefined, () => false,
-      runtime(['boot-a:123', 'boot-a:123'], [undefined])).status).toBe('exact');
+      runtime(['boot-a:123', 'boot-a:123'], [undefined]), false).status).toBe('exact');
   });
 
   it('treats an unreadable pid as stale only when the OS confirms it is gone', () => {
