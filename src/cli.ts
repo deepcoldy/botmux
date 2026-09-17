@@ -3521,13 +3521,15 @@ async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
  */
 async function dashboardMemberComingUp(): Promise<boolean | null> {
   try {
-    const { fleetStatePath, DASHBOARD_PROCESS_NAME } = await import('./core/fleet-runtime.js');
+    const { fleetStatePath, DASHBOARD_PROCESS_NAME, inspectSupervisorState } = await import('./core/fleet-runtime.js');
     const { readFleetState } = await import('./core/fleet-state-store.js');
+    const state = readFleetState(fleetStatePath());
     // The mapping itself lives in dashboard-command.ts as a pure function so it is
     // unit testable; this wrapper only supplies the I/O (state file + pid probe).
     return dashboardComingUpFromState(
-      readFleetState(fleetStatePath()),
+      state,
       DASHBOARD_PROCESS_NAME,
+      () => state !== null && inspectSupervisorState(state).status === 'exact',
       (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
     );
   } catch {

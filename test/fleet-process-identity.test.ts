@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  builtinFleetEntryMatches,
   inspectFleetProcess,
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
@@ -17,6 +18,14 @@ function runtime(identities: Array<string | undefined>, commands: Array<string |
 afterEach(() => vi.restoreAllMocks());
 
 describe('fleet process identity', () => {
+  it('matches built-in roles across checkout paths without accepting another role', () => {
+    expect(builtinFleetEntryMatches('daemon', '/usr/bin/node /old/review/dist/index-daemon.js')).toBe(true);
+    expect(builtinFleetEntryMatches('daemon', '/usr/bin/node "/old review/dist/index-daemon.js"')).toBe(true);
+    expect(builtinFleetEntryMatches('daemon', '/new/botmux __daemon')).toBe(true);
+    expect(builtinFleetEntryMatches('daemon', '/new/botmux __dashboard')).toBe(false);
+    expect(builtinFleetEntryMatches('daemon', '/tmp/index-daemon.js.backup')).toBe(false);
+    expect(builtinFleetEntryMatches('dashboard', '/usr/bin/node /new/dist/index-dashboard.js')).toBe(true);
+  });
   it('accepts a persisted birth identity only when command and generation both match', () => {
     const result = inspectFleetProcess(61, 'boot-a:123', undefined, cmd => cmd.includes('__supervisor'),
       runtime(['boot-a:123', 'boot-a:123'], ['/opt/botmux __supervisor']));
@@ -45,6 +54,12 @@ describe('fleet process identity', () => {
   it('rejects a pid recycled during inspection', () => {
     expect(inspectFleetProcess(61, undefined, undefined, () => true,
       runtime(['boot-a:123', 'boot-a:999'], ['node /opt/botmux/dist/index-supervisor.js']))).toEqual({ status: 'stale' });
+  });
+
+  it('treats a process that exits before the second identity read as stale', () => {
+    const deps = runtime(['boot-a:123', undefined], ['node /opt/botmux/dist/index-supervisor.js']);
+    deps.pidExists = () => false;
+    expect(inspectFleetProcess(61, undefined, undefined, () => true, deps)).toEqual({ status: 'stale' });
   });
 
   it('fails closed when identity evidence is unreadable', () => {

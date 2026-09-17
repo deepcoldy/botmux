@@ -18,10 +18,11 @@ import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
+  builtinFleetEntryMatches,
   inspectFleetProcess,
   fleetProcessIdentityRuntime,
-  readFleetProcessCommandLine,
   signalAttestedFleetProcess,
+  type FleetProcessIdentityRuntime,
 } from './fleet-process-identity.js';
 import {
   decideOnExit,
@@ -113,6 +114,8 @@ export interface FleetSupervisorOptions {
   logDir?: string;
   /** Injected for tests; defaults to console. */
   log?: (msg: string) => void;
+  /** Injected for process-identity edge-case tests. */
+  processIdentityRuntime?: FleetProcessIdentityRuntime;
 }
 
 /** True if a pid is alive (kill -0). pid<=1 is never a real supervised child. */
@@ -167,8 +170,10 @@ export class FleetSupervisor {
     // hold no child handles or timers, and the event loop would drain: the new
     // supervisor exits immediately, leaving the whole fleet (bot daemons AND the
     // dashboard) running unsupervised, with `botmux start/restart` unable to bring
-    // it back. A supervisor must OWN every live member, so we kill these orphans
-    // here and let planStart respawn them under our ownership.
+    // it back. A supervisor must OWN every live member it can safely identify,
+    // so we kill verified orphans here and let planStart respawn them. An
+    // unverifiable member is isolated in place: no signal and no duplicate
+    // spawn, while the rest of the fleet still reconciles.
     //
     // The `!this.children.has` ownership check is the whole criterion — no pid /
     // generation comparison. On the SAME supervisor re-reconciling (idempotent
@@ -176,6 +181,8 @@ export class FleetSupervisor {
     // the reconcile branch below are both natural no-ops; only genuinely unowned
     // live procs are reclaimed. (Relying on pid-inequality would miss the corner
     // where the OS recycles the dead supervisor's pid onto the new one.)
+    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
+    const unreclaimable = new Set<string>();
     const unowned = (p: FleetProcState): boolean =>
       specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name);
     for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
@@ -183,16 +190,21 @@ export class FleetSupervisor {
         const spec = specByName.get(p.name)!;
         const expected = spec.external
           ? { command: spec.external.command, args: spec.external.args ?? [] }
-          : resolveEntrySpawn(spec.entry ?? 'daemon', this.opts.distDir);
+          : undefined;
+        const builtInEntry = spec.entry === 'dashboard' ? 'dashboard' : 'daemon';
         const inspection = inspectFleetProcess(
           p.pid,
           p.processStart,
           undefined,
-          commandLine => commandLine.includes(expected.command)
-            && expected.args.every(arg => commandLine.includes(arg)),
+          commandLine => expected
+            ? commandLine.includes(expected.command) && expected.args.every(arg => commandLine.includes(arg))
+            : builtinFleetEntryMatches(builtInEntry, commandLine),
+          identityRuntime,
         );
         if (inspection.status === 'unverifiable') {
-          throw new Error(`fleet: cannot verify unowned ${p.name} process identity (pid ${p.pid})`);
+          unreclaimable.add(p.name);
+          this.log(`cannot verify unowned ${p.name} process identity (pid ${p.pid}); leaving this member untouched`);
+          continue;
         }
         if (inspection.status === 'exact') {
           // Legacy fleet-state rows have no persisted processStart. The exact
@@ -200,15 +212,18 @@ export class FleetSupervisor {
           // it samples a durable birth identity on both sides of a strict
           // command-line match, then signalAttestedFleetProcess rechecks that
           // freshly-attested generation immediately before sending SIGTERM.
-          if (!signalAttestedFleetProcess(inspection.attestation, 'SIGTERM')) {
+          if (!signalAttestedFleetProcess(inspection.attestation, 'SIGTERM', identityRuntime)) {
             const after = inspectFleetProcess(
               p.pid,
               inspection.attestation.processStart,
               inspection.attestation.pidNamespace,
               commandLine => commandLine === inspection.attestation.commandLine,
+              identityRuntime,
             );
             if (after.status !== 'stale') {
-              throw new Error(`fleet: failed to signal verified unowned ${p.name} process (pid ${p.pid})`);
+              unreclaimable.add(p.name);
+              this.log(`lost verification for unowned ${p.name} process (pid ${p.pid}); leaving this member untouched`);
+              continue;
             }
           }
           this.log(`reclaiming unowned live ${p.name} (pid ${p.pid}) from a prior supervisor — SIGTERM + respawn`);
@@ -224,16 +239,16 @@ export class FleetSupervisor {
       // only when the SAME supervisor re-reconciles (idempotent re-start).
       const recordedPid = cur.supervisorPid;
       cur.supervisorEntry = isStandaloneBinary() ? process.execPath : process.argv[1];
-      const supervisorProcessStart = readDurableProcessIdentity(process.pid);
+      const supervisorProcessStart = identityRuntime.readIdentity(process.pid);
       if (!supervisorProcessStart) throw new Error('fleet: cannot determine supervisor process identity');
       cur.supervisorProcessStart = supervisorProcessStart;
-      const supervisorPidNamespace = fleetProcessIdentityRuntime.readPidNamespace(process.pid);
+      const supervisorPidNamespace = identityRuntime.readPidNamespace(process.pid);
       if (process.platform === 'linux' && !supervisorPidNamespace) {
         throw new Error('fleet: cannot determine supervisor PID namespace');
       }
       if (supervisorPidNamespace) cur.supervisorPidNamespace = supervisorPidNamespace;
       else delete cur.supervisorPidNamespace;
-      const supervisorCommand = readFleetProcessCommandLine(process.pid);
+      const supervisorCommand = identityRuntime.readCommandLine(process.pid);
       if (!supervisorCommand) throw new Error('fleet: cannot determine supervisor command identity');
       cur.supervisorCommand = supervisorCommand;
       if (recordedPid !== process.pid || !cur.supervisorStartedAt) {
@@ -246,7 +261,11 @@ export class FleetSupervisor {
       // to is not a member we supervise.
       cur.procs = cur.procs.filter((p) => specByName.has(p.name));
       for (const p of cur.procs) {
-        if (p.status === 'online' && (!pidAlive(p.pid) || !this.children.has(p.name))) { p.pid = 0; p.status = 'stopped'; }
+        if (p.status === 'online'
+          && (!pidAlive(p.pid) || (!this.children.has(p.name) && !unreclaimable.has(p.name)))) {
+          p.pid = 0;
+          p.status = 'stopped';
+        }
       }
       return cur;
     });

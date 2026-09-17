@@ -21,6 +21,32 @@ export type FleetProcessInspection =
   | { status: 'stale' }
   | { status: 'unverifiable' };
 
+const BUILTIN_FLEET_ENTRY_MARKERS = {
+  daemon: { token: '__daemon', script: 'index-daemon.js' },
+  dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
+} as const;
+
+function commandLineHasArg(commandLine: string, arg: string): boolean {
+  const escaped = arg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s\"'])${escaped}(?:$|[\\s\"'])`).test(commandLine);
+}
+
+/**
+ * Match one of botmux's built-in fleet roles without tying ownership to the
+ * current checkout's absolute dist path. A normal install starts a real
+ * `index-*.js` file, while the standalone binary uses a hidden `__*` argv
+ * token. Both markers survive upgrades and worktree switches.
+ */
+export function builtinFleetEntryMatches(
+  entry: 'daemon' | 'dashboard',
+  commandLine: string,
+): boolean {
+  const { token, script } = BUILTIN_FLEET_ENTRY_MARKERS[entry];
+  if (commandLineHasArg(commandLine, token)) return true;
+  const escaped = script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s\"'\\\\/])${escaped}(?:$|[\\s\"'])`).test(commandLine);
+}
+
 function systemPsBin(): string | undefined {
   for (const candidate of ['/usr/bin/ps', '/bin/ps']) {
     if (existsSync(candidate)) return candidate;
@@ -100,7 +126,7 @@ export function inspectFleetProcess(
   }
   if (!legacyCommandMatches(commandLine)) return { status: 'stale' };
   const second = runtime.readIdentity(pid);
-  if (!second) return { status: 'unverifiable' };
+  if (!second) return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   return first === second
     ? { status: 'exact', attestation: { pid, processStart: first, commandLine, ...(pidNamespace ? { pidNamespace } : {}) } }
     : { status: 'stale' };
