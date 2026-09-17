@@ -11208,6 +11208,21 @@ async function assertProjectDispatchPolicy(input: {
   throw new Error(`${body.error ?? `HTTP ${response.status}`}${disallowed}`);
 }
 
+/** Best-effort receipt metadata only: never turn a sent dispatch into a failure. */
+async function resolveDispatchThreadId(larkAppId: string, rootMessageId: string): Promise<string | null> {
+  try {
+    const { getMessageThreadId } = await import('./im/lark/client.js');
+    const threadId = await getMessageThreadId(larkAppId, rootMessageId, {
+      timeoutMs: 2_000,
+      signal: AbortSignal.timeout(2_000),
+    });
+    // Root-message ids (om_...) are routing anchors, not topic ids (omt_...).
+    return threadId && /^omt_[A-Za-z0-9_-]+$/.test(threadId) ? threadId : null;
+  } catch {
+    return null;
+  }
+}
+
 async function cmdDispatch(rest: string[]): Promise<void> {
   const parsedArgs = parseDispatchArgs(rest);
   if (!parsedArgs.ok) {
@@ -11235,7 +11250,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
-  返回 JSON（含 seedMessageId / threadRootId），供编排者登记 子项目↔话题。
+  返回 JSON：seedMessageId / threadRootId 仍为 om_...；新增 threadId 为 omt_... 或 null。
+  普通群和话题群均在话题回复成功后读取 threadId；--standby 在 /repo 回复后读取，--into 读取已有根消息。
+  threadId 查询失败、超时或暂不可用时返回 null，不改变派发/接单结果；不要将 om_... 用作话题链接。
 
 选项:
   --title <t>           子项目标题（新开话题时必填）
@@ -11491,6 +11508,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         success: accepted, taskSent: true, mode: 'into', sourceSessionId: sid,
         targetAppIds: parsedBotApps.map(item => item.appId),
         ...receiptState, threadRootId: intoRoot,
+        threadId: await resolveDispatchThreadId(appId, intoRoot),
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
         projectSynced,
@@ -11614,6 +11632,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       mode: standby ? 'standby' : 'dispatch',
       seedMessageId: seedId,
       threadRootId: seedId,
+      // A normal-group seed may only become a topic after the prime/kickoff reply.
+      threadId: await resolveDispatchThreadId(appId, seedId),
       primeMessageId: primeId,
       kickoffMessageId: kickoffId,
       repo: repo ?? null,
@@ -11663,6 +11683,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       targetAppIds: parsedBotApps.map(item => item.appId),
       chatId: targetChatId,
       threadRootId: dispatchRootForLifecycle ?? null,
+      threadId: null,
       ...receiptState,
       detail: err?.message ?? String(err),
     }));
