@@ -19,9 +19,13 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Codex/Gemini): use plain sendText + Enter
+ * - Other adapters (Aiden/Gemini): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ * - Hermes: single pasteText with the whole content + delayed Enter. Its
+ *   prompt_toolkit composer handles a bracketed paste in one event, while the
+ *   old sendText burst's trailing Enter is swallowed by the 50ms anti-paste
+ *   guard on a cold start (opening prompt stranded until manual Enter).
  * - OpenCode: short single-line prompts use sendText + Enter; multiline or
  *   large prompts use pasteText + Enter so OpenTUI receives bracketed paste.
  *
@@ -203,15 +207,18 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
- *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
+ *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
+ *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
+ *  composer drains the send-keys burst together with the trailing Enter, and
+ *  Hermes' 50ms anti-paste window (#10994) then drops that Enter as a pasted
+ *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
-  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
@@ -227,15 +234,20 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, and Pi. See coco.ts for the
+ *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, Pi, and Hermes. See coco.ts for the
  *  Trae 0.120.31 burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
- *  bracketed paste" note was true only for a much earlier build). */
+ *  bracketed paste" note was true only for a much earlier build).
+ *  Hermes: its prompt_toolkit composer's 50ms anti-paste guard (issue #10994)
+ *  eats the trailing Enter of the old send-keys burst on cold start, so the
+ *  opening prompt strands until a manual Enter; a single bracketed-paste
+ *  event keeps embedded newlines inert and submits reliably. */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
   ['kimi', createKimiAdapter('/bin/kimi')],
   ['pi', createPiAdapter('/bin/pi')],
+  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -328,9 +340,10 @@ describe('writeInput: single-line, non-tmux mode', () => {
 
 // =========================================================================
 // 2. Multiline content
-//    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
-//      string — the embedded \n stay content, only the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/MTR/Hermes): sendText with the
+//    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
+//      (pasteText) with the whole string — the embedded \n stay content, only
+//      the trailing Enter submits.
+//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
 //    - OpenCode: pasteText for multiline/large prompts so its TUI receives
@@ -672,6 +685,12 @@ describe('supportsTypeAhead flag', () => {
 
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
+  });
+
+  it('hermes: supportsTypeAhead undefined even though writeInput uses pasteText', () => {
+    // Hermes moved to PASTE_BUFFER_ADAPTERS (write mechanics) without opting
+    // into type-ahead: the adapter still relies on deferFirstPromptTimeoutUntilReady.
+    expect(createHermesAdapter('/bin/hermes').supportsTypeAhead).toBeUndefined();
   });
 });
 
