@@ -20,6 +20,187 @@ function fp(name: string): string {
   return join(dir, name);
 }
 
+function codexItems(items: Record<string, unknown>[]): ReturnType<typeof parseCodexInsight> {
+  const path = fp('codex-items.jsonl');
+  writeFileSync(path, items.map(item => JSON.stringify({
+    type: 'event_msg', timestamp: '2026-09-16T01:00:10.000Z',
+    payload: { type: 'item_completed', turn_id: 'turn-0', item },
+  })).join('\n') + '\n');
+  return parseCodexInsight(path);
+}
+
+describe('Codex item_completed insight', () => {
+  it('unwraps failed shell commands and projects duration, intent and scrubbed output', () => {
+    const parsed = codexItems([{
+      type: 'CommandExecution', id: 'exec-1', command: ['/usr/bin/zsh', '-lc', 'npm test'],
+      exit_code: 1, status: 'failed', duration: { secs: 7, nanos: 250000000 }, stdout: 'TOKEN=secret',
+    }]);
+    expect(parsed.spans).toHaveLength(1);
+    expect(parsed.spans[0]).toMatchObject({
+      tool: 'exec_command', phase: 'run', status: 'error', durationMs: 7250,
+      startMs: Date.parse('2026-09-16T01:00:02.750Z'),
+      intent: { kind: 'test', subject: 'npm test' }, result: { category: 'test_failed', exitCode: 1 },
+      evidence: { command: { text: 'npm test' }, output: { text: 'TOKEN=<redacted>' } },
+    });
+  });
+
+  it.each([
+    { command: ['/bin/sh', '-c', 'npm test'], expected: 'npm test', kind: 'test' },
+    { command: ['/bin/bash', '-lc', 'npm test'], expected: 'npm test', kind: 'test' },
+    { command: ['/usr/bin/fish', '-c', 'npm test'], expected: 'npm test', kind: 'test' },
+    { command: ['git', 'status'], expected: 'git status', kind: 'git' },
+    { command: ['/usr/bin/zsh', '-lc', 'echo ignored'], parsed_cmd: [{ type: 'search', cmd: 'rg needle src' }], expected: 'rg needle src', kind: 'search' },
+  ])('extracts command $expected without changing the run phase', ({ command, parsed_cmd, expected, kind }) => {
+    const parsed = codexItems([{
+      type: 'CommandExecution', command, parsed_cmd, status: 'completed', exit_code: 0,
+      stdout: '', aggregated_output: 'TOKEN=secret', duration: { secs: 0, nanos: 1500000 },
+    }]);
+    expect(parsed.spans[0]).toMatchObject({
+      phase: 'run', status: 'ok', durationMs: 2, intent: { kind }, result: { category: 'ok' },
+      evidence: { command: { text: expected }, output: { text: 'TOKEN=<redacted>' } },
+    });
+  });
+
+  it.each([
+    { status: 'completed', exit_code: 2 },
+    { status: 'failed', exit_code: 0 },
+  ])('honors status and exit code for $status/$exit_code', item => {
+    const parsed = codexItems([{ type: 'CommandExecution', command: ['npm', 'test'], ...item }]);
+    expect(parsed.spans[0]).toMatchObject({ status: 'error', result: { category: 'test_failed' } });
+  });
+
+  it('extracts wrapped prompts and both public phases, then distributes context across turns', () => {
+    const path = fp('codex-item-turns.jsonl');
+    const completed = (item: unknown, turn_id: string) => ({ type: 'event_msg', payload: { type: 'item_completed', item, turn_id } });
+    const usage = (input_tokens: number) => ({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens, output_tokens: 10 } } } });
+    writeFileSync(path, [
+      completed({ type: 'UserMessage', content: [{ type: 'text', text: '<user_message>build</user_message><sender type="user" open_id="ou_private" />' }] }, 't0'),
+      completed({ type: 'AgentMessage', phase: 'commentary', content: [{ type: 'Text', text: 'Building TOKEN=secret' }] }, 't0'),
+      completed({ type: 'AgentMessage', phase: 'final_answer', content: [{ type: 'Text', text: 'Build complete' }] }, 't0'),
+      usage(100),
+      completed({ type: 'UserMessage', content: [{ type: 'text', text: 'test now' }] }, 't1'),
+      completed({ type: 'CommandExecution', command: ['npm', 'test'], exit_code: 0, status: 'completed' }, 't1'),
+      usage(200),
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const parsed = parseCodexInsight(path);
+    expect(parsed.turnPrompts?.map(p => p.text)).toEqual(['build', 'test now']);
+    expect(parsed.turnAgentSay?.[0]?.text).toBe('Building TOKEN=<redacted>\n\nBuild complete');
+    expect(parsed.turnContext?.map(p => [p.turnIndex, p.inputTokens])).toEqual([[0, 100], [1, 200]]);
+    expect(parsed.spans[0].turnIndex).toBe(1);
+    expect(JSON.stringify(parsed.turnPrompts)).not.toContain('ou_private');
+  });
+
+  it('counts changed files and diff lines without counting diff headers', () => {
+    const parsed = codexItems([{
+      type: 'FileChange', id: 'exec-patch', changes: {
+        '/repo/a.ts': { type: 'update', unified_diff: '--- a.ts\n+++ a.ts\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n context' },
+        '/repo/b.ts': { type: 'add', unified_diff: '--- /dev/null\r\n+++ b.ts\r\n+created\r\n' },
+      },
+    }]);
+    expect(parsed.spans).toHaveLength(1);
+    expect(parsed.spans[0]).toMatchObject({
+      tool: 'apply_patch', phase: 'edit', status: 'ok',
+      filePaths: ['/repo/a.ts', '/repo/b.ts'], lineCounts: { added: 3, removed: 1 },
+    });
+  });
+
+  it('never includes reasoning or unsupported item bodies in narration or spans', () => {
+    const parsed = codexItems([
+      { type: 'Reasoning', summary_text: ['private summary'], raw_content: ['private reasoning'] },
+      ...['ImageView', 'WebSearch', 'Extension'].map(type => ({ type, content: [{ text: 'unsupported body' }] })),
+      { type: 'AgentMessage', content: [{ type: 'Text', text: 'public answer' }] },
+    ]);
+    expect(parsed.spans).toEqual([]);
+    expect(parsed.turnAgentSay).toEqual([{ text: 'public answer', truncated: false }]);
+  });
+
+  it('counts compaction only once when the completed item mirrors a compacted entry', () => {
+    const path = fp('codex-compaction.jsonl');
+    writeFileSync(path, [
+      { type: 'event_msg', payload: { type: 'item_completed', turn_id: 't0', item: { type: 'ContextCompaction', id: 'compact-1' } } },
+      { type: 'compacted', payload: {} },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    expect(parseCodexInsight(path).compactions).toBe(1);
+  });
+
+  it('falls back to paired exec wrappers only when command items are absent', () => {
+    const path = fp('codex-exec-fallback.jsonl');
+    writeFileSync(path, [
+      { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'c1', input: 'await tools.exec_command({cmd: "npm test"})' } },
+      { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'Wall time: 7.25s\nProcess exited with code 1\nTOKEN=secret' } },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const parsed = parseCodexInsight(path);
+    expect(parsed.spans).toHaveLength(1);
+    expect(parsed.spans[0]).toMatchObject({
+      tool: 'exec_command', phase: 'run', status: 'error', durationMs: 7250,
+      evidence: { output: { text: expect.stringContaining('TOKEN=<redacted>') } },
+    });
+  });
+
+  it('counts command items rather than exec wrappers even when wrappers come first', () => {
+    const path = fp('codex-exec-mixed.jsonl');
+    writeFileSync(path, [
+      ...[0, 1, 2].flatMap(i => [
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: `c${i}`, input: 'await tools.write_stdin({session_id: 1})' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: `c${i}`, output: 'Process exited with code 1' } },
+      ]),
+      ...[0, 1].map(i => ({ type: 'event_msg', payload: { type: 'item_completed', turn_id: 't0', item: { type: 'CommandExecution', id: `exec-${i}`, command: ['npm', 'test'], status: 'completed', exit_code: 0 } } })),
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const parsed = parseCodexInsight(path);
+    expect(parsed.spans).toHaveLength(2);
+    expect(parsed.spans.every(span => span.phase === 'run' && span.status === 'ok')).toBe(true);
+  });
+
+  it('safely projects MCP results and classifies collaboration as delegate', () => {
+    const parsed = codexItems([
+      { type: 'McpToolCall', server: 'fs', tool: 'read_file', arguments: { path: '/repo/a.ts', token: 'private-argument' }, status: 'completed', result: { text: 'TOKEN=secret' } },
+      { type: 'McpToolCall', server: 'fs', tool: 'read_file', status: 'failed', result: 'unavailable' },
+      { type: 'CollabAgentToolCall', tool: 'wait', status: 'completed' },
+      { type: 'CollabAgentToolCall', tool: 'spawn_agent', status: 'failed' },
+    ]);
+    expect(parsed.spans).toHaveLength(4);
+    expect(parsed.spans[0]).toMatchObject({
+      tool: 'fs.read_file', phase: 'research', status: 'ok',
+      intent: { kind: 'read_file', subject: 'a.ts' }, evidence: { output: { text: 'TOKEN=<redacted>' } },
+    });
+    expect(parsed.spans[1]).toMatchObject({ status: 'error', result: { category: 'tool_error' } });
+    expect(parsed.spans[2]).toMatchObject({ tool: 'wait', phase: 'delegate', status: 'ok', intent: { kind: 'delegate' } });
+    expect(parsed.spans[3]).toMatchObject({ phase: 'delegate', status: 'error' });
+    expect(JSON.stringify(parsed.spans)).not.toContain('private-argument');
+    expect(JSON.stringify(parsed.spans)).not.toContain('TOKEN=secret');
+  });
+
+  it.each(['legacy', 'item'] as const)('pairs one prompt mirror in either order (%s first) without swallowing the next turn', first => {
+    const path = fp('codex-prompt-mirrors.jsonl');
+    const prompt = (dialect: 'legacy' | 'item', seconds: number) => ({
+      type: 'event_msg', timestamp: `2026-09-16T01:00:0${seconds}.000Z`,
+      payload: dialect === 'legacy' ? { type: 'user_message', message: 'build' }
+        : { type: 'item_completed', turn_id: `t${seconds}`, item: { type: 'UserMessage', content: [{ type: 'text', text: '<user_message>build</user_message><mentions></mentions>' }] } },
+    });
+    const other = first === 'legacy' ? 'item' : 'legacy';
+    writeFileSync(path, [prompt(first, 0), prompt(other, 1), prompt(first, 2), prompt(other, 3)]
+      .map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    expect(parseCodexInsight(path).turnPrompts?.map(p => p.text)).toEqual(['build', 'build']);
+  });
+
+  it.each([
+    { name: 'outside the mirror window', delay: 6000, firstText: 'build', secondText: 'build' },
+    { name: 'same dialect', delay: 1000, firstText: 'build', secondText: 'build', secondLegacy: true },
+    { name: 'different turn IDs', delay: 1000, firstText: 'build', secondText: 'build', firstId: 't0', secondId: 't1' },
+    { name: 'different text after preview truncation', delay: 1000, firstText: 'a'.repeat(500) + '1', secondText: 'a'.repeat(500) + '2' },
+    { name: 'different redacted values', delay: 1000, firstText: 'TOKEN=one', secondText: 'TOKEN=two' },
+  ])('preserves distinct prompts: $name', ({ delay, firstText, secondText, secondLegacy, firstId, secondId }) => {
+    const path = fp('codex-distinct-prompts.jsonl');
+    writeFileSync(path, [
+      { type: 'event_msg', timestamp: '2026-09-16T01:00:00.000Z', payload: { type: 'user_message', message: firstText, turn_id: firstId } },
+      { type: 'event_msg', timestamp: new Date(Date.parse('2026-09-16T01:00:00.000Z') + delay).toISOString(), payload: secondLegacy
+        ? { type: 'user_message', message: secondText }
+        : { type: 'item_completed', turn_id: secondId, item: { type: 'UserMessage', content: [{ type: 'text', text: secondText }] } } },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    expect(parseCodexInsight(path).turnPrompts).toHaveLength(2);
+  });
+});
+
 describe('insight span readers', () => {
   it('pairs Claude tool_use/tool_result and ignores trailing partial JSONL', () => {
     const path = fp('claude.jsonl');
