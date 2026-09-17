@@ -368,9 +368,6 @@ import {
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
-  crossPrincipalBotClassifyNotice,
-  crossPrincipalBotWaitNotice,
-  crossPrincipalControlNotice,
   crossPrincipalClassificationOptions,
   crossPrincipalClassificationPrompt,
   crossPrincipalStagedNotice,
@@ -18585,19 +18582,12 @@ async function stageCrossPrincipalInterruption(args: {
   const loc = localeForBot(ds.larkAppId);
   const proposerOpenId = proposer.requestUserOpenId;
   if (proposer.senderType === 'bot') {
-    if (proposerOpenId) {
-      void sessionReply(
-        sessionAnchorId(ds),
-        crossPrincipalBotClassifyNotice(proposerOpenId, staged.record.id, loc),
-        'text',
-        ds.larkAppId,
-        message.turnId,
-        { uuid: crossPrincipalNoticeUuid('classification', staged.record) },
-      ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
-    }
-    staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
-    persistCrossPrincipalQueue(ds);
-    scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
+    // New CLIs must declare `--as` before a bot-directed send leaves the
+    // process. A legacy sender may still arrive without the durable token; fail
+    // closed without publishing another bot-addressed control message into the
+    // shared topic (that was the mixed-version recursion source).
+    removeCrossPrincipalRecord(ds, staged.record.id);
+    await notifyCrossPrincipalTerminal(ds, staged.record, tr('xpi.timeout.unclassified', undefined, loc));
     return true;
   }
   void sessionReply(
@@ -18616,19 +18606,24 @@ async function notifyCrossPrincipalTerminal(
   record: CrossPrincipalInterruption,
   text: string,
 ): Promise<void> {
-  const ownerId = record.owner.requestUserOpenId;
-  const proposerId = record.proposer.requestUserOpenId;
-  const ats = [...new Set([ownerId, proposerId].filter((v): v is string => !!v))]
-    .map(id => `<at id=${id}></at>`)
-    .join(' ');
-  await sessionReply(
-    sessionAnchorId(ds),
-    crossPrincipalControlNotice('terminal', record.id, `${ats}${ats ? ' ' : ''}${text}`),
-    'text',
-    ds.larkAppId,
-    undefined,
-    { uuid: crossPrincipalNoticeUuid('terminal', record, text) },
-  );
+  const humanIds = [...new Set([record.owner, record.proposer]
+    .filter(principal => principal.senderType !== 'bot')
+    .map(principal => principal.requestUserOpenId)
+    .filter((id): id is string => !!id))];
+
+  if (humanIds.length > 0) {
+    const ats = humanIds.map(id => `<at id=${id}></at>`).join(' ');
+    // Human-facing terminal text may remain in the original topic, but the
+    // executable protocol marker must never be published to the whole topic.
+    await sessionReply(
+      sessionAnchorId(ds),
+      `${ats} ${text}`,
+      'text',
+      ds.larkAppId,
+      undefined,
+      { uuid: crossPrincipalNoticeUuid('terminal', record, text) },
+    );
+  }
 }
 
 async function dispatchApprovedCrossPrincipalSuggestion(
@@ -18899,10 +18894,17 @@ async function prepareIndependentCrossPrincipalSession(
 
   let rootMessageId = record.independentRootMessageId;
   if (!rootMessageId) {
+    // The root is the target daemon's own internal child-session anchor. A bot
+    // proposer must not be @-addressed here: doing so would publish another
+    // bot-directed control turn and wake old/mixed-version peers. Humans still
+    // receive the ordinary acknowledgement mention.
+    const proposerAt = record.proposer.senderType === 'bot'
+      ? ''
+      : `<at id=${proposerId}></at> `;
     rootMessageId = await sendMessage(
       sourceDs.larkAppId,
       sourceDs.chatId,
-      `<at id=${proposerId}></at> 已为这条独立任务创建隔离话题；不会读取原会话的 CLI 记录或工具输出。`,
+      `${proposerAt}已为这条独立任务创建隔离话题；不会读取原会话的 CLI 记录或工具输出。`,
       'text',
       record.id,
     );
@@ -19076,24 +19078,8 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         return;
       }
       if (record.proposer.senderType === 'bot') {
-        if (record.botClassifyDeadlineAt && Date.now() >= record.botClassifyDeadlineAt) {
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
-          return;
-        }
-        if (!record.botClassifyDeadlineAt) {
-          await sessionReply(
-            sessionAnchorId(ds),
-            crossPrincipalBotClassifyNotice(proposerId, record.id, loc),
-            'text',
-            ds.larkAppId,
-            undefined,
-            { uuid: crossPrincipalNoticeUuid('classification', record) },
-          );
-          record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
-          persistCrossPrincipalQueue(ds);
-        }
-        scheduleCrossPrincipalOwnerWait(ds, record.botClassifyDeadlineAt);
+        removeCrossPrincipalRecord(ds, record.id);
+        await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
         return;
       }
       const result = await registerHostAsk({
@@ -19150,22 +19136,8 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         const round = record.waitDecisionRound ?? 0;
         const loc = localeForBot(ds.larkAppId);
         if (record.proposer.senderType === 'bot') {
-          if ((record.waitDecisionRound ?? 0) > 0) {
-            removeCrossPrincipalRecord(ds, record.id);
-            await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
-            return;
-          }
-          await sessionReply(
-            sessionAnchorId(ds),
-            crossPrincipalBotWaitNotice(proposerId, record.id, loc),
-            'text',
-            ds.larkAppId,
-            undefined,
-            { uuid: crossPrincipalNoticeUuid('wait', record) },
-          );
-          continueCrossPrincipalOwnerWait(record, Date.now(), CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS);
-          persistCrossPrincipalQueue(ds);
-          scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+          removeCrossPrincipalRecord(ds, record.id);
+          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
           return;
         }
         const waitResult = await registerHostAsk({
@@ -22021,6 +21993,20 @@ async function handleThreadReplyAdmitted(
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
   const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
+  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
+    ? parseCrossPrincipalControlNotice(parsed.content)
+    : undefined;
+  if (xpiControlNotice) {
+    // Legacy protocol traffic is never a business turn. New builds no longer
+    // publish these markers; consuming historical/mixed-version copies before
+    // session auto-create keeps an old loop from re-entering XPI staging.
+    markIngressAdmitted(ctx);
+    logger.info(
+      `[${larkAppId}] consumed XPI control notice kind=${xpiControlNotice.kind} `
+      + `record=${xpiControlNotice.recordId} surface=${ctxChatType ?? 'unknown'}`,
+    );
+    return;
+  }
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -23179,22 +23165,6 @@ async function handleThreadReplyAdmitted(
   // the existing-owner route below, i.e. deliver the message like any other —
   // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
   // message that is not diverted here is also not rejected there.
-  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
-    ? parseCrossPrincipalControlNotice(parsed.content)
-    : undefined;
-  if (xpiControlNotice) {
-    // XPI protocol traffic is control-plane data, never a business turn. It is
-    // authenticated by the transport-level bot sender fact plus a strict
-    // record marker. Consuming it here prevents two bots from classifying each
-    // other's notices forever; human-authored lookalikes continue normally.
-    markIngressAdmitted(ctx);
-    logger.info(
-      `[${tag(ds)}] consumed XPI control notice kind=${xpiControlNotice.kind} `
-      + `record=${xpiControlNotice.recordId}`,
-    );
-    return;
-  }
-
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn

@@ -62,6 +62,17 @@ describe('parseApiMessage metadata', () => {
 // ─── Interactive card: Format A (Lark API simplified) ─────────────────────
 
 describe('Interactive card parsing: Format A (API simplified)', () => {
+  it('preserves the visible XPI choice token through card re-serialisation', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '请处理这项任务' },
+        { tag: 'text', text: '\n[botmux-as:v1:suggestion]' },
+      ]],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content)
+      .toContain('[botmux-as:v1:suggestion]');
+  });
+
   it('should extract title and text elements', () => {
     const card = {
       title: '🎁 Bits UT Defect Challenge | Leaderboard Update!',

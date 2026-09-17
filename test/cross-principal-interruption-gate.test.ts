@@ -114,13 +114,15 @@ describe('XPI switch — accessor (config file + env override)', () => {
 });
 
 describe('XPI control-notice loop guard wiring', () => {
-  it('consumes only authenticated bot control notices before generic XPI staging', () => {
+  it('consumes authenticated legacy control notices before auto-create or generic staging', () => {
     const parseAt = daemonSource.indexOf("threadTrustedCaller?.senderType === 'bot'");
     const consumeAt = daemonSource.indexOf('consumed XPI control notice');
-    const stageGateAt = daemonSource.indexOf('if (config.crossPrincipalInterruption', consumeAt);
+    const autoCreateAt = daemonSource.indexOf('if (!ds) {', consumeAt);
+    const stageGateAt = daemonSource.indexOf('if (config.crossPrincipalInterruption', autoCreateAt);
     expect(parseAt).toBeGreaterThan(0);
     expect(consumeAt).toBeGreaterThan(parseAt);
-    expect(stageGateAt).toBeGreaterThan(consumeAt);
+    expect(autoCreateAt).toBeGreaterThan(consumeAt);
+    expect(stageGateAt).toBeGreaterThan(autoCreateAt);
   });
 
   it('cleans strict persisted session rows as well as active sessions when disabled', () => {

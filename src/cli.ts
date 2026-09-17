@@ -270,6 +270,7 @@ import {
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
+  crossPrincipalBotSendNeedsChoice,
   embedCrossPrincipalAsToken,
   parseCrossPrincipalAsFlag,
 } from './core/cross-principal-choice.js';
@@ -9013,7 +9014,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (asChoice && customCardRequested) {
-    console.error('botmux send: --as 不能与 --card-file/--card-json 混用；请先发卡片，再单独 `botmux send --as independent|suggestion`');
+    console.error('botmux send: --as 不能与 --card-file/--card-json 混用；XPI 下发给 Bot 的分类只支持普通文本，请改用普通文本并携带 --as independent|suggestion');
     process.exit(2);
   }
   // Backward-compatible default: an unclassified proactive send is non-final.
@@ -9133,6 +9134,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
     process.exit(2);
   }
+  if (asChoice && asVoice) {
+    console.error('botmux send: --as 不能与 --voice 混用；XPI 分类标记只支持普通文本');
+    process.exit(2);
+  }
   // --slash: send a NATIVE slash command (e.g. /clear /model /close) as a
   // single-line plain-`text` message instead of the usual interactive card.
   // The card path appends a `[🔊 语音总结]` footer, turning the body multi-line
@@ -9143,6 +9148,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // line of text, nothing else.
   const isSlashSend = rest.includes('--slash');
   if (isSlashSend) {
+    if (asChoice) {
+      console.error('botmux send: --slash 不能与 --as 混用；原生斜杠命令走控制通道，不参与 XPI 分类');
+      process.exit(2);
+    }
     if (customCardRequested || asVoice) {
       console.error('botmux send: --slash 不能与 --card-file/--card-json/--voice 混用（斜杠命令只发单行纯文本）');
       process.exit(2);
@@ -10397,6 +10406,32 @@ async function cmdSend(rest: string[]): Promise<void> {
     recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);
     return result.messageId;
   };
+
+  // Bot-to-bot XPI classification must be decided before the message leaves
+  // this process. The former post-send control prompt was published into the
+  // shared topic, where mixed-version peers could treat it as a fresh task and
+  // recursively stage it. Run this before uploads or any provider effect.
+  const customCardPayload = customCard ? JSON.stringify(customCard) : '';
+  const customCardKnownBotTarget = customCardPayload.length > 0
+    && [...knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId)]
+      .some(openId => customCardPayload.includes(openId));
+  const knownBotTextTarget = !asVoice && (
+    (!noMention && hasKnownBotMention(content, mentions, botEntries, crossRef, appId))
+    || customCardKnownBotTarget
+  );
+  if (config.crossPrincipalInterruption && customCardRequested && knownBotTextTarget) {
+    console.error('botmux send: XPI 开启时暂不支持向 Bot 发送自定义卡片；请改用普通文本并携带 --as independent|suggestion');
+    process.exit(2);
+  }
+  if (crossPrincipalBotSendNeedsChoice({
+    enabled: config.crossPrincipalInterruption,
+    hasKnownBotMention: knownBotTextTarget,
+    choice: asChoice,
+    controlLane: isSlashSend,
+  })) {
+    console.error(t('xpi.send.as_required', undefined, localeForBot(appId)));
+    process.exit(2);
+  }
 
   try {
     // A file-sandbox relay supplies a host-private copy normalized inside the

@@ -24,17 +24,6 @@ export type CrossPrincipalControlNoticeKind = 'classification' | 'wait' | 'termi
 
 const XPI_CONTROL_NOTICE_RE = /^\[botmux-xpi-control:v1:(classification|wait|terminal):(xpi_[a-f0-9]{24})\](?:\n|$)/;
 
-export function crossPrincipalControlNotice(
-  kind: CrossPrincipalControlNoticeKind,
-  recordId: string,
-  text: string,
-): string {
-  if (!/^xpi_[a-f0-9]{24}$/.test(recordId)) {
-    throw new Error('invalid_cross_principal_record_id');
-  }
-  return `[botmux-xpi-control:v1:${kind}:${recordId}]\n${text}`;
-}
-
 export function parseCrossPrincipalControlNotice(text: string): {
   kind: CrossPrincipalControlNoticeKind;
   recordId: string;
@@ -47,7 +36,11 @@ export function parseCrossPrincipalControlNotice(text: string): {
   };
 }
 
-const AS_TOKEN_RE = /(?:^|\n)\s*<!--botmux-as:(independent|suggestion)-->\s*$/;
+// The original HTML-comment token is retained for persisted/legacy inputs, but
+// new sends use a visible plain-text token. Feishu card re-serialisation strips
+// HTML comments, which made an explicit `--as` disappear before the receiving
+// daemon could classify it.
+const AS_TOKEN_RE = /(?:^|\n)\s*(?:<!--botmux-as:(independent|suggestion)-->|\[botmux-as:v1:(independent|suggestion)\])\s*$/;
 
 /**
  * One source of truth per choice, consumed at two different strictnesses:
@@ -97,6 +90,15 @@ export function isCrossPrincipalAsChoice(value: string): value is CrossPrincipal
   return value === 'independent' || value === 'suggestion';
 }
 
+export function crossPrincipalBotSendNeedsChoice(args: {
+  enabled: boolean;
+  hasKnownBotMention: boolean;
+  choice?: CrossPrincipalAsChoice;
+  controlLane?: boolean;
+}): boolean {
+  return args.enabled && args.hasKnownBotMention && !args.controlLane && !args.choice;
+}
+
 /** Parse `botmux send --as <value>`. Unknown values stay undefined. */
 export function parseCrossPrincipalAsFlag(raw: string | undefined): CrossPrincipalAsChoice | undefined {
   if (!raw) return undefined;
@@ -121,7 +123,7 @@ export function embedCrossPrincipalAsToken(
   choice: CrossPrincipalAsChoice,
 ): string {
   const stripped = stripCrossPrincipalAsToken(text).text.replace(/\s+$/u, '');
-  const token = `<!--botmux-as:${choice}-->`;
+  const token = `[botmux-as:v1:${choice}]`;
   return stripped ? `${stripped}\n${token}` : token;
 }
 
@@ -133,7 +135,7 @@ export function stripCrossPrincipalAsToken(text: string): {
   if (!match || match.index === undefined) return { text };
   return {
     text: text.slice(0, match.index).replace(/\s+$/u, ''),
-    choice: match[1] as CrossPrincipalAsChoice,
+    choice: (match[1] ?? match[2]) as CrossPrincipalAsChoice,
   };
 }
 
@@ -237,32 +239,4 @@ export function crossPrincipalStagedNotice(
 ): string {
   const at = proposerOpenId ? `<at id=${proposerOpenId}></at> ` : '';
   return `${at}${t('xpi.notice.staged', undefined, locale)}`;
-}
-
-export function crossPrincipalAgentHint(locale?: Locale): string {
-  return t('xpi.agent.hint', undefined, locale);
-}
-
-export function crossPrincipalBotClassifyNotice(
-  proposerOpenId: string,
-  recordId: string,
-  locale?: Locale,
-): string {
-  return crossPrincipalControlNotice(
-    'classification',
-    recordId,
-    `${t('xpi.bot.classify.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`,
-  );
-}
-
-export function crossPrincipalBotWaitNotice(
-  proposerOpenId: string,
-  recordId: string,
-  locale?: Locale,
-): string {
-  return crossPrincipalControlNotice(
-    'wait',
-    recordId,
-    `${t('xpi.bot.wait.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`,
-  );
 }

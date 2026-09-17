@@ -329,12 +329,13 @@ export interface DashboardGlobalConfig {
    *  arrives while a DIFFERENT principal owns the active CLI turn, the daemon
    *  diverts it into a staged `crossPrincipalInterruptions` record and asks the
    *  proposer to classify it (另开任务 / 留给当前任务) instead of delivering it.
-   *  Default OFF (absent ⇒ off): the classification round-trip is not reliable
-   *  on Feishu today — a v2 card re-serialization drops the hidden `--as` token
-   *  and strips button `value`, so neither the flag nor the bare keyword settles
-   *  the card and the message can never leave the queue. With the switch OFF the
-   *  message is delivered exactly as it was before the feature existed. Read live
-   *  — see config.ts `crossPrincipalInterruption`. */
+   *  Human proposers use the host-ask card path. Agent proposers must declare
+   *  `botmux send --as …` before the send; the durable visible annotation
+   *  survives Feishu card re-serialization. An unclassified legacy bot message
+   *  is terminalised without publishing bot-addressed protocol traffic into the
+   *  shared topic. Default OFF (absent ⇒ off). With the switch OFF the message
+   *  is delivered exactly as it was before the feature existed. Read live — see
+   *  config.ts `crossPrincipalInterruption`. */
   crossPrincipalInterruption?: boolean;
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
@@ -854,10 +855,10 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
  * OFF (the default) restores the pre-#1348 delivery shape exactly: a message
  * from another principal is appended to the queue and delivered to the active
  * CLI turn like any other message — no divert, no staged record, no
- * classification card. That is deliberate mitigation, not a repair: the
- * classification round-trip cannot currently be answered on Feishu (the card
- * re-serialization drops the hidden `--as` token and strips button `value`), so
- * an enforced isolation can strand the proposer's message indefinitely.
+ * classification card. Agent-to-agent sends classify up front with
+ * `botmux send --as …`; human proposers use the host-ask card path. Legacy bot
+ * messages without a choice are terminalised instead of entering an unbounded
+ * wait or publishing recursive control traffic.
  *
  * Mirrors isWorkflowFeatureEnabled: `BOTMUX_XPI_ENABLED` wins when set (an
  * escape hatch for a single daemon / a test), otherwise the dashboard toggle.

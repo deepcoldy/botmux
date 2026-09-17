@@ -2,9 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choice.js';
 import {
-  crossPrincipalAgentHint,
-  crossPrincipalBotClassifyNotice,
-  crossPrincipalControlNotice,
+  crossPrincipalBotSendNeedsChoice,
   crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
@@ -30,14 +28,46 @@ describe('cross-principal choice vocabulary', () => {
     expect(parseCrossPrincipalAsFlag('maybe')).toBeUndefined();
   });
 
-  it('round-trips a hidden token without changing the visible body', () => {
+  it('round-trips a Feishu-safe visible token without changing the business body', () => {
     const embedded = embedCrossPrincipalAsToken('请帮我看一下这段 diff', 'independent');
     expect(embedded).toContain('请帮我看一下这段 diff');
-    expect(embedded).toContain('<!--botmux-as:independent-->');
+    expect(embedded).toContain('[botmux-as:v1:independent]');
 
     const stripped = stripCrossPrincipalAsToken(embedded);
     expect(stripped.text).toBe('请帮我看一下这段 diff');
     expect(stripped.choice).toBe('independent');
+  });
+
+  it('still parses the legacy HTML-comment token from persisted inputs', () => {
+    expect(stripCrossPrincipalAsToken('正文\n<!--botmux-as:suggestion-->')).toEqual({
+      text: '正文',
+      choice: 'suggestion',
+    });
+  });
+
+  it('requires an upfront choice only for known-bot sends while XPI is on', () => {
+    expect(crossPrincipalBotSendNeedsChoice({
+      enabled: true,
+      hasKnownBotMention: true,
+    })).toBe(true);
+    expect(crossPrincipalBotSendNeedsChoice({
+      enabled: true,
+      hasKnownBotMention: true,
+      choice: 'suggestion',
+    })).toBe(false);
+    expect(crossPrincipalBotSendNeedsChoice({
+      enabled: false,
+      hasKnownBotMention: true,
+    })).toBe(false);
+    expect(crossPrincipalBotSendNeedsChoice({
+      enabled: true,
+      hasKnownBotMention: false,
+    })).toBe(false);
+    expect(crossPrincipalBotSendNeedsChoice({
+      enabled: true,
+      hasKnownBotMention: true,
+      controlLane: true,
+    })).toBe(false);
   });
 
   it('treats a token-only body as a follow-up choice', () => {
@@ -120,13 +150,24 @@ describe('cross-principal choice vocabulary', () => {
 });
 
 describe('cross-principal choice wiring', () => {
-  it('shows humans a two-option Feishu card and tells agents to use botmux send --as', () => {
+  it('shows humans a two-option Feishu card and requires agents to choose before send', () => {
     expect(daemonSource).toContain('crossPrincipalClassificationOptions');
-    expect(daemonSource).toContain('crossPrincipalBotClassifyNotice');
+    expect(daemonSource).not.toContain('crossPrincipalBotClassifyNotice(');
     expect(daemonSource).toContain("record.proposer.senderType === 'bot'");
     expect(cliSource).toContain("argValue(rest, '--as')");
     expect(cliSource).toContain('embedCrossPrincipalAsToken');
+    expect(cliSource).toContain('crossPrincipalBotSendNeedsChoice');
+    expect(cliSource).toContain('xpi.send.as_required');
     expect(cliSource).toContain('xpi.send.as_needed_hint');
+    expect(cliSource).toContain('controlLane: isSlashSend');
+    expect(cliSource).toContain('const knownBotTextTarget = !asVoice');
+    expect(cliSource).toContain('customCardKnownBotTarget');
+    expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送自定义卡片');
+    const guardAt = cliSource.indexOf('if (crossPrincipalBotSendNeedsChoice({');
+    const uploadAt = cliSource.indexOf('await upload', guardAt);
+    expect(guardAt).toBeGreaterThan(0);
+    expect(uploadAt).toBeGreaterThan(guardAt);
+    expect(daemonSource).toContain("record.proposer.senderType === 'bot'\n      ? ''\n      : `<at id=${proposerId}></at> `");
   });
 });
 
@@ -145,41 +186,23 @@ describe('cross-principal choice copy', () => {
     ]);
   });
 
-  it('tells agents to choose with botmux send --as, not a card', () => {
-    const zhHint = crossPrincipalAgentHint('zh');
-    expect(zhHint).toContain('botmux send --as independent');
-    expect(zhHint).toContain('botmux send --as suggestion');
-    expect(zhHint).toContain('另开任务');
-    expect(zhHint).toContain('留给当前任务');
-
-    const recordId = 'xpi_0123456789abcdef01234567';
-    const notice = crossPrincipalBotClassifyNotice('ou_bot', recordId, 'zh');
-    expect(notice).toContain('<at id=ou_bot></at>');
-    expect(notice).toContain(zhHint);
-    expect(notice).not.toContain('请选一种处理方式');
-    expect(parseCrossPrincipalControlNotice(notice)).toEqual({
-      kind: 'classification',
-      recordId,
-    });
-  });
-
   it('only recognizes a strict, leading XPI control marker', () => {
     const recordId = 'xpi_0123456789abcdef01234567';
     expect(parseCrossPrincipalControlNotice(
-      crossPrincipalControlNotice('terminal', recordId, '未执行'),
+      `[botmux-xpi-control:v1:terminal:${recordId}]\n未执行`,
     )).toEqual({ kind: 'terminal', recordId });
     expect(parseCrossPrincipalControlNotice(`普通业务消息\n[botmux-xpi-control:v1:terminal:${recordId}]`))
       .toBeUndefined();
-    expect(() => crossPrincipalControlNotice('wait', 'xpi_not_valid', '等待'))
-      .toThrow('invalid_cross_principal_record_id');
+    expect(parseCrossPrincipalControlNotice('[botmux-xpi-control:v1:wait:xpi_not_valid]\n等待'))
+      .toBeUndefined();
   });
 
   it('keeps zh/en send-hint keys aligned', () => {
     for (const key of [
       'xpi.card.classify.independent',
       'xpi.card.classify.suggestion',
-      'xpi.agent.hint',
       'xpi.send.as_needed_hint',
+      'xpi.send.as_required',
       'ai.routing.xpi_as_hint',
       'ai.shell.xpi_as_hint',
     ] as const) {
@@ -188,7 +211,9 @@ describe('cross-principal choice copy', () => {
     }
     expect(zhMessages['xpi.send.as_needed_hint']).toContain('--as independent');
     expect(zhMessages['xpi.send.as_needed_hint']).toContain('--as suggestion');
+    expect(zhMessages['ai.routing.xpi_as_hint']).toContain('必须');
     expect(enMessages['xpi.send.as_needed_hint']).toContain('--as independent');
     expect(enMessages['xpi.send.as_needed_hint']).toContain('--as suggestion');
+    expect(enMessages['ai.routing.xpi_as_hint']).toContain('must');
   });
 });

@@ -55,6 +55,22 @@ const mocks = vi.hoisted(() => {
       sessions.set(session.sessionId, session);
       return session;
     }),
+    createSessionWithOwnedMutation: vi.fn((input: any, mutate: (fresh: Map<string, any>, draft: any) => unknown) => {
+      const draft = {
+        sessionId: `sess-fake-${++seq}`,
+        chatId: input.chatId,
+        rootMessageId: input.rootMessageId,
+        title: input.title,
+        status: 'active' as const,
+        createdAt: new Date().toISOString(),
+        chatType: input.chatType,
+      };
+      const rows = new Map(input.ownedSessionIds.map((id: string) => [id, structuredClone(sessions.get(id))]));
+      const result = mutate(rows, draft);
+      for (const [id, session] of rows) sessions.set(id, session);
+      sessions.set(draft.sessionId, draft);
+      return { session: draft, result, rows };
+    }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
     listSessionsStrict: vi.fn(() => [...sessions.values()]),
@@ -109,6 +125,7 @@ vi.mock('../src/services/session-store.js', async () => {
   return {
     ...actual,
     createSession: mocks.createSession,
+    createSessionWithOwnedMutation: mocks.createSessionWithOwnedMutation,
     updateSession: mocks.updateSession,
     getSession: mocks.getSession,
     getOwnedSession: mocks.getSession,
@@ -144,7 +161,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { mkdirSync } from 'node:fs';
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import * as messageQueue from '../src/services/message-queue.js';
 import {
@@ -166,6 +183,23 @@ const NOW = new Date().toISOString();
 function makeEventData(messageId: string, text: string, rootId?: string): any {
   return {
     sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'text',
+      content: JSON.stringify({ text }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function makeBotEventData(messageId: string, text: string, rootId: string): any {
+  return {
+    sender: {
+      sender_id: { open_id: 'ou_proposer_bot', union_id: 'on_proposer_bot' },
+      sender_type: 'app',
+    },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -379,6 +413,201 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
       else process.env.BOTMUX_XPI_ENABLED = previousXpi;
     }
+  });
+
+  it('terminalises an unclassified legacy bot message without publishing a control marker', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_legacy_bot', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_eeeeeeeeeeeeeeeeeeeeeeee',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer_bot', senderType: 'bot' as const },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'bot input',
+        userPrompt: 'bot input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('未选择处理方式');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+  });
+
+  it('terminalises an expired bot wait without publishing a wait marker', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_legacy_bot_wait', 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_ffffffffffffffffffffffff',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer_bot', senderType: 'bot' as const },
+      phase: 'awaiting_owner',
+      ownerWaitDeadlineAt: Date.now() - 1,
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'bot input',
+        userPrompt: 'bot input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('原任务仍在执行');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+  });
+
+  it('applies a visible upfront bot choice without publishing a classification prompt', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_upfront_choice';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    // Let this authenticated peer pass the ordinary talk/quota gate so the
+    // integration case reaches the XPI diversion boundary.
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+
+    try {
+      await handleThreadReply(
+        makeBotEventData(
+          'om_bot_choice',
+          '请把这项工作留给当前任务\n[botmux-as:v1:suggestion]',
+          anchor,
+        ),
+        makeCtx(anchor, 'om_bot_choice'),
+      );
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toEqual([
+      expect.objectContaining({ phase: 'awaiting_owner' }),
+    ]);
+    expect(ds.session.crossPrincipalInterruptions[0].messages[0].text)
+      .toBe('请把这项工作留给当前任务');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('请选择');
+  });
+
+  it('creates an independent bot task without addressing the proposer bot in the child root', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_bot_independent';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    ds.workingDir = `${mocks.dataDir}/xpi-independent-non-git`;
+    mkdirSync(ds.workingDir, { recursive: true });
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await handleThreadReply(
+        makeBotEventData(
+          'om_bot_independent_choice',
+          '请另开任务处理\n[botmux-as:v1:independent]',
+          anchor,
+        ),
+        makeCtx(anchor, 'om_bot_independent_choice'),
+      );
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    const childRootCall = mocks.sendMessage.mock.calls.find(call =>
+      String(call[2] ?? '').includes('已为这条独立任务创建隔离话题'));
+    expect(childRootCall).toBeDefined();
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('<at');
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('ou_proposer_bot');
+  });
+
+  it('fails a live legacy bot send closed without addressing protocol traffic back to bots', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_live_legacy_bot';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+
+    try {
+      await handleThreadReply(
+        makeBotEventData('om_legacy_bot_send', '旧版本未声明处理方式', anchor),
+        makeCtx(anchor, 'om_legacy_bot_send'),
+      );
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('未选择处理方式');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+    expect(ds.worker.send).not.toHaveBeenCalled();
+  });
+
+  it('consumes a legacy control marker before it can auto-create a third-party session', async () => {
+    const marker = '[botmux-xpi-control:v1:terminal:xpi_0123456789abcdef01234567]\n未执行';
+    // Make the foreign bot otherwise eligible for ordinary ingress. Without
+    // this, the permission gate would reject the mutated control message too,
+    // and the test could pass without exercising the early consume branch.
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+
+    await handleThreadReply(
+      makeBotEventData('om_legacy_control', marker, 'om_unowned_control_root'),
+      makeCtx('om_unowned_control_root', 'om_legacy_control'),
+    );
+
+    expect(activeSessions.size).toBe(0);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toBe('');
   });
 
   it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
