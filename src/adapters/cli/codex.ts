@@ -14,6 +14,22 @@ import { delay, scaleMs } from '../../utils/timing.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 
+/** Only the current viewport is meaningful here: stripping the PTY stream
+ * leaves erased loading screens and old transcript prompts in the text. */
+function resumedCodexPromptReady(screen: string): boolean {
+  if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
+  const lines = screen.trimEnd().split('\n');
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  // The composer must be the bottom input surface, followed only by its
+  // initialized model/path footer. Pickers, review dialogs and history alone
+  // cannot satisfy this shape. Do not depend on a particular model name.
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  return footer.length === 1 && /^\s*\S[^\n]* · (?:\/|~)\S*/.test(footer[0]);
+}
+
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
  *  file, which Codex creates lazily at the first submit (chicken-and-egg:
@@ -450,6 +466,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // cell boundaries, not literal newlines: PTY redraws also move the cursor.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
+    startupResume: {
+      historyPattern: /Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript/,
+      isReady: resumedCodexPromptReady,
+    },
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.
