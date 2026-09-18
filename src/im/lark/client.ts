@@ -714,9 +714,14 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
  * truncated list would make members past the cap look like "not in the chat"
  * (wrong-answer fail-open), so a truncation is surfaced as an error instead.
  */
-export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+export interface ChatUserMember {
+  openId: string;
+  name?: string;
+}
+
+export async function listChatUserMembers(larkAppId: string, chatId: string): Promise<ChatUserMember[]> {
   const c = getBotClient(larkAppId);
-  const openIds: string[] = [];
+  const members: ChatUserMember[] = [];
   let pageToken: string | undefined;
   let truncated = false;
   // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
@@ -729,7 +734,10 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
     }
     for (const it of (res.data?.items ?? [])) {
       const id = it?.member_id;
-      if (typeof id === 'string' && id) openIds.push(id);
+      if (typeof id === 'string' && id) {
+        const name = typeof it?.name === 'string' && it.name.trim() ? it.name.trim() : undefined;
+        members.push({ openId: id, ...(name ? { name } : {}) });
+      }
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
@@ -743,7 +751,11 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
       `Refusing to return an incomplete list (would misjudge members past the cap as "not in chat").`,
     );
   }
-  return openIds;
+  return members;
+}
+
+export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+  return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
 
 /**

@@ -164,6 +164,12 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
 
+  it('lets explicit recipients replace the implicit reply target in quote and footer routing', () => {
+    expect(cliSource).toContain('shouldSuppressImplicitReplyTarget({');
+    expect(cliSource).toContain('if (suppressImplicitReplyTarget) effectiveQuoteTargetId = undefined');
+    expect(cliSource).toContain('hasExplicitMention: mentions.length > 0');
+  });
+
   it('gates the legacy global quote-sender fallback on NO currentTurnId — an exact-turn miss never borrows the advanced global slot (#750 cross-turn guard)', () => {
     // The reply-target sender chain is: VC → #597 frozen dispatch → exact
     // turnReplyTarget.senderOpenId → (ONLY when no currentTurnId) legacy global

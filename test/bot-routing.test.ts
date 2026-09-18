@@ -158,6 +158,13 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_human_caller', cc: [] });
   });
 
+  it('does not append the caller when an explicit human recipient was selected', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_triggering_bot' },
+      { isOncall: true, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
   it('suppresses owner addressing in oncall when the body explicitly targets a bot', () => {
     // Handoff to another bot: the default owner-courtesy ping is redundant noise
     // and is dropped. A human is looped in only via explicit --mention-back.
