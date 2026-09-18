@@ -651,12 +651,16 @@ function templateForResult(result: AskResult): string {
 }
 
 function approverSummary(ask: PendingAsk, locale?: Locale): string {
-  // `answererOpenId` is an authorization boundary, not display data. Embedding
-  // it as an at/person resource makes the whole card fail with Lark 230099 when
-  // the responder was resolved across apps (even though the callback identity
-  // is valid for broker authorization). Keep the concrete id only in the
-  // pending ask and show a neutral label in the card.
-  if (ask.answererOpenId) return t('card.ask.answerable_designated_member', undefined, locale);
+  if (ask.answererOpenId) {
+    // XPI can resolve this id from union_id in another app. It is valid for the
+    // broker's callback authorization, but embedding it as an at/person card
+    // resource can make Lark reject the whole card with 230099. Keep ordinary
+    // same-app asks unchanged; only the three XPI origins use a neutral label.
+    if (ask.originKind?.startsWith('host_cross_principal_')) {
+      return t('card.ask.answerable_designated_member', undefined, locale);
+    }
+    return `<at id=${ask.answererOpenId}></at>`;
+  }
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

@@ -111,12 +111,22 @@ describe('buildAskCard', () => {
     expect(text).toContain('继续发布');
   });
 
-  it('指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
-    const text = buildAskCard(makePending({ answererOpenId: 'ou_cross_app_answerer' }));
+  it('XPI 指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
+    const text = buildAskCard(makePending({
+      answererOpenId: 'ou_cross_app_answerer',
+      originKind: 'host_cross_principal_owner',
+    }));
 
     expect(text).toContain('指定成员（仅本人可操作）');
     expect(text).not.toContain('ou_cross_app_answerer');
     expect(text).not.toContain('<at');
+  });
+
+  it('普通同 app 指定答复人仍显示具体成员', () => {
+    const text = buildAskCard(makePending({ answererOpenId: 'ou_same_app_answerer' }));
+
+    expect(text).toContain('<at id=ou\\\\_same\\\\_app\\\\_answerer></at>');
+    expect(text).not.toContain('指定成员（仅本人可操作）');
   });
 
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
