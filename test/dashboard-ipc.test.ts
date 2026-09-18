@@ -9642,6 +9642,10 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
     expect(ins.status).not.toBe(401);
     // NOT allowlisted (no auth header) → 401.
+    const supersede = await fetch(`${base}/api/sessions/nope/trigger-result/supersede`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    expect(supersede.status).toBe(401);
     expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
     // /api/asks/answer is deliberately excluded from the allowlist → 401.

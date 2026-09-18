@@ -14988,10 +14988,16 @@ async function spawnCli(
   // Shim paths and the identity-file locator must reach the tool shell together.
   // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
   // identity under the Botmux session id. No credential is passed here.
-  const identityShellEnv: Record<string, string> = {};
+  const identityShellEnv: Record<string, string> = {
+    BOTMUX_SESSION_ID: cfg.sessionId,
+    BOTMUX_CHAT_ID: cfg.chatId,
+    BOTMUX_LARK_APP_ID: cfg.larkAppId,
+    BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+  };
+  if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
+  if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
-    identityShellEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
     identityShellEnv.ZDOTDIR = join(dir, 'shell');
