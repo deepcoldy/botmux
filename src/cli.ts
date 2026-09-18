@@ -5458,7 +5458,7 @@ async function postSessionCliIpc(
 async function cmdContinuation(argv: string[]): Promise<void> {
   const action = argv[0] ?? '';
   if (!['start', 'await-user', 'cancel'].includes(action)) {
-    console.error('用法: botmux continuation start --readonly [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
+    console.error('用法: botmux continuation start [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
     process.exitCode = 2;
     return;
   }
@@ -5466,11 +5466,6 @@ async function cmdContinuation(argv: string[]): Promise<void> {
   if (!ctx?.sessionId || !ctx.turnId) {
     console.error('✗ continuation 只能由当前 BotMux 会话的活动轮次调用');
     process.exitCode = 1;
-    return;
-  }
-  if (action === 'start' && !argv.includes('--readonly')) {
-    console.error('✗ 第一阶段只支持显式 --readonly 的只读长程任务');
-    process.exitCode = 2;
     return;
   }
   const ttlRaw = argValue(argv, '--ttl-minutes');
@@ -5500,7 +5495,7 @@ async function cmdContinuation(argv: string[]): Promise<void> {
     action,
     originTurnId: ctx.turnId,
     ...(ctx.dispatchAttempt !== undefined ? { originDispatchAttempt: ctx.dispatchAttempt } : {}),
-    ...(action === 'start' ? { readonly: true } : {}),
+    ...(action === 'start' && argv.includes('--readonly') ? { readonly: true } : {}),
     ...(ttlMinutes !== undefined ? { ttlMs: Math.round(ttlMinutes * 60_000) } : {}),
     ...(maxContinuations !== undefined ? { maxContinuations } : {}),
   });
@@ -6609,8 +6604,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
-  continuation start --readonly
-                   （实验性）为当前 TraeX 普通会话显式开启一次只读长程任务续跑；
+  continuation start
+                   （实验性）为当前 TraeX 普通会话显式开启一次授权继承的长程任务续跑；
                    可加 --ttl-minutes N / --max-continuations N，另有 await-user / cancel
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启

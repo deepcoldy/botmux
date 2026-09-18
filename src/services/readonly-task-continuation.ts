@@ -1,9 +1,16 @@
+import type { TrustedCaller } from '../types.js';
+
 export const READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE = 'codex_output_limit_exceeded';
+export const TASK_CONTINUATION_RATE_LIMIT_CODE = 'codex_rate_limited';
+export const TASK_CONTINUATION_CONNECTION_CODE = 'codex_connection_failed';
+export const TASK_CONTINUATION_UPSTREAM_CODE = 'codex_upstream_error';
+export const TASK_CONTINUATION_ENGINE_DEAD_CODE = 'rpc_engine_dead';
+export const TASK_CONTINUATION_CLI_EXIT_CODE = 'cli_exit';
 
 export const READONLY_TASK_CONTINUATION_PROMPT = [
-  '[BOTMUX_READONLY_CONTINUATION]',
-  '这是同一个只读长程任务的受限自动续跑。请读取当前会话与工作区中的过程账本，从最后一个可验证检查点继续；',
-  '保持只读，不执行任何写入、发布、重启、配置修改或其他外部副作用，也不要重复已经完成的查询。',
+  '[BOTMUX_CONTINUATION]',
+  '这是同一个长程任务在非业务中断后的受控自动续跑。请读取当前会话与工作区中的过程账本，从最后一个可验证检查点继续；',
+  '权限边界与原用户轮次完全相同：不得请求或假定新增权限，不得绕过仍需用户确认的操作。不要重复已经完成的动作；如果外部副作用是否成功不明确，先只读核验，仍无法证明时输出 await_user。',
   '本轮最终输出必须是单个 JSON 对象且不要使用代码块：任务完成时输出 {"status":"completed","content":"给用户的最终结论"}；仍可继续时输出 {"status":"continue"}；需要用户输入时输出 {"status":"await_user","content":"要问用户的问题"}。',
   '不要调用 botmux send，不要用自然语言猜测或声明内部完成状态；daemon 只接受上述严格结构并负责最终投递。',
 ].join('\n');
@@ -40,6 +47,14 @@ export interface ReadonlyTaskContinuationState {
   expiresAt: number;
   maxContinuations: number;
   continuationsStarted: number;
+  /** New leases inherit the exact runtime authority of the originating user
+   * turn. Missing means a pre-upgrade read-only lease and is never widened. */
+  authorizationMode?: 'inherited';
+  /** Daemon-authenticated caller/controller frozen when the originating turn
+   * opts in. These are replayed on synthetic turns so MCP/current-actor policy
+   * sees the same principal after terminal or worker restart. */
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
   status: ReadonlyTaskContinuationStatus;
   nextAttemptAt?: number;
   lastErrorCode?: string;
@@ -107,6 +122,9 @@ export interface ReadonlyTaskContinuationSession {
 export interface StartReadonlyTaskContinuationInput {
   turnId: string;
   workerGeneration: number;
+  authorizationMode: 'inherited';
+  trustedCaller: TrustedCaller;
+  trustedController?: TrustedCaller;
   ttlMs?: number;
   maxContinuations?: number;
 }
@@ -126,6 +144,17 @@ function isLiveStatus(status: ReadonlyTaskContinuationStatus): boolean {
 
 function isOpenStatus(status: ReadonlyTaskContinuationStatus): boolean {
   return isLiveStatus(status) || status === 'awaiting_user';
+}
+
+function validInheritedUser(value: unknown): value is TrustedCaller {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const caller = value as TrustedCaller;
+  if (typeof caller.requestLarkAppId !== 'string' || !caller.requestLarkAppId) return false;
+  if ((!caller.requestUserOpenId || typeof caller.requestUserOpenId !== 'string')
+    && (!caller.requestUserUnionId || typeof caller.requestUserUnionId !== 'string')) return false;
+  return caller.senderType === 'user'
+    && caller.source === undefined
+    && caller.taskId === undefined;
 }
 
 export type ReadonlyContinuationOutput =
@@ -155,9 +184,20 @@ export function readonlyTaskContinuationRecoversTerminal(
     || terminal.turnId !== state.currentTurnId
     || terminal.dispatchAttempt !== state.currentDispatchAttempt
     || terminal.workerGeneration !== state.currentWorkerGeneration) return false;
-  return terminal.status === 'completed'
-    || (terminal.status === 'failed'
-      && terminal.errorCode === READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE);
+  if (terminal.status === 'completed') return true;
+  if (terminal.status === 'ambiguous') {
+    // Engine death is a transport interruption, not a request replay: the next
+    // turn resumes the same persisted thread and must verify uncertain effects
+    // before doing more work. All other ambiguous terminals stay fail-closed.
+    return terminal.errorCode === TASK_CONTINUATION_ENGINE_DEAD_CODE
+      || terminal.errorCode === TASK_CONTINUATION_CLI_EXIT_CODE;
+  }
+  return terminal.status === 'failed' && [
+    READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE,
+    TASK_CONTINUATION_RATE_LIMIT_CODE,
+    TASK_CONTINUATION_CONNECTION_CODE,
+    TASK_CONTINUATION_UPSTREAM_CODE,
+  ].includes(terminal.errorCode ?? '');
 }
 
 /** A deliberately narrow task lease. It never infers completion from prose:
@@ -191,6 +231,27 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       return;
     }
     if (this.state.warningDispatched === true) this.publishAttention(this.state);
+    if (isLiveStatus(this.state.status) && this.state.authorizationMode !== 'inherited') {
+      this.warnOnce({
+        ...this.state,
+        status: 'failed',
+        nextAttemptAt: undefined,
+        lastErrorCode: 'continuation_legacy_lease_not_resumed',
+      });
+      return;
+    }
+    if (isLiveStatus(this.state.status)
+      && (!validInheritedUser(this.state.trustedCaller)
+        || (this.state.trustedController !== undefined
+          && !validInheritedUser(this.state.trustedController)))) {
+      this.warnOnce({
+        ...this.state,
+        status: 'failed',
+        nextAttemptAt: undefined,
+        lastErrorCode: 'continuation_authority_not_resumable',
+      });
+      return;
+    }
     if (!this.deps.enabled()) {
       if (isLiveStatus(this.state.status)) {
         this.commit({
@@ -251,6 +312,10 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
 
   start(input: StartReadonlyTaskContinuationInput): ReadonlyTaskContinuationState {
     if (!this.deps.enabled()) throw new Error('readonly_continuation_disabled');
+    if (!validInheritedUser(input.trustedCaller)
+      || (input.trustedController !== undefined && !validInheritedUser(input.trustedController))) {
+      throw new Error('continuation_authority_required');
+    }
     const current = this.state;
     if (current && (isLiveStatus(current.status)
       || (!!current.pendingWarning && current.warningDispatched !== true))) {
@@ -278,6 +343,11 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       expiresAt: createdAt + ttlMs,
       maxContinuations,
       continuationsStarted: 0,
+      authorizationMode: input.authorizationMode,
+      trustedCaller: { ...input.trustedCaller },
+      ...(input.trustedController
+        ? { trustedController: { ...input.trustedController } }
+        : {}),
       status: 'active',
     });
     this.armExpiry();
@@ -302,7 +372,10 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       };
       try { return this.commit(stopped); } catch { this.retain(stopped); return stopped; }
     }
-    return this.scheduleContinuation(current);
+    return this.scheduleContinuation({
+      ...current,
+      lastErrorCode: terminal.errorCode,
+    });
   }
 
   complete(
@@ -543,7 +616,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       next = this.commit({
         ...current,
         status: 'backoff',
-        nextAttemptAt: this.now() + this.delayMs,
+        nextAttemptAt: this.now() + this.nextDelayMs(current),
       });
     } catch {
       return this.retainFailed(current, 'readonly_continuation_backoff_persist_failed');
@@ -594,7 +667,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         return;
       }
       const continuation = live.continuationsStarted + 1;
-      const turnId = `bmx-readonly-${this.randomId()}`;
+      const turnId = `bmx-continuation-${this.randomId()}`;
       let dispatching: ReadonlyTaskContinuationState;
       try {
         dispatching = this.commit({
@@ -655,6 +728,21 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         this.warnOnce(failed);
       }
     });
+  }
+
+  private nextDelayMs(state: ReadonlyTaskContinuationState): number {
+    if (state.lastErrorCode === TASK_CONTINUATION_RATE_LIMIT_CODE) {
+      return Math.max(this.delayMs, Math.min(60_000, 15_000 * (2 ** state.continuationsStarted)));
+    }
+    if ([
+      TASK_CONTINUATION_CONNECTION_CODE,
+      TASK_CONTINUATION_UPSTREAM_CODE,
+      TASK_CONTINUATION_ENGINE_DEAD_CODE,
+      TASK_CONTINUATION_CLI_EXIT_CODE,
+    ].includes(state.lastErrorCode ?? '')) {
+      return Math.max(this.delayMs, Math.min(30_000, 5_000 * (2 ** state.continuationsStarted)));
+    }
+    return this.delayMs;
   }
 
   private armExpiry(): void {
