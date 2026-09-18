@@ -60,6 +60,35 @@ export type OutgoingMention = {
   name?: string;
 };
 
+export function loadBotMentionIdentityMap(
+  dataDir: string,
+  appId: string,
+): { botEntries: BotMentionEntry[]; crossRef: Record<string, string> } {
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    const parsedCrossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
+      : {};
+  } catch { /* best-effort identity map */ }
+  return { botEntries, crossRef };
+}
+
 function knownBotNames(entries: BotMentionEntry[], selfAppId?: string): Set<string> {
   const names = new Set<string>();
   for (const entry of entries) {

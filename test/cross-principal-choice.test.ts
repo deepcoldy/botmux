@@ -184,6 +184,8 @@ describe('cross-principal choice wiring', () => {
     expect(cliSource).toContain('xpi.send.as_needed_hint');
     expect(cliSource).toContain('controlLane: isSlashSend');
     expect(cliSource).toContain('const knownBotTextTarget = !asVoice');
+    expect(cliSource).toContain('const knownBotVoiceTarget = asVoice');
+    expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送语音');
     expect(cliSource).toContain('customCardKnownBotTarget');
     expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送自定义卡片');
     expect(cliSource).toContain('process.exit(64)');
@@ -197,8 +199,12 @@ describe('cross-principal choice wiring', () => {
     expect(daemonSource).toContain('ds.chatType === \'group\'');
     const guardAt = cliSource.indexOf('const xpiSendGate = crossPrincipalBotSendGate({');
     const uploadAt = cliSource.indexOf('await upload', guardAt);
+    const voiceGuardAt = cliSource.indexOf('const knownBotVoiceTarget = asVoice');
+    const voiceProviderAt = cliSource.indexOf('await synthesizeVoiceOpus');
     expect(guardAt).toBeGreaterThan(0);
     expect(uploadAt).toBeGreaterThan(guardAt);
+    expect(voiceGuardAt).toBeGreaterThan(0);
+    expect(voiceProviderAt).toBeGreaterThan(voiceGuardAt);
     expect(daemonSource).toContain("record.proposer.senderType === 'bot'\n      ? ''\n      : `<at id=${proposerId}></at> `");
   });
 });

@@ -17590,11 +17590,13 @@ function setActiveInteractiveTurn(
   ds: DaemonSession,
   turnId: string,
   caller: TrustedCaller,
+  userPrompt?: string,
 ): void {
   const controller = trustedSessionController(ds);
   ds.activeInteractiveTurn = {
     turnId,
     caller: { ...caller },
+    ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
 }
@@ -17907,7 +17909,11 @@ function completedTurnHasCrossPrincipalFollower(
 ): boolean {
   if (terminal.status !== 'completed') return false;
   return !!ds.session.crossPrincipalInterruptions?.some(
-    record => record.ownerTurnId === terminal.turnId,
+    record => record.ownerTurnId === terminal.turnId
+      // Approval can arrive after owner turn T1 completed while a later T2 is
+      // active. dispatchApprovedCrossPrincipalSuggestion parks behind T2, so
+      // T2's terminal must wake the durable approved record as well.
+      || record.phase === 'owner_approved',
   ) || !!ds.pendingCrossPrincipalSuggestions?.some(
     suggestion => suggestion.ownerTurnId === terminal.turnId,
   );
@@ -18377,6 +18383,8 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
 const CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 const CROSS_PRINCIPAL_OWNER_WAIT_MS = 10 * 60 * 1000;
 const CROSS_PRINCIPAL_PUBLIC_CONTEXT_LIMIT = 20;
+const XPI_IDENTITY_RESOLUTION_MAX_ATTEMPTS = 3;
+const XPI_IDENTITY_RESOLUTION_RETRY_MS = 5_000;
 
 function crossPrincipalSuggestionAccepted(
   result: Awaited<ReturnType<typeof registerAskBroker>>,
@@ -18407,6 +18415,42 @@ function persistCrossPrincipalQueue(ds: DaemonSession): void {
   const queue = ds.session.crossPrincipalInterruptions;
   if (queue && queue.length === 0) ds.session.crossPrincipalInterruptions = undefined;
   sessionStore.updateSession(ds.session);
+}
+
+/** A contact API 5xx/timeout is not evidence that the human is invalid. Keep
+ * the durable XPI item and retry a small bounded number of times; definitive
+ * scope/visibility failures still fail closed immediately. */
+function deferTransientXpiIdentityResolution(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  role: XpiHumanIdentityRole,
+  resolution: XpiHumanOpenIdResolution,
+): boolean {
+  if (resolution.status !== 'transient') {
+    if (record.identityResolutionRetry?.role === role) {
+      delete record.identityResolutionRetry;
+      persistCrossPrincipalQueue(ds);
+    }
+    return false;
+  }
+  const attempts = record.identityResolutionRetry?.role === role
+    ? record.identityResolutionRetry.attempts + 1
+    : 1;
+  if (attempts >= XPI_IDENTITY_RESOLUTION_MAX_ATTEMPTS) {
+    delete record.identityResolutionRetry;
+    persistCrossPrincipalQueue(ds);
+    logger.warn(
+      `[${tag(ds)}] XPI human identity transient lookup exhausted role=${role} attempts=${attempts}`,
+    );
+    return false;
+  }
+  record.identityResolutionRetry = { role, attempts };
+  persistCrossPrincipalQueue(ds);
+  logger.warn(
+    `[${tag(ds)}] XPI human identity transient lookup deferred role=${role} attempts=${attempts}`,
+  );
+  scheduleCrossPrincipalOwnerWait(ds, Date.now() + XPI_IDENTITY_RESOLUTION_RETRY_MS);
+  return true;
 }
 
 const XPI_TERMINAL_ALERT_MAX_ATTEMPTS = 3;
@@ -18695,7 +18739,7 @@ async function stageCrossPrincipalInterruption(args: {
     ownerTurnId,
     owner,
     ownerUserPrompt: ds.activeInteractiveTurn?.turnId === ownerTurnId
-      ? ds.lastUserPrompt
+      ? (ds.activeInteractiveTurn.userPrompt ?? ds.lastUserPrompt)
       : undefined,
     proposer,
     message,
@@ -19039,7 +19083,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
   }
-  setActiveInteractiveTurn(ds, turnId, record.owner);
+  setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
   beginNewTurn(ds, ownerTask, turnId);
   rememberLastCliInput(ds, prompt, cliInput);
   removeCrossPrincipalRecord(ds, record.id);
@@ -19401,10 +19445,18 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       }
       const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
       if (proposerIdentity.status !== 'resolved') {
+        if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
         removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '无法在当前应用解析消息发送者身份，消息未执行；可重新发送。');
+        await notifyCrossPrincipalTerminal(
+          ds,
+          record,
+          proposerIdentity.status === 'transient'
+            ? '多次重试后仍无法解析消息发送者身份，消息未执行；可重新发送。'
+            : '无法在当前应用解析消息发送者身份，消息未执行；可重新发送。',
+        );
         return;
       }
+      deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity);
       const proposerId = proposerIdentity.openId;
       const botOwnedTurn = record.owner.senderType === 'bot';
       const classificationOptions = crossPrincipalClassificationOptions(loc);
@@ -19472,10 +19524,18 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         }
         const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
         if (proposerIdentity.status !== 'resolved') {
+          if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
           removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, '等待期间无法在当前应用解析消息发送者身份，消息未执行。');
+          await notifyCrossPrincipalTerminal(
+            ds,
+            record,
+            proposerIdentity.status === 'transient'
+              ? '等待期间多次重试仍无法解析消息发送者身份，消息未执行。'
+              : '等待期间无法在当前应用解析消息发送者身份，消息未执行。',
+          );
           return;
         }
+        deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity);
         const proposerId = proposerIdentity.openId;
         const waitResult = await registerHostAsk({
           larkAppId: ds.larkAppId,
@@ -19520,10 +19580,18 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       }
       const ownerIdentity = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
       if (ownerIdentity.status !== 'resolved') {
+        if (deferTransientXpiIdentityResolution(ds, record, 'owner', ownerIdentity)) return;
         removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '建议未获原任务发起人确认，未执行。');
+        await notifyCrossPrincipalTerminal(
+          ds,
+          record,
+          ownerIdentity.status === 'transient'
+            ? '多次重试后仍无法解析原任务发起人身份，建议未执行。'
+            : '建议未获原任务发起人确认，未执行。',
+        );
         return;
       }
+      deferTransientXpiIdentityResolution(ds, record, 'owner', ownerIdentity);
       const ownerId = ownerIdentity.openId;
       const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
       const result = await registerHostAsk({
@@ -19744,7 +19812,7 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
   }
 
   ds.pendingCrossPrincipalSuggestions?.shift();
-  setActiveInteractiveTurn(ds, suggestion.turnId, suggestion.owner);
+  setActiveInteractiveTurn(ds, suggestion.turnId, suggestion.owner, suggestion.text);
   beginNewTurn(ds, suggestion.text, suggestion.turnId);
   rememberLastCliInput(ds, suggestion.userPrompt, approvedInput);
   sessionStore.updateSession(ds.session);
@@ -23723,7 +23791,12 @@ async function handleThreadReplyAdmitted(
         markIngressAdmitted(ctx);
         beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller) {
-          setActiveInteractiveTurn(ds, parsed.messageId, threadTrustedCaller);
+          setActiveInteractiveTurn(
+            ds,
+            parsed.messageId,
+            threadTrustedCaller,
+            stripCrossPrincipalAsToken(parsed.content).text,
+          );
         }
         rememberLastCliInput(ds, promptContent, cliInput);
       }
@@ -24119,6 +24192,7 @@ async function handleThreadReplyAdmitted(
           ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
           : parsed.messageId,
         threadTrustedCaller,
+        queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
     }
     // Record the input as the session's last real CLI turn ONLY after the fork

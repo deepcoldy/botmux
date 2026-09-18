@@ -298,6 +298,11 @@ describe('completed-turn XPI progression', () => {
       turnId: 'stale-turn',
       status: 'completed',
     })).toBe(false);
+    ds.session.crossPrincipalInterruptions[0].phase = 'owner_approved';
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'later-owner-turn',
+      status: 'completed',
+    })).toBe(true);
     expect(completedTurnHasCrossPrincipalFollower(ds, {
       turnId: 'owner-turn',
       status: 'failed',
@@ -546,7 +551,9 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ds.activeInteractiveTurn = {
       turnId: 'owner-turn',
       caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      userPrompt: 'owner clean prompt',
     };
+    ds.lastUserPrompt = '<quote_context>transport wrapper</quote_context>\nowner clean prompt';
 
     try {
       await handleThreadReply(
@@ -565,7 +572,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }
 
     expect(ds.session.crossPrincipalInterruptions).toEqual([
-      expect.objectContaining({ phase: 'awaiting_owner' }),
+      expect.objectContaining({
+        phase: 'awaiting_owner',
+        ownerUserPrompt: 'owner clean prompt',
+      }),
     ]);
     expect(ds.session.crossPrincipalInterruptions[0].messages[0].text)
       .toBe('请把这项工作留给当前任务');
@@ -842,6 +852,70 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(repliedText()).toContain('你的建议已获确认');
   });
 
+  it('wakes an approved T1 suggestion when later owner turn T2 completes', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_after_t2', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn-t2',
+      caller: owner,
+      userPrompt: 'T2 task',
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_replay_after_t2aaaaaaaaa',
+      ownerTurnId: 'owner-turn-t1',
+      owner,
+      ownerUserPrompt: 'T1 task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(ds.session.crossPrincipalInterruptions).toHaveLength(1);
+      expect(completedTurnHasCrossPrincipalFollower(ds, {
+        turnId: 'owner-turn-t2',
+        status: 'completed',
+      })).toBe(true);
+
+      ds.activeInteractiveTurn = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0]?.[0]).toMatchObject({
+      type: 'message',
+      turnId: 'xpi_replay_after_t2aaaaaaaaa:approved',
+      trustedCaller: owner,
+    });
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+  });
+
   it('fails closed when an approved legacy record lacks the original owner prompt', async () => {
     const previousXpi = process.env.BOTMUX_XPI_ENABLED;
     process.env.BOTMUX_XPI_ENABLED = 'true';
@@ -1001,6 +1075,61 @@ describe('XPI cross-app human classification identity', () => {
       openId: OWNER,
       source: 'target_app_owner',
     });
+  });
+
+  it('keeps a staged human message across bounded transient identity lookup retries', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'transient' });
+    const ds = seedThreadSession('om_xpi_transient_identity_retry', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_transient_identity_1234',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_transient_identity_message',
+        text: '作为建议',
+        userPrompt: '作为建议',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({
+          id: 'xpi_transient_identity_1234',
+          identityResolutionRetry: { role: 'proposer', attempts: 1 },
+        }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.identityResolutionRetry)
+        .toEqual({ role: 'proposer', attempts: 2 });
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledTimes(4);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
   });
 
   it('binds the classification card to the target-app open_id and accepts that user click', async () => {

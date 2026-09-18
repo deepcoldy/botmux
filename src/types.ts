@@ -923,9 +923,9 @@ export interface CrossPrincipalInterruption {
   id: string;
   ownerTurnId: string;
   owner: TrustedCaller;
-  /** Exact user prompt of the active owner turn that B interrupted. Required
-   * to replay the original task deterministically after the owner approves B's
-   * suggestion; a vague reference to "the previous task" is not sufficient. */
+  /** Business prompt of the active owner turn, captured before daemon-owned
+   * quote/application wrappers. Required to replay the original task after
+   * the owner approves B's suggestion. */
   ownerUserPrompt?: string;
   proposer: TrustedCaller;
   phase:
@@ -954,6 +954,11 @@ export interface CrossPrincipalInterruption {
   /** Legacy field retained for restore compatibility. New owner-confirmation
    *  clocks are owned by the ask broker and start after card delivery. */
   ownerDeadlineAt?: number;
+  /** Restart-safe bounded retry state for target-app human identity lookup. */
+  identityResolutionRetry?: {
+    role: 'owner' | 'proposer';
+    attempts: number;
+  };
   messages: CrossPrincipalInterruptionMessage[];
   independentRootMessageId?: string;
   independentChildSessionId?: string;
