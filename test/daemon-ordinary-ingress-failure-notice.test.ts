@@ -36,6 +36,10 @@ const mocks = vi.hoisted(() => {
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+    resolveTargetAppOpenId: vi.fn(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -117,6 +121,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
+    resolveTargetAppOpenId: mocks.resolveTargetAppOpenId,
   };
 });
 
@@ -166,13 +171,22 @@ import { sessionKey } from '../src/core/types.js';
 import * as messageQueue from '../src/services/message-queue.js';
 import {
   __testOnly_activeSessions as activeSessions,
+  __testOnly_completedTurnHasCrossPrincipalFollower as completedTurnHasCrossPrincipalFollower,
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
   __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
   __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
+  __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
 } from '../src/daemon.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
+import {
+  findPendingAskByAnchor,
+  setCardDispatcher,
+  setCanTalkChecker,
+  tryResolveAsk,
+} from '../src/core/ask-broker.js';
+import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -262,6 +276,35 @@ function expectedNotice(): string {
   return tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
 }
 
+describe('completed-turn XPI progression', () => {
+  it('uses the durable owner turn even after the active-turn mirror was revoked', () => {
+    const ds = seedThreadSession('om_thread_xpi_terminal_progress', 'seeded') as any;
+    ds.activeInteractiveTurn = undefined;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_terminal_progress_123456',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_b', senderType: 'user' },
+      phase: 'awaiting_owner',
+      messages: [],
+    }];
+
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'owner-turn',
+      status: 'completed',
+    })).toBe(true);
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'stale-turn',
+      status: 'completed',
+    })).toBe(false);
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'owner-turn',
+      status: 'failed',
+    })).toBe(false);
+  });
+});
+
 describe('ordinary ingress terminal failure → actionable notice', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -269,6 +312,10 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
@@ -444,7 +491,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }
 
     expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
-    expect(repliedText()).toContain('未选择处理方式');
+    expect(repliedText()).toBe('');
     expect(repliedText()).not.toContain('[botmux-xpi-control:');
     expect(repliedText()).not.toContain('ou_proposer_bot');
   });
@@ -482,7 +529,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }
 
     expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
-    expect(repliedText()).toContain('原任务仍在执行');
+    expect(repliedText()).toBe('');
     expect(repliedText()).not.toContain('[botmux-xpi-control:');
     expect(repliedText()).not.toContain('ou_proposer_bot');
   });
@@ -587,7 +634,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     }
 
     expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
-    expect(repliedText()).toContain('未选择处理方式');
+    expect(repliedText()).toBe('');
     expect(repliedText()).not.toContain('[botmux-xpi-control:');
     expect(repliedText()).not.toContain('ou_proposer_bot');
     expect(ds.worker.send).not.toHaveBeenCalled();
@@ -615,7 +662,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     const previousXpi = process.env.BOTMUX_XPI_ENABLED;
     process.env.BOTMUX_XPI_ENABLED = 'true';
     const ds = seedThreadSession('om_thread_owner_queue_full', 'seeded') as any;
-    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
     ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-queue-full';
     ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
     ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
@@ -634,7 +686,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       id: 'xpi_aaaaaaaaaaaaaaaaaaaaaaaa',
       ownerTurnId: 'owner-turn',
       owner: caller,
-      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
       phase: 'owner_approved',
       messages: [{
         turnId: 'proposer-turn',
@@ -662,7 +719,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     const previousXpi = process.env.BOTMUX_XPI_ENABLED;
     process.env.BOTMUX_XPI_ENABLED = 'true';
     const ds = seedThreadSession('om_thread_owner_notice_retry', 'seeded') as any;
-    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
     ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-notice-retry';
     ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
     ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
@@ -681,7 +743,12 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb',
       ownerTurnId: 'owner-turn',
       owner: caller,
-      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
       phase: 'owner_approved',
       messages: [{
         turnId: 'proposer-turn',
@@ -710,6 +777,247 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
   });
 });
 
+describe('XPI cross-app human classification identity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.sessions.clear();
+    activeSessions.clear();
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
+    setCardDispatcher(createLarkAskCardDispatcher({
+      replyMessage: mocks.replyMessage,
+      sendMessage: mocks.sendMessage,
+      updateMessage: vi.fn(async () => undefined),
+    }));
+    setCanTalkChecker(() => true);
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER, 'ou_target_proposer'];
+  });
+
+  it('resolves union_id in the receiving app and never reuses the source-app open_id', async () => {
+    const ds = seedThreadSession('om_xpi_cross_app_identity', 'seeded');
+    const result = await resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: 'ou_foreign_source_app',
+      requestUserUnionId: 'on_proposer',
+      requestLarkAppId: 'foreign-app-observer',
+      senderType: 'user',
+    }, 'proposer');
+
+    expect(result).toEqual({
+      status: 'resolved',
+      openId: 'ou_target_proposer',
+      source: 'resolved_from_union',
+    });
+    expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledWith(APP, 'on_proposer');
+  });
+
+  it('fails closed when a proposer has only a source-app open_id', async () => {
+    const ds = seedThreadSession('om_xpi_reject_foreign_open_id', 'seeded');
+    await expect(resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: 'ou_foreign_source_app',
+      requestLarkAppId: 'foreign-app-observer',
+      senderType: 'user',
+    }, 'proposer')).resolves.toEqual({ status: 'rejected_source_app_open_id' });
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('may fall back only to the active owner open_id captured by the target app', async () => {
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'definitive' });
+    const ds = seedThreadSession('om_xpi_owner_target_fallback', 'seeded');
+    await expect(resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner_hidden_from_contact',
+      requestLarkAppId: APP,
+      senderType: 'user',
+    }, 'owner')).resolves.toEqual({
+      status: 'resolved',
+      openId: OWNER,
+      source: 'target_app_owner',
+    });
+  });
+
+  it('binds the classification card to the target-app open_id and accepts that user click', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_xpi_cross_app_card';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cross_app_card_12345678',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_cross_app_message',
+        text: '作为建议',
+        userPrompt: '作为建议',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      const driving = driveCrossPrincipalInterruptions(ds);
+      await vi.waitFor(() => {
+        expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })).toBeDefined();
+      });
+      const ask = findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })!;
+      expect(ask.answererOpenId).toBe('ou_target_proposer');
+      expect(JSON.stringify(mocks.replyMessage.mock.calls)).not.toContain('ou_foreign_source_app');
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'suggestion',
+        by: 'ou_target_proposer',
+      })).toBe('accepted');
+      await driving;
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({ phase: 'awaiting_owner' }),
+      ]);
+      expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      expect(repliedText()).not.toContain('消息已暂存，不会打断当前任务。');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('offers only an independent task when the active owner is a bot', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_xpi_bot_owner_human_card';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-bot-turn',
+      caller: { requestLarkAppId: 'owner-bot-app', requestUserOpenId: 'ou_owner_bot', senderType: 'bot' as const },
+    };
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_bot_owner_card_123456789',
+      ownerTurnId: 'owner-bot-turn',
+      owner: { requestLarkAppId: 'owner-bot-app', requestUserOpenId: 'ou_owner_bot', senderType: 'bot' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_bot_owner_human_message',
+        text: '请帮忙处理',
+        userPrompt: '请帮忙处理',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      const driving = driveCrossPrincipalInterruptions(ds);
+      await vi.waitFor(() => {
+        expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })).toBeDefined();
+      });
+      const ask = findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })!;
+      expect(ask.questions[0]?.prompt).toContain('当前任务由机器人发起');
+      expect(ask.questions[0]?.options).toEqual([
+        { key: 'independent', label: '另开任务' },
+      ]);
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'suggestion',
+        by: 'ou_target_proposer',
+      })).toBe('stale');
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'independent',
+        by: 'ou_target_proposer',
+      })).toBe('accepted');
+      await driving;
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.phase)
+        .toMatch(/preparing_independent|independent_queued/);
+      expect(repliedText()).not.toContain('--as');
+      expect(repliedText()).not.toContain('requestLarkAppId');
+      expect(repliedText()).not.toContain('turnId');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('fails closed with human guidance when the target app cannot resolve the proposer', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'definitive' });
+    const ds = seedThreadSession('om_xpi_cross_app_unresolvable', 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cross_app_missing_123456',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_unresolvable',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_cross_app_unresolvable',
+        text: 'human message',
+        userPrompt: 'human message',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toBe('');
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
+      .toEqual(['delivery_failed', 'delivery_exhausted']);
+    expect(repliedText()).not.toContain('ou_foreign_source_app');
+    expect(repliedText()).not.toContain('--as');
+  });
+});
+
 describe('XPI human terminal alert delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -717,6 +1025,10 @@ describe('XPI human terminal alert delivery', () => {
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.sessions.clear();
     activeSessions.clear();
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -732,7 +1044,12 @@ describe('XPI human terminal alert delivery', () => {
       id: 'xpi_alert_test_123456789012',
       ownerTurnId: 'owner-turn',
       owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
-      proposer: { requestLarkAppId: 'proposer-app', requestUserOpenId: 'ou_proposer', senderType: 'bot' },
+      proposer: {
+        requestLarkAppId: 'proposer-app',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_human_proposer',
+        senderType: 'user',
+      },
       phase: 'awaiting_classification',
       messages: [{
         turnId: 'turn-with-secret',
@@ -749,7 +1066,7 @@ describe('XPI human terminal alert delivery', () => {
     mocks.replyMessage.mockRejectedValue(new Error('alert transport down'));
     mocks.sendMessage.mockRejectedValue(new Error('alert transport down'));
 
-    await expect(notifyCrossPrincipalTerminal(ds, record, 'secret-original-body-should-not-leak')).resolves.toBe(false);
+    await expect(notifyCrossPrincipalTerminal(ds, record, '未选择处理方式')).resolves.toBe(false);
 
     expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
       .toEqual(['delivery_failed', 'delivery_failed', 'delivery_failed', 'delivery_exhausted']);
@@ -763,13 +1080,47 @@ describe('XPI human terminal alert delivery', () => {
       .mockRejectedValueOnce(new Error('transient'))
       .mockResolvedValueOnce('om_recovered');
 
-    await expect(notifyCrossPrincipalTerminal(ds, record, 'generic terminal reason')).resolves.toBe(true);
+    await expect(notifyCrossPrincipalTerminal(ds, record, '未选择处理方式')).resolves.toBe(true);
 
     expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
       .toEqual(['delivery_failed', 'delivery_recovered']);
     expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.some((item: any) => item.event === 'delivery_exhausted')).toBe(false);
-    expect(repliedText()).toContain('来源应用: proposer-app');
+    expect(repliedText()).toContain('你未选择处理方式，该消息未执行。请重新发送。');
+    expect(repliedText()).not.toContain('接收应用');
+    expect(repliedText()).not.toContain('发送者类型');
+    expect(repliedText()).not.toContain('--as');
     expect(repliedText()).not.toContain('generic terminal reason');
+  });
+
+  it('uses target-app identity and human guidance without bot --as instructions', async () => {
+    const ds = seedThreadSession('om_alert_cross_app_human', 'seeded');
+    const record = {
+      ...seedAlertRecord(ds),
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_human_proposer',
+        senderType: 'user',
+      },
+      messages: [{
+        turnId: 'om_x100b65fde2fa2cb0c224fa8cbfcb084',
+        text: 'secret-original-body-should-not-leak',
+        userPrompt: 'secret-original-body-should-not-leak',
+        createdAt: NOW,
+      }],
+    };
+
+    await expect(notifyCrossPrincipalTerminal(ds, record as any, '未选择处理方式')).resolves.toBe(true);
+
+    expect(repliedText()).toContain('<at id=ou_target_human_proposer></at>');
+    expect(repliedText()).toContain('你未选择处理方式，该消息未执行。请重新发送。');
+    expect(repliedText()).not.toContain('ou_foreign_source_app');
+    expect(repliedText()).not.toContain('--as');
+    expect(repliedText()).not.toContain('发送者类型');
+    expect(repliedText()).not.toContain('接收应用');
+    expect(repliedText()).not.toContain('turnId');
+    expect(repliedText()).not.toContain('4fa8cbfcb084');
+    expect(repliedText()).not.toContain('secret-original-body-should-not-leak');
   });
 
   it('fails closed outside a group/topic and records the route reason without sending', async () => {

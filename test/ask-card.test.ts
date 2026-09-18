@@ -111,6 +111,14 @@ describe('buildAskCard', () => {
     expect(text).toContain('继续发布');
   });
 
+  it('指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
+    const text = buildAskCard(makePending({ answererOpenId: 'ou_cross_app_answerer' }));
+
+    expect(text).toContain('指定成员（仅本人可操作）');
+    expect(text).not.toContain('ou_cross_app_answerer');
+    expect(text).not.toContain('<at');
+  });
+
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
     const text = buildAskCard(makePending());
     expect(text).toContain('直接在话题');

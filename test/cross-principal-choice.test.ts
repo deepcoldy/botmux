@@ -4,6 +4,7 @@ import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choic
 import {
   crossPrincipalBotSendGate,
   crossPrincipalBotSendNeedsChoice,
+  crossPrincipalClassificationPrompt,
   crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
@@ -11,6 +12,7 @@ import {
   parseCrossPrincipalChoiceText,
   parseCrossPrincipalControlNotice,
   stripCrossPrincipalAsToken,
+  crossPrincipalWaitPrompt,
 } from '../src/core/cross-principal-choice.js';
 import { messages as enMessages } from '../src/i18n/en.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
@@ -183,9 +185,12 @@ describe('cross-principal choice wiring', () => {
     expect(cliSource).toContain('process.exit(64)');
     expect(daemonSource).toContain('crossPrincipalInterruptionDeliveryAudits');
     expect(daemonSource).toContain("'delivery_exhausted'");
-    expect(daemonSource).toContain('请升级发送端 botmux');
+    expect(daemonSource).not.toContain('请升级发送端 botmux');
+    expect(daemonSource).toContain("tr('xpi.card.classify.bot_owner_prompt'");
+    expect(daemonSource).toContain("record.owner.senderType === 'bot'");
+    expect(daemonSource).toContain("option.key === 'independent'");
+    expect(daemonSource).toContain('XPI bot terminal kept on control/audit plane');
     expect(daemonSource).toContain('ds.chatType === \'group\'');
-    expect(daemonSource).toContain('no executable protocol marker or original message body');
     const guardAt = cliSource.indexOf('const xpiSendGate = crossPrincipalBotSendGate({');
     const uploadAt = cliSource.indexOf('await upload', guardAt);
     expect(guardAt).toBeGreaterThan(0);
@@ -195,6 +200,21 @@ describe('cross-principal choice wiring', () => {
 });
 
 describe('cross-principal choice copy', () => {
+  it('keeps cross-app responder ids out of XPI card content', () => {
+    const responder = 'ou_cross_app_responder';
+    for (const prompt of [
+      crossPrincipalClassificationPrompt(responder, 'zh'),
+      crossPrincipalClassificationPrompt(responder, 'en'),
+      crossPrincipalWaitPrompt(responder, 'zh'),
+      crossPrincipalWaitPrompt(responder, 'en'),
+    ]) {
+      expect(prompt).not.toContain(responder);
+      expect(prompt).not.toContain('<at');
+    }
+    expect(daemonSource).not.toContain('prompt: `<at id=${ownerId}></at> 另一位成员建议');
+    expect(daemonSource).not.toContain('prompt: `<at id=${ownerOpenId}></at> 另一位成员建议');
+  });
+
   it('keeps the human card to exactly two short options', () => {
     const zh = crossPrincipalClassificationOptions('zh');
     expect(zh).toEqual([

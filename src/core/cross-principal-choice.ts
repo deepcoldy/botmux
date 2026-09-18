@@ -216,10 +216,14 @@ export function crossPrincipalAsKeyword(
 }
 
 export function crossPrincipalClassificationPrompt(
-  proposerOpenId: string,
+  _proposerOpenId: string,
   locale?: Locale,
 ): string {
-  return t('xpi.card.classify.prompt', { at: `<at id=${proposerOpenId}></at>` }, locale);
+  // The concrete responder identity is an authorization boundary carried by
+  // `answererOpenId`; it must not be rendered as an at/person resource in the
+  // card. Cross-app open_ids can be valid for callback authorization while
+  // Lark still rejects the same id as a card mention (230099).
+  return t('xpi.card.classify.prompt', undefined, locale);
 }
 
 export function crossPrincipalClassificationOptions(locale?: Locale): Array<{
@@ -233,10 +237,10 @@ export function crossPrincipalClassificationOptions(locale?: Locale): Array<{
 }
 
 export function crossPrincipalWaitPrompt(
-  proposerOpenId: string,
+  _proposerOpenId: string,
   locale?: Locale,
 ): string {
-  return t('xpi.card.wait.prompt', { at: `<at id=${proposerOpenId}></at>` }, locale);
+  return t('xpi.card.wait.prompt', undefined, locale);
 }
 
 export function crossPrincipalWaitOptions(locale?: Locale): Array<{

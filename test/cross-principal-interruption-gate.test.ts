@@ -247,9 +247,10 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     const start = workerSource.indexOf('function adoptActiveTurnWhenIsolationOff(');
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
     const gate = body.indexOf('if (crossPrincipalIsolationOn()) return false;');
-    const clear = body.indexOf('activeTurnAuthority.clear()');
+    const adopt = body.indexOf('activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)');
     expect(gate).toBeGreaterThanOrEqual(0);
-    expect(clear).toBeGreaterThan(gate);
+    expect(adopt).toBeGreaterThan(gate);
+    expect(body).not.toContain('activeTurnAuthority.clear()');
   });
 });
 
@@ -277,17 +278,54 @@ describe('XPI switch — adoption semantics against the real authority', () => {
     expect(authority.markStarted({ turnId: 'turn-b', caller: B })).toBe(false);
   });
 
-  it('clear-then-reserve hands the tuple to the turn that is really writing', () => {
-    // The shape adoptActiveTurnWhenIsolationOff performs. The resulting
-    // identity is what the MCP gateway signs and the sandbox relay publishes,
-    // so it must describe B, not the stale A.
+  it('hands the envelope to B while keeping A as the trusted tool caller', () => {
+    // Disabled isolation merges B's input into A's in-flight work. Reply/turn
+    // attribution follows B's envelope, while the MCP gateway must keep signing
+    // tools as A per the disabled-mode product contract.
     const authority = new ActiveTurnAuthority();
-    authority.reserve({ turnId: 'turn-a', caller: A });
-    authority.clear();
-    expect(authority.reserve({ turnId: 'turn-b', caller: B })).toBe(true);
-    expect(authority.markStarted({ turnId: 'turn-b', caller: B })).toBe(true);
-    expect(authority.identity()).toEqual({ turnId: 'turn-b', caller: B });
+    const controllerA = {
+      ...A,
+      requestUserOpenId: 'ou_controller_a',
+      requestUserUnionId: 'on_controller_a',
+    };
+    authority.reserve({ turnId: 'turn-a', caller: A, controller: controllerA });
+    expect(authority.adoptEnvelopePreservingPrincipal({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: B,
+      controller: B,
+    }, 123)).toBe(true);
+    expect(authority.markStarted({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: B,
+    })).toBe(true);
+    expect(authority.identity()).toEqual({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: A,
+      controller: controllerA,
+    });
     expect(authority.snapshot()?.started).toBe(true);
+  });
+
+  it('falls back to the incoming principal only when no active principal exists', () => {
+    const authority = new ActiveTurnAuthority();
+
+    expect(authority.adoptEnvelopePreservingPrincipal({
+      turnId: 'turn-b',
+      caller: B,
+      controller: B,
+    }, 456)).toBe(true);
+    expect(authority.identity()).toEqual({
+      turnId: 'turn-b',
+      caller: B,
+      controller: B,
+    });
+    expect(authority.snapshot()).toMatchObject({
+      started: false,
+      reservedAtMs: 456,
+    });
   });
 });
 
