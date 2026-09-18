@@ -48,6 +48,7 @@ describe('cross-principal interruption durable identity', () => {
       session: source,
       ownerTurnId: 'om_a',
       owner,
+      ownerUserPrompt: 'A original task',
       proposer,
       message: {
         turnId: 'om_b',
@@ -68,6 +69,32 @@ describe('cross-principal interruption durable identity', () => {
     expect(source.crossPrincipalInterruptions).toHaveLength(1);
     expect(source.crossPrincipalInterruptions?.[0]?.messages).toHaveLength(1);
     expect(source.crossPrincipalInterruptions?.[0]?.messages[0]?.turnId).toBe('om_b');
+    expect(source.crossPrincipalInterruptions?.[0]?.ownerUserPrompt).toBe('A original task');
+  });
+
+  it('does not let a duplicate delivery replace the captured owner prompt', () => {
+    const source = session();
+    const base = {
+      session: source,
+      ownerTurnId: 'om_a',
+      owner,
+      proposer,
+      message: {
+        turnId: 'om_b',
+        text: 'B input',
+        userPrompt: 'B input',
+        createdAt: '2026-09-09T00:01:00.000Z',
+      },
+    };
+
+    stageCrossPrincipalInterruptionRecord({ ...base, ownerUserPrompt: 'original A task' });
+    const duplicate = stageCrossPrincipalInterruptionRecord({
+      ...base,
+      ownerUserPrompt: 'later unrelated task',
+    });
+
+    expect(duplicate.inserted).toBe(false);
+    expect(duplicate.record.ownerUserPrompt).toBe('original A task');
   });
 
   it('never defaults bot proposers to suggestion and does not start a pre-card deadline', () => {

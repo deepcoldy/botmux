@@ -923,6 +923,10 @@ export interface CrossPrincipalInterruption {
   id: string;
   ownerTurnId: string;
   owner: TrustedCaller;
+  /** Exact user prompt of the active owner turn that B interrupted. Required
+   * to replay the original task deterministically after the owner approves B's
+   * suggestion; a vague reference to "the previous task" is not sufficient. */
+  ownerUserPrompt?: string;
   proposer: TrustedCaller;
   phase:
     | 'awaiting_classification'

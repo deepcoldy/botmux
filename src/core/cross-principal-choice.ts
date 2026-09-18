@@ -58,7 +58,7 @@ const CHOICE_ALTERNATIVES: Record<CrossPrincipalChoice, string> = {
   // 对当前任务的建议 is the label older builds printed in their staged notice;
   // a bot that answers with the wording it was shown must still be understood.
   independent: '独立任务|另开任务',
-  suggestion: '对当前任务的建议|对\\s*A\\s*的建议|留给当前任务|建议',
+  suggestion: '对当前任务的建议|对\\s*A\\s*的建议|留给当前任务|任务结束后请发起人确认|建议',
   accept: '确认|同意|采纳并重新执行|采纳|执行|是|yes|y|ok|accept',
   reject: '拒绝|不采纳|否|no|n|reject',
   continue_waiting: '继续等待|继续等',
@@ -129,6 +129,7 @@ export function parseCrossPrincipalAsFlag(raw: string | undefined): CrossPrincip
     value === 'suggestion'
     || value === 'advice'
     || value === '留给当前任务'
+    || value === '任务结束后请发起人确认'
     || value === '建议'
   ) return 'suggestion';
   return undefined;
@@ -234,6 +235,29 @@ export function crossPrincipalClassificationOptions(locale?: Locale): Array<{
     { key: 'independent', label: t('xpi.card.classify.independent', undefined, locale) },
     { key: 'suggestion', label: t('xpi.card.classify.suggestion', undefined, locale) },
   ];
+}
+
+/**
+ * Build the task owner's approval prompt from business content, not identity
+ * handles. The display name is optional and untrusted display data; the ask
+ * broker still authorizes the click exclusively through answererOpenId.
+ */
+export function crossPrincipalOwnerPrompt(
+  suggestion: string,
+  proposerName?: string,
+  locale?: Locale,
+): string {
+  const source = proposerName?.trim()
+    || t('xpi.card.owner.unknown_source', undefined, locale);
+  return t('xpi.card.owner.prompt', { source, suggestion }, locale);
+}
+
+export function crossPrincipalApprovedReplayPrompt(
+  ownerTask: string,
+  suggestion: string,
+  locale?: Locale,
+): string {
+  return t('xpi.replay.prompt', { ownerTask, suggestion }, locale);
 }
 
 export function crossPrincipalWaitPrompt(

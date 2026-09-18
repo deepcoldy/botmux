@@ -369,7 +369,19 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
   const elements: Array<Record<string, unknown>> = [metaDiv];
 
   if (status) {
-    // 已 settle：展示状态摘要，无可交互组件
+    // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
+    // 只留下「已选择」，审批人就无法回看自己批准了什么。
+    elements.push({ tag: 'hr' });
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+        },
+      });
+    }
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',

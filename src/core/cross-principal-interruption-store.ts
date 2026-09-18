@@ -20,6 +20,7 @@ export function stageCrossPrincipalInterruptionRecord(args: {
   session: Session;
   ownerTurnId: string;
   owner: TrustedCaller;
+  ownerUserPrompt?: string;
   proposer: TrustedCaller;
   message: CrossPrincipalInterruptionMessage;
 }): { record: CrossPrincipalInterruption; inserted: boolean } {
@@ -34,6 +35,7 @@ export function stageCrossPrincipalInterruptionRecord(args: {
     id,
     ownerTurnId: args.ownerTurnId,
     owner: { ...args.owner },
+    ...(args.ownerUserPrompt?.trim() ? { ownerUserPrompt: args.ownerUserPrompt } : {}),
     proposer: { ...args.proposer },
     // Human and bot proposers follow the same explicit classification protocol.
     // No deadline starts here: the proposer cannot act until the card/protocol

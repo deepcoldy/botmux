@@ -159,7 +159,7 @@ describe('buildAskCard', () => {
 
   it('settled 态（answered）：渲染答案摘要、无可点组件', () => {
     const ask = makePending({
-      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
+      questions: [{ prompt: '审批内容：补充回归测试', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
     });
     const json = JSON.parse(buildAskCard(ask, {
       kind: 'answered',
@@ -173,6 +173,8 @@ describe('buildAskCard', () => {
     expect(json.header.template).toBe('green');
     // 答案摘要包含"已选择"文字
     expect(text).toContain('已选择');
+    // 终态仍保留原问题，让审批人能回看自己批准的内容。
+    expect(text).toContain('审批内容：补充回归测试');
     // 选中标签"是"出现在卡片中
     expect(text).toContain('是');
     // 不含任何 action 动作（无可交互组件）

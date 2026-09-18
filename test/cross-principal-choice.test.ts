@@ -6,6 +6,8 @@ import {
   crossPrincipalBotSendNeedsChoice,
   crossPrincipalClassificationPrompt,
   crossPrincipalClassificationOptions,
+  crossPrincipalApprovedReplayPrompt,
+  crossPrincipalOwnerPrompt,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
   parseCrossPrincipalAsFlag,
@@ -43,6 +45,7 @@ describe('cross-principal choice vocabulary', () => {
     expect(parseCrossPrincipalAsFlag('独立任务')).toBe('independent');
     expect(parseCrossPrincipalAsFlag('suggestion')).toBe('suggestion');
     expect(parseCrossPrincipalAsFlag('留给当前任务')).toBe('suggestion');
+    expect(parseCrossPrincipalAsFlag('任务结束后请发起人确认')).toBe('suggestion');
     expect(parseCrossPrincipalAsFlag('建议')).toBe('suggestion');
     expect(parseCrossPrincipalAsFlag('maybe')).toBeUndefined();
   });
@@ -98,6 +101,7 @@ describe('cross-principal choice vocabulary', () => {
   it('accepts the human card labels as free-text answers', () => {
     expect(parseCrossPrincipalChoiceText('另开任务', 'classification')).toBe('independent');
     expect(parseCrossPrincipalChoiceText('留给当前任务', 'classification')).toBe('suggestion');
+    expect(parseCrossPrincipalChoiceText('任务结束后请发起人确认', 'classification')).toBe('suggestion');
     expect(parseCrossPrincipalChoiceText('独立任务', 'classification')).toBe('independent');
     expect(parseCrossPrincipalChoiceText('建议', 'classification')).toBe('suggestion');
     expect(isCrossPrincipalChoiceOnlyText('请帮我看一下这段 diff', 'classification')).toBe(false);
@@ -215,18 +219,39 @@ describe('cross-principal choice copy', () => {
     expect(daemonSource).not.toContain('prompt: `<at id=${ownerOpenId}></at> 另一位成员建议');
   });
 
-  it('keeps the human card to exactly two short options', () => {
+  it('keeps the human card to two explicit options', () => {
     const zh = crossPrincipalClassificationOptions('zh');
     expect(zh).toEqual([
       { key: 'independent', label: '另开任务' },
-      { key: 'suggestion', label: '留给当前任务' },
+      { key: 'suggestion', label: '任务结束后请发起人确认' },
     ]);
 
     const en = crossPrincipalClassificationOptions('en');
     expect(en).toEqual([
       { key: 'independent', label: 'Start a new task' },
-      { key: 'suggestion', label: 'Leave it for the current task' },
+      { key: 'suggestion', label: 'Ask the task owner after it finishes' },
     ]);
+  });
+
+  it('shows the suggestion and optional display name in the owner approval prompt', () => {
+    expect(crossPrincipalOwnerPrompt('补充回归测试', '成员 B', 'zh')).toContain('来自 成员 B 的建议');
+    expect(crossPrincipalOwnerPrompt('补充回归测试', '成员 B', 'zh')).toContain('补充回归测试');
+    expect(crossPrincipalOwnerPrompt('add regression coverage', undefined, 'en'))
+      .toContain('Suggestion from another member');
+  });
+
+  it('replays the complete owner task together with the approved suggestion', () => {
+    const zh = crossPrincipalApprovedReplayPrompt('生成并校验发布说明', '补充回滚步骤', 'zh');
+    expect(zh).toContain('生成并校验发布说明');
+    expect(zh).toContain('补充回滚步骤');
+    expect(zh).toContain('请重新执行原任务');
+    expect(zh).toContain('不要只回复');
+    expect(zh).toContain('不要把建议者视为本轮授权人');
+
+    const en = crossPrincipalApprovedReplayPrompt('prepare release notes', 'include rollback steps', 'en');
+    expect(en).toContain('prepare release notes');
+    expect(en).toContain('include rollback steps');
+    expect(en).toContain('Run the original task again');
   });
 
   it('only recognizes a strict, leading XPI control marker', () => {

@@ -693,6 +693,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
         requestLarkAppId: 'foreign-app-observer',
       },
       phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
       messages: [{
         turnId: 'proposer-turn',
         text: 'approved advice',
@@ -750,6 +751,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
         requestLarkAppId: 'foreign-app-observer',
       },
       phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
       messages: [{
         turnId: 'proposer-turn',
         text: 'approved advice',
@@ -774,6 +776,162 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.crossPrincipalWaitTimer).toBeDefined();
     clearTimeout(ds.crossPrincipalWaitTimer);
     ds.crossPrincipalWaitTimer = undefined;
+  });
+
+  it('replays the original owner task with the approved suggestion under the owner identity', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_replayaaaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: '生成发布说明并校验链接',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: '补充回滚步骤',
+        userPrompt: '补充回滚步骤',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    const sent = workerSend.mock.calls[0]?.[0];
+    expect(sent).toMatchObject({
+      type: 'message',
+      turnId: 'xpi_replayaaaaaaaaaaaaaaaaaa:approved',
+      atMostOnce: true,
+      trustedCaller: owner,
+    });
+    expect(sent.content).toContain('生成发布说明并校验链接');
+    expect(sent.content).toContain('补充回滚步骤');
+    expect(sent.content).toContain('请重新执行原任务');
+    expect(sent.content).not.toContain('ou_foreign_proposer');
+    expect(ds.lastUserPrompt).toContain('生成发布说明并校验链接');
+    expect(ds.lastUserPrompt).toContain('补充回滚步骤');
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'xpi_replayaaaaaaaaaaaaaaaaaa:approved',
+      caller: owner,
+    });
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('正在以你的身份重新执行原任务');
+    expect(repliedText()).toContain('你的建议已获确认');
+  });
+
+  it('fails closed when an approved legacy record lacks the original owner prompt', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_missing', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_missingaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner: {
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+        requestUserUnionId: 'on_owner',
+        senderType: 'user' as const,
+      },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('无法恢复原任务内容');
+  });
+
+  it('retains and schedules an approved replay when worker delivery is temporarily unavailable', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_retry', 'seeded') as any;
+    ds.worker = { killed: false, send: vi.fn(() => { throw new Error('ipc unavailable'); }) };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_retryaaaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner: {
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+        requestUserUnionId: 'on_owner',
+        senderType: 'user' as const,
+      },
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({ id: 'xpi_retryaaaaaaaaaaaaaaaaaa', phase: 'owner_approved' }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+      expect(repliedText()).toContain('暂未成功启动');
+      expect(ds.activeInteractiveTurn).toBeUndefined();
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
   });
 });
 

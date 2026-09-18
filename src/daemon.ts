@@ -368,8 +368,10 @@ import {
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
+  crossPrincipalApprovedReplayPrompt,
   crossPrincipalClassificationOptions,
   crossPrincipalClassificationPrompt,
+  crossPrincipalOwnerPrompt,
   crossPrincipalWaitOptions,
   crossPrincipalWaitPrompt,
   isCrossPrincipalChoiceOnlyText,
@@ -18692,6 +18694,9 @@ async function stageCrossPrincipalInterruption(args: {
     session: ds.session,
     ownerTurnId,
     owner,
+    ownerUserPrompt: ds.activeInteractiveTurn?.turnId === ownerTurnId
+      ? ds.lastUserPrompt
+      : undefined,
     proposer,
     message,
   });
@@ -18855,6 +18860,78 @@ async function notifyCrossPrincipalTerminal(
 
 export const __testOnly_notifyCrossPrincipalTerminal = notifyCrossPrincipalTerminal;
 
+async function notifyCrossPrincipalOwnerLifecycle(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  text: string,
+  discriminator: string,
+): Promise<boolean> {
+  if (record.owner.senderType === 'bot') {
+    logger.info(
+      `[${tag(ds)}] XPI owner lifecycle kept on control/audit plane `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return true;
+  }
+  const owner = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
+  if (owner.status !== 'resolved') {
+    logger.warn(
+      `[${tag(ds)}] XPI owner lifecycle not delivered: identity=${owner.status} `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return false;
+  }
+  try {
+    await sessionReply(
+      sessionAnchorId(ds),
+      `<at id=${owner.openId}></at> ${text}`,
+      'text',
+      ds.larkAppId,
+      undefined,
+      { uuid: crossPrincipalNoticeUuid('terminal', record, `owner-${discriminator}`) },
+    );
+    return true;
+  } catch (error) {
+    logger.warn(
+      `[${tag(ds)}] XPI owner lifecycle delivery failed record=${record.id} `
+      + `outcome=${discriminator}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
+async function notifyApprovedCrossPrincipalDispatch(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  state: 'started' | 'queued' | 'retrying',
+): Promise<void> {
+  const loc = localeForBot(ds.larkAppId);
+  const ownerMessageKey = state === 'started'
+    ? 'xpi.notice.owner_rerun_started'
+    : state === 'queued'
+      ? 'xpi.notice.owner_rerun_queued'
+      : 'xpi.notice.owner_rerun_retrying';
+  const proposerMessage = state === 'started'
+    ? '你的建议已获确认，正在以原任务发起人的身份重新执行原任务。'
+    : state === 'queued'
+      ? '你的建议已获确认，原任务已进入串行队列。'
+      : '你的建议已获确认，但原任务暂未成功启动；系统将自动重试。';
+  await Promise.all([
+    notifyCrossPrincipalOwnerLifecycle(
+      ds,
+      record,
+      tr(ownerMessageKey, undefined, loc),
+      `rerun-${state}`,
+    ),
+    notifyCrossPrincipalProposer(
+      ds,
+      record,
+      proposerMessage,
+      `suggestion-approved-${state}`,
+    ),
+  ]);
+}
+
 async function dispatchApprovedCrossPrincipalSuggestion(
   ds: DaemonSession,
   record: CrossPrincipalInterruption,
@@ -18862,10 +18939,21 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   if (ds.activeInteractiveTurn) return false;
   const ownerId = record.owner.requestUserOpenId;
   if (!ownerId) return false;
+  const loc = localeForBot(ds.larkAppId);
+  const ownerTask = record.ownerUserPrompt?.trim();
+  if (!ownerTask) {
+    const notice = tr('xpi.notice.owner_prompt_missing', undefined, loc);
+    removeCrossPrincipalRecord(ds, record.id);
+    await Promise.all([
+      notifyCrossPrincipalOwnerLifecycle(ds, record, notice, 'rerun-source-missing'),
+      notifyCrossPrincipalTerminal(ds, record, notice),
+    ]);
+    return true;
+  }
   const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
   const turnId = `${record.id}:approved`;
   const advice = record.messages.map(m => m.text).join('\n\n');
-  const prompt = `原任务发起人已明确采纳下面的建议。请基于该建议重新执行上一项任务；不要把建议者视为本轮授权人。\n\n${advice}`;
+  const prompt = crossPrincipalApprovedReplayPrompt(ownerTask, advice, loc);
   const ownerIsBot = record.owner.senderType === 'bot';
   const sender = { openId: ownerId, type: ownerIsBot ? 'bot' as const : 'user' as const };
   const botCfg = getBot(ds.larkAppId).config;
@@ -18902,6 +18990,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     });
     if (admission.kind === 'queued') {
       removeCrossPrincipalRecord(ds, record.id);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
     accepted = sendWorkerInput(ds, cliInput, turnId, {
@@ -18919,6 +19008,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
         resume: ds.hasHistory,
       });
       removeCrossPrincipalRecord(ds, record.id);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
     accepted = forkXpiSharedCwdTurn(ds, {
@@ -18945,18 +19035,15 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   }
   if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired')) {
     rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+    scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
   }
   setActiveInteractiveTurn(ds, turnId, record.owner);
-  beginNewTurn(ds, advice, turnId);
+  beginNewTurn(ds, ownerTask, turnId);
   rememberLastCliInput(ds, prompt, cliInput);
   removeCrossPrincipalRecord(ds, record.id);
-  void notifyCrossPrincipalProposer(
-    ds,
-    record,
-    '你的建议已获确认，将作为新一轮任务执行。',
-    'suggestion-approved',
-  );
+  await notifyApprovedCrossPrincipalDispatch(ds, record, 'started');
   return true;
 }
 
@@ -19456,7 +19543,11 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           // `answererOpenId` enforces who may answer. Do not duplicate it as an
           // at/person card resource: Lark can reject cross-app-resolved ids in
           // card content even though the same id is valid for authorization.
-          prompt: `另一位成员建议：${record.messages.map(m => m.text).join('\n\n')}\n\n是否采纳并重新执行？`,
+          prompt: crossPrincipalOwnerPrompt(
+            record.messages.map(m => m.text).join('\n\n'),
+            record.messages[0]?.proposerName,
+            localeForBot(ds.larkAppId),
+          ),
           multiSelect: false,
           options: [
             { key: 'accept', label: '采纳并重新执行' },
@@ -19568,7 +19659,11 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
         chatType: ds.chatType,
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: `另一位成员建议：${suggestion.text}\n\n是否采纳该建议并重新执行？`,
+          prompt: crossPrincipalOwnerPrompt(
+            suggestion.text,
+            suggestion.proposerName,
+            localeForBot(ds.larkAppId),
+          ),
           multiSelect: false,
           options: [
             { key: 'accept', label: '采纳并重新执行' },
