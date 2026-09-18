@@ -3335,6 +3335,37 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('/th /tw inside a native topic stay thread-scoped like /t instead of folding into chat scope', async () => {
+    setupBotState({ chatReplyModes: { 'chat-alias-topic': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    for (const [index, alias] of ['/th inspect', '/tw inspect'].entries()) {
+      handlers.handleThreadReply.mockClear();
+      handlers.handleNewTopic.mockClear();
+      const rootId = `alias-topic-root-${index}`;
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: `@BotA ${alias}` }),
+        rootId,
+        threadId: `omt_alias_topic_${index}`,
+        messageId: `alias-topic-message-${index}`,
+        chatId: 'chat-alias-topic',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+      handlers.isSessionOwner.mockReturnValue(false);
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: rootId,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    }
+  });
+
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
     // Bot already owns a thread-scope session at this root → continue it.
     const event = makeUserMessageEvent({
