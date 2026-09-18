@@ -30,4 +30,20 @@ describe('codex adapter × read isolation', () => {
     const plain = adapter.buildArgs({ sessionId: 's', resume: false }).join(' ');
     expect(plain).not.toContain('shell_environment_policy.inherit');
   });
+
+  it('forwards non-secret Botmux routing identity to ordinary shell subprocesses', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'session-1',
+      resume: false,
+      shellSubprocessEnv: {
+        BOTMUX_SESSION_ID: 'session-1',
+        BOTMUX_CHAT_ID: 'oc_chat',
+        BOTMUX_LARK_APP_ID: 'cli_app',
+        BOTMUX_SESSION_SCOPE: 'chat',
+      },
+    }).join(' ');
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_LARK_APP_ID="cli_app"');
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_CHAT_ID="oc_chat"');
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_SESSION_SCOPE="chat"');
+  });
 });

@@ -3204,6 +3204,45 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   jsonRes(res, result.ok ? 200 : 400, result);
 });
 
+ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req, res, params) => {
+  const session = findOwnedSessionRecord(params.sessionId);
+  if (!session || !cachedLarkAppId || session.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4_096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const predecessorTriggerId = typeof body.predecessorTriggerId === 'string' ? body.predecessorTriggerId.trim() : '';
+  const successorTriggerId = typeof body.successorTriggerId === 'string' ? body.successorTriggerId.trim() : '';
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    return jsonRes(res, 400, { ok: false, error: 'distinct_trigger_ids_required' });
+  }
+  try {
+    const outcome = asyncTriggerStore.supersedePendingTriggerByCompletedSuccessorStrict(
+      params.sessionId,
+      predecessorTriggerId,
+      successorTriggerId,
+      Date.now(),
+      cachedLarkAppId,
+    );
+    if (outcome === 'superseded' || outcome === 'already_superseded') {
+      const results = findActiveBySessionId(params.sessionId)?.asyncTriggerResults;
+      if (results?.get(predecessorTriggerId)?.status === 'pending') results.delete(predecessorTriggerId);
+      return jsonRes(res, 200, {
+        ok: true,
+        state: 'superseded',
+        alreadyTerminal: outcome === 'already_superseded',
+        predecessorTriggerId,
+        successorTriggerId,
+      });
+    }
+    return jsonRes(res, 409, { ok: false, error: outcome, predecessorTriggerId, successorTriggerId });
+  } catch (error) {
+    logger.warn(`[async-trigger] exact supersession failed session=${params.sessionId.slice(0, 8)}: ${error}`);
+    return jsonRes(res, 409, { ok: false, error: 'trigger_supersession_rejected' });
+  }
+});
+
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
 // （SafeInsightReport）。底层 services/insight 已做 fail-closed 脱敏投影——raw 命令
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
