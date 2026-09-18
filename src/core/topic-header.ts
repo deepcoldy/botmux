@@ -169,6 +169,10 @@ function parseTitle(raw: string, tokensBefore: Token[]): string | null | undefin
  * `content` 必须**已经剥掉对本 bot 的所有 @**（见 message-parser 的
  * `stripBotMentions`）——@ 的位置与解析无关（D8），但残留的 `@名字` 会占住 token 位。
  */
+export function parseTopicHeaderWithLifecycleAliases(content: string): TopicHeaderParse {
+  return parseTopicHeader(content.replace(/^\s*\/(?:th|tw)(?=\s|$)/i, '/t'));
+}
+
 export function parseTopicHeader(content: string): TopicHeaderParse {
   const tokens = tokenize(content);
   const sentinelIndex = tokens.findIndex(t => sentinelOf(t) !== undefined);

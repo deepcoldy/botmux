@@ -871,6 +871,26 @@ describe('指令头与授权闸（restrictGrantCommands）', () => {
     expect(mocks.createdSessions.length).toBeGreaterThan(0);
   });
 
+  it('已有 chat 会话里的非法 /th 指令保持 fail-closed，不转发给 CLI', async () => {
+    registerRestrictedBot({ restrictGrantCommands: false });
+    const ds = seedChatSession();
+
+    await handleThreadReply(
+      guestBotEvent('/th /model', 'om_guest_bot_bad_alias'),
+      {
+        chatId: GROUP,
+        messageId: 'om_guest_bot_bad_alias',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: GROUP,
+        larkAppId: APP,
+      },
+    );
+
+    expect(sentContents()[0]).toContain('只在开新话题的第一条消息里生效');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalledWith(ds, expect.anything(), expect.anything());
+  });
+
   it('已有会话的话题里聊到 /t：原文照常进 CLI，不被授权闸吞掉', async () => {
     const ds = seedThreadSession();
 

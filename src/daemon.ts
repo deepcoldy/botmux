@@ -309,7 +309,7 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
-import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
+import { parseTopicHeader, parseTopicHeaderWithLifecycleAliases, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -21956,7 +21956,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
-  const threadHeaderParse = parseTopicHeader(stripBotMentions(
+  const threadHeaderParse = parseTopicHeaderWithLifecycleAliases(stripBotMentions(
     cmdContent,
     parsed.mentions,
     { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
@@ -25873,6 +25873,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      validateTopicHeader: (header, appId) => resolveTopicSpec(header, {
+        botCfg: getBot(appId).config,
+        scanDirs: getProjectScanDirsForBot(appId),
+      }).ok,
       handleBotAdded: (chatId, operatorOpenId, appId) => withBotTurnAdmission(
         appId,
         () => handleBotAdded(chatId, operatorOpenId, appId),

@@ -900,12 +900,14 @@ function setupBotState(opts?: {
   onChatModeConverted: ReturnType<typeof vi.fn>;
   resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
   chatSessionAnsweredRootAtTopLevel: ReturnType<typeof vi.fn>;
+  validateTopicHeader: ReturnType<typeof vi.fn>;
   handleVcMeetingPush: ReturnType<typeof vi.fn>;
 } {
   return {
     handleCardAction: vi.fn(async () => undefined),
     handleNewTopic: vi.fn(async () => {}),
     handleThreadReply: vi.fn(async () => {}),
+    validateTopicHeader: vi.fn(() => true),
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
     resolveReplyThreadAlias: vi.fn(() => null),
@@ -2680,6 +2682,21 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
     expect(maybeApplyForceTopicOverride(r2, bareRepo, 'om_repo', MY_APP_ID)).toBe(true);
     expect(r2).toEqual({ scope: 'thread', anchor: 'om_repo', forceTopicApplied: true });
+  });
+
+  it('/th /tw 完整规格语义校验失败时不翻 scope', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    for (const text of ['/tw /repo does-not-exist task', '/th /model unsupported task']) {
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(
+        routing,
+        { content: JSON.stringify({ text }), mentions: [] },
+        'om_invalid',
+        MY_APP_ID,
+        () => false,
+      )).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
   });
 
   it('/th /tw 必须是行首完整 token，正文里提到 /the 或 /two 不触发翻话题', () => {
