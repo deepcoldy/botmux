@@ -77,18 +77,13 @@ export interface DaemonSession {
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
-  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
-  readonlyContinuationRpcProof?: {
+  /** Liveness proof for the exact worker + RPC generation. This proves only
+   * that continuation delivery will use the same live thread; it grants no
+   * permissions and carries no provider capability assumptions. */
+  taskContinuationRpcProof?: {
     workerGeneration: number;
     rpcGeneration: string;
     checkedAt: number;
-  };
-  /** Exact live synthetic turn whose hook-level native subagent requests must
-   * be denied. Derived only from trusted worker IPC for the current generation. */
-  readonlyContinuationTurnOrigin?: {
-    workerGeneration: number;
-    turnId: string;
-    dispatchAttempt: number;
   };
   larkAppId: string;
   chatId: string;

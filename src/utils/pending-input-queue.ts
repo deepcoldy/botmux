@@ -1,6 +1,6 @@
 import type {
   CodexAppTurnInput,
-  ReadonlyContinuationDispatchMarker,
+  TaskContinuationDispatchMarker,
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
@@ -50,7 +50,7 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
-  readonlyContinuation?: ReadonlyContinuationDispatchMarker;
+  taskContinuation?: TaskContinuationDispatchMarker;
 }
 
 /**
@@ -114,7 +114,7 @@ export function mergeQueuedCliInput(
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent
-    || tail.readonlyContinuation || next.readonlyContinuation) return false;
+    || tail.taskContinuation || next.taskContinuation) return false;
   // Caller attribution is part of the logical envelope. Older code merged two
   // queued messages and kept only the later turnId while silently retaining no
   // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown

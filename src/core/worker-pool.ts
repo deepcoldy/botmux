@@ -1704,6 +1704,8 @@ export function ensureOrdinaryTurnRecoveryAttached(
 }
 
 function readonlyTaskContinuationEnabled(): boolean {
+  const canonical = process.env.BOTMUX_TASK_CONTINUATION_ENABLED?.trim().toLowerCase();
+  if (canonical) return canonical === 'true';
   return process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
 }
 
@@ -1729,7 +1731,69 @@ function readonlyTaskContinuationWarning(
     : state.status === 'exhausted'
       ? `达到最大续跑次数 ${state.maxContinuations}`
       : state.lastErrorCode ?? '续跑交接失败';
-  return `⚠️ 只读长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
+  return `⚠️ 长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
+}
+
+function handleTaskContinuationCliExit(
+  ds: DaemonSession,
+  workerGeneration: number,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+): boolean {
+  if (!turnId) return false;
+  const terminal = {
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    status: 'ambiguous' as const,
+    errorCode: 'cli_exit',
+    workerGeneration,
+  };
+  if (!readonlyTaskContinuationHandlesTerminal(ds.session, terminal)) return false;
+  handleReadonlyTaskContinuationTerminal(ds.session, terminal);
+  return true;
+}
+
+type TaskContinuationWorkerExitRecovery = {
+  leaseId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+  workerGeneration: number;
+  action: 'resume' | 'fail';
+};
+
+/** Decide recovery while the exiting generation is still the live owner. A
+ * Node-worker death proves a PTY execution endpoint is gone. Persistent panes
+ * need an authoritative missing probe; exists/unknown fail closed because the
+ * detached CLI may still be executing the last authorized action. */
+function taskContinuationWorkerExitRecovery(
+  ds: DaemonSession,
+  workerGeneration: number,
+): TaskContinuationWorkerExitRecovery | undefined {
+  const state = ds.session.readonlyTaskContinuation;
+  if (!state || (state.status !== 'active' && state.status !== 'backoff')
+    || state.currentWorkerGeneration !== workerGeneration) return undefined;
+
+  const frozenBackend = ds.initConfig?.backendType ?? ds.session.backendType;
+  let action: TaskContinuationWorkerExitRecovery['action'] = 'fail';
+  if (frozenBackend === 'pty') {
+    action = 'resume';
+  } else {
+    try {
+      const target = persistentBackendTargetForSession(ds);
+      if (target) action = probePersistentBackendTarget(target) === 'missing' ? 'resume' : 'fail';
+    } catch {
+      action = 'fail';
+    }
+  }
+  return {
+    leaseId: state.leaseId,
+    turnId: state.currentTurnId,
+    ...(state.currentDispatchAttempt !== undefined
+      ? { dispatchAttempt: state.currentDispatchAttempt }
+      : {}),
+    workerGeneration,
+    action,
+  };
 }
 
 function deliverReadonlyTaskContinuationPending(
@@ -1823,7 +1887,7 @@ function deliverReadonlyTaskContinuationWarningPending(
   );
 }
 
-/** Attach the opt-in read-only task continuation owner. The machine switch is
+/** Attach the opt-in authorization-inheriting task continuation owner. The machine switch is
  * checked both here and before every dispatch; an off switch leaves all normal
  * sessions on their existing path. */
 export function ensureReadonlyTaskContinuationAttached(
@@ -1864,7 +1928,7 @@ export function ensureReadonlyTaskContinuationAttached(
     recoverDelivery: state => deliverReadonlyTaskContinuationPending(ds, state),
     canEnqueue: () => {
       const workerGeneration = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
       return readonlyTaskContinuationEligible(ds)
         && ordinaryTurnRecoveryStillOwnsSession(ds)
         && !!ds.worker
@@ -1881,17 +1945,23 @@ export function ensureReadonlyTaskContinuationAttached(
         return false;
       }
       const workerGeneration = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0
         || ds.session.workerGeneration !== workerGeneration
-        || proof?.workerGeneration !== workerGeneration) {
+        || !proof
+        || proof.workerGeneration !== workerGeneration) {
         return false;
       }
       const current = ds.session.readonlyTaskContinuation;
       if (!current || current.currentTurnId !== dispatch.turnId
-        || current.currentDispatchAttempt !== dispatch.dispatchAttempt) return false;
+        || current.currentDispatchAttempt !== dispatch.dispatchAttempt
+        || current.authorizationMode !== 'inherited'
+        || !current.trustedCaller
+        || current.trustedCaller.requestLarkAppId !== ds.larkAppId
+        || (current.trustedController
+          && current.trustedController.requestLarkAppId !== ds.larkAppId)) return false;
       try {
         ds.worker.send({
           type: 'message',
@@ -1899,11 +1969,23 @@ export function ensureReadonlyTaskContinuationAttached(
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
           ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
-          readonlyContinuation: {
+          trustedCaller: current.trustedCaller,
+          ...(current.trustedController
+            ? { trustedController: current.trustedController }
+            : {}),
+          taskContinuation: {
             leaseId: current.leaseId,
-            rpcGeneration: proof!.rpcGeneration,
+            rpcGeneration: proof.rpcGeneration,
+            authorizationMode: 'inherited',
           },
         } satisfies Extract<DaemonToWorker, { type: 'message' }>);
+        ds.activeInteractiveTurn = {
+          turnId: dispatch.turnId,
+          caller: { ...current.trustedCaller },
+          ...(current.trustedController
+            ? { controller: { ...current.trustedController } }
+            : {}),
+        };
         recordAdmittedOrdinaryUserTurn(ds, dispatch.turnId, {
           beginRecovery: false,
           dispatchAttempt: dispatch.dispatchAttempt,
@@ -1911,7 +1993,7 @@ export function ensureReadonlyTaskContinuationAttached(
         return workerGeneration!;
       } catch (err) {
         logger.error(
-          `[${tag(ds)}] Failed to enqueue read-only task continuation `
+          `[${tag(ds)}] Failed to enqueue task continuation `
           + `${dispatch.continuation}: ${err instanceof Error ? err.message : String(err)}`,
         );
         return false;
@@ -1922,7 +2004,7 @@ export function ensureReadonlyTaskContinuationAttached(
       ds.agentAttention = { kind: 'blocked', reason: warning, at: Date.now() };
       publishAttentionPatch(ds);
       emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'readonly_task_continuation_stopped',
+        reason: 'task_continuation_stopped',
         errorCode: state.lastErrorCode,
         logicalTurnId: state.logicalTurnId,
       });
@@ -9872,7 +9954,7 @@ function recordAdmittedOrdinaryUserTurn(
       cancelReadonlyTaskContinuationForUserInput(ds.session, turnId);
     } catch (err) {
       logger.error(
-        `[${tag(ds)}] Failed to cancel read-only continuation for new user input `
+        `[${tag(ds)}] Failed to cancel task continuation for new user input `
         + `${turnId.substring(0, 16)}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -11889,7 +11971,15 @@ function isMeetingDrivenTurn(
 function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
   // The daemon owns this per-turn sender map. The worker contributes only the
   // turn id over private IPC; it can never choose which human that id denotes.
-  return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+  const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+  if (replyTargetCaller) return replyTargetCaller;
+  const continuation = ds.session.readonlyTaskContinuation;
+  return continuation?.authorizationMode === 'inherited'
+    && continuation.currentTurnId === turnId
+    && continuation.trustedCaller?.requestLarkAppId === ds.larkAppId
+    && continuation.trustedCaller.senderType === 'user'
+    ? continuation.trustedCaller.requestUserOpenId
+    : undefined;
 }
 
 function currentTurnProcessIdentities(
@@ -11918,8 +12008,7 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
-  ds.readonlyContinuationRpcProof = undefined;
-  ds.readonlyContinuationTurnOrigin = undefined;
+  ds.taskContinuationRpcProof = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -13786,6 +13875,24 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        // The original opted-in turn has no dispatchAttempt, so worker.ts's
+        // durable-delivery terminal path cannot report its CLI exit. Bind the
+        // exit here to the exact live turn + worker generation. Synthetic
+        // continuation exits may already have emitted the same terminal; the
+        // coordinator's tuple/state check makes this second path a no-op.
+        try {
+          handleTaskContinuationCliExit(
+            ds, workerGeneration, msg.turnId, msg.dispatchAttempt,
+          );
+        } catch (err) {
+          logger.error(
+            `[${t}] Failed to persist task continuation CLI exit for generation ${workerGeneration}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // The app-server died with this CLI lifetime. Do not let a backoff timer
+        // reuse its stale generation proof before the replacement reports one.
+        ds.taskContinuationRpcProof = undefined;
         ds.activeInteractiveTurn = undefined;
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
@@ -14229,7 +14336,7 @@ function setupWorkerHandlers(
             );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to persist original-turn business final for read-only continuation `
+              `[${t}] Failed to persist original-turn business final for task continuation `
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -14359,7 +14466,7 @@ function setupWorkerHandlers(
           recoveryHandled ||= readonlyContinuationOwnsTerminal;
         } catch (err) {
           logger.error(
-            `[${t}] Failed to persist read-only task continuation terminal for `
+            `[${t}] Failed to persist task continuation terminal for `
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
@@ -14689,11 +14796,6 @@ function setupWorkerHandlers(
             ? { preexistingProcessIdentities }
             : {}),
         };
-        ds.readonlyContinuationTurnOrigin = msg.readonlyContinuation === true
-          && msg.turnId?.startsWith('bmx-readonly-')
-          && msg.dispatchAttempt !== undefined
-          ? { workerGeneration, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }
-          : undefined;
         break;
       }
 
@@ -14742,11 +14844,6 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored stale policy capability in managed turn origin revoke`);
         }
         if (!revokeLive && !revokePolicy) break;
-        if (ds.readonlyContinuationTurnOrigin?.workerGeneration === workerGeneration
-          && ds.readonlyContinuationTurnOrigin.turnId === msg.turnId
-          && ds.readonlyContinuationTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
-          ds.readonlyContinuationTurnOrigin = undefined;
-        }
         if (revokeLive) {
           ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
             ? {
@@ -14848,15 +14945,15 @@ function setupWorkerHandlers(
         break;
       }
 
-      case 'readonly_continuation_rpc_status': {
+      case 'task_continuation_rpc_status': {
         if (ds.worker !== worker
           || msg.sessionId !== ds.session.sessionId
           || ds.workerGeneration !== workerGeneration
           || ds.session.workerGeneration !== workerGeneration) {
-          logger.warn(`[${t}] Ignored read-only RPC proof from stale worker generation`);
+          logger.warn(`[${t}] Ignored task continuation RPC status from stale worker generation`);
           break;
         }
-        ds.readonlyContinuationRpcProof = msg.eligible
+        ds.taskContinuationRpcProof = msg.eligible
           ? { workerGeneration, rpcGeneration: msg.rpcGeneration, checkedAt: Date.now() }
           : undefined;
         break;
@@ -14864,14 +14961,14 @@ function setupWorkerHandlers(
 
       case 'final_output': {
         const continuation = ds.session.readonlyTaskContinuation;
-        const exactReadonlyFinal = continuation
+        const exactContinuationFinal = continuation
           && ['active', 'backoff'].includes(continuation.status)
-          && msg.turnId.startsWith('bmx-readonly-')
+          && msg.turnId.startsWith('bmx-continuation-')
           && msg.dispatchAttempt !== undefined
           && continuation.currentTurnId === msg.turnId
           && continuation.currentDispatchAttempt === msg.dispatchAttempt
           && continuation.currentWorkerGeneration === workerGeneration;
-        if (exactReadonlyFinal) {
+        if (exactContinuationFinal) {
           // MR1 deliberately surfaces failed-turn fallback text before the
           // structured terminal. For a synthetic continuation that text is a
           // transport diagnostic, not the model's strict JSON business result;
@@ -14895,8 +14992,8 @@ function setupWorkerHandlers(
           deliverReadonlyTaskContinuationPending(ds, deliveryState);
           break;
         }
-        if (msg.turnId.startsWith('bmx-readonly-')) {
-          logger.warn(`[${t}] Dropped stale/unbound read-only continuation final_output`);
+        if (msg.turnId.startsWith('bmx-continuation-')) {
+          logger.warn(`[${t}] Dropped stale/unbound task continuation final_output`);
           break;
         }
         const originalContinuation = ds.session.readonlyTaskContinuation;
@@ -14910,7 +15007,7 @@ function setupWorkerHandlers(
             );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to persist original-turn final output for read-only continuation `
+              `[${t}] Failed to persist original-turn final output for task continuation `
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -15216,6 +15313,15 @@ function setupWorkerHandlers(
   worker.on('exit', (code, signal) => {
     const transferRetirement = transferRetiringWorkers.has(worker);
     const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
+    const unexpectedWorkerExit = !transferRetirement
+      && !lifecycleRetirement
+      && !worker.killed
+      && ds.session.status === 'active'
+      && ds.worker === worker
+      && ds.workerGeneration === workerGeneration;
+    const continuationRecovery = unexpectedWorkerExit
+      ? taskContinuationWorkerExitRecovery(ds, workerGeneration)
+      : undefined;
     const preReadyExit = !startupState.ready;
     const suppressDeliveryFailure = transferRetirement
       || lifecycleRetirement
@@ -15294,6 +15400,7 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
@@ -15327,6 +15434,33 @@ function setupWorkerHandlers(
       // 进程树，包括那一代注册的 dev server。与代次围栏并进同一次落盘。
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
+      if (continuationRecovery?.action === 'resume') {
+        const terminal = {
+          turnId: continuationRecovery.turnId,
+          ...(continuationRecovery.dispatchAttempt !== undefined
+            ? { dispatchAttempt: continuationRecovery.dispatchAttempt }
+            : {}),
+          status: 'ambiguous' as const,
+          errorCode: 'cli_exit',
+          workerGeneration: continuationRecovery.workerGeneration,
+        };
+        try {
+          handleReadonlyTaskContinuationTerminal(ds.session, terminal);
+        } catch (err) {
+          logger.error(
+            `[${t}] Failed to persist task continuation worker-exit recovery: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else if (continuationRecovery?.action === 'fail') {
+        failReadonlyTaskContinuationVisible(
+          ds.session,
+          continuationRecovery.turnId,
+          continuationRecovery.dispatchAttempt,
+          continuationRecovery.workerGeneration,
+          'continuation_worker_exit_backend_unverified',
+        );
+      }
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
       dashboardEventBus.publish({
         type: 'session.update',
@@ -15337,18 +15471,49 @@ function setupWorkerHandlers(
       });
     }
     if (!transferRetirement) {
+      let workerExitReconciled: void | Promise<void> = undefined;
       try {
-        const notified = cb.onWorkerExit?.(ds, {
+        workerExitReconciled = cb.onWorkerExit?.(ds, {
           sessionId: ds.session.sessionId,
           workerGeneration,
           code,
           signal,
         });
-        void Promise.resolve(notified).catch((err: any) => {
+        void Promise.resolve(workerExitReconciled).catch((err: any) => {
           logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
         });
       } catch (err: any) {
         logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
+      }
+      if (continuationRecovery?.action === 'resume') {
+        const resumeAfterReconcile = (): void => {
+          const state = ds.session.readonlyTaskContinuation;
+          if (state?.leaseId !== continuationRecovery.leaseId
+            || state.status !== 'backoff'
+            || ds.session.status !== 'active'
+            || (ds.worker && !ds.worker.killed)
+            || (activeSessionsRegistry
+              && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds)) return;
+          try {
+            forkWorker(ds, '', { resume: true });
+          } catch (err) {
+            failReadonlyTaskContinuationVisible(
+              ds.session,
+              continuationRecovery.turnId,
+              continuationRecovery.dispatchAttempt,
+              continuationRecovery.workerGeneration,
+              'continuation_worker_restart_failed',
+            );
+            logger.error(
+              `[${t}] Failed to restart worker for task continuation: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        };
+        void Promise.resolve(workerExitReconciled).then(
+          resumeAfterReconcile,
+          resumeAfterReconcile,
+        );
       }
     } else {
       logger.info(`[${t}] Suppressed external worker-exit effects for routing transfer`);
@@ -16362,7 +16527,7 @@ export function forkAdoptWorker(
   }
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
-  ds.readonlyContinuationRpcProof = undefined;
+  ds.taskContinuationRpcProof = undefined;
   const cb = requireCallbacks();
   const t = tag(ds);
   const adopted = ds.adoptedFrom;
