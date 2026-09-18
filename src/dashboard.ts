@@ -8,7 +8,8 @@ import {
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
@@ -2549,6 +2550,26 @@ async function handlePluginManagementApi(
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/plugins') {
     return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  const settingsMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/settings$/);
+  if (settingsMatch) {
+    if (req.method !== 'GET' && req.method !== 'PUT') return pluginJson(res, 405, { error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(settingsMatch[1]);
+    const record = requireInstalledPlugin(pluginId);
+    if (!record || !dashboardEntriesForRecord(record).length) return pluginJson(res, 404, { error: 'plugin_not_found' });
+    // Only an explicit server-side adapter may expose settings. Never return raw plugin config.
+    const entry = resolvePluginPath(pluginRuntimeDir(pluginId), 'server/settings.js');
+    if (!existsSync(entry)) return pluginJson(res, 404, { error: 'plugin_settings_not_supported' });
+    try {
+      const adapter = await import(pathToFileURL(entry).href + `?v=${statSync(entry).mtimeMs}`);
+      const api = { config: createConfigApi(pluginId) };
+      const body = req.method === 'PUT' ? await readJsonBody(req) : undefined;
+      const result = req.method === 'GET' ? await adapter.getSettings(api) : await adapter.saveSettings(api, body);
+      return pluginJson(res, 200, result);
+    } catch (error) {
+      return pluginJson(res, 400, { error: error instanceof Error ? error.message : 'invalid_plugin_settings' });
+    }
   }
 
   let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);

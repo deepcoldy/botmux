@@ -1,4 +1,4 @@
-import type React from 'react';
+import * as React from 'react';
 import {
   useCallback,
   useEffect,
@@ -567,23 +567,22 @@ function PluginGlobalSetting(props: {
 }): React.JSX.Element {
   const enabled = pluginEnabledInScope(props.plugin, 'global', props.pendingToggles);
   return (
-    <label className="toggle-row plugin-global-setting">
+    <div className="toggle-row plugin-global-setting">
       <span className="plugin-global-setting-copy">
         <strong>全局启用</strong>
-        <small>{enabled
-          ? `已对全部 ${props.bots.length} 个 Bot 启用`
-          : '关闭时可展开卡片，按 Bot 单独启用'}</small>
+        <small>{enabled ? `已对全部 ${props.bots.length} 个 Bot 启用` : '默认按 Bot 单独启用；展开详情可设置'}</small>
       </span>
-      <input
-        type="checkbox"
-        data-plugin-toggle="global"
-        data-plugin-id={props.plugin.id}
-        checked={enabled}
-        disabled={props.busy}
-        onChange={event => props.onToggle('global', event.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true"></span>
-    </label>
+      <button type="button" className="btn-link" data-plugin-toggle="global"
+        data-plugin-id={props.plugin.id} disabled={props.busy}
+        onClick={() => {
+          const message = enabled
+            ? '关闭全局启用？单独启用的 Bot 会保留自己的设置。'
+            : `将为所有 ${props.bots.length} 个 Bot 以及以后新增的 Bot 启用此插件。确认全部启用？`;
+          if (window.confirm(message)) props.onToggle('global', !enabled);
+        }}>
+        {enabled ? '关闭全局启用…' : '为所有 Bot 启用…'}
+      </button>
+    </div>
   );
 }
 
@@ -932,7 +931,20 @@ function PluginManagementPage(): React.JSX.Element {
 }
 
 function pluginDashboardApi(pluginId: string) {
+  async function settings(method: string, value?: unknown) {
+    const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
+      method, headers: { 'content-type': 'application/json' },
+      ...(method === 'PUT' ? { body: JSON.stringify(value) } : {}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    return result;
+  }
   return {
+    react: React,
+    getSettings: () => settings('GET'),
+    saveSettings: (value: unknown) => settings('PUT', value),
+    async listBots() { return (await fetchPluginManagement()).bots; },
     async getServiceStatus() {
       const payload = await fetchPluginManagement();
       return payload.plugins.find(plugin => plugin.id === pluginId)?.serviceReport;
