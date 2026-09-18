@@ -5,6 +5,7 @@ import {
 } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
+import { immersiveWorkbenchHash } from './workbench-shell.js';
 
 export interface DashboardUrls {
   /**
@@ -142,25 +143,28 @@ export const WORKBENCH_HASH_ROUTE = '#/agent-workbench';
 
 /**
  * 把一条 Dashboard 登录 URL（`<base>/?t=<token>`，见 {@link buildDashboardUrls}）
- * 改写成**工作台直达** URL：`<base>/?t=<token>#/agent-workbench`。
+ * 改写成**工作台直达** URL：`<base>/?t=<token>#/agent-workbench?botmuxWorkbenchShell=immersive`。
  *
- * 用于飞书卡片的「打开工作台」按钮：token 留在查询串里（Dashboard 的鉴权只认
- * `?t=`），hash 只负责选路由，所以两者可以共存。非 http/https 或不可解析的
- * 输入返回 null，调用方据此不渲染按钮，绝不拼出半截链接。
+ * 用于飞书卡片的「打开工作台」按钮与平台托管时 CLI 打印的工作台链接：token 留在
+ * 查询串里（Dashboard 的鉴权只认 `?t=`），hash 只负责选路由，所以两者可以共存。
+ * hash 里的沉浸式标记让直达入口落成无边框壳（不带 Dashboard 侧栏），登录跳转剥
+ * 查询串时它跟着 fragment 一起活下来（见 core/workbench-shell.ts）。非 http/https
+ * 或不可解析的输入返回 null，调用方据此不渲染按钮，绝不拼出半截链接。
  */
 export function workbenchSpaUrl(dashboardUrl: string): string | null {
   const u = parseHttpUrl(dashboardUrl);
   if (!u) return null;
-  u.hash = WORKBENCH_HASH_ROUTE;
+  u.hash = immersiveWorkbenchHash(WORKBENCH_HASH_ROUTE);
   return u.toString();
 }
 
 /**
  * 无 fragment 的工作台入口：`<base>/workbench?t=<token>`。
  *
- * Dashboard 自己 302 到 `/?t=…#/agent-workbench`（见 dashboard.ts 的 `/workbench`
- * 分支）。终端/脚本里复制粘贴一条不带 `#` 的 URL 更不容易被截断或被 shell 当注释，
- * 所以 CLI 打印这一形态。同样在无法解析时返回 null。
+ * Dashboard 自己 302 到 `/?t=…#/agent-workbench?botmuxWorkbenchShell=immersive`
+ * （见 dashboard.ts 的 `/workbench` 分支；直达入口落沉浸式无边框壳，标记的来龙去脉
+ * 见 core/workbench-shell.ts）。终端/脚本里复制粘贴一条不带 `#` 的 URL 更不容易被
+ * 截断或被 shell 当注释，所以 CLI 打印这一形态。同样在无法解析时返回 null。
  *
  * ⚠️ 这是**唯一**保留「长期 token 直拼进 URL」的形态，只出现在两个**私人上下文**：
  *   1. `botmux dashboard` 的终端输出（cli/dashboard-command.ts，终端是私人环境）；

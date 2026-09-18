@@ -207,10 +207,12 @@ export interface CodexBridgeEvent {
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
    *   - 'assistant_final' closes the currently-collecting turn with output
    *   - 'turn_aborted' closes it without producing fallback output
+   *   - 'turn_bind' adds a provider turn id to an already-started turn
+   *     without starting, closing, or otherwise advancing the queue
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
    *     never starts or closes a turn */
-  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot';
+  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -226,6 +228,13 @@ export interface CodexBridgeEvent {
    *  Raw provider payloads stay in the rollout/Web terminal. */
   terminalErrorSummary?: string;
   sourceSessionId?: string;
+  /** Native provider turn id when the transcript format exposes one. Bridges
+   *  can use it to bind cosmetic/terminal events to the exact started turn
+   *  instead of relying solely on whichever turn is currently collecting. */
+  sourceTurnId?: string;
+  /** The transcript parser has positive evidence that this user record starts
+   * a distinct native turn while an older id-less turn remains open. */
+  preserveCollecting?: boolean;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
@@ -354,7 +363,9 @@ export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
  *  so the user-facing card can say "server-side transient, just retry later"
  *  instead of pointing at the local network. */
 export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
+export const CODEX_OUTPUT_LIMIT_ERROR_CODE = 'codex_output_limit_exceeded';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
+export const CODEX_OUTPUT_LIMIT_ERROR_MESSAGE = 'model output limit exceeded: max_output_tokens';
 
 const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
 /** Pre-scan bound applied BEFORE the redaction regexes run. Well above the
@@ -547,6 +558,19 @@ export function codexTaskFailureCode(error: unknown): string {
   return CODEX_TASK_FAILED_ERROR_CODE;
 }
 
+/** Exact opt-in classifier used only by the TraeX read-only continuation
+ * path. Keeping it out of codexTaskFailureCode preserves every other CLI's
+ * existing public error taxonomy. */
+export function isExactCodexOutputLimitError(error: unknown): boolean {
+  const leaf = codexFailureLeaf(error);
+  const leafMessage = typeof leaf === 'string'
+    ? leaf
+    : leaf && typeof leaf === 'object' && typeof (leaf as Record<string, unknown>).message === 'string'
+      ? String((leaf as Record<string, unknown>).message)
+      : '';
+  return leafMessage.trim().toLowerCase() === CODEX_OUTPUT_LIMIT_ERROR_MESSAGE;
+}
+
 export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
   return event.kind === 'assistant_final'
     && event.terminalStatus === 'failed'
@@ -564,7 +588,7 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot'; text: string }[],
+  events: readonly Pick<CodexBridgeEvent, 'kind' | 'text'>[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {

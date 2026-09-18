@@ -50,7 +50,9 @@ export interface ResolvedDashboardSettingsView {
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -91,6 +93,7 @@ export interface ResolvedDashboardSettingsView {
     targetDaemonOnline?: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -213,7 +216,9 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
+  | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
+  | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -235,6 +240,7 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_owner_missing'
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
+  | 'invalid_crossPrincipalInterruption'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -431,17 +437,36 @@ export async function applySettingsWrite(
     }
     patch.codexRpcInput = obj.codexRpcInput;
   }
+  if ('autoUpgradeCodexSessions' in obj) {
+    if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {
+      return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
+    }
+    patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
+  }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
     }
     patch.bypassCodexHookTrust = obj.bypassCodexHookTrust;
   }
+  if ('hideCodexRateLimitModelNudge' in obj) {
+    if (typeof obj.hideCodexRateLimitModelNudge !== 'boolean') {
+      return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
+    }
+    patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
+  }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
       return { ok: false, error: 'invalid_noVisibleOutputHint' };
     }
     patch.noVisibleOutputHint = obj.noVisibleOutputHint;
+  }
+
+  if ('crossPrincipalInterruption' in obj) {
+    if (typeof obj.crossPrincipalInterruption !== 'boolean') {
+      return { ok: false, error: 'invalid_crossPrincipalInterruption' };
+    }
+    patch.crossPrincipalInterruption = obj.crossPrincipalInterruption;
   }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;

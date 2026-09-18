@@ -301,6 +301,32 @@ describe('groups-store wrappers', () => {
     expect(callArgs.params?.user_id_type).toBeUndefined();
   });
 
+  it('createChat forwards chatMode as data.chat_mode when set', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_topic' },
+    });
+    const r = await createChat('cli_creator', {
+      name: 'topic chat',
+      botIds: ['cli_creator'],
+      chatMode: 'topic',
+    });
+    expect(r.chatId).toBe('oc_topic');
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.chat_mode).toBe('topic');
+  });
+
+  it('createChat omits chat_mode when chatMode is not provided', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_default' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator', 'cli_other'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    // Absent field -> Feishu's default (普通群). We must not pin it explicitly.
+    expect(callArgs.data.chat_mode).toBeUndefined();
+  });
+
   it('getChatShareLink returns share_link and passes validity_period (default permanently)', async () => {
     chatLinkStub.mockResolvedValueOnce({
       code: 0,

@@ -11,6 +11,8 @@
  * Run:  pnpm vitest run test/event-dispatcher.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHmac } from 'node:crypto';
+import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -48,6 +50,15 @@ vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
 }));
 
+// chat.bot_added 观察钩子的发射断言口。真实现是 fire-and-forget 且无 hooks 配置时
+// 为 no-op；mock 掉让断言直接看发射参数（client.ts 的 emitHookEvent 引用也走这个
+// mock，本文件不覆盖其行为）。
+const { emitHookEventMock, runGroupJoinCommandMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn(), runGroupJoinCommandMock: vi.fn() }));
+vi.mock('../src/services/hook-runner.js', () => ({
+  emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+  runGroupJoinCommand: (...args: unknown[]) => runGroupJoinCommandMock(...args),
+}));
+
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
 const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
@@ -83,7 +94,9 @@ const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 const mockIsHumanOpenId = vi.fn(async () => false);
 // best-effort profile 查询（授权申请卡取申请人名字用）：默认查不到 → 卡片回落缩略身份。
 const mockGetUserProfile = vi.fn(async () => null as { name: string } | null);
+const mockSignedChatContext = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
+  getChatContext: (...args: any[]) => mockSignedChatContext(...args),
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   getCachedChatMode: (...args: any[]) => mockGetCachedChatMode(...args),
@@ -811,8 +824,11 @@ function setupBotState(opts?: {
   ownerOpenId?: string;
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
+  /** 内存态黑名单（P1c），默认 []。 */
+  resolvedBlockedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+  signedChatDefaults?: boolean;
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
@@ -850,6 +866,7 @@ function setupBotState(opts?: {
       allowedChatGroups: opts?.allowedChatGroups,
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyMode: opts?.regularGroupReplyMode,
+      signedChatDefaults: opts?.signedChatDefaults,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
@@ -867,6 +884,9 @@ function setupBotState(opts?: {
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
+    // P1c 黑名单字段：假 bot 默认空名单，与 makeBotState 生产默认值对齐；
+    // 缺了它 evaluateTalk/canOperate 的否决腿 .includes 会在 dispatcher 公共路径上抛错。
+    resolvedBlockedUsers: opts?.resolvedBlockedUsers ?? [],
   };
   mockGetBot.mockReturnValue(state);
   return state;
@@ -1006,83 +1026,19 @@ function makeHistoryMessage(opts: {
   };
 }
 
-const WS_PROXY_ENV_KEYS = [
-  'HTTPS_PROXY',
-  'https_proxy',
-  'HTTP_PROXY',
-  'http_proxy',
-  'ALL_PROXY',
-  'all_proxy',
-  'NO_PROXY',
-  'no_proxy',
-  'NPM_CONFIG_HTTPS_PROXY',
-  'npm_config_https_proxy',
-  'NPM_CONFIG_PROXY',
-  'npm_config_proxy',
-  'NPM_CONFIG_NO_PROXY',
-  'npm_config_no_proxy',
-] as const;
-
-function withWsProxyEnv(values: Partial<Record<(typeof WS_PROXY_ENV_KEYS)[number], string>>, callback: () => void): void {
-  const original = Object.fromEntries(
-    WS_PROXY_ENV_KEYS.map(key => [key, process.env[key]]),
-  );
-  for (const key of WS_PROXY_ENV_KEYS) delete process.env[key];
-  Object.assign(process.env, values);
-
-  try {
-    callback();
-  } finally {
-    for (const key of WS_PROXY_ENV_KEYS) {
-      const value = original[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
-
-describe('startLarkEventDispatcher — WebSocket proxy', () => {
-  it('uses HTTPS proxy precedence for secure WebSocket URLs', () => {
-    withWsProxyEnv({
-      HTTPS_PROXY: 'http://upper-proxy:8118',
-      https_proxy: 'http://lower-proxy:8118',
-    }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      const agent = capturedWsClientOptions?.agent;
-      expect(agent?.constructor?.name).toBe('ProxyAgent');
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('http://lower-proxy:8118');
+describe('startLarkEventDispatcher — connection wiring', () => {
+  it.each(['feishu', 'lark'] as const)('starts %s with the registered dispatcher and returns the SDK client', (brand) => {
+    const client = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers(), brand);
+    expect(client).toBeInstanceOf(Lark.WSClient);
+    expect(capturedWsClientOptions).toMatchObject({
+      appId: MY_APP_ID,
+      appSecret: 'secret',
+      domain: brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn',
     });
-  });
-
-  it('honors NO_PROXY for the WebSocket destination', () => {
-    withWsProxyEnv({
-      HTTPS_PROXY: 'http://proxy.example:8118',
-      NO_PROXY: '.feishu.cn',
-    }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      const agent = capturedWsClientOptions?.agent;
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('');
-      expect(agent?.getProxyForUrl('wss://msg-frontier.larksuite.com/ws', {})).toBe('http://proxy.example:8118');
-    });
-  });
-
-  it('supports an ALL_PROXY fallback such as SOCKS', () => {
-    withWsProxyEnv({ ALL_PROXY: 'socks5://127.0.0.1:1080' }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      const agent = capturedWsClientOptions?.agent;
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('socks5://127.0.0.1:1080');
-    });
-  });
-
-  it('keeps the SDK default agent when no proxy is configured', () => {
-    withWsProxyEnv({}, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      expect(capturedWsClientOptions?.agent).toBeUndefined();
-    });
+    expect(client.start).toHaveBeenCalledOnce();
+    expect(client.start).toHaveBeenCalledWith({ eventDispatcher: expect.any(Lark.EventDispatcher) });
+    expect(capturedHandlers['im.message.receive_v1']).toBeTypeOf('function');
+    expect(capturedHandlers['card.action.trigger']).toBeTypeOf('function');
   });
 });
 
@@ -3017,6 +2973,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_sibling'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_sibling'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID, // NOT in allowedUsers
@@ -3043,6 +3000,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     });
 
     expect(canTalk(MY_APP_ID, 'oc_team', USER_OPEN_ID)).toBe(true);
@@ -3055,6 +3013,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     });
 
     expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(false);
@@ -3065,6 +3024,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'], allowedUsers: ['ou_admin'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_admin'],
+      resolvedBlockedUsers: [],
     });
 
     expect(canOperate(MY_APP_ID, 'oc_team', USER_OPEN_ID)).toBe(false);
@@ -3083,6 +3043,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_human_only'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_human_only'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
@@ -5125,6 +5086,29 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it.each(['plain', 'redirect', 'untrusted', 'denied'])(
+    'signed group default: %s retains ambient redirect and talk authorization boundaries', async (scenario) => {
+      const chatId = 'signed-group-' + scenario;
+      setupBotState({ allowedUsers: scenario === 'denied' ? ['ou_different_owner'] : [USER_OPEN_ID], regularGroupMentionMode: 'topic', signedChatDefaults: true });
+      mockGetChatMode.mockResolvedValue('group');
+      handlers.isSessionOwner.mockReturnValue(false);
+      const signature = createHmac('sha256', scenario === 'untrusted' ? 'wrong-secret' : 'secret')
+        .update(`botmux-chat-defaults-v1:${MY_APP_ID}:${chatId}:ambient`).digest('base64url');
+      mockSignedChatContext.mockResolvedValue({ fetchStatus: 'ok', mode: 'group', description: 'marker\nBOTMUX1:' + signature });
+      const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, chatId, chatType: 'group', messageId: 'msg-' + chatId,
+        content: JSON.stringify({ text: 'hello without mentioning this bot' }),
+        mentions: scenario === 'redirect' ? [{ key: '@_other', name: 'Other', id: { open_id: 'ou_other' } }] : [],
+      });
+      const signedContextCallsBefore = mockSignedChatContext.mock.calls.length;
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+      if (scenario === 'plain') expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({ scope: 'chat', anchor: chatId }));
+      else expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(mockSignedChatContext.mock.calls.length - signedContextCallsBefore).toBe(scenario === 'denied' ? 0 : 1);
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    },
+  );
+
   it('ambient: a top-level message that @mentions ANOTHER member (not this bot) is ignored — yields the turn', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
     mockGetChatMode.mockResolvedValue('group');
@@ -6247,6 +6231,7 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_only_this_user'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_only_this_user'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: 'ou_random_user',
@@ -6287,6 +6272,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
       // true), which would route through the single-user relaxation instead and
       // never exercise the branch under test.
       resolvedAllowedUsers: ['ou_someone_else'],
+      resolvedBlockedUsers: [],
     });
   }
 
@@ -6406,6 +6392,32 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
       content: JSON.stringify({ text: '/t 偷偷开工' }),
       messageId: 'msg-plain-forcetopic',
       chatId: 'chat-plain-2',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('话题群新话题（未 @）发送者在黑名单、开关开 → 仍静默不自动开工（blocked 纯否决腿）', async () => {
+    // 回归：blocked 是纯否决腿。未 @ 的 blocked 消息在 checkGroupMessageAccess
+    // 落 'ignore'，但不得在 autoStartOnNewTopic 分支被当作新话题种子复活——
+    // 即便该话题群已开启自动开工。messageListener 观察者订阅是另一条 relax 腿，
+    // 不在此断言范围。
+    setupAutoTopicBot(true);
+    mockGetBot.mockReturnValue({
+      ...mockGetBot(),
+      resolvedBlockedUsers: [USER_OPEN_ID],
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '被拉黑者发的新话题种子' }),
+      messageId: 'msg-topic-blocked-seed',
+      chatId: 'chat-topic-blocked',
       chatType: 'group',
     });
 
@@ -7215,6 +7227,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_some_other_human'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_some_other_human'],  // USER_OPEN_ID not in list
+      resolvedBlockedUsers: [],
     });
     const event = makeIntroduceEvent({
       mentions: [
@@ -7354,6 +7367,34 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
       'om_feedback_negative',
       JSON.stringify({ type: 'negative-followup-card' }),
     );
+  });
+
+  it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({ afterAck });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_toggle', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps an inline confirmation toast in the ACK and handles publisher rejection', async () => {
+    const afterAck = vi.fn(async () => { throw new Error('temporary publish failure'); });
+    const toast = { type: 'warning', content: 'confirm empty selection' };
+    handlers.handleCardAction.mockResolvedValue({ afterAck, toast });
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'ask_submit', ask_id: 'inline' } },
+      operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_inline' },
+    });
+    expect(result).toEqual({ toast });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
@@ -8502,6 +8543,7 @@ describe('im.message.receive_v1 — botOpenId startup race', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       botOpenId: undefined,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     };
     mockGetBot.mockReturnValue(botState);
     // The probe resolves the open_id: token call, then bot-info call.
@@ -8532,6 +8574,7 @@ describe('ensureBotOpenId — dedup', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       botOpenId: undefined,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     };
     mockGetBot.mockReturnValue(botState);
     // Each probe = 2 fetches (token + bot-info). Same payload works for both.
@@ -9155,5 +9198,77 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
       scope: 'chat',
       anchor: 'chat-cmd',
     }));
+  });
+});
+
+describe('chat.bot_added observer hook', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    emitHookEventMock.mockClear();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  // 拉群信号钩子（应急群自动化的触发点）：bot 被拉进群即发射，早于 owner 自动邀请
+  // 与 autoStart 判定；payload 只带 chatId + operatorOpenId，去重由 scheduleAckSafeEvent
+  // 的 event claim 保证（重推不重复发射）。
+  it('fires once when the bot is added to a chat', async () => {
+    const event = {
+      chat_id: 'chat-emergency-1',
+      operator_id: { open_id: USER_OPEN_ID },
+    };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+
+    const calls = emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({
+      larkAppId: MY_APP_ID,
+      chatId: 'chat-emergency-1',
+      operatorOpenId: USER_OPEN_ID,
+    });
+
+    // 同一事件重推（同 event claim key）不再发射。
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
+  });
+
+  it('runs the per-bot group-join command once when enabled, independent of autoStart', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: ' bash /opt/on-join.sh ' });
+    const event = { chat_id: 'chat-emergency-2', operator_id: { open_id: USER_OPEN_ID } };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+    expect(runGroupJoinCommandMock).toHaveBeenCalledWith('bash /opt/on-join.sh', {
+      larkAppId: MY_APP_ID, chatId: 'chat-emergency-2', operatorOpenId: USER_OPEN_ID,
+    });
+
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run the group-join command when disabled or blank', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: false, groupJoinCommand: 'bash /opt/on-join.sh' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-off', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: '   ' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-blank', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).not.toHaveBeenCalled();
   });
 });

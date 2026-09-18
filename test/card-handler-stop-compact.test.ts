@@ -219,6 +219,38 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const replyCards = await import('../src/core/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_running' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    const update = vi.spyOn(replyCards, 'updateTurnReplyCard').mockResolvedValue(undefined);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_running';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(sendWorkerSessionInputMock).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+      expect(result.card).toBeUndefined();
+      expect(update).toHaveBeenCalled();
+    } finally { read.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects a stale reply-card Stop button while a later turn is running', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_new_turn' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_old_turn';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); }
+  });
   it('sends term_action ctrlc to the worker and re-renders the card as interrupted', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('stop_turn'), depsWith(ds), LARK_APP_ID);

@@ -24,6 +24,14 @@ import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
+import {
+  inspectFleetProcess,
+  signalAttestedFleetProcess,
+  type FleetProcessAttestation,
+  type FleetProcessIdentityRuntime,
+  type FleetProcessInspection,
+  fleetProcessIdentityRuntime,
+} from './fleet-process-identity.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -248,12 +256,55 @@ export function resolveFleetMembers(): FleetBotSpec[] {
   return [...resolveFleetBots(), resolveDashboardSpec()];
 }
 
-/** True if a live fleet supervisor is already running (per fleet-state pid + kill -0). */
-export function liveSupervisorPid(): number | undefined {
-  const state = readFleetState(fleetStatePath());
+function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
+  if (!state.supervisorEntry || !commandLine.includes(state.supervisorEntry)) return false;
+  return state.supervisorEntry.includes('index-supervisor') || commandLine.includes('__supervisor');
+}
+
+export function inspectSupervisorState(
+  state: FleetState,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessInspection {
   const pid = state?.supervisorPid ?? 0;
-  if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
-  try { process.kill(pid, 0); return pid; } catch { return undefined; }
+  if (pid > 1 && !state.supervisorCommand && !state.supervisorEntry) return { status: 'unverifiable' };
+  return inspectFleetProcess(
+    pid,
+    state.supervisorProcessStart,
+    state.supervisorPidNamespace,
+    commandLine => state.supervisorCommand
+      ? commandLine === state.supervisorCommand
+      : supervisorCommandMatches(state, commandLine),
+    runtime,
+  );
+}
+
+export function liveSupervisorTarget(
+  statePath: string = fleetStatePath(),
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessAttestation | undefined {
+  const state = readFleetState(statePath);
+  const pid = state?.supervisorPid ?? 0;
+  if (!state) return undefined;
+  const inspection = inspectSupervisorState(state, runtime);
+  if (inspection.status === 'unverifiable') {
+    throw new Error(`fleet: 无法核验 supervisor pid ${pid} 的进程身份；为避免双实例，已中止操作`);
+  }
+  return inspection.status === 'exact' ? inspection.attestation : undefined;
+}
+
+function attestedSupervisorAlive(target: FleetProcessAttestation): boolean {
+  const inspection = inspectFleetProcess(
+    target.pid,
+    target.processStart,
+    target.pidNamespace,
+    commandLine => commandLine === target.commandLine,
+  );
+  return inspection.status === 'exact';
+}
+
+/** True only when fleet-state identifies this exact supervisor generation. */
+export function liveSupervisorPid(): number | undefined {
+  return liveSupervisorTarget()?.pid;
 }
 
 export interface StartFleetResult {
@@ -319,19 +370,20 @@ export interface StopFleetResult {
  * a time), same contract as startFleetViaSupervisor.
  */
 export function stopFleet(timeoutMs = DEFAULT_STOP_TIMEOUT_MS): StopFleetResult {
-  const pid = liveSupervisorPid();
-  if (pid === undefined) return { action: 'not-running', supervisorPid: 0 };
-  try { process.kill(pid, 'SIGTERM'); } catch { return { action: 'not-running', supervisorPid: pid }; }
+  const target = liveSupervisorTarget();
+  if (!target) return { action: 'not-running', supervisorPid: 0 };
+  const pid = target.pid;
+  if (!signalAttestedFleetProcess(target, 'SIGTERM')) return { action: 'not-running', supervisorPid: pid };
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() < deadline) {
-    if (!pidAlive(pid)) return { action: 'stopped', supervisorPid: pid };
+    if (!attestedSupervisorAlive(target)) return { action: 'stopped', supervisorPid: pid };
     sleepSyncMs(STOP_POLL_INTERVAL_MS);
   }
-  if (!pidAlive(pid)) return { action: 'stopped', supervisorPid: pid };
+  if (!attestedSupervisorAlive(target)) return { action: 'stopped', supervisorPid: pid };
   // Supervisor outlasted its graceful window — hard-kill it. Its daemon children
   // already got SIGTERM from stopAll() and will exit on their own.
-  try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-  return pidAlive(pid) ? { action: 'timeout', supervisorPid: pid } : { action: 'stopped', supervisorPid: pid };
+  signalAttestedFleetProcess(target, 'SIGKILL');
+  return attestedSupervisorAlive(target) ? { action: 'timeout', supervisorPid: pid } : { action: 'stopped', supervisorPid: pid };
 }
 
 export interface RestartFleetResult {
@@ -409,7 +461,12 @@ export function projectFleetStatus(
  * on its next tick, but status should never lie about liveness in the meantime.
  */
 export function readFleetStatus(statePath: string = fleetStatePath()): FleetStatus {
-  return projectFleetStatus(readFleetState(statePath));
+  const state = readFleetState(statePath);
+  const status = projectFleetStatus(state);
+  if (!state || state.supervisorPid <= 1) return status;
+  const inspection = inspectSupervisorState(state);
+  status.supervisorAlive = inspection.status === 'exact';
+  return status;
 }
 
 /** Block for `ms` without a busy-spin (one-shot CLI; stalling its loop is fine). */
@@ -446,9 +503,16 @@ export function waitFleetOnline(
   let pending: string[] = [...want];
   for (;;) {
     const status = readFleetStatus(statePath);
-    const onlineNames = new Set(
-      status.rows.filter((r) => want.has(r.name) && r.status === 'online' && r.alive).map((r) => r.name),
-    );
+    // Member rows are a projection owned by the supervisor. Never accept old
+    // rows merely because their numeric PIDs happen to exist: until the exact
+    // supervisor generation is attested, none of its projection proves that the
+    // newly-started fleet is healthy. This closes the same cross-namespace/PID
+    // reuse hole as stop/restart signalling.
+    const onlineNames = status.supervisorAlive
+      ? new Set(status.rows
+        .filter((r) => want.has(r.name) && r.status === 'online' && r.alive)
+        .map((r) => r.name))
+      : new Set<string>();
     pending = [...want].filter((n) => !onlineNames.has(n));
     if (pending.length === 0) return { healthy: true, online: expected, expected, pending: [] };
     if (Date.now() >= deadline) return { healthy: false, online: expected - pending.length, expected, pending };
@@ -496,8 +560,8 @@ export function startBotViaSupervisor(
 ): StartBotSupervisorResult {
   const spec = resolveFleetBotByAppId(appId);
   if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  const supervisorPid = liveSupervisorPid();
-  if (supervisorPid === undefined) {
+  const supervisorTarget = liveSupervisorTarget();
+  if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start', name: spec.name };
   }
   // Already online+alive? No-op.
@@ -508,7 +572,7 @@ export function startBotViaSupervisor(
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'start-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
   });
-  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+  if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
   const health = waitFleetOnline([spec.name], timeoutMs);
@@ -530,8 +594,8 @@ export function stopBotViaSupervisor(
 ): StopBotSupervisorResult {
   const spec = resolveFleetBotByAppId(appId);
   if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  const supervisorPid = liveSupervisorPid();
-  if (supervisorPid === undefined) {
+  const supervisorTarget = liveSupervisorTarget();
+  if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
   const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
@@ -550,7 +614,7 @@ export function stopBotViaSupervisor(
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'stop-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
   });
-  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+  if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
   // Poll until the bot has actually come to rest (stopped/errored/absent), or

@@ -17,6 +17,7 @@ import {
   parseHookCommand,
   prepareHookPayload,
   runHookCommandForTest,
+  runGroupJoinCommand,
   type HookConfig,
 } from '../src/services/hook-runner.js';
 
@@ -279,6 +280,45 @@ describe('filterMatches', () => {
 
   it('treats absent filters as a match', () => {
     expect(filterMatches(undefined, { event: 'schedule.fired', chatId: 'oc_1' })).toBe(true);
+  });
+});
+
+describe('runGroupJoinCommand', () => {
+  it('passes the join payload on stdin and BOTMUX_JOIN_* env without leaking secrets', async () => {
+    const script = join(tmpDir, 'join-writer.js');
+    const output = join(tmpDir, 'join.json');
+    writeFileSync(script, `
+      import { writeFileSync } from 'node:fs';
+      let input = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', chunk => { input += chunk; });
+      process.stdin.on('end', () => writeFileSync(process.argv[2], JSON.stringify({ input: JSON.parse(input), env: process.env })));
+    `);
+    process.env.LARK_APP_SECRET = 'super-secret';
+    try {
+      runGroupJoinCommand(`${process.execPath} ${script} ${output}`, {
+        larkAppId: 'cli_app', chatId: 'oc_join', operatorOpenId: 'ou_op',
+      });
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(output) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      await new Promise(r => setTimeout(r, 50));
+      const got = JSON.parse(readFileSync(output, 'utf-8'));
+      expect(got.input).toMatchObject({ event: 'chat.bot_added', larkAppId: 'cli_app', chatId: 'oc_join', operatorOpenId: 'ou_op' });
+      expect(got.env).toMatchObject({
+        BOTMUX_HOOK_EVENT: 'chat.bot_added',
+        BOTMUX_JOIN_CHAT_ID: 'oc_join',
+        BOTMUX_JOIN_LARK_APP_ID: 'cli_app',
+        BOTMUX_JOIN_OPERATOR_OPEN_ID: 'ou_op',
+      });
+      expect(got.env.LARK_APP_SECRET).toBeUndefined();
+      expect(got.env.BOTMUX_SESSION_ID).toBeUndefined();
+    } finally {
+      delete process.env.LARK_APP_SECRET;
+    }
+  });
+
+  it('never throws on an unparsable command', () => {
+    expect(() => runGroupJoinCommand('bash "unterminated', { larkAppId: 'a', chatId: 'oc_x' })).not.toThrow();
   });
 });
 

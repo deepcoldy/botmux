@@ -19224,6 +19224,58 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .connector-dedup-field { display: grid; gap: 7px; }
 
+.connector-group-name-config,
+.connector-group-name-input {
+  display: grid;
+  gap: 7px;
+}
+
+.connector-group-name-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.connector-group-name-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--fg);
+  text-align: left;
+  box-shadow: none;
+}
+
+.connector-group-name-option:hover,
+.connector-group-name-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  transform: none;
+}
+
+.connector-group-name-option > span:last-child { display: grid; gap: 4px; min-width: 0; }
+.connector-group-name-option b { color: var(--fg); font-size: 12px; }
+.connector-group-name-option small { color: var(--muted); font-size: 11px; font-weight: 600; line-height: 1.4; }
+.connector-group-name-option.selected .connector-strategy-radio { border: 4px solid var(--accent); }
+
+.connector-group-name-input > small {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.connector-group-name-input > small span {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
 .connector-new-group-note {
   margin: 0;
   padding: 9px 11px;
@@ -24813,6 +24865,20 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-card-setting-group > .bd-row {
   margin-top: 0;
+}
+
+.bot-defaults-page .bd-card-settings .bd-card-display {
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.bot-defaults-page .bd-card-display > .bd-field {
+  width: min(100%, 420px);
+}
+
+.bot-defaults-page .bd-card-display > .bd-card-setting-copy {
+  max-width: 72ch;
+  margin: 0;
 }
 
 .bot-defaults-page .bd-card-control-list {
@@ -33812,3 +33878,20 @@ a.card-menu-item {
     width: min(400px, calc(100vw - 24px));
   }
 }
+
+.group-default-models-row {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 0;
+}
+.group-default-models-row > strong { flex-basis: 100%; }
+.group-default-models-field { display: grid; gap: 6px; flex: 1 1 180px; }
+.group-default-models-row input { width: 100%; min-width: 0; }
+.group-default-models-row > small { flex-basis: 100%; }
+
+.group-default-models-row .sect-sort-menu,
+.group-default-models-row .sect-sort-menu > summary { width: 100%; min-width: 0; }
+.group-default-models-row .sect-sort-value { max-width: none; }
+.group-default-models-field { min-width: 0; }

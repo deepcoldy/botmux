@@ -178,10 +178,10 @@ describe('schedule-store', () => {
       expect(explicitTrue).not.toBe(absent);
 
       // create-or-return-identical: same id + silent flip must conflict, not no-op.
-      createTask({ ...TASK_PARAMS, id: 'fixed-id1', silent: true });
-      expect(() => createTask({ ...TASK_PARAMS, id: 'fixed-id1' })).toThrow(IdempotencyConflictError);
-      const same = createTask({ ...TASK_PARAMS, id: 'fixed-id1', silent: true });
-      expect(same.id).toBe('fixed-id1');
+      createTask({ ...TASK_PARAMS, id: 'fixed_id1', silent: true });
+      expect(() => createTask({ ...TASK_PARAMS, id: 'fixed_id1' })).toThrow(IdempotencyConflictError);
+      const same = createTask({ ...TASK_PARAMS, id: 'fixed_id1', silent: true });
+      expect(same.id).toBe('fixed_id1');
     });
 
     it('keeps the legacy single-chat canonical hash and persisted shape byte-for-byte compatible', async () => {
@@ -215,6 +215,56 @@ describe('schedule-store', () => {
         chatId: 'oc_primary',
         chatIds: ['oc_primary', 'oc_second', 'oc_third'],
       });
+    });
+
+    it('accepts workflow-derived wf3_/wf_ task ids within the 50-char alphabet', async () => {
+      const { createTask, getTask } = await freshImport();
+      const wf3 = createTask({ ...TASK_PARAMS, id: `wf3_${'a'.repeat(46)}` });
+      expect(wf3.id).toHaveLength(50);
+      const wf = createTask({ ...TASK_PARAMS, name: 'v2', id: `wf_${'b'.repeat(47)}` });
+      expect(wf.id).toHaveLength(50);
+      expect(getTask(wf3.id)?.id).toBe(wf3.id);
+      expect(getTask(wf.id)?.id).toBe(wf.id);
+    });
+
+    it('rejects task ids outside the [0-9a-z_]{1,50} alphabet', async () => {
+      const { createTask, listTasks } = await freshImport();
+      expect(() => createTask({ ...TASK_PARAMS, id: 'has-dash' })).toThrow();
+      expect(() => createTask({ ...TASK_PARAMS, id: 'UpperCase' })).toThrow();
+      expect(() => createTask({ ...TASK_PARAMS, id: 'a/b' })).toThrow();
+      expect(() => createTask({ ...TASK_PARAMS, id: 'a'.repeat(51) })).toThrow();
+      expect(listTasks()).toHaveLength(0);
+    });
+
+    it('canonical hash: ownerOpenId is absent for ownerless input and distinguishes owners', async () => {
+      const { canonicalScheduleInput, createTask } = await freshImport();
+      const { computeInputHash } = await import('../src/utils/canonical-input-hash.js');
+
+      const ownerless = computeInputHash(canonicalScheduleInput(TASK_PARAMS));
+      // Undefined ownerOpenId is dropped by the canonical serializer, so old
+      // inputs hash exactly as before the field existed.
+      expect(computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, ownerOpenId: undefined })))
+        .toBe(ownerless);
+      const ownerA1 = computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, ownerOpenId: 'ou_a' }));
+      const ownerA2 = computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, ownerOpenId: 'ou_a' }));
+      const ownerB = computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, ownerOpenId: 'ou_b' }));
+      expect(ownerA1).toBe(ownerA2);
+      expect(ownerA1).not.toBe(ownerless);
+      expect(ownerA1).not.toBe(ownerB);
+
+      // ownerOpenId is part of create-or-return-identical input: same id with a
+      // different owner is an idempotency conflict, not a silent no-op.
+      createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', ownerOpenId: 'ou_a' });
+      expect(() => createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', ownerOpenId: 'ou_b' }))
+        .toThrow('IdempotencyConflict');
+    });
+
+    it('persists ownerOpenId across reloads', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask({ ...TASK_PARAMS, ownerOpenId: 'ou_creator' });
+      expect(task.ownerOpenId).toBe('ou_creator');
+      const store2 = await freshImport();
+      expect(store2.getTask(task.id)?.ownerOpenId).toBe('ou_creator');
     });
   });
 
@@ -474,7 +524,7 @@ describe('schedule-store', () => {
 
     it('preserves modern and legacy scope values across reload/migration', async () => {
       const store1 = await freshImport();
-      const modern = store1.createTask({ ...TASK_PARAMS, id: 'modern-scope', scope: 'thread' });
+      const modern = store1.createTask({ ...TASK_PARAMS, id: 'modern_scope', scope: 'thread' });
       expect(modern.scope).toBe('thread');
 
       const fp = storeFp();
@@ -494,7 +544,7 @@ describe('schedule-store', () => {
       writeFileSync(fp, JSON.stringify(onDisk, null, 2), 'utf-8');
 
       const store2 = await freshImport();
-      expect(store2.getTask('modern-scope')?.scope).toBe('thread');
+      expect(store2.getTask('modern_scope')?.scope).toBe('thread');
       expect(store2.getTask('legacy-scope')?.scope).toBe('chat');
       expect(store2.getTask('legacy-scope')?.parsed).toEqual({
         kind: 'cron',
@@ -534,7 +584,7 @@ describe('schedule-store', () => {
 
     it('rolls back memory and disk when persistence fails before rename', async () => {
       const store = await freshImport();
-      const original = store.createTask({ ...TASK_PARAMS, id: 'durable-original' });
+      const original = store.createTask({ ...TASK_PARAMS, id: 'durable_original' });
       const fp = storeFp();
       const before = readFileSync(fp, 'utf-8');
 
@@ -557,26 +607,26 @@ describe('schedule-store', () => {
 
     it('does not lose updates when a stale module instance mutates later', async () => {
       const store1 = await freshImport();
-      store1.createTask({ ...TASK_PARAMS, id: 'from-store-1-a', name: 'one-a' });
+      store1.createTask({ ...TASK_PARAMS, id: 'from_store_1_a', name: 'one-a' });
 
       const store2 = await freshImport();
-      expect(store2.listTasks().map(task => task.id)).toEqual(['from-store-1-a']);
+      expect(store2.listTasks().map(task => task.id)).toEqual(['from_store_1_a']);
 
       // store2 now has a stale in-memory map. store1 commits another task,
       // then store2 writes. The lock-internal forced reload must retain both.
-      store1.createTask({ ...TASK_PARAMS, id: 'from-store-1-b', name: 'one-b' });
-      store2.createTask({ ...TASK_PARAMS, id: 'from-store-2', name: 'two' });
+      store1.createTask({ ...TASK_PARAMS, id: 'from_store_1_b', name: 'one-b' });
+      store2.createTask({ ...TASK_PARAMS, id: 'from_store_2', name: 'two' });
 
       const persisted = JSON.parse(readFileSync(storeFp(), 'utf-8'));
       expect(Object.keys(persisted).sort()).toEqual([
-        'from-store-1-a',
-        'from-store-1-b',
-        'from-store-2',
+        'from_store_1_a',
+        'from_store_1_b',
+        'from_store_2',
       ]);
       expect(store1.listTasks().map(task => task.id).sort()).toEqual([
-        'from-store-1-a',
-        'from-store-1-b',
-        'from-store-2',
+        'from_store_1_a',
+        'from_store_1_b',
+        'from_store_2',
       ]);
     });
   });

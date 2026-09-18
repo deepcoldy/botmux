@@ -28,7 +28,9 @@ interface DashboardSettings {
     recommendedRef: string;
   };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -65,6 +67,7 @@ interface DashboardSettings {
     targetDaemonOnline: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -177,8 +180,10 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
+    autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -213,6 +218,7 @@ function parseSettings(s: any): DashboardSettings {
       targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
+    crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -720,7 +726,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -864,11 +870,25 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('codexRpcInput', value)}
           />
           <ToggleRow
+            title={tr('settings.autoUpgradeCodexSessions')}
+            help={tr('settings.autoUpgradeCodexSessionsHelp')}
+            checked={settings.autoUpgradeCodexSessions}
+            disabled={dis || savingKey === 'autoUpgradeCodexSessions'}
+            onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
             disabled={dis || savingKey === 'bypassCodexHookTrust'}
             onChange={value => saveBoolean('bypassCodexHookTrust', value)}
+          />
+          <ToggleRow
+            title={tr('settings.hideCodexRateLimitModelNudge')}
+            help={tr('settings.hideCodexRateLimitModelNudgeHelp')}
+            checked={settings.hideCodexRateLimitModelNudge}
+            disabled={dis || savingKey === 'hideCodexRateLimitModelNudge'}
+            onChange={value => saveBoolean('hideCodexRateLimitModelNudge', value)}
           />
           <CodexNotifierSettingsEditor
             value={settings.codexNotifier}
@@ -882,6 +902,13 @@ function SettingsBody(props: {
             checked={settings.noVisibleOutputHint}
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+          <ToggleRow
+            title={tr('settings.crossPrincipalInterruption')}
+            help={tr('settings.crossPrincipalInterruptionHelp')}
+            checked={settings.crossPrincipalInterruption}
+            disabled={dis || savingKey === 'crossPrincipalInterruption'}
+            onChange={value => saveBoolean('crossPrincipalInterruption', value)}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>

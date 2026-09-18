@@ -1,0 +1,91 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { config } from '../src/config.js';
+import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
+
+const override = 'notice.hide_rate_limit_model_nudge=true';
+
+describe('Codex-family low-quota model-switch protection', () => {
+  let fixtureDir: string;
+  beforeEach(() => {
+    fixtureDir = mkdtempSync(join(tmpdir(), 'botmux-model-nudge-'));
+    vi.stubEnv('HOME', fixtureDir);
+    vi.stubEnv('CODEX_HOME', join(fixtureDir, '.codex'));
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+    mkdirSync(join(fixtureDir, '.codex'));
+    writeFileSync(join(fixtureDir, '.codex/config.toml'), 'model = "gpt-6-astra"\n');
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(fixtureDir, { recursive: true, force: true });
+  });
+
+  const launches = [
+    { kind: 'fresh', resume: false },
+    { kind: 'resume', resume: true, resumeSessionId: 'existing-thread' },
+    { kind: 'fork', resume: true, forkSession: true, resumeSessionId: 'existing-thread' },
+    { kind: 'RPC viewer', resume: true, remoteWsUrl: 'ws://127.0.0.1:9000', remoteThreadId: 'existing-thread' },
+  ];
+  const adapters = [
+    { cli: 'Codex', adapter: createCodexAdapter('/usr/bin/codex'), configFlag: '-c', launches },
+    { cli: 'SpineCodex path override', adapter: createCodexAdapter('/usr/bin/spine-codex'), configFlag: '-c', launches },
+    { cli: 'TraeX', adapter: createTraexAdapter('/usr/bin/traex'), configFlag: '-c', launches: launches.filter(l => l.kind !== 'fork') },
+    { cli: 'CoCo', adapter: createCocoAdapter('/usr/bin/coco'), configFlag: '--config', launches: launches.filter(l => l.kind === 'fresh' || l.kind === 'resume') },
+  ];
+  it.each(adapters.flatMap(({ cli, adapter, configFlag, launches }) => launches.map(launch => ({ cli, adapter, configFlag, kind: launch.kind, launch }))))(
+    'protects $cli $kind launches by default and preserves opt-out across reloads', ({ adapter, configFlag, launch }) => {
+      for (const enabled of [undefined, false, true]) {
+        if (enabled !== undefined) mergeDashboardConfig({ hideCodexRateLimitModelNudge: enabled });
+        for (const restricted of [false, true]) {
+          const args = adapter.buildArgs({
+            sessionId: 'botmux-thread', ...launch,
+            model: 'gpt-6-astra',
+            disableCliBypass: restricted,
+            hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
+          });
+          expect(args.includes(override)).toBe(enabled !== false);
+          expect(args).not.toContain('notice.hide_rate_limit_model_nudge=false');
+          if (enabled !== false) {
+            expect(args[args.indexOf(override) - 1]).toBe(configFlag);
+            if (args.includes('existing-thread')) {
+              expect(args.indexOf(override)).toBeLessThan(args.indexOf('existing-thread'));
+            }
+          }
+          if (adapter.id === 'coco') {
+            expect(args).toContain('model.name=gpt-6-astra');
+            expect(args[args.indexOf('model.name=gpt-6-astra') - 1]).toBe('--config');
+            expect(args.slice(0, 2)).toEqual([launch.resume ? '--resume' : '--session-id', 'botmux-thread']);
+          } else if (!launch.remoteWsUrl) {
+            expect(args[args.indexOf('--model') + 1]).toBe('gpt-6-astra');
+          }
+        }
+      }
+      expect(readFileSync(join(fixtureDir, '.codex/config.toml'), 'utf8')).toBe('model = "gpt-6-astra"\n');
+    },
+  );
+
+  it('ignores malformed persisted values and retains the default protection', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { hideCodexRateLimitModelNudge: 'false' } }));
+    expect(config.hideCodexRateLimitModelNudge).toBe(true);
+  });
+
+  it.each(ALL_CLI_IDS.filter(id => id !== 'codex' && id !== 'traex' && id !== 'coco'))(
+    'does not alter %s launch arguments when protection is toggled', (id) => {
+      const adapter = createCliAdapterSync(id, `/usr/bin/${id}`);
+      const args = adapter.buildArgs({
+        sessionId: 'other-cli', resume: false,
+        hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
+      });
+      expect(args.join(' ')).not.toContain('hide_rate_limit_model_nudge');
+      expect(args).toEqual(adapter.buildArgs({
+        sessionId: 'other-cli', resume: false, hideRateLimitModelNudge: false,
+      }));
+    },
+  );
+});

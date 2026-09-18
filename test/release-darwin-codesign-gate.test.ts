@@ -254,6 +254,24 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
     expect(STABLE_SIGN).not.toMatch(/--sign\s+['"]?-['"]?/);
   });
 
+  it('registers the temporary keychain in the user search domain before importing', () => {
+    // On a headless CI runner a freshly `security create-keychain`d keychain is
+    // not added to the user search domain automatically. `security import -k`
+    // and `set-key-partition-list` resolve the imported key through that search
+    // domain, so without this step the stable sign job dies with
+    // errSecItemNotFound ("The specified item could not be found in the
+    // keychain") before any binary is signed. electron-builder performs this
+    // registration internally for the desktop job; this CLI script must do it
+    // explicitly.
+    const register = STABLE_SIGN.indexOf('security list-keychain -d user -s "$KEYCHAIN_PATH"');
+    const importCert = STABLE_SIGN.indexOf('security import "$CERT_PATH"');
+    expect(register).toBeGreaterThan(-1);
+    expect(importCert).toBeGreaterThan(-1);
+    expect(register).toBeLessThan(importCert);
+    // Restore the previous search list before deleting the temporary keychain.
+    expect(STABLE_SIGN).toMatch(/list-keychain -d user -s "\$\{ORIGINAL_KEYCHAINS\[@\]\}"/);
+  });
+
   it('rejects an unstable identity and pins one designated requirement across arches', () => {
     expect(STABLE_SIGN).toContain('Developer ID Application:');
     expect(STABLE_SIGN).toContain('TeamIdentifier');

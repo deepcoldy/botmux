@@ -327,7 +327,7 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  *     路径底层 claude 从不注入此 flag，剥除是 no-op。
  * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
- * 通道，不丢功能。关闭启动更新的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
+ * 通道。关闭启动更新和额度换模型提醒的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
  * worker 会在极少数仍出现选择器的启动中自动选择非升级项，host 侧仍会做每日只读检查。
  * `-c` 按 botmux 注入白名单精确识别，用户自带的
  * `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略

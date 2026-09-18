@@ -30,6 +30,17 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn((s: Session) => { store.set(s.sessionId, s); }),
   getSession: vi.fn((id: string) => store.get(id)),
   listSessions: vi.fn(() => [...store.values()]),
+  mutateOwnedSessionsAtomically: vi.fn((ids: readonly string[], mutate: (fresh: Map<string, Session>) => unknown) => {
+    const fresh = new Map<string, Session>();
+    for (const id of ids) {
+      const session = store.get(id);
+      if (!session) throw new Error(`atomic session mutation cannot find ${id}`);
+      fresh.set(id, structuredClone(session));
+    }
+    const result = mutate(fresh);
+    for (const [id, session] of fresh) store.set(id, session);
+    return { result, rows: fresh };
+  }),
   closeSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -71,6 +82,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  ensureReadonlyTaskContinuationAttached: vi.fn(),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);

@@ -32,6 +32,8 @@ import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotM
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
@@ -1074,10 +1076,11 @@ async function handleScheduleCommand(
     const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
     // Default to group top-level: a schedule created inside a topic (including
     // an adopted one) must not pin its results to that topic. NL 路径的
-    // extractScheduleModifiers 只有 top-level/new-topic 关键词，没有 topic
-    // 修饰符；topic 执行只能经 CLI --topic 或 Dashboard 表单显式指定。
+    // extractScheduleModifiers 只有 top-level/new-topic/task（独立话题/专属
+    // 话题）关键词，没有 topic 修饰符；topic 执行只能经 CLI --topic 或
+    // Dashboard 表单显式指定。
     const executionPosition = (requestedPosition ?? 'top-level') as ScheduleExecutionPosition;
-    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
@@ -1123,9 +1126,11 @@ async function handleScheduleCommand(
     const positionNote = '\n' + t(
       executionPosition === 'new-topic'
         ? 'schedule.deliver_new_topic'
-        : executionPosition === 'top-level'
-          ? 'schedule.position_top_level'
-          : 'schedule.position_topic',
+        : executionPosition === 'task'
+          ? 'schedulePos.positionNote'
+          : executionPosition === 'top-level'
+            ? 'schedule.position_top_level'
+            : 'schedule.position_topic',
       undefined,
       loc,
     );
@@ -1492,6 +1497,8 @@ export async function handleCardCommand(
   const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
+  const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
+    && ['claude-code', 'codex'].includes(ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1523,13 +1530,13 @@ export async function handleCardCommand(
   if (sub === 'off') {
     const r = await setCardMode(larkAppId, chatId, true);
     if (ds) ds.streamingCardForced = undefined;
-    await reply(r.ok ? t('cmd.card.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    await reply(r.ok ? t(managedReplyMode ? 'cmd.card.reply_off_ok' : 'cmd.card.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
     return;
   }
   if (sub === 'on') {
     const r = await setCardMode(larkAppId, chatId, false);
     if (ds) ds.streamingCardForced = undefined;
-    await reply(r.ok ? t('cmd.card.on_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    await reply(r.ok ? t(managedReplyMode ? 'cmd.card.reply_on_ok' : 'cmd.card.on_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
     return;
   }
   if (sub === '' || sub === 'show') {
@@ -1631,6 +1638,15 @@ export async function handleCotCommand(
     }
     ds.cotForced = true;
     if (ds.lastThinkingUpdate) {
+      if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
+        const update = ds.lastThinkingUpdate;
+        await updateTurnReplyCard(ds, update.turnId, {
+          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
+          activity: publicReplyCardActivity(update.entries),
+        }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
+        { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        return;
+      }
       // Turn in flight with thinking already accumulated — render right away
       // (the worker only emits on NEW entries, so waiting could miss a turn
       // whose thinking phase is over).
@@ -5346,6 +5362,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.tabs', undefined, loc),
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),

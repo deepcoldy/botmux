@@ -7,6 +7,10 @@ import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
 import { confirm } from './confirm-modal.js';
+import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../../services/connector-lifecycle-group-name.js';
 
 interface Connector {
   id: string;
@@ -31,6 +35,10 @@ interface Connector {
   suppressFinalOutput?: boolean;
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
+  lifecycleGroupName?: {
+    mode: 'default' | 'fixed' | 'template';
+    text?: string;
+  };
 }
 
 interface ConnectorTopicMessageExtractor {
@@ -64,6 +72,8 @@ interface CreateForm {
   allowChats: string[];
   deduplicate: boolean;
   dedup: string;
+  groupNameMode: 'default' | 'fixed' | 'template';
+  groupNameText: string;
   instruction: string;
   topicMessageMode: 'default' | 'custom' | 'template' | 'none';
   topicMessageText: string;
@@ -105,6 +115,8 @@ const emptyForm: CreateForm = {
   allowChats: [],
   deduplicate: false,
   dedup: '',
+  groupNameMode: 'default',
+  groupNameText: '',
   instruction: '',
   topicMessageMode: 'default',
   topicMessageText: '',
@@ -152,6 +164,25 @@ export function buildConnectorTopicMessageConfig(
   } catch {
     return { ok: false, error: 'connectors.errTopicExtractors' };
   }
+}
+
+export function trimConnectorLifecycleGroupNameInput(text: string): string {
+  return Array.from(text).slice(0, CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH).join('');
+}
+
+export function buildConnectorLifecycleGroupNameConfig(
+  mode: CreateForm['groupNameMode'],
+  rawText: string,
+):
+  | { ok: true; value: NonNullable<Connector['lifecycleGroupName']> }
+  | { ok: false; error: 'connectors.errGroupName' | 'connectors.errGroupNameTemplate' } {
+  const text = rawText.trim();
+  if (mode === 'default') return { ok: true, value: { mode } };
+  if (!text) return { ok: false, error: 'connectors.errGroupName' };
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'connectors.errGroupNameTemplate' };
+  }
+  return { ok: true, value: { mode, text } };
 }
 
 export function buildConnectorKindOptions(
@@ -356,6 +387,8 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     allowChats: connector.target.allowChats || [],
     deduplicate: Boolean(connector.lifecycleExtractors?.dedupKey),
     dedup: connector.lifecycleExtractors?.dedupKey || '',
+    groupNameMode: connector.lifecycleGroupName?.mode || 'default',
+    groupNameText: connector.lifecycleGroupName?.text || '',
     instruction: connector.promptEnvelope?.instruction || '',
     topicMessageMode: connector.topicMessage?.mode || 'default',
     topicMessageText: connector.topicMessage?.text || '',
@@ -640,6 +673,15 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       const dedup = form.dedup.trim();
       if (form.deduplicate && !dedup) { setCreateMsg({ text: tr('connectors.errDedup'), error: true }); return; }
       body.lifecycleExtractors = form.deduplicate ? { dedupKey: dedup } : null;
+      const lifecycleGroupName = buildConnectorLifecycleGroupNameConfig(
+        form.groupNameMode,
+        form.groupNameText,
+      );
+      if (!lifecycleGroupName.ok) {
+        setCreateMsg({ text: tr(lifecycleGroupName.error), error: true });
+        return;
+      }
+      body.lifecycleGroupName = lifecycleGroupName.value;
     } else {
       body.lifecycleExtractors = null;
     }
@@ -715,6 +757,8 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           workflowId: '',
           manualChatId: '',
           dedup: '',
+          groupNameMode: 'default',
+          groupNameText: '',
           secret: '',
           instruction: '',
           additionalBotIds: [],
@@ -1012,6 +1056,51 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                   <input id="cn-dedup" value={form.dedup} onChange={e => patchForm({ dedup: e.currentTarget.value })} placeholder={tr('connectors.fDedupPh')} />
                 </label>
               ) : null}
+              <div className="connector-group-name-config">
+                <FieldTitle help={tr('connectors.groupNameHint')}>
+                  {tr('connectors.groupName')}
+                </FieldTitle>
+                <div className="connector-group-name-options" role="radiogroup" aria-label={tr('connectors.groupName')}>
+                  {(['default', 'fixed', 'template'] as const).map(mode => {
+                    const labelSuffix = mode === 'default' ? 'Default' : mode === 'fixed' ? 'Fixed' : 'Template';
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={form.groupNameMode === mode}
+                        className={`connector-group-name-option${form.groupNameMode === mode ? ' selected' : ''}`}
+                        onClick={() => patchForm({ groupNameMode: mode })}
+                      >
+                        <span className="connector-strategy-radio" aria-hidden="true" />
+                        <span>
+                          <b>{tr(`connectors.groupName${labelSuffix}`)}</b>
+                          <small>{tr(`connectors.groupName${labelSuffix}Hint`)}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {form.groupNameMode === 'fixed' || form.groupNameMode === 'template' ? (
+                  <label className="connector-group-name-input" htmlFor="cn-group-name">
+                    <input
+                      id="cn-group-name"
+                      type="text"
+                      value={form.groupNameText}
+                      onChange={event => patchForm({ groupNameText: trimConnectorLifecycleGroupNameInput(event.currentTarget.value) })}
+                      placeholder={tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplatePh'
+                        : 'connectors.groupNameFixedPh')}
+                    />
+                    <small>
+                      {tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplateHelp'
+                        : 'connectors.groupNameFixedHelp')}
+                      <span>{Array.from(form.groupNameText).length}/{CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH}</span>
+                    </small>
+                  </label>
+                ) : null}
+              </div>
               <p className="connector-new-group-note">{tr('connectors.newGroupNotice')}</p>
             </div>
           ) : null}
@@ -1216,6 +1305,12 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
             <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
             <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageDynamicNote') }} />
           </>
+        ) : c.isToken && c.mode === 'new-group' ? (
+          <>
+            <p className="muted connector-created-help">{tr('connectors.usageNewGroupLede')}</p>
+            <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
+            <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageNewGroupNote') }} />
+          </>
         ) : c.isToken ? (
           <>
             <p className="muted connector-created-help">{tr('connectors.usageTokenLede')}</p>
@@ -1287,6 +1382,13 @@ function ConnectorList(props: {
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
             {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
+            {c.target.mode === 'new-group' && c.lifecycleGroupName?.mode && c.lifecycleGroupName.mode !== 'default' ? (
+              <div className="muted connector-item-note">
+                {tr(c.lifecycleGroupName.mode === 'template'
+                  ? 'connectors.groupNameListTemplate'
+                  : 'connectors.groupNameListFixed', { text: c.lifecycleGroupName.text || '' })}
+              </div>
+            ) : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'

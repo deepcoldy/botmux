@@ -8,6 +8,7 @@ import {
   filterAndPaginateSchedules,
   filterSchedules,
   kindCounts,
+  nextScheduleExecutionPosition,
   paginateSchedules,
   resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
@@ -204,6 +205,27 @@ describe('schedule-card-model · invariants', () => {
     expect(computeDeliveryButtonAvailability(topic, 'top-level')).toEqual({ enabled: true });
     expect(computeDeliveryButtonAvailability(topic, 'new-topic'))
       .toEqual({ enabled: true });
+  });
+
+  it('derives the dedicated-task placement and its cycle button states', () => {
+    // Rootless task: dedicated placement, next step parks at top level.
+    const task = makeTask({ executionPosition: 'task', scope: 'thread' });
+    expect(resolveScheduleExecutionPlacement(task)).toBe('task');
+    expect(nextScheduleExecutionPosition(task)).toBe('top-level');
+    // A materialized task (first-fire root written back) presents as an
+    // ordinary thread placement.
+    const materialized = makeTask({ executionPosition: 'task', scope: 'thread', rootMessageId: 'om_task' });
+    expect(resolveScheduleExecutionPlacement(materialized)).toBe('thread');
+    // Re-entering the same dedicated position is disabled with its own reason.
+    expect(computeDeliveryButtonAvailability(task, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.alreadyTask' });
+    // A single-chat fresh-topic task offers the dedicated-task step.
+    const fresh = makeTask({ executionPosition: 'new-topic', scope: 'chat' });
+    expect(computeDeliveryButtonAvailability(fresh, 'task')).toEqual({ enabled: true });
+    // The dedicated position is impossible for a multi-chat task.
+    const multi = makeTask({ executionPosition: 'new-topic', scope: 'chat', chatIds: ['oc_a', 'oc_b'] });
+    expect(computeDeliveryButtonAvailability(multi, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.taskMultiChat' });
   });
 
   it('filter / paginate / toRow do not mutate the input list', () => {

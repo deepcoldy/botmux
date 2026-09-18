@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   additionalConnectorBotIds,
+  buildConnectorLifecycleGroupNameConfig,
   buildConnectorTargetBody,
   buildConnectorInstructionUpdateBody,
   buildConnectorKindOptions,
   buildConnectorTopicMessageConfig,
   normalizeConnectorBotIds,
   replaceConnectorById,
+  trimConnectorLifecycleGroupNameInput,
 } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
@@ -149,5 +151,44 @@ describe('dashboard trusted topic templates', () => {
       ok: true,
       value: { mode: 'none' },
     });
+  });
+});
+
+describe('dashboard connector lifecycle group names', () => {
+  it('builds fixed and template group name configs', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('default', 'ignored')).toEqual({
+      ok: true,
+      value: { mode: 'default' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  固定处理群  ')).toEqual({
+      ok: true,
+      value: { mode: 'fixed', text: '固定处理群' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{payload.name}} {{$.payload.id}}')).toEqual({
+      ok: true,
+      value: { mode: 'template', text: '告警 {{payload.name}} {{$.payload.id}}' },
+    });
+  });
+
+  it('requires text for fixed and template group names', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  ')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{alert.*}}')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupNameTemplate',
+    });
+  });
+
+  it('trims group name input by Unicode code point, not UTF-16 code unit', () => {
+    const text = trimConnectorLifecycleGroupNameInput('😀'.repeat(61));
+
+    expect(text).toBe('😀'.repeat(60));
+    expect(Array.from(text)).toHaveLength(60);
   });
 });

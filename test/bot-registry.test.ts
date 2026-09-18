@@ -2306,6 +2306,24 @@ describe('loadBotConfigs', () => {
     expect(configs).toEqual([]);
   });
 
+  it.each([true, false, 'true', undefined])('signed chat defaults require boolean opt-in (%s)', (enabled) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaults: enabled,
+      signedChatDefaultsRegistryUrl: 'https://registry.example/lookup',
+    }]))[0];
+    expect(config.signedChatDefaults).toBe(enabled === true ? true : undefined);
+    expect(config.signedChatDefaultsRegistryUrl).toBe('https://registry.example/lookup');
+  });
+
+  it.each(['http://registry.example/lookup', 42, null, undefined])('ignores non-HTTPS registry configuration (%s)', (endpoint) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaultsRegistryUrl: endpoint,
+    }]))[0];
+    expect(config.signedChatDefaultsRegistryUrl).toBeUndefined();
+  });
+
   // ── defaultOncall parsing ────────────────────────────────────────────────
 
   it('should parse a fully-formed defaultOncall entry', () => {

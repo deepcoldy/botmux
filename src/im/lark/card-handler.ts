@@ -8,6 +8,8 @@ import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
+import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
+import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
@@ -1446,7 +1448,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (isAskCardAction(value?.action)) {
-    return handleAskCardAction(data);
+    return handleAskCardAction(data, { larkAppId });
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
@@ -3935,6 +3937,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       if (!ds.worker || ds.worker.killed) {
         return { toast: { type: 'warning', content: t('card.action.stop_no_worker', undefined, locDs) } };
+      }
+      if (typeof value.reply_card_turn_id === 'string') {
+        const key = replyCardKey(ds, value.reply_card_turn_id,
+          typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined);
+        const record = new TurnReplyCardStore(config.session.dataDir).read(key);
+        if (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered
+          || ds.replyCardRunningTurnId !== key.turnId) {
+          return { toast: { type: 'warning', content: locDs === 'en' ? 'This turn is no longer running.' : '这一轮已不在执行，停止操作未发送。' } };
+        }
+        sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+        void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
+          (body, type, uuid) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid }),
+          { dispatchAttempt: key.dispatchAttempt }).catch(error => logger.warn(`[reply-card] stop display: ${error.message}`));
+        return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
       }
       sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
       logger.info(`[${tag(ds)}] stop_turn: ^C sent (session kept alive)`);

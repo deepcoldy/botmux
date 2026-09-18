@@ -101,6 +101,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
@@ -711,6 +712,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getBot).mockReturnValue({
         config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       try {
@@ -745,6 +747,7 @@ describe('Card integration: full event flow', () => {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
           resolvedAllowedUsers: [],
+          resolvedBlockedUsers: [],
           botOpenId: 'ou_bot',
         } as any);
       }
@@ -760,6 +763,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getBot).mockReturnValue({
         config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       try {
@@ -793,6 +797,7 @@ describe('Card integration: full event flow', () => {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
           resolvedAllowedUsers: [],
+          resolvedBlockedUsers: [],
           botOpenId: 'ou_bot',
         } as any);
       }
@@ -865,6 +870,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -893,6 +899,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', globalGrants: ['ou_peer'] } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -921,6 +928,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', p2pOpen: true } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -950,6 +958,7 @@ describe('Card integration: full event flow', () => {
         // config.allowedUsers 是原始配置（hasAllowlist 据此判定）；resolvedAllowedUsers 是解析结果。
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_other_user'] } as any,
         resolvedAllowedUsers: ['ou_other_user'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
 

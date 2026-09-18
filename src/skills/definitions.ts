@@ -142,6 +142,37 @@ botmux chat rename "支付链路排障｜待验证" --proactive
 \`permission_denied\`、\`rate_limited\`、\`lark_api_error\`。
 `;
 
+const SESSION_RENAME_SKILL = `---
+name: botmux-session-rename
+description: 给当前任务/botmux 会话改名时触发——用户明确要求给当前任务或会话改名，或任务进入新阶段、现有标题已不准确时由 agent 主动规范命名。改的是 botmux/Dashboard 的会话标题，不是飞书群名，也不是飞书话题名。
+---
+
+# botmux-session-rename — 更新当前会话的 botmux 标题
+
+在会话内执行（会话自动识别，只能改**当前会话**，没有也不允许 \`--session-id\` 之类参数指定他人会话）：
+
+\`\`\`bash
+botmux session rename "排障｜支付链路超时"
+\`\`\`
+
+## 命名规范
+
+- 格式「类型｜具体事项」，例如：
+  - \`排障｜支付链路超时\`
+  - \`开发｜权限黑名单\`
+  - \`调研｜调度幂等设计\`
+- 简短、稳定、可读，让人在 Dashboard 和 \`/sessions\` 列表里一眼认出任务。
+- 只在**任务阶段发生实质变化**时改（排障 → 验证 → 收尾等），不要因细小进度反复改名。
+- 不写精确百分比、敏感信息（密钥/内部标识）、评价性措辞。
+- 不确定任务主线、只是临时支线时，不主动改名。
+
+## 改名后的生效范围
+
+- 立即生效于 botmux 侧：Dashboard 各视图与 \`/sessions\` 列表；运行中的 CLI 若支持会 best-effort 同步原生会话名（resume picker），CLI 不在线或不支持时命令仍成功，回执会说明。
+- **飞书话题（omt）标题改不了**：开放平台没有话题改名接口，话题列表始终显示首条消息；本命令只改 botmux/Dashboard 标题，不要承诺"飞书里的话题名会变"。
+- **不要与 \`botmux-chat-rename\` 混用**：\`botmux chat rename\` 改的是**整个飞书群**的群名（话题群里是整个群，不是单个话题），影响所有话题和全部成员。只想规范当前任务标题时一律用 \`botmux session rename\`。
+`;
+
 const HISTORY_SKILL = `---
 name: botmux-history
 description: 需要查看当前飞书会话历史消息时触发。话题/thread 会话默认拉话题内消息；普通群 chat-scope 会话拉整群最近 N 条（默认 50，用 --limit 调节）。普通群通过 /t 或 per-bot 配置开出的 thread 会话也按话题内读取。在 thread 内如果需要 thread 外的群聊上下文，用 --scope ambient。适合"看看之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
@@ -336,6 +367,22 @@ botmux send --attention=blocked --mention-back "缺 TOS 上传密钥，拿不到
 - **只用于回复当前会话的文本/卡片消息**：不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` 混用（否则消息发到别处、撤下绑定会裂，或绕过举手置位路径）。也必须有文本正文（看板要显示 reason）。
 
 **什么时候不要 \`--attention\`**：常规进度汇报、你自己查得到/能合理假设的事、只是想确认一下——都用普通 \`send\`。这是"我真卡住了、必须人来"的信号，不是闲聊也不是汇报。需要用户在**给定选项里二选一**那种用 \`botmux ask\`（发按钮、阻塞等结果）。
+
+## 加急本轮触发者：\`--urgent\`
+
+只有用户明确要求加急时才用；不要把它当普通通知。加急固定只发给
+\`--mention-back\` 解析出的本轮触发者，不会把其他 \`--mention\` 对象一起加急。
+
+\`\`\`bash
+botmux send --urgent --mention-back "发布窗口将在 10 分钟后关闭，请尽快确认"
+botmux send --urgent=sms --mention-back "线上故障需要立即确认"
+botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
+\`\`\`
+
+- \`--urgent\` 等价于 \`--urgent=app\`（应用内加急）。
+- \`sms\` / \`phone\` 会消耗租户额度，必须由用户明确要求。
+- 只能用于当前会话回复，不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` / \`--slash\` 混用。
+- 主消息先发、加急后调；加急失败时命令会返回 \`urgent.sent=false\`，不要重发主消息。
 
 ## 用法
 
@@ -533,6 +580,20 @@ botmux send --no-mention "后台任务还在跑，预计 5 分钟。"
 
 （可设环境变量 \`BOTMUX_REQUIRE_MENTION_DECISION=false\` 关闭此硬门。）
 
+### 对方正在执行任务时：\`--as\`
+
+你的消息如果碰上其他成员（人或另一个 bot）正在跑任务，**不会打断对方**，而是先暂存。这时必须二选一：
+
+| flag | 含义 |
+|---|---|
+| \`botmux send --as independent\` | **另开任务**：马上单独做，不打断当前任务 |
+| \`botmux send --as suggestion\` | **留给当前任务**：等对方结束后确认要不要采纳 |
+
+可以跟原文一起发：\`botmux send --as independent --mention <ou_xxx> "请帮我看这段 diff"\`。
+也可以先发出原文，再单独 \`botmux send --as independent\` 或 \`botmux send --as suggestion\`。
+
+人在飞书里会看到两个按钮（另开任务 / 留给当前任务）；agent 用上面的 flag 选，不要去点卡片。
+
 ### 引用串联（普通群）
 
 普通群里，回复默认会**引用本轮触发的那条消息**（飞书"引用"样式），把对话串成可追溯的链——你无需做任何事。
@@ -594,6 +655,7 @@ sandbox dispatch 暂不支持
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
 | \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
+| \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
@@ -1654,6 +1716,7 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
+  { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

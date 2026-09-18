@@ -63,7 +63,19 @@ function childFailureReason(command: string, failure: any, timeoutMs: number): s
   const code = failure?.code ?? nested?.code;
   const signal = failure?.signal ?? nested?.signal;
   const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
+  const rawMessage = nested?.message ?? failure?.message;
 
+  // Seccomp/container sandboxes that block clone3 (without the clone fallback)
+  // let the tmux binary exec but kill its first fork with EPERM. The binary is
+  // installed — telling the user to install tmux sends them the wrong way.
+  if (
+    code === 'EPERM'
+    || /clone3/i.test(stderr) || /clone3/i.test(rawMessage ?? '')
+    || /operation not permitted/i.test(stderr) || /operation not permitted/i.test(rawMessage ?? '')
+  ) {
+    return `${command} 启动失败：tmux 已安装，但当前运行环境（容器 seccomp/沙箱）禁止进程克隆`
+      + '（clone3 返回 EPERM / Operation not permitted），tmux server 无法启动';
+  }
   if (code === 'ENOENT') return `${command} 启动失败：找不到 tmux 可执行文件（ENOENT）`;
   if (code === 'EACCES') return `${command} 启动失败：tmux 不可执行（EACCES）`;
   if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
@@ -73,8 +85,81 @@ function childFailureReason(command: string, failure: any, timeoutMs: number): s
   }
   if (stderr) return `${command} 失败：${stderr}`;
   if (typeof failure?.status === 'number') return `${command} 失败（exit ${failure.status}）`;
-  const message = nested?.message ?? failure?.message;
-  return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
+  return `${command} 启动/探测失败${rawMessage ? `：${rawMessage}` : ''}`;
+}
+
+/** Coarse class of a tmux probe failure reason string, used to pick the
+ *  user-facing gate copy. `env-denied` means the binary exists but the daemon's
+ *  runtime blocks process cloning (container seccomp clone3 EPERM); `missing`
+ *  matches the authoritative ENOENT wording. Anything uncertain stays generic. */
+export type TmuxProbeFailureClass = 'missing' | 'env-denied' | 'generic';
+
+export function classifyTmuxProbeFailure(reason: string): TmuxProbeFailureClass {
+  const text = String(reason ?? '');
+  if (/clone3|EPERM|operation not permitted/i.test(text)) return 'env-denied';
+  if (/ENOENT|找不到 tmux/.test(text)) return 'missing';
+  return 'generic';
+}
+
+export interface TmuxVersion {
+  major: number;
+  minor: number;
+}
+
+/** Parse `tmux -V` output (`tmux 3.3a`, `tmux 2.8`, …). Letter suffixes are
+ *  ignored; unparseable input returns null. */
+export function parseTmuxVersion(raw: string): TmuxVersion | null {
+  const match = /(\d+)\.(\d+)/.exec(String(raw ?? ''));
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+// Successful probes are cached for process lifetime; a failed probe is cached
+// only briefly (a resize fires on every viewport change, and a tmux backend
+// only reaches these paths once a server is reachable, so a missing -V answer
+// is normally transient), after which it is re-probed.
+const NULL_VERSION_CACHE_TTL_MS = 10_000;
+let cachedTmuxVersion: TmuxVersion | null | undefined;
+let cachedTmuxVersionNullAt = 0;
+
+export function resetTmuxVersionCacheForTests(): void {
+  cachedTmuxVersion = undefined;
+  cachedTmuxVersionNullAt = 0;
+}
+
+/** Cached `tmux -V` version. Never throws — any failure returns null. */
+export function getTmuxVersionCached(): TmuxVersion | null {
+  if (cachedTmuxVersion) return cachedTmuxVersion;
+  if (cachedTmuxVersion === null && Date.now() - cachedTmuxVersionNullAt < NULL_VERSION_CACHE_TTL_MS) {
+    return null;
+  }
+  let version: TmuxVersion | null = null;
+  try {
+    const out = execFileSync('tmux', ['-V'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+    version = parseTmuxVersion(out);
+  } catch {
+    version = null;
+  }
+  if (version) {
+    cachedTmuxVersion = version;
+  } else {
+    cachedTmuxVersion = null;
+    cachedTmuxVersionNullAt = Date.now();
+  }
+  return version;
+}
+
+/** Version comparison: true iff `version` is a known release >= major.minor.
+ *  Deliberately false for null (unknown) — callers keep legacy behaviour on an
+ *  unknown version rather than silently skipping commands. */
+export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, minor: number): boolean {
+  if (!version) return false;
+  return version.major > major || (version.major === major && version.minor >= minor);
 }
 
 function probeTmuxVersion(): TmuxVersionProbe {

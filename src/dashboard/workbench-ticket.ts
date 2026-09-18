@@ -8,6 +8,8 @@ import {
   withSecureHostParentSync,
 } from '../platform/secure-host-file.js';
 
+import { WORKBENCH_IMMERSIVE_ENTRY } from '../core/workbench-shell.js';
+
 import { buildSetCookie } from './auth.js';
 import { DashboardH5ExchangeGate, dashboardH5ClientIp } from './h5-auth.js';
 
@@ -498,7 +500,9 @@ export interface WorkbenchTicketRedemptionDeps {
  *  - 触发限流：429 + Retry-After + 无凭据提示页（在读任何盘之前就返回，见文件
  *    顶部 P1-10）。名额按尝试消耗，与 LocateRateLimiter 一致。
  *  - 票据有效（含 generation 命中）且有活跃 token：
- *    `Set-Cookie: botmux_dashboard_token=<active>` + 302 `/#/agent-workbench`。
+ *    `Set-Cookie: botmux_dashboard_token=<active>` + 302 进沉浸式工作台
+ *    （`/#/agent-workbench?botmuxWorkbenchShell=immersive`，卡片按钮是直达入口，
+ *    不带 Dashboard 侧栏，见 core/workbench-shell.ts）。
  *  - 票据有效但当前没有活跃 token（dashboard 从未发号）：302 进工作台但不种
  *    cookie，用户面对正常登录墙。这是旧「读不到 token 就发裸链接」行为的对位，
  *    绝不在匿名请求侧顺手铸造新 token。
@@ -534,7 +538,7 @@ export function handleWorkbenchTicketRedemption(
   // 兑不出新 cookie，也不会退化成「无 cookie 但仍然 302」的半通过。
   if (verifyWorkbenchTicket(ticket, Date.now(), workbenchTicketGeneration(token))) {
     res.writeHead(302, {
-      location: '/#/agent-workbench',
+      location: WORKBENCH_IMMERSIVE_ENTRY,
       'cache-control': 'no-store',
       ...(token ? { 'set-cookie': buildSetCookie(token) } : {}),
     });

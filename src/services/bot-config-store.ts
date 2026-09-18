@@ -11,10 +11,10 @@
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
 import type { BotConfig } from '../bot-registry.js';
-import { getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
 import { config } from '../config.js';
-import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
+import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
@@ -103,9 +103,10 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
+  { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex 普通飞书对话' },
   { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
-  { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
+  { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex / traex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
@@ -278,6 +279,10 @@ async function applyConfigFieldInternal(
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
+    if (entry.replyCardMode === 'final-only') {
+      entry.replyCardMode = 'unified';
+      entry.disableStreamingCard = true;
+    }
     const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
       ? entry.cliId.trim()
       : bot.config.cliId;
@@ -467,7 +472,8 @@ export async function setBotAllowedUsers(
   }
   writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
     map,
-    retainKeys: rawEntries,
+    // sidecar 同时承载 blockedUsers 的缓存：retainKeys 取并集，不得剪掉黑名单条目。
+    retainKeys: [...new Set([...rawEntries, ...(bot.config.blockedUsers ?? [])])],
     deleteEntries: definitiveEntries,
   });
   republishResolvedAllowedUsersDescriptor(larkAppId, resolved);
@@ -478,6 +484,148 @@ export async function setBotAllowedUsers(
   if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
   return { ok: true, raw: rawEntries, resolved };
+}
+
+export type SetBlockedUsersResult =
+  | { ok: true; raw: string[]; resolved: string[] }
+  | { ok: false; reason: 'bot_not_registered' | 'empty_resolved' | 'cannot_block_admin' | string; conflicting?: string[] };
+
+/**
+ * 改 blockedUsers（黑名单，P1c）。与 {@link setBotAllowedUsers} 同构、语义相反，
+ * 是 talk/operate 判定上一条**纯增量否决腿**（见 evaluateTalk）：
+ *   1. 空数组 = 清除：删 bots.json 的 blockedUsers、内存 resolvedBlockedUsers=[],
+ *      直接返回 ok（无需解析）。
+ *   2. 非空：复用 allowedUsers 同一解析器 + 同一 sidecar 把邮箱/on_/ou_ 换成本
+ *      app open_id；解析结果为空 → empty_resolved。
+ *   3. 不可拉黑守卫（命中即拒绝且**绝不落盘**）：解析结果与当前
+ *      resolvedAllowedUsers 有交集，或包含 getOwnerOpenId —— owner/管理员被误拉黑
+ *      会被静默锁死，写入口必须挡住（运行时判定里 allowedUser 腿仍优先于否决腿，
+ *      属于双保险）。
+ *   4. rmwBotEntry 落盘原始条目，同步内存 config.blockedUsers /
+ *      resolvedBlockedUsers；sidecar 的 retainKeys 取 allowedUsers ∪ blockedUsers
+ *      原始条目并集——同一个缓存文件，任一侧写回都不得 prune 另一侧的条目。
+ * 黑名单不进 dashboard descriptor，故不调 republishResolvedAllowedUsersDescriptor。
+ */
+export async function setBotBlockedUsers(
+  larkAppId: string,
+  rawEntries: string[],
+): Promise<SetBlockedUsersResult> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  // 空数组 = 清除黑名单。
+  if (rawEntries.length === 0) {
+    const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+      delete entry.blockedUsers;
+      return { write: true, result: null };
+    });
+    if (!r.ok) return { ok: false, reason: r.reason };
+    bot.config.blockedUsers = undefined;
+    bot.resolvedBlockedUsers = [];
+    logger.info(`[config:${larkAppId}] blockedUsers cleared`);
+    return { ok: true, raw: [], resolved: [] };
+  }
+
+  const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+  if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
+
+  // 守卫：当前管理员（resolvedAllowedUsers）与 owner 绝不可被拉黑。
+  const conflicting = new Set<string>();
+  for (const ou of resolved) {
+    if (bot.resolvedAllowedUsers.includes(ou)) conflicting.add(ou);
+  }
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (ownerOpenId && resolved.includes(ownerOpenId)) conflicting.add(ownerOpenId);
+  if (conflicting.size > 0) {
+    return { ok: false, reason: 'cannot_block_admin', conflicting: [...conflicting] };
+  }
+
+  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+    entry.blockedUsers = rawEntries;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  bot.config.blockedUsers = rawEntries;
+  bot.resolvedBlockedUsers = resolved;
+  // 与 setBotAllowedUsers 同款写穿：两侧共用同一 sidecar，retainKeys 必须并集，
+  // 黑名单写回不能把 allowed 条目（可能正靠缓存度过 contact API 降级）剪掉。
+  const definitiveEntries: string[] = [];
+  for (const [entry, status] of entryStatus.entries()) {
+    if (status === 'definitive') definitiveEntries.push(entry);
+  }
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
+    map,
+    retainKeys: [...new Set([...(bot.config.allowedUsers ?? []), ...rawEntries])],
+    deleteEntries: definitiveEntries,
+  });
+  logger.info(`[config:${larkAppId}] blockedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
+  return { ok: true, raw: rawEntries, resolved };
+}
+
+/**
+ * 按 open_id 定向解除黑名单（成员面板单行「解除」专用）。调用方只持有点行
+ * 的 ou_，而 raw 条目可能以邮箱 / on_ / 手机形态写入——只按 ou_ 直值过滤
+ * 会把这些条目留下、接口却回报成功（评审指出的假成功）。
+ *
+ * 对剩余非 ou_ 条目复用同一解析器（降级时再查同一 sidecar 缓存）反查
+ * raw→ou_ 映射：证据表明映射到目标 open_id 的 raw 条目一并剔除；解析不出
+ * （definitive miss，或 transient 且缓存也没有）的条目**原样保留，绝不在证
+ * 据不足时多删**。ou_ 直值直接出列。无命中为幂等 no-op。
+ *
+ * 落盘不回退到 {@link setBotBlockedUsers}：全量重解析会在列表里混有
+ * 历史 definitive-miss 条目时返回 empty_resolved，而本次定向解除已有
+ * 映射证据成立——不能让无关脏条目挡住本次解除。
+ */
+export async function removeBlockedUsers(
+  larkAppId: string,
+  openIds: string[],
+): Promise<SetBlockedUsersResult> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const targets = new Set(openIds.filter(id => typeof id === 'string' && id.startsWith('ou_')));
+  const raw = bot.config.blockedUsers ?? [];
+  if (targets.size === 0 || raw.length === 0) {
+    return { ok: true, raw, resolved: bot.resolvedBlockedUsers ?? [] };
+  }
+  // ou_ 直值直接出列；邮箱 / on_ / 手机条目等映射证据。
+  const pending = raw.filter(entry => !targets.has(entry));
+  const unresolved = pending.filter(entry => !entry.startsWith('ou_'));
+  let mapping = new Map<string, string>();
+  if (unresolved.length > 0) {
+    const result = await resolveAllowedUsersWithMap(larkAppId, unresolved);
+    mapping = result.map;
+    if (result.errored) {
+      // contact API 降级时复用写入路径一直维护的 sidecar，避免解除在故障期
+      // 静默 no-op；缓存也没有的条目按证据不足保留。
+      const cached = readAllowedUsersResolveCache(config.session.dataDir, larkAppId);
+      for (const entry of unresolved) {
+        if (!mapping.has(entry) && cached[entry]) mapping.set(entry, cached[entry]);
+      }
+    }
+  }
+  const kept = pending.filter(entry => {
+    if (entry.startsWith('ou_')) return true;
+    const resolvedId = mapping.get(entry);
+    // 只有被证明解析到目标 open_id 的条目才剔除；其余一律保留。
+    return resolvedId === undefined || !targets.has(resolvedId);
+  });
+  if (kept.length === raw.length) {
+    return { ok: true, raw, resolved: bot.resolvedBlockedUsers ?? [] };
+  }
+  if (kept.length === 0) return setBotBlockedUsers(larkAppId, []);
+  const w = await rmwBotEntry<null>(larkAppId, (entry) => {
+    entry.blockedUsers = kept;
+    return { write: true, result: null };
+  });
+  if (!w.ok) return { ok: false, reason: w.reason };
+  bot.config.blockedUsers = kept;
+  // 被剔除的 email/on_ 条目的 ou_ 必在 targets 内（映射命中才剔除），故从
+  // resolved 减去 targets 恰好覆盖直值与别名两种形态。
+  const nextResolved = (bot.resolvedBlockedUsers ?? []).filter(ou => !targets.has(ou));
+  bot.resolvedBlockedUsers = nextResolved;
+  logger.info(`[config:${larkAppId}] blockedUsers unblocked: ${raw.length - kept.length} entries`);
+  return { ok: true, raw: kept, resolved: nextResolved };
 }
 
 export type CoerceResult =

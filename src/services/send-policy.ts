@@ -118,6 +118,7 @@ export interface ManagedVcSendControlArgs {
   overrideChatId?: string;
   sendInto?: string;
   attentionRequested: boolean;
+  urgentRequested?: boolean;
   explicitMentionCount: number;
   mentionBack: boolean;
   noMention: boolean;
@@ -133,6 +134,9 @@ export function managedVcSendControlError(args: ManagedVcSendControlArgs): strin
   }
   if (args.attentionRequested) {
     return '--attention 不属于受管 VC 主消息 action。';
+  }
+  if (args.urgentRequested) {
+    return '--urgent 不属于受管 VC 主消息 action。';
   }
   if (args.explicitMentionCount > 0 || args.mentionBack || !args.noMention) {
     return '受管 VC 回复必须显式使用 --no-mention，不能使用 --mention/--mention-back。';
@@ -380,6 +384,67 @@ export function parseAttentionFlag(args: string[]): { requested: boolean; kind: 
   const raw = arg.includes('=') ? arg.slice('--attention='.length) : '';
   const kind = (ATTENTION_KINDS as readonly string[]).includes(raw) ? raw : 'blocked';
   return { requested: true, kind };
+}
+
+export const URGENT_MODES = ['app', 'sms', 'phone'] as const;
+export type UrgentMode = typeof URGENT_MODES[number];
+
+export interface UrgentFlagResult {
+  requested: boolean;
+  mode: UrgentMode;
+  error?: string;
+}
+
+/**
+ * Parse `botmux send --urgent[=app|sms|phone]`.
+ *
+ * A bare flag deliberately means in-app Buzz. SMS and phone are explicit
+ * because they consume tenant quota and are materially more disruptive.
+ * Multiple urgent flags are rejected rather than silently picking one.
+ */
+export function parseUrgentFlag(args: string[]): UrgentFlagResult {
+  const flags = args.filter(arg => arg === '--urgent' || arg.startsWith('--urgent='));
+  if (flags.length === 0) return { requested: false, mode: 'app' };
+  if (flags.length > 1) {
+    return { requested: true, mode: 'app', error: '--urgent 只能指定一次。' };
+  }
+  const flag = flags[0]!;
+  const raw = flag === '--urgent' ? 'app' : flag.slice('--urgent='.length);
+  if (!(URGENT_MODES as readonly string[]).includes(raw)) {
+    return {
+      requested: true,
+      mode: 'app',
+      error: '--urgent 仅支持 app|sms|phone；省略值时默认为 app。',
+    };
+  }
+  return { requested: true, mode: raw as UrgentMode };
+}
+
+export interface UrgentUsageArgs {
+  requested: boolean;
+  mentionBack: boolean;
+  sendTopLevel: boolean;
+  overrideChatId?: string;
+  sendInto?: string;
+  asVoice?: boolean;
+}
+
+/**
+ * Buzz is intentionally single-recipient and bound to the exact turn sender.
+ * This avoids accidentally buzzing every explicit @ (including peer bots).
+ */
+export function urgentUsageError(args: UrgentUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (!args.mentionBack) {
+    return '--urgent 必须与 --mention-back 一起使用，只加急本轮触发者。';
+  }
+  if (args.sendTopLevel || args.overrideChatId || args.sendInto) {
+    return '--urgent 只能用于回复当前会话，不能与 --top-level / --chat-id / --into 混用。';
+  }
+  if (args.asVoice) {
+    return '--urgent 暂不支持 --voice。';
+  }
+  return null;
 }
 
 export interface AttentionUsageArgs {

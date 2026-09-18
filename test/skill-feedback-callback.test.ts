@@ -24,6 +24,25 @@ function event(action: Record<string, unknown>, operator = 'ou_user', formValue?
 }
 
 describe('feedback callback state machine', () => {
+  it('rejects requester-only feedback when the delivery has no requester identity', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'requester' });
+    const response = store.createResponse({ interactionId: 'int-ownerless-requester', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'),
+      'app',
+      { store },
+    );
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法验证本次提问者，无法提交反馈' } });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_anyone')).toHaveLength(0);
+    store.close();
+  });
+
   it('rebuilds a callback card from the platform card while the persisted template contains no answer', async () => {
     const { store } = await setup();
     const delivery = store.findDeliveryByPlatformMessage('lark', 'app', 'om')!;

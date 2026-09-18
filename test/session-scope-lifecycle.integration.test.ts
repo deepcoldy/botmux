@@ -24,6 +24,33 @@ function waitFor(predicate: () => boolean, timeoutMs = 8_000): void {
   throw new Error('timed out waiting for scope lifecycle evidence');
 }
 
+function readReadyPids(paths: string[]): number[] | undefined {
+  if (!paths.every(existsSync)) return undefined;
+  const contents = paths.map(path => readFileSync(path, 'utf8'));
+  // Shell redirection creates the file before echo writes the PID and newline.
+  if (!contents.every(text => /^[1-9]\d*\n$/.test(text))) return undefined;
+  const pids = contents.map(text => Number(text.trim()));
+  return pids.every(pid => Number.isSafeInteger(pid) && pid > 1) ? pids : undefined;
+}
+
+it('waits for complete PID contents after shell redirection creates the files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-scope-pid-test-'));
+  const paths = ['root.pid', 'child.pid', 'grandchild.pid'].map(name => join(dir, name));
+  try {
+    expect(readReadyPids(paths)).toBeUndefined();
+    writeFileSync(paths[0], '123\n');
+    writeFileSync(paths[1], '456\n');
+    writeFileSync(paths[2], '');
+    expect(readReadyPids(paths)).toBeUndefined();
+    writeFileSync(paths[2], '789');
+    expect(readReadyPids(paths)).toBeUndefined();
+    writeFileSync(paths[2], '789\n');
+    expect(readReadyPids(paths)).toEqual([123, 456, 789]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe('real tmux pane systemd-scope lifecycle', () => {
   const unavailableReason = !tmuxAvailable
     ? 'tmux is unavailable'
@@ -64,8 +91,11 @@ describe('real tmux pane systemd-scope lifecycle', () => {
           scoped.bin, ...scoped.args,
         ]);
         const pidFiles = ['root.pid', 'child.pid', 'grandchild.pid'].map(name => join(dir, name));
-        waitFor(() => pidFiles.every(existsSync));
-        const pids = pidFiles.map(path => Number(readFileSync(path, 'utf8').trim()));
+        let pids: number[] = [];
+        waitFor(() => {
+          pids = readReadyPids(pidFiles) ?? [];
+          return pids.length === pidFiles.length;
+        });
         expect(pids.every(pid => pid > 1)).toBe(true);
         for (const pid of pids) {
           expect(readFileSync(`/proc/${pid}/cgroup`, 'utf8')).toContain(unit);

@@ -119,6 +119,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts } from '../src/core/worker-pool.js';
 import { MAX_STARTUP_AUTO_RETRIES } from '../src/core/worker-startup-retry.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -176,6 +177,55 @@ async function failOnce(ds: DaemonSession, message: string, extras: Record<strin
 }
 
 const INCIDENT_REASON = 'spawnSync tmux ETIMEDOUT';
+
+describe('worker runtime version display synchronization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+  });
+
+  it('updates the live session and publishes its version without persisting it', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-version', worker);
+    ds.cliVersion = '0.146.0';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    vi.mocked(dashboardEventBus.publish).mockClear();
+    updateSessionMock.mockClear();
+
+    worker.emit('message', { type: 'cli_runtime_version', version: '0.153.4' });
+    await flush();
+
+    expect(ds.cliVersion).toBe('0.153.4');
+    expect(dashboardEventBus.publish).toHaveBeenCalledExactlyOnceWith({
+      type: 'session.update',
+      body: { sessionId: 'sid-version', patch: { cliVersion: '0.153.4' } },
+    });
+    expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['replacement-worker', 'fenced-generation'] as const)('ignores a runtime version report after ownership changes: %s', async change => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-stale-version', worker);
+    ds.cliVersion = '0.153.4';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    if (change === 'replacement-worker') ds.worker = makeFakeWorker();
+    else ds.session.workerGeneration = (ds.session.workerGeneration ?? 0) + 1;
+    vi.mocked(dashboardEventBus.publish).mockClear();
+    updateSessionMock.mockClear();
+
+    worker.emit('message', { type: 'cli_runtime_version', version: '0.146.0' });
+    await flush();
+
+    expect(ds.cliVersion).toBe('0.153.4');
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+    expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("worker-pool 'error' transient self-heal wiring", () => {
   beforeEach(() => {

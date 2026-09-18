@@ -236,6 +236,18 @@ export async function unbindOncall(
   return { status: upstream.status, body: json ?? text };
 }
 
+/** Persist the new-topic defaults on the named group member bot. */
+export async function setDefaultModelsForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-default-models/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
 /**
  * PUT /api/groups/:chatId/pin-streaming-card/:appId — set the per-(chat × bot)
  * pin-streaming-card override. Internal proxy path is

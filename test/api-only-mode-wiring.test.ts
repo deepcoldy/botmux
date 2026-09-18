@@ -818,6 +818,17 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(helperCall).toContain('markSessionsRestored: () => {');
     expect(helperCall).toContain('sessionsRestored = true;');
 
+    // Supplemental ordering guard only; this assertion does not prove callback
+    // delivery semantics and must not be treated as load-bearing evidence.
+    const dispatcherStartAt = daemonSource.indexOf(
+      'for (const startDispatcher of startEventDispatchers) startDispatcher();',
+    );
+    const quarantineNoticeAt = daemonSource.indexOf(
+      'for (const notice of startupXpiQuarantineNotices)',
+    );
+    expect(dispatcherStartAt).toBeGreaterThan(restoreAt);
+    expect(quarantineNoticeAt).toBeGreaterThan(dispatcherStartAt);
+
     const helperBody = region(
       daemonSource,
       'async function restoreSessionsAndScheduleStartupRecovery(opts: {',

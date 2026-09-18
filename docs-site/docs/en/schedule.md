@@ -2,6 +2,8 @@
 
 Supports three schedule types plus natural-language input. Tasks run at their configured execution position when due. **In group chats, the default is chat top level, even when the task is created inside a topic.** To continue in the current topic, explicitly pass `--topic` when creating the task through the CLI, or select the original topic under **Execution position** in the Dashboard.
 
+There are four execution positions: **chat top level** (the default; all top-level tasks in one group share the chat-scope session context), **a specified topic** (`--topic`, bound to one existing topic), **a new topic per run** (`--new-topic`, every run stands alone), and **a dedicated task topic** (opt-in; each task owns its own topic session — see below).
+
 ## Two Ways to Create
 
 - **Slash command** (quick): `/schedule 每日17:50 帮我看看AI圈有什么新闻`
@@ -104,7 +106,31 @@ botmux schedule add "每日17:30" "generate digest" --new-topic
 botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 ```
 
-You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, or a new topic for every run.
+You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, a new topic for every run, or the task's dedicated topic.
+
+## A Dedicated Topic Per Task
+
+"A new topic per run" keeps every run of the same task unrelated; chat top level goes the other way, with all top-level tasks in one group sharing one chat-scope session. A **dedicated task topic** gives each task a topic session that belongs to it alone:
+
+- Every run of the same task lands in the **same topic**, so the context carries over — just like a topic-pinned task.
+- Different tasks in the same group use separate topics and are **isolated from one another, never sharing context** — a sentinel task and a daily-report task never end up in the same session history.
+- The topic is created **on the first fire**: a non-silent task posts a seed message (the "task started" banner) first, anchored as that topic's root; a silent task defers creation until the bot's first `botmux send`, exactly like "new topic per run" combined with silent.
+
+How to set it:
+
+- **Natural language**: prefix the prompt with the dedicated-topic keyword — `独立话题` / `专属话题` in Chinese, "dedicated topic" in English. It combines with the silent keyword in either order, for example:
+
+```bash
+/schedule 每日18:00 独立话题 summarize today's service health checks
+/schedule 工作日9:00 静默 专属话题 write the morning brief; speak up only on anomalies
+```
+
+- **Lark schedule card / Dashboard**: on the card, the execution-position button cycles **chat top level → new topic per run → dedicated task topic → chat top level**; the Dashboard **Schedules** form lets you pick the position directly.
+
+Limits and notes:
+
+- **Single-group tasks only**; a multi-group task cannot choose the dedicated task topic.
+- The per-task model behaves exactly like `--topic`: it applies only on the first fire that creates the session; later runs reuse the model that session started with (see the next section).
 
 ## Follow the Active Topic
 
@@ -152,7 +178,7 @@ The Dashboard "Schedules" page has both fields too; empty means "follow the bot 
 | Execution position | Effect |
 | --- | --- |
 | `--new-topic` | Every run starts a new session, so the model applies **every time** |
-| `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
+| Dedicated task topic / `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
 
 Use `--new-topic` when it must apply on every run. Both the CLI and the Dashboard say which case you are in when you save.
 
@@ -165,4 +191,4 @@ Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trig
 /schedule remove|enable|disable|run <id>
 ```
 
-> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content.
+> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content. A dedicated task topic creates the task's own topic on its first fire (a non-silent run posts a seed message anchored as the root; a silent run defers materialization to the first `botmux send`), and every later run is appended to that same session.

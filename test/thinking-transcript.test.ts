@@ -55,7 +55,7 @@ describe('extractAssistantThinking', () => {
 });
 
 describe('extractCotEntries', () => {
-  it('extracts thinking and tool_use blocks in content order', () => {
+  it('extracts thinking, text and tool_use blocks in content order', () => {
     const ev: TranscriptEvent = {
       type: 'assistant',
       uuid: 'a1',
@@ -68,9 +68,12 @@ describe('extractCotEntries', () => {
         ],
       },
     };
+    // The text block travels too: it is the model's narration, and with
+    // extended thinking off it is the ONLY prose the bubble would ever get.
     expect(extractCotEntries(ev)).toEqual([
       { kind: 'thinking', text: 'need to list files' },
       { kind: 'tool_call', id: 'toolu_1', name: 'Bash', args: '{"command":"ls"}', subject: 'ls' },
+      { kind: 'text', text: 'visible answer' },
     ]);
   });
 
@@ -110,8 +113,12 @@ describe('extractCotEntries', () => {
     expect(result.result.endsWith('…')).toBe(true);
   });
 
-  it('returns [] for plain text events', () => {
-    expect(extractCotEntries(textEvent('a1', 'hi'))).toEqual([]);
+  it('extracts plain text events as narration entries', () => {
+    expect(extractCotEntries(textEvent('a1', 'hi'))).toEqual([{ kind: 'text', text: 'hi' }]);
+  });
+
+  it('skips blank text blocks — an empty node would be a gap in the bubble', () => {
+    expect(extractCotEntries(textEvent('a1', '   \n  '))).toEqual([]);
   });
 
   /**

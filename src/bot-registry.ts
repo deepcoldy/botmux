@@ -14,6 +14,7 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
@@ -45,7 +46,7 @@ import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
   type NativeSubagentRuntimePolicy,
@@ -1450,6 +1451,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Per-chat defaults captured only by newly created topics. */
+  groupDefaultModels?: Record<string, GroupDefaultModels>;
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
@@ -1655,6 +1658,20 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   /**
+   * 黑名单（纯增量「否决腿」，与 allowedUsers 白名单独立）：原始条目形态与
+   * allowedUsers 完全一致（邮箱 / 手机号 / on_ / ou_ 混写），daemon 启动期复用
+   * 同一套 resolveAllowedUsersWithMap + sidecar 缓存解析成**本 app 视角**的
+   * open_id（resolvedBlockedUsers）。注意 `ou_` 与 allowedUsers 一样是
+   * app-scoped：只对本飞书应用有效，不能从别的 Bot 配置复制。
+   *
+   * 语义：命中黑名单的 sender 在 evaluateTalk 里于 allowedUser 命中腿**之后**、
+   * 其它所有放行腿（oncall / peer / team / grants / open …）**之前**被否决，
+   * canOperate 同腿；黑名单不进 dashboard owner 描述符。owner / 管理员
+   * （resolvedAllowedUsers）不可被拉黑——写入口 setBotBlockedUsers 有守卫，
+   * 判定顺序是双保险。空/缺省 = 不否决任何人。
+   */
+  blockedUsers?: string[];
+  /**
    * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
    * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
    * email entries needing a contact-API resolve every boot), this is stored raw
@@ -1704,6 +1721,10 @@ export interface BotConfig {
   defaultWorkingDirAutoWorktree?: boolean;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
+  /** Opt-in: accept app/chat-bound signed ambient defaults from a trusted creator. No grants. */
+  signedChatDefaults?: boolean;
+  /** Optional trusted HTTPS registry for private self-service room metadata. */
+  signedChatDefaultsRegistryUrl?: string;
   /**
    * Chat IDs that have ever been auto-bound by `defaultOncall`. Append-only.
    * Once a chat appears here, the default is permanently "spent" for it — even
@@ -1880,6 +1901,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Ordinary Claude Code/Codex replies. Absent preserves legacy delivery. */
+  replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
@@ -2008,6 +2031,20 @@ export interface BotConfig {
    * {@link autoStartOnGroupJoin} 开关检查，开关关闭时 seed 仍可能发出。
    */
   autoStartOnGroupJoinSeed?: string;
+  /**
+   * 主动开工 — 入群执行命令开关。true 且 {@link groupJoinCommand} 非空时，bot 被拉进
+   * 任意群就直接执行该命令（不起 CLI 会话、不经 LLM），与 {@link autoStartOnGroupJoin}
+   * 互相独立、可同时开。不做 allowedUser 在群闸：命令本身由 bot 管理员配置，
+   * 典型场景是告警平台拉的应急群里人还没进来就要先跑诊断脚本。
+   */
+  groupJoinCommandEnabled?: boolean;
+  /**
+   * 主动开工 — 入群执行的命令。执行契约同 hooks.json（无 shell、按空白/引号切分参数、
+   * 最小 env 白名单）；stdin 是 JSON `{event:'chat.bot_added', larkAppId, chatId,
+   * operatorOpenId, emittedAt}`，另有 BOTMUX_JOIN_CHAT_ID / BOTMUX_JOIN_LARK_APP_ID /
+   * BOTMUX_JOIN_OPERATOR_OPEN_ID 环境变量；超时 10 分钟杀进程组。
+   */
+  groupJoinCommand?: string;
   /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
@@ -2163,6 +2200,9 @@ export interface BotState {
   resolvedAllowedUsers: string[];
   /** raw allowedUsers 条目 → 解析后的 open_id。供 /revoke 反查并删除 email 形式的 raw 条目。 */
   rawAllowedUserResolution: Map<string, string>;
+  /** blockedUsers 原始条目解析后的本 app open_id（纯否决腿，启动期 best-effort 解析，
+   *  缺省 [] = 不否决任何人）。与 resolvedAllowedUsers 共用同一 sidecar 缓存。 */
+  resolvedBlockedUsers: string[];
 }
 
 export type NativeSubagentRuntimeConfigState =
@@ -2389,6 +2429,7 @@ export function registerBot(cfg: BotConfig): BotState {
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
+    resolvedBlockedUsers: [],
   };
   // p2pOpen 是一次显式的权限边界声明（进入限制态），但它只授 talk。没有 allowedUsers 就
   // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
@@ -3545,7 +3586,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
-      modelBackendVariant: entryCliId === 'traex'
+      groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
+      modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
         : undefined,
@@ -3603,6 +3645,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // 与 allowedUsers 同款原始条目（邮箱/手机/on_/ou_），daemon 启动期复用同一套
+      // 解析缓存换成本 app open_id；非数组 / 空归一为 undefined，保持 bots.json 干净。
+      blockedUsers: Array.isArray(entry.blockedUsers)
+        ? (normalizeStringList(entry.blockedUsers) || undefined)
+        : undefined,
       // Only a well-formed native open_id is trusted; anything else (stray on_/
       // email/garbage) is dropped so the fail-safe recipient can never be a
       // value that itself needs resolving.
@@ -3612,6 +3659,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       allowedChatGroups,
       oncallChats,
       defaultOncall,
+      signedChatDefaults: entry.signedChatDefaults === true || undefined,
+      signedChatDefaultsRegistryUrl: typeof entry.signedChatDefaultsRegistryUrl === 'string' && entry.signedChatDefaultsRegistryUrl.startsWith('https://') ? entry.signedChatDefaultsRegistryUrl : undefined,
       defaultOncallAutoboundChats,
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
@@ -3654,7 +3703,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
-      disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      // Retired final-only preference must not opt into an extra terminal card.
+      disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
+      replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
@@ -3711,6 +3762,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
+      groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
+        ? entry.groupJoinCommand.trim()
+        : undefined,
       // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,

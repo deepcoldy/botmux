@@ -11,6 +11,7 @@ import type {
   ModelFallbackState,
   DisplayMode,
   StreamStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -76,6 +77,19 @@ export interface DaemonSession {
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
+  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
+  readonlyContinuationRpcProof?: {
+    workerGeneration: number;
+    rpcGeneration: string;
+    checkedAt: number;
+  };
+  /** Exact live synthetic turn whose hook-level native subagent requests must
+   * be denied. Derived only from trusted worker IPC for the current generation. */
+  readonlyContinuationTurnOrigin?: {
+    workerGeneration: number;
+    turnId: string;
+    dispatchAttempt: number;
+  };
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
@@ -359,6 +373,42 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Actual input-committed turn for the managed reply card's Stop control. */
+  replyCardRunningTurnId?: string;
+  /**
+   * Authenticated human principal that owns the currently executing interactive
+   * turn. Set only after a worker accepts the turn and cleared by its exact
+   * terminal. A different human's message cannot mutate this task directly;
+   * it is staged as a suggestion for this owner to approve after completion.
+   * In-memory only.
+   */
+  activeInteractiveTurn?: {
+    turnId: string;
+    caller: import('../types.js').TrustedCaller;
+    /** Stable authenticated task/session owner, when distinct from the caller
+     * that happened to start the current CLI turn. */
+    controller?: import('../types.js').TrustedCaller;
+  };
+  /** Host-owned classification/approval driver currently attached to disk state. */
+  crossPrincipalInterruptionDriving?: boolean;
+  /** Runtime wake-up for the bounded wait until the current owner turn ends. */
+  crossPrincipalWaitTimer?: NodeJS.Timeout;
+  /** Transitional runtime queue retained until the durable classifier replaces
+   * every old call site. Never persisted; do not add new producers. */
+  pendingCrossPrincipalSuggestions?: Array<{
+    turnId: string;
+    ownerTurnId: string;
+    owner: TrustedCaller;
+    text: string;
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    proposer: TrustedCaller;
+    proposerName?: string;
+    replyRootId?: string;
+    inThread?: boolean;
+    approved?: boolean;
+  }>;
+  crossPrincipalSuggestionConfirming?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a

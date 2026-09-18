@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, get, type Server } from 'node:http';
+import { connect, type Socket } from 'node:net';
 import { listenWithProbe } from '../src/utils/listen-with-probe.js';
 
 const open: Server[] = [];
@@ -150,4 +151,51 @@ describe('listenWithProbe', () => {
     expect(bound).not.toBe(sport);                 // did not settle on the shadowed port
     expect(await selfCheck(bound)).toBe(true);     // loopback to the bound port reaches US
   });
+
+  it('steps up even when a client is still parked on the rejected port', async () => {
+    // Regression, 2026-09: the dashboard silently stopped binding 7891 — no
+    // LISTEN, no step to 7892, not one log line. Cause: a stale process from an
+    // older checkout kept dialing 127.0.0.1:7891; our listen() accepted it and
+    // it then sat there without reading. server.close() only stops ACCEPTING —
+    // it waits for every already-accepted socket to drain — and the probe's
+    // tryNext() (the only thing that logs or steps) runs inside that callback.
+    // One parked socket therefore wedged the entire probe, invisibly.
+    //
+    // MEASURED on this shape: close() alone never fires its callback on either
+    // runtime (node 22 and bun both still pending at 10s); with
+    // closeAllConnections() it fires in 0-1ms. Hence the 4s budget below —
+    // generous for the fix, unreachable for the bug.
+    const start = await reserveAdjacentPair();
+    const parked: Socket[] = [];
+
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      maxProbe: 3,
+      verifyBound: async (p) => {
+        verified.push(p);
+        if (verified.length > 1) return true;
+        // Land a real connection on the port we are about to reject, and leave
+        // it open with an unanswered request — exactly what the stale process did.
+        await new Promise<void>((resolve) => {
+          const sock = connect(p, '127.0.0.1', () => {
+            sock.write('GET /__selfcheck HTTP/1.1\r\nHost: x\r\n\r\n');
+            parked.push(sock);
+            resolve();
+          });
+          sock.on('error', () => resolve());
+        });
+        return false;
+      },
+    });
+
+    try {
+      expect(verified[0]).toBe(start);        // it really bound and rejected `start`
+      expect(bound).toBeGreaterThan(start);   // …and still got past it
+    } finally {
+      for (const sock of parked) sock.destroy();
+    }
+  }, 4000);
 });

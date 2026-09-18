@@ -142,7 +142,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
@@ -150,6 +150,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       if (!disableCliBypass) args.push('--yolo');
+      // CoCo on traecli shares the low-quota picker; use its long config flag.
+      if (hideRateLimitModelNudge) args.push('--config', 'notice.hide_rate_limit_model_nudge=true');
       if (model && model.trim()) {
         // CoCo expects nested key path for model override. `model=...` exits 1,
         // while `model.name=...` starts correctly.

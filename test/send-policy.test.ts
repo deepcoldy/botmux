@@ -9,6 +9,8 @@ import {
   mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
+  parseUrgentFlag,
+  urgentUsageError,
   managedVcQuoteError,
   managedVcCustomCardError,
   managedVcSendControlError,
@@ -117,6 +119,7 @@ describe('managedVcSendControlError', () => {
       { ...safe, overrideChatId: 'oc_other' },
       { ...safe, sendInto: 'om_other' },
       { ...safe, attentionRequested: true },
+      { ...safe, urgentRequested: true },
     ]) {
       const error = managedVcSendControlError(input);
       if (!error) providerCall();
@@ -362,6 +365,46 @@ describe('attentionUsageError', () => {
   });
   it('rejects no-text (dashboard needs a reason)', () => {
     expect(attentionUsageError({ ...ok, hasText: false })).toMatch(/reason/);
+  });
+});
+
+describe('parseUrgentFlag', () => {
+  it('defaults a bare flag to in-app Buzz without eating the message', () => {
+    expect(parseUrgentFlag(['--urgent', 'please respond'])).toEqual({
+      requested: true,
+      mode: 'app',
+    });
+  });
+
+  it('accepts explicit app, sms and phone modes', () => {
+    expect(parseUrgentFlag(['--urgent=app'])).toMatchObject({ requested: true, mode: 'app' });
+    expect(parseUrgentFlag(['--urgent=sms'])).toMatchObject({ requested: true, mode: 'sms' });
+    expect(parseUrgentFlag(['--urgent=phone'])).toMatchObject({ requested: true, mode: 'phone' });
+  });
+
+  it('rejects unknown or repeated modes instead of choosing a costly channel', () => {
+    expect(parseUrgentFlag(['--urgent=all']).error).toMatch(/app\|sms\|phone/);
+    expect(parseUrgentFlag(['--urgent', '--urgent=phone']).error).toMatch(/只能指定一次/);
+  });
+});
+
+describe('urgentUsageError', () => {
+  const ok = {
+    requested: true,
+    mentionBack: true,
+    sendTopLevel: false,
+  };
+
+  it('requires the exact turn sender and accepts an ordinary reply', () => {
+    expect(urgentUsageError(ok)).toBeNull();
+    expect(urgentUsageError({ ...ok, mentionBack: false })).toMatch(/--mention-back/);
+  });
+
+  it('rejects detoured and voice sends', () => {
+    expect(urgentUsageError({ ...ok, sendTopLevel: true })).toMatch(/--top-level/);
+    expect(urgentUsageError({ ...ok, overrideChatId: 'oc_other' })).toMatch(/--chat-id/);
+    expect(urgentUsageError({ ...ok, sendInto: 'om_other' })).toMatch(/--into/);
+    expect(urgentUsageError({ ...ok, asVoice: true })).toMatch(/--voice/);
   });
 });
 

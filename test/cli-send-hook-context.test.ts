@@ -108,7 +108,6 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
     expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
     expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
-    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
     expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
   });
 
@@ -571,7 +570,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend.indexOf('const exactOriginDispatch = (() => {'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf("exactOriginDispatch?.deliverySink === 'http_wait'"))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
@@ -655,7 +654,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf('const managedRenderedPayloadError = managedVcSendPayloadError({'))

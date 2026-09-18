@@ -29,6 +29,11 @@ export type ScheduleInput = {
   executionPosition?: ScheduleExecutionPosition;
   topicTitle?: string;
   larkAppId?: string;
+  /** Run initiator's open_id, only materializable as the exact
+   *  `{ "$ref": "context.initiatorOpenId" }` binding (template-bindings
+   *  policy). Stamped onto the task so scheduled turns authenticate as the
+   *  workflow initiator; omitted for ownerless templates. */
+  ownerOpenId?: string;
   /** `repeat.completed` is intentionally absent — it's a runtime counter
    *  and must not be part of canonical input.  See schedule-store
    *  canonicalScheduleInput. */
@@ -66,9 +71,10 @@ const ScheduleInputSchema = z.object({
   chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
-  executionPosition: z.enum(['top-level', 'topic', 'new-topic']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic', 'task']).optional(),
   topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
+  ownerOpenId: z.string().optional(),
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
   silent: z.boolean().optional(),
@@ -146,6 +152,13 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'topic execution requires rootMessageId',
       };
     }
+    if (input.executionPosition === 'task' && input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+        message: 'task execution runs in its own session and must not carry rootMessageId',
+      };
+    }
     if (input.followActive === true && input.executionPosition !== 'topic') {
       return {
         ok: false,
@@ -183,6 +196,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       executionPosition: input.executionPosition,
       topicTitle: input.topicTitle?.trim() || undefined,
       larkAppId: input.larkAppId,
+      ownerOpenId: input.ownerOpenId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
       silent: input.silent,

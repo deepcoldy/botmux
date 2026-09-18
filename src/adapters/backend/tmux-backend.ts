@@ -3,7 +3,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
-import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
+import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
 import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
@@ -943,7 +943,12 @@ function configureTmuxSessionOptions(sessionName: string): void {
     // tmux window. If a web client at 80x24 causes tmux to resize the window
     // down, reflowed content shifts buffer positions and historical output
     // leaks into the streaming card.
-    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    // window-size largest exists since tmux 3.1; skip on known-older builds.
+    // Unknown version: keep trying (best-effort inside the try/catch).
+    const version = getTmuxVersionCached();
+    if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    }
   } catch { /* session may not be ready yet — benign */ }
 }
 

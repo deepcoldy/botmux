@@ -221,6 +221,24 @@ describe('createGroupWithBots', () => {
     expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_x', [OTHER_BOT]);
   });
 
+  it('forwards chatMode to createChat (topic group)', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      chatMode: 'topic',
+    });
+    expect(result.chatId).toBe('oc_topic');
+    expect(mockCreateChat).toHaveBeenCalledTimes(1);
+    expect(mockCreateChat.mock.calls[0][1].chatMode).toBe('topic');
+  });
+
+  it('leaves chatMode undefined when the caller does not ask for a topology', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_default', invalidBotIds: [], invalidUserIds: [] });
+    await createGroupWithBots({ creatorLarkAppId: CREATOR, larkAppIds: [CREATOR] });
+    expect(mockCreateChat.mock.calls[0][1].chatMode).toBeUndefined();
+  });
+
   it('reports chatId immediately after chat.create before invite and transfer work', async () => {
     const events: string[] = [];
     mockCreateChat.mockImplementation(async () => {

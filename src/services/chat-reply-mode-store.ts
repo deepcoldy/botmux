@@ -29,6 +29,7 @@
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode, type GroupMentionMode } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import { signedChatMentionDefault } from './signed-chat-defaults.js';
 
 export type { ChatReplyMode, GroupMentionMode } from '../bot-registry.js';
 
@@ -68,7 +69,8 @@ function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
  *               specific member (person/bot) without @ing this bot (redirect).
  *
  * Per-chat override (`chatMentionModes[chatId]`, written by `/mention-mode`)
- * wins when present; otherwise the per-bot `regularGroupMentionMode` default.
+ * wins when present; otherwise an opted-in signed chat default, then the
+ * per-bot `regularGroupMentionMode` default.
  */
 export function resolveGroupMentionMode(larkAppId: string, chatId?: string): GroupMentionMode {
   try {
@@ -77,6 +79,7 @@ export function resolveGroupMentionMode(larkAppId: string, chatId?: string): Gro
     if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
       return perChat;
     }
+    if (cfg.signedChatDefaults === true && signedChatMentionDefault(larkAppId, chatId)) return 'ambient';
     const m = cfg.regularGroupMentionMode;
     return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
   } catch {
@@ -166,7 +169,9 @@ export async function setChatMentionMode(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const redundant = mode === groupMentionDefaultMode(larkAppId);
+  // Keep explicit intent for signed-default bots even if the proof cache is
+  // cold/expired; removing a "redundant" topic override could re-enable ambient.
+  const redundant = bot.config.signedChatDefaults !== true && mode === groupMentionDefaultMode(larkAppId);
 
   const r = await rmwBotEntry<GroupMentionMode>(larkAppId, (entry) => {
     if (!entry.chatMentionModes || typeof entry.chatMentionModes !== 'object' || Array.isArray(entry.chatMentionModes)) {

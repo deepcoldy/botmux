@@ -152,15 +152,21 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(second.repeat?.completed).toBe(1);
   });
 
-  it('keeps creator identity out of the canonical input so the same id stays idempotent', async () => {
-    const { createTask } = await freshImport();
+  it('treats ownerOpenId as part of the canonical input so a re-create with a different creator conflicts', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_owner_identity';
     const first = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_old' });
-    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' });
-    // Creator identity is audit metadata, not task input: a re-create with a
-    // different creator must return the existing task untouched rather than
-    // conflict — and must not quietly re-stamp whose identity it runs as.
+    // The creator open_id is the identity scheduled turns authenticate as, so
+    // the same workflow id re-run by a different creator must not silently
+    // reuse the existing task; it conflicts instead.
+    expect(() => createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' })).toThrow(
+      IdempotencyConflictError,
+    );
+    // Same id + same creator stays idempotent and keeps the stored audit
+    // metadata (ownerUnionId is not part of the canonical input).
+    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_new' });
     expect(second.id).toBe(first.id);
+    expect(second.ownerOpenId).toBe('ou_old');
     expect(second.ownerUnionId).toBe('on_old');
   });
 

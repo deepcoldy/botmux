@@ -361,7 +361,8 @@ describe('formatDashboardSuccessLines', () => {
     expect(lines[0]).toBe('https://m-abc.platform.test/');
     // 无凭证形态必须走 hash 路由：`/workbench` 不在静态壳白名单里，token-free
     // 访问是 401 死链（实测平台身份下同样 401）。
-    expect(lines[1]).toBe('工作台: https://m-abc.platform.test/#/agent-workbench');
+    // 直达入口带沉浸式标记（无边框壳），见 core/workbench-shell.ts。
+    expect(lines[1]).toBe('工作台: https://m-abc.platform.test/#/agent-workbench?botmuxWorkbenchShell=immersive');
     // 整段输出里不得再出现 token —— 这是本次改动的核心断言。
     expect(lines.join('\n')).not.toContain('tok-abc');
   });

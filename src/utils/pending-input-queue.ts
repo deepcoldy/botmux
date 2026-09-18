@@ -1,4 +1,10 @@
-import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
+import type {
+  CodexAppTurnInput,
+  ReadonlyContinuationDispatchMarker,
+  TrustedCaller,
+  VcMeetingImTurnOrigin,
+} from '../types.js';
+import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface PendingCliInput {
   content: string;
@@ -16,6 +22,8 @@ export interface PendingCliInput {
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   trustedCaller?: TrustedCaller;
+  /** Stable authenticated controller of the surrounding session/task. */
+  trustedController?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
   /** Best-effort CLI-native title to apply after this exact user input has
    * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
@@ -42,6 +50,7 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  readonlyContinuation?: ReadonlyContinuationDispatchMarker;
 }
 
 /**
@@ -104,7 +113,13 @@ export function mergeQueuedCliInput(
     || tail.codexAppInput || next.codexAppInput
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
-    || tail.logicalContent || next.logicalContent) return false;
+    || tail.logicalContent || next.logicalContent
+    || tail.readonlyContinuation || next.readonlyContinuation) return false;
+  // Caller attribution is part of the logical envelope. Older code merged two
+  // queued messages and kept only the later turnId while silently retaining no
+  // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
+  // legacy callers fail closed and stay as separate turns.
+  if (!sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;

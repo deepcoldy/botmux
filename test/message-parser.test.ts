@@ -1870,6 +1870,41 @@ describe('cmdQuoted shared-numberer invariant', () => {
     expect(resources).toEqual([{ type: 'image', key: 'img_zzz', name: 'img_zzz.jpg' }]);
     expect(parsed.content).toBe('[图片 1]');
   });
+
+  it('post with a top-level files array extracts the upload for download', () => {
+    // Real Feishu shape observed when a user attaches an MD file to a rich-text
+    // message: the body only carries the @ mention, while the upload descriptor
+    // is a sibling of `content`/`content_v2`. It must still reach the shared
+    // resource downloader; otherwise agents see the @ but no attachment path.
+    const postContent = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      content_v2: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      files: [{
+        file_key: 'file_v3_top_level',
+        file_name: 'brief.md',
+        is_folder: false,
+      }],
+    });
+    const msg = {
+      message_id: 'om_post_top_level_file',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+
+    expect(resources).toEqual([{
+      type: 'file',
+      key: 'file_v3_top_level',
+      name: 'brief.md',
+    }]);
+    expect(parsed.content).toBe('@agent');
+  });
 });
 
 // ─── parseEventMessage: parentId surfacing for quote-reply ────────────────

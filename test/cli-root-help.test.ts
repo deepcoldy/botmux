@@ -1,5 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { connect, createServer } from 'node:net';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,6 +99,91 @@ describe('botmux root help workflow surface', () => {
       expect(readdirSync(home).filter(entry => entry !== '.bun').sort()).toEqual(before);
       expect(readFileSync(sentinel, 'utf8')).toBe('untouched\n');
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  // `send --help` regressed differently from the commands above: cmdSend had no
+  // --help intercept at all, so `--help` fell through positionals() (which
+  // filters it as a flag) into readStdin(). With a pipe that reaches EOF that
+  // surfaced as exit 1 「没有内容可发送」; with stdin that never closes — an open
+  // socket, which is what a relay shell hands the CLI — the process waited for
+  // EOF forever and wedged the calling shell. Both shapes are asserted here.
+  it.each([
+    ['--help'],
+    ['-h'],
+    // --help must outrank every other flag, including the @-decision gate that
+    // rejects this contradictory pair with exit 2 when a body is present.
+    ['--no-mention', '--help'],
+    ['--mention', 'ou_probe:probe', '--no-mention', '--help'],
+  ])('send %s prints the send help instead of waiting on stdin', (...flags) => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-send-help-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      delete env.BOTMUX_WORKFLOW;
+      const { command, prefixArgs } = tsRunnerPrefix();
+      const stdout = execFileSync(
+        command,
+        [
+          ...prefixArgs,
+          fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+          'send',
+          ...flags,
+        ],
+        // An empty pipe still reaches EOF, so a missing intercept fails loudly
+        // (exit 1) here rather than hanging the suite.
+        { cwd: process.cwd(), env, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+
+      // The flag documentation itself, not merely the one-line usage error.
+      expect(stdout).toContain('send [content]');
+      expect(stdout).toContain('--help, -h');
+      expect(stdout).toContain('--image-mode <mode>');
+      expect(stdout).toContain('--video-covers <path>');
+      expect(stdout).toContain('@ 硬门：每条回复须三选一');
+      expect(stdout).not.toContain('没有内容可发送');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('send --help does not wait for EOF when stdin is a socket that never closes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-send-help-socket-'));
+    const server = createServer();
+    try {
+      const env = { ...process.env, HOME: home };
+      delete env.BOTMUX_WORKFLOW;
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      // A connected socket held open by the peer: readStdin() would never see
+      // 'end', so a missing intercept hangs until the test timeout instead of
+      // exiting. This is the shape that left `send --help` processes resident
+      // for days, each blocking the shell that spawned it.
+      const peer = connect(port, '127.0.0.1');
+      await new Promise<void>((resolve, reject) => {
+        peer.once('connect', () => resolve());
+        peer.once('error', reject);
+      });
+      const { command, prefixArgs } = tsRunnerPrefix();
+      const child = spawn(
+        command,
+        [
+          ...prefixArgs,
+          fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+          'send',
+          '--help',
+        ],
+        { cwd: process.cwd(), env, stdio: [peer, 'pipe', 'ignore'] },
+      );
+      let stdout = '';
+      child.stdout.setEncoding('utf-8');
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      const code = await new Promise<number | null>(resolve => child.once('close', resolve));
+
+      expect(code).toBe(0);
+      expect(stdout).toContain('send [content]');
+      peer.destroy();
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
       rmSync(home, { recursive: true, force: true });
     }
   });

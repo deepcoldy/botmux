@@ -64,13 +64,14 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
 // disableStreamingCard (streaming card on → no reactions; off → reactions).
-function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string } = {}) {
+function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string; replyCardMode?: 'legacy' | 'unified' } = {}) {
   registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
     cliId: 'claude-code',
     allowedUsers: ['ou_o'],
     disableStreamingCard: reactionsOn || undefined,
+    replyCardMode: opts.replyCardMode,
     silentTurnReactions: opts.silentTurnReactions || undefined,
     receivedReactionEmoji: opts.receivedReactionEmoji,
     doneReactionEmoji: opts.doneReactionEmoji,
@@ -91,6 +92,13 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
+  it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
+    registerWith(statusOff, { replyCardMode: 'unified' });
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_status_toggle');
+    expect(mocks.addReaction).toHaveBeenCalledTimes(statusOff ? 1 : 0);
   });
 
   it('Plan B: a meeting-agent session reacts to plain user turns like any card-off session', async () => {
@@ -517,5 +525,4 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
   });
 });
-
 

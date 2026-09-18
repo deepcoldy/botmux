@@ -70,10 +70,12 @@ import {
   __testOnly_setBeforeRowPersist,
   init,
   createSession,
+  createSessionWithOwnedMutation,
   getSession,
   getOwnedSession,
   listSessions,
   listSessionsStrict,
+  SessionStoreBusyError,
   SessionStoreUnavailableError,
   beginMojoCloseJournal,
   markMojoClosePrepared,
@@ -89,6 +91,7 @@ import {
   repairMissingChatScope,
   loadAllSessionsSnapshot,
   applySessionCommandUnowned,
+  mutateOwnedSessionsAtomically,
   readSessionRowUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
@@ -148,6 +151,172 @@ beforeEach(() => {
 
 afterEach(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+describe('mutateOwnedSessionsAtomically()', () => {
+  it('publishes a multi-row authority change only after every row commits', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const second = createSession('chat-b', 'root-b', 'B');
+
+    const outcome = mutateOwnedSessionsAtomically([first.sessionId, second.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      rows.get(second.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      return 'committed' as const;
+    });
+
+    expect(outcome.result).toBe('committed');
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    init();
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+  });
+
+  it('rolls back disk and cache together when the second row cannot persist', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const second = createSession('chat-b', 'root-b', 'B');
+    __testOnly_setBeforeRowPersist(sessionId => {
+      if (sessionId === second.sessionId) throw new Error('synthetic second-row failure');
+    });
+
+    expect(() => mutateOwnedSessionsAtomically([first.sessionId, second.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      rows.get(second.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+    })).toThrow('synthetic second-row failure');
+
+    expect(first.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    expect(second.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init();
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+  });
+
+  it('fails fast without publishing cache or disk when nonblocking lock acquisition is busy', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const writer = new DatabaseSync(join(tempDir, 'sessions.db'));
+    writer.exec('PRAGMA busy_timeout = 0;');
+    writer.exec('BEGIN IMMEDIATE;');
+    const startedAt = performance.now();
+    try {
+      expect(() => mutateOwnedSessionsAtomically([first.sessionId], rows => {
+        rows.get(first.sessionId)!.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+      }, { nonblocking: true })).toThrow(SessionStoreBusyError);
+      expect(performance.now() - startedAt).toBeLessThan(500);
+      expect(first.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    } finally {
+      writer.exec('ROLLBACK;');
+      writer.close();
+    }
+
+    mutateOwnedSessionsAtomically([first.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionGroupId = 'after-lock-release';
+    }, { nonblocking: true });
+    expect(first.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
+    init();
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
+  });
+});
+
+describe('createSessionWithOwnedMutation()', () => {
+  it('publishes the child and parent-side authority in one commit', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    const created = createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, (rows, child) => {
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+      child.xpiSharedCwdAdmissionGroupId = 'group-a';
+      return child.sessionId;
+    });
+
+    expect(created.result).toBe(created.session.sessionId);
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    init();
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+  });
+
+  it('captures group model defaults through the atomic child creation path', () => {
+    init('atomic-model-defaults', {
+      groupDefaultModels: chatId => chatId === 'chat-a' ? { codex: 'gpt-5.6-sol' } : undefined,
+    });
+    const parent = createSession('chat-a', 'root-a', 'parent');
+
+    const created = createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      chatType: 'group',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, rows => {
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+    });
+
+    expect(created.session.groupDefaultModels).toEqual({ codex: 'gpt-5.6-sol' });
+    expect(getOwnedSession(created.session.sessionId)?.groupDefaultModels)
+      .toEqual({ codex: 'gpt-5.6-sol' });
+  });
+
+  it('rolls back the parent when the child insert fails after the parent write', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    let childId: string | undefined;
+    __testOnly_setBeforeRowPersist(sessionId => {
+      if (sessionId === childId) throw new Error('synthetic child insert failure');
+    });
+
+    expect(() => createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, (rows, child) => {
+      childId = child.sessionId;
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+      child.xpiSharedCwdAdmissionGroupId = 'group-a';
+    })).toThrow('synthetic child insert failure');
+
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect(childId && getOwnedSession(childId)).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init();
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect(childId && getOwnedSession(childId)).toBeUndefined();
+  });
+
+  it('does not publish a child or parent mutation when nonblocking BEGIN is busy', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    const beforeIds = listSessionsStrict().map(session => session.sessionId);
+    const writer = new DatabaseSync(join(tempDir, 'sessions.db'));
+    writer.exec('PRAGMA busy_timeout = 0;');
+    writer.exec('BEGIN IMMEDIATE;');
+    const startedAt = performance.now();
+    try {
+      expect(() => createSessionWithOwnedMutation({
+        chatId: 'chat-a',
+        rootMessageId: 'root-child',
+        title: 'child',
+        scope: 'thread',
+        ownedSessionIds: [parent.sessionId],
+        nonblocking: true,
+      }, (rows, child) => {
+        rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+        child.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+      })).toThrow(SessionStoreBusyError);
+      expect(performance.now() - startedAt).toBeLessThan(500);
+      expect(parent.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+      expect(listSessionsStrict().map(session => session.sessionId)).toEqual(beforeIds);
+    } finally {
+      writer.exec('ROLLBACK;');
+      writer.close();
+    }
+  });
 });
 
 // ─── init() ───────────────────────────────────────────────────────────────
@@ -1855,4 +2024,34 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(held).toEqual({ outcome: 'contended' });
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
   }, 15_000);
+});
+
+it('captures group model defaults only for new topics and persists independent snapshots', () => {
+  const groups = { oc_a: { codex: 'first', 'claude-code': 'sonnet' }, oc_b: { codex: 'other' } };
+  init('model-test', { groupDefaultModels: chatId => groups[chatId as keyof typeof groups] });
+  const first = createSession('oc_a', 'root-one', 'one', 'group');
+  const other = createSession('oc_b', 'root-two', 'two', 'group');
+  groups.oc_a.codex = 'changed';
+  const next = createSession('oc_a', 'root-three', 'three', 'group');
+  expect(first.groupDefaultModels?.codex).toBe('first');
+  expect(other.groupDefaultModels?.codex).toBe('other');
+  expect(next.groupDefaultModels?.codex).toBe('changed');
+  expect(createSession('oc_a', 'p2p', 'dm', 'p2p').groupDefaultModels).toBeUndefined();
+  expect(createSession('oc_a', 'chat', 'chat', 'group', 'chat').groupDefaultModels).toBeUndefined();
+  init('model-test');
+  expect(getSession(first.sessionId)?.groupDefaultModels).toEqual({ codex: 'first', 'claude-code': 'sonnet' });
+  expect(createSession('oc_a', 'legacy', 'no resolver', 'group').groupDefaultModels).toBeUndefined();
+});
+
+
+it('deeply snapshots group model and effort without changing runtime identity', () => {
+  const models = {codex:{model:'gpt-5.6-sol',reasoningEffort:'ultra' as const},'claude-code':{model:'sonnet',reasoningEffort:'high' as const}};
+  init('effort-test', {groupDefaultModels:()=>models});
+  const session=createSession('oc_group','root-effort','effort','group');
+  expect(session.reasoningEffort).toBeUndefined();
+  expect(session.cliId).toBeUndefined();
+  models.codex.model='changed';
+  expect(session.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+  init('effort-test');
+  expect(getSession(session.sessionId)?.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
 });

@@ -763,10 +763,13 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 40 = master 的 36 条 + /quote + /sessions + /project + /cleanup-wt。
+    // /tabs 与 /tab 由 Lark pre-routing 拦截，不属于 daemon command；否则
+    // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
     expect(DAEMON_COMMANDS.size).toBe(40);
+    expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -7891,6 +7894,8 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     const ds = makeDaemonSession();
     ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
     const deps = makeDeps(ds);
+    // This legacy turn has no persisted reply card; the shared fs mock otherwise reports every path as present.
+    vi.mocked(existsSync).mockReturnValueOnce(false);
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
     expect(ds.cotForced).toBe(true);
     expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({

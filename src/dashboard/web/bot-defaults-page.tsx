@@ -2,6 +2,8 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { BlockedUsersEditor } from './blocked-users-editor.js';
+import { QuietPresetSection } from './quiet-preset-section.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -62,7 +64,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
@@ -473,7 +475,7 @@ type DropdownFieldOption<T extends string> = {
   disabled?: boolean;
 };
 
-function DropdownField<T extends string>(props: {
+export function DropdownField<T extends string>(props: {
   dataInput: string;
   value: T;
   options: DropdownFieldOption<T>[];
@@ -525,6 +527,7 @@ export function ModelPickerField(props: {
   ariaLabel: string;
   defaultLabel: string;
   customLabel: string;
+  includeDefault?: boolean;
   detectedCount?: number;
   detectedLabel?: string;
   /** 下拉菜单样式类：defaults 页传 bd-field-menu，onboarding 传 onboarding-menu。 */
@@ -536,13 +539,14 @@ export function ModelPickerField(props: {
   const current = props.value;
   const dropdownOptions = useMemo(() => {
     const opts: { value: string; label: ReactNode }[] = [];
+    if (props.includeDefault) opts.push({ value: '', label: props.defaultLabel });
     if (current && !props.options.includes(current)) {
       opts.push({ value: current, label: current });
     }
     for (const item of props.options) opts.push({ value: item, label: item });
     opts.push({ value: MODEL_PICKER_CUSTOM, label: props.customLabel });
     return opts;
-  }, [current, props.options, props.customLabel]);
+  }, [current, props.options, props.customLabel, props.includeDefault, props.defaultLabel]);
 
   return (
     <span className="bd-model-picker">
@@ -751,6 +755,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
+    replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
@@ -766,6 +771,8 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
+    groupJoinCommandEnabled: body.groupJoinCommandEnabled,
+    groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
@@ -1138,6 +1145,7 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -2359,7 +2367,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (nextKey !== 'traex') {
+    if (!isBackendVariantCliId(nextKey)) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2454,7 +2462,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(cliKey === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(cliKey) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2660,7 +2668,7 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
-  const isTraex = cliKey === 'traex';
+  const isTraex = isBackendVariantCliId(cliKey);
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
@@ -3367,7 +3375,11 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
   // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+  const [joinCmdOn, setJoinCmdOn] = useState(bot.groupJoinCommandEnabled === true);
+  const [joinCmd, setJoinCmd] = useState(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   const [status, setStatus] = useState<StatusMessage>(null);
+  // 同一块里有两排按钮，状态提示跟着最后操作的那一排显示。
+  const [statusKey, setStatusKey] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3375,6 +3387,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+    setJoinCmdOn(bot.groupJoinCommandEnabled === true);
+    setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
     bot.autoStartOnGroupJoin,
@@ -3382,11 +3396,14 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartOnGroupJoinSeed,
     bot.autoStartOnGroupJoinSeedDefault,
     bot.autoStartOnNewTopic,
+    bot.groupJoinCommandEnabled,
+    bot.groupJoinCommand,
   ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
     setStatus(null);
+    setStatusKey(key);
     try {
       const res = await putCardPref(patch);
       setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
@@ -3459,7 +3476,36 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
             {tr('botDefaults.autoStartJoinSeedReset')}
           </button>
         ) : null}
-        <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
+        {statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
+      </div>
+      <ToggleRow
+        checked={joinCmdOn}
+        disabled={busy === 'joincmd-toggle' || (!joinCmdOn && !(bot.groupJoinCommand ?? '').trim())}
+        dataAction="toggle-group-join-command"
+        title={tr('botDefaults.groupJoinCommand')}
+        help={tr('botDefaults.groupJoinCommandHelp')}
+        onChange={checked => {
+          setJoinCmdOn(checked);
+          void savePatch({ groupJoinCommandEnabled: checked }, 'joincmd-toggle');
+        }}
+      />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.groupJoinCommandFieldHelp')}>{tr('botDefaults.groupJoinCommandField')}</FieldTitle>
+          <textarea
+            data-input="groupJoinCommand"
+            rows={2}
+            placeholder={tr('botDefaults.groupJoinCommandPlaceholder')}
+            value={joinCmd}
+            onChange={event => setJoinCmd(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-group-join-command" disabled={busy === 'joincmd'} onClick={() => void savePatch({ groupJoinCommand: joinCmd }, 'joincmd')}>
+          {tr('botDefaults.groupJoinCommandSave')}
+        </button>
+        {statusKey?.startsWith('joincmd') ? <StatusSpan status={status} attr={{ 'data-group-join-command-status': '' }} /> : null}
       </div>
     </div>
   );
@@ -4263,6 +4309,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const { bot, putCardPref } = props;
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
@@ -4276,6 +4323,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
+    setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
@@ -4283,7 +4331,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
     setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4315,12 +4363,48 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
       title: tr(`botDefaults.streamingButton.${id}`),
       description: tr(`botDefaults.streamingButton.${id}Description`),
     }));
+  const pinToggle = <StreamingCardPinToggle
+    scope="bot-defaults"
+    checked={pinStreamingCard}
+    disabled={busy !== null}
+    dataAction="toggle-pin-streaming-card"
+    title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
+    description={tr('botDefaults.pinStreamingCardDescription')}
+    help={replyMode === 'legacy' ? tr('botDefaults.pinStreamingCardHelp') : undefined}
+    onChange={checked => {
+      const previous = pinStreamingCard;
+      setPinStreamingCard(checked);
+      void savePatch({ pinStreamingCard: checked }, 'pin-streaming', () => setPinStreamingCard(previous));
+    }}
+  />;
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
       <div className="bd-card-settings">
         <section className="bd-card-setting-group" data-card-feedback-group>
           <h4 className="bd-card-setting-heading">{tr('botDefaults.cardFeedbackGroup')}</h4>
+          <div className="bd-row bd-card-display">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.replyCardModeHelp')}>{tr('botDefaults.replyCardMode')}</FieldTitle>
+              <DropdownField
+                dataInput="replyCardMode"
+                ariaLabel={tr('botDefaults.replyCardMode')}
+                value={replyMode}
+                disabled={busy !== null}
+                options={[
+                  { value: 'legacy', label: tr('botDefaults.replyCardLegacy') },
+                  { value: 'unified', label: tr('botDefaults.replyCardUnified') },
+                ]}
+                onChange={next => {
+                  const previous = replyMode;
+                  setReplyMode(next);
+                  void savePatch({ replyCardMode: next }, 'reply-mode', () => setReplyMode(previous));
+                }}
+              />
+            </div>
+            <p className="bd-card-setting-copy">{tr(replyMode === 'unified' ? 'botDefaults.replyCardUnifiedDescription'
+              : 'botDefaults.replyCardLegacyDescription')}</p>
+          </div>
           <ToggleRow
             className="bd-card-primary-toggle"
             checked={!disableStreaming}
@@ -4357,9 +4441,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             checked={thinkingCard}
             disabled={busy !== null}
             dataAction="toggle-thinking-card"
-            title={tr('botDefaults.thinkingCard')}
-            description={tr('botDefaults.thinkingCardDescription')}
-            help={tr('botDefaults.thinkingCardHelp')}
+            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
               const previous = thinkingCard;
               setThinkingCard(checked);
@@ -4372,8 +4456,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               disabled={busy !== null}
               dataAction="toggle-thinking-card-tool-result"
               title={tr('botDefaults.thinkingCardToolResult')}
-              description={tr('botDefaults.thinkingCardToolResultDescription')}
-              help={tr('botDefaults.thinkingCardToolResultHelp')}
+              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
+              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
               onChange={checked => {
                 const previous = thinkingCardToolResult;
                 setThinkingCardToolResult(checked);
@@ -4381,28 +4465,24 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               }}
             />
           </div>
-          <StreamingCardPinToggle
-            scope="bot-defaults"
-            checked={pinStreamingCard}
-            disabled={busy !== null}
-            dataAction="toggle-pin-streaming-card"
-            title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
-            description={tr('botDefaults.pinStreamingCardDescription')}
-            help={tr('botDefaults.pinStreamingCardHelp')}
-            onChange={checked => {
-              const previous = pinStreamingCard;
-              setPinStreamingCard(checked);
-              void savePatch(
-                { pinStreamingCard: checked },
-                'pin-streaming',
-                () => setPinStreamingCard(previous),
-              );
+          {replyMode === 'legacy' && pinToggle}
+          <QuietPresetSection
+            tr={tr}
+            thinkingCard={thinkingCard}
+            silentReactions={silentReactions}
+            disableStreaming={disableStreaming}
+            putCardPref={putCardPref}
+            onApplied={() => {
+              setThinkingCard(false);
+              setSilentReactions(true);
+              setDisableStreaming(true);
             }}
           />
         </section>
 
         <section className="bd-card-setting-group" data-card-buttons-group>
-          <h4 className="bd-card-setting-heading">{tr('botDefaults.streamingButtons')}</h4>
+          <h4 className="bd-card-setting-heading">{tr(replyMode === 'legacy' ? 'botDefaults.streamingButtons' : 'botDefaults.replyCardControls')}</h4>
+          {replyMode !== 'legacy' && <p className="bd-card-setting-copy">{tr('botDefaults.replyCardControlsHelp')}</p>}
           <div className="bd-card-button-grid" data-card-button-grid>
             {buttonOptions.map(option => {
               const visible = !hiddenButtons.includes(option.id);
@@ -4432,6 +4512,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               );
             })}
           </div>
+          {replyMode !== 'legacy' && pinToggle}
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>

@@ -131,6 +131,9 @@ export interface CliAdapter {
     workingDir?: string;
     /** CLI-native session id used for resume when it differs from botmux's session id. */
     resumeSessionId?: string;
+    /** Maintenance resume with no new input: suppress automatic recap/inference
+     *  and require the original thread where the adapter supports strict resume. */
+    quietResume?: boolean;
     /** When true, resume the `resumeSessionId` transcript but write forward into a
      *  NEW CLI-native session id instead of the resumed one, leaving the source
      *  transcript untouched — the native "fork/branch a session" primitive
@@ -204,6 +207,9 @@ export interface CliAdapter {
      *  treated as false by adapters (the worker always sends an explicit boolean
      *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
     bypassHookTrust?: boolean;
+    /** Codex-family (codex/traex/coco): suppress the low-quota model-switch picker per process.
+     *  The worker supplies the global default-ON setting; false/absent adds no override. */
+    hideRateLimitModelNudge?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -221,6 +227,25 @@ export interface CliAdapter {
     /** TraeCode only: process-scoped PreToolUse command for native spawn_agent.
      *  The worker supplies this for every managed model-owning Trae process. */
     nativeSubagentRuntimeHookCommand?: string;
+    /** This bot's own `env` from bots.json (already sanitized by the worker).
+     *  The same vars always reach the CLI as process env (pane injectEnv), but
+     *  for CLIs whose SETTINGS-file `env` map is applied ON TOP of inherited
+     *  process env (claude family: the user's ~/.claude/settings.json env
+     *  overwrites pane env at startup), that delivery loses to whatever the
+     *  user's global settings say — a bot configured with its own
+     *  ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL silently runs on the user's default
+     *  provider instead. Adapters with such a settings source SHOULD promote
+     *  these vars into their highest-precedence one (claude: `--settings`).
+     *  Other adapters ignore the field. */
+    settingsEnv?: Record<string, string>;
+    /** Host path where the adapter may persist a settings FILE carrying
+     *  settingsEnv (secrets like ANTHROPIC_AUTH_TOKEN must never travel via
+     *  inline `--settings <json>` — argv is world-readable through `ps`). The
+     *  worker only supplies a path whose location the CLI can read in every
+     *  mode (redirected/sandboxed → inside the effective CLI data dir; plain →
+     *  per-bot BOT_HOME). Absent ⇒ the adapter must NOT inline secrets into
+     *  argv; it falls back to process-env-only delivery (the old behavior). */
+    settingsFilePath?: string;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees
@@ -468,6 +493,22 @@ export interface CliAdapter {
    * It survives per-turn resets and is retired once per IdleDetector/spawn. */
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
+  /** Optional positive initialization evidence from a complete backend history
+   * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
+   * This only releases startup type-ahead; it never proves an idle/turn boundary. */
+  readonly startupReadyFromHistory?: (history: string) => boolean;
+
+  /**
+   * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
+   * (per IdleDetector instance; per-turn reset() does not restore it). Intended
+   * for adapters with readyPattern===undefined whose Bubble Tea style TUI can
+   * still be booting after the default 2s quiet window (OpenCode): the first
+   * queued message then waits this long before being pasted; every later cycle
+   * uses the normal quiescence. Ignored for adapters that define readyPattern
+   * (their prompt anchor gates quiescence already). The worker's first-prompt
+   * soft/hard timeouts remain the outer bound.
+   */
+  readonly firstPromptQuiescenceMs?: number;
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —

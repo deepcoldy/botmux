@@ -26,6 +26,15 @@ function noVisibleOutputHintOn(): boolean {
   return resolveConditionalLine('ai.routing.no_visible_output_ok', config.noVisibleOutputHint);
 }
 
+/** The `--as` guidance only makes sense while cross-principal isolation is
+ *  actually enforced. With the experimental switch off (the default) a message
+ *  is never staged, so `--as` classifies nothing — telling agents to use it
+ *  would be instructions for a feature that is not running. Gated through the
+ *  same conditional-line resolver so an operator can still force it either way. */
+function xpiAsHintOn(): boolean {
+  return resolveConditionalLine('ai.routing.xpi_as_hint', config.crossPrincipalInterruption);
+}
+
 /** The Workflow discovery line as pure text. Migrated to i18n key
  *  `ai.routing.workflow_hint` so it is customizable/overridable like the rest of
  *  the routing copy (byte-identical to the old literal when uncustomized).
@@ -95,6 +104,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean): s
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     feedbackResponseKindHint(locale),
+    ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so
@@ -263,6 +273,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.usage_silence'),
       escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
+      ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
       // Experimental anti-resend guidance — opt-in via dashboard Settings
       // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
       // the pre-feature baseline. Live-read so a toggle applies to the next session.

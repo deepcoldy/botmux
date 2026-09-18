@@ -295,6 +295,11 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Automatically replace outdated Codex session processes when safely idle
+   *  and resume the same thread without sending a new prompt. Experimental,
+   *  default OFF; read live so an explicit true starts scheduling upgrades and
+   *  removing it stops them, both without restarting the daemon. */
+  autoUpgradeCodexSessions?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -309,6 +314,10 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
+  /** Suppress Codex/TraeX/CoCo's low-quota model-switch picker for managed launches.
+   *  Default ON; false leaves the CLI's own notice configuration in control.
+   *  Applied per process; never edits the user's CLI config. Aiden's gateway cannot forward it. */
+  hideCodexRateLimitModelNudge?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -316,6 +325,17 @@ export interface DashboardGlobalConfig {
    *  model; harmless but unnecessary otherwise. Read live — see config.ts
    *  `noVisibleOutputHint`. */
   noVisibleOutputHint?: boolean;
+  /** Experimental: enforce cross-principal turn isolation (XPI). When a message
+   *  arrives while a DIFFERENT principal owns the active CLI turn, the daemon
+   *  diverts it into a staged `crossPrincipalInterruptions` record and asks the
+   *  proposer to classify it (另开任务 / 留给当前任务) instead of delivering it.
+   *  Default OFF (absent ⇒ off): the classification round-trip is not reliable
+   *  on Feishu today — a v2 card re-serialization drops the hidden `--as` token
+   *  and strips button `value`, so neither the flag nor the bare keyword settles
+   *  the card and the message can never leave the queue. With the switch OFF the
+   *  message is delivered exactly as it was before the feature existed. Read live
+   *  — see config.ts `crossPrincipalInterruption`. */
+  crossPrincipalInterruption?: boolean;
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
@@ -446,11 +466,14 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
+  if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
+  if (typeof d.crossPrincipalInterruption === 'boolean') out.crossPrincipalInterruption = d.crossPrincipalInterruption;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'
     && Number.isFinite(d.contextCompactThreshold)
@@ -823,6 +846,35 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().workflow?.enabled === true;
+}
+
+/**
+ * Machine-wide experimental switch for cross-principal turn isolation (XPI).
+ *
+ * OFF (the default) restores the pre-#1348 delivery shape exactly: a message
+ * from another principal is appended to the queue and delivered to the active
+ * CLI turn like any other message — no divert, no staged record, no
+ * classification card. That is deliberate mitigation, not a repair: the
+ * classification round-trip cannot currently be answered on Feishu (the card
+ * re-serialization drops the hidden `--as` token and strips button `value`), so
+ * an enforced isolation can strand the proposer's message indefinitely.
+ *
+ * Mirrors isWorkflowFeatureEnabled: `BOTMUX_XPI_ENABLED` wins when set (an
+ * escape hatch for a single daemon / a test), otherwise the dashboard toggle.
+ * Read live off the short-TTL config cache, so flipping Settings applies to the
+ * next turn without a daemon restart. Worker and daemon each call this on their
+ * own side; a mid-turn flip can only change what happens to the NEXT message,
+ * never rewrite an authority tuple already in flight.
+ */
+export function isCrossPrincipalInterruptionEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const flag = env.BOTMUX_XPI_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

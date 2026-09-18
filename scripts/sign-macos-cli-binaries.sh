@@ -26,7 +26,15 @@ fail() {
 [ -n "$CERT_PASSWORD" ] || fail "MAC_CSC_KEY_PASSWORD is required"
 [ -f "$ENTITLEMENTS" ] || fail "entitlements file not found: $ENTITLEMENTS"
 
+# Prior user keychain search domain, captured so cleanup can restore it.
+ORIGINAL_KEYCHAINS=()
+
 cleanup() {
+  # Restore the keychain search list before deleting the temporary keychain so
+  # we never leave a dangling sole entry behind.
+  if [ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]; then
+    security list-keychain -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+  fi
   security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
   rm -f "$CERT_PATH"
 }
@@ -53,6 +61,21 @@ esac
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+# A freshly created keychain is NOT registered in the user's search domain in a
+# non-GUI CI session. Both `security import -k` targeting it and
+# `set-key-partition-list` (which resolves the imported private key through the
+# search domain even when handed a path) then fail with errSecItemNotFound:
+# "The specified item could not be found in the keychain." Make the temporary
+# keychain the only user search keychain for this run; cleanup() restores the
+# previous list. This mirrors what electron-builder sets up for the desktop job
+# (which signs with the same identity successfully).
+while IFS= read -r kc_entry; do
+  kc_entry="${kc_entry#"${kc_entry%%[![:space:]]*}"}"
+  kc_entry="${kc_entry#\"}"
+  kc_entry="${kc_entry%\"}"
+  [ -n "$kc_entry" ] && ORIGINAL_KEYCHAINS+=("$kc_entry")
+done < <(security list-keychain -d user)
+security list-keychain -d user -s "$KEYCHAIN_PATH"
 security import "$CERT_PATH" \
   -k "$KEYCHAIN_PATH" \
   -P "$CERT_PASSWORD" \

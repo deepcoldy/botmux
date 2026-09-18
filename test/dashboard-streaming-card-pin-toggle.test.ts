@@ -82,6 +82,70 @@ function makeChat(memberBots: GroupMember[], overrides: Partial<GroupChat> = {})
 }
 
 describe('shared streaming-card pin toggle', () => {
+  it('uses the shared reply-mode menu and keeps manual-card controls out of unified reply feedback', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_mode', replyCardMode: 'unified' },
+        putCardPref: vi.fn(async () => ({ ok: true, status: 200, body: {} })),
+      }));
+    });
+    const feedback = renderer.root.findByProps({ 'data-card-feedback-group': true });
+    const controls = renderer.root.findByProps({ 'data-card-buttons-group': true });
+    expect(feedback.findAllByType('select')).toHaveLength(0);
+    expect(feedback.findByProps({ id: 'bd-menu-replyCardMode' }).props.value).toBe('unified');
+    expect(feedback.findByProps({ id: 'bd-menu-replyCardMode' }).props.options).toEqual([
+      { value: 'legacy', label: '默认模式' },
+      { value: 'unified', label: '动态单卡模式' },
+    ]);
+    expect(feedback.findAllByProps({ 'data-action': 'toggle-pin-streaming-card' })).toHaveLength(0);
+    expect(controls.findByProps({ 'data-action': 'toggle-pin-streaming-card' })).toBeTruthy();
+    expect(renderer.root.findAllByProps({ 'data-streaming-card-pin-help': 'bot-defaults' })).toHaveLength(0);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('selecting unified replies preserves the status-card switch and rolls back a rejected save', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: false, status: 400, body: { error: 'save_failed' } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_mode', disableStreamingCard: true }, putCardPref,
+      }));
+    });
+    await act(async () => {
+      renderer.root.findByProps({ id: 'bd-menu-replyCardMode' }).props.onChange('unified');
+    });
+    expect(putCardPref).toHaveBeenCalledWith({ replyCardMode: 'unified' });
+    expect(renderer.root.findByProps({ 'data-input': 'replyCardMode' }).props.value).toBe('legacy');
+    expect(findByDataAction(renderer, 'toggle-disable-streaming').props.checked).toBe(false);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it.each(['legacy', 'unified'] as const)('shows an independent status-card toggle in %s mode', async replyCardMode => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: {} }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_mode', replyCardMode, disableStreamingCard: true }, putCardPref,
+      }));
+    });
+    const toggle = findByDataAction(renderer, 'toggle-disable-streaming');
+    for (let node: TestRenderer.ReactTestInstance | null = toggle; node; node = node.parent) {
+      expect(node.props.hidden).not.toBe(true);
+    }
+    expect(toggle.props.checked).toBe(false);
+    const nextMode = replyCardMode === 'unified' ? 'legacy' : 'unified';
+    await act(async () => {
+      renderer.root.findByProps({ id: 'bd-menu-replyCardMode' }).props.onChange(nextMode);
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyCardMode: nextMode });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => { toggle.props.onChange({ currentTarget: { checked: true } }); });
+    expect(putCardPref).toHaveBeenLastCalledWith({ disableStreamingCard: false });
+    expect(renderer.root.findByProps({ 'data-input': 'replyCardMode' }).props.value).toBe(nextMode);
+    expect(toggle.props.checked).toBe(true);
+    await act(async () => { renderer.unmount(); });
+  });
   it('keeps the bot-defaults pin toggle semantics while rendering shared copy', () => {
     const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
     let renderer!: TestRenderer.ReactTestRenderer;

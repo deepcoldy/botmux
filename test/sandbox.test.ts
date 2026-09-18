@@ -274,6 +274,27 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('allows only the two cross-principal --as choices through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'independent', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'independent', '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'suggestion'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'suggestion'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'maybe'],
+    })).toMatchObject({ ok: false, error: 'flag --as must be independent or suggestion' });
+  });
+
   it('allows only canonical reply layouts through the sandbox relay', () => {
     for (const layout of ['result', 'progress', 'risk', 'blocked', 'handoff']) {
       expect(validateRelayRequest({
@@ -293,6 +314,19 @@ describe('validateRelayRequest', () => {
         error: 'flag --layout must be result, progress, risk, blocked, or handoff',
       });
     }
+  });
+
+  it('allows only validated urgent modes through the sandbox relay', () => {
+    for (const flag of ['--urgent', '--urgent=app', '--urgent=sms', '--urgent=phone']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: [flag, '--mention-back'],
+      })).toMatchObject({ ok: true, value: { flags: [flag, '--mention-back'] } });
+    }
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--urgent=all'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
   });
 
   it('accepts a custom card file as a plain outbox basename', () => {

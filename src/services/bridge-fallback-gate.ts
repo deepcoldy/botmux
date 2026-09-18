@@ -194,8 +194,11 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
+  responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
+  /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
+  replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
@@ -295,7 +298,9 @@ export function shouldSuppressBridgeEmit(
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
+    && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'));
+  if (markersInWindow.some(m => m.replyCardResponseKind === 'final')) return true;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

@@ -9,10 +9,11 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
+import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -95,6 +96,11 @@ import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import {
+  reconcileXpiSharedCwdRecovery,
+  type XpiSharedCwdQuarantineNotice,
+  type XpiSharedCwdStartupNotice,
+} from './xpi-shared-cwd-admission.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -2105,7 +2111,7 @@ export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
   options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
-): Promise<void> {
+): Promise<XpiSharedCwdStartupNotice[] | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.headless) return 2;
@@ -2117,7 +2123,7 @@ export async function restoreActiveSessions(
   // real CLI/adopt rows first, queued intent second, command scratches last.
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
-  const active = sessions
+  let active = sessions
     .filter(s => s.status === 'active')
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
@@ -2128,6 +2134,87 @@ export async function restoreActiveSessions(
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
 
+  // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
+  // before stale-pid sweeping, backend probes, registration, card recovery, or
+  // any worker fork. One stale legacy record quarantines only its session; an
+  // ambiguous authority quarantines only its explicit group. Every unrelated
+  // session continues through ordinary restore.
+  let xpiQuarantineNotices: XpiSharedCwdStartupNotice[] = [];
+  if (active.length > 0) {
+    const groups = new Map<string, Session[]>();
+    const standalone: Session[][] = [];
+    for (const session of active) {
+      const groupId = session.xpiSharedCwdAdmissionGroupId;
+      if (groupId) {
+        const members = groups.get(groupId) ?? [];
+        members.push(session);
+        groups.set(groupId, members);
+        continue;
+      }
+      const hasStandaloneRecoveryState = !!session.xpiSharedCwdQuarantine
+        || (session.crossPrincipalInterruptions?.length ?? 0) > 0
+        || !!session.xpiSharedCwdAdmissionCoordinatorSessionId
+        || !!session.xpiSharedCwdAdmissionLease
+        || (session.xpiSharedCwdQueuedTurns?.length ?? 0) > 0;
+      if (hasStandaloneRecoveryState) standalone.push([session]);
+    }
+    const partitions = [
+      ...[...groups.entries()].map(([key, members]) => ({ scope: 'group' as const, key, members })),
+      ...standalone.map(members => ({ scope: 'session' as const, key: members[0]!.sessionId, members })),
+    ];
+    const quarantinedSessionIds = new Set<string>();
+    for (const partition of partitions) {
+      try {
+        let result: ReturnType<typeof reconcileXpiSharedCwdRecovery> | undefined;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            ({ result } = sessionStore.mutateOwnedSessionsAtomically(
+              partition.members.map(session => session.sessionId),
+              fresh => reconcileXpiSharedCwdRecovery([...fresh.values()], Date.now()),
+              { nonblocking: true },
+            ));
+            break;
+          } catch (error) {
+            if (!(error instanceof sessionStore.SessionStoreBusyError) || attempt === 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        if (!result) throw new Error('XPI shared-cwd recovery transaction returned no result');
+        xpiQuarantineNotices.push(...result.notices);
+        xpiQuarantineNotices.push(...result.dispatchUnknownNotices);
+        for (const sessionId of result.quarantinedSessionIds) quarantinedSessionIds.add(sessionId);
+        for (const notice of result.notices) {
+          logger.error(`[xpi-shared-cwd] recovery_quarantine ${JSON.stringify(notice)}`);
+        }
+      } catch (error) {
+        const detail = `XPI shared-cwd ${partition.scope} ${partition.key} recovery persistence failed: `
+          + `${error instanceof Error ? error.message : String(error)}`;
+        logger.error(`[xpi-shared-cwd] recovery_partition_failure ${JSON.stringify({
+          scope: partition.scope,
+          key: partition.key,
+          sessionIds: partition.members.map(session => session.sessionId),
+          detail,
+        })}`);
+        for (const session of partition.members) {
+          // The write lock is unavailable, so this marker cannot be durable in
+          // this attempt. listSessions() exposes the owned in-memory cache;
+          // stamping it still reserves the route for this daemon lifetime and
+          // prevents a replacement session beside an unverified old backing.
+          // The next boot retries the durable reconcile before opening ingress.
+          session.restoreQuarantinedAt ??= new Date().toISOString();
+          quarantinedSessionIds.add(session.sessionId);
+          xpiQuarantineNotices.push({
+            sessionId: session.sessionId,
+            scope: partition.scope,
+            reason: 'recovery_persistence_failure',
+            detail,
+          });
+        }
+      }
+    }
+    active = active.filter(session => !quarantinedSessionIds.has(session.sessionId));
+  }
+
   // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:
   // the landmine files (recycled-PID misroute source) accumulate across every
   // daemon run, and a run with zero active sessions is still a fresh start that
@@ -2136,7 +2223,7 @@ export async function restoreActiveSessions(
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
-    return;
+    return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
   }
 
   // Kill any stale CLI processes from previous daemon run
@@ -2667,6 +2754,21 @@ export async function restoreActiveSessions(
       session.replyThreadAliases = aliases;
       session.rootMessageId = binding.rootMessageId;
       ds.replyThreadAliases = aliases;
+      // A materialized task-position run is promoted to an ordinary thread
+      // session before registration: write the root back onto the task, clear
+      // the deferred marker and flip scope so setActiveSessionSafe below
+      // registers at the real om_ key (sessionAnchorId reads the cleared
+      // marker + thread scope) instead of the stable virtual slot.
+      if (binding.routingAnchor.startsWith('schedule-task:')) {
+        scheduleStore.updateTask(
+          session.deferredScheduleRun.taskId,
+          { rootMessageId: binding.rootMessageId },
+          larkAppId,
+        );
+        session.scope = 'thread';
+        ds.scope = 'thread';
+        session.deferredScheduleRun = undefined;
+      }
       sessionStore.updateSession(session);
     }
     // Literal pending-repo passthroughs have an empty init prompt and therefore
@@ -2824,7 +2926,9 @@ export async function restoreActiveSessions(
   // pass has registered collision winners. A zero-delay overdue backoff must
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
-    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
+    if (!stillOwnsRestoreRegistration(ds)) continue;
+    ensureOrdinaryTurnRecoveryAttached(ds);
+    ensureReadonlyTaskContinuationAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -3015,6 +3119,7 @@ export async function restoreActiveSessions(
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
+  return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
 }
 
 /** Re-attaching to a pane that is already alive: the worker only has to reconnect. */
@@ -3398,6 +3503,7 @@ export function resolveScheduledTaskScope(
   task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
 ): 'thread' | 'chat' {
   if (task.executionPosition === 'topic' && task.rootMessageId) return 'thread';
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'thread' : 'chat';
   if (task.executionPosition === 'top-level' || task.executionPosition === 'new-topic') return 'chat';
   if (task.deliver === 'new-topic') return 'chat';
   if (task.scope === 'chat') return 'chat';
@@ -3406,8 +3512,12 @@ export function resolveScheduledTaskScope(
 
 export function resolveScheduledTaskExecutionPosition(
   task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
-): 'top-level' | 'topic' | 'new-topic' {
+): 'top-level' | 'topic' | 'new-topic' | 'task' {
   if (task.executionPosition === 'new-topic') return 'new-topic';
+  // A materialized task-position run is an ordinary retained thread: resolve
+  // it to 'topic' so the existing thread branch owns every later fire. The
+  // rootless first fire keeps 'task' and goes through the dedicated branch.
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'topic' : 'task';
   if (task.executionPosition === 'topic' && task.rootMessageId) return 'topic';
   if (task.executionPosition === 'top-level') return 'top-level';
   if (task.deliver === 'new-topic') return 'new-topic';
@@ -3553,6 +3663,67 @@ export async function executeScheduledTask(
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
       if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
+    }
+  } else if (executionPosition === 'task') {
+    // Dedicated per-task topic, first fire: the task has no materialized root
+    // yet (a materialized run resolves to position 'topic' above).
+    if (silent) {
+      // Stable virtual anchor shared by every fire of THIS task — unlike
+      // new-topic's per-run `schedule-run:<id>:<turn>` anchor, a second fire
+      // before materialization lands in this same slot and continues the
+      // hidden session. The visible Lark root stays deferred until the first
+      // botmux send; no seed message and no banner are posted.
+      anchor = `schedule-task:${task.id}`;
+      isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
+    } else {
+      // Two rootless snapshots admitted near-simultaneously (e.g. two run-now
+      // clicks) must not each send a seed: distinct om_ anchors take different
+      // real-key locks below and both win the registration CAS, forking two
+      // sessions that split the task's history. Serialize the recheck / seed /
+      // writeback on the SAME stable per-task key the silent branch uses; the
+      // loser finds the root the winner wrote back and continues that topic.
+      // Lock order is virtual→real here and virtual→real in the promotion
+      // helper, so no lock-order inversion is possible.
+      const firstFire = await withActiveSessionKeyLock(
+        activeSessions,
+        sessionKey(`schedule-task:${task.id}`, larkAppId),
+        async () => {
+          const existingRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+          if (existingRoot) {
+            return { anchor: existingRoot, rootMessageId: existingRoot, isContinuation: true };
+          }
+          if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+            const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+            buildScheduledTargetNotice({
+              kind: 'chat',
+              taskName: task.name,
+              targetAppId: larkAppId,
+              targetChatId: task.chatId,
+              targetBrand: bot.config.brand,
+              locale: localeForBot(creatorAppId),
+            }).then(content => replyMessage(
+              creatorAppId,
+              task.creatorRootMessageId!,
+              content,
+              'text',
+              true,
+            )).catch((err: any) => {
+              logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+            });
+          }
+          const topicSeed = task.topicTitle?.trim()
+            || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
+          const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
+          // Write the root straight into the task row (store call, not the
+          // scheduler wrapper/event bus): every later fire resolves to this
+          // exact thread and resumes the session created below.
+          scheduleStore.updateTask(task.id, { rootMessageId: seed }, larkAppId);
+          return { anchor: seed, rootMessageId: seed, isContinuation: false };
+        },
+      );
+      anchor = firstFire.anchor;
+      task = { ...task, rootMessageId: firstFire.rootMessageId };
+      isContinuation = firstFire.isContinuation;
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.
@@ -3703,6 +3874,32 @@ export async function executeScheduledTask(
     // let the scheduled prompt overtake (or replace) the opening prompt that
     // owns the reservation.
     const existing = activeSessions.get(key);
+    if (!existing
+      && executionPosition === 'task'
+      && anchor.startsWith('schedule-task:')) {
+      // A rootless first-fire snapshot can race the materialization settlement
+      // of the PREVIOUS fire: promotion (task-root writeback + live-map move to
+      // the om_ slot) commits under THIS virtual-key lock, so reaching the
+      // create path with no virtual owner while the store already carries a root
+      // means this task's session now lives at the real topic slot. Re-enter
+      // routing there instead of opening a second hidden session — its later
+      // materialization would overwrite the task root and split the task's
+      // history. Lock order stays virtual→real, identical to the promotion
+      // helper, so no lock-order inversion is possible.
+      const promotedRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+      if (promotedRoot) {
+        logger.info(
+          `[scheduler] Task "${task.name}" (${task.id}) first fire raced topic materialization; `
+          + `resuming at the promoted root ${promotedRoot.slice(0, 12)}`,
+        );
+        return executeScheduledTask(
+          { ...task, rootMessageId: promotedRoot },
+          activeSessions,
+          refreshCliVersion,
+          additionalPrompt,
+        );
+      }
+    }
     if (existing) {
       const reservedState = existing.pendingRepo
         ? 'pending_repo'
@@ -3754,6 +3951,14 @@ export async function executeScheduledTask(
         }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
+        if (existing.session.deferredScheduleRun
+          && existing.session.deferredScheduleRun.routingAnchor.startsWith('schedule-task:')) {
+          // A task-position hidden session re-fired before materialization
+          // keeps its stable virtual anchor; hand materialization ownership to
+          // the new turn (the first `botmux send` validates turn equality).
+          existing.session.deferredScheduleRun.turnId = scheduledTurnId;
+          sessionStore.updateSession(existing.session);
+        }
         if (sharedTopicRootId) {
           beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
           sessionStore.updateSession(existing.session);
@@ -3825,7 +4030,8 @@ export async function executeScheduledTask(
     // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
     // formerly chat-scope task was redirected into a converted topic chat, promote
     // the runtime session to thread-scope so follow-up replies stay in-thread.
-    const deferredFreshTopic = executionPosition === 'new-topic' && silent;
+    const deferredFreshTopic = silent
+      && (executionPosition === 'new-topic' || executionPosition === 'task');
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;

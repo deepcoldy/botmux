@@ -173,6 +173,7 @@ import {
   workbenchEntryUrl,
   type DashboardUrls,
 } from './core/dashboard-url.js';
+import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/workbench-shell.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
@@ -243,6 +244,7 @@ import {
   leaveGroup,
   renameGroup,
   setPinStreamingCardForGroup,
+  setDefaultModelsForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -1012,9 +1014,11 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1054,6 +1058,8 @@ interface ResolvedDashboardSettings {
   };
   /** Experimental anti-resend guidance in botmux routing hints. Default OFF. */
   noVisibleOutputHint: boolean;
+  /** Experimental cross-principal turn isolation (XPI). Default OFF. */
+  crossPrincipalInterruption: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -1613,8 +1619,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,
@@ -1638,6 +1646,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
         && registry.list().some(bot => bot.larkAppId === global.hostOverloadAlert?.targetBotAppId),
     },
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
+    crossPrincipalInterruption: dashboard.crossPrincipalInterruption === true, // default OFF; opt-in cross-principal isolation
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       larkCliVersion: larkCli?.version ?? null,
@@ -2983,15 +2992,9 @@ function lifecycleBotIds(connector: ConnectorDefinition): string[] {
   return Array.from(new Set([connector.target.botId, ...(connector.target.botIds ?? [])].filter(Boolean)));
 }
 
-function lifecycleGroupName(connector: ConnectorDefinition, dedupKey: string): string {
-  const cleanKey = dedupKey.replace(/\s+/g, ' ').trim();
-  const name = `${connector.name}: ${cleanKey}`;
-  return name.length <= 58 ? name : `${name.slice(0, 55)}...`;
-}
-
 async function createLifecycleGroupForWebhook(
   connector: ConnectorDefinition,
-  args: { dedupKey: string },
+  args: { dedupKey: string; groupName: string },
 ): Promise<{ chatId: string; creatorLarkAppId?: string }> {
   const selectedIds = lifecycleBotIds(connector);
   const pick = pickCreatorForGroup(selectedIds, (id) => {
@@ -3012,7 +3015,7 @@ async function createLifecycleGroupForWebhook(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      name: lifecycleGroupName(connector, args.dedupKey),
+      name: args.groupName,
       larkAppIds: selectedIds,
       ...(ownerUnionIds.length > 0 ? { ownerUnionIds } : {}),
       ...(userOpenIds.length > 0 ? { userOpenIds } : {}),
@@ -3049,6 +3052,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
+          defaultModels, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3073,6 +3077,8 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           cliId: d.cliId,
           inChat: true,
           oncallChat: oncallChat ?? null,
+          defaultModels: defaultModels ?? {},
+          agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
           pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
@@ -4106,10 +4112,12 @@ const server = createServer(async (req, res) => {
     // `/s/<id>?token=` URL; ours carried `#/agent-workbench`, and a fragment is
     // the one structural difference between the two. Clients that re-encode or
     // truncate an AppLink's `url` lose it and land on the Dashboard home, so
-    // offer a path that survives regardless.
+    // offer a path that survives regardless. These are direct entries, so the
+    // target hash carries the immersive (chrome-less) marker — the sidebar's
+    // own `#/agent-workbench` keeps the normal shell (core/workbench-shell.ts).
     if ((req.method === 'GET' || req.method === 'HEAD')
       && (url.pathname === '/workbench' || url.pathname === '/workbench/dock')) {
-      const target = url.pathname === '/workbench/dock' ? '#/agent-workbench-dock' : '#/agent-workbench';
+      const target = url.pathname === '/workbench/dock' ? WORKBENCH_DOCK_IMMERSIVE_HASH : WORKBENCH_IMMERSIVE_HASH;
       const token = url.searchParams.get('t');
       const query = token ? `?t=${encodeURIComponent(token)}` : '';
       res.writeHead(302, { location: `/${query}${target}`, 'cache-control': 'no-store' });
@@ -6272,6 +6280,64 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── 成员授权 / 黑名单 / 整群授权（proxy to daemon；管理写路径，不在
+    // PUBLIC_READ_PATHS，非 manager 已在 resolveDashboardRequestGate 被 deny401）───
+    let mBotBlockedUsers: RegExpMatchArray | null;
+    if ((mBotBlockedUsers = url.pathname.match(/^\/api\/bots\/([^/]+)\/blocked-users$/))) {
+      const appId = decodeURIComponent(mBotBlockedUsers[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mBotChatGrant: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mBotChatGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/grants\/chat$/))) {
+      const appId = decodeURIComponent(mBotChatGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/grants/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mBotChatGroupGrant: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotChatGroupGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/chat-group-grant$/))) {
+      const appId = decodeURIComponent(mBotChatGroupGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/chat-group-grant', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
     // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
     if (url.pathname === '/api/vc-meeting/consumer-profiles') {
@@ -6572,6 +6638,18 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mDefaultModels: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mDefaultModels = url.pathname.match(/^\/api\/groups\/([^/]+)\/default-models\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setDefaultModelsForGroup(
+        decodeURIComponent(mDefaultModels[1]), decodeURIComponent(mDefaultModels[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
     }
 
     let mPinStreamingCard: RegExpMatchArray | null;
