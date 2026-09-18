@@ -144,6 +144,17 @@ describe('supersedePendingTriggerByCompletedSuccessorStrict', () => {
     expect(lookup('sess1', 'trg_old')?.result.status).toBe('pending');
   });
 
+  it('rejects a corrupted completed successor without completion evidence', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    writeFileSync(join(tempDir, 'async-triggers', 'sess1.json'), JSON.stringify({
+      ownerLarkAppId: 'cli_test',
+      results: { trg_old: { status: 'pending', createdAt: 1000 }, trg_new: { status: 'completed', createdAt: 2000 } },
+    }));
+    expect(supersedePendingTriggerByCompletedSuccessorStrict('sess1', 'trg_old', 'trg_new', 3000, 'cli_test'))
+      .toBe('successor_not_completed');
+    expect(lookup('sess1', 'trg_old')?.result.status).toBe('pending');
+  });
+
   it('is idempotent for the same explicit successor', () => {
     recordPending('sess1', 'trg_old', 1000, 'cli_test');
     recordCompleted('sess1', 'trg_new', 'done', 2000, 'cli_test');

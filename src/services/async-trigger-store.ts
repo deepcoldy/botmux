@@ -240,6 +240,8 @@ export type SupersedePendingTriggerOutcome =
  * the same session is durably completed. The caller owns proof of the external
  * causal link (for example a handoff receipt's predecessorReceiptFile); this
  * store deliberately never infers causality from timestamps or trigger order.
+ * Later authoritative worker completion or terminal failure may replace this
+ * marker through the normal completed-wins persistence contract.
  */
 export function supersedePendingTriggerByCompletedSuccessorStrict(
   sessionId: string,
@@ -260,7 +262,7 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
     }
     const predecessor = file.results[predecessorTriggerId];
     const successor = file.results[successorTriggerId];
-    if (successor?.status !== 'completed') return 'successor_not_completed';
+    if (!isValidPersistedResult(successor) || successor.status !== 'completed') return 'successor_not_completed';
     if (predecessor?.status === 'failed'
       && predecessor.reason === 'turn_terminal'
       && predecessor.terminalErrorCode === `superseded_by_completed_successor:${successorTriggerId}`) {

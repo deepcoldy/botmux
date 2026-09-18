@@ -3224,6 +3224,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req
       cachedLarkAppId,
     );
     if (outcome === 'superseded' || outcome === 'already_superseded') {
+      const results = findActiveBySessionId(params.sessionId)?.asyncTriggerResults;
+      if (results?.get(predecessorTriggerId)?.status === 'pending') results.delete(predecessorTriggerId);
       return jsonRes(res, 200, {
         ok: true,
         state: 'superseded',

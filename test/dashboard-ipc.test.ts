@@ -32,6 +32,7 @@ scheduleStore.setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
+import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as sandboxStore from '../src/services/sandbox-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
@@ -9626,6 +9627,50 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
   afterEach(async () => {
     __testOnly_resetCoreOnlyReadiness();
     if (handle) { await handle.close(); handle = null; }
+  });
+
+  it('supersedes exact pending triggers through authenticated IPC and converges the next poll', async () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'supersede-ipc-'));
+    config.session.dataDir = dataDir;
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('cli_supersede');
+    const results = new Map([['old', { status: 'pending', createdAt: 1000 }]]);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 'supersede-session', chatId: 'oc_test', larkAppId: 'cli_supersede', status: 'active' },
+      asyncTriggerResults: results,
+    } as any);
+    try {
+      asyncTriggerStore.recordPending('supersede-session', 'old', 1000, 'cli_supersede');
+      asyncTriggerStore.recordPending('supersede-session', 'new', 2000, 'cli_supersede');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const base = `http://127.0.0.1:${handle.port}/api/sessions/supersede-session/trigger-result`;
+      const post = (predecessorTriggerId = 'old') => fetch(`${base}/supersede`, {
+        method: 'POST', headers: { ...trustedHostHeaders('POST', '/api/sessions/supersede-session/trigger-result/supersede', handle!.port), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ predecessorTriggerId, successorTriggerId: 'new' }),
+      });
+      let response = await post();
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: 'successor_not_completed' });
+      asyncTriggerStore.recordCompleted('supersede-session', 'new', 'done', 3000, 'cli_supersede');
+      response = await post();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ state: 'superseded', alreadyTerminal: false });
+      expect(results.has('old')).toBe(false);
+      response = await post();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ alreadyTerminal: true });
+      const poll = await fetch(`${base}?triggerId=old`, { headers: trustedHostHeaders('GET', '/api/sessions/supersede-session/trigger-result', handle!.port) });
+      expect(poll.status).toBe(200);
+      expect(await poll.json()).toMatchObject({ state: 'failed' });
+      response = await post('missing');
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: 'predecessor_not_pending' });
+    } finally {
+      findSpy.mockRestore();
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
