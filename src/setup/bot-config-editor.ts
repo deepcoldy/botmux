@@ -47,10 +47,11 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // （25→reasonix、26→opencode2、27→dsh）。
   '28': 'mojo',
   '29': 'ebsd',
-  '30': 'mimocode',
+  // minimax 的 '30' 已随 v3.21.0 正式发布，序号不能移位。
+  '30': 'minimax',
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
-  '31': 'minimax',
+  '31': 'mimocode',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
