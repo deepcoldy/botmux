@@ -933,7 +933,8 @@ export interface CrossPrincipalInterruption {
     | 'awaiting_owner'
     | 'owner_approved'
     | 'preparing_independent'
-    | 'independent_queued';
+    | 'independent_queued'
+    | 'terminal_notice_pending';
   /** Legacy field retained for restore compatibility. Human records start the
    *  classification clock only after the classification card is delivered.
    *
@@ -959,6 +960,10 @@ export interface CrossPrincipalInterruption {
     role: 'owner' | 'proposer';
     attempts: number;
   };
+  /** Durable terminal outcome retained until its human notification is
+   * delivered, or until the bounded outer retry budget is exhausted. */
+  terminalNoticeText?: string;
+  terminalNoticeAttempts?: number;
   messages: CrossPrincipalInterruptionMessage[];
   independentRootMessageId?: string;
   independentChildSessionId?: string;

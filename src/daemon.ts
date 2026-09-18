@@ -18456,6 +18456,8 @@ function deferTransientXpiIdentityResolution(
 const XPI_TERMINAL_ALERT_MAX_ATTEMPTS = 3;
 const XPI_TERMINAL_ALERT_RETRY_DELAYS_MS = [0, 250, 1_000];
 const XPI_TERMINAL_ALERT_AUDIT_LIMIT = 50;
+const XPI_TERMINAL_NOTICE_MAX_CYCLES = 3;
+const XPI_TERMINAL_NOTICE_RETRY_MS = 5_000;
 
 function recordCrossPrincipalDeliveryAudit(
   ds: DaemonSession,
@@ -18659,8 +18661,7 @@ async function applyCrossPrincipalProposerChoice(
       // decision. Human cards hide this choice; text/legacy callers still hit
       // this fail-closed boundary.
       if (record.owner.senderType === 'bot') {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           '原任务由机器人发起，无法确认追加建议；请选择独立任务。',
@@ -18763,8 +18764,7 @@ async function stageCrossPrincipalInterruption(args: {
     // process. A legacy sender may still arrive without the durable token; fail
     // closed without publishing another bot-addressed control message into the
     // shared topic (that was the mixed-version recursion source).
-    removeCrossPrincipalRecord(ds, staged.record.id);
-    await notifyCrossPrincipalTerminal(ds, staged.record, tr('xpi.timeout.unclassified', undefined, loc));
+    await settleCrossPrincipalTerminal(ds, staged.record, tr('xpi.timeout.unclassified', undefined, loc));
     return true;
   }
   // The classification card is the acknowledgement. Posting a separate
@@ -18904,6 +18904,67 @@ async function notifyCrossPrincipalTerminal(
 
 export const __testOnly_notifyCrossPrincipalTerminal = notifyCrossPrincipalTerminal;
 
+/** Keep a terminal XPI record durable until the human outcome is delivered.
+ * Each cycle already has the transport's short retry loop above; this outer,
+ * restart-safe state adds bounded recovery for longer outages without ever
+ * replaying the business action that produced the outcome. */
+async function settleCrossPrincipalTerminal(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  text: string,
+): Promise<void> {
+  if (record.phase !== 'terminal_notice_pending') {
+    record.phase = 'terminal_notice_pending';
+    record.terminalNoticeText = text;
+    record.terminalNoticeAttempts = 0;
+    delete record.identityResolutionRetry;
+    persistCrossPrincipalQueue(ds);
+  } else if (!record.terminalNoticeText) {
+    record.terminalNoticeText = text;
+    persistCrossPrincipalQueue(ds);
+  }
+
+  let delivered = false;
+  try {
+    delivered = await notifyCrossPrincipalTerminal(ds, record, record.terminalNoticeText ?? text);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    recordCrossPrincipalDeliveryAudit(
+      ds,
+      record,
+      'delivery_failed',
+      ds.scope === 'thread' ? 'topic' : 'group',
+      0,
+      detail,
+    );
+    logger.warn(`[${tag(ds)}] XPI terminal notice cycle failed record=${record.id}: ${detail}`);
+  }
+  if (delivered) {
+    removeCrossPrincipalRecord(ds, record.id);
+    return;
+  }
+
+  record.terminalNoticeAttempts = (record.terminalNoticeAttempts ?? 0) + 1;
+  if (record.terminalNoticeAttempts >= XPI_TERMINAL_NOTICE_MAX_CYCLES) {
+    recordCrossPrincipalDeliveryAudit(
+      ds,
+      record,
+      'delivery_exhausted',
+      ds.scope === 'thread' ? 'topic' : 'group',
+      record.terminalNoticeAttempts,
+      'terminal notice outer retry exhausted; closing on audit plane',
+    );
+    logger.error(
+      `[${tag(ds)}] XPI terminal notice outer retry exhausted; `
+      + `closing on audit plane record=${record.id} cycles=${record.terminalNoticeAttempts}`,
+    );
+    removeCrossPrincipalRecord(ds, record.id);
+    return;
+  }
+  persistCrossPrincipalQueue(ds);
+  scheduleCrossPrincipalOwnerWait(ds, Date.now() + XPI_TERMINAL_NOTICE_RETRY_MS);
+}
+
 async function notifyCrossPrincipalOwnerLifecycle(
   ds: DaemonSession,
   record: CrossPrincipalInterruption,
@@ -18987,11 +19048,8 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   const ownerTask = record.ownerUserPrompt?.trim();
   if (!ownerTask) {
     const notice = tr('xpi.notice.owner_prompt_missing', undefined, loc);
-    removeCrossPrincipalRecord(ds, record.id);
-    await Promise.all([
-      notifyCrossPrincipalOwnerLifecycle(ds, record, notice, 'rerun-source-missing'),
-      notifyCrossPrincipalTerminal(ds, record, notice),
-    ]);
+    await notifyCrossPrincipalOwnerLifecycle(ds, record, notice, 'rerun-source-missing');
+    await settleCrossPrincipalTerminal(ds, record, notice);
     return true;
   }
   const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
@@ -19233,10 +19291,25 @@ async function prepareIndependentCrossPrincipalSession(
   sourceDs: DaemonSession,
   record: CrossPrincipalInterruption,
 ): Promise<void> {
-  const proposerId = record.proposer.requestUserOpenId;
+  let proposerId = record.proposer.requestUserOpenId;
+  if (record.proposer.senderType === 'user') {
+    const proposerIdentity = await resolveXpiHumanOpenId(sourceDs, record.proposer, 'proposer');
+    if (proposerIdentity.status !== 'resolved') {
+      if (deferTransientXpiIdentityResolution(sourceDs, record, 'proposer', proposerIdentity)) return;
+      await settleCrossPrincipalTerminal(
+        sourceDs,
+        record,
+        proposerIdentity.status === 'transient'
+          ? '多次重试后仍无法解析消息发送者身份，独立任务未创建。'
+          : '无法在当前应用解析消息发送者身份，独立任务未创建。',
+      );
+      return;
+    }
+    deferTransientXpiIdentityResolution(sourceDs, record, 'proposer', proposerIdentity);
+    proposerId = proposerIdentity.openId;
+  }
   if (!proposerId) {
-    removeCrossPrincipalRecord(sourceDs, record.id);
-    await notifyCrossPrincipalTerminal(sourceDs, record, '无法确认消息发送者身份，未执行。');
+    await settleCrossPrincipalTerminal(sourceDs, record, '无法确认消息发送者身份，未执行。');
     return;
   }
 
@@ -19400,8 +19473,7 @@ async function prepareIndependentCrossPrincipalSession(
 
   const availableBots = await getAvailableBots(childDs.larkAppId, childDs.chatId);
   const started = forkReservedInitialSession(childDs, availableBots, record.proposer);
-  removeCrossPrincipalRecord(sourceDs, record.id);
-  await notifyCrossPrincipalTerminal(
+  await settleCrossPrincipalTerminal(
     sourceDs,
     record,
     started ? '独立会话已开始执行。' : '独立会话已进入共享目录串行队列。',
@@ -19432,6 +19504,14 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
   }
   ds.crossPrincipalInterruptionDriving = true;
   try {
+    if (record.phase === 'terminal_notice_pending') {
+      await settleCrossPrincipalTerminal(
+        ds,
+        record,
+        record.terminalNoticeText ?? '处理已结束，但结果通知未能送达。',
+      );
+      return;
+    }
     if (record.phase === 'preparing_independent' || record.phase === 'independent_queued') {
       await prepareIndependentCrossPrincipalSession(ds, record);
       return;
@@ -19439,15 +19519,13 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     if (record.phase === 'awaiting_classification') {
       const loc = localeForBot(ds.larkAppId);
       if (record.proposer.senderType === 'bot') {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
+        await settleCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
         return;
       }
       const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
       if (proposerIdentity.status !== 'resolved') {
         if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           proposerIdentity.status === 'transient'
@@ -19486,8 +19564,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
       if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
-      removeCrossPrincipalRecord(ds, record.id);
-      await notifyCrossPrincipalTerminal(
+      await settleCrossPrincipalTerminal(
         ds,
         record,
         result.kind === 'invalidated'
@@ -19518,15 +19595,13 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         const round = record.waitDecisionRound ?? 0;
         const loc = localeForBot(ds.larkAppId);
         if (record.proposer.senderType === 'bot') {
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
+          await settleCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
           return;
         }
         const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
         if (proposerIdentity.status !== 'resolved') {
           if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(
+          await settleCrossPrincipalTerminal(
             ds,
             record,
             proposerIdentity.status === 'transient'
@@ -19557,8 +19632,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
         if (!current) return;
         if (waitChoice && await applyCrossPrincipalProposerChoice(ds, current, waitChoice)) return;
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           waitResult.kind === 'invalidated'
@@ -19570,8 +19644,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
       if (record.owner.senderType === 'bot') {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           '原任务由机器人发起，无法确认追加建议；请选择独立任务。',
@@ -19581,8 +19654,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       const ownerIdentity = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
       if (ownerIdentity.status !== 'resolved') {
         if (deferTransientXpiIdentityResolution(ds, record, 'owner', ownerIdentity)) return;
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           ownerIdentity.status === 'transient'
@@ -19627,8 +19699,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
       if (choice !== 'accept') {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '建议未获确认，未执行。');
+        await settleCrossPrincipalTerminal(ds, record, '建议未获确认，未执行。');
         return;
       }
       current.phase = 'owner_approved';
@@ -19641,23 +19712,15 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     }
   } catch (err) {
     if (err instanceof XpiSharedCwdQueueFullError) {
-      // This branch runs while the owner is actively resolving the durable
-      // confirmation record. Keep that record durable until the terminal
-      // notice is actually delivered; otherwise a transport failure would
-      // turn explicit backpressure into a silent drop. A failed notice gets a
-      // fixed-cadence retry and remains restart-recoverable through the same
-      // record; successful delivery is the only terminal condition.
+      // Keep the record on the same durable terminal-notice path as every
+      // other terminal outcome. The business action is not retried; only the
+      // human notification is.
       try {
-        const delivered = await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           '建议已确认，但共享目录等待队列已满；本次未接收也不会执行，请稍后重新发起。',
         );
-        if (delivered) {
-          removeCrossPrincipalRecord(ds, record.id);
-        } else {
-          scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
-        }
       } catch (noticeErr) {
         logger.warn(
           `[${tag(ds)}] failed to notify owner about full XPI shared-cwd queue: `

@@ -621,6 +621,59 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(String(childRootCall?.[2] ?? '')).not.toContain('ou_proposer_bot');
   });
 
+  it('resolves a cross-app human before creating an independent task and stores only the target-app open_id', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_human_independent', 'seeded') as any;
+    ds.workingDir = `${mocks.dataDir}/xpi-human-independent-non-git`;
+    mkdirSync(ds.workingDir, { recursive: true });
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_human_independent_1234',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'preparing_independent',
+      messages: [{
+        turnId: 'om_human_independent_choice',
+        text: '请单独检查这项任务',
+        userPrompt: '请单独检查这项任务',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    const childRootCall = mocks.sendMessage.mock.calls.find(call =>
+      String(call[2] ?? '').includes('已为这条独立任务创建隔离话题'));
+    expect(String(childRootCall?.[2] ?? '')).toContain('<at id=ou_target_proposer></at>');
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('ou_foreign_source_app');
+    const child = [...mocks.sessions.values()].find((session: any) =>
+      session.sessionId !== ds.session.sessionId && session.rootMessageId === 'om_top');
+    expect(child).toMatchObject({
+      ownerOpenId: 'ou_target_proposer',
+      ownerUnionId: 'on_proposer',
+      creatorOpenId: 'ou_target_proposer',
+      lastCallerOpenId: 'ou_target_proposer',
+    });
+    expect(child.ownerOpenId).not.toBe('ou_foreign_source_app');
+    expect(child.creatorOpenId).not.toBe('ou_foreign_source_app');
+    expect(child.lastCallerOpenId).not.toBe('ou_foreign_source_app');
+  });
+
   it('fails a live legacy bot send closed without addressing protocol traffic back to bots', async () => {
     const previousXpi = process.env.BOTMUX_XPI_ENABLED;
     process.env.BOTMUX_XPI_ENABLED = 'true';
@@ -775,17 +828,28 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
 
     try {
       await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({
+          id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb',
+          phase: 'terminal_notice_pending',
+          terminalNoticeAttempts: 1,
+        }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      mocks.replyMessage.mockResolvedValue('om_terminal_recovered');
+      mocks.sendMessage.mockResolvedValue('om_terminal_recovered');
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+      expect(ds.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
     } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
       if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
       else process.env.BOTMUX_XPI_ENABLED = previousXpi;
     }
-
-    expect(ds.session.crossPrincipalInterruptions).toEqual([
-      expect.objectContaining({ id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb', phase: 'owner_approved' }),
-    ]);
-    expect(ds.crossPrincipalWaitTimer).toBeDefined();
-    clearTimeout(ds.crossPrincipalWaitTimer);
-    ds.crossPrincipalWaitTimer = undefined;
   });
 
   it('replays the original owner task with the approved suggestion under the owner identity', async () => {
@@ -1122,8 +1186,21 @@ describe('XPI cross-app human classification identity', () => {
       clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
       await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.terminalNoticeAttempts).toBe(2);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
       expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
-      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledTimes(4);
+      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledTimes(6);
     } finally {
       if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
@@ -1291,15 +1368,33 @@ describe('XPI cross-app human classification identity', () => {
 
     try {
       await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.terminalNoticeAttempts).toBe(2);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
     } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
       if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
       else process.env.BOTMUX_XPI_ENABLED = previousXpi;
     }
 
     expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
     expect(repliedText()).toBe('');
-    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
-      .toEqual(['delivery_failed', 'delivery_exhausted']);
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.at(-1)).toMatchObject({
+      event: 'delivery_exhausted',
+      reason: 'terminal notice outer retry exhausted; closing on audit plane',
+    });
     expect(repliedText()).not.toContain('ou_foreign_source_app');
     expect(repliedText()).not.toContain('--as');
   });
