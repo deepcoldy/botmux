@@ -8,6 +8,7 @@ vi.mock('../src/global-config.js', () => ({
 }));
 vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
+  platformTerminalBaseUrl: vi.fn(() => null),
   publicReverseProxyBaseUrl: vi.fn(() => null),
   readPlatformBinding: vi.fn(() => null),
 }));
@@ -30,6 +31,7 @@ import {
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import {
   platformMachineBaseUrl,
+  platformTerminalBaseUrl,
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../src/platform/binding.js';
@@ -37,6 +39,7 @@ import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
+const setPlatformTerminal = (base: string | null) => vi.mocked(platformTerminalBaseUrl).mockReturnValue(base);
 const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).mockReturnValue(base);
 const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
   vi.mocked(readPlatformBinding).mockReturnValue(binding)
@@ -47,6 +50,7 @@ describe('buildDashboardUrl', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPlatformTerminal(null);
     setPublic(null);
     setBinding(null);
     setDevbox(null);
@@ -142,6 +146,7 @@ describe('buildDashboardUrls', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPlatformTerminal(null);
     setPublic(null);
     setDevbox(null);
   });
@@ -363,14 +368,15 @@ describe('buildV3TerminalUrl', () => {
     })).toBe('http://[::1]:8765/?viewToken=view%20token%261');
   });
 
-  it('builds a central /s link carrying the same read capability', () => {
+  it('builds a central terminal-subdomain /s link carrying the same read capability', () => {
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
+    setPlatformTerminal('https://t-deadbeef.botmux.example');
     expect(buildV3TerminalUrl('sess/with space', {
       host: '10.0.0.8',
       viewToken: 'view token&1',
     })).toBe(
-      'https://m-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
+      'https://t-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
     );
   });
 
@@ -378,6 +384,7 @@ describe('buildV3TerminalUrl', () => {
     expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8', webPort: 8765 })).toBeNull();
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
+    setPlatformTerminal('https://t-deadbeef.botmux.example');
     expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8' })).toBeNull();
   });
 });
