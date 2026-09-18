@@ -178,6 +178,7 @@ import {
   __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
   __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
+  __testOnly_restoreSessionsAndScheduleStartupRecovery as restoreSessionsAndScheduleStartupRecovery,
 } from '../src/daemon.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
 import {
@@ -847,6 +848,102 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     } finally {
       if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('retries a persisted terminal notice after daemon restart without replaying the business action', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_terminal_notice_restart';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:terminal-notice-restart';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `restart-queued-${index}`,
+      turnId: `restart-queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_terminal_restart_123456',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
+      phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
+    mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        id: 'xpi_terminal_restart_123456',
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+      expect(ds.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
+      const persisted = structuredClone(ds.session);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      activeSessions.clear();
+      vi.clearAllMocks();
+      mocks.replyMessage.mockResolvedValue('om_terminal_recovered_after_restart');
+      mocks.sendMessage.mockResolvedValue('om_terminal_recovered_after_restart');
+      const workerSend = vi.fn();
+      const restartedDs = {
+        ...ds,
+        worker: { killed: false, send: workerSend },
+        session: persisted,
+        crossPrincipalInterruptionDriving: false,
+        crossPrincipalWaitTimer: undefined,
+      } as any;
+
+      await restoreSessionsAndScheduleStartupRecovery({
+        larkAppId: APP,
+        restoreSessions: async () => {
+          activeSessions.set(sessionKey(anchor, APP), restartedDs);
+          return [];
+        },
+        markSessionsRestored: () => {},
+        driveRestoredXpiGroup: () => {},
+      });
+
+      await vi.waitFor(() => {
+        expect(restartedDs.session.crossPrincipalInterruptions).toBeUndefined();
+      });
+      expect(restartedDs.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(repliedText()).toContain('建议已确认，但共享目录等待队列已满');
+    } finally {
+      activeSessions.clear();
       if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
       else process.env.BOTMUX_XPI_ENABLED = previousXpi;
     }
