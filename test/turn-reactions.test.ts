@@ -42,7 +42,7 @@ vi.mock('../src/im/lark/client.js', async () => {
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { noteTurnReceived } from '../src/daemon.js';
 import {
   initWorkerPool,
@@ -92,6 +92,11 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.turnReceivedAtMs).toBeUndefined();
+    getBot(APP).config.showReplyTiming = true;
+    await noteTurnReceived(ds, 'om_b', undefined, undefined, 'om_actual_turn');
+    expect(ds.turnReceivedAtMs?.get('om_actual_turn')).toEqual(expect.any(Number));
+    expect(ds.turnReceivedAtMs?.has('om_b')).toBe(false);
   });
 
   it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {

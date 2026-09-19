@@ -1605,6 +1605,8 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
+  'card.waiting_duration': 'Waiting {seconds}s',
+  'card.execution_duration': 'Execution time {seconds}s',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.

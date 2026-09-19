@@ -20154,9 +20154,20 @@ function emitTurnTerminal(
 }
 
 function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
-  return msg.type === 'final_output' && sessionId
-    ? { ...msg, sessionId }
-    : msg;
+  if (msg.type !== 'final_output') return msg;
+  // Signed Codex finals already freeze the native completion instant. Other
+  // bridges sample their exact turn before emitTurnTerminal consumes the clock.
+  const timing = msg.codexAppSettlement
+    ?? turnExecutionClock.peek(msg.turnId, msg.dispatchAttempt);
+  const durationMs = timing?.durationMs;
+  const executionStartedAtMs = durationMs !== undefined && timing?.completedAtMs !== undefined
+    ? timing.completedAtMs - durationMs : undefined;
+  return {
+    ...msg,
+    ...(sessionId ? { sessionId } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(executionStartedAtMs !== undefined ? { executionStartedAtMs } : {}),
+  };
 }
 
 function send(msg: WorkerToDaemon): void {

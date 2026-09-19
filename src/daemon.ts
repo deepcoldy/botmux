@@ -3671,6 +3671,13 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  if (getBot(ds.larkAppId).config.showReplyTiming === true) {
+    const turnId = _turnId ?? triggerMessageId;
+    const received = ds.turnReceivedAtMs ??= new Map();
+    if (!received.has(turnId)) received.set(turnId, Date.now());
+    // Keep recent timestamps for delivery retries; unknown/evicted turns omit waiting time.
+    if (received.size > 512) received.delete(received.keys().next().value!);
+  }
   // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
   // turn. This is the per-message acceptance point — every inbound turn passes
   // through here before reaching the worker — so it is the one place that can

@@ -1845,6 +1845,10 @@ export type WorkerToDaemon =
       lastUuid: string;
       turnId: string;
       replyTurnId?: string;
+      /** Measured native execution time for this exact turn/attempt, excluding queueing. */
+      durationMs?: number;
+      /** Literal CLI input time, from the same execution window as durationMs. */
+      executionStartedAtMs?: number;
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;
