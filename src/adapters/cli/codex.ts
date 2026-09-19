@@ -488,21 +488,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
-    // Codex 0.134.0+ accepts a message while the current turn is still running:
-    // it parks it ("Messages to be submitted after next tool call") via an
-    // active-turn STEER, not a deferred next-turn submit. Two rollout shapes
-    // result (both verified empirically on codex-cli 0.134.0):
-    //   - turn with no tool_call: the queued user event is written when the turn
-    //     ends → interleaved user1 → asstFinal1 → user2 → asstFinal2.
-    //   - turn with a tool_call: the queued input is steered into the SAME turn
-    //     and codex emits ONE merged final → user1 → user2 → assistant_final.
-    // CodexBridgeQueue handles both via HOL-block-drop (a user event arriving
-    // while the collecting turn has no finalText discards that turn), so the
-    // merge case attributes the combined reply to the last steered turn instead
-    // of wedging the queue. The submit log history.jsonl IS written at submit
-    // time even for a parked message, so writeInput's verification confirms the
-    // submit immediately and never spuriously reports a mid-turn send failure.
-    supportsTypeAhead: true,
+    // Current Codex TUI builds can remain in Working/Waiting for agents without
+    // an input composer. Treating that state as type-ahead capable can silently
+    // drop pasted input, so keep Codex on the serial ready/idle queue path.
+    supportsTypeAhead: false,
     reliableTurnTerminal: true,
     // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
     // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a

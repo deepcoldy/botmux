@@ -257,8 +257,10 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  adapterSupportsTypeAhead = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !adapterSupportsTypeAhead
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

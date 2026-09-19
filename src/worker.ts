@@ -11921,8 +11921,10 @@ async function flushPending(): Promise<void> {
   // Codex on codex-cli 0.134.0.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
+  const runtimeSupportsTypeAhead =
+    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
+    runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
@@ -12696,7 +12698,7 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      if (shouldStopPendingBatch(item, pendingMessages[0])) break;
+      if (shouldStopPendingBatch(item, pendingMessages[0], runtimeSupportsTypeAhead)) break;
     }
   } finally {
     isFlushing = false;
