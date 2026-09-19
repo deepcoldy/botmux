@@ -42,6 +42,24 @@ export function stageCrossPrincipalInterruptionRecord(args: {
   return { record, inserted: true };
 }
 
+/** Identity of the messages a terminal cross-principal notice is about.
+ *
+ * The terminal notices ("no choice was made, the message was not executed")
+ * carry no identity at all, so a proposer that sent several messages while the
+ * session was busy cannot tell WHICH one was dropped, and a bot proposer
+ * cannot resend precisely. The excerpt is taken from text the proposer already
+ * posted in this same chat, so echoing it back reveals nothing new. */
+export function crossPrincipalDroppedMessageDigest(
+  record: CrossPrincipalInterruption,
+  excerptChars = 60,
+): { turnId: string; excerpt: string } | undefined {
+  const first = record.messages[0];
+  if (!first) return undefined;
+  const flat = first.text.replace(/\s+/g, ' ').trim();
+  const excerpt = flat.length > excerptChars ? `${flat.slice(0, excerptChars)}…` : flat;
+  return { turnId: first.turnId, excerpt };
+}
+
 export function markCrossPrincipalSuggestionWaiting(
   record: CrossPrincipalInterruption,
   now: number,
