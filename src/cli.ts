@@ -7995,7 +7995,7 @@ import {
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
-import { applyInlineMentions } from './im/lark/inline-mentions.js';
+import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
   effectiveDefaultWorkingDir,
@@ -8013,6 +8013,7 @@ import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
+  shouldSuppressImplicitReplyTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   classifyMentionIdentifiers,
@@ -8028,6 +8029,7 @@ import {
   managedVcSendControlError,
   managedVcSendPayloadError,
   containsLarkAtTag,
+  matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
 
 /**
@@ -9855,12 +9857,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Turn each raw --mention identifier into a { open_id, name } entry.
   //   • Literal open_id (ou_…): kept as-is, always allowed (pre-existing
   //     behavior — an agent that already has an app-scoped open_id is trusted).
-  //   • Anything else (email / union_id / mobile): only when the bot config
-  //     sets `allowArbitraryMention: true`. Resolve via the existing
-  //     resolveAllowedUsersWithMap (email→open_id etc.), then require the
-  //     resolved open_id to be a member of the destination chat. This is the
-  //     safety gate: default-deny, and even when opened, an agent can only @
-  //     people who are actually in the group.
+  //   • Anything else (email / union_id / mobile / exact display name): only
+  //     when the bot config sets `allowArbitraryMention: true`. Resolve through
+  //     contact APIs first, then fall back to an exact UNIQUE display-name match
+  //     in the target chat. The membership gate remains default-deny: an agent
+  //     can only @ people who are actually in that group.
   {
     const mentionChatId = overrideChatId ?? s.chatId;
     const arbitraryAllowed = (() => {
@@ -9880,22 +9881,13 @@ async function cmdSend(rest: string[]): Promise<void> {
 
     const nonOpenId = classified.toResolve;
     if (nonOpenId.length > 0) {
-      const { resolveAllowedUsersWithMap, listChatMemberOpenIds } = await import('./im/lark/client.js');
+      const { resolveAllowedUsersWithMap, listChatUserMembers } = await import('./im/lark/client.js');
       const { map, errored } = await resolveAllowedUsersWithMap(
         s.larkAppId, nonOpenId.map(r => r.identifier),
       );
-      const unresolved = nonOpenId.filter(r => !map.get(r.identifier));
-      if (unresolved.length > 0) {
-        console.error(
-          `--mention 无法解析这些标识为群内 open_id：${unresolved.map(r => r.identifier).join(', ')}` +
-          (errored ? `（部分为临时失败，可稍后重试）` : `（不存在或本 bot 不可见）`),
-        );
-        process.exit(2);
-      }
-      // Membership gate: only @ people actually in the destination chat.
-      let memberIds: Set<string>;
+      let chatMembers: Awaited<ReturnType<typeof listChatUserMembers>>;
       try {
-        memberIds = new Set(await listChatMemberOpenIds(s.larkAppId, mentionChatId));
+        chatMembers = await listChatUserMembers(s.larkAppId, mentionChatId);
       } catch (err: any) {
         console.error(
           `--mention 群成员校验失败（无法读取群 ${mentionChatId} 成员，可能缺 im:chat 成员读取权限）：` +
@@ -9903,6 +9895,24 @@ async function cmdSend(rest: string[]): Promise<void> {
         );
         process.exit(2);
       }
+
+      // Some apps cannot resolve an employee email through contact scope even
+      // when that person is already in the target chat. Fall back only to an
+      // exact, unique display-name match from that chat's own member list.
+      for (const r of nonOpenId.filter(item => !map.get(item.identifier))) {
+        const byName = matchUniqueChatMemberOpenId(r.name || r.identifier, chatMembers);
+        if (byName) map.set(r.identifier, byName);
+      }
+      const unresolved = nonOpenId.filter(r => !map.get(r.identifier));
+      if (unresolved.length > 0) {
+        console.error(
+          `--mention 无法解析这些标识为当前群唯一成员：${unresolved.map(r => r.identifier).join(', ')}` +
+          (errored ? `（部分通讯录查询临时失败）` : `（不在群、重名或本 bot 不可见）`),
+        );
+        process.exit(2);
+      }
+      // Membership gate: only @ people actually in the destination chat.
+      const memberIds = new Set(chatMembers.map(member => member.openId));
       const outsiders = outsidersForMembership(
         nonOpenId.map(r => ({ identifier: r.identifier, openId: map.get(r.identifier)! })),
         memberIds,
@@ -10529,6 +10539,12 @@ async function cmdSend(rest: string[]): Promise<void> {
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
+    const suppressImplicitReplyTarget = shouldSuppressImplicitReplyTarget({
+      explicitQuote,
+      mentionOpenIds: mentions.map(m => m.open_id),
+      replyTargetSenderOpenId,
+    });
+    if (suppressImplicitReplyTarget) effectiveQuoteTargetId = undefined;
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
     // （Codex review P2）。--top-level 同样无特定收件人。
@@ -10546,18 +10562,20 @@ async function cmdSend(rest: string[]): Promise<void> {
       : buildFooterAddressing(frozenFooterAddressingSource, {
           isOncall: !!oncallEntry,
           isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
+          hasExplicitMention: mentions.length > 0,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
     if (customCard) {
+      const inlineResult = applyInlineMentionsToCard(customCard, mentions);
       const mentionFooter = orderedFooterRecipients({
         sendTo: footerAddressing.sendTo,
         mentionIds: mentions.map(m => m.open_id),
         cc: footerAddressing.cc,
-        inlinedIds: [],
+        inlinedIds: inlineResult.usedIds,
       });
       const withFooter = withCustomCardMentionFooter(
-        customCard,
+        inlineResult.card,
         mentionFooter,
         localeForBot(appId),
       );

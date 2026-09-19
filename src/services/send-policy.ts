@@ -35,6 +35,45 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface ExplicitRecipientReplyArgs {
+  /** --quote is intentional routing and must always win. */
+  explicitQuote?: string;
+  /** Resolved real @ recipients for this outbound message. */
+  mentionOpenIds: Iterable<string>;
+  /** Sender of the inbound message this turn is replying to, when known. */
+  replyTargetSenderOpenId?: string;
+}
+
+/**
+ * An explicit recipient selection replaces the implicit reply addressee.
+ *
+ * This keeps a handoff or user-directed result from also notifying the bot (or
+ * human) that happened to trigger the turn. Explicitly mentioning that sender,
+ * or explicitly choosing --quote, preserves the reply relationship.
+ */
+export function shouldSuppressImplicitReplyTarget(args: ExplicitRecipientReplyArgs): boolean {
+  if (args.explicitQuote?.trim()) return false;
+  const recipients = new Set([...args.mentionOpenIds].filter(Boolean));
+  if (recipients.size === 0) return false;
+  return !args.replyTargetSenderOpenId || !recipients.has(args.replyTargetSenderOpenId);
+}
+
+export interface MentionableChatMember {
+  openId: string;
+  name?: string;
+}
+
+/** Resolve only an exact, unique display-name match inside the target chat. */
+export function matchUniqueChatMemberOpenId(
+  displayName: string,
+  members: Iterable<MentionableChatMember>,
+): string | undefined {
+  const wanted = displayName.trim();
+  if (!wanted) return undefined;
+  const matches = [...members].filter(member => member.name?.trim() === wanted);
+  return matches.length === 1 ? matches[0].openId : undefined;
+}
+
 export interface AfterTheFactTopicQuoteArgs {
   /** The message id this send would quote (null ⇒ nothing to decide). */
   quoteTargetId: string | null;

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
+  shouldSuppressImplicitReplyTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   classifyMentionIdentifiers,
@@ -17,6 +18,7 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
   neutralizeLarkAtTags,
+  matchUniqueChatMemberOpenId,
 } from '../src/services/send-policy.js';
 
 describe('resolveQuoteTarget', () => {
@@ -45,6 +47,56 @@ describe('resolveQuoteTarget', () => {
 
   it('--top-level never quotes', () => {
     expect(resolveQuoteTarget({ ...base, sendTopLevel: true, sessionQuoteTargetId: 'om_a' })).toBeNull();
+  });
+});
+
+describe('shouldSuppressImplicitReplyTarget', () => {
+  it('drops the implicit reply when an explicit recipient excludes the caller', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(true);
+  });
+
+  it('keeps the reply when the caller is explicitly included', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_triggering_bot', 'ou_other'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('preserves an explicit --quote', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      explicitQuote: 'om_explicit',
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('keeps the default reply when no recipient was selected', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: [],
+      replyTargetSenderOpenId: 'ou_human',
+    })).toBe(false);
+  });
+});
+
+describe('matchUniqueChatMemberOpenId', () => {
+  const members = [
+    { openId: 'ou_owner', name: '汪睿麟' },
+    { openId: 'ou_other', name: '其他人' },
+  ];
+
+  it('resolves an exact unique member name', () => {
+    expect(matchUniqueChatMemberOpenId('汪睿麟', members)).toBe('ou_owner');
+  });
+
+  it('does not guess on missing or ambiguous names', () => {
+    expect(matchUniqueChatMemberOpenId('不存在', members)).toBeUndefined();
+    expect(matchUniqueChatMemberOpenId('同名', [
+      { openId: 'ou_a', name: '同名' },
+      { openId: 'ou_b', name: '同名' },
+    ])).toBeUndefined();
   });
 });
 
