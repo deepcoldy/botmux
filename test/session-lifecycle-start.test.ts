@@ -5599,7 +5599,7 @@ describe('managed turn authority worker generations', () => {
     scheduledTasksForProvenance.delete('feedbeef');
   });
 
-  it('binds a fresh scheduled turn managed origin to its exact creator', () => {
+  it('keeps a fresh scheduled turn bound across repeated managed-origin publications', async () => {
     const ds = makeDs();
     forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -5616,6 +5616,29 @@ describe('managed turn authority worker generations', () => {
       turnId: scheduledTurnId,
       callerOpenId: scheduledCaller.requestUserOpenId,
     });
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability-with-pid',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      capability: 'scheduled-capability-with-pid',
+      turnId: scheduledTurnId,
+      callerOpenId: scheduledCaller.requestUserOpenId,
+    });
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId,
+      status: 'completed',
+    });
+    await Promise.resolve();
     expect(ds.scheduledTurnCallers).toBeUndefined();
   });
 

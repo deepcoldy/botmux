@@ -12092,10 +12092,10 @@ function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string |
   if (replyTargetCaller) return replyTargetCaller;
   const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
   if (scheduledCaller) {
-    // One-shot handoff: once the daemon has attached the caller to the live
-    // managed origin, retaining this admission record only increases the stale
-    // identity surface. A later turn needs its own exact admission.
-    forgetScheduledTurnCaller(ds, turnId);
+    // The worker publishes the same turn more than once: first at init, then
+    // again after the CLI PID attestation exists. Keep the exact-turn caller
+    // until terminal/revoke/worker-exit so the second publication cannot
+    // overwrite a correctly-bound origin with an anonymous one.
     return scheduledCaller.requestUserOpenId;
   }
   const continuation = ds.session.readonlyTaskContinuation;

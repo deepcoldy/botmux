@@ -42,6 +42,7 @@ import {
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { resolveCurrentTurnProvenance } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
@@ -6839,6 +6840,43 @@ function detectCurrentSession(): CurrentSession | null {
   };
 }
 
+/**
+ * Resolve the session whose live CLI process is an authenticated ancestor.
+ *
+ * Routing commands may deliberately fall back to BOTMUX_SESSION_ID after a
+ * detached/background launch, but task creator identity is authority: it must
+ * never come from an environment-selected session row. Keep this lookup
+ * marker-only so changing BOTMUX_SESSION_ID cannot borrow another session's
+ * open_id/union_id.
+ */
+function detectAuthenticatedCurrentSession(): CurrentSession | null {
+  const dataDir = resolveDataDir();
+  const provenance = resolveCurrentTurnProvenance({
+    dataDir,
+    envSessionId: process.env.BOTMUX_SESSION_ID,
+  });
+  if (!provenance) return null;
+  const s = loadSessions().get(provenance.sessionId);
+  if (!s || s.status !== 'active') return null;
+  // The persisted union_id belongs to the session owner. Only attach it when
+  // the authenticated caller for THIS exact turn is that same owner; another
+  // allowed participant in a shared session must not inherit the owner's user
+  // identity. Scheduled child creation passes because its provenance resolves
+  // back to the already-verified task creator.
+  if (!s.ownerOpenId || provenance.callerOpenId !== s.ownerOpenId) return null;
+  return {
+    sessionId: s.sessionId,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    workingDir: s.workingDir,
+    larkAppId: s.larkAppId,
+    chatType: s.chatType,
+    scope: s.scope,
+    ownerOpenId: s.ownerOpenId,
+    ownerUnionId: s.ownerUnionId,
+  };
+}
+
 /** Pick a value from --flag <value> or --flag=value style args. */
 function argValue(args: string[], ...flags: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
@@ -7340,6 +7378,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = detectCurrentSession();
+    const authenticatedCur = detectAuthenticatedCurrentSession();
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7454,11 +7493,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         // Stamp the creator (sandboxed session owner) so the task's scheduled
         // turns can authenticate workflow commands as them. The daemon
         // re-checks the owner is still allowed at every run mutation.
-        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
-        // union_id must come from the authenticated persisted session. Unlike
-        // ownerOpenId, there is deliberately no environment override: scheduled
-        // turns use this tenant-stable identity to access user-bound tools.
-        ownerUnionId: cur?.ownerUnionId,
+        // Creator identity is authority-bearing. It comes only from the
+        // procStart-bound live ancestor marker, never BOTMUX_SESSION_ID or
+        // BOTMUX_OWNER_OPEN_ID environment fallbacks. The app equality guard
+        // prevents an authenticated session from lending app-scoped open_id to
+        // an explicitly selected different bot store.
+        ownerOpenId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerOpenId
+          : undefined,
+        ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerUnionId
+          : undefined,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
