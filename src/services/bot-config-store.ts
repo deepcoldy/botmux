@@ -17,7 +17,7 @@ import { config } from '../config.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
-import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
+import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -43,6 +43,7 @@ import {
   MIN_CARD_ACTION_ACK_TIMEOUT_MS,
 } from '../core/card-action-ack.js';
 import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
+import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 
 /**
  * 生效时机：
@@ -273,7 +274,9 @@ async function applyConfigFieldInternal(
   const previousPinStreamingCard = spec.configKey === 'pinStreamingCard'
     ? bot.config.pinStreamingCard === true
     : undefined;
-  const oldText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
+  const oldText = spec.kind === 'cli'
+    ? selectionKeyForBot(bot.config.cliId, bot.config.wrapperCli, bot.config.cliLaunchMode)
+    : formatFieldValue(spec, (bot.config as any)[spec.configKey]);
 
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
@@ -283,11 +286,20 @@ async function applyConfigFieldInternal(
       entry.replyCardMode = 'unified';
       entry.disableStreamingCard = true;
     }
+    const cliSelection = spec.kind === 'cli' && effective !== null
+      ? typeof effective === 'string'
+        ? resolveCliSelection(effective)
+        : effective && typeof effective === 'object' && !Array.isArray(effective)
+          ? effective as ReturnType<typeof resolveCliSelection>
+          : undefined
+      : undefined;
     const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
       ? entry.cliId.trim()
       : bot.config.cliId;
-    const nextCliId = spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
-      ? effective.trim()
+    const nextCliId = cliSelection
+      ? cliSelection.cliId
+      : spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
+        ? effective.trim()
       : currentCliId;
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
@@ -315,7 +327,26 @@ async function applyConfigFieldInternal(
         && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
     }
-    if (effective === null) {
+    if (cliSelection) {
+      entry.cliId = cliSelection.cliId;
+      if (cliSelection.wrapperCli) entry.wrapperCli = cliSelection.wrapperCli;
+      else delete entry.wrapperCli;
+      if (cliSelection.cliLaunchMode) entry.cliLaunchMode = cliSelection.cliLaunchMode;
+      else delete entry.cliLaunchMode;
+      try {
+        validateCliLaunchModeConfig({
+          cliId: entry.cliId,
+          cliLaunchMode: entry.cliLaunchMode,
+          wrapperCli: entry.wrapperCli,
+          cliRuntime: entry.cliRuntime,
+          cliPathOverride: entry.cliPathOverride,
+          sandbox: entry.sandbox,
+          readIsolation: entry.readIsolation,
+        });
+      } catch (e) {
+        return { write: false, result: `invalid_cli_launch_mode: ${(e as Error).message}` };
+      }
+    } else if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
@@ -339,7 +370,18 @@ async function applyConfigFieldInternal(
   if (r.result) return { ok: false, reason: r.result };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
-  if (effective === null) {
+  const cliSelection = spec.kind === 'cli' && effective !== null
+    ? typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : effective && typeof effective === 'object' && !Array.isArray(effective)
+        ? effective as ReturnType<typeof resolveCliSelection>
+        : undefined
+    : undefined;
+  if (cliSelection) {
+    bot.config.cliId = cliSelection.cliId;
+    bot.config.wrapperCli = cliSelection.wrapperCli;
+    bot.config.cliLaunchMode = cliSelection.cliLaunchMode;
+  } else if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
     (bot.config as any)[spec.configKey] = spec.defaultOn
@@ -353,7 +395,9 @@ async function applyConfigFieldInternal(
   if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
     bot.config.reasoningEffort = undefined;
   }
-  const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
+  const newText = spec.kind === 'cli'
+    ? selectionKeyForBot(bot.config.cliId, bot.config.wrapperCli, bot.config.cliLaunchMode)
+    : formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   if (spec.configKey === 'feedback') {
     try {
       const path = sendCredFilePath(config.session.dataDir, larkAppId);
@@ -668,8 +712,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         : { ok: false, reason: 'invalid_enum' };
     case 'cli': {
       try {
-        const id = resolveCliId(s);
-        return id ? { ok: true, value: id } : { ok: false, reason: 'invalid_cli' };
+        return { ok: true, value: resolveCliSelection(s) };
       } catch { return { ok: false, reason: 'invalid_cli' }; }
     }
     case 'dir': {
@@ -779,8 +822,8 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
-    cliId: cfg.cliId,
-    cliOptions: CLI_OPTIONS.map(o => ({ id: o.id, label: o.label })),
+    cliId: selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode),
+    cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
     model: cfg.model ?? null,
     modelChoices: [...modelChoices],
     lang: cfg.lang ?? null,

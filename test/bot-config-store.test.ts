@@ -757,7 +757,41 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_default', spec, 'codex');
     expect(r.ok).toBe(true);
     expect(readConfig().cliId).toBe('codex');
+    expect(readConfig().cliLaunchMode).toBeUndefined();
+    expect(readConfig().wrapperCli).toBeUndefined();
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
+    expect(registry.getBot('app_default').config.cliLaunchMode).toBeUndefined();
+    expect(registry.getBot('app_default').config.wrapperCli).toBeUndefined();
+  });
+
+  it('cli field sets and clears Forge x TraeX launch mode atomically', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex' });
+    const spec = store.findConfigField('cli')!;
+    expect(store.coerceConfigValue(spec, 'forge-x-traex')).toMatchObject({
+      ok: true,
+      value: { cliId: 'traex', cliLaunchMode: 'forge-traex' },
+    });
+
+    const setForge = await store.applyConfigField('app_default', spec, 'forge-x-traex');
+    expect(setForge.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(registry.getBot('app_default').config.cliLaunchMode).toBe('forge-traex');
+
+    const setPlain = await store.applyConfigField('app_default', spec, 'traex');
+    expect(setPlain.ok).toBe(true);
+    expect(readConfig().cliId).toBe('traex');
+    expect(readConfig().cliLaunchMode).toBeUndefined();
+    expect(registry.getBot('app_default').config.cliLaunchMode).toBeUndefined();
+  });
+
+  it('cli field rejects Forge x TraeX when existing security isolation would make it invalid', async () => {
+    const { store } = await loaded({ cliId: 'traex', readIsolation: true });
+    const spec = store.findConfigField('cli')!;
+    const result = await store.applyConfigField('app_default', spec, 'forge-x-traex');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('cannot be combined with sandbox or readIsolation');
+    expect(readConfig()).toMatchObject({ cliId: 'traex', readIsolation: true });
+    expect(readConfig().cliLaunchMode).toBeUndefined();
   });
 
   it('reasoningEffort is a next-session enum field', async () => {
@@ -1085,7 +1119,7 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(langSpec, 'EN')).toEqual({ ok: true, value: 'en' });
     expect(store.coerceConfigValue(langSpec, 'fr')).toEqual({ ok: false, reason: 'invalid_enum' });
     const cliSpec = store.findConfigField('cli')!;
-    expect(store.coerceConfigValue(cliSpec, 'codex')).toEqual({ ok: true, value: 'codex' });
+    expect(store.coerceConfigValue(cliSpec, 'codex')).toMatchObject({ ok: true, value: { cliId: 'codex' } });
     expect(store.coerceConfigValue(cliSpec, 'bogus-cli')).toEqual({ ok: false, reason: 'invalid_cli' });
     const authSpec = store.findConfigField('codexAuthSync')!;
     expect(store.coerceConfigValue(authSpec, 'ISOLATED')).toEqual({ ok: true, value: 'isolated' });
@@ -1114,10 +1148,13 @@ describe('bot-config store', () => {
     expect(data!.model).toBe('opus');
     expect(data!.modelChoices).toEqual(['opus', 'sonnet']);
     expect(data!.cliOptions.length).toBeGreaterThan(0);
+    expect(data!.cliOptions.map(option => option.id)).toContain('forge-x-traex');
     expect(data!.booleans.find(b => b.key === 'disableStreamingCard')?.on).toBe(true);
     expect(data!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(true);
     const { store: store2 } = await loaded({ model: 'opus' });
     expect(store2.getConfigCardData('app_default', ['opus'])!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(false);
+    const { store: store3 } = await loaded({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(store3.getConfigCardData('app_default')!.cliId).toBe('forge-x-traex');
     expect(store.getConfigCardData('app_missing')).toBeNull();
   });
 

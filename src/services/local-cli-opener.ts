@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
+import { decorateResumeForCliLaunchMode } from '../core/cli-launch-mode.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
@@ -350,8 +351,10 @@ function buildLocalCliResumeCommand(
   const quotedResumeCommand = quoteKnownResumeCommand(cliId, rawResume);
   if (!quotedResumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
   const resumeCommand = replaceFrozenResumeExecutable(cliId, quotedResumeCommand, runtimeExecutable);
+  const launchMode = ds.session.cliLaunchMode ?? ds.initConfig?.cliLaunchMode;
+  const decoratedResumeCommand = decorateResumeForCliLaunchMode(resumeCommand, launchMode);
 
-  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
+  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${decoratedResumeCommand}` };
 }
 
 /** Pure preflight for local CLI opening. It performs the same attach/resume

@@ -42,6 +42,7 @@ import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWor
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
+import type { CliLaunchMode } from './cli-launch-mode.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
@@ -304,31 +305,43 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
-  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
+  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode };
   try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
   if (!botCfg.cliId) return null;
   const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
   const botWrapper = botCfg.wrapperCli?.trim() || undefined;
+  const sessionLaunchMode = ds.session.cliLaunchMode;
+  const botLaunchMode = botCfg.cliLaunchMode;
   const describe = (
     cliId: CliId,
     runtime: CliRuntimeConfig | CliRuntimeSnapshot | undefined,
     legacyPath: string | undefined,
     wrapper: string | undefined,
+    launchMode: CliLaunchMode | undefined,
   ) => {
     const runtimeName = runtime?.displayName ?? runtime?.id ?? (legacyPath ? basename(legacyPath) : cliId);
+    if (launchMode === 'forge-traex') return `Forge x TraeX (${runtimeName})`;
     return wrapper ? `${wrapper} (${runtimeName})` : runtimeName;
   };
   if (sessionCliId !== botCfg.cliId) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
-      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
+      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper, sessionLaunchMode),
+      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper, botLaunchMode),
+    };
+  }
+  if ((sessionLaunchMode ?? '') !== (botLaunchMode ?? '')) {
+    return {
+      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper, sessionLaunchMode),
+      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper, botLaunchMode),
     };
   }
   // wrapper 轴：'aiden x claude' 与裸 claude-code 共享同一个 cliId，但是两种不同的
   // 启动选择（selectionKeyForBot 以 cliId+wrapperCli 为键），wrapper 间切换同样不能
   // 复活旧会话。仅 agentFrozen 的会话有可靠的 wrapper 快照——legacy 未冻结会话下次
-  // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。
-  if (ds.session.agentFrozen && !sameRuntimeIdentity(
+  // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。cliLaunchMode
+  // 是显式选择的启动形态，已在上面独立比较，legacy 普通 TraeX 不能热切成 Forge。
+  if (ds.session.agentFrozen && (
+    !sameRuntimeIdentity(
     {
       cliId: sessionCliId,
       cliRuntime: ds.session.cliRuntime,
@@ -341,10 +354,10 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
       cliPathOverride: botCfg.cliPathOverride,
       wrapperCli: botWrapper,
     },
-  )) {
+  ))) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
-      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
+      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper, sessionLaunchMode),
+      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper, botLaunchMode),
     };
   }
   return null;

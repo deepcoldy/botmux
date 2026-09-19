@@ -284,6 +284,7 @@ import {
   type CodexExecutable, type CodexProcess,
 } from './services/codex-session-upgrade.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
+import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import {
   findLaunchedCliPid,
@@ -2016,6 +2017,10 @@ function drainArgvDurableInitialPromptCompletion(): boolean {
 // CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
 // cfg at gate-check time; capture the spawn-time verdict for currentTraexObservedPid.
 let lastSpawnOuterBwrapActive = false;
+// True when getChildPid() may be a launcher above the real TRAE process. This
+// includes bwrap and Forge; keep it separate from lastSpawnOuterBwrapActive
+// because prompt-readiness code has bwrap-specific shell handling.
+let lastSpawnTraexLauncherActive = false;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
  * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
@@ -7184,11 +7189,13 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
  *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
  *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
  *  would always fail. The real traex leaf is host-visible across the pid ns
- *  (ps -A ppid links), so a comm-based BFS descends to it. Outside the sandbox
- *  (or if traex hasn't been forked yet) the candidate already is the leaf, so
- *  we return it unchanged — fail closed to the launcher pid rather than guess. */
-function resolveTraexOwnershipPid(candidatePid: number, sandbox: boolean): number {
-  if (!sandbox || !candidatePid) return candidatePid;
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Forge x TraeX has
+ *  the same launcher shape (`forge` launcher → `traex` child). Outside such
+ *  launcher shapes (or if traex hasn't been forked yet) the candidate already
+ *  is the leaf, so we return it unchanged — fail closed to the launcher pid
+ *  rather than guess. */
+function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
   return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;
 }
 
@@ -7198,12 +7205,12 @@ function resolveTraexOwnershipPid(candidatePid: number, sandbox: boolean): numbe
  *  adopt-pending pid (which is populated for TRAE too, see the codex/traex
  *  branch around line 3674). backend.cliPid is already sandbox-resolved at wire
  *  time; the getChildPid() fallback is not, so descend it here too (no-op
- *  outside the sandbox / when already a leaf). */
+ *  outside launcher shapes / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
   const wired = (backend as { cliPid?: number } | null)?.cliPid;
   if (wired) return wired;
   const child = backend?.getChildPid?.();
-  if (child) return resolveTraexOwnershipPid(child, lastSpawnOuterBwrapActive);
+  if (child) return resolveTraexOwnershipPid(child, lastSpawnTraexLauncherActive);
   return codexAdoptPendingPid;
 }
 
@@ -13558,6 +13565,16 @@ async function spawnCli(
   // so every other dsh-specific branch (OSC decode, turn timeout, etc.) is
   // unaffected — dsh-tui simply doesn't emit OSC frames, making the decoder a
   // no-op for it.
+  validateCliLaunchModeConfig({
+    cliId: cfg.cliId,
+    cliLaunchMode: cfg.cliLaunchMode,
+    wrapperCli: cfg.wrapperCli,
+    cliRuntime: cfg.cliRuntime,
+    cliPathOverride: cfg.cliPathOverride,
+    sandbox: cfg.sandbox,
+    readIsolation: cfg.readIsolation,
+  }, "worker session " + cfg.sessionId);
+
   const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
     ? 'dsh-tui'
     : cfg.cliId as CliId;
@@ -13931,6 +13948,9 @@ async function spawnCli(
   }
   const sandboxRequested = !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
+    throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
+  }
   if (cfg.cliInstanceBinding?.source !== 'legacy' && cfg.cliInstanceBinding && sandboxRequested) {
     throw new Error('Codex instance routing does not support sandbox/readIsolation');
   }
@@ -15133,6 +15153,7 @@ async function spawnCli(
           cliId: cfg.cliId as CliId,
           cliPathOverride: cfg.cliPathOverride,
           wrapperCli: cfg.wrapperCli,
+          cliLaunchMode: cfg.cliLaunchMode,
         }, cliName());
     if (unavailable) {
       log(`${unavailable} (PATH=${process.env.PATH ?? ''})`);
@@ -16187,6 +16208,21 @@ async function spawnCli(
     }
   }
 
+  // Forge x TraeX：Forge 要求把 TraeX argv 合成一个 --agent-args 字符串，不能走普通 wrapperCli。
+  if (cfg.cliLaunchMode === 'forge-traex') {
+    const effectiveChildEnv = buildEffectiveChildEnv({
+      base: childEnv,
+      botEnv: perBotInjectEnv,
+      mojoEnv: effectiveBackendType === 'mojo'
+        ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
+        : undefined,
+    });
+    const launch = buildForgeTraexLaunch(spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b);
+    spawnBin = launch.bin;
+    spawnArgs = launch.args;
+    log("Launch mode forge-traex: spawning " + spawnBin + " " + spawnArgs.slice(0, 4).join(" ") + " …");
+  }
+
   // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
   // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
   // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
@@ -16464,6 +16500,7 @@ async function spawnCli(
       baseBin: reproduceBaseBin,
       baseArgs: reproduceBaseArgs,
       wrapperCli: cfg.wrapperCli,
+      cliLaunchMode: cfg.cliLaunchMode,
       sandboxOn: sandboxRequested,
       binResolver: (b) => locateOnPath(b) ?? b,
       ttadkModel: cfg.model,
@@ -16746,27 +16783,25 @@ async function spawnCli(
   if (cliPid) observeCursorCliSessionId(cliPid);
 
   // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
-  // traex`, so the pane leaf (getChildPid) is the bwrap SUPERVISOR — its
-  // /proc/<pid>/fd holds no rollout and the TRAE ownership gate can never admit
-  // a session id (fresh sandbox TRAE then never captures its SID, the bridge
-  // never attaches, and because reliableTurnTerminal disables screen-idle the
-  // durable turn can wedge — it does NOT self-heal). The real traex leaf is
-  // host-visible across the pid ns (ps -A ppid links), so BFS-descend to it and
-  // rewire backend.cliPid. Bounded retry (not one-shot): bwrap may not have
-  // forked traex yet at spawn. Reuses scheduleWrapperRealCliPid's stale-backend
-  // guard so a mid-retry worker restart can't rewire the new session. Gated on
-  // outerBwrapActive — sandboxRequested OR the Linux credential-only bwrap path,
-  // both of which produce an outer supervisor pid. */
+  // traex`; Forge x TraeX launches `forge run --agent traex`. In both shapes the
+  // pane leaf (getChildPid) is a launcher, not the process that holds the TRAE
+  // rollout fd, so the ownership gate cannot admit the id until backend.cliPid is
+  // rewired to the real traex descendant. Bounded retry (not one-shot): the
+  // launcher may not have forked traex yet at spawn. Reuses
+  // scheduleWrapperRealCliPid's stale-backend guard so a mid-retry worker restart
+  // can't rewire the new session.
   const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;
   lastSpawnOuterBwrapActive = outerBwrapActive;
-  const startTraexSandboxPidResolve = (launcherPid: number): void => {
-    if (cfg.cliId !== 'traex' || !outerBwrapActive) return;
+  const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
+  lastSpawnTraexLauncherActive = traexLauncherActive;
+  const startTraexLauncherPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, 'traex'),
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
-        log(`TRAE sandbox: resolved real traex leaf pid ${realPid} under bwrap supervisor ${launcherPid}; rewiring ownership pid`);
+        log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         codexAdoptPendingPid = realPid;
@@ -16796,13 +16831,13 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix')) {
-    // TRAE under outer bwrap: best-effort immediate resolve (leaf may already be
-    // forked), then a bounded retry below covers the not-yet-forked case.
-    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
+    // TRAE under bwrap/Forge launcher: best-effort immediate resolve (leaf may
+    // already be forked), then a bounded retry below covers the not-yet-forked case.
+    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, traexLauncherActive) : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
-    if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(cliPid);
+    if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -16831,11 +16866,11 @@ async function spawnCli(
           }
         }
         if (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix') {
-          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, outerBwrapActive) : pid;
+          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, traexLauncherActive) : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
-          if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(pid);
+          if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI

@@ -13,6 +13,7 @@ export type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
   modelChoices?: readonly string[];
 };
@@ -68,6 +69,7 @@ export type BotDefaultsRow = {
   /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
+  cliLaunchMode?: 'forge-traex' | null;
   model?: string;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -107,6 +109,7 @@ export type BotDefaultsRow = {
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
+  readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';

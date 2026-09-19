@@ -118,6 +118,7 @@ describe('Codex-compatible runtime editor', () => {
       { id: 'claude-code', label: 'Claude' },
       { id: 'codex', label: 'Codex' },
       { id: 'traex', label: 'traex' },
+      { id: 'forge-x-traex', label: 'Forge x TraeX', cliLaunchMode: 'forge-traex' as const },
       { id: 'ttadk-x-codex', label: 'Codex via TTADK' },
     ],
     ttadkModelDefault: 'glm-5.1',
@@ -463,6 +464,60 @@ describe('Codex-compatible runtime editor', () => {
 
       const codex = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol' });
       expect(codex.root.findAllByProps({ dataInput: 'agentModelBackendVariant' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('treats Forge x TraeX as TraeX for backend variant and native subagent settings', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...body,
+          ok: true,
+          cliId: 'traex',
+          cliLaunchMode: 'forge-traex',
+          selectionKey: 'forge-x-traex',
+          nativeSubagentRuntime: body.nativeSubagentRuntime ?? null,
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+        agentSelectionKey: 'forge-x-traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+
+      const variant = root.findByProps({ dataInput: 'agentModelBackendVariant' });
+      expect(variant.props.value).toBe('max');
+      expect(root.findAllByProps({ 'data-native-subagent-runtime': '' })).toHaveLength(1);
+
+      act(() => variant.props.onChange('standard'));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ 'data-input': 'nativeSubagentModel' }).props.onChange({ currentTarget: { value: 'GPT-5.6-Sol' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+
+      expect(requests[0]).toMatchObject({
+        cliId: 'forge-x-traex',
+        modelBackendVariant: 'standard',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
+      });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }

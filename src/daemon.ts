@@ -5835,6 +5835,7 @@ async function adoptCodexNotifierEvent(
     ds.session.cliId = 'codex-app';
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
+    delete ds.session.cliLaunchMode;
     delete ds.session.model;
     ds.spawnModelOverride = undefined;
     ds.session.agentFrozen = true;
@@ -18722,6 +18723,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
     : undefined;
   child.cliPathOverride = source.cliPathOverride;
   child.wrapperCli = source.wrapperCli;
+  child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
 }
 

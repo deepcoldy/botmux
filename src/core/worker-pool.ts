@@ -73,6 +73,7 @@ import {
   type CliRuntimeConfig,
   type CliRuntimeSnapshot,
 } from '../adapters/cli/runtime.js';
+import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
@@ -1987,8 +1988,8 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
@@ -2001,6 +2002,7 @@ function sessionAgentConfig(
     const runtime = selected.cliRuntime ?? undefined;
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
+    const cliLaunchMode = selected.cliLaunchMode ?? undefined;
     const reasoningEffort = selected.reasoningEffort ?? groupEffort;
     const modelBackendVariant = isBackendVariantCliId(selected.cliId)
       ? selected.modelBackendVariant ?? undefined
@@ -2013,6 +2015,7 @@ function sessionAgentConfig(
       ds.session.cliRuntime = runtime;
       ds.session.cliPathOverride = legacyPath;
       ds.session.wrapperCli = wrapperCli;
+      ds.session.cliLaunchMode = cliLaunchMode;
       ds.session.reasoningEffort = reasoningEffort;
       ds.session.modelBackendVariant = modelBackendVariant;
       ds.session.agentFrozen = true;
@@ -2026,7 +2029,7 @@ function sessionAgentConfig(
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2071,6 +2074,7 @@ function sessionAgentConfig(
       ?? runtimePathOverride(runtime)
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
+    ds.session.cliLaunchMode = ds.session.cliLaunchMode ?? botCfg.cliLaunchMode;
     ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
@@ -2109,6 +2113,10 @@ function sessionAgentConfig(
       ds.session.modelBackendVariant = undefined;
       repaired = true;
     }
+    if (ds.session.cliId !== 'traex' && ds.session.cliLaunchMode !== undefined) {
+      ds.session.cliLaunchMode = undefined;
+      repaired = true;
+    }
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
@@ -2126,6 +2134,7 @@ function sessionAgentConfig(
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
+    cliLaunchMode: ds.session.cliLaunchMode,
     model,
     modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
@@ -2195,12 +2204,13 @@ export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonS
  */
 function frozenSessionLaunchIdentity(
   ds: DaemonSession,
-  botCfg: { cliPathOverride?: string; wrapperCli?: string },
-): { cliPathOverride?: string; wrapperCli?: string } {
+  botCfg: { cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode },
+): { cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode } {
   if (ds.session.agentFrozen) {
     return {
       cliPathOverride: ds.session.cliPathOverride,
       wrapperCli: ds.session.wrapperCli,
+      cliLaunchMode: ds.session.cliLaunchMode,
     };
   }
   // Legacy, never frozen: it was launching off the live bot config, so that is
@@ -2208,6 +2218,7 @@ function frozenSessionLaunchIdentity(
   return {
     cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
+    cliLaunchMode: ds.session.cliLaunchMode ?? botCfg.cliLaunchMode,
   };
 }
 
@@ -9269,6 +9280,7 @@ export async function forkSession(
     : undefined;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
+  childSession.cliLaunchMode = ds.session.cliLaunchMode;
   childSession.agentFrozen = ds.session.agentFrozen;
   childSession.nativeSessionTitle = childTitle;
   childSession.nativeSessionTitleUserDefined = true;
@@ -11451,6 +11463,7 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     wrapperCli: agentCfg.wrapperCli,
+    cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
     model: agentCfg.model,
     modelBackendVariant: agentCfg.modelBackendVariant,

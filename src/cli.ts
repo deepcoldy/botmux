@@ -110,6 +110,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
+import type { CliLaunchMode } from './core/cli-launch-mode.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
@@ -1212,7 +1213,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  // CLI 适配器：可搜索的级联选择器（选 Aiden 可进 × Claude / × Codex，aiden 网关）。
+  // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   // 非交互终端自动回退为序号 / ID 文本输入。
   // Esc = 中止 setup（不写盘）。新建流程的必答题没有"上一步"可退，绝不静默
   // 替用户选默认——扫码建出的应用可事后用「选择已有应用」找回，不会丢。
@@ -1223,16 +1224,18 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   let cliId: CliId;
   let wrapperCli: string | undefined;
+  let cliLaunchMode: CliLaunchMode | undefined;
   try {
     const sel = resolveCliSelection(selKey);
     cliId = sel.cliId;
     wrapperCli = sel.wrapperCli;
+    cliLaunchMode = sel.cliLaunchMode;
   } catch (err: any) {
     console.log(`\n❌ ${err?.message ?? String(err)}`);
     console.log('   不写 bots.json。请重新运行 botmux setup。');
     return null;
   }
-  const cliAvailability = checkCliAvailability({ cliId, wrapperCli });
+  const cliAvailability = checkCliAvailability({ cliId, wrapperCli, cliLaunchMode });
   if (!cliAvailability.available) {
     console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);
     console.log('   配置仍可继续；请在 daemon 所在机器安装或修正 PATH / CLI 路径后再启动 Bot。\n');
@@ -1279,6 +1282,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     cliId,
     // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
     ...(wrapperCli ? { wrapperCli } : {}),
+    ...(cliLaunchMode ? { cliLaunchMode } : {}),
     // 仓库选择模式总是写 workingDir（留空用 '~'），用户手动编辑 bots.json 时
     // 一眼能看到字段在哪儿；固定默认目录模式只写 defaultWorkingDir，扫描根
     // 回退默认 ~，bots.json 不留多余字段。
@@ -1432,19 +1436,21 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  // CLI 适配器：可搜索的级联选择器（选 Aiden 可进 × Claude / × Codex，aiden 网关）。
+  // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   printInputHelp('CLI 适配器', [
     '可搜索的交互式选择：输入关键字过滤、↑/↓ 选择、⏎ 确认、Esc 保留当前值。',
-    '选 Aiden 进二级菜单：× Claude / × Codex（aiden 网关，无需 wrapper 脚本）。',
+    'Aiden、Forge 等分组需要先进入二级菜单，再选择具体版本或形态。',
     '非交互终端下回退为「输入序号 / 适配器 ID」。',
   ]);
-  const currentKey = selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli);
+  const currentKey = selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode);
   const selKey = await pickCliSelection(rl, { title: 'CLI 适配器', currentKey });
   if (selKey) {
     try {
       const sel = resolveCliSelection(selKey);
       input.cliChoice = sel.cliId;
       input.wrapperCli = sel.wrapperCli ?? null; // 选普通 CLI 时清掉旧的 aiden×* 前缀
+      input.cliLaunchMode = sel.cliLaunchMode ?? null;
+      input.cliRuntime = null;
     } catch (err: any) {
       console.log(`\n❌ ${err?.message ?? String(err)}（保留当前 CLI）`);
     }
@@ -1801,6 +1807,7 @@ async function cmdSetupScripted(
         cliId: preflight.cliId ?? 'claude-code',
         cliPathOverride: preflight.cliPathOverride,
         wrapperCli: preflight.wrapperCli,
+        cliLaunchMode: preflight.cliLaunchMode,
       });
       if (!preflightCli.available) {
         failSetupScripted(
@@ -1928,6 +1935,7 @@ async function cmdSetupScripted(
       cliId: bot.cliId ?? 'claude-code',
       cliPathOverride: bot.cliPathOverride,
       wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
     });
     if (!cliAvailability.available) {
       failSetupScripted(
@@ -2124,11 +2132,13 @@ async function cmdSetupScripted(
         cliId: original.cliId ?? 'claude-code',
         cliPathOverride: original.cliPathOverride,
         wrapperCli: original.wrapperCli,
+        cliLaunchMode: original.cliLaunchMode,
       },
       {
         cliId: edited.cliId ?? 'claude-code',
         cliPathOverride: edited.cliPathOverride,
         wrapperCli: edited.wrapperCli,
+        cliLaunchMode: edited.cliLaunchMode,
       },
     );
     // Missing Agent dependencies must block introducing a broken launch
@@ -2139,6 +2149,7 @@ async function cmdSetupScripted(
         cliId: edited.cliId ?? 'claude-code',
         cliPathOverride: edited.cliPathOverride,
         wrapperCli: edited.wrapperCli,
+        cliLaunchMode: edited.cliLaunchMode,
       });
       if (!cliAvailability.available) {
         failSetupScripted(
@@ -2357,6 +2368,7 @@ async function cmdSetup(): Promise<void> {
         cliId: edited.cliId ?? 'claude-code',
         cliPathOverride: edited.cliPathOverride,
         wrapperCli: edited.wrapperCli,
+        cliLaunchMode: edited.cliLaunchMode,
       });
       if (!cliAvailability.available) {
         console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);

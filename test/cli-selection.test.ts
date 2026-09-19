@@ -79,6 +79,20 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
     const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
     expect(flatKeys.indexOf('traex')).toBe(flatKeys.indexOf('coco') - 1);
+    expect(flatKeys.indexOf('forge-x-traex')).toBe(flatKeys.indexOf('coco') + 1);
+  });
+
+  it('exposes Forge x TraeX as a first-class top-level launch shape', () => {
+    const forge = CLI_SELECT_TREE.find((g) => g.key === 'forge-x-traex');
+    expect(forge?.label).toBe('Forge x TraeX');
+    expect(forge?.option).toEqual({
+      key: 'forge-x-traex',
+      label: 'Forge x TraeX',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+    expect(forge?.children).toBeUndefined();
+    expect(resolveCliSelection('forge-x-traex')).toEqual({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
   });
 
   it('keeps traecli as an input-only alias of the TRAE CLI 2.0 adapter', () => {
@@ -86,6 +100,10 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(CLI_SELECT_OPTIONS.map((o) => o.key)).not.toContain('traecli');
     expect(lookupCliSelection('traecli')).toBe(lookupCliSelection('traex'));
     expect(resolveCliSelection('traecli')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps numeric setup choices as selection aliases', () => {
+    expect(resolveCliSelection('14')).toEqual({ cliId: 'traex' });
   });
 
   it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
@@ -200,6 +218,11 @@ describe('resolveCliSelection', () => {
 });
 
 describe('selectionKeyForBot', () => {
+  it('round-trips Forge x TraeX bots back to their first-class selection key', () => {
+    expect(selectionKeyForBot('traex', undefined, 'forge-traex')).toBe('forge-x-traex');
+    expect(selectionKeyForBot('traex', 'ignored wrapper', 'forge-traex')).toBe('forge-x-traex');
+  });
+
   it('round-trips aiden gateway bots back to their selection key', () => {
     expect(selectionKeyForBot('claude-code', 'aiden x claude')).toBe('aiden-x-claude');
     expect(selectionKeyForBot('codex', 'aiden x codex')).toBe('aiden-x-codex');

@@ -11,6 +11,11 @@ import {
   normalizeCliRuntimeConfig,
   type CliRuntimeConfig,
 } from './adapters/cli/runtime.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -1455,6 +1460,8 @@ export interface BotConfig {
    * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
    */
   wrapperCli?: string;
+  /** Special launch mode layered above the adapter; currently Forge x TraeX. */
+  cliLaunchMode?: CliLaunchMode;
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
@@ -3253,12 +3260,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    const cliLaunchMode = normalizeCliLaunchMode(
+      entry.cliLaunchMode,
+      `Bot config [${i}].cliLaunchMode`,
+    );
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    validateCliLaunchModeConfig({
+      cliId: entryCliId,
+      cliLaunchMode,
+      wrapperCli: entry.wrapperCli,
+      cliRuntime: entry.cliRuntime,
+      cliPathOverride: entry.cliPathOverride,
+      sandbox: entry.sandbox,
+      readIsolation: entry.readIsolation,
+    }, `Bot config [${i}]`);
     const existingAppServer = normalizeExistingAppServerConfig(
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
@@ -3615,6 +3635,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
         : undefined,
+      cliLaunchMode,
       launchShell: typeof entry.launchShell === 'string' && entry.launchShell.trim()
         ? entry.launchShell.trim()
         : undefined,

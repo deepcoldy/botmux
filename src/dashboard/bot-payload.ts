@@ -3,6 +3,7 @@ import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
@@ -21,6 +22,7 @@ export interface DashboardBotDescriptor {
   /** Legacy executable override. Private Bot Defaults payload only. */
   cliPathOverride?: string;
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
@@ -84,6 +86,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
+    ...(bot.cliLaunchMode ? { cliLaunchMode: bot.cliLaunchMode } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
@@ -94,7 +97,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
     // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
     // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。
-    ...(bot.cliId ? { agentSelectionKey: selectionKeyForBot(bot.cliId, bot.wrapperCli) } : {}),
+    ...(bot.cliId ? { agentSelectionKey: selectionKeyForBot(bot.cliId, bot.wrapperCli, bot.cliLaunchMode) } : {}),
     online: true,
   };
   if (error) return { ...base, error };

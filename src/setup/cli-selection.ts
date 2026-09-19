@@ -21,8 +21,9 @@
  *   - 展示：`CLI_SELECT_OPTIONS`（扁平，web 下拉 + 非 TTY 回退）/ `CLI_SELECT_TREE`（级联，终端 TUI）
  *   - 解析：`resolveCliSelection(key)` → `{ cliId, wrapperCli? }`（纯映射，无副作用）
  */
-import { CLI_OPTIONS } from './bot-config-editor.js';
+import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
@@ -34,9 +35,11 @@ export interface CliSelectOption {
   readonly cliId: CliId;
   /** 通用启动前缀，如 'aiden x claude'；普通 CLI 无此项。 */
   readonly wrapperCli?: string;
+  /** 特殊启动模式；目前仅 Forge 以 `--agent-args` 字符串启动 TraeX。 */
+  readonly cliLaunchMode?: CliLaunchMode;
 }
 
-/** 级联树节点：顶层 CLI；children 非空表示选中后进二级菜单（目前只有 Aiden）。 */
+/** 级联树节点：顶层 CLI；children 非空表示选中后进二级菜单。 */
 export interface CliSelectGroup {
   readonly key: string;
   readonly label: string;
@@ -49,6 +52,7 @@ export interface CliSelectGroup {
 export interface ResolvedCliSelection {
   readonly cliId: CliId;
   readonly wrapperCli?: string;
+  readonly cliLaunchMode?: CliLaunchMode;
 }
 
 // ─── aiden 选项 ──────────────────────────────────────────────────────────────
@@ -87,12 +91,19 @@ const TRAE_X: CliSelectOption = {
   label: 'TRAE CLI 2.0（推荐；traex / traecli）',
   cliId: 'traex',
 };
+const FORGE_X_TRAEX: CliSelectOption = {
+  key: 'forge-x-traex',
+  label: 'Forge x TraeX',
+  cliId: 'traex',
+  cliLaunchMode: 'forge-traex',
+};
 const TRAE_COCO: CliSelectOption = {
   key: 'coco',
   label: 'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
   cliId: 'coco',
 };
 const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_X, TRAE_COCO];
+const FORGE_VARIANTS: ReadonlyArray<CliSelectOption> = [FORGE_X_TRAEX];
 
 // ─── OpenCode 选项 ──────────────────────────────────────────────────────────
 // OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
@@ -179,9 +190,13 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
     // codex + codex-app collapse into one「Codex」二级菜单 at codex's position.
     if (o.id === 'codex') return [{ key: 'codex', label: 'Codex', children: CODEX_VARIANTS }];
     if (o.id === 'codex-app') return [];
-    // coco + traex collapse into one「TRAE CLI」submenu at coco's position.
+    // coco + traex collapse into one「TRAE CLI」submenu at coco's position;
+    // Forge x TraeX stays a first-class top-level launch shape.
     // Keep the underlying CLI_OPTIONS / numeric cliId mapping untouched.
-    if (o.id === 'coco') return [{ key: 'trae', label: 'TRAE CLI', children: TRAE_VARIANTS }];
+    if (o.id === 'coco') return [
+      { key: 'trae', label: 'TRAE CLI', children: TRAE_VARIANTS },
+      { key: 'forge-x-traex', label: 'Forge x TraeX', option: FORGE_X_TRAEX },
+    ];
     if (o.id === 'traex') return [];
     // Pi and Oh My Pi are kept as adjacent leaves (emitted together at pi's spot).
     if (o.id === 'pi') return [
@@ -208,7 +223,7 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'mir') return [];               // already included via MIRA_VARIANTS
     if (o.id === 'codex') return CODEX_VARIANTS;  // expands to Codex + Codex App
     if (o.id === 'codex-app') return [];
-    if (o.id === 'coco') return TRAE_VARIANTS;    // expands to TRAE CLI 2.0 + legacy Coco
+    if (o.id === 'coco') return [...TRAE_VARIANTS, ...FORGE_VARIANTS]; // TRAE CLI 2.0 + legacy Coco + Forge x TraeX
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
@@ -229,6 +244,7 @@ const OPTION_BY_KEY: ReadonlyMap<string, CliSelectOption> = new Map(
  * Bot 配置仍落已有 cliId，避免迁移 adapter 注册、配置和历史 session。
  */
 export const CLI_SELECTION_ALIASES: Readonly<Record<string, string>> = {
+  ...CLI_ID_CHOICES,
   traecli: 'traex',
 };
 
@@ -238,8 +254,12 @@ export function lookupCliSelection(key: string): CliSelectOption | undefined {
   return OPTION_BY_KEY.get(CLI_SELECTION_ALIASES[normalized] ?? normalized);
 }
 
-/** 反查：由一个 bot 现有的 cliId + wrapperCli 得到对应的选择键（供编辑时高亮默认）。 */
-export function selectionKeyForBot(cliId: string, wrapperCli?: string): string {
+/** 反查：由一个 bot 现有的 cliId + wrapperCli / cliLaunchMode 得到对应的选择键。 */
+export function selectionKeyForBot(cliId: string, wrapperCli?: string, cliLaunchMode?: CliLaunchMode): string {
+  if (cliLaunchMode) {
+    const match = CLI_SELECT_OPTIONS.find((o) => o.cliId === cliId && o.cliLaunchMode === cliLaunchMode);
+    if (match) return match.key;
+  }
   if (wrapperCli && wrapperCli.trim()) {
     const match = CLI_SELECT_OPTIONS.find((o) => o.wrapperCli === wrapperCli.trim());
     if (match) return match.key;
@@ -258,7 +278,11 @@ export function resolveCliSelection(key: string): ResolvedCliSelection {
       `未知 CLI 选择项 "${key}"。合法值：${legalKeys.join(', ')}`,
     );
   }
-  return opt.wrapperCli ? { cliId: opt.cliId, wrapperCli: opt.wrapperCli } : { cliId: opt.cliId };
+  return {
+    cliId: opt.cliId,
+    ...(opt.wrapperCli ? { wrapperCli: opt.wrapperCli } : {}),
+    ...(opt.cliLaunchMode ? { cliLaunchMode: opt.cliLaunchMode } : {}),
+  };
 }
 
 // ─── 运行时：通用 wrapperCli 启动前缀（无 wrapper 脚本）────────────────────────

@@ -50,6 +50,7 @@ const bot = vi.hoisted(() => ({
   cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
   cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
+  cliLaunchMode: undefined as import('../src/core/cli-launch-mode.js').CliLaunchMode | undefined,
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -189,6 +190,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliRuntime: bot.cliRuntime,
       cliPathOverride: bot.cliPathOverride,
       wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
       workingDir: '~',
       workingDirs: ['~'],
     },
@@ -303,6 +305,7 @@ beforeEach(() => {
   bot.cliRuntime = undefined;
   bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
+  bot.cliLaunchMode = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
@@ -1480,6 +1483,21 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     expect(await closeCliMismatchedSessionsForBot('app_test'))
       .toMatchObject({ closed: 1 });
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('closes legacy unfrozen TraeX sessions when the bot switches to Forge x TraeX', async () => {
+    bot.cliId = 'traex';
+    bot.cliLaunchMode = 'forge-traex';
+    const s = makeActivePersistentSession('om_rt_legacy_traex_forge');
+    s.cliId = 'traex';
+    s.agentFrozen = false;
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
 
