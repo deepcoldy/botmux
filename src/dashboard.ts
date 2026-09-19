@@ -165,7 +165,7 @@ import {
 } from './services/model-catalog.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -331,6 +331,7 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { startAutoCleanup, stopAutoCleanup, resolveCleanupHours, resolveCleanupIntervalMs } from './dashboard/auto-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
   handleDesktopCompat,
@@ -1083,6 +1084,13 @@ interface ResolvedDashboardSettings {
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. */
   workflow: { enabled: boolean };
+  /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
+   *  生效值（含默认回退）。 */
+  sessionCleanup: {
+    enabled: boolean;
+    olderThanHours: SessionCleanupHours;
+    intervalMinutes: number;
+  };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1663,6 +1671,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
+    sessionCleanup: {
+      enabled: global.sessionCleanup?.enabled === true, // default OFF
+      olderThanHours: resolveCleanupHours(global.sessionCleanup),
+      intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -8076,6 +8089,36 @@ listenWithProbe({
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();
   startPlatformTunnelIfBound();
+  // Scheduled auto-cleanup of idle sessions (config-gated, default OFF). Runs in
+  // the dashboard process — the only one holding the cross-bot session view and
+  // the per-bot close fan-out, and a single host-wide process (so no N-way
+  // duplication). The closer is byte-identical to the manual /cleanup-idle route.
+  startAutoCleanup({
+    getSessions: () => aggregator.getSessions(),
+    closeCandidate: async (s) => {
+      try {
+        const upstream = await proxyToDaemon(
+          s.larkAppId ?? '',
+          `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+          { method: 'POST' },
+        );
+        const text = await upstream.text();
+        let parsed: any = null;
+        try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+        const ok = upstream.ok && parsed?.ok === true;
+        const residual = ok ? parseCloseResidual(parsed) : undefined;
+        return {
+          sessionId: s.sessionId,
+          ok,
+          ...(residual ? { residual } : {}),
+          error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+        };
+      } catch (e: any) {
+        return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+      }
+    },
+    log: (m) => logger.info(`[auto-cleanup] ${m}`),
+  });
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
   process.exit(1);
@@ -8325,6 +8368,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 // Graceful shutdown
 function shutdown(): void {
   codexNotifierAbort.abort();
+  stopAutoCleanup();
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();

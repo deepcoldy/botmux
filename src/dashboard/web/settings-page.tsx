@@ -80,6 +80,7 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
+  sessionCleanup: { enabled: boolean; olderThanHours: 24 | 72 | 168; intervalMinutes: number };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -231,6 +232,15 @@ function parseSettings(s: any): DashboardSettings {
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
+    sessionCleanup: {
+      enabled: s?.sessionCleanup?.enabled === true,
+      olderThanHours: ([24, 72, 168] as const).includes(s?.sessionCleanup?.olderThanHours)
+        ? s.sessionCleanup.olderThanHours
+        : 168,
+      intervalMinutes: typeof s?.sessionCleanup?.intervalMinutes === 'number' && s.sessionCleanup.intervalMinutes >= 5
+        ? Math.floor(s.sessionCleanup.intervalMinutes)
+        : 60,
+    },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
@@ -971,6 +981,17 @@ function SettingsBody(props: {
               );
             }}
           />
+          <SessionCleanupRow
+            value={settings.sessionCleanup}
+            disabled={dis || savingKey === 'sessionCleanup'}
+            onSave={patch => {
+              void props.onSave(
+                'sessionCleanup',
+                { sessionCleanup: patch },
+                s => ({ ...s, sessionCleanup: { ...s.sessionCleanup, ...patch } }),
+              );
+            }}
+          />
         </SettingsBlock>
       </SettingsGroup>
       </SettingsModule>
@@ -1528,6 +1549,79 @@ function ToggleRow(props: {
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+const SESSION_CLEANUP_HOURS = [24, 72, 168] as const;
+function sessionCleanupHoursLabel(hours: 24 | 72 | 168): string {
+  return hours === 168 ? '7d' : `${hours}H`;
+}
+
+/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+function SessionCleanupRow(props: {
+  value: { enabled: boolean; olderThanHours: 24 | 72 | 168; intervalMinutes: number };
+  disabled: boolean;
+  onSave(patch: { enabled?: boolean; olderThanHours?: 24 | 72 | 168; intervalMinutes?: number }): void;
+}) {
+  const tr = useT();
+  const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
+  useEffect(() => setIntervalDraft(String(props.value.intervalMinutes)), [props.value.intervalMinutes]);
+
+  const parsedInterval = Number(intervalDraft);
+  const intervalValid = Number.isFinite(parsedInterval) && parsedInterval >= 5 && Number.isInteger(parsedInterval);
+  const intervalDirty = intervalValid && Math.floor(parsedInterval) !== props.value.intervalMinutes;
+
+  return (
+    <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupEnable')}
+        help={tr('settings.sessionCleanupEnableHelp')}
+        checked={props.value.enabled}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ enabled: value })}
+      />
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupOlderThanHelp')}>{tr('settings.sessionCleanupOlderThan')}</FieldTitle>
+        <div
+          className="idle-cleanup-threshold-options"
+          role="radiogroup"
+          aria-label={tr('settings.sessionCleanupOlderThan')}
+        >
+          {SESSION_CLEANUP_HOURS.map(hours => {
+            const active = hours === props.value.olderThanHours;
+            return (
+              <button
+                type="button"
+                key={hours}
+                className={active ? 'active' : undefined}
+                aria-pressed={active ? 'true' : 'false'}
+                disabled={props.disabled || !props.value.enabled}
+                onClick={() => { if (hours !== props.value.olderThanHours) props.onSave({ olderThanHours: hours }); }}
+              >
+                {sessionCleanupHoursLabel(hours)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupIntervalHelp')}>{tr('settings.sessionCleanupInterval')}</FieldTitle>
+        <input
+          type="number"
+          min={5}
+          step={1}
+          inputMode="numeric"
+          value={intervalDraft}
+          disabled={props.disabled || !props.value.enabled}
+          onChange={e => setIntervalDraft(e.currentTarget.value)}
+          onBlur={() => {
+            if (intervalDirty) props.onSave({ intervalMinutes: Math.floor(parsedInterval) });
+            else setIntervalDraft(String(props.value.intervalMinutes));
+          }}
+          onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function GroupNamePrefixRow(props: {
   value: string;

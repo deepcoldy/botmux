@@ -491,3 +491,59 @@ describe('global dashboard config', () => {
     expect(raw.dashboard.localCliOpenMode).toBe('attach');
   });
 });
+
+describe('global sessionCleanup config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-session-cleanup-config-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reads a full sessionCleanup block', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({
+      enabled: true, olderThanHours: 72, intervalMinutes: 30,
+    });
+  });
+
+  it('drops an unsupported olderThanHours but keeps the rest', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 12, intervalMinutes: 15 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 15 });
+  });
+
+  it('drops a sub-floor intervalMinutes and floors a fractional one', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 1 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 90.7 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 90 });
+  });
+
+  it('ignores a non-object sessionCleanup', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: 'nope' }));
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('drops a non-boolean enabled', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
+  });
+});

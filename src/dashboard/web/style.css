@@ -19906,6 +19906,24 @@ form.dashboard-toolbar > input[type="text"]:focus {
   grid-column: span 2;
 }
 
+/* Scheduled idle-session cleanup block: stack the toggle + threshold + interval
+   rows with steady spacing, matching the other settings blocks. */
+.settings-session-cleanup {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.settings-session-cleanup .idle-cleanup-threshold-options {
+  margin-left: auto;
+}
+.settings-session-cleanup input[type="number"] {
+  width: 96px;
+  margin-left: auto;
+}
+
 .settings-group-meeting .settings-group-card {
   grid-template-columns: 1fr;
 }

@@ -11,6 +11,10 @@ export interface IdleCleanupSessionRow {
   agentAttention?: unknown;
   locked?: unknown;
   webPort?: unknown;
+  /** Owning daemon's app id — used to route the per-session close via
+   *  proxyToDaemon. Present on aggregator rows; optional here since the pure
+   *  selection logic never reads it. */
+  larkAppId?: string;
 }
 
 const OPTIONS = new Set<number>(IDLE_CLEANUP_HOUR_OPTIONS);
