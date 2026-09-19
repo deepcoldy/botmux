@@ -585,6 +585,7 @@ import {
   handleReadonlyTaskContinuationTerminal,
   parseReadonlyContinuationOutput,
   readonlyTaskContinuationHandlesTerminal,
+  startReadonlyTaskContinuation,
   type ReadonlyTaskContinuationDispatch,
   type ReadonlyTaskContinuationState,
 } from '../services/readonly-task-continuation.js';
@@ -1751,6 +1752,87 @@ function readonlyTaskContinuationEligible(
     && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
 }
 
+const OPEN_TASK_CONTINUATION_STATUSES = new Set([
+  'active',
+  'backoff',
+  'dispatching',
+  'delivering',
+  'awaiting_user',
+]);
+
+/**
+ * Arm continuation for the current authenticated ordinary user turn as soon as
+ * both independently-produced proofs exist: daemon admission authority and the
+ * live worker's RPC generation. Either can arrive first on a fresh session, so
+ * callers invoke this helper at both edges.
+ *
+ * The machine-wide flag remains the rollout/kill switch. Per-turn opt-in is not
+ * required: an existing record for this logical turn (including cancelled or
+ * awaiting-user) is never re-armed implicitly, and an open lease for another
+ * turn is never overwritten.
+ */
+export function ensureAutomaticTaskContinuationLease(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  if (!readonlyTaskContinuationEligible(ds, botCfg)) return false;
+  const authority = ds.activeInteractiveTurn;
+  if (!authority
+    || !authority.turnId.startsWith('om_')
+    || authority.caller.senderType !== 'user'
+    || authority.caller.requestLarkAppId !== ds.larkAppId
+    || (authority.controller
+      && authority.controller.requestLarkAppId !== ds.larkAppId)) return false;
+  // A lease must be born while the same RPC turn still exposes a live managed
+  // capability. After terminal/revocation, RPC proof alone is only a session
+  // capability and must never retroactively bless a completed turn.
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.capability
+    || origin.turnId !== authority.turnId
+    || origin.dispatchAttempt !== undefined) return false;
+
+  const existing = ds.session.readonlyTaskContinuation;
+  // Preserve every explicit terminal/control decision for this turn. In
+  // particular, a later duplicate RPC-status event must not undo `cancel` or
+  // `await-user`.
+  if (existing?.logicalTurnId === authority.turnId) {
+    return OPEN_TASK_CONTINUATION_STATUSES.has(existing.status);
+  }
+  if (existing && OPEN_TASK_CONTINUATION_STATUSES.has(existing.status)) return false;
+
+  const workerGeneration = ds.workerGeneration;
+  const proof = ds.taskContinuationRpcProof;
+  if (!ds.worker || ds.worker.killed || ds.worker.connected === false
+    || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0
+    || ds.session.workerGeneration !== workerGeneration
+    || proof?.workerGeneration !== workerGeneration) return false;
+  if (!ensureReadonlyTaskContinuationAttached(ds, botCfg)) return false;
+
+  try {
+    const state = startReadonlyTaskContinuation(ds.session, {
+      turnId: authority.turnId,
+      workerGeneration: workerGeneration!,
+      authorizationMode: 'inherited',
+      trustedCaller: authority.caller,
+      ...(authority.controller
+        ? { trustedController: authority.controller }
+        : {}),
+    });
+    return state?.logicalTurnId === authority.turnId
+      && OPEN_TASK_CONTINUATION_STATUSES.has(state.status);
+  } catch (err) {
+    // The user turn is already admitted. A lease persistence failure must not
+    // turn that successful admission into a retry (which could duplicate side
+    // effects); leave continuation fail-closed and keep the original turn live.
+    logger.error(
+      `[${tag(ds)}] Failed to arm automatic task continuation for `
+      + `${authority.turnId.substring(0, 16)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
 function readonlyTaskContinuationWarning(
   state: NonNullable<Session['readonlyTaskContinuation']>,
 ): string {
@@ -1915,7 +1997,7 @@ function deliverReadonlyTaskContinuationWarningPending(
   );
 }
 
-/** Attach the opt-in authorization-inheriting task continuation owner. The machine switch is
+/** Attach the authorization-inheriting task continuation owner. The machine switch is
  * checked both here and before every dispatch; an off switch leaves all normal
  * sessions on their existing path. */
 export function ensureReadonlyTaskContinuationAttached(
@@ -14894,6 +14976,7 @@ function setupWorkerHandlers(
             ? { preexistingProcessIdentities }
             : {}),
         };
+        ensureAutomaticTaskContinuationLease(ds, botCfg);
         break;
       }
 
@@ -15054,6 +15137,7 @@ function setupWorkerHandlers(
         ds.taskContinuationRpcProof = msg.eligible
           ? { workerGeneration, rpcGeneration: msg.rpcGeneration, checkedAt: Date.now() }
           : undefined;
+        if (msg.eligible) ensureAutomaticTaskContinuationLease(ds, botCfg);
         break;
       }
 
