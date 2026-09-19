@@ -55,6 +55,19 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
     }
     if (request.params.name === 'validate_sql_for_user') {
+      if (args.sql.includes('RETURN_VALIDATION_ERROR')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: 'validation_error',
+              result_class: 'policy_error',
+              message: 'missing execution context',
+              issues: [{ code: 'query_plan_session_required' }],
+            }),
+          }],
+        };
+      }
       validatedSql = args.sql;
       return { content: [{ type: 'text', text: JSON.stringify({ query_plan_id: 'qplan_fixture', sql: args.sql }) }] };
     }

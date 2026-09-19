@@ -154,6 +154,49 @@ describe('Frozen Commands definition and positional UX', () => {
     })).rejects.toMatchObject({ code: 'untrusted_caller' });
   });
 
+  it('preserves a normal MCP business failure instead of masking it as query_plan_missing', async () => {
+    const validationErrorDefinition = BASE.replace(
+      'SELECT sum(amount) FROM bills',
+      "SELECT 'RETURN_VALIDATION_ERROR'",
+    );
+    const { root, definition } = fixture(validationErrorDefinition);
+    const home = join(root, 'home');
+    const source = join(root, 'data-mcp-plugin');
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-data-mcp',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'data-mcp' },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      transport: 'stdio',
+      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
+    }));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+    installLocalPlugin(source);
+
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'] },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test',
+        requestLarkAppId: 'cli_test',
+        senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    })).rejects.toMatchObject({
+      code: 'data_mcp_validate_failed',
+      message: expect.stringContaining('query_plan_session_required'),
+    });
+  });
+
   it('only permits model fallback for explicitly transient failures', () => {
     const { definition } = fixture(BASE);
     expect(shouldFallbackFrozenCommand(

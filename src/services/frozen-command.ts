@@ -649,7 +649,18 @@ export async function executeFrozenCommand(input: {
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
     if (validateResult.isError === true) downstreamFailure('validate', validateResult);
-    const queryPlanId = planIdFromResult(validateResult);
+    let queryPlanId: string;
+    try {
+      queryPlanId = planIdFromResult(validateResult);
+    } catch (error) {
+      // Data MCP deliberately returns policy/validation failures as a normal
+      // MCP tool result containing structured JSON. Preserve that real error
+      // instead of masking it as a missing query plan.
+      if (error instanceof FrozenCommandError && error.code === 'query_plan_missing') {
+        downstreamFailure('validate', validateResult);
+      }
+      throw error;
+    }
     const runResult = await client.callTool({
       name: run,
       arguments: {
