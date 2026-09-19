@@ -18,6 +18,7 @@ import {
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { privateReplyEnabled } from './private-reply.js';
 import { isDocNativeSession, larkTransportEnabled, sessionAnchorId, type DaemonSession } from './types.js';
 
 export type ReplyCardSender = (content: string, msgType: string, uuid: string) => Promise<string>;
@@ -45,7 +46,7 @@ export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
 /** Freeze display mode per accepted turn. Unsupported entry points keep their
  * established delivery contract, including sandbox, API-only, v3, adoption and VC. */
 export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): TurnReplyCardMode {
-  if (!turnId || replyCardSandboxBlocked(ds)) return 'legacy';
+  if (!turnId || privateReplyEnabled(ds.session) || replyCardSandboxBlocked(ds)) return 'legacy';
   let snapshot = modes.get(ds);
   if (!snapshot) { snapshot = new Map(); modes.set(ds, snapshot); }
   const prior = snapshot.get(turnId);

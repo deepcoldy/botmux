@@ -3734,7 +3734,6 @@ interface SessionData {
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
-    replyTargetSenderIsBot?: boolean;
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
@@ -10793,7 +10792,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
       const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
         || process.env.BOTMUX_SANDBOX === '1';
-      const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
+      const canUseReplyCard = replyKey && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));

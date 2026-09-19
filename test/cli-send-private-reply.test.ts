@@ -5,8 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
+import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 
-function run(fail: boolean, args: string[] = [], turnId = 'turn_a') {
+function run(fail: boolean, args: string[] = [], turnId = 'turn_a', reservedCard = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-private-cli-'));
   const dataDir = join(root, 'data');
   try {
@@ -24,6 +25,12 @@ function run(fail: boolean, args: string[] = [], turnId = 'turn_a') {
         replyTargets: { turn_a: { senderOpenId: 'ou_a', updatedAt: new Date(0).toISOString() } },
       },
     });
+    if (reservedCard) {
+      const store = new TurnReplyCardStore(dataDir);
+      const key = { larkAppId: 'cli_test', sessionId: 'session', turnId };
+      const record = store.prepareSync(key, { mode: 'unified', chatId: 'oc_test', rootId: 'om_topic' });
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify({ ...record, messageId: 'om_public_card' }));
+    }
     const result = spawnSyncTsScript(fileURLToPath(new URL('./fixtures/send-private-reply-capture.ts', import.meta.url)), [
       'send', 'answer', '--session-id', 'session', '--no-mention', ...args,
     ], {
@@ -48,6 +55,16 @@ describe('real CLI private delivery', () => {
     expect(group.url).toMatch(/\/im\/v1\/messages\/om_topic\/reply$/);
     expect(group.body.reply_in_thread).toBe(true);
     expect(group.body.content).toBe(fail ? dm.body.content : JSON.stringify({ text: 'sent privately' }));
+  });
+
+  it.each([false, true])('does not patch an existing public card with fallback=%s', fail => {
+    const result = run(fail, ['--response-kind', 'final'], 'turn_a', true);
+    expect(result.status, String(result.stderr)).toBe(0);
+    expect(result.deliveries).toHaveLength(2);
+    expect(result.deliveries[0].body.receive_id).toBe('ou_a');
+    expect(result.deliveries[1].url).toMatch(/\/im\/v1\/messages\/om_topic\/reply$/);
+    expect(result.deliveries[1].body.content).toBe(fail
+      ? result.deliveries[0].body.content : JSON.stringify({ text: 'sent privately' }));
   });
 
   it('returns an evicted turn to the topic without borrowing the last sender', () => {
