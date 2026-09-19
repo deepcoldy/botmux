@@ -296,6 +296,11 @@ describe('executeScheduledTask — silent thread fire', () => {
       source: 'schedule_creator',
       taskId: 'task0001',
     });
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.session).toMatchObject({
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    });
   });
 
   it('carries no identity when the task has no creator union_id (fail closed, not "runs as the bot")', async () => {

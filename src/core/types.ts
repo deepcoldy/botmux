@@ -384,6 +384,11 @@ export interface DaemonSession {
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
   };
+  /** Daemon-authenticated scheduled creator identities waiting for the worker
+   * to publish the matching managed-turn capability. Keyed by the exact
+   * daemon-minted schedule turn id and never persisted. The worker can name a
+   * turn id but cannot add or change the identity behind it. */
+  scheduledTurnCallers?: Map<string, TrustedCaller>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

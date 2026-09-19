@@ -3721,6 +3721,7 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
@@ -6815,6 +6816,7 @@ interface CurrentSession {
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
   ownerOpenId?: string;
+  ownerUnionId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -6833,6 +6835,7 @@ function detectCurrentSession(): CurrentSession | null {
     chatType: s.chatType,
     scope: s.scope,
     ownerOpenId: s.ownerOpenId,
+    ownerUnionId: s.ownerUnionId,
   };
 }
 
@@ -7452,6 +7455,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         // turns can authenticate workflow commands as them. The daemon
         // re-checks the owner is still allowed at every run mutation.
         ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
+        // union_id must come from the authenticated persisted session. Unlike
+        // ownerOpenId, there is deliberately no environment override: scheduled
+        // turns use this tenant-stable identity to access user-bound tools.
+        ownerUnionId: cur?.ownerUnionId,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
