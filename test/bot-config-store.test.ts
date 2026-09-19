@@ -89,6 +89,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
     expect(keys).toContain('feedback');
+    expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
   });
 
@@ -427,6 +428,13 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+
+    const timing = store.findConfigField('showReplyTiming')!;
+    await store.applyConfigField('app_default', timing, true);
+    expect(registry.getBot('app_default').config.showReplyTiming).toBe(true);
+    expect(registry.loadBotConfigs()[0].showReplyTiming).toBe(true);
+    await store.applyConfigField('app_default', timing, false);
+    expect(readConfig().showReplyTiming).toBeUndefined();
   });
 
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
