@@ -22,9 +22,17 @@ afterAll(() => {
 });
 
 function runCli(args: string[], input?: string): { status: number; stdout: string; stderr: string } {
+  // The child must not inherit a surrounding botmux session: the resolver
+  // rejects rows whose larkAppId differs from BOTMUX_LARK_APP_ID, and the
+  // session-scoped copy switches on BOTMUX_SESSION_ID / origin channel.
+  // Delete the keys — Node spawns `undefined` values as the string "undefined".
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, SESSION_DATA_DIR: dataDir };
+  for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_ORIGIN_CHANNEL_ID', 'BOTMUX_READ_ISOLATED', 'BOTMUX_SEND_RELAY', 'BOTMUX_DAEMON_IPC_PORT']) {
+    delete env[key];
+  }
   const r = spawnSync('node', [CLI_PATH, ...args], {
     cwd: home,
-    env: { ...process.env, HOME: home, USERPROFILE: home, SESSION_DATA_DIR: dataDir },
+    env,
     input,
     stdio: ['pipe', 'pipe', 'pipe'],
     encoding: 'utf-8',

@@ -17,6 +17,10 @@ export interface DaemonInfo {
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with the boot identity. */
   workflowIpcProtocol?: string;
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   lastHeartbeat: number;
   /**
    * open_ids of users the bot's allowedUsers list was resolved to (post-email
@@ -112,6 +116,12 @@ export class DaemonRegistry {
       if (!n.endsWith('.json')) continue;
       try {
         const d = JSON.parse(readFileSync(join(this.dir, n), 'utf8')) as DaemonInfo;
+        if (typeof d.sessionStoreProtocol !== 'string' || !d.sessionStoreProtocol) {
+          delete d.sessionStoreProtocol;
+        }
+        if (typeof d.botmuxVersion !== 'string' || !d.botmuxVersion) {
+          delete d.botmuxVersion;
+        }
         next.set(d.larkAppId, d);
       } catch {
         // Skip malformed / partially-written files
