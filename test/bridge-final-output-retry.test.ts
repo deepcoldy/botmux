@@ -278,10 +278,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     vi.useRealTimers();
   });
 
-  it('merges the real worker final_output into its existing reply card', async () => {
+  it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
     vi.useRealTimers();
     const bot = getBot('app_test');
     bot.config.replyCardMode = 'unified';
+    bot.config.oncallGroup = { enabled: true, chatIds: ['oc_chat'] };
     vi.mocked(getBot).mockReturnValue(bot);
     const ds = makeDs();
     ds.adoptedFrom = undefined;
@@ -294,21 +295,34 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
     await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' },
       (body, type, uuid) => sessionReply(ds.session.rootMessageId, body, type, ds.larkAppId, ds.currentTurnId, { uuid }));
+    if (source === 'explicit') {
+      const { attachOncallGroupButton } = await import('../src/im/lark/oncall-group.js');
+      const card = attachOncallGroupButton(JSON.stringify({ schema: '2.0', body: { elements: [
+        { tag: 'markdown', content: '显式完整答复' },
+      ] } }), bot.config.oncallGroup, ds.chatId);
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'final', text: '显式完整答复', card, source },
+        async () => 'om_managed_reply');
+    }
     ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
       entries: [{ kind: 'tool_call', id: 'read-1', name: 'Read', args: '{}', subject: 'README.md' }] });
     ds.worker!.emit('message', { type: 'final_output', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
       kind: 'bridge', content: '同卡完整答复', lastUuid: 'managed-final' });
     ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
       status: 'completed', durationMs: 2300, completedAtMs: Date.now() });
+    const expectedAnswer = source === 'explicit' ? '显式完整答复' : '同卡完整答复';
+    const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     await vi.waitFor(() => {
-      expect(updateMessageMock.mock.calls.some(call => call[2]?.includes('同卡完整答复') && call[2]?.includes('已完成'))).toBe(true);
+      expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
+      expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_managed_reply'))
+        .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
     const record = new TurnReplyCardStore('/tmp/test-sessions').read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
-    expect(record?.tools[0]?.subject).toBe('README.md');
+    if (source === 'bridge') expect(record?.tools[0]?.subject).toBe('README.md');
     expect(record?.finalDelivered).toBe(true);
+    expect(record?.finalSource).toBe(source);
   });
 
   it.each([
@@ -503,6 +517,31 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_admin_human');
+  });
+
+  it.each(['claude-code', 'codex'])('adds an independent Oncall button on the %s final delivery path', async cliId => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId, oncallGroup: { enabled: true, chatIds: ['oc_chat'] } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_oncall_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_different_owner';
+    ds.session.cliId = cliId as any;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('oncall_group_create');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+    const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
+    expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
+    expect(delivery).toMatchObject({ cardMode: 'card' });
+    expect(delivery?.policy).toBeUndefined();
+    expect(delivery?.baseCard).toBeUndefined();
   });
 
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {

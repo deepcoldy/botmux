@@ -16,6 +16,7 @@ import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-se
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
+import { handleOncallServiceSecret } from './dashboard/oncall-service-secret.js';
 import {
   deleteTeamRoleFile,
   readTeamRoleInjectMode,
@@ -7002,6 +7003,20 @@ const server = createServer(async (req, res) => {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (await handleOncallServiceSecret(req, res, url, { identity: requestIdentity, csrfTokens: controlCsrfTokens })) return;
+
+    const mOncallGroup = url.pathname.match(/^\/api\/bots\/([^/]+)\/oncall-group$/);
+    if (req.method === 'PUT' && mOncallGroup) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mOncallGroup[1]), '/api/bot-oncall-group', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}',
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());

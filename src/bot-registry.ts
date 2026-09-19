@@ -40,6 +40,7 @@ import {
   type CodexBrowserConfig,
 } from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
@@ -1401,6 +1402,7 @@ export interface BotConfig {
   apiOnly?: boolean;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  oncallGroup?: OncallGroupPolicy;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -3594,6 +3596,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),

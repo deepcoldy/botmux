@@ -704,6 +704,10 @@ describe('cmdSend hook context wiring', () => {
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
     expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(oncallIndex).toBeGreaterThan(primarySend);
+    expect(oncallIndex).toBeLessThan(completionIndex);
     // The feedback control (policy + card snapshot) rides along only when a
     // policy actually applies; the record itself is unconditional.
     expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');
