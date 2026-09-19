@@ -343,6 +343,22 @@ export interface Session {
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
   /**
+   * Per-proposer count of consecutive bot cross-principal interruptions on this
+   * session, keyed by {@link crossPrincipalProposerKey} (lark app + the bot's
+   * own union/open id; unattributable senders share an `unknown` bucket). Each
+   * bot's tally is incremented when that bot (never a human) interrupts the
+   * active turn without classifying, and the whole map is cleared the moment any
+   * non-bot proposer interrupts. Once a bot's tally crosses
+   * {@link CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD} the acknowledgement prompt is
+   * suppressed for *that* bot: the interruption is still staged durably, but
+   * botmux stops @-mentioning it, breaking the mutual auto-reply storm where two
+   * `mentionMode: always` bots keep re-triggering each other's
+   * "请选择独立任务/建议" cards. Counting per proposer means an unrelated bot's
+   * first legitimate interruption is never dropped because a *different* bot was
+   * looping. Absent/empty = every bot at 0.
+   */
+  crossPrincipalBotInterruptionCounts?: Record<string, number>;
+  /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.
    *
@@ -945,6 +961,15 @@ export interface CrossPrincipalInterruption {
    *  clocks are owned by the ask broker and start after card delivery. */
   ownerDeadlineAt?: number;
   messages: CrossPrincipalInterruptionMessage[];
+  /**
+   * Set when the bot↔bot auto-reply circuit breaker tripped for this record
+   * (more than {@link CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD} consecutive bot
+   * proposers). The record is still staged durably, but the drive loop resolves
+   * it silently — no classification card, no @-mention terminal notice — so two
+   * `mentionMode: always` bots stop re-triggering each other. Never set for a
+   * human proposer.
+   */
+  loopSuppressed?: boolean;
   independentRootMessageId?: string;
   independentChildSessionId?: string;
   independentWorkingDir?: string;
