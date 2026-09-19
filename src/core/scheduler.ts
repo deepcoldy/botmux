@@ -546,8 +546,6 @@ async function tick(): Promise<void> {
       }
     }
 
-    // Execute
-    logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
     const executionContext = createExecutionContext('scheduler');
     // Claim every due run before dispatch. Recurring tasks advance to their next
     // occurrence; one-shots persist lastRunAt and clear nextRunAt, so another
@@ -555,23 +553,23 @@ async function tick(): Promise<void> {
     // its asynchronous model turn is still in flight. A precondition skip
     // explicitly restores a one-shot retry time in recordDispatchOutcome().
     const newNext = computeNextRun(task.parsed, executionContext.startedAt);
-    scheduleStore.updateTask(task.id, {
+    const claim = scheduleStore.claimRun(task.id, {
       lastRunAt: executionContext.startedAt,
       nextRunAt: newNext ?? undefined,
-      lastStatus: 'running',
       lastRunId: executionContext.runId,
-      lastError: undefined,
-      lastDeliveryError: undefined,
     });
+    if (!claim.ok) continue;
+    const claimedTask = claim.task;
+    logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
     if (executeCallback) {
-      const taskId = task.id;
-      executeCallback(task, executionContext)
-        .then(outcome => recordDispatchOutcome(task, executionContext, outcome))
+      const taskId = claimedTask.id;
+      executeCallback(claimedTask, executionContext)
+        .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
-          logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
+          logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
           scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
-          cleanupIfTaskWasAutoRemoved(task);
+          cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -581,11 +579,11 @@ async function tick(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             },
           });
-          emitScheduleFiredHook(task, 'error', err);
+          emitScheduleFiredHook(claimedTask, 'error', err);
         });
     } else {
       scheduleStore.markRun(
-        task.id,
+        claimedTask.id,
         false,
         'scheduler execute callback is not initialised',
         undefined,
@@ -854,8 +852,9 @@ export function runTaskNow(id: string): boolean {
   // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
   // which was wrong in multi-bot setups — the callback on this daemon may
   // not even be the right bot for this task.
+  const requested = scheduleStore.requestRunNow(id);
+  if (!requested.ok) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
-  scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
   return true;
 }
 
@@ -883,28 +882,27 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
   const next = computeNextRun(task.parsed, executionContext.startedAt);
-  scheduleStore.updateTask(id, {
+  const claim = scheduleStore.claimRun(id, {
     lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
-    lastStatus: 'running',
     lastRunId: executionContext.runId,
-    lastError: undefined,
-    lastDeliveryError: undefined,
   });
+  if (!claim.ok) return claim;
+  const claimedTask = claim.task;
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
-    outcome => recordDispatchOutcome(task, executionContext, outcome),
+  void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
+    outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg, undefined, executionContext.runId);
-      cleanupIfTaskWasAutoRemoved(task);
+      scheduleStore.markRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
       });
-      emitScheduleFiredHook(task, 'error', err);
+      emitScheduleFiredHook(claimedTask, 'error', err);
     },
   );
   return { ok: true };

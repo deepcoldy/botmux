@@ -734,6 +734,49 @@ export function updateTask(
   }, appId);
 }
 
+export type ScheduleRunClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' };
+
+/** Atomically claim a task for dispatch. The file lock makes this the single
+ * admission point shared by natural ticks and Dashboard run-now requests. */
+export function claimRun(
+  id: string,
+  claim: Pick<ScheduledTask, 'lastRunAt' | 'nextRunAt' | 'lastRunId'>,
+  appId?: string,
+): ScheduleRunClaimResult {
+  return mutateTasks<ScheduleRunClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    Object.assign(task, claim, {
+      lastStatus: 'running' as const,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task } as const, changed: true };
+  }, appId);
+}
+
+/** Atomically make a task due without re-arming one that is already running. */
+export function requestRunNow(
+  id: string,
+  nextRunAt = new Date().toISOString(),
+  appId?: string,
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' }>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    task.nextRunAt = nextRunAt;
+    return { result: { ok: true } as const, changed: true };
+  }, appId);
+}
+
 /** Record a skipped check without consuming a run or disabling a one-shot. */
 export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
   mutateTasks(working => {
