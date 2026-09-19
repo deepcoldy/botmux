@@ -16078,6 +16078,13 @@ function deliverFinalOutput(
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
+      const executionDurationMs = getBot(ds.larkAppId).config.showReplyTiming === true
+        ? msg.durationMs ?? msg.codexAppSettlement?.durationMs
+        : undefined;
+      const receivedAtMs = ds.turnReceivedAtMs?.get(msg.turnId);
+      const waitingDurationMs = executionDurationMs !== undefined && msg.dispatchAttempt === undefined
+        && receivedAtMs !== undefined && msg.executionStartedAtMs !== undefined
+        ? msg.executionStartedAtMs - receivedAtMs : undefined;
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
@@ -16090,6 +16097,8 @@ function deliverFinalOutput(
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            executionDurationMs,
+            waitingDurationMs,
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
@@ -16101,6 +16110,8 @@ function deliverFinalOutput(
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            executionDurationMs,
+            waitingDurationMs,
           });
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 

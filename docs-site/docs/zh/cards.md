@@ -120,3 +120,12 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - 示例中的 `send` 带 `--no-mention`：进度卡片不需要 @ 任何人，显式声明不提及可避免被 mention 策略门拦截（exit 2）。
 - Bot 身份从会话上下文解析（与 `send` 相同）；消息已撤回、无权限、目标不是卡片消息等错误会原样透出（exit 1）。
 - 成功输出 `{"success":true,"messageId":"om_xxx","sessionId":"..."}`（stdout 只有 JSON）；参数错误 exit 2。
+
+## 最终回复的耗时
+
+管理员可用 `/botconfig set showReplyTiming on` 在最终回复页脚显示「等待 3.2 秒 · 执行耗时 23.4 秒」。默认关闭，用 `off` 关闭；无需重启，从新接收的消息开始记录等待时间。
+
+- **等待**：从 Botmux 接受本轮消息，到输入实际交给 CLI；包含排队和冷启动准备，不包含飞书消息到达 Botmux 之前的时间。
+- **执行耗时**：从输入实际交给 CLI，到最终输出被观察到；Codex App 使用原生完成时间。两项都不包含飞书投递耗时。
+
+仅展示当前轮次和尝试的已知计时；缺失或无效的数值不显示。带独立 dispatch attempt 的重试不展示等待时间，以免把之前的执行也算进等待。旧 worker、恢复后无法确定起点的轮次，以及模型通过 `botmux send` 提前发出的消息不会补猜耗时。此配置不改变动态单卡已有的计时标题。

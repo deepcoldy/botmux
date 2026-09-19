@@ -342,6 +342,8 @@ export interface DaemonSession {
    *  ended). Cleared on turn_terminal: a bubble created after its turn
    *  settled would never receive RUN_FINISHED and spin forever. */
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
+  /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
+  turnReceivedAtMs?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
