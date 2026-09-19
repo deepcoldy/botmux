@@ -75,7 +75,15 @@ jobs:
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if ! command -v bwrap >/dev/null; then
+            # Runner apt lists can be stale: the cached bubblewrap deb
+            # (0.9.0-1ubuntu0.1) 404s without apt-get update first. Refresh
+            # lists and install; a plain install is the fallback.
+            sudo apt-get update -y \
+              && sudo apt-get install -y bubblewrap \
+              || sudo apt-get install -y --no-install-recommends bubblewrap \
+              || true
+          fi
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
@@ -178,7 +186,15 @@ jobs:
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if ! command -v bwrap >/dev/null; then
+            # The runner image's apt lists can be stale: the cached bubblewrap
+            # deb reference (0.9.0-1ubuntu0.1) 404s without apt-get update
+            # first. Refresh lists, install; then retry plain install once.
+            sudo apt-get update -y \
+              && sudo apt-get install -y bubblewrap \
+              || sudo apt-get install -y --no-install-recommends bubblewrap \
+              || true
+          fi
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
