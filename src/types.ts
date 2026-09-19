@@ -1190,7 +1190,11 @@ export interface ScheduledTask {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  /** Durable state of the most recently claimed run. `running` is written
+   *  before asynchronous dispatch and settled only by the matching run id. */
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  /** Scheduler-generated identity for the run represented by lastStatus. */
+  lastRunId?: string;
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
