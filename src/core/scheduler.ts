@@ -542,16 +542,19 @@ async function tick(): Promise<void> {
       }
     }
 
-    // At-most-once: advance next_run BEFORE execution so crash mid-run doesn't re-fire
-    if (task.parsed.kind !== 'once') {
-      const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
-      if (newNext) scheduleStore.updateTask(task.id, { nextRunAt: newNext });
-    }
-
     // Execute
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
     const executionContext = createExecutionContext('scheduler');
-    scheduleStore.updateTask(task.id, { lastRunAt: executionContext.startedAt });
+    // Claim every due run before dispatch. Recurring tasks advance to their next
+    // occurrence; one-shots persist lastRunAt and clear nextRunAt, so another
+    // scheduler tick (or a daemon restart) cannot dispatch the same run while
+    // its asynchronous model turn is still in flight. A precondition skip
+    // explicitly restores a one-shot retry time in recordDispatchOutcome().
+    const newNext = computeNextRun(task.parsed, executionContext.startedAt);
+    scheduleStore.updateTask(task.id, {
+      lastRunAt: executionContext.startedAt,
+      nextRunAt: newNext ?? undefined,
+    });
 
     if (executeCallback) {
       const taskId = task.id;

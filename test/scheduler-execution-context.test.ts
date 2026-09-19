@@ -125,7 +125,28 @@ describe('scheduler execution context', () => {
     });
     expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
       lastRunAt: received!.startedAt,
+      nextRunAt: undefined,
     });
+  });
+
+  it('claims a one-shot before dispatch so a long model turn cannot fire twice', async () => {
+    const liveTask = structuredClone(task);
+    mocks.listTasks.mockImplementation(() => [structuredClone(liveTask)]);
+    mocks.updateTask.mockImplementation((id: string, updates: Partial<ScheduledTask>) => {
+      if (id === liveTask.id) Object.assign(liveTask, updates);
+    });
+    const execute = vi.fn(() => new Promise<void>(() => {}));
+    setExecuteCallback(execute);
+
+    startScheduler();
+    await vi.advanceTimersByTimeAsync(65_000);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(liveTask).toMatchObject({
+      enabled: true,
+      lastRunAt: '2026-08-31T00:01:05.000Z',
+    });
+    expect(liveTask.nextRunAt).toBeUndefined();
   });
 
   it('keeps chatId as the primary fired-hook target and adds chatIds only for fan-out', async () => {
