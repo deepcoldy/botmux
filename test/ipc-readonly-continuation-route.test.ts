@@ -94,6 +94,7 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
         status: 'active',
         maxContinuations: 2,
         authorizationMode: 'inherited',
+        startMode: 'explicit',
         trustedCaller: TRUSTED_CALLER,
       },
     });

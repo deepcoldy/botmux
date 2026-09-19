@@ -36,6 +36,7 @@ function state(overrides: Partial<ReadonlyTaskContinuationState> = {}): Readonly
     maxContinuations: 2,
     continuationsStarted: 0,
     authorizationMode: 'inherited',
+    startMode: 'explicit',
     trustedCaller: TRUSTED_CALLER,
     currentWorkerGeneration: 1,
     status: 'active',
@@ -80,6 +81,126 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       continuation: 1,
     });
     expect(enqueue.mock.calls[0][0].prompt).not.toContain('original user prompt');
+  });
+
+  it('settles an automatically started original turn on normal completion', () => {
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const automatic = state({ startMode: 'automatic' });
+    coordinator.restore(automatic);
+
+    expect(coordinator.onTerminal(automatic, {
+      turnId: 'om_original',
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'completed', continuationsStarted: 0 });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('settles a persisted lease without a start mode fail-closed on normal completion', () => {
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const persisted = state({ startMode: undefined });
+    coordinator.restore(persisted);
+
+    expect(coordinator.onTerminal(persisted, {
+      turnId: 'om_original',
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'completed', continuationsStarted: 0 });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('keeps a persisted completed synthetic turn resumable without a start mode', () => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const synthetic = state({
+      startMode: undefined,
+      currentTurnId: 'bmx-continuation-one',
+      currentDispatchAttempt: 1,
+      continuationsStarted: 1,
+    });
+    coordinator.restore(synthetic);
+
+    expect(coordinator.onTerminal(synthetic, {
+      turnId: 'bmx-continuation-one',
+      dispatchAttempt: 1,
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'backoff', continuationsStarted: 1 });
+    expect(timers.length).toBeGreaterThan(1);
+  });
+
+  it('promotes the matching automatic lease when the user explicitly starts continuation', () => {
+    const timers: Array<{ delayMs: number; run: () => void }> = [];
+    const persist = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { timers.push({ delayMs, run }); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue: vi.fn(() => 7),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    coordinator.restore(state({ startMode: undefined }));
+
+    expect(coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 120_000,
+      maxContinuations: 4,
+    })).toMatchObject({
+      startMode: 'explicit',
+      expiresAt: 122_000,
+      maxContinuations: 4,
+    });
+    expect(persist).toHaveBeenCalledOnce();
+    expect(timers.at(-1)?.delayMs).toBe(120_000);
+
+    const backoff = state({
+      startMode: 'automatic',
+      status: 'backoff',
+      nextAttemptAt: 7_000,
+      lastErrorCode: TASK_CONTINUATION_RATE_LIMIT_CODE,
+    });
+    coordinator.restore(backoff);
+    expect(coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: TRUSTED_CALLER,
+    })).toMatchObject({ startMode: 'explicit', lastErrorCode: undefined });
+    expect(timers.at(-1)?.delayMs).toBe(5_000);
   });
 
   it('continues only the exact allowlisted failed terminal', () => {

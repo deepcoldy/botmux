@@ -1813,6 +1813,7 @@ export function ensureAutomaticTaskContinuationLease(
       turnId: authority.turnId,
       workerGeneration: workerGeneration!,
       authorizationMode: 'inherited',
+      startMode: 'automatic',
       trustedCaller: authority.caller,
       ...(authority.controller
         ? { trustedController: authority.controller }
