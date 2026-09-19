@@ -13,6 +13,7 @@
  *   botmux restart [--with-plugin] [--companion-secret-file <path> --companion-bot <appId>]
  *                         — restart daemon, then ensure auto plugin services
  *   botmux logs [--lines] [--bot <i>] [--no-follow] — view/stream per-bot daemon logs
+ *   botmux model-proxy serve --config <path> — authenticated local model protocol
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version (本地 checkout 则 git pull --ff-only + rebuild + restart)
  *   botmux device enroll|status|logout — manage the host desktop device credential
@@ -6611,6 +6612,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（同样接受 --companion-secret-file / --companion-bot；--with-plugin 显式先停再启动 auto service）
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
+  model-proxy serve --config <path>
+              启动有鉴权的本机模型协议入口（Chat Completions 子集）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
   dashboard current
@@ -15687,6 +15690,11 @@ switch (command) {
   case 'headless': {
     const { cmdHeadless } = await import('./cli/headless-command.js');
     process.exitCode = await cmdHeadless(process.argv.slice(3));
+    break;
+  }
+  case 'model-proxy': {
+    const { cmdModelProxy } = await import('./cli/model-proxy-command.js');
+    process.exitCode = await cmdModelProxy(process.argv.slice(3));
     break;
   }
   case 'session': {

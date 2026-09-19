@@ -26667,6 +26667,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // refused and never persisted (delivery cannot be reconstructed to
     // completed/failed/cancelled after the fact). Keep the queue and dispatcher
     // live through worker teardown.
+    await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);

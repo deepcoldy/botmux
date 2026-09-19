@@ -2898,6 +2898,48 @@ function findHeadlessRecordForThisDaemon(idOrSessionId: string): HeadlessSession
   return record;
 }
 
+// Uses the same signed host-CLI IPC boundary and bot admission gate as headless.
+ipcRoute('GET', '/api/headless/invocations/capabilities', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationCapabilityForBot } = await import('../services/constrained-invocation/daemon.js');
+  return jsonRes(res, 200, { ok: true, capability: invocationCapabilityForBot(cachedLarkAppId) });
+});
+ipcRoute('POST', '/api/headless/invocations', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
+    try {
+      const result = invocationServiceForBot(cachedLarkAppId!, true).start(body);
+      return jsonRes(res, result.state === 'running' ? 202 : 200, { ok: true, result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'invalid_invocation';
+      return jsonRes(res, message === 'idempotency_conflict' ? 409 : 400, { ok: false, error: message });
+    }
+  });
+});
+ipcRoute('GET', '/api/headless/invocations/:requestId', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = invocationServiceForBot(cachedLarkAppId).get(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
+ipcRoute('POST', '/api/headless/invocations/:requestId/cancel', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = await invocationServiceForBot(cachedLarkAppId).cancel(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
+
 ipcRoute('GET', '/api/headless/sessions', (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
   const sessions = new Map(sessionStore.listSessions().map(session => [session.sessionId, session]));

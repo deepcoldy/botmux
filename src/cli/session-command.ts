@@ -11,6 +11,7 @@ import {
 const USAGE = `botmux session
 
 Usage:
+  botmux session invoke <start|result|cancel|capabilities> --bot <bot> [--json]
   botmux session start --headless --bot <bot> --working-dir <dir>
                        --prompt-file <path> [--json]
                        [--model <model>] [--reasoning-effort <effort>]
@@ -326,6 +327,10 @@ export function parseSessionCommandForTest(args: readonly string[]): SessionPars
 }
 
 export async function cmdSession(args: readonly string[]): Promise<number> {
+  if (args[0] === 'invoke') {
+    const { cmdSessionInvoke } = await import('./session-invoke-command.js');
+    return cmdSessionInvoke(args.slice(1));
+  }
   const parsed = parseSessionArgs(args);
   const wantsJson = args.includes('--json');
   if (!parsed.ok) return fail(parsed.error, wantsJson, 2);

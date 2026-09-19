@@ -134,6 +134,10 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
 
+## Integrating Applications with Their Own Task Workflows
+
+External applications can use experimental [model proxy mode](docs/model-proxy.md) through an authenticated local Chat Completions endpoint. Applications such as [OpenCodeReview (OCR)](https://github.com/alibaba/open-code-review) can connect through a model SDK while retaining control of context, tools, and task workflows. The execution layer implements seven CLI identities; the documentation distinguishes protocol support, native CLI tests, and pending account validation. The underlying [constrained invocation interface](docs/constrained-invocations.md) provides task status, cancellation, deduplication, and process cleanup.
+
 ## Docs · Community · Contributing
 
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
