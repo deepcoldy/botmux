@@ -139,7 +139,14 @@ describe('role injection mode', () => {
   });
 
   it('falls back to the bot-level default injection mode when a chat has none', async () => {
-    const { readRoleInjectMode, readTeamRoleInjectMode, writeTeamRoleInjectMode, writeRoleInjectMode } = await fresh();
+    const {
+      readRoleDispatchCompletionEnabled,
+      readRoleInjectMode,
+      readTeamRoleInjectMode,
+      writeRoleDispatchCompletionEnabled,
+      writeTeamRoleInjectMode,
+      writeRoleInjectMode,
+    } = await fresh();
     // bot-level default itself defaults to 'every' (legacy).
     expect(readTeamRoleInjectMode('appB')).toBe('every');
     expect(readRoleInjectMode('appB', 'oc_x')).toBe('every');
@@ -148,9 +155,12 @@ describe('role injection mode', () => {
     expect(readTeamRoleInjectMode('appB')).toBe('once');
     expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
     expect(readRoleInjectMode('appB', 'oc_y')).toBe('once');
-    // A per-chat sidecar still wins over the bot default.
-    writeRoleInjectMode('appB', 'oc_x', 'once');   // explicit once (same value)
-    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    // A per-chat explicit 'every' still wins over the bot default and survives
+    // unrelated metadata updates in the same sidecar.
+    writeRoleInjectMode('appB', 'oc_x', 'every');
+    writeRoleDispatchCompletionEnabled('appB', 'oc_x', true);
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('every');
+    expect(readRoleDispatchCompletionEnabled('appB', 'oc_x')).toBe(true);
     // Clearing the bot default returns unset chats to 'every'.
     writeTeamRoleInjectMode('appB', 'every');       // removes the meta sidecar
     expect(readRoleInjectMode('appB', 'oc_y')).toBe('every');
