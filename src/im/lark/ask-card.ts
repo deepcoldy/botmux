@@ -385,12 +385,15 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
 
-      // 问题标题
+      // 问题标题。问题正文完整渲染：审批按钮的效力取决于完整信息，展示层截断
+      // 会让批准人在信息不全的情况下做决定。空 prompt 已在 ask-api 归一化时以
+      // bad_question_shape 拒绝；飞书整卡硬限制约 109KB，远大于真实 ask 问题正文
+      // （AskUserQuestion 的问题而非输出），不做字符级截断。
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(q.prompt)}`,
         },
       });
 
@@ -667,11 +670,6 @@ function appendActionRows(elements: Array<Record<string, unknown>>, actions: Arr
       actions: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW),
     });
   }
-}
-
-function truncate(s: string, maxChars: number, locale?: Locale): string {
-  if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
-  return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
 }
 
 function escapeMd(s: string): string {
