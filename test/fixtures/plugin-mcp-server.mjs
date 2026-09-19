@@ -30,21 +30,46 @@ const server = new Server(
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, request => request.params?.cursor
+server.setRequestHandler(ListToolsRequestSchema, request => serverName === 'data'
   ? {
-      tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
+      tools: [
+        { name: 'validate_sql_for_user', description: 'validate', inputSchema: { type: 'object' } },
+        { name: 'run_query_for_user', description: 'run', inputSchema: { type: 'object' } },
+      ],
     }
-  : {
-      tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
-      nextCursor: 'second-page',
-    });
+  : request.params?.cursor
+    ? {
+        tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
+      }
+    : {
+        tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
+        nextCursor: 'second-page',
+      });
 
-server.setRequestHandler(CallToolRequestSchema, request => ({
-  content: [{
-    type: 'text',
-    text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}:meta=${JSON.stringify(request.params._meta ?? {})}:session=${process.env.BOTMUX_SESSION_ID || ''}:token=${process.env.PRIVATE_MCP_TOKEN || ''}`,
-  }],
-}));
+let validatedSql;
+server.setRequestHandler(CallToolRequestSchema, request => {
+  if (serverName === 'data') {
+    const args = request.params.arguments ?? {};
+    const trusted = request.params._meta?.botmuxTrustedCaller;
+    if (process.env.BOTMUX_SESSION_ID || !process.env.BOTMUX_EXECUTION_ID || trusted?.requestUserUnionId !== 'on_test') {
+      return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
+    }
+    if (request.params.name === 'validate_sql_for_user') {
+      validatedSql = args.sql;
+      return { content: [{ type: 'text', text: JSON.stringify({ query_plan_id: 'qplan_fixture', sql: args.sql }) }] };
+    }
+    if (request.params.name === 'run_query_for_user' && args.query_plan_id === 'qplan_fixture' && args.sql === validatedSql) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'ok', sql: args.sql, data: [{ amount: 12 }] }) }] };
+    }
+    return { isError: true, content: [{ type: 'text', text: 'query_plan_sql_mismatch' }] };
+  }
+  return {
+    content: [{
+      type: 'text',
+      text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}:meta=${JSON.stringify(request.params._meta ?? {})}:session=${process.env.BOTMUX_SESSION_ID || ''}:token=${process.env.PRIVATE_MCP_TOKEN || ''}:execution=${process.env.BOTMUX_EXECUTION_ID || ''}`,
+    }],
+  };
+});
 
 server.setRequestHandler(ListPromptsRequestSchema, () => ({
   prompts: [{ name: 'welcome', description: `${serverName} welcome` }],

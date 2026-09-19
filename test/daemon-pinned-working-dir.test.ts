@@ -57,6 +57,22 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
+  it('looks up frozen commands without auto-binding a defaultOncall chat', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('frozen-read-only-oncall');
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+    });
+
+    const resolved = daemon.__testOnly_resolveFrozenCommandWorkingDir({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_unseen', chatType: 'group', larkAppId: 'app-self',
+    });
+
+    expect(resolved).toBe(oncallDir);
+    expect(botRegistry.findOncallChat('app-self', 'oc_unseen')).toBeUndefined();
+  });
+
   it('prefers THIS bot\'s own defaultWorkingDir over a valid same-anchor peer (no cross-bot dir pollution)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');

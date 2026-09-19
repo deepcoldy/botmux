@@ -32,6 +32,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
+5. **已安装的固化查询是例外**：如果 prompt 是 \`/<固化命令> [参数]\`，不要代替用户执行 \`botmux schedule add\`。请让真人在飞书里直接发送原生 \`/schedule <规则>，执行 /<固化命令> [参数]\`；只有这个入口会记录任务创建人的可信 union_id。CLI 创建的任务没有这份身份，Data MCP 会按 fail-closed 拒绝。
 
 ## 支持的 schedule 格式
 
@@ -182,6 +183,75 @@ botmux session rename "排障｜支付链路超时"
 - 立即生效于 botmux 侧：Dashboard 各视图与 \`/sessions\` 列表；运行中的 CLI 若支持会 best-effort 同步原生会话名（resume picker），CLI 不在线或不支持时命令仍成功，回执会说明。
 - **飞书话题（omt）标题改不了**：开放平台没有话题改名接口，话题列表始终显示首条消息；本命令只改 botmux/Dashboard 标题，不要承诺"飞书里的话题名会变"。
 - **不要与 \`botmux-chat-rename\` 混用**：\`botmux chat rename\` 改的是**整个飞书群**的群名（话题群里是整个群，不是单个话题），影响所有话题和全部成员。只想规范当前任务标题时一律用 \`botmux session rename\`。
+`;
+
+const FROZEN_COMMAND_SKILL = `---
+name: botmux-freeze
+description: 把已经跑通并由用户确认正确的数据查询固化成当前角色目录下的斜杠命令。用户说“把刚才这个固化成 /xxx”“安装固定查询”“freeze command”或要求修改/覆盖已有固化命令时触发。必须从本话题实际成功的工具调用录制，不得重新猜 SQL；确认卡不展示 SQL。
+---
+
+# botmux-freeze — 固化已跑通的数据查询
+
+仅用于已经在本话题里通过 Data MCP 成功执行、且用户确认结果正确的查询。不要把探索性问题、失败查询或需要临场判断的任务固化。
+
+## 不变量
+
+1. 只从本话题最近一次与用户所指业务问题对应的**实际成功工具调用**提取 SQL、datasource 和样例结果；不得让模型重新生成一段 SQL 代替录制。
+2. 用户永远不需要看到 SQL。确认卡、回复、错误信息都只展示业务说明、用法、样例结果和作用域。
+3. SQL 中会变化的业务输入必须参数化；例如“最近 7 天”应录为整数参数 \`days\`，默认 7，并设置合理 min/max。参数只能替换值，不能让用户提供 SQL 片段、表名、列名或任意字符串。
+4. 命令文件只写到当前工作目录的 \`.botmux/commands/<命令名>.yaml\`。命令属于当前角色/目录，不跨目录查找。
+5. 安装或覆盖前必须用 \`botmux ask buttons\` 展示并确认。选项为：确认安装、改名、取消。卡片展示：命令名、位置参数用法、默认值、业务说明、刚才的样例结果、当前目录/角色；不展示 SQL。
+6. 用户选“改名”时让用户给出新名称，然后重新展示确认卡。选“取消”不得写文件。
+7. 覆盖同名命令时必须在确认卡明确写“将覆盖已有命令”。
+8. 身份字段不得写入 SQL 模板；调用者身份由 BotMux Gateway metadata 注入。
+
+## YAML 格式
+
+\`\`\`yaml
+schemaVersion: 1
+name: 泰国上账
+description: 查询泰国最近 N 天的上账金额（USD）
+timezone: Asia/Bangkok
+datasource: optional-datasource
+params:
+  - name: days
+    label: 天数
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+sql: |-
+  SELECT ... WHERE dt >= today() - {{days}} LIMIT 100
+output:
+  prefix: "近 N 天泰国上账：\\n"
+  maxChars: 20000
+onError: fallback_llm
+\`\`\`
+
+支持的参数类型：
+
+- \`integer\`：必须有 min/max，可有 default；渲染为数字字面量。
+- \`enum\`：必须列出 values，可有 default；字符串由执行器做 SQL 字面量编码。
+- \`date\`：值为 \`YYYY-MM-DD\` 或定义期默认 \`today±N\`；渲染为 SQL 日期字符串。
+
+参数按 YAML 中的顺序映射到位置参数，因此上例用法是 \`/泰国上账 [天数]\`，调用示例为 \`/泰国上账 30\`，不是 \`days=30\`。
+
+## 安装步骤
+
+1. 从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果。
+2. 将常量中真正需要用户每次调整的值替换为 \`{{param}}\`；固定业务口径（例如国家=泰国）保持常量。
+3. 明确参数类型、顺序、默认值和上下界；确保 SQL 显式有 LIMIT/分区范围。
+4. 检查当前目录是否已有同名 YAML。
+5. 用 \`botmux ask buttons\` 发确认卡并等待选择；卡片只放业务可读信息和样例结果。
+6. 确认后原子写入 YAML；写完重新读取并核对 name、参数和 SQL 原文字节。不要执行查询作为安装副作用。
+7. 回复：\`已安装，试试 /<命令> <示例参数>\`。
+
+管理操作由宿主直接处理：
+
+- \`/freeze list\`：列出当前目录命令与用法。
+- \`/freeze rm /<命令>\`：删除当前目录中的命令。
+- 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
+- 定时执行：让真人在飞书里直接发送 \`/schedule <规则>，执行 /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
 `;
 
 const HISTORY_SKILL = `---
@@ -1728,6 +1798,7 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
+  { name: 'botmux-freeze', content: FROZEN_COMMAND_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

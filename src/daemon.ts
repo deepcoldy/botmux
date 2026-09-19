@@ -117,6 +117,17 @@ import {
   ScheduleTargetExecutionError,
 } from './services/schedule-target-executor.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
+import {
+  buildFrozenCommandFallbackPrompt,
+  executeFrozenCommand,
+  frozenCommandUsage,
+  listFrozenCommandSnapshots,
+  lookupFrozenCommand,
+  removeFrozenCommand,
+  renderFrozenCommandSql,
+  shouldFallbackFrozenCommand,
+  userFacingFrozenCommandError,
+} from './services/frozen-command.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -430,7 +441,7 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
-import { renderCommandTriggerPrompt } from './services/command-trigger.js';
+import { renderCommandTriggerPrompt, reservedCommandKind } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -5471,6 +5482,139 @@ function commandDepsForInvocation(input: {
         opts?.replyTarget ? opts : { ...opts, replyTarget },
       ),
   };
+}
+
+type FrozenCommandRouteResult =
+  | { kind: 'not_found' }
+  | { kind: 'handled' }
+  | { kind: 'fallback'; prompt: string };
+
+function frozenCommandRawArgs(commandContent: string): string {
+  const match = /^\/\S+(?:\s+([\s\S]*))?$/u.exec(commandContent.trim());
+  return match?.[1] ?? '';
+}
+
+async function routeFrozenCommand(input: {
+  cmd: string;
+  commandContent: string;
+  workingDir: string | undefined;
+  larkAppId: string;
+  anchor: string;
+  turnId: string;
+  senderOpenId?: string;
+  senderUnionId?: string;
+  senderIsBot?: boolean;
+  reply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+}): Promise<FrozenCommandRouteResult> {
+  if (!input.workingDir) {
+    if (input.cmd === '/freeze') {
+      await input.reply(
+        input.anchor,
+        '当前角色还没有可用的工作目录，无法管理固化命令。请先选择仓库或配置默认工作目录。',
+        'text',
+        input.larkAppId,
+      );
+      return { kind: 'handled' };
+    }
+    return { kind: 'not_found' };
+  }
+
+  if (input.cmd === '/freeze') {
+    const args = frozenCommandRawArgs(input.commandContent).trim();
+    if (args === 'list') {
+      const rows = listFrozenCommandSnapshots(input.workingDir);
+      const visible = rows.map((row) => {
+        if (row.error) return `- /${row.command}（定义损坏，暂不可用）`;
+        const definition = row.snapshot!.definition;
+        return `- ${frozenCommandUsage(definition)} — ${definition.description}`;
+      });
+      await input.reply(
+        input.anchor,
+        [`当前目录：${input.workingDir}`, '', visible.length > 0 ? visible.join('\n') : '还没有安装固化命令。'].join('\n'),
+        'text',
+        input.larkAppId,
+      );
+      return { kind: 'handled' };
+    }
+    const removeMatch = /^rm\s+(\/[^\s]+)$/u.exec(args);
+    if (removeMatch) {
+      try {
+        const removed = removeFrozenCommand(input.workingDir, removeMatch[1]!);
+        await input.reply(
+          input.anchor,
+          removed ? `已删除 ${removeMatch[1]}` : `未找到 ${removeMatch[1]}（当前目录：${input.workingDir}）`,
+          'text',
+          input.larkAppId,
+        );
+      } catch (error) {
+        await input.reply(
+          input.anchor,
+          `删除失败：${error instanceof Error ? error.message : String(error)}`,
+          'text',
+          input.larkAppId,
+        );
+      }
+      return { kind: 'handled' };
+    }
+    // `/freeze <名>` is intentionally left to the model-assisted recorder.
+    // The daemon owns list/rm and execution; the recorder extracts the actual
+    // successful tool call and presents the confirmation card before writing.
+    return { kind: 'not_found' };
+  }
+
+  const lookup = lookupFrozenCommand({ workingDir: input.workingDir, command: input.cmd });
+  if (lookup.kind === 'missing') return { kind: 'not_found' };
+  if (lookup.kind === 'invalid') {
+    await input.reply(input.anchor, `固化命令暂不可用：${lookup.error.message}`, 'text', input.larkAppId);
+    return { kind: 'handled' };
+  }
+
+  const definition = lookup.snapshot.definition;
+  const rawArgs = frozenCommandRawArgs(input.commandContent);
+  const invocationNow = new Date();
+  let renderedSql: string | undefined;
+  try {
+    renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
+    const result = await executeFrozenCommand({
+      definition,
+      rawArgs,
+      targetLarkAppId: input.larkAppId,
+      botConfig: getBot(input.larkAppId).config,
+      trustedCaller: trustedCallerForTurn(
+        input.larkAppId,
+        input.senderOpenId,
+        input.senderUnionId,
+        input.senderIsBot,
+      ),
+      turnId: input.turnId,
+      dataDir: config.session.dataDir,
+      now: invocationNow,
+    });
+    await input.reply(input.anchor, result.text, 'text', input.larkAppId);
+    return { kind: 'handled' };
+  } catch (error) {
+    if (shouldFallbackFrozenCommand(definition, error)) {
+      // Transient fallback reuses the exact business SQL frozen for this
+      // invocation. It may retry that query, but must never regenerate one.
+      if (!renderedSql) throw error;
+      return {
+        kind: 'fallback',
+        prompt: buildFrozenCommandFallbackPrompt({
+          definition,
+          rawArgs,
+          renderedSql,
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      };
+    }
+    await input.reply(
+      input.anchor,
+      `固化命令执行失败：${userFacingFrozenCommandError(error)}`,
+      'text',
+      input.larkAppId,
+    );
+    return { kind: 'handled' };
+  }
 }
 
 /**
@@ -17324,6 +17468,40 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
 }
 
 /**
+ * Resolve the directory used only to LOOK UP a frozen command.
+ *
+ * This deliberately mirrors the read side of resolvePinnedWorkingDir without
+ * calling maybeAutoBindDefaultOncall. Merely probing an unknown slash command
+ * must never persist a new oncall binding; the ordinary spawn path remains the
+ * sole owner of that side effect.
+ */
+function resolveFrozenCommandWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+}): string | undefined {
+  const oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
+  if (oncallEntry?.workingDir) return expandHome(oncallEntry.workingDir);
+
+  const botDefaultWorkingDir = resolveBotDefaultWorkingDir(ctx.larkAppId);
+  const preferPeerOverAutoWorktree = !!botDefaultWorkingDir
+    && botAutoWorktreeEnabled(ctx.larkAppId);
+  const inheritedFrom = (!botDefaultWorkingDir || preferPeerOverAutoWorktree)
+    ? findInheritablePeer({
+        scope: ctx.scope,
+        anchor: ctx.anchor,
+        chatId: ctx.chatId,
+        chatType: ctx.chatType,
+        selfAppId: ctx.larkAppId,
+        botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
+      })
+    : null;
+  return inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+}
+
+/**
  * Resolve the pinned working dir for a brand-new topic via the layered lookup:
  *   1) this bot's OWN oncall binding (per-bot: another bot's binding never pins
  *      this bot — cross-bot dir alignment is handled by layer 4 inherit-peer)
@@ -17397,6 +17575,7 @@ async function resolvePinnedWorkingDir(ctx: {
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+export const __testOnly_resolveFrozenCommandWorkingDir = resolveFrozenCommandWorkingDir;
 // Production message routes (function declarations hoist, so the references
 // are valid here). Exposed for route-level regression tests — e.g. asserting
 // that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
@@ -21664,6 +21843,26 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
+    if (cmd === '/freeze' || reservedCommandKind(cmd, resolvePassthroughCommands(larkAppId)) === null) {
+      const pinnedWorkingDir = resolveFrozenCommandWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const frozen = await routeFrozenCommand({
+        cmd,
+        commandContent,
+        workingDir: pinnedWorkingDir,
+        larkAppId,
+        anchor,
+        turnId: parsed.messageId,
+        senderOpenId,
+        senderUnionId,
+        senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
+        reply: invocationDeps.sessionReply,
+      });
+      if (frozen.kind === 'handled') return;
+      if (frozen.kind === 'fallback') {
+        content = frozen.prompt;
+        parsed.content = frozen.prompt;
+      }
+    }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
     // ordinary permitted members can use the MVP without a per-bot downgrade
@@ -23812,6 +24011,36 @@ async function handleThreadReplyAdmitted(
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
+    }
+    if (cmd === '/freeze' || reservedCommandKind(cmd, resolvePassthroughCommands(larkAppId)) === null) {
+      const frozenWorkingDir = existingDs
+        ? getSessionWorkingDir(existingDs)
+        : resolveFrozenCommandWorkingDir({
+            scope,
+            anchor,
+            chatId: effectiveThreadChatId,
+            chatType: ctxChatType,
+            larkAppId,
+          });
+      const frozen = await routeFrozenCommand({
+        cmd,
+        commandContent,
+        workingDir: frozenWorkingDir,
+        larkAppId,
+        anchor,
+        turnId: parsed.messageId,
+        senderOpenId: threadSenderOpenId,
+        senderUnionId: threadSenderUnionId,
+        senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
+        reply: invocationDeps.sessionReply,
+      });
+      if (frozen.kind === 'handled') return;
+      if (frozen.kind === 'fallback') {
+        promptContent = initialCodexAppMessageContext
+          + initialCodexAppApplicationContext
+          + frozen.prompt;
+        rewrittenCodexAppMessageContext = initialCodexAppMessageContext + frozen.prompt;
+      }
     }
     if (cmd === '/sessions') {
       const botSender = isBotSenderType || isForeignBot;

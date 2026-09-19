@@ -100,6 +100,14 @@ import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import {
+  buildFrozenCommandFallbackPrompt,
+  executeFrozenCommand,
+  lookupFrozenCommand,
+  renderFrozenCommandSql,
+  shouldFallbackFrozenCommand,
+  userFacingFrozenCommandError,
+} from '../services/frozen-command.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
   reconcileXpiSharedCwdRecovery,
@@ -4091,13 +4099,72 @@ export async function executeScheduledTask(
     }
   }
 
+  // A native /schedule may point directly at an installed Frozen Command.
+  // Execute it under the task creator's trusted identity without opening a
+  // model/CLI session. Ownerless/CLI-created schedules have no trusted caller
+  // and therefore fail closed in executeFrozenCommand. Silent schedules keep
+  // their existing model semantics because host execution cannot infer the
+  // prompt's conditional-delivery intent.
+  let frozenFallbackPrompt: string | undefined;
+  const frozenInvocation = !silent && additionalPrompt === undefined
+    ? /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(task.prompt.trim())
+    : null;
+  if (frozenInvocation) {
+    const lookup = lookupFrozenCommand({
+      workingDir: task.workingDir,
+      command: `/${frozenInvocation[1]!}`,
+    });
+    const deliver = async (text: string): Promise<void> => {
+      const replyRoot = sharedTopicRootId ?? (anchor === task.chatId ? undefined : anchor);
+      if (replyRoot) await replyMessage(larkAppId, replyRoot, text, 'text', true);
+      else await sendMessage(larkAppId, task.chatId, text);
+    };
+    if (lookup.kind === 'invalid') {
+      await deliver(`固化命令暂不可用：${lookup.error.message}`);
+      return;
+    }
+    if (lookup.kind === 'found') {
+      const definition = lookup.snapshot.definition;
+      const rawArgs = frozenInvocation[2] ?? '';
+      const invocationNow = new Date();
+      let renderedSql: string | undefined;
+      try {
+        renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
+        const result = await executeFrozenCommand({
+          definition,
+          rawArgs,
+          targetLarkAppId: larkAppId,
+          botConfig: bot.config,
+          trustedCaller: scheduledTrustedCaller,
+          turnId: scheduledTurnId,
+          dataDir: config.session.dataDir,
+          now: invocationNow,
+        });
+        await deliver(result.text);
+        return;
+      } catch (error) {
+        if (renderedSql && shouldFallbackFrozenCommand(definition, error)) {
+          frozenFallbackPrompt = buildFrozenCommandFallbackPrompt({
+            definition,
+            rawArgs,
+            renderedSql,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        } else {
+          await deliver(`固化命令执行失败：${userFacingFrozenCommandError(error)}`);
+          return;
+        }
+      }
+    }
+  }
+
   refreshCliVersion(bot.config);
 
   // A Bash precondition may provide per-fire context. Keep the durable task and
   // Dashboard-facing lastUserPrompt unchanged; lastCliInput still records the
   // exact input sent to the model through the ordinary session lifecycle.
   const effectivePrompt = additionalPrompt === undefined
-    ? task.prompt
+    ? (frozenFallbackPrompt ?? task.prompt)
     : `${task.prompt}\n\n${additionalPrompt}`;
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`

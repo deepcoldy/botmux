@@ -20,8 +20,12 @@
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { installLocalPlugin } from '../src/core/plugins/install.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -328,6 +332,62 @@ describe('executeScheduledTask — silent thread fire', () => {
     // Unit-level check: dispatch receipts require a live worker generation.
     ds.session.workerGeneration = 1;
     expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
+  });
+
+  it('runs an installed frozen command directly as the native schedule creator', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-frozen-'));
+    const previousDataDir = config.session.dataDir;
+    const previousPlugins = (BOT.config as any).plugins;
+    try {
+      const home = join(root, 'home');
+      const source = join(root, 'plugin');
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
+schemaVersion: 1
+name: 泰国上账
+description: 查询泰国最近 N 天的上账金额
+params:
+  - name: days
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+`);
+      writeFileSync(join(source, 'package.json'), JSON.stringify({
+        name: '@botmux-ai/plugin-data-mcp', version: '0.1.0', type: 'module',
+        keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: 'data-mcp' },
+      }));
+      writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+        transport: 'stdio',
+        command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
+      }));
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+      config.session.dataDir = join(home, '.botmux', 'data');
+      (BOT.config as any).plugins = ['data-mcp'];
+      installLocalPlugin(source);
+
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      const resultReply = replyMessageMock.mock.calls.at(-1)?.[2];
+      expect(resultReply).toContain('"amount": 12');
+      expect(resultReply).not.toContain('SELECT sum');
+    } finally {
+      config.session.dataDir = previousDataDir;
+      (BOT.config as any).plugins = previousPlugins;
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('loud fresh session appends per-fire context without mutating the scheduled task', async () => {
