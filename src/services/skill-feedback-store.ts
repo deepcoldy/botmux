@@ -930,20 +930,34 @@ export class SkillFeedbackStore {
     reasonKey?: string;
     comment?: string;
     callbackKey: string;
+    /** Optional optimistic precondition. `null` means the card was rendered
+     * before any feedback existed; `undefined` keeps non-card writers
+     * backward-compatible and skips the precondition. */
+    expectedFeedbackId?: string | null;
     webhookDestinations?: FeedbackWebhookDestination[];
-  }): { status: 'accepted' | 'duplicate' | 'revised'; feedback: ReturnType<SkillFeedbackStore['mapFeedback']>; feedbackId?: string } {
+  }): { status: 'accepted' | 'duplicate' | 'revised' | 'stale'; feedback: ReturnType<SkillFeedbackStore['mapFeedback']>; feedbackId?: string } {
     const delivery = this.findDeliveryByPlatformMessage(input.platform, input.platformAppId, input.platformMessageId);
     if (!delivery) throw new Error('feedback_delivery_not_found');
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const latest = this.db.prepare('SELECT * FROM feedback_revisions WHERE delivery_id=? ORDER BY rowid DESC LIMIT 1')
+        .get(delivery.deliveryId) as unknown as FeedbackRow | undefined;
       const duplicate = this.db.prepare('SELECT * FROM feedback_revisions WHERE callback_key=?').get(input.callbackKey) as unknown as FeedbackRow | undefined;
       if (duplicate) {
         if (duplicate.delivery_id !== delivery.deliveryId || duplicate.operator_subject_id !== input.operatorSubjectId) {
           throw new Error('feedback_callback_key_conflict');
         }
         this.db.exec('COMMIT');
-        const feedback = this.mapFeedback(duplicate);
+        // A duplicate may arrive after a newer callback. Return the card's
+        // current state instead of letting the old callback repaint it.
+        const feedback = this.mapFeedback(latest ?? duplicate);
         return { status: 'duplicate', feedback, feedbackId: feedback.feedbackId };
+      }
+      if (input.expectedFeedbackId !== undefined && (latest?.feedback_id ?? null) !== input.expectedFeedbackId) {
+        if (!latest) throw new Error('feedback_version_mismatch');
+        this.db.exec('COMMIT');
+        const feedback = this.mapFeedback(latest);
+        return { status: 'stale', feedback, feedbackId: feedback.feedbackId };
       }
       const previous = this.db.prepare(`SELECT * FROM feedback_revisions WHERE delivery_id=? AND operator_subject_id=? ORDER BY revision DESC LIMIT 1`)
         .get(delivery.deliveryId, input.operatorSubjectId) as unknown as FeedbackRow | undefined;
@@ -981,7 +995,9 @@ export class SkillFeedbackStore {
         if (duplicate.delivery_id !== delivery.deliveryId || duplicate.operator_subject_id !== input.operatorSubjectId) {
           throw new Error('feedback_callback_key_conflict');
         }
-        const feedback = this.mapFeedback(duplicate);
+        const latest = this.db.prepare('SELECT * FROM feedback_revisions WHERE delivery_id=? ORDER BY rowid DESC LIMIT 1')
+          .get(delivery.deliveryId) as unknown as FeedbackRow | undefined;
+        const feedback = this.mapFeedback(latest ?? duplicate);
         return { status: 'duplicate', feedback, feedbackId: feedback.feedbackId };
       }
       throw error;
