@@ -5620,6 +5620,105 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 });
 
 describe('managed turn authority worker generations', () => {
+  const scheduledCaller = {
+    requestUserOpenId: 'ou_schedule_owner',
+    requestUserUnionId: 'on_schedule_owner',
+    requestLarkAppId: 'app_test',
+    source: 'schedule_creator' as const,
+    taskId: 'feedbeef',
+  };
+  const scheduledTurnId = 'schedule:feedbeef:11111111-2222-3333-4444-555555555555';
+
+  beforeEach(() => {
+    scheduledTasksForProvenance.set('feedbeef', {
+      id: 'feedbeef',
+      ownerOpenId: scheduledCaller.requestUserOpenId,
+      ownerUnionId: scheduledCaller.requestUserUnionId,
+      larkAppId: scheduledCaller.requestLarkAppId,
+      creatorLarkAppId: scheduledCaller.requestLarkAppId,
+      enabled: true,
+    });
+  });
+
+  afterEach(() => {
+    scheduledTasksForProvenance.delete('feedbeef');
+  });
+
+  it('binds a fresh scheduled turn managed origin to its exact creator', () => {
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      turnId: scheduledTurnId,
+      callerOpenId: scheduledCaller.requestUserOpenId,
+    });
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
+  it('does not bind a scheduled creator to a different worker turn', () => {
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'different-capability',
+      turnId: 'schedule:feedbeef:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
+
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+  });
+
+  it('rejects a forged scheduled creator that differs from the task record', () => {
+    const ds = makeDs();
+    forkWorker(ds, {
+      content: 'scheduled',
+      trustedCaller: { ...scheduledCaller, requestUserOpenId: 'ou_forged' },
+    }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'forged-capability',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
+  it('binds a live injected scheduled turn and clears the pending identity on terminal', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary opening', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(sendWorkerInput(ds, 'scheduled', scheduledTurnId, {
+      trustedCaller: scheduledCaller,
+    })).toBe(true);
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
   it('keeps policy authority but invalidates live authority across claude_exit auto-restart', async () => {
     const ds = makeDs({
       activeInteractiveTurn: {
