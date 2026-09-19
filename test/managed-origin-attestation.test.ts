@@ -55,6 +55,8 @@ describe('managed-origin host proof sidecar', () => {
             channelId: CHANNEL,
             sessionId: context.sessionId,
             turnId: 'turn-live',
+            callerOpenId: 'ou_current',
+            larkAppId: 'cli_app',
             dispatchAttempt: 4,
             requiresCodexAppLedger: true,
             issuedAtMs: Date.now(),
@@ -69,6 +71,8 @@ describe('managed-origin host proof sidecar', () => {
     expect(result).toEqual({
       sessionId: 'session-a',
       turnId: 'turn-live',
+      callerOpenId: 'ou_current',
+      larkAppId: 'cli_app',
       dispatchAttempt: 4,
       requiresCodexAppLedger: true,
     });

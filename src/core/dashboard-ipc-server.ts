@@ -1054,6 +1054,8 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),

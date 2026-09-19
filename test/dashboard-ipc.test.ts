@@ -1405,6 +1405,7 @@ describe('POST /api/session-origin/attest', () => {
       originChannelId: CHANNEL,
       turnId: TURN_ID,
       dispatchAttempt: DISPATCH_ATTEMPT,
+      callerOpenId: 'ou_managed_origin_owner',
     };
     const worker = options.worker === null
       ? null
@@ -1485,6 +1486,8 @@ describe('POST /api/session-origin/attest', () => {
         channelId: CHANNEL,
         sessionId: fixture.sessionId,
         turnId: TURN_ID,
+        callerOpenId: 'ou_managed_origin_owner',
+        larkAppId: 'app-managed-origin',
         dispatchAttempt: DISPATCH_ATTEMPT,
         requiresCodexAppLedger: true,
       });

@@ -6811,15 +6811,57 @@ function detectCurrentSession(): CurrentSession | null {
  * marker-only so changing BOTMUX_SESSION_ID cannot borrow another session's
  * open_id/union_id.
  */
-function detectAuthenticatedCurrentSession(): CurrentSession | null {
+async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | null> {
   const dataDir = resolveDataDir();
-  const provenance = resolveCurrentTurnProvenance({
-    dataDir,
-    envSessionId: process.env.BOTMUX_SESSION_ID,
-  });
+  let provenance: {
+    sessionId: string;
+    turnId: string;
+    callerOpenId: string;
+    larkAppId: string;
+  } | null = null;
+  try {
+    provenance = resolveCurrentTurnProvenance({
+      dataDir,
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+  } catch (hostError) {
+    // Linux bwrap deliberately hides the host PID namespace and shared marker
+    // directory. If this exact turn has a rotating managed-origin capability,
+    // exchange it for a daemon-written host proof instead of treating the
+    // absence of host ancestors as a detached call. A sandbox fixture/legacy
+    // session without that capability fails closed; a claimed BotMux session
+    // must never degrade to a standalone OWNERLESS task.
+    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
+    if (!isolated?.originChannelId) throw hostError;
+    const attested = await attestManagedOrigin({
+      context: {
+        sessionId: isolated.sessionId,
+        channelId: isolated.originChannelId,
+        capability: isolated.capability,
+        dataDir,
+        ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
+        ...(isolated.ipcPortFallback !== undefined
+          ? { ipcPortFallback: isolated.ipcPortFallback }
+          : {}),
+      },
+      resolveIpcPort: (appId) => {
+        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+    provenance = {
+      sessionId: attested.sessionId,
+      turnId: attested.turnId,
+      callerOpenId: attested.callerOpenId,
+      larkAppId: attested.larkAppId,
+    };
+    void hostError;
+  }
   if (!provenance) return null;
   const s = loadSessions().get(provenance.sessionId);
   if (!s || s.status !== 'active') return null;
+  if (provenance.larkAppId !== s.larkAppId) return null;
   // The persisted union_id belongs to the session owner. Only attach it when
   // the authenticated caller for THIS exact turn is that same owner; another
   // allowed participant in a shared session must not inherit the owner's user
@@ -7340,7 +7382,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = detectCurrentSession();
-    const authenticatedCur = detectAuthenticatedCurrentSession();
+    let authenticatedCur = await detectAuthenticatedCurrentSession();
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7437,6 +7479,21 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     let task;
     try {
+      // Identity-bearing task fields are a write authority. Re-attest at the
+      // effect boundary so a turn rotation cannot carry an earlier proof into
+      // a later schedule write. If the first lookup was ownerless, do not
+      // opportunistically gain an identity at this later point.
+      if (authenticatedCur) {
+        const fresh = await detectAuthenticatedCurrentSession();
+        if (!fresh
+          || fresh.sessionId !== authenticatedCur.sessionId
+          || fresh.larkAppId !== authenticatedCur.larkAppId
+          || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
+          || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
+          throw new Error('schedule creator provenance changed before write');
+        }
+        authenticatedCur = fresh;
+      }
       task = scheduler.addTask({
         name,
         schedule: rawSchedule,
