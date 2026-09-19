@@ -123,11 +123,18 @@ import {
   frozenCommandUsage,
   listFrozenCommandSnapshots,
   lookupFrozenCommand,
-  removeFrozenCommand,
   renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
 } from './services/frozen-command.js';
+import {
+  confirmFrozenCommandTransition,
+  evaluateFrozenCommandLifecycle,
+  listFrozenCommandLifecycleRecords,
+  prepareFrozenCommandTransition,
+  reconcileFrozenCommandLifecycleAtStartup,
+  type FrozenCommandLifecycleAction,
+} from './services/frozen-command-lifecycle.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -5489,6 +5496,37 @@ type FrozenCommandRouteResult =
   | { kind: 'handled' }
   | { kind: 'fallback'; prompt: string };
 
+function parseFrozenCommandTransitionRequest(args: string): {
+  action: FrozenCommandLifecycleAction;
+  command: string;
+  reason: string;
+  replacement?: string;
+} | undefined {
+  const head = /^(approve|rm|restore|purge)\s+(\/[^\s]+)([\s\S]*)$/u.exec(args);
+  if (!head) return undefined;
+  let tail = head[3]!.trim();
+  let replacement: string | undefined;
+  const replacementMatch = /(?:^|\s)--replacement\s+(\/[^\s]+)\s*$/u.exec(tail);
+  if (replacementMatch) {
+    replacement = replacementMatch[1]!;
+    tail = tail.slice(0, replacementMatch.index).trim();
+  }
+  const reasonMatch = /^--reason\s+([\s\S]+)$/u.exec(tail);
+  if (!reasonMatch) return undefined;
+  return {
+    action: head[1] === 'approve'
+      ? 'approve'
+      : head[1] === 'rm'
+        ? 'retire'
+        : head[1] === 'purge'
+          ? 'revoke'
+          : 'restore',
+    command: head[2]!,
+    reason: reasonMatch[1]!.trim(),
+    ...(replacement ? { replacement } : {}),
+  };
+}
+
 function frozenCommandRawArgs(
   commandContent: string,
   mentions: readonly LarkMention[] = [],
@@ -5534,13 +5572,39 @@ async function routeFrozenCommand(input: {
       botOpenId: self.botOpenId,
       larkAppId: input.larkAppId,
     }).trim();
-    if (args === 'list') {
+    if (args === 'list' || args === 'list --all') {
+      const showRetired = args.endsWith('--all');
       const rows = listFrozenCommandSnapshots(input.workingDir);
-      const visible = rows.map((row) => {
+      const listedCommands = new Set(rows.map(row => row.command));
+      const visible = rows.flatMap((row) => {
+        const lifecycle = evaluateFrozenCommandLifecycle({
+          dataDir: config.session.dataDir,
+          targetBotId: input.larkAppId,
+          workingDir: input.workingDir!,
+          command: row.command,
+          ...(row.snapshot ? { snapshot: row.snapshot } : {}),
+        });
+        if (lifecycle.kind === 'retired') {
+          if (!showRetired) return [];
+          const payload = lifecycle.record.tombstonePayload;
+          return [`- /${row.command}（已废弃：${payload?.reason ?? '未提供原因'}${payload?.replacement ? `；替代命令 ${payload.replacement}` : ''}）`];
+        }
+        if (lifecycle.kind === 'revoked') return showRetired ? [`- /${row.command}（已撤销）`] : [];
+        if (lifecycle.kind === 'fail_closed') return [`- /${row.command}（状态异常，已拒绝执行）`];
         if (row.error) return `- /${row.command}（定义损坏，暂不可用）`;
         const definition = row.snapshot!.definition;
         return `- ${frozenCommandUsage(definition)} — ${definition.description}`;
       });
+      if (showRetired) {
+        for (const record of listFrozenCommandLifecycleRecords({
+          dataDir: config.session.dataDir,
+          targetBotId: input.larkAppId,
+          workingDir: input.workingDir,
+        })) {
+          if (listedCommands.has(record.command) || record.state === 'active') continue;
+          visible.push(`- /${record.command}（${record.state === 'revoked' ? '已撤销' : '已废弃'}）`);
+        }
+      }
       await input.reply(
         input.anchor,
         [`当前目录：${input.workingDir}`, '', visible.length > 0 ? visible.join('\n') : '还没有安装固化命令。'].join('\n'),
@@ -5549,30 +5613,122 @@ async function routeFrozenCommand(input: {
       );
       return { kind: 'handled' };
     }
-    const removeMatch = /^rm\s+(\/[^\s]+)$/u.exec(args);
-    if (removeMatch) {
+    const confirmMatch = /^confirm\s+([A-Za-z0-9_-]{20,80})$/u.exec(args);
+    if (confirmMatch) {
       try {
-        const removed = removeFrozenCommand(input.workingDir, removeMatch[1]!);
+        if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以确认固化命令状态变更');
+        const record = confirmFrozenCommandTransition({
+          dataDir: config.session.dataDir,
+          targetBotId: input.larkAppId,
+          token: confirmMatch[1]!,
+          actor: { openId: input.senderOpenId, unionId: input.senderUnionId },
+        });
+        const status = record.confirmedAction === 'approve'
+          ? '已批准'
+          : record.confirmedAction === 'restore'
+            ? '已恢复'
+            : record.state === 'retired'
+              ? '已废弃'
+              : '已彻底撤销';
         await input.reply(
           input.anchor,
-          removed ? `已删除 ${removeMatch[1]}` : `未找到 ${removeMatch[1]}（当前目录：${input.workingDir}）`,
+          `${status} /${record.command}（revision ${record.stateRevisionId}）`,
           'text',
           input.larkAppId,
         );
       } catch (error) {
         await input.reply(
           input.anchor,
-          `删除失败：${error instanceof Error ? error.message : String(error)}`,
+          `状态变更失败：${error instanceof Error ? error.message : String(error)}`,
           'text',
           input.larkAppId,
         );
       }
       return { kind: 'handled' };
     }
+    const transition = parseFrozenCommandTransitionRequest(args);
+    if (transition) {
+      try {
+        if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以发起固化命令状态变更');
+        const prepared = prepareFrozenCommandTransition({
+          dataDir: config.session.dataDir,
+          targetBotId: input.larkAppId,
+          workingDir: input.workingDir,
+          command: transition.command,
+          action: transition.action,
+          actor: { openId: input.senderOpenId, unionId: input.senderUnionId },
+          reason: transition.reason,
+          replacement: transition.replacement,
+        });
+        const actionLabel = prepared.action === 'approve'
+          ? '批准'
+          : prepared.action === 'retire'
+            ? '废弃'
+            : prepared.action === 'restore'
+              ? '恢复'
+              : '彻底撤销';
+        await input.reply(
+          input.anchor,
+          [
+            `即将${actionLabel} /${prepared.command}。`,
+            `原因：${prepared.reason}`,
+            ...(prepared.replacement ? [`替代命令：${prepared.replacement}`] : []),
+            ...(prepared.specHash ? [`定义 hash：${prepared.specHash}`] : []),
+            ...(prepared.expectedRevisionId ? [`当前 revision：${prepared.expectedRevisionId}`] : []),
+            `确认有效期至 ${prepared.expiresAt}。`,
+            `请由同一真人发送：/freeze confirm ${prepared.token}`,
+          ].join('\n'),
+          'text',
+          input.larkAppId,
+        );
+      } catch (error) {
+        await input.reply(
+          input.anchor,
+          `无法发起状态变更：${error instanceof Error ? error.message : String(error)}`,
+          'text',
+          input.larkAppId,
+        );
+      }
+      return { kind: 'handled' };
+    }
+    if (/^(?:approve|rm|restore|purge)\b/u.test(args)) {
+      await input.reply(
+        input.anchor,
+        '用法：/freeze approve|rm|restore|purge /命令 --reason 原因 [--replacement /替代命令]',
+        'text',
+        input.larkAppId,
+      );
+      return { kind: 'handled' };
+    }
     // `/freeze <名>` is intentionally left to the model-assisted recorder.
     // The daemon owns list/rm and execution; the recorder extracts the actual
     // successful tool call and presents the confirmation card before writing.
     return { kind: 'not_found' };
+  }
+
+  const lifecycle = evaluateFrozenCommandLifecycle({
+    dataDir: config.session.dataDir,
+    targetBotId: input.larkAppId,
+    workingDir: input.workingDir,
+    command: input.cmd,
+  });
+  if (lifecycle.kind === 'retired') {
+    const payload = lifecycle.record.tombstonePayload;
+    await input.reply(
+      input.anchor,
+      `固化命令 /${lifecycle.record.command} 已废弃：${payload?.reason ?? '未提供原因'}${payload?.replacement ? `。请改用 ${payload.replacement}` : ''}`,
+      'text',
+      input.larkAppId,
+    );
+    return { kind: 'handled' };
+  }
+  if (lifecycle.kind === 'revoked') {
+    await input.reply(input.anchor, '该固化命令已撤销，拒绝执行。', 'text', input.larkAppId);
+    return { kind: 'handled' };
+  }
+  if (lifecycle.kind === 'fail_closed') {
+    await input.reply(input.anchor, `固化命令状态异常，已拒绝执行：${lifecycle.reason}`, 'text', input.larkAppId);
+    return { kind: 'handled' };
   }
 
   const lookup = lookupFrozenCommand({ workingDir: input.workingDir, command: input.cmd });
@@ -17594,6 +17750,8 @@ async function resolvePinnedWorkingDir(ctx: {
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 export const __testOnly_resolveFrozenCommandWorkingDir = resolveFrozenCommandWorkingDir;
 export const __testOnly_frozenCommandRawArgs = frozenCommandRawArgs;
+export const __testOnly_parseFrozenCommandTransitionRequest = parseFrozenCommandTransitionRequest;
+export const __testOnly_routeFrozenCommand = routeFrozenCommand;
 // Production message routes (function declarations hoist, so the references
 // are valid here). Exposed for route-level regression tests — e.g. asserting
 // that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
@@ -26853,6 +27011,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  const frozenReconcile = reconcileFrozenCommandLifecycleAtStartup({
+    dataDir: config.session.dataDir,
+    targetBotId: cfg.larkAppId,
+  });
+  if (frozenReconcile.repaired > 0) {
+    logger.info(`[frozen-command] reconciled ${frozenReconcile.repaired}/${frozenReconcile.inspected} lifecycle record(s)`);
+  }
+  for (const failure of frozenReconcile.errors) {
+    logger.warn(`[frozen-command] reconcile failed command=/${failure.command}: ${failure.error}`);
+  }
   // Host-executed schedule conditions are authority material. Create and
   // validate their 0700 root before any restored worker can receive a sandbox
   // policy; a symlink/corrupt root aborts startup instead of exposing scripts.

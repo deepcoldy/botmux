@@ -209,6 +209,7 @@ description: 把已经跑通并由用户确认正确的数据查询固化成当�
 
 \`\`\`yaml
 schemaVersion: 1
+status: active
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额（USD）
 timezone: Asia/Bangkok
@@ -244,12 +245,17 @@ onError: fallback_llm
 4. 检查当前目录是否已有同名 YAML。
 5. 用 \`botmux ask buttons\` 发确认卡并等待选择；卡片只放业务可读信息和样例结果。
 6. 确认后原子写入 YAML；写完重新读取并核对 name、参数和 SQL 原文字节。不要执行查询作为安装副作用。
-7. 回复：\`已安装，试试 /<命令> <示例参数>\`。
+7. 让同一真人发送 \`/freeze approve /<命令> --reason 安装或更新原因\`，再按宿主返回的一次性确认码发送 \`/freeze confirm <确认码>\`。带 \`status: active\` 的新定义在宿主批准并记录 spec hash 前会 fail-closed。
+8. 宿主确认批准后回复：\`已安装，试试 /<命令> <示例参数>\`。
 
 管理操作由宿主直接处理：
 
 - \`/freeze list\`：列出当前目录命令与用法。
-- \`/freeze rm /<命令>\`：删除当前目录中的命令。
+- \`/freeze list --all\`：同时列出已废弃/撤销的命令。
+- \`/freeze approve /<命令> --reason <原因>\`：批准新装或覆盖后的精确 spec hash；仍需同一真人二次确认。
+- \`/freeze rm /<命令> --reason <原因> [--replacement /<替代命令>]\`：发起废弃；宿主返回一次性确认码，必须由同一真人在十分钟内发送 \`/freeze confirm <确认码>\`。废弃只写 tombstone，不直接删除，因此后续同名调用会明确拒绝且不会落入模型。
+- \`/freeze restore /<命令> --reason <原因>\`：发起恢复；仍需同一真人二次确认，并生成新 revision，不能复用旧确认。
+- \`/freeze purge /<命令> --reason <原因>\`：对已废弃命令发起不可逆撤销；确认后先提交 revoked 审计再删除 tombstone。删除后同名调用仍由账本 fail-closed，不回退模型。
 - 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
 - 定时执行：让真人在飞书里直接发送 \`/schedule <规则>，执行 /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
 `;

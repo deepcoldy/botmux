@@ -26,6 +26,10 @@ import { join, resolve } from 'node:path';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
+import {
+  confirmFrozenCommandTransition,
+  prepareFrozenCommandTransition,
+} from '../src/services/frozen-command-lifecycle.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -386,6 +390,52 @@ sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
       config.session.dataDir = previousDataDir;
       (BOT.config as any).plugins = previousPlugins;
       vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for a retired command without spawning a model session or Data MCP', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-retired-'));
+    const previousDataDir = config.session.dataDir;
+    try {
+      const dataDir = join(root, 'data');
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
+schemaVersion: 1
+name: 泰国上账
+description: 即将废弃的命令
+params: []
+sql: SELECT 1
+onError: fallback_llm
+`);
+      config.session.dataDir = dataDir;
+      const actor = { openId: 'ou_test', unionId: 'on_test' };
+      const pending = prepareFrozenCommandTransition({
+        dataDir,
+        targetBotId: APP,
+        workingDir: root,
+        command: '/泰国上账',
+        action: 'retire',
+        actor,
+        reason: '改用新命令',
+        replacement: '/新命令',
+      });
+      confirmFrozenCommandTransition({ dataDir, targetBotId: APP, token: pending.token, actor });
+
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账',
+        workingDir: root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('已废弃');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('/新命令');
+    } finally {
+      config.session.dataDir = previousDataDir;
       rmSync(root, { recursive: true, force: true });
     }
   });

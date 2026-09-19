@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/daemon-pinned-working-dir.test.ts test/inherit-peer.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,6 +67,57 @@ describe('resolvePinnedWorkingDir', () => {
     expect(daemon.__testOnly_frozenCommandRawArgs('@Current Bot /fc验收 11', selfMentions, self)).toBe('11');
     expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11', selfMentions, self)).toBe('11');
     expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11 @Other Member', otherMentions, self)).toBe('11 @Other Member');
+  });
+
+  it('retires through same-user confirmation and blocks later invocation before MCP/model fallback', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const workingDir = tempDir('frozen-lifecycle-route');
+    mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(workingDir, '.botmux', 'commands', '生命周期测试.yaml'), `
+schemaVersion: 1
+name: 生命周期测试
+description: route lifecycle test
+params: []
+sql: SELECT 1
+onError: fallback_llm
+`);
+    botRegistry.registerBot({ larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code' });
+    const replies: string[] = [];
+    const base = {
+      workingDir,
+      larkAppId: 'app-self',
+      anchor: 'om_root',
+      turnId: 'om_turn',
+      senderOpenId: 'ou_user',
+      senderUnionId: 'on_user',
+      senderIsBot: false,
+      reply: async (_rootId: string, content: string) => {
+        replies.push(content);
+        return `om_reply_${replies.length}`;
+      },
+    };
+    await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/freeze',
+      commandContent: '/freeze rm /生命周期测试 --reason 口径迁移 --replacement /新命令',
+    });
+    const token = /\/freeze confirm ([A-Za-z0-9_-]+)/u.exec(replies.at(-1)!)?.[1];
+    expect(token).toBeTruthy();
+    await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/freeze',
+      commandContent: `/freeze confirm ${token}`,
+    });
+    expect(readFileSync(join(workingDir, '.botmux', 'commands', '生命周期测试.yaml'), 'utf8')).toContain('status: retired');
+
+    const result = await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/生命周期测试',
+      commandContent: '/生命周期测试',
+    });
+    expect(result).toEqual({ kind: 'handled' });
+    expect(replies.at(-1)).toContain('已废弃');
+    expect(replies.at(-1)).toContain('/新命令');
   });
 
   it('looks up frozen commands without auto-binding a defaultOncall chat', async () => {

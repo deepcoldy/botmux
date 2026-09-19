@@ -853,7 +853,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
-  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+  it('stamps the turn sender type onto the trusted caller at every IM execution boundary', () => {
     // A bot's turn carries a perfectly valid union_id (its own), so a consumer
     // cannot tell "a person asked" from "a bot triggered itself" unless the host
     // says which it was. Both inbound paths must therefore pass it — a missed
@@ -872,8 +872,11 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
-      expect(senderTypeArg).toContain('senderIsBotTriState(');
       expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
+      // The frozen-command helper receives the already-normalized tri-state as
+      // a typed input; the two direct IM paths normalize it at the call site.
+      if (senderTypeArg.startsWith('input.senderIsBot')) continue;
+      expect(senderTypeArg).toContain('senderIsBotTriState(');
       // ...and the cross-ref leg must actually be wired in: passing a literal
       // `false` there keeps the helper name but drops peer-bot recognition,
       // which is the exact case a bare `sender_type` check already missed.

@@ -5,7 +5,6 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  unlinkSync,
 } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -72,6 +71,7 @@ export type FrozenCommandParameter = IntegerParameter | EnumParameter | DatePara
 
 export interface FrozenCommandDefinition {
   schemaVersion: 1;
+  status: 'active';
   name: string;
   description: string;
   timezone: string;
@@ -237,11 +237,14 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   }
   if (!isPlainObject(value)) throw new FrozenCommandError('definition_invalid', '指令定义必须是对象');
   onlyKeys(value, [
-    'schemaVersion', 'name', 'description', 'timezone', 'datasource', 'sql', 'params',
+    'schemaVersion', 'status', 'name', 'description', 'timezone', 'datasource', 'sql', 'params',
     'output', 'onError', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy',
   ], 'definition');
   if (value.schemaVersion !== undefined && value.schemaVersion !== 1) {
     throw new FrozenCommandError('definition_version_unsupported', `不支持 schemaVersion=${String(value.schemaVersion)}`);
+  }
+  if (value.status !== undefined && value.status !== 'active') {
+    throw new FrozenCommandError('definition_inactive', `命令定义状态不是 active：${String(value.status)}`);
   }
   const name = normalizeFrozenCommandName(nonBlank(value.name, 'name', 64));
   if (!name || name !== command) {
@@ -298,6 +301,7 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   }
   return {
     schemaVersion: 1,
+    status: 'active',
     name,
     description,
     timezone,
@@ -364,17 +368,6 @@ export function listFrozenCommandSnapshots(workingDir: string): Array<{ command:
         };
       }
     });
-}
-
-export function removeFrozenCommand(workingDir: string, command: string): boolean {
-  const filePath = frozenCommandFilePath(workingDir, command);
-  if (!existsSync(filePath)) return false;
-  const stat = lstatSync(filePath);
-  if (stat.isSymbolicLink()) throw new FrozenCommandError('definition_file_invalid', '指令定义禁止使用符号链接');
-  if (!stat.isFile()) throw new FrozenCommandError('definition_file_invalid', '指令定义不是普通文件');
-  const realpath = assertCommandPathContained(workingDir, filePath);
-  unlinkSync(realpath);
-  return true;
 }
 
 export function frozenCommandUsage(definition: FrozenCommandDefinition): string {

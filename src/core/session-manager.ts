@@ -108,6 +108,7 @@ import {
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
 } from '../services/frozen-command.js';
+import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
   reconcileXpiSharedCwdRecovery,
@@ -4110,6 +4111,12 @@ export async function executeScheduledTask(
     ? /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(task.prompt.trim())
     : null;
   if (frozenInvocation) {
+    const lifecycle = evaluateFrozenCommandLifecycle({
+      dataDir: config.session.dataDir,
+      targetBotId: larkAppId,
+      workingDir: task.workingDir,
+      command: `/${frozenInvocation[1]!}`,
+    });
     const lookup = lookupFrozenCommand({
       workingDir: task.workingDir,
       command: `/${frozenInvocation[1]!}`,
@@ -4119,6 +4126,19 @@ export async function executeScheduledTask(
       if (replyRoot) await replyMessage(larkAppId, replyRoot, text, 'text', true);
       else await sendMessage(larkAppId, task.chatId, text);
     };
+    if (lifecycle.kind === 'retired') {
+      const payload = lifecycle.record.tombstonePayload;
+      await deliver(`固化命令 /${lifecycle.record.command} 已废弃：${payload?.reason ?? '未提供原因'}${payload?.replacement ? `。请改用 ${payload.replacement}` : ''}`);
+      return;
+    }
+    if (lifecycle.kind === 'revoked') {
+      await deliver('该固化命令已撤销，拒绝执行。');
+      return;
+    }
+    if (lifecycle.kind === 'fail_closed') {
+      await deliver(`固化命令状态异常，已拒绝执行：${lifecycle.reason}`);
+      return;
+    }
     if (lookup.kind === 'invalid') {
       await deliver(`固化命令暂不可用：${lookup.error.message}`);
       return;
