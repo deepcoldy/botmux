@@ -6643,8 +6643,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
   continuation start
-                   （实验性）为当前 TraeX 普通会话显式开启一次授权继承的长程任务续跑；
-                   可加 --ttl-minutes N / --max-continuations N，另有 await-user / cancel
+                   （实验性）功能开关启用时，TraeX 普通用户轮默认自动开启授权继承续跑；
+                   start 可在取消后重新开启，并设置 --ttl-minutes N / --max-continuations N，
+                   另有 await-user / cancel
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态

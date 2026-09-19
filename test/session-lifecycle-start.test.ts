@@ -208,6 +208,7 @@ import {
   getDaemonBootId,
   initWorkerPool,
   ensureReadonlyTaskContinuationAttached,
+  ensureAutomaticTaskContinuationLease,
   promoteQueuedActivationTail,
   restartCounts,
   sendWorkerInput,
@@ -215,6 +216,8 @@ import {
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import {
+  awaitReadonlyTaskContinuationUser,
+  cancelReadonlyTaskContinuationExplicit,
   disposeReadonlyTaskContinuation,
   startReadonlyTaskContinuation,
 } from '../src/services/readonly-task-continuation.js';
@@ -1479,7 +1482,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   });
 });
 
-describe('TraeX opt-in task continuation', () => {
+describe('TraeX task continuation', () => {
   const trustedCaller = {
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
@@ -1511,6 +1514,283 @@ describe('TraeX opt-in task continuation', () => {
     })).toMatchObject({ status: 'active', continuationsStarted: 0 });
     return { ds, worker };
   }
+
+  it('automatically arms an admitted user turn when RPC proof arrives afterwards', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: ds.workerGeneration,
+      status: 'active',
+      authorizationMode: 'inherited',
+      trustedCaller,
+    });
+  });
+
+  it('automatically arms when turn authority arrives after RPC proof', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(true);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'active',
+    });
+  });
+
+  it('automatically arms when the live managed-turn proof is the last proof to arrive', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'capability',
+      turnId: 'om_original',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'active',
+    });
+  });
+
+  it('automatically continues an allowlisted rate limit without an explicit start call', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'codex_rate_limited',
+    });
+    await Promise.resolve();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      lastErrorCode: 'codex_rate_limited',
+      continuationsStarted: 0,
+    });
+
+    ds.workerReady = true;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+  });
+
+  it('does not silently re-arm a turn after explicit cancellation', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(cancelReadonlyTaskContinuationExplicit(ds.session, 'om_original'))
+      .toMatchObject({ status: 'cancelled' });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-repeat',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'cancelled',
+    });
+  });
+
+  it('does not silently re-arm a turn after it starts awaiting user input', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(awaitReadonlyTaskContinuationUser(ds.session, 'om_original'))
+      .toMatchObject({ status: 'awaiting_user' });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-repeat',
+      eligible: true,
+    });
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'capability-repeat',
+      turnId: 'om_original',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'awaiting_user',
+    });
+  });
+
+  it.each([
+    ['bot caller', 'om_original', { ...trustedCaller, senderType: 'bot' as const }],
+    ['synthetic turn', 'bmx-synthetic', trustedCaller],
+  ])('does not automatically arm an ineligible %s', (_label, turnId, caller) => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId, caller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
+
+  it.each([
+    ['shared/adopt session', { adoptedFrom: { sessionId: 'external' } }, undefined],
+    ['VC receiver', {}, {
+      vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 },
+    }],
+    ['deferred schedule', {}, { deferredScheduleRun: { turnId: 'schedule-turn' } }],
+    ['external topicless trigger', {}, { externalTriggerTopicless: true }],
+  ])('does not automatically arm an ineligible %s', (_label, daemonShape, sessionShape) => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    Object.assign(ds, daemonShape);
+    if (sessionShape) Object.assign(ds.session, sessionShape);
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
+
+  it('fails closed without dispatch when automatic lease persistence fails', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('session store unavailable');
+    });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
+  });
+
+  it('does not automatically arm without the rollout switch or the current RPC proof', () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(false);
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(false);
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
 
   it('continues a completed turn and the exact output-limit failure without replaying the task', async () => {
     const { ds, worker } = startTraexLease();

@@ -272,6 +272,7 @@ import {
   dshRuntimeForSession,
   recordTurnExplicitMention,
   pruneSteerFanoutState,
+  ensureAutomaticTaskContinuationLease,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -17597,6 +17598,7 @@ function setActiveInteractiveTurn(
     caller: { ...caller },
     ...(controller ? { controller } : {}),
   };
+  ensureAutomaticTaskContinuationLease(ds);
 }
 
 type XpiSharedCwdTurnAdmission =
