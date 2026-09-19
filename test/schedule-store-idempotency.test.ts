@@ -174,6 +174,24 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(getTask(id)).toMatchObject({ enabled: true, lastStatus: 'ok' });
   });
 
+  it('atomically rejects a second claim and run-now request while running', async () => {
+    const { claimRun, createTask, requestRunNow } = await freshImport();
+    const id = 'cafefeed';
+    createTask({ ...BASE_PARAMS, id });
+
+    expect(claimRun(id, {
+      lastRunAt: '2026-05-19T10:00:00Z',
+      nextRunAt: undefined,
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+    })).toMatchObject({ ok: true });
+    expect(claimRun(id, {
+      lastRunAt: '2026-05-19T10:00:01Z',
+      nextRunAt: undefined,
+      lastRunId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    })).toEqual({ ok: false, error: 'already_running' });
+    expect(requestRunNow(id)).toEqual({ ok: false, error: 'already_running' });
+  });
+
   it('treats ownerOpenId as part of the canonical input so a re-create with a different creator conflicts', async () => {
     const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_owner_identity';

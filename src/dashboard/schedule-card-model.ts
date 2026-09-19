@@ -194,15 +194,18 @@ function formatLastRun(lastRunAt: string | undefined, nowMs: number): string {
 
 /** Compute UI availability for the 3 schedule action buttons (pure). */
 export function computeButtonAvailability(task: ScheduleCardTaskInput): ScheduleActionMatrix {
+  const runNow = task.lastStatus === 'running'
+    ? { enabled: false, reasonKey: 'schedules.action.run.alreadyRunning' }
+    : { enabled: true };
   if (task.enabled) {
     return {
-      runNow: { enabled: true },
+      runNow,
       pause: { enabled: true },
       resume: { enabled: false, reasonKey: 'schedules.action.resume.alreadyEnabled' },
     };
   }
   return {
-    runNow: { enabled: true },
+    runNow,
     pause: { enabled: false, reasonKey: 'schedules.action.pause.alreadyPaused' },
     resume: { enabled: true },
   };
