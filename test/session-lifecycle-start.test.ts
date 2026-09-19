@@ -688,6 +688,88 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(businessSends).toHaveLength(2);
   });
 
+  it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    // The daemon declines the handoff — this is the real fallback path: the XPI
+    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
+    // delivery then falls back to retry/fail, and its terminal notice must still
+    // describe a KNOWN outcome: the turn never entered the worker queue.
+    const onOrdinaryImInputRejected = vi.fn(async () => false);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    const trustedCaller = {
+      requestUserOpenId: 'ou_b',
+      requestUserUnionId: 'on_b',
+      requestLarkAppId: 'app_test',
+      senderType: 'user' as const,
+    };
+    expect(sendWorkerInput(ds, {
+      content: 'business turn',
+      rerouteEnvelope: {
+        turnId: 'om_business',
+        text: 'business turn',
+        userPrompt: 'business turn',
+        senderName: 'B',
+        createdAt: 1,
+      },
+    }, 'om_business', { trustedCaller })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'om_active_a',
+      activeCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    };
+    const businessSends = () => vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(businessSends()).toHaveLength(2));
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalled());
+
+    const bodies = sessionReply.mock.calls.map(call => String(call[1]));
+    const terminal = bodies.at(-1)!;
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    // The ambiguous-outcome notice must not be used for a rejection the daemon
+    // can describe exactly: it tells the user not to resend, which would strand
+    // a message that provably never ran.
+    for (const body of bodies) {
+      expect(body).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+      expect(body).not.toContain('不要直接重发');
+    }
+    expect(businessSends()).toHaveLength(2);
+  });
+
   it('hands a deterministic pre-admission rejection back exactly once without retrying the worker input', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');

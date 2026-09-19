@@ -1053,6 +1053,7 @@ export const messages: Record<string, string> = {
   'worker.input_delivery_failed': '⚠️ Botmux 无法确认这条消息是否已进入 Worker 的执行队列。已停止继续投递以避免重复执行。请先查看会话状态，不要直接重发。\nturn: {turnId}',
   'worker.input_delivery_delayed': '⏳ 消息已进入 Worker 的 IPC 队列，但 Worker 暂未确认接收。机器可能较忙；消息仍可能继续执行，请勿重发。\nturn: {turnId}',
   'worker.input_commit_delayed': '⏳ Worker 已收到这条消息，但暂未确认它已进入执行队列。机器可能较忙；消息仍可能继续执行，请勿重发。\nturn: {turnId}',
+  'worker.input_rejected_before_admission': '⚠️ 这条消息在进入 Worker 执行队列之前就被拒收：它没有被执行，也没有产生任何副作用。常见原因是会话里正在执行的那一轮由另一个身份发起（跨身份打断隔离）；等那一轮结束后重新发送即可。\nturn: {turnId}｜reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ 会话在处理这条消息期间被主动休眠或更换，Botmux 未能确认它是否已进入执行队列。请先查看会话记录确认结果；若未执行，再重新发送这条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'workerDiag.recentStderr': '最近的 worker 输出（可能含死因）：',
