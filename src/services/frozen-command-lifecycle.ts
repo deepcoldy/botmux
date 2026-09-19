@@ -461,6 +461,18 @@ export function prepareFrozenCommandTransition(input: {
       const snapshot = loadFrozenCommandSnapshot({ workingDir: input.workingDir, command: key.command });
       if (!snapshot) throw new FrozenCommandError('definition_missing', `未找到 /${key.command}`);
       expectedSpecHash = frozenCommandSpecHash(snapshot);
+      if (current?.state === 'active') {
+        if (!current.specHash || !current.sourceYaml) {
+          throw new FrozenCommandError('lifecycle_store_corrupt', '已批准命令缺少原始定义或 hash');
+        }
+        if (expectedSpecHash !== current.specHash) {
+          throw new FrozenCommandError(
+            'lifecycle_definition_mismatch',
+            '命令定义与已批准版本不一致；请先批准新版本，再发起废弃',
+          );
+        }
+        expectedSpecHash = current.specHash;
+      }
       preparedSpecHash = expectedSpecHash;
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${key.command} 当前为 ${current.state}，不能废弃`);
@@ -569,11 +581,27 @@ export function confirmFrozenCommandTransition(input: {
       if (!existsSync(pending.command_path)) throw new FrozenCommandError('definition_missing', '待废弃命令已不存在');
       const stat = lstatSync(pending.command_path);
       if (stat.isSymbolicLink() || !stat.isFile()) throw new FrozenCommandError('definition_file_invalid', '待废弃命令不是普通文件');
-      sourceYaml = readFileSync(pending.command_path, 'utf8');
+      const diskYaml = readFileSync(pending.command_path, 'utf8');
       if (!snapshot) throw new FrozenCommandError('definition_missing', '待废弃命令已不存在');
-      specHash = frozenCommandSpecHash(snapshot);
-      if (specHash !== pending.expected_spec_hash) {
+      const diskSpecHash = frozenCommandSpecHash(snapshot);
+      if (diskSpecHash !== pending.expected_spec_hash) {
         throw new FrozenCommandError('transition_stale', '命令定义在确认前已变化，请重新发起废弃');
+      }
+      if (current?.state === 'active') {
+        if (!current.specHash || !current.sourceYaml || diskSpecHash !== current.specHash) {
+          throw new FrozenCommandError(
+            'lifecycle_definition_mismatch',
+            '命令定义与已批准版本不一致；请先批准新版本，再发起废弃',
+          );
+        }
+        // Retirement must preserve the bytes/hash that were explicitly
+        // approved. Semantically equivalent comment/format edits on disk must
+        // not silently become the source restored by a later transition.
+        sourceYaml = current.sourceYaml;
+        specHash = current.specHash;
+      } else {
+        sourceYaml = diskYaml;
+        specHash = diskSpecHash;
       }
       tombstonePayload = {
         status: 'retired',

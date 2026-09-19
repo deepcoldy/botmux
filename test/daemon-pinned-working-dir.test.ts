@@ -81,11 +81,14 @@ params: []
 sql: SELECT 1
 onError: fallback_llm
 `);
-    botRegistry.registerBot({ larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_user'],
+    });
     const replies: string[] = [];
     const base = {
       workingDir,
       larkAppId: 'app-self',
+      chatId: 'oc_chat',
       anchor: 'om_root',
       turnId: 'om_turn',
       senderOpenId: 'ou_user',
@@ -118,6 +121,80 @@ onError: fallback_llm
     expect(result).toEqual({ kind: 'handled' });
     expect(replies.at(-1)).toContain('已废弃');
     expect(replies.at(-1)).toContain('/新命令');
+  });
+
+  it('requires canOperate at both prepare and confirm, while bot/unknown identity stays denied', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const workingDir = tempDir('frozen-lifecycle-auth');
+    mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
+    const definitionPath = join(workingDir, '.botmux', 'commands', '权限测试.yaml');
+    writeFileSync(definitionPath, `
+schemaVersion: 1
+name: 权限测试
+description: lifecycle authorization test
+params: []
+sql: SELECT 1
+onError: fail
+`);
+    const bot = botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'],
+    });
+    const replies: string[] = [];
+    const route = (overrides: Record<string, unknown>) => daemon.__testOnly_routeFrozenCommand({
+      workingDir,
+      larkAppId: 'app-self',
+      chatId: 'oc_chat',
+      anchor: 'om_root',
+      turnId: 'om_turn',
+      senderUnionId: 'on_user',
+      mentions: [],
+      reply: async (_rootId: string, content: string) => {
+        replies.push(content);
+        return `om_reply_${replies.length}`;
+      },
+      ...overrides,
+    } as Parameters<typeof daemon.__testOnly_routeFrozenCommand>[0]);
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 越权尝试',
+      senderOpenId: 'ou_member', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('无权发起');
+    expect(replies.at(-1)).not.toContain('/freeze confirm');
+
+    for (const senderIsBot of [true, undefined]) {
+      await route({
+        cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 身份尝试',
+        senderOpenId: 'ou_owner', senderIsBot,
+      });
+      expect(replies.at(-1)).toContain('身份明确的真人');
+      expect(replies.at(-1)).not.toContain('/freeze confirm');
+    }
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 合法废弃',
+      senderOpenId: 'ou_owner', senderIsBot: false,
+    });
+    const token = /\/freeze confirm ([A-Za-z0-9_-]+)/u.exec(replies.at(-1)!)?.[1];
+    expect(token).toBeTruthy();
+
+    // Authorization is checked again at confirmation time. A once-authorized
+    // token cannot outlive a permission revocation.
+    bot.resolvedAllowedUsers = ['ou_new_owner'];
+    await route({
+      cmd: '/freeze', commandContent: `/freeze confirm ${token}`,
+      senderOpenId: 'ou_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('无权确认');
+    expect(readFileSync(definitionPath, 'utf8')).not.toContain('status: retired');
+
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    await route({
+      cmd: '/freeze', commandContent: `/freeze confirm ${token}`,
+      senderOpenId: 'ou_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('已废弃');
+    expect(readFileSync(definitionPath, 'utf8')).toContain('status: retired');
   });
 
   it('looks up frozen commands without auto-binding a defaultOncall chat', async () => {

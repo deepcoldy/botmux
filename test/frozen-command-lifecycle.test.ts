@@ -10,6 +10,7 @@ import {
   prepareFrozenCommandTransition,
   reconcileFrozenCommandLifecycleAtStartup,
 } from '../src/services/frozen-command-lifecycle.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
 const roots: string[] = [];
 const BOT = 'cli_lifecycle_test';
@@ -83,6 +84,54 @@ describe('Frozen Command lifecycle ledger', () => {
       actor: ACTOR,
     })).toThrowError(/确认前已变化/);
     expect(readFileSync(input.file, 'utf8')).toContain('+ 1');
+  });
+
+  it('rejects retiring a tampered active definition and cannot reach restore without retirement', () => {
+    const input = setup();
+    const approval = prepareFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      workingDir: input.root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '批准 A',
+    });
+    const approved = confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: approval.token,
+      actor: ACTOR,
+    });
+    expect(approved.state).toBe('active');
+    expect(approved.sourceYaml).toBe(ACTIVE);
+
+    const tampered = ACTIVE.replace('SELECT {{value}}', 'SELECT {{value}} + 1');
+    writeFileSync(input.file, tampered);
+    expect(evaluateFrozenCommandLifecycle({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      workingDir: input.root,
+      command: '/生命周期测试',
+    }).kind).toBe('fail_closed');
+
+    expect(() => prepare(input, 'retire')).toThrowError(/已批准版本/);
+    expect(() => prepare(input, 'restore')).toThrowError(/不是 retired/);
+    expect(readFileSync(input.file, 'utf8')).toBe(tampered);
+
+    const db = openDatabaseSyncOrThrow(join(input.dataDir, 'frozen-commands', 'approvals.sqlite'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS count FROM pending_transitions').get() as { count: number }).count).toBe(0);
+      expect((db.prepare('SELECT COUNT(*) AS count FROM command_audit').get() as { count: number }).count).toBe(1);
+      const row = db.prepare('SELECT state, spec_hash, source_yaml FROM command_lifecycle').get() as {
+        state: string; spec_hash: string; source_yaml: string;
+      };
+      expect(row.state).toBe('active');
+      expect(row.spec_hash).toBe(approved.specHash);
+      expect(row.source_yaml).toBe(ACTIVE);
+    } finally {
+      db.close();
+    }
   });
 
   it('fails closed for explicit active definitions until their exact spec hash is approved', () => {

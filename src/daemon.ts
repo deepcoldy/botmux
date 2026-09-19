@@ -5545,10 +5545,12 @@ async function routeFrozenCommand(input: {
   commandContent: string;
   workingDir: string | undefined;
   larkAppId: string;
+  chatId?: string;
   anchor: string;
   turnId: string;
   senderOpenId?: string;
   senderUnionId?: string;
+  operatorTrustUnionId?: string;
   senderIsBot?: boolean;
   mentions?: readonly LarkMention[];
   reply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
@@ -5617,6 +5619,9 @@ async function routeFrozenCommand(input: {
     if (confirmMatch) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以确认固化命令状态变更');
+        if (!canOperate(input.larkAppId, input.chatId, input.senderOpenId, input.operatorTrustUnionId)) {
+          throw new Error('当前用户无权确认固化命令状态变更');
+        }
         const record = confirmFrozenCommandTransition({
           dataDir: config.session.dataDir,
           targetBotId: input.larkAppId,
@@ -5650,6 +5655,9 @@ async function routeFrozenCommand(input: {
     if (transition) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以发起固化命令状态变更');
+        if (!canOperate(input.larkAppId, input.chatId, input.senderOpenId, input.operatorTrustUnionId)) {
+          throw new Error('当前用户无权发起固化命令状态变更');
+        }
         const prepared = prepareFrozenCommandTransition({
           dataDir: config.session.dataDir,
           targetBotId: input.larkAppId,
@@ -22026,10 +22034,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         commandContent,
         workingDir: pinnedWorkingDir,
         larkAppId,
+        chatId,
         anchor,
         turnId: parsed.messageId,
         senderOpenId,
         senderUnionId,
+        operatorTrustUnionId: teamTrustUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
         mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,
@@ -24204,10 +24214,12 @@ async function handleThreadReplyAdmitted(
         commandContent,
         workingDir: frozenWorkingDir,
         larkAppId,
+        chatId: effectiveThreadChatId,
         anchor,
         turnId: parsed.messageId,
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
+        operatorTrustUnionId: threadTeamTrustUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
         mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,
