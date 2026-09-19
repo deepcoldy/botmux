@@ -175,4 +175,40 @@ describe('daemon current actor attestation', () => {
       findSession: () => ds, resolveIdentity, procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
   });
+
+  it('rejects an adopt session that never published its CLI pid', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeSession();
+    ds.localProcessAttestation.cliPid = undefined;
+    ds.localProcessAttestation.cliProcStart = undefined;
+    ds.managedTurnOrigin.preexistingProcessIdentities = undefined;
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+    }));
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1', peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds, resolveIdentity, procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('binds an adopt session once its CLI pid is published', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 101, 100, '2000');
+    const ds = activeSession();
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+    }));
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+    })).resolves.toMatchObject({ ok: true, document: { actor: { email: 'current@example.com' } } });
+  });
 });

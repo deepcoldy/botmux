@@ -158,14 +158,37 @@ export type CurrentActorDaemonResult =
   | { ok: true; document: CurrentActorDocument }
   | { ok: false; error: 'current_actor_unverified' };
 
-/** Daemon-owned authorization and identity lookup for the current live turn. */
-export async function resolveDaemonCurrentActor(input: {
+export interface CurrentTurnPeerAttestation {
+  ds: DaemonSession;
+  turnId: string;
+  generation: number;
+  callerOpenId: string;
+  capability: string;
+  cliPid: number;
+  cliProcStart: string;
+  workerPid: number;
+  workerProcStart: string;
+  processIdentities: string[];
+}
+
+export interface CurrentTurnPeerAttestationInput {
   sessionId: string;
   peer: ProcessIdentity;
   findSession: (sessionId: string) => DaemonSession | undefined;
-  resolveIdentity?: typeof resolveVerifiedUserIdentity;
   procRoot?: string;
-}): Promise<CurrentActorDaemonResult> {
+}
+
+/**
+ * Prove that one resolved loopback peer belongs to the exact live turn of a
+ * session, reading the caller/turn tuple straight from in-memory daemon state.
+ * Shared by `/api/current-actor` and the agent authorization routes so the
+ * host-session lineage proof (no rotating capability, no channel env) has a
+ * single source of truth.
+ */
+export function attestCurrentTurnLoopbackPeer(
+  input: CurrentTurnPeerAttestationInput,
+): CurrentTurnPeerAttestation | null {
+  const procRoot = input.procRoot ?? '/proc';
   const ds = input.findSession(input.sessionId);
   const turnId = ds?.managedTurnOrigin?.turnId;
   const generation = ds?.workerGeneration;
@@ -174,7 +197,9 @@ export async function resolveDaemonCurrentActor(input: {
   const cliProcStart = attestation?.cliProcStart;
   const processIdentities = ds?.managedTurnOrigin?.preexistingProcessIdentities;
   const workerPid = ds?.worker?.pid;
-  const workerProcStart = workerPid ? readProcStart(workerPid, input.procRoot ?? '/proc') : undefined;
+  const workerProcStart = workerPid ? readProcStart(workerPid, procRoot) : undefined;
+  const callerOpenId = ds?.managedTurnOrigin?.callerOpenId;
+  const capability = ds?.managedTurnOrigin?.capability;
   if (!ds || ds.session.status !== 'active'
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
     || !turnId || generation === undefined
@@ -182,57 +207,66 @@ export async function resolveDaemonCurrentActor(input: {
     || attestation?.workerGeneration !== generation
     || !cliPid || !cliProcStart
     || !processIdentities || processIdentities.length === 0
-    || readProcStart(cliPid, input.procRoot ?? '/proc') !== cliProcStart) {
-    return { ok: false, error: 'current_actor_unverified' };
+    || !callerOpenId?.startsWith('ou_') || !capability
+    || readProcStart(cliPid, procRoot) !== cliProcStart) {
+    return null;
   }
-  const procRoot = input.procRoot ?? '/proc';
-  const preexistingProcessIdentities = new Set(processIdentities);
   if (!peerBelongsToCurrentTurn({
       peer: input.peer, cliPid, procRoot,
-      preexistingProcessIdentities,
+      preexistingProcessIdentities: new Set(processIdentities),
     })
-    || readProcStart(input.peer.pid, input.procRoot ?? '/proc') !== input.peer.procStart) {
-    return { ok: false, error: 'current_actor_unverified' };
+    || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    return null;
   }
-  const senderOpenId = ds.managedTurnOrigin?.callerOpenId;
-  const liveCapability = ds.managedTurnOrigin?.capability;
-  if (!senderOpenId?.startsWith('ou_') || !liveCapability) {
-    return { ok: false, error: 'current_actor_unverified' };
-  }
-
-  const frozen = {
-    ds, turnId, generation, senderOpenId, capability: liveCapability,
-    workerPid, workerProcStart, processIdentities: [...processIdentities],
+  return {
+    ds, turnId, generation, callerOpenId, capability,
+    cliPid, cliProcStart, workerPid, workerProcStart,
+    processIdentities: [...processIdentities],
   };
-  const identity = await (input.resolveIdentity ?? resolveVerifiedUserIdentity)(ds.larkAppId, senderOpenId);
-  if (!identity || identity.type !== 'user' || identity.openId !== senderOpenId) {
+}
+
+/** Re-run the peer attestation and confirm the live turn is byte-for-byte the
+ *  one an earlier attestation froze, so an await in between cannot smuggle in a
+ *  rotated turn, replaced worker, or changed sender. */
+export function currentTurnPeerAttestationStable(
+  frozen: CurrentTurnPeerAttestation,
+  input: CurrentTurnPeerAttestationInput,
+): boolean {
+  const again = attestCurrentTurnLoopbackPeer(input);
+  return !!again
+    && again.ds === frozen.ds && again.turnId === frozen.turnId
+    && again.generation === frozen.generation && again.callerOpenId === frozen.callerOpenId
+    && again.capability === frozen.capability && again.cliPid === frozen.cliPid
+    && again.cliProcStart === frozen.cliProcStart && again.workerPid === frozen.workerPid
+    && again.workerProcStart === frozen.workerProcStart
+    && JSON.stringify(again.processIdentities) === JSON.stringify(frozen.processIdentities);
+}
+
+/** Daemon-owned authorization and identity lookup for the current live turn. */
+export async function resolveDaemonCurrentActor(input: {
+  sessionId: string;
+  peer: ProcessIdentity;
+  findSession: (sessionId: string) => DaemonSession | undefined;
+  resolveIdentity?: typeof resolveVerifiedUserIdentity;
+  procRoot?: string;
+}): Promise<CurrentActorDaemonResult> {
+  const procRoot = input.procRoot ?? '/proc';
+  const attestInput = {
+    sessionId: input.sessionId, peer: input.peer,
+    findSession: input.findSession, procRoot,
+  };
+  const frozen = attestCurrentTurnLoopbackPeer(attestInput);
+  if (!frozen) return { ok: false, error: 'current_actor_unverified' };
+
+  const identity = await (input.resolveIdentity ?? resolveVerifiedUserIdentity)(frozen.ds.larkAppId, frozen.callerOpenId);
+  if (!identity || identity.type !== 'user' || identity.openId !== frozen.callerOpenId) {
     return { ok: false, error: 'current_actor_unverified' };
   }
   let email: string;
   try { email = normalizeActorEmail(identity.email); }
   catch { return { ok: false, error: 'current_actor_unverified' }; }
 
-  const current = input.findSession(input.sessionId);
-  const currentSender = current?.managedTurnOrigin?.callerOpenId;
-  if (current !== frozen.ds || current?.session.status !== 'active'
-    || current.workerGeneration !== frozen.generation
-    || current.worker?.pid !== frozen.workerPid
-    || current.worker?.killed === true
-    || current.localProcessAttestation?.workerGeneration !== frozen.generation
-    || current.localProcessAttestation?.cliPid !== cliPid
-    || current.localProcessAttestation?.cliProcStart !== cliProcStart
-    || current.managedTurnOrigin?.turnId !== frozen.turnId
-    || current.managedTurnOrigin?.capability !== frozen.capability
-    || JSON.stringify(current.managedTurnOrigin?.preexistingProcessIdentities)
-      !== JSON.stringify(frozen.processIdentities)
-    || currentSender !== frozen.senderOpenId
-    || readProcStart(frozen.workerPid, input.procRoot ?? '/proc') !== frozen.workerProcStart
-    || readProcStart(cliPid, input.procRoot ?? '/proc') !== cliProcStart
-    || readProcStart(input.peer.pid, input.procRoot ?? '/proc') !== input.peer.procStart
-    || !peerBelongsToCurrentTurn({
-      peer: input.peer, cliPid, procRoot,
-      preexistingProcessIdentities: new Set(frozen.processIdentities),
-    })) {
+  if (!currentTurnPeerAttestationStable(frozen, attestInput)) {
     return { ok: false, error: 'current_actor_unverified' };
   }
 

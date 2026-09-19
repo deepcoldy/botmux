@@ -231,6 +231,7 @@ import {
   readManagedOriginRootLocator,
   readManagedOriginCapability,
   readManagedOriginPolicyCapability,
+  type ManagedOriginCapabilityClaim,
 } from './core/managed-origin-capability.js';
 import {
   attestManagedOrigin,
@@ -6621,6 +6622,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
+  auth request [--scope "<scope1 scope2,...>"] [--json]
+              为本轮发起人生成飞书授权链接，返回 JSON；由 Agent 将链接发给用户
+  auth wait --request-id <id> [--json]
+              等待当前授权请求就绪，最多 5 分钟；成功后可重试原操作
   mojo-containment list|revoke
               查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
@@ -11337,6 +11342,77 @@ async function cmdCard(rest: string[]): Promise<void> {
   console.log(buildCardPatchSuccessOutput(outcome.messageId, sid));
 }
 
+async function cmdAuth(rest: string[]): Promise<void> {
+  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs } = await import('./cli/auth-request.js');
+  let parsed;
+  try {
+    parsed = parseAuthRequestArgs(rest);
+  } catch (error) {
+    console.error(`botmux auth: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.help) {
+    console.log(AUTH_REQUEST_USAGE);
+    return;
+  }
+  try {
+    const { sid, larkAppId } = await resolveSessionAppId(undefined);
+    // Isolated panes (sandbox / read isolation) prove the turn with their
+    // rotating capability tuple; a managed host session has neither the relay
+    // nor the origin channel injected and instead proves lineage on the daemon
+    // via the loopback peer walk (same as `actor current`), so it presents no
+    // tuple. Absence of both env markers is the host case, never a missing turn.
+    const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
+      || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
+    let claim: ManagedOriginCapabilityClaim | undefined;
+    if (isolatedPane) {
+      const read = readManagedOriginCapability(
+        resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      );
+      if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
+      claim = read;
+    }
+    const deadline = Date.now() + 300_000;
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (parsed.command === 'wait' && remaining <= 0) {
+        console.log(JSON.stringify({ ok: false, status: 'pending', error: 'auth_request_timeout' }));
+        process.exitCode = 1;
+        return;
+      }
+      const response = await postCurrentSessionDaemonRoute({
+        path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
+        sessionId: sid,
+        larkAppId,
+        ...(claim ? { originClaim: claim } : {}),
+        signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+        body: {
+          ...(parsed.command === 'request' ? { scopes: parsed.scopes } : { requestId: parsed.requestId }),
+          ...(claim ? {
+            originCapability: claim.capability,
+            originTurnId: claim.turnId,
+            originDispatchAttempt: claim.dispatchAttempt,
+          } : {}),
+        },
+      });
+      const body = await response.json() as { ok?: boolean; status?: string };
+      if (parsed.command === 'wait' && response.ok && body.ok === true && body.status === 'pending') {
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(2_000, deadline - Date.now()))));
+        continue;
+      }
+      console.log(JSON.stringify(body));
+      if (!response.ok || body.ok !== true || parsed.command === 'wait' && body.status !== 'ready') {
+        process.exitCode = 1;
+      }
+      return;
+    }
+  } catch (error) {
+    console.error(`botmux auth: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}
+
 // ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
 
 async function postCurrentSessionDaemonRoute(input: {
@@ -11344,6 +11420,8 @@ async function postCurrentSessionDaemonRoute(input: {
   sessionId: string;
   larkAppId: string;
   body: Record<string, unknown>;
+  originClaim?: ManagedOriginCapabilityClaim;
+  signal?: AbortSignal;
 }): Promise<Response> {
   const relayDir = process.env.BOTMUX_SEND_RELAY;
   let hostSecret: string | undefined;
@@ -11359,9 +11437,10 @@ async function postCurrentSessionDaemonRoute(input: {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: input.sessionId, ...input.body }),
+      signal: input.signal,
     }, hostSecret);
   }
-  const originClaim = readManagedOriginCapability(
+  const originClaim = input.originClaim ?? readManagedOriginCapability(
     resolveDataDir(),
     input.sessionId,
     relayDir,
@@ -11370,6 +11449,7 @@ async function postCurrentSessionDaemonRoute(input: {
   return loopbackFetch(`http://127.0.0.1:${port}${input.path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    signal: input.signal,
     body: JSON.stringify({
       sessionId: input.sessionId,
       ...input.body,
@@ -15355,7 +15435,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
   'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
-  'vc-agent', 'report', 'actor',
+  'vc-agent', 'report', 'actor', 'auth',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
   console.error(
@@ -15702,6 +15782,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'auth':     await cmdAuth(process.argv.slice(3)); break;
   case 'tabs':     await cmdTabs(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;

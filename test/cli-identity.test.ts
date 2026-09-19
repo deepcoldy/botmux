@@ -25,6 +25,7 @@ import {
   publishActiveTurn,
   installLoginShellPathShim,
   writeSessionIdentity,
+  refreshSessionIdentity,
   clearSessionIdentity,
   clearAllSessionIdentities,
   sessionIdentityPath,
@@ -423,6 +424,35 @@ describe('renderIdentityWrapper', () => {
     publishActiveTurn(dir, SESSION, 'turn-A');
 
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
+  });
+
+  it('uses refreshed credentials on the next invocation in the same turn', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    const identity = { tool: 'lark-cli' as const, appId: 'a', userAccessToken: 'old-token', turnId: 'turn-A' };
+    writeSessionIdentity(dir, SESSION, identity);
+    publishActiveTurn(dir, SESSION, identity.turnId);
+    const env = { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION };
+    expect(runWrapper(wrapperPath, env)).toBe('a|old-token|');
+
+    expect(refreshSessionIdentity(dir, SESSION, { ...identity, userAccessToken: 'new-token' })).toBe(true);
+    expect(runWrapper(wrapperPath, env)).toBe('a|new-token|');
+  });
+
+  it.each([
+    ['turn-B', 'turn-A'],
+    ['turn-A', 'turn-B'],
+    [undefined, 'turn-A'],
+    ['turn-A', undefined],
+  ])('preserves identity when published turn is %s and active turn is %s', (publishedTurn, activeTurn) => {
+    const identity = { tool: 'lark-cli' as const, appId: 'a', userAccessToken: 'old-token', turnId: 'turn-A' };
+    const path = sessionIdentityPath(dir, SESSION, identity.tool);
+    if (publishedTurn) writeSessionIdentity(dir, SESSION, { ...identity, turnId: publishedTurn });
+    if (activeTurn) publishActiveTurn(dir, SESSION, activeTurn);
+    const before = existsSync(path) ? readFileSync(path) : undefined;
+
+    expect(refreshSessionIdentity(dir, SESSION, { ...identity, userAccessToken: 'new-token' })).toBe(false);
+    expect(existsSync(path) ? readFileSync(path) : undefined).toEqual(before);
   });
 
   // The regression itself: Alice's turn is mid-flight when Bob's message lands.

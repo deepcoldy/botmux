@@ -13483,6 +13483,7 @@ async function spawnCli(
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
+    publishLocalProcessAttestation(cfg.adoptCliPid);
     log(`Adopt mode (herdr): observing ${cfg.adoptHerdrSessionName}:${target} (${cols}x${rows})`);
     return;
   }
@@ -13548,6 +13549,7 @@ async function spawnCli(
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
     const target = cfg.adoptZellijPaneId ? `${cfg.adoptZellijSession}/${cfg.adoptZellijPaneId}` : cfg.adoptTmuxTarget;
+    publishLocalProcessAttestation(cfg.adoptCliPid);
     log(`Adopt mode (${effectiveBackendType}): observing ${target} (${cols}x${rows})`);
     return;
   }

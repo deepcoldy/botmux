@@ -1,5 +1,6 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -78,6 +79,7 @@ import {
   CURRENT_ACTOR_ROUTE,
 } from '../cli/current-actor.js';
 import {
+  attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -297,11 +299,14 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { tokenStoreProtection, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
+import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
+import { refreshSessionIdentity } from './cli-identity.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   normalizeSparseReplyStyleConfig,
@@ -809,7 +814,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2061,6 +2066,130 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
   return jsonRes(res, 200, { ok: true, preview });
 });
+
+const sessionAuthRequests = new Map<string, {
+  sessionId: string;
+  isCurrent: () => boolean;
+  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+}>();
+
+for (const action of ['auth-request', 'auth-status']) {
+  ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
+    let body: Record<string, unknown>;
+    try { body = await readBoundedJsonBody(req, 16_384, 1_000); }
+    catch (err) {
+      if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+        closeUntrustedRequestAfterResponse(req, res);
+      }
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const ds = findActiveBySessionId(params.sessionId);
+    const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+    if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+    if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const origin = ds?.managedTurnOrigin;
+    if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+      || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
+      || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    // Two proof modes for "this request belongs to the current turn":
+    //  · Isolated pane (sandbox / read isolation): presents the rotating
+    //    capability tuple in the body, cross-checked against managedTurnOrigin.
+    //  · Managed host (no relay/channel injected): sends no tuple and instead
+    //    proves lineage the way `/api/current-actor` does — the daemon maps the
+    //    loopback socket to the client pid and walks it to the live CLI. Never
+    //    let a partial/stale tuple fall through to the host path.
+    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
+      || 'originDispatchAttempt' in body;
+    if (presentsOriginTuple) {
+      if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
+        || body.originDispatchAttempt !== origin.dispatchAttempt) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    } else {
+      const peer = resolveLoopbackPeerProcesses({
+        remoteAddress: req.socket.remoteAddress,
+        remotePort: req.socket.remotePort,
+        localPort: req.socket.localPort,
+      });
+      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+        sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+      })) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    }
+    const callerOpenId = origin.callerOpenId;
+    const turnId = origin.turnId;
+    const capability = origin.capability;
+    const attempt = origin.dispatchAttempt;
+    const worker = ds.worker;
+    const generation = ds.workerGeneration;
+    const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
+      && ds.session.status === 'active' && ds.worker === worker && !worker.killed
+      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === callerOpenId
+      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
+      && ds.managedTurnOrigin?.dispatchAttempt === attempt;
+    const cfg = getBot(ds.larkAppId).config;
+    if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+      return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
+    }
+
+    if (action === 'auth-status') {
+      const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
+      if (!request || request.sessionId !== params.sessionId || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      const result = await request.poll();
+      if (!isCurrent() || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
+      if (result.status === 'failed') {
+        return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
+      }
+      if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+        tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+      })) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      return jsonRes(res, 200, { ok: true, status: 'ready' });
+    }
+
+    if (!Array.isArray(body.scopes) || body.scopes.length > 100
+      || body.scopes.some(scope => typeof scope !== 'string' || !scope || scope.length > 256)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const scopes = [...new Set(body.scopes as string[])];
+    const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope));
+    if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
+    const cached = getIdentity(ds.larkAppId, callerOpenId);
+    const identity = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached
+      : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
+    if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    try {
+      authorization = await requestUserAuthorization(
+        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
+      );
+    } catch {
+      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+    }
+    if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    const requestId = randomBytes(32).toString('hex');
+    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
+    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    return jsonRes(res, 200, {
+      ok: true, authUrl: authorization.authUrl, requestId,
+      scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+    });
+  });
+}
 
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating

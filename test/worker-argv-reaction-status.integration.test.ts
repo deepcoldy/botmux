@@ -135,6 +135,24 @@ async function waitForPromptReady(
   throw new Error(`timed out waiting for prompt_ready: ${JSON.stringify(messages)}\n${logs.join('')}`);
 }
 
+async function waitForMessage<T extends WorkerToDaemon['type']>(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  type: T,
+  logs: string[],
+): Promise<Extract<WorkerToDaemon, { type: T }>> {
+  const deadline = Date.now() + 12_000;
+  while (Date.now() < deadline) {
+    const found = messages.find((m): m is Extract<WorkerToDaemon, { type: T }> => m.type === type);
+    if (found) return found;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before ${type}\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(`timed out waiting for ${type}: ${JSON.stringify(messages)}\n${logs.join('')}`);
+}
+
 /** A Pi transcript `message` record, shaped like SessionManager's JSONL. */
 function piTranscriptRecord(role: 'user' | 'assistant', text: string, stopReason?: string): string {
   return JSON.stringify({
@@ -1229,6 +1247,88 @@ setInterval(() => {}, 1_000);
 
     await waitForPromptReady(child, messages, logs);
   }, 15_000);
+
+  it.skipIf(!tmuxAvailable)('publishes the adopted tmux pane CLI pid and start identity before prompt_ready', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-adopt-attest-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeCli = join(root, 'fake-cli');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdout.write('ready\\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const tmuxSession = `botmux-adopt-attest-${process.pid}-${Date.now()}`;
+    tmuxSessions.add(tmuxSession);
+    execFileSync('tmux', ['new-session', '-d', '-s', tmuxSession, fakeCli]);
+    const panePid = Number(
+      execFileSync('tmux', ['list-panes', '-t', tmuxSession, '-F', '#{pane_pid}']).toString().trim().split('\n')[0],
+    );
+    expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-adopt-attest',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-adopt-attest',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      backendType: 'tmux',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+      adoptMode: true,
+      adoptTmuxTarget: `${tmuxSession}:0.0`,
+      adoptCliPid: panePid,
+      adoptPaneCols: 160,
+      adoptPaneRows: 50,
+    } satisfies DaemonToWorker);
+
+    const attestation = await waitForMessage(child, messages, 'local_process_attestation', logs);
+    expect(attestation.cliPid, JSON.stringify(attestation)).toBe(panePid);
+    expect(typeof attestation.cliProcStart === 'string' && attestation.cliProcStart.length > 0).toBe(true);
+    expect(attestation.backendType).toBe('tmux');
+
+    // The daemon snapshots the current turn's pre-existing descendants right
+    // after it records this CLI pid, so the attestation must reach it before
+    // the same-turn readiness edge. An observe-only adopt pane never emits
+    // prompt_ready, so `ready` is the readiness signal here.
+    await waitForMessage(child, messages, 'ready', logs);
+    const attestationIndex = messages.findIndex(m => m.type === 'local_process_attestation');
+    const readyIndex = messages.findIndex(m => m.type === 'ready');
+    expect(attestationIndex).toBeGreaterThanOrEqual(0);
+    expect(attestationIndex).toBeLessThan(readyIndex);
+    // Attestation precedes the current turn's origin snapshot refresh: the
+    // daemon records this CLI pid before it snapshots the turn's descendants,
+    // so a managed_turn_origin for the live turn follows the attestation.
+    const originAfterAttestation = messages.findIndex(
+      (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+    );
+    expect(originAfterAttestation, JSON.stringify(messages)).toBeGreaterThan(attestationIndex);
+  }, 20_000);
 
   it('forces the synthetic working seed before classifying a limited settle', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-argv-reaction-'));

@@ -891,10 +891,8 @@ export const messages: Record<string, string> = {
   'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
-  'ai.credentials.on_auth_failure': '遇到鉴权失败：直接把失败原样告诉用户，并提示他授权（飞书发 /login，ByteCloud 发 /login bytedcli，命令被拒时 stderr 里会写明是哪一个）；不要试图翻找、拼凑或复用其他凭证来绕过。',
-  // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑 /login，
-  // 那只会拿到同样的权限再失败一次。飞书已经把缺的 scope 名字列出来了，照抄即可。
-  'ai.credentials.on_missing_scope': '如果报的是 missing_scope（99991679）：说明用户授权过、但缺这一项权限。把飞书返回的 missing_scopes 原样念给用户，并让他发「/login --scope <那些权限名>」补授权后重试；不要改用 bot 身份绕过，也不要让他重跑一次普通 /login。',
+  'ai.credentials.on_auth_failure': '遇到鉴权失败：原样说明失败。飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后，由 Agent 运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。ByteCloud 仍提示用户发 /login bytedcli；命令被拒时 stderr 会标明平台。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_missing_scope': '如果报 missing_scope（99991679），由 Agent 运行 `botmux auth request --scope "<所需权限>" --json`，再用 `botmux send` 发回 authUrl。飞书错误若列出满足同一操作的候选权限，选择其中一个即可，例如 im:chat、im:chat:readonly、im:chat:read 选择 im:chat:read。不同操作各自需要的独立权限才合并请求。说明本次请求的权限，再运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 后以本轮用户身份重试原操作。',
   'ai.identity.routing_intro': '群里可能有多个 bot，按 @名字 和 open_id 区分归属：',
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',

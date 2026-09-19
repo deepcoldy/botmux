@@ -32,7 +32,7 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -259,6 +259,24 @@ export function writeSessionIdentity(
   mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
   return path;
+}
+
+export function refreshSessionIdentity(
+  sessionDataDir: string,
+  sessionId: string,
+  identity: CliIdentity & { turnId: string },
+): boolean {
+  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
+  const turnPath = sessionActiveTurnPath(sessionDataDir, sessionId);
+  const suffix = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}\n`;
+  try {
+    if (!readFileSync(path, 'utf8').endsWith(suffix)
+      || readFileSync(turnPath, 'utf8').trim() !== identity.turnId) return false;
+  } catch {
+    return false;
+  }
+  writeSessionIdentity(sessionDataDir, sessionId, identity);
+  return true;
 }
 
 /**
