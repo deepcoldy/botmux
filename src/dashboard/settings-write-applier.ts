@@ -151,6 +151,9 @@ export interface SettingsWriteApplierDeps {
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
+  /** After persisting XPI=false, terminalise every daemon's staged runtime
+   * queue so historical records cannot keep notifying or revive later. */
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>;
   /** 校验通知 Bot；保存关闭态配置时只校验静态配置，启用时再要求 daemon 与收件人就绪。 */
   validateCodexNotifierTargetBotAppId?: (
     appId: string,
@@ -172,6 +175,7 @@ export interface SettingsWriteApplierDeps {
 export function defaultSettingsWriteApplierDeps(
   resolveDashboardSettings: () => ResolvedDashboardSettingsView,
   reloadLocaleOnAllDaemons?: () => Promise<void>,
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>,
 ): SettingsWriteApplierDeps {
   return {
     readGlobalConfig,
@@ -187,6 +191,7 @@ export function defaultSettingsWriteApplierDeps(
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
+    disableCrossPrincipalInterruptionOnAllDaemons,
     installCodexNotifierHook: () => {
       installCodexNotifierHook();
       if (!isCodexNotifierHookInstalled()) throw new Error('codex_notifier_hook_not_executable');
@@ -749,6 +754,11 @@ export async function applySettingsWrite(
   if (hostOverloadAlertPatch) {
     deps.writeHostOverloadAlertConfig(hostOverloadAlertPatch);
     touched = true;
+  }
+
+  if (patch.crossPrincipalInterruption === false
+    && deps.disableCrossPrincipalInterruptionOnAllDaemons) {
+    await deps.disableCrossPrincipalInterruptionOnAllDaemons();
   }
 
   if (!touched) return { ok: false, error: 'empty_patch' };
