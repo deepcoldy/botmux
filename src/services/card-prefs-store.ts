@@ -50,6 +50,12 @@ import {
   normalizeHiddenStreamingCardButtons,
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
+import {
+  DEFAULT_PRIVATE_REPLY_REVIEW,
+  normalizePrivateReplyReviewConfig,
+  resolvedPrivateReplyReviewConfig,
+  type PrivateReplyReviewConfig,
+} from './private-reply-review-config.js';
 
 export interface BotCardPrefs {
   /** Where to show native Context / Token usage:
@@ -67,6 +73,7 @@ export interface BotCardPrefs {
   codexAppCleanInput: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
+  privateReplyReview: PrivateReplyReviewConfig;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
@@ -126,6 +133,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
+      privateReplyReview: resolvedPrivateReplyReviewConfig(c.privateReplyReview),
       thinkingCard: c.thinkingCard !== false,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
       senderTag: c.senderTag !== false,
@@ -155,6 +163,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
+      privateReplyReview: DEFAULT_PRIVATE_REPLY_REVIEW,
       thinkingCard: true,
       thinkingCardToolResult: true,
       senderTag: true,
@@ -253,7 +262,12 @@ async function updateBotCardPrefsInternal(
     if (normalized) entry.hiddenStreamingCardButtons = normalized;
     else delete entry.hiddenStreamingCardButtons;
   };
-
+  const applyPrivateReplyReview = (entry: any, val: PrivateReplyReviewConfig | undefined) => {
+    if (val === undefined) return;
+    const normalized = normalizePrivateReplyReviewConfig(val);
+    if (normalized) entry.privateReplyReview = normalized;
+    else delete entry.privateReplyReview;
+  };
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     if (entry.replyCardMode === 'final-only') {
       entry.replyCardMode = 'unified';
@@ -271,6 +285,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    applyPrivateReplyReview(entry, patch.privateReplyReview);
     applyDefaultTrue(entry, 'thinkingCard', patch.thinkingCard);
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
@@ -299,6 +314,7 @@ async function updateBotCardPrefsInternal(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
+        privateReplyReview: resolvedPrivateReplyReviewConfig(entry.privateReplyReview),
         thinkingCard: entry.thinkingCard !== false,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         senderTag: entry.senderTag !== false,
@@ -354,6 +370,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
+  }
+  if (patch.privateReplyReview !== undefined) {
+    bot.config.privateReplyReview = normalizePrivateReplyReviewConfig(patch.privateReplyReview);
   }
   if (patch.thinkingCard !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -423,6 +442,7 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `privateReplyReview=${r.result.privateReplyReview.enabled}/${r.result.privateReplyReview.audience}/${r.result.privateReplyReview.fallback}/${r.result.privateReplyReview.expireHours}h ` +
     `thinkingCard=${r.result.thinkingCard} thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +

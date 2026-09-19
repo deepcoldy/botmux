@@ -234,6 +234,7 @@ describe('Riff worker session environment', () => {
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
             BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+            BOTMUX_PRIVATE_REPLY_REVIEW: JSON.stringify({ enabled: false, audience: 'requester', fallback: 'dm', expireHours: 24 }),
           },
         },
         prompt: 'verify remote session environment',
@@ -260,6 +261,12 @@ describe('Riff worker session environment', () => {
           layout: false,
           theme: 'minimal',
           layoutTags: { blocked: '请处理' },
+        },
+        privateReplyReview: {
+          enabled: true,
+          audience: 'allowedUsers',
+          fallback: 'drop',
+          expireHours: 8,
         },
       };
       child.send(init);
@@ -289,6 +296,12 @@ describe('Riff worker session environment', () => {
       expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
         enabled: true,
         buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
+      });
+      expect(JSON.parse(request.config?.env?.BOTMUX_PRIVATE_REPLY_REVIEW)).toEqual({
+        enabled: true,
+        audience: 'allowedUsers',
+        fallback: 'drop',
+        expireHours: 8,
       });
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');

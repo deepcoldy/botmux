@@ -50,6 +50,7 @@ node -e '
       MOJO_BLOCK_ONLY: process.env.MOJO_BLOCK_ONLY,
       BOTMUX_SESSION_ID: process.env.BOTMUX_SESSION_ID,
       BOTMUX_REPLY_STYLE: process.env.BOTMUX_REPLY_STYLE,
+      BOTMUX_PRIVATE_REPLY_REVIEW: process.env.BOTMUX_PRIVATE_REPLY_REVIEW,
       AGENT_LOCAL_DAEMON: process.env.AGENT_LOCAL_DAEMON,
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
       WRAPPER_MARK: process.env.WRAPPER_MARK,
@@ -363,6 +364,12 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
         model: 'gpt-5.5-2026-04-24',
         env: { PER_BOT_TOKEN: 'per-bot-value' },
         replyStyle: { recipes: false, layout: false, theme: 'minimal' },
+        privateReplyReview: {
+          enabled: true,
+          audience: 'allowedUsers',
+          fallback: 'drop',
+          expireHours: 8,
+        },
         backendConfig: { cloud: true, env: { MOJO_BLOCK_ONLY: 'mojo-block-value' } },
       },
     });
@@ -381,6 +388,12 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       recipes: false,
       layout: false,
       theme: 'minimal',
+    });
+    expect(JSON.parse(invocation.env.BOTMUX_PRIVATE_REPLY_REVIEW ?? '')).toEqual({
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 8,
     });
     // cloud=true (localDaemon unset) is the fully-remote shape — no host daemon.
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');

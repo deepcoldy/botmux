@@ -244,6 +244,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `doneReactionEmoji` | Feishu emoji_type for the "done" reaction in card-off sessions; `undefined` = default `DONE` (✅). Set it equal to `receivedReactionEmoji` to keep the marker unchanged on turn-end — handy for CLIs whose idle detection can fire early (e.g. Pi), avoiding a premature, misleading ✅ |
 | `writableTerminalLinkInCard` | When `true`, the card body directly embeds a **writable** terminal link (with token, anyone who can see the card can operate it); by default it's hidden behind a "Get write permission" button and sent privately to whoever clicks. Meaningless when `disableStreamingCard` is enabled |
 | `privateCard` | When `true`, `/card` uses an ephemeral private card visible only to `allowedUsers` (talk grantees and the bare triggerer don't receive it), only effective in plain `group` chats, and cannot live-update. Only affects the `/card` command itself |
+| `privateReplyReview` | Final-reply review configuration, default off. `{ "enabled": true, "audience": "requester" \| "owners" \| "allowedUsers", "fallback": "dm" \| "public" \| "drop", "expireHours": 24 }`. When enabled, ordinary final replies in group/topic chats are first sent privately to reviewers; a reviewer must click "Publish to chat" before Botmux posts the answer to the original target. It only gates final replies, not live status cards, CoT, or manual `/card`; p2p chats keep the existing direct-reply behavior |
 
 ## Prompt injection
 

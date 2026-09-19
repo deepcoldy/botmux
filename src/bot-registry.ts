@@ -42,6 +42,7 @@ import {
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { normalizePrivateReplyReviewConfig, type PrivateReplyReviewConfig } from './services/private-reply-review-config.js';
 import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
@@ -2019,6 +2020,15 @@ export interface BotConfig {
    */
   privateCard?: boolean;
   /**
+   * Oncall-oriented final-answer review gate. When enabled, ordinary final
+   * replies are first sent as a private ephemeral/DM review card to the configured
+   * audience; only an authorized card click republishes the answer visibly to the
+   * original chat/thread. Scoped to final answers (`botmux send --response-kind
+   * final` and daemon transcript fallback); progress messages, live status cards
+   * and manual `/card` remain controlled by their own switches.
+   */
+  privateReplyReview?: PrivateReplyReviewConfig;
+  /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
    * reuses that sibling's workingDir and skips its own repo-selection card.
@@ -3779,6 +3789,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      privateReplyReview: normalizePrivateReplyReviewConfig(entry.privateReplyReview),
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

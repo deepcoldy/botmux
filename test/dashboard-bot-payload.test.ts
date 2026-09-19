@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard', 'privateReplyReview',
       'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -115,6 +115,19 @@ describe('dashboard bot payload helpers', () => {
 
     // Never in the public summary — it names which credential boundary a bot runs.
     expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('triggerUserAuth');
+  });
+
+  it('normalizes private reply review only in private Bot Defaults payloads', () => {
+    const privateReplyReview = {
+      enabled: true,
+      audience: 'allowedUsers',
+      fallback: 'drop',
+      expireHours: 6,
+    };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { privateReplyReview })).toMatchObject({ privateReplyReview });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { privateReplyReview: { enabled: false } }))
+      .toMatchObject({ privateReplyReview: { enabled: false, audience: 'requester', fallback: 'dm', expireHours: 24 } });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('privateReplyReview');
   });
 
   it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {

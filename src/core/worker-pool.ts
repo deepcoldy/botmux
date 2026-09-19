@@ -111,6 +111,8 @@ import { RestartCoordinator, type RestartObserver } from './restart-coordinator.
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { stagePrivateReplyForReview } from '../services/private-reply-review.js';
+import { resolvedPrivateReplyReviewConfig } from '../services/private-reply-review-config.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -11439,7 +11441,9 @@ export function forkWorker(
   // Send init config — use per-bot settings
   const runtimeIdentity = runtimeBuildIdentity();
   const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
+  const privateReplyReview = resolvedPrivateReplyReviewConfig(botCfg.privateReplyReview);
   ds.feedbackPolicy = feedbackPolicy;
+  ds.privateReplyReview = privateReplyReview;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -11573,6 +11577,7 @@ export function forkWorker(
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
     feedback: feedbackPolicy,
+    privateReplyReview: privateReplyReview.enabled ? privateReplyReview : undefined,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
     // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
@@ -16013,6 +16018,17 @@ function deliverFinalOutput(
       // no human recipient; `requester` audience still needs the recipient to be
       // clickable. Never re-derive an owner here — the ownerless session stays
       // ownerless (no @-loop back to the alerting bot).
+      const privateReplyReview = ds.privateReplyReview;
+      const privateReplyReviewEnabled = privateReplyReview?.enabled === true;
+      const privateReplyReviewMayGateFinal = privateReplyReviewEnabled
+        && ds.chatType !== 'p2p'
+        && !managedReceiver
+        && !imOrigin
+        && !listenerOutputOwner
+        && !msg.codexAppSettlement;
+      if (feedbackPolicy && privateReplyReviewMayGateFinal) {
+        feedbackPolicy = undefined;
+      }
       const feedback = feedbackPolicy
         && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
         ? { policy: feedbackPolicy }
@@ -16175,6 +16191,49 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
+      const privateReplyReviewAppliesToFinal = privateReplyReviewMayGateFinal && !preparedListenerReply;
+      if (privateReplyReviewAppliesToFinal) {
+        const reviewPlacement = frozenReplyTarget && !managedReceiver
+          ? frozenReplyTarget.mode === 'plain'
+            ? { mode: 'plain' as const, chatId: frozenReplyTarget.chatId }
+            : frozenReplyTarget.mode === 'thread'
+              ? { mode: 'thread' as const, rootMessageId: frozenReplyTarget.rootMessageId, replyInThread: true as const }
+              : { mode: 'reply' as const, rootMessageId: frozenReplyTarget.rootMessageId, replyInThread: false as const }
+          : ds.scope === 'chat'
+            ? { mode: 'plain' as const, chatId: ds.chatId }
+            : { mode: 'thread' as const, rootMessageId: sessionAnchorId(ds), replyInThread: true as const };
+        const review = await stagePrivateReplyForReview({
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          chatType: ds.chatType,
+          sessionId: ds.session.sessionId,
+          turnId: msg.replyTurnId ?? msg.turnId,
+          ...(recipientOpenId ?? ds.session.ownerOpenId ? { requesterOpenId: (recipientOpenId ?? ds.session.ownerOpenId)! } : {}),
+          placement: reviewPlacement,
+          msgType: canonicalOutput.msgType as 'interactive' | 'post' | 'text',
+          content: canonicalOutput.content,
+          idempotencySeed: bridgeFinalOutputUuid(ds, msg),
+          reviewConfig: privateReplyReview,
+          locale: localeForBot(ds.larkAppId),
+        });
+        if (review.staged) {
+          const messageId = review.privateMessageIds[0] ?? review.publishId;
+          if (!isStillOwned()) { onComplete?.(true); return; }
+          if (msg.turnId.startsWith('mlrp_turn_')) {
+            markMessageListenerRunPreviewReplied(msg.turnId, {
+              sessionId: ds.session.sessionId,
+              replyMessageId: messageId,
+            });
+          }
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.info(`[${t}] Bridge final_output staged for private review (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`);
+          onComplete?.(true);
+          return;
+        }
+        if (review.reason !== 'disabled' && review.reason !== 'public_fallback') {
+          throw new Error(`private reply review staging failed: ${review.reason}`);
+        }
+      }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge') && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
         await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
           logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
@@ -16540,6 +16599,8 @@ export function forkAdoptWorker(
   // transcript-backed CLIs.
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  const privateReplyReview = resolvedPrivateReplyReviewConfig(botCfg.privateReplyReview);
+  ds.privateReplyReview = privateReplyReview;
 
   initMsg = {
     type: 'init',
@@ -16588,6 +16649,7 @@ export function forkAdoptWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    privateReplyReview: privateReplyReview.enabled ? privateReplyReview : undefined,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,

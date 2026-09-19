@@ -29,6 +29,7 @@ import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import { normalizePrivateReplyReviewConfig } from './private-reply-review-config.js';
 import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
@@ -102,6 +103,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
+  { key: 'privateReplyReview', configKey: 'privateReplyReview', kind: 'json', effect: 'immediate', clearable: true, hint: 'oncall 最终回复审核发布 JSON；enabled=true 后最终回答先私密给审核人，点击公开后才发到原群/话题；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex 普通飞书对话' },
   { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
@@ -688,6 +690,11 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           if ((parsed as { enabled?: unknown }).enabled !== true) return { ok: true, value: { enabled: false } };
           try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
           catch { return { ok: false, reason: 'invalid_json' }; }
+        }
+        if (spec.configKey === 'privateReplyReview') {
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+          const normalized = normalizePrivateReplyReviewConfig(parsed);
+          return normalized ? { ok: true, value: normalized } : { ok: true, value: null };
         }
         if (spec.configKey === 'env') {
           // Must be a JSON object; sanitize to valid env keys + primitive values.

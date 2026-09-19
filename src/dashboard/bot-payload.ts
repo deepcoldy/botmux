@@ -8,6 +8,7 @@ import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
+import { resolvedPrivateReplyReviewConfig } from '../services/private-reply-review-config.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -142,6 +143,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     codexAppCleanInput: j?.codexAppCleanInput === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    privateReplyReview: resolvedPrivateReplyReviewConfig(j?.privateReplyReview),
     thinkingCard: j?.thinkingCard !== false,
     thinkingCardToolResult: j?.thinkingCardToolResult !== false,
     senderTag: j?.senderTag !== false,
