@@ -5489,8 +5489,16 @@ type FrozenCommandRouteResult =
   | { kind: 'handled' }
   | { kind: 'fallback'; prompt: string };
 
-function frozenCommandRawArgs(commandContent: string): string {
-  const match = /^\/\S+(?:\s+([\s\S]*))?$/u.exec(commandContent.trim());
+function frozenCommandRawArgs(
+  commandContent: string,
+  mentions: readonly LarkMention[] = [],
+  self: { botOpenId?: string; larkAppId?: string } = {},
+): string {
+  // Lark may place the target bot after the command (`/report 7 @bot`) as well
+  // as before it. Only this bot's mention is routing metadata; other member
+  // mentions remain business arguments and must not be silently removed.
+  const mentionFree = stripBotMentions(commandContent, mentions, self);
+  const match = /^\/\S+(?:\s+([\s\S]*))?$/u.exec(mentionFree.trim());
   return match?.[1] ?? '';
 }
 
@@ -5504,6 +5512,7 @@ async function routeFrozenCommand(input: {
   senderOpenId?: string;
   senderUnionId?: string;
   senderIsBot?: boolean;
+  mentions?: readonly LarkMention[];
   reply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
 }): Promise<FrozenCommandRouteResult> {
   if (!input.workingDir) {
@@ -5520,7 +5529,11 @@ async function routeFrozenCommand(input: {
   }
 
   if (input.cmd === '/freeze') {
-    const args = frozenCommandRawArgs(input.commandContent).trim();
+    const self = getBot(input.larkAppId);
+    const args = frozenCommandRawArgs(input.commandContent, input.mentions, {
+      botOpenId: self.botOpenId,
+      larkAppId: input.larkAppId,
+    }).trim();
     if (args === 'list') {
       const rows = listFrozenCommandSnapshots(input.workingDir);
       const visible = rows.map((row) => {
@@ -5570,7 +5583,11 @@ async function routeFrozenCommand(input: {
   }
 
   const definition = lookup.snapshot.definition;
-  const rawArgs = frozenCommandRawArgs(input.commandContent);
+  const self = getBot(input.larkAppId);
+  const rawArgs = frozenCommandRawArgs(input.commandContent, input.mentions, {
+    botOpenId: self.botOpenId,
+    larkAppId: input.larkAppId,
+  });
   const invocationNow = new Date();
   let renderedSql: string | undefined;
   try {
@@ -17576,6 +17593,7 @@ async function resolvePinnedWorkingDir(ctx: {
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 export const __testOnly_resolveFrozenCommandWorkingDir = resolveFrozenCommandWorkingDir;
+export const __testOnly_frozenCommandRawArgs = frozenCommandRawArgs;
 // Production message routes (function declarations hoist, so the references
 // are valid here). Exposed for route-level regression tests — e.g. asserting
 // that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
@@ -21855,6 +21873,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         senderOpenId,
         senderUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
+        mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,
       });
       if (frozen.kind === 'handled') return;
@@ -24032,6 +24051,7 @@ async function handleThreadReplyAdmitted(
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
+        mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,
       });
       if (frozen.kind === 'handled') return;

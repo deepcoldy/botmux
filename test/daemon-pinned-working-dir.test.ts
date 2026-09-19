@@ -57,6 +57,18 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
+  it('strips only the current bot mention from frozen-command arguments', async () => {
+    const { daemon } = await loadFreshModules();
+    const self = { botOpenId: 'ou_self', larkAppId: 'cli_self' };
+    const selfMentions = [{ key: '@_user_1', name: 'Current Bot', openId: 'ou_self' }];
+    const otherMentions = [{ key: '@_user_2', name: 'Other Member', openId: 'ou_other' }];
+
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11 @Current Bot', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('@Current Bot /fc验收 11', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11 @Other Member', otherMentions, self)).toBe('11 @Other Member');
+  });
+
   it('looks up frozen commands without auto-binding a defaultOncall chat', async () => {
     const { botRegistry, daemon } = await loadFreshModules();
     const oncallDir = tempDir('frozen-read-only-oncall');
