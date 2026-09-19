@@ -42,6 +42,7 @@ import {
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { resolveCurrentTurnProvenance } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
@@ -3721,6 +3722,7 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
@@ -5466,7 +5468,7 @@ async function postSessionCliIpc(
 async function cmdContinuation(argv: string[]): Promise<void> {
   const action = argv[0] ?? '';
   if (!['start', 'await-user', 'cancel'].includes(action)) {
-    console.error('用法: botmux continuation start --readonly [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
+    console.error('用法: botmux continuation start [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
     process.exitCode = 2;
     return;
   }
@@ -5474,11 +5476,6 @@ async function cmdContinuation(argv: string[]): Promise<void> {
   if (!ctx?.sessionId || !ctx.turnId) {
     console.error('✗ continuation 只能由当前 BotMux 会话的活动轮次调用');
     process.exitCode = 1;
-    return;
-  }
-  if (action === 'start' && !argv.includes('--readonly')) {
-    console.error('✗ 第一阶段只支持显式 --readonly 的只读长程任务');
-    process.exitCode = 2;
     return;
   }
   const ttlRaw = argValue(argv, '--ttl-minutes');
@@ -5508,7 +5505,7 @@ async function cmdContinuation(argv: string[]): Promise<void> {
     action,
     originTurnId: ctx.turnId,
     ...(ctx.dispatchAttempt !== undefined ? { originDispatchAttempt: ctx.dispatchAttempt } : {}),
-    ...(action === 'start' ? { readonly: true } : {}),
+    ...(action === 'start' && argv.includes('--readonly') ? { readonly: true } : {}),
     ...(ttlMinutes !== undefined ? { ttlMs: Math.round(ttlMinutes * 60_000) } : {}),
     ...(maxContinuations !== undefined ? { maxContinuations } : {}),
   });
@@ -6611,9 +6608,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
-  continuation start --readonly
-                   （实验性）为当前 TraeX 普通会话显式开启一次只读长程任务续跑；
-                   可加 --ttl-minutes N / --max-continuations N，另有 await-user / cancel
+  continuation start
+                   （实验性）功能开关启用时，TraeX 普通用户轮默认自动开启授权继承续跑；
+                   start 可在取消后重新开启，并设置 --ttl-minutes N / --max-continuations N，
+                   另有 await-user / cancel
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -6776,6 +6774,7 @@ function findAncestorSessionId(): string | null {
 
 interface CurrentSession {
   sessionId: string;
+  turnId?: string;
   chatId: string;
   rootMessageId: string;
   workingDir?: string;
@@ -6783,6 +6782,7 @@ interface CurrentSession {
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
   ownerOpenId?: string;
+  ownerUnionId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -6801,6 +6801,89 @@ function detectCurrentSession(): CurrentSession | null {
     chatType: s.chatType,
     scope: s.scope,
     ownerOpenId: s.ownerOpenId,
+    ownerUnionId: s.ownerUnionId,
+  };
+}
+
+/**
+ * Resolve the session whose live CLI process is an authenticated ancestor.
+ *
+ * Routing commands may deliberately fall back to BOTMUX_SESSION_ID after a
+ * detached/background launch, but task creator identity is authority: it must
+ * never come from an environment-selected session row. Keep this lookup
+ * marker-only so changing BOTMUX_SESSION_ID cannot borrow another session's
+ * open_id/union_id.
+ */
+async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | null> {
+  const dataDir = resolveDataDir();
+  let provenance: {
+    sessionId: string;
+    turnId: string;
+    callerOpenId: string;
+    larkAppId: string;
+  } | null = null;
+  try {
+    provenance = resolveCurrentTurnProvenance({
+      dataDir,
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+  } catch (hostError) {
+    // Linux bwrap deliberately hides the host PID namespace and shared marker
+    // directory. If this exact turn has a rotating managed-origin capability,
+    // exchange it for a daemon-written host proof instead of treating the
+    // absence of host ancestors as a detached call. A sandbox fixture/legacy
+    // session without that capability fails closed; a claimed BotMux session
+    // must never degrade to a standalone OWNERLESS task.
+    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
+    if (!isolated?.originChannelId) throw hostError;
+    const attested = await attestManagedOrigin({
+      context: {
+        sessionId: isolated.sessionId,
+        channelId: isolated.originChannelId,
+        capability: isolated.capability,
+        dataDir,
+        ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
+        ...(isolated.ipcPortFallback !== undefined
+          ? { ipcPortFallback: isolated.ipcPortFallback }
+          : {}),
+      },
+      resolveIpcPort: (appId) => {
+        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+    provenance = {
+      sessionId: attested.sessionId,
+      turnId: attested.turnId,
+      callerOpenId: attested.callerOpenId,
+      larkAppId: attested.larkAppId,
+    };
+    void hostError;
+  }
+  if (!provenance) return null;
+  const s = loadSessions().get(provenance.sessionId);
+  if (!s || s.status !== 'active') return null;
+  if (provenance.larkAppId !== s.larkAppId) return null;
+  // The persisted union_id belongs to the session owner. Only attach it when
+  // the authenticated caller for THIS exact turn is that same owner; another
+  // allowed participant in a shared session must not inherit the owner's user
+  // identity. Scheduled child creation passes because its provenance resolves
+  // back to the already-verified task creator.
+  if (!s.ownerOpenId || provenance.callerOpenId !== s.ownerOpenId) {
+    throw new Error('current turn caller does not match the session owner');
+  }
+  return {
+    sessionId: s.sessionId,
+    turnId: provenance.turnId,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    workingDir: s.workingDir,
+    larkAppId: s.larkAppId,
+    chatType: s.chatType,
+    scope: s.scope,
+    ownerOpenId: s.ownerOpenId,
+    ownerUnionId: s.ownerUnionId,
   };
 }
 
@@ -7294,7 +7377,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   if (sub === 'add') {
     const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -7305,6 +7388,16 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = detectCurrentSession();
+    let authenticatedCur = await detectAuthenticatedCurrentSession();
+    const explicitTaskId = argValue(rest, '--id');
+    if (rest.includes('--id') && !explicitTaskId) {
+      console.error('--id 需要一个 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
+    if (explicitTaskId !== undefined && !/^[0-9a-f]{8}$/.test(explicitTaskId)) {
+      console.error('--id 只接受 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7401,7 +7494,24 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     let task;
     try {
+      // Identity-bearing task fields are a write authority. Re-attest at the
+      // effect boundary so a turn rotation cannot carry an earlier proof into
+      // a later schedule write. If the first lookup was ownerless, do not
+      // opportunistically gain an identity at this later point.
+      if (authenticatedCur) {
+        const fresh = await detectAuthenticatedCurrentSession();
+        if (!fresh
+          || fresh.sessionId !== authenticatedCur.sessionId
+          || fresh.turnId !== authenticatedCur.turnId
+          || fresh.larkAppId !== authenticatedCur.larkAppId
+          || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
+          || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
+          throw new Error('schedule creator provenance changed before write');
+        }
+        authenticatedCur = fresh;
+      }
       task = scheduler.addTask({
+        id: explicitTaskId,
         name,
         schedule: rawSchedule,
         parsed,
@@ -7419,7 +7529,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         // Stamp the creator (sandboxed session owner) so the task's scheduled
         // turns can authenticate workflow commands as them. The daemon
         // re-checks the owner is still allowed at every run mutation.
-        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
+        // Creator identity is authority-bearing. It comes only from the
+        // procStart-bound live ancestor marker, never BOTMUX_SESSION_ID or
+        // BOTMUX_OWNER_OPEN_ID environment fallbacks. The app equality guard
+        // prevents an authenticated session from lending app-scoped open_id to
+        // an explicitly selected different bot store.
+        ownerOpenId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerOpenId
+          : undefined,
+        ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerUnionId
+          : undefined,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
@@ -7513,7 +7633,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         let task = scheduleStore.getTask(id);
         if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
         if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
-        scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
+        const requested = scheduleStore.requestRunNow(id);
+        if (!requested.ok) {
+          console.error(requested.error === 'already_running'
+            ? `任务 ${id} 正在运行，未重复触发`
+            : `未找到任务 ${id}`);
+          process.exit(1);
+        }
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
       }
       break;

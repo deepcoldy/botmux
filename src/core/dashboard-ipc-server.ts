@@ -1037,6 +1037,8 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -1548,18 +1550,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
-  if (readonlyOrigin
-    && readonlyOrigin.workerGeneration === ds.workerGeneration
-    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
-    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
-    return nativeSubagentRuntimeJsonRes({
-      req, res, sessionId: params.sessionId, status: 200,
-      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
-      ...responseAuth,
-    });
-  }
-
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
   catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
@@ -2278,13 +2268,13 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
   }
 });
 
-/** Explicit control plane for one read-only long-running task lease. The
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
  * rotating current-turn capability binds every action to the calling session
  * and turn; the daemon owns all persisted state and timers. */
 ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
   type ContinuationRequestBody = {
     action?: unknown;
-    readonly?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
     ttlMs?: unknown;
     maxContinuations?: unknown;
   } & Record<string, unknown>;
@@ -2299,14 +2289,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
     return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
   }
   if (!ensureReadonlyTaskContinuationAttached(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
   }
   try {
     let state;
     if (body.action === 'start') {
-      if (body.readonly !== true) {
-        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
-      }
       if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
         return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
       }
@@ -2321,17 +2308,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
       }
       const generation = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
         || ds.session.workerGeneration !== generation
         || proof?.workerGeneration !== generation) {
-        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
         ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
         ...(typeof body.maxContinuations === 'number'
           ? { maxContinuations: body.maxContinuations }
@@ -3943,7 +3942,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';

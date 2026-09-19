@@ -11,6 +11,12 @@ import { disposeReadonlyTaskContinuation } from '../src/services/readonly-task-c
 
 const CAP = 'ab12cd34'.repeat(8);
 const SESSION_ID = 's-readonly-continuation';
+const TRUSTED_CALLER = {
+  requestUserOpenId: 'ou_owner',
+  requestUserUnionId: 'on_owner',
+  requestLarkAppId: 'app-1',
+  senderType: 'user' as const,
+};
 let handle: IpcServerHandle | null = null;
 
 function session(overrides: Record<string, unknown> = {}) {
@@ -24,10 +30,15 @@ function session(overrides: Record<string, unknown> = {}) {
       ...((overrides.session as Record<string, unknown> | undefined) ?? {}),
     },
     managedTurnOrigin: { capability: CAP, turnId: 'om_original' },
+    activeInteractiveTurn: { turnId: 'om_original', caller: TRUSTED_CALLER },
+    taskContinuationRpcProof: {
+      workerGeneration: 3,
+      rpcGeneration: 'rpc-proof',
+      checkedAt: 1,
+    },
     worker,
     workerReady: true,
     workerGeneration: 3,
-    readonlyContinuationRpcProof: { workerGeneration: 3, rpcGeneration: 'rpc-proof', checkedAt: 1 },
     larkAppId: 'app-1',
     chatId: 'oc-chat',
     chatType: 'group',
@@ -55,6 +66,7 @@ afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   disposeReadonlyTaskContinuation({ sessionId: SESSION_ID });
   vi.restoreAllMocks();
@@ -62,7 +74,7 @@ afterEach(async () => {
 
 describe('POST /api/sessions/:sessionId/continuation', () => {
   it('starts, hands off to the user, and cancels only the current ordinary TraeX turn', async () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId: 'traex' } } as any);
@@ -70,7 +82,6 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
 
     const started = await post({
       action: 'start',
-      readonly: true,
       ttlMs: 120_000,
       maxContinuations: 2,
     });
@@ -82,6 +93,9 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
         currentTurnId: 'om_original',
         status: 'active',
         maxContinuations: 2,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: TRUSTED_CALLER,
       },
     });
 
@@ -89,7 +103,7 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
     expect(awaiting.status).toBe(200);
     expect(await awaiting.json()).toMatchObject({ ok: true, state: { status: 'awaiting_user' } });
 
-    const restarted = await post({ action: 'start', readonly: true });
+    const restarted = await post({ action: 'start' });
     expect(restarted.status).toBe(200);
     const cancelled = await post({ action: 'cancel' });
     expect(cancelled.status).toBe(200);
@@ -97,16 +111,16 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
   });
 
   it('rejects missing capability, stale turn, synthetic turn, and dispatch attempts', async () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId: 'traex' } } as any);
     vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
 
-    const missingCapability = await post({ originCapability: undefined, action: 'start', readonly: true });
+    const missingCapability = await post({ originCapability: undefined, action: 'start' });
     expect(missingCapability.status).toBe(403);
 
-    const staleTurn = await post({ originTurnId: 'om_stale', action: 'start', readonly: true });
+    const staleTurn = await post({ originTurnId: 'om_stale', action: 'start' });
     expect(staleTurn.status).toBe(409);
     expect(await staleTurn.json()).toMatchObject({ ok: false, error: 'active_turn_required' });
 
@@ -114,7 +128,6 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
     const synthetic = await post({
       originTurnId: 'bmx-synthetic',
       action: 'start',
-      readonly: true,
     });
     expect(synthetic.status).toBe(409);
     expect(await synthetic.json()).toMatchObject({ ok: false, error: 'ordinary_user_turn_required' });
@@ -124,10 +137,23 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
       originTurnId: 'om_attempt',
       originDispatchAttempt: 2,
       action: 'start',
-      readonly: true,
     });
     expect(retryAttempt.status).toBe(409);
     expect(await retryAttempt.json()).toMatchObject({ ok: false, error: 'ordinary_user_turn_required' });
+  });
+
+  it('rejects a start when the live turn has no daemon-authenticated caller to inherit', async () => {
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    const ds = session({ activeInteractiveTurn: undefined });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId: 'traex' } } as any);
+
+    const response = await post({ action: 'start' });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      ok: false, error: 'continuation_authority_required',
+    });
   });
 
   it('is unavailable by default and for non-TraeX sessions', async () => {
@@ -136,30 +162,30 @@ describe('POST /api/sessions/:sessionId/continuation', () => {
     const botSpy = vi.spyOn(botRegistry, 'getBot')
       .mockReturnValue({ config: { cliId: 'traex' } } as any);
 
-    const disabled = await post({ action: 'start', readonly: true });
+    const disabled = await post({ action: 'start' });
     expect(disabled.status).toBe(409);
     expect(await disabled.json()).toMatchObject({
-      ok: false, error: 'readonly_continuation_unavailable',
+      ok: false, error: 'continuation_unavailable',
     });
 
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     botSpy.mockReturnValue({ config: { cliId: 'codex' } } as any);
     ds.session.cliId = 'codex';
-    const nonTraex = await post({ action: 'start', readonly: true });
+    const nonTraex = await post({ action: 'start' });
     expect(nonTraex.status).toBe(409);
     expect(await nonTraex.json()).toMatchObject({
-      ok: false, error: 'readonly_continuation_unavailable',
+      ok: false, error: 'continuation_unavailable',
     });
   });
 
   it('returns non-200 and retains a failed fence when cancel persistence fails', async () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId: 'traex' } } as any);
     const persist = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
 
-    expect((await post({ action: 'start', readonly: true })).status).toBe(200);
+    expect((await post({ action: 'start' })).status).toBe(200);
     persist.mockImplementation(() => { throw new Error('session store unavailable'); });
     const cancelled = await post({ action: 'cancel' });
 

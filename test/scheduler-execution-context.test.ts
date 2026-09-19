@@ -5,7 +5,10 @@ const mocks = vi.hoisted(() => ({
   listTasks: vi.fn<() => ScheduledTask[]>(),
   getTask: vi.fn<(id: string) => ScheduledTask | undefined>(),
   updateTask: vi.fn(),
+  claimRun: vi.fn(),
+  requestRunNow: vi.fn(),
   markRun: vi.fn(),
+  markSkipped: vi.fn(),
   removeTask: vi.fn(),
   createTask: vi.fn(),
   getScheduleScope: vi.fn(() => 'cli_app'),
@@ -20,7 +23,10 @@ vi.mock('../src/services/schedule-store.js', () => ({
   listTasks: mocks.listTasks,
   getTask: mocks.getTask,
   updateTask: mocks.updateTask,
+  claimRun: mocks.claimRun,
+  requestRunNow: mocks.requestRunNow,
   markRun: mocks.markRun,
+  markSkipped: mocks.markSkipped,
   removeTask: mocks.removeTask,
   createTask: mocks.createTask,
   getScheduleScope: mocks.getScheduleScope,
@@ -51,6 +57,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   removeTask,
   runNow,
+  runTaskNow,
   setExecuteCallback,
   startScheduler,
   stopScheduler,
@@ -81,6 +88,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.listTasks.mockReturnValue([]);
   mocks.getTask.mockReturnValue(task);
+  mocks.claimRun.mockImplementation((id, claim) => {
+    const current = mocks.getTask(id);
+    return current
+      ? { ok: true, task: { ...current, ...claim, lastStatus: 'running' } }
+      : { ok: false, error: 'not_found' };
+  });
+  mocks.requestRunNow.mockReturnValue({ ok: true });
   mocks.removeTask.mockReturnValue(true);
 });
 
@@ -103,8 +117,9 @@ describe('scheduler execution context', () => {
       trigger: 'dashboard',
       startedAt: '2026-08-31T00:01:00.000Z',
     });
-    expect(mocks.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
+    expect(mocks.claimRun).toHaveBeenCalledWith(task.id, expect.objectContaining({
       lastRunAt: received!.startedAt,
+      lastRunId: received!.runId,
     }));
     const firedPayload = mocks.emitHook.mock.calls.find(([name]) => name === 'schedule.fired')?.[1];
     expect(firedPayload).not.toHaveProperty('chatIds');
@@ -123,9 +138,86 @@ describe('scheduler execution context', () => {
       trigger: 'scheduler',
       startedAt: '2026-08-31T00:01:05.000Z',
     });
-    expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
+    expect(mocks.claimRun).toHaveBeenCalledWith(task.id, {
       lastRunAt: received!.startedAt,
+      nextRunAt: undefined,
+      lastRunId: received!.runId,
     });
+  });
+
+  it('claims a one-shot before dispatch so a long model turn cannot fire twice', async () => {
+    const liveTask = structuredClone(task);
+    mocks.listTasks.mockImplementation(() => [structuredClone(liveTask)]);
+    mocks.claimRun.mockImplementation((id: string, claim: Partial<ScheduledTask>) => {
+      if (id !== liveTask.id || liveTask.lastStatus === 'running') {
+        return { ok: false, error: 'already_running' };
+      }
+      Object.assign(liveTask, claim, { lastStatus: 'running' });
+      return { ok: true, task: structuredClone(liveTask) };
+    });
+    const execute = vi.fn(() => new Promise<void>(() => {}));
+    setExecuteCallback(execute);
+
+    startScheduler();
+    await vi.advanceTimersByTimeAsync(65_000);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(liveTask).toMatchObject({
+      enabled: true,
+      lastRunAt: '2026-08-31T00:01:05.000Z',
+      lastStatus: 'running',
+      lastRunId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    });
+    expect(liveTask.nextRunAt).toBeUndefined();
+  });
+
+  it('rejects a second Dashboard run while the first callback is pending', async () => {
+    const liveTask = structuredClone(task);
+    mocks.getTask.mockImplementation(() => structuredClone(liveTask));
+    mocks.claimRun.mockImplementation((_id: string, claim: Partial<ScheduledTask>) => {
+      if (liveTask.lastStatus === 'running') {
+        return { ok: false, error: 'already_running' };
+      }
+      Object.assign(liveTask, claim, { lastStatus: 'running' });
+      return { ok: true, task: structuredClone(liveTask) };
+    });
+    const execute = vi.fn(() => new Promise<void>(() => {}));
+    setExecuteCallback(execute);
+
+    expect(runNow(task.id)).toEqual({ ok: true });
+    expect(runNow(task.id)).toEqual({ ok: false, error: 'already_running' });
+    await vi.runAllTicks();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-arm a task that is already running through the chat path', () => {
+    mocks.requestRunNow.mockReturnValue({ ok: false, error: 'already_running' });
+
+    expect(runTaskNow(task.id)).toBe(false);
+    expect(mocks.requestRunNow).toHaveBeenCalledWith(task.id);
+  });
+
+  it('settles a persisted running run as interrupted before startup scheduling', () => {
+    const interrupted: ScheduledTask = {
+      ...task,
+      lastRunAt: '2026-08-31T00:00:30.000Z',
+      nextRunAt: undefined,
+      lastStatus: 'running',
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+    };
+    mocks.listTasks.mockReturnValue([interrupted]);
+
+    startScheduler();
+
+    expect(mocks.markRun).toHaveBeenCalledWith(
+      interrupted.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      interrupted.lastRunId,
+    );
   });
 
   it('keeps chatId as the primary fired-hook target and adds chatIds only for fan-out', async () => {

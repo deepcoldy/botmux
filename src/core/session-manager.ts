@@ -4121,6 +4121,14 @@ export async function executeScheduledTask(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
+    if (scheduledTrustedCaller) {
+      // A fresh scheduled session is owned by the authenticated task creator.
+      // Persist both ids so an in-turn `botmux schedule add` can create a child
+      // task with the same tenant-stable identity instead of degrading to an
+      // ownerOpenId-only legacy task.
+      session.ownerOpenId = scheduledTrustedCaller.requestUserOpenId;
+      session.ownerUnionId = scheduledTrustedCaller.requestUserUnionId;
+    }
     if (deferredFreshTopic) {
       session.deferredScheduleRun = {
         taskId: task.id,

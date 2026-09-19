@@ -80,18 +80,13 @@ export interface DaemonSession {
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
-  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
-  readonlyContinuationRpcProof?: {
+  /** Liveness proof for the exact worker + RPC generation. This proves only
+   * that continuation delivery will use the same live thread; it grants no
+   * permissions and carries no provider capability assumptions. */
+  taskContinuationRpcProof?: {
     workerGeneration: number;
     rpcGeneration: string;
     checkedAt: number;
-  };
-  /** Exact live synthetic turn whose hook-level native subagent requests must
-   * be denied. Derived only from trusted worker IPC for the current generation. */
-  readonlyContinuationTurnOrigin?: {
-    workerGeneration: number;
-    turnId: string;
-    dispatchAttempt: number;
   };
   larkAppId: string;
   chatId: string;
@@ -396,6 +391,11 @@ export interface DaemonSession {
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
   };
+  /** Daemon-authenticated scheduled creator identities waiting for the worker
+   * to publish the matching managed-turn capability. Keyed by the exact
+   * daemon-minted schedule turn id and never persisted. The worker can name a
+   * turn id but cannot add or change the identity behind it. */
+  scheduledTurnCallers?: Map<string, TrustedCaller>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

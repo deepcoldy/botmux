@@ -8,11 +8,23 @@ import {
   handleReadonlyTaskContinuationTerminal,
   READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE,
   READONLY_TASK_CONTINUATION_PROMPT,
+  TASK_CONTINUATION_CLI_EXIT_CODE,
+  TASK_CONTINUATION_CONNECTION_CODE,
+  TASK_CONTINUATION_ENGINE_DEAD_CODE,
+  TASK_CONTINUATION_RATE_LIMIT_CODE,
+  TASK_CONTINUATION_UPSTREAM_CODE,
   ReadonlyTaskContinuationCoordinator,
   startReadonlyTaskContinuation,
   type ReadonlyTaskContinuationSession,
   type ReadonlyTaskContinuationState,
 } from '../src/services/readonly-task-continuation.js';
+
+const TRUSTED_CALLER = {
+  requestUserOpenId: 'ou_owner',
+  requestUserUnionId: 'on_owner',
+  requestLarkAppId: 'app_test',
+  senderType: 'user' as const,
+};
 
 function state(overrides: Partial<ReadonlyTaskContinuationState> = {}): ReadonlyTaskContinuationState {
   return {
@@ -23,6 +35,9 @@ function state(overrides: Partial<ReadonlyTaskContinuationState> = {}): Readonly
     expiresAt: 61_000,
     maxContinuations: 2,
     continuationsStarted: 0,
+    authorizationMode: 'inherited',
+    startMode: 'explicit',
+    trustedCaller: TRUSTED_CALLER,
     currentWorkerGeneration: 1,
     status: 'active',
     ...overrides,
@@ -60,12 +75,132 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
 
     expect(enqueue).toHaveBeenCalledWith({
       logicalTurnId: 'om_original',
-      turnId: 'bmx-readonly-next',
+      turnId: 'bmx-continuation-next',
       dispatchAttempt: 1,
       prompt: READONLY_TASK_CONTINUATION_PROMPT,
       continuation: 1,
     });
     expect(enqueue.mock.calls[0][0].prompt).not.toContain('original user prompt');
+  });
+
+  it('settles an automatically started original turn on normal completion', () => {
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const automatic = state({ startMode: 'automatic' });
+    coordinator.restore(automatic);
+
+    expect(coordinator.onTerminal(automatic, {
+      turnId: 'om_original',
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'completed', continuationsStarted: 0 });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('settles a persisted lease without a start mode fail-closed on normal completion', () => {
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const persisted = state({ startMode: undefined });
+    coordinator.restore(persisted);
+
+    expect(coordinator.onTerminal(persisted, {
+      turnId: 'om_original',
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'completed', continuationsStarted: 0 });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('keeps a persisted completed synthetic turn resumable without a start mode', () => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => 7);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    const synthetic = state({
+      startMode: undefined,
+      currentTurnId: 'bmx-continuation-one',
+      currentDispatchAttempt: 1,
+      continuationsStarted: 1,
+    });
+    coordinator.restore(synthetic);
+
+    expect(coordinator.onTerminal(synthetic, {
+      turnId: 'bmx-continuation-one',
+      dispatchAttempt: 1,
+      status: 'completed',
+      workerGeneration: 1,
+    })).toMatchObject({ status: 'backoff', continuationsStarted: 1 });
+    expect(timers.length).toBeGreaterThan(1);
+  });
+
+  it('promotes the matching automatic lease when the user explicitly starts continuation', () => {
+    const timers: Array<{ delayMs: number; run: () => void }> = [];
+    const persist = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { timers.push({ delayMs, run }); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue: vi.fn(() => 7),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    coordinator.restore(state({ startMode: undefined }));
+
+    expect(coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 120_000,
+      maxContinuations: 4,
+    })).toMatchObject({
+      startMode: 'explicit',
+      expiresAt: 122_000,
+      maxContinuations: 4,
+    });
+    expect(persist).toHaveBeenCalledOnce();
+    expect(timers.at(-1)?.delayMs).toBe(120_000);
+
+    const backoff = state({
+      startMode: 'automatic',
+      status: 'backoff',
+      nextAttemptAt: 7_000,
+      lastErrorCode: TASK_CONTINUATION_RATE_LIMIT_CODE,
+    });
+    coordinator.restore(backoff);
+    expect(coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: TRUSTED_CALLER,
+    })).toMatchObject({ startMode: 'explicit', lastErrorCode: undefined });
+    expect(timers.at(-1)?.delayMs).toBe(5_000);
   });
 
   it('continues only the exact allowlisted failed terminal', () => {
@@ -77,7 +212,6 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       enqueue: vi.fn(() => 1),
       warn: vi.fn(),
       enabled: () => true,
-      now: () => 2_000,
       now: () => 2_000,
     });
     coordinator.restore(state());
@@ -95,10 +229,158 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     expect(coordinator.onTerminal(ordinaryFailure, {
       turnId: 'om_original',
       status: 'failed',
-      errorCode: 'codex_connection_failed',
+      errorCode: 'business_failure',
       workerGeneration: 1,
     }).status).toBe('failed');
     expect(timers).toHaveLength(3);
+  });
+
+  it.each([
+    READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE,
+    TASK_CONTINUATION_RATE_LIMIT_CODE,
+    TASK_CONTINUATION_CONNECTION_CODE,
+    TASK_CONTINUATION_UPSTREAM_CODE,
+  ])('continues the allowlisted transient failure %s', errorCode => {
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    coordinator.restore(state());
+
+    expect(coordinator.onTerminal(state(), {
+      turnId: 'om_original', status: 'failed', errorCode, workerGeneration: 1,
+    }).status).toBe('backoff');
+  });
+
+  it.each([TASK_CONTINUATION_ENGINE_DEAD_CODE, TASK_CONTINUATION_CLI_EXIT_CODE])(
+    'continues the allowlisted runtime interruption %s',
+    errorCode => {
+      const coordinator = new ReadonlyTaskContinuationCoordinator({
+        schedule: (_delayMs, run) => run,
+        cancel: vi.fn(),
+        persist: vi.fn(),
+        enqueue: vi.fn(() => 1),
+        warn: vi.fn(),
+        enabled: () => true,
+        now: () => 2_000,
+      });
+      coordinator.restore(state());
+
+      expect(coordinator.onTerminal(state(), {
+        turnId: 'om_original', status: 'ambiguous', errorCode, workerGeneration: 1,
+      }).status).toBe('backoff');
+    },
+  );
+
+  it('fails closed for an ambiguous interrupted turn with unknown side effects', () => {
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+    coordinator.restore(state());
+
+    expect(coordinator.onTerminal(state(), {
+      turnId: 'om_original', status: 'ambiguous', errorCode: 'rpc_turn_aborted', workerGeneration: 1,
+    })).toMatchObject({ status: 'failed', lastErrorCode: 'rpc_turn_aborted' });
+  });
+
+  it.each([
+    [TASK_CONTINUATION_CONNECTION_CODE, 5_000],
+    [TASK_CONTINUATION_UPSTREAM_CODE, 5_000],
+    [TASK_CONTINUATION_ENGINE_DEAD_CODE, 5_000],
+    [TASK_CONTINUATION_CLI_EXIT_CODE, 5_000],
+    [TASK_CONTINUATION_RATE_LIMIT_CODE, 15_000],
+  ] as const)('uses bounded backoff for %s', (errorCode, expectedDelayMs) => {
+    const delays: number[] = [];
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { delays.push(delayMs); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+      delayMs: 1_000,
+    });
+    coordinator.restore(state());
+    coordinator.onTerminal(state(), {
+      turnId: 'om_original',
+      status: errorCode === TASK_CONTINUATION_ENGINE_DEAD_CODE
+        || errorCode === TASK_CONTINUATION_CLI_EXIT_CODE ? 'ambiguous' : 'failed',
+      errorCode,
+      workerGeneration: 1,
+    });
+
+    expect(delays.at(-1)).toBe(expectedDelayMs);
+  });
+
+  it('fails visibly instead of widening a pre-upgrade live lease on restore', () => {
+    const warn = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => 2_000,
+    });
+
+    coordinator.restore(state({ authorizationMode: undefined }));
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      lastErrorCode: 'continuation_legacy_lease_not_resumed',
+    }));
+  });
+
+  it('requires a persisted authenticated caller for a new inherited-authority lease', () => {
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+    });
+
+    expect(() => coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      trustedCaller: {} as any,
+    })).toThrow('continuation_authority_required');
+  });
+
+  it('fails visibly when a restored inherited-authority lease lacks its caller', () => {
+    const warn = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => 2_000,
+    });
+
+    coordinator.restore(state({ trustedCaller: undefined }));
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      lastErrorCode: 'continuation_authority_not_resumable',
+    }));
   });
 
   it('waits for worker/RPC readiness without consuming a continuation attempt', () => {
@@ -261,7 +543,12 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       enabled: () => false,
     });
 
-    expect(() => coordinator.start({ turnId: 'om_original', workerGeneration: 1 }))
+    expect(() => coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      trustedCaller: TRUSTED_CALLER,
+    }))
       .toThrow('readonly_continuation_disabled');
     coordinator.restore(state({ status: 'backoff', nextAttemptAt: Date.now() + 10_000 }));
     expect(coordinator.onTerminal(state(), {
@@ -285,7 +572,13 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       randomId: () => 'lease',
     });
 
-    expect(coordinator.start({ turnId: 'om_original', workerGeneration: 1, ttlMs: 5_000 }).status).toBe('active');
+    expect(coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 5_000,
+    }).status).toBe('active');
     expect(timers).toHaveLength(1);
     now = 6_000;
     timers.at(-1)!();
@@ -506,7 +799,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
   });
 });
 
-describe('attached read-only continuation', () => {
+describe('attached task continuation', () => {
   it('persists the lease, copies routing context, and exposes explicit terminal controls', () => {
     const session: ReadonlyTaskContinuationSession = {
       sessionId: 'session',
@@ -526,24 +819,33 @@ describe('attached read-only continuation', () => {
       randomId: vi.fn().mockReturnValueOnce('lease').mockReturnValueOnce('next'),
     });
 
-    expect(startReadonlyTaskContinuation(session, { turnId: 'om_original', workerGeneration: 1 }))
+    expect(startReadonlyTaskContinuation(session, {
+      turnId: 'om_original', workerGeneration: 1, authorizationMode: 'inherited',
+      trustedCaller: TRUSTED_CALLER,
+    }))
       .toMatchObject({ leaseId: 'readonly-lease', status: 'active' });
     expect(handleReadonlyTaskContinuationTerminal(session, {
       turnId: 'om_original', status: 'completed', workerGeneration: 1,
     })?.status).toBe('backoff');
     timers.at(-1)!();
-    expect(session.turnReplyContexts?.['bmx-readonly-next']).toEqual({ inThread: true });
-    expect(session.replyTargets?.['bmx-readonly-next']).toEqual({ rootMessageId: 'om_root' });
+    expect(session.turnReplyContexts?.['bmx-continuation-next']).toEqual({ inThread: true });
+    expect(session.replyTargets?.['bmx-continuation-next']).toEqual({ rootMessageId: 'om_root' });
     expect(enqueue).toHaveBeenCalledOnce();
 
-    expect(awaitReadonlyTaskContinuationUser(session, 'bmx-readonly-next'))
+    expect(awaitReadonlyTaskContinuationUser(session, 'bmx-continuation-next'))
       .toMatchObject({ status: 'awaiting_user' });
 
-    startReadonlyTaskContinuation(session, { turnId: 'om_new', workerGeneration: 1 });
+    startReadonlyTaskContinuation(session, {
+      turnId: 'om_new', workerGeneration: 1, authorizationMode: 'inherited',
+      trustedCaller: TRUSTED_CALLER,
+    });
     expect(cancelReadonlyTaskContinuationForUserInput(session, 'om_interrupt'))
       .toMatchObject({ status: 'cancelled', cancelledByTurnId: 'om_interrupt' });
 
-    startReadonlyTaskContinuation(session, { turnId: 'om_final', workerGeneration: 1 });
+    startReadonlyTaskContinuation(session, {
+      turnId: 'om_final', workerGeneration: 1, authorizationMode: 'inherited',
+      trustedCaller: TRUSTED_CALLER,
+    });
     expect(completeReadonlyTaskContinuation(session, 'om_final', undefined, 'om_reply', 1))
       .toMatchObject({ status: 'completed', completedMessageId: 'om_reply' });
   });

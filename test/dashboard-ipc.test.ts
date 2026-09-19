@@ -547,14 +547,11 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
     });
   });
 
-  it('denies native subagents for the exact live read-only continuation turn', async () => {
+  it('keeps the ordinary native-subagent policy for a continuation turn', async () => {
     const active = installRuntimeSession({ model: { mode: 'custom', value: 'session-model' } });
     active.workerGeneration = 3;
     active.managedTurnOrigin = {
-      ...active.managedTurnOrigin, turnId: 'bmx-readonly-exact', dispatchAttempt: 2,
-    };
-    active.readonlyContinuationTurnOrigin = {
-      workerGeneration: 3, turnId: 'bmx-readonly-exact', dispatchAttempt: 2,
+      ...active.managedTurnOrigin, turnId: 'bmx-continuation-exact', dispatchAttempt: 2,
     };
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -564,7 +561,7 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
-      ok: true, deny: true, reason: 'read-only continuation forbids subagents',
+      ok: true, policy: { model: { mode: 'custom', value: 'session-model' } },
     });
   });
 
@@ -1406,6 +1403,7 @@ describe('POST /api/session-origin/attest', () => {
       originChannelId: CHANNEL,
       turnId: TURN_ID,
       dispatchAttempt: DISPATCH_ATTEMPT,
+      callerOpenId: 'ou_managed_origin_owner',
     };
     const worker = options.worker === null
       ? null
@@ -1486,6 +1484,8 @@ describe('POST /api/session-origin/attest', () => {
         channelId: CHANNEL,
         sessionId: fixture.sessionId,
         turnId: TURN_ID,
+        callerOpenId: 'ou_managed_origin_owner',
+        larkAppId: 'app-managed-origin',
         dispatchAttempt: DISPATCH_ATTEMPT,
         requiresCodexAppLedger: true,
       });
