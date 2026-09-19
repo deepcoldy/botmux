@@ -52,6 +52,16 @@ export interface AutostartState {
 
 const LABEL = 'com.botmux.daemon';
 const SERVICE_NAME = 'botmux.service';
+// Companion crash watchdog (Linux user systemd only). The boot unit below is
+// Type=oneshot + RemainAfterExit: it launches the daemon once at login and
+// never restarts it. If the detached built-in supervisor dies (or is
+// stopped) the fleet stays down until someone manually re-runs `start`. This
+// timer runs a lightweight local liveness check every 30s, so a dead fleet
+// self-heals without doing full startup work while it is healthy.
+const WATCHDOG_SERVICE_NAME = 'botmux-watchdog.service';
+const WATCHDOG_TIMER_NAME = 'botmux-watchdog.timer';
+const WATCHDOG_INTERVAL_SEC = 30;
+const WATCHDOG_STOP_INTENT_FILE = 'watchdog-stopped';
 const WINDOWS_FALLBACK_PATH = '%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem';
 
 /**
@@ -87,7 +97,6 @@ export function consumeAutostartUnitMarker(env: NodeJS.ProcessEnv = process.env)
   delete env[AUTOSTART_UNIT_ENV];
   return raw === '1';
 }
-
 const WINDOWS_TASK_NAME = 'botmux-daemon';
 
 function platform(): 'macos' | 'linux' | 'windows' | 'unsupported' {
@@ -107,6 +116,32 @@ function plistPath(): string {
 
 function unitPath(): string {
   return join(homedir(), '.config', 'systemd', 'user', SERVICE_NAME);
+}
+
+function watchdogServicePath(): string {
+  return join(homedir(), '.config', 'systemd', 'user', WATCHDOG_SERVICE_NAME);
+}
+
+function watchdogTimerPath(): string {
+  return join(homedir(), '.config', 'systemd', 'user', WATCHDOG_TIMER_NAME);
+}
+
+function watchdogStopIntentPath(configDir: string): string {
+  return join(configDir, WATCHDOG_STOP_INTENT_FILE);
+}
+
+export function watchdogStopRequested(configDir: string): boolean {
+  return existsSync(watchdogStopIntentPath(configDir));
+}
+
+export function markWatchdogStopped(configDir: string): void {
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(watchdogStopIntentPath(configDir), `${new Date().toISOString()}\n`, { mode: 0o600 });
+}
+
+export function clearWatchdogStopped(configDir: string): void {
+  const path = watchdogStopIntentPath(configDir);
+  if (existsSync(path)) unlinkSync(path);
 }
 
 /**
@@ -328,6 +363,41 @@ WantedBy=default.target
 `;
 }
 
+/**
+ * Companion watchdog service + timer.
+ *
+ * The service invokes a lightweight local liveness command. `KillMode=process`
+ * is load-bearing: the command launches the supervisor detached, but that child
+ * remains in the unit cgroup. The default `control-group` would kill the newly
+ * recovered supervisor as soon as this oneshot becomes inactive.
+ */
+function watchdogServiceContent(opts: AutostartOpts): string {
+  return `[Unit]
+Description=Ensure the botmux fleet is running (crash watchdog)
+
+[Service]
+Type=oneshot
+WorkingDirectory=${opts.configDir}
+Environment=PATH=${autostartPath(opts.environmentPath, 'linux')}
+Environment=${AUTOSTART_UNIT_ENV}=1
+KillMode=process
+ExecStart=${launchCommand(opts, '__watchdog')}
+`;
+}
+
+function watchdogTimerContent(): string {
+  return `[Unit]
+Description=Restart the botmux fleet if it is not running
+
+[Timer]
+OnActiveSec=${WATCHDOG_INTERVAL_SEC}s
+OnUnitActiveSec=${WATCHDOG_INTERVAL_SEC}s
+
+[Install]
+WantedBy=timers.target
+`;
+}
+
 function userSystemdAvailable(): boolean {
   // Check the user manager is reachable. In containers / sshd-without-DBus
   // sessions `systemctl --user` will fail with "Failed to connect to bus".
@@ -356,6 +426,7 @@ function enableLinux(opts: AutostartOpts): void {
   const path = unitPath();
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, unitContent(opts));
+  writeWatchdogUnits(opts);
   console.log(`✅ 已写入 systemd unit: ${path}`);
 
   const reload = spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
@@ -378,6 +449,10 @@ function enableLinux(opts: AutostartOpts): void {
   console.log(`✅ 已启用 ${SERVICE_NAME}`);
   console.log(`   下次开机自动启动。立即启动: botmux start`);
 
+  // Enable only after all unit files have been written and daemon-reload has
+  // made their latest contents visible to the user manager.
+  enableWatchdogTimer();
+
   if (!lingerEnabled()) {
     const username = userInfo().username;
     console.log(``);
@@ -393,6 +468,11 @@ function disableLinux(): void {
     console.error(`   如曾手工创建过 unit，请手动 rm: ${unitPath()}`);
     process.exit(1);
   }
+
+  // Remove the crash watchdog first so it does not resurrect the fleet while
+  // (or right after) we disable the boot hook.
+  removeWatchdogUnits();
+
   const path = unitPath();
   // No `--now`: only undo the boot hook. Without --now systemd skips ExecStop,
   // so the running pm2 daemon is left untouched. To stop it, the user runs
@@ -405,11 +485,13 @@ function disableLinux(): void {
   if (existsSync(path)) {
     unlinkSync(path);
     console.log(`✅ 已删除 ${path}`);
-    spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
   } else {
     console.log(`ℹ️  ${path} 不存在`);
   }
-  console.log(`   pm2 daemon 仍在运行；要停止请跑 botmux stop`);
+  // Always reload: watchdog files may have existed even if the main unit did
+  // not (for example after an interrupted older install).
+  spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
+  console.log(`   supervisor 仍在运行；要停止请跑 botmux stop`);
 }
 
 function statusLinux(): void {
@@ -423,9 +505,41 @@ function statusLinux(): void {
   }
   const isEnabled = spawnSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME], { stdio: 'pipe' });
   const isActive = spawnSync('systemctl', ['--user', 'is-active', SERVICE_NAME], { stdio: 'pipe' });
+  const watchdogActive = spawnSync('systemctl', ['--user', 'is-active', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
   console.log(`enabled: ${isEnabled.stdout.toString().trim() || isEnabled.stderr.toString().trim()}`);
   console.log(`active: ${isActive.stdout.toString().trim() || isActive.stderr.toString().trim()}`);
+  console.log(`watchdog enabled: ${watchdogEnabled() ? 'yes' : 'no'}`);
+  console.log(`watchdog active: ${watchdogActive.stdout.toString().trim() || watchdogActive.stderr.toString().trim()}`);
   console.log(`Linger: ${lingerEnabled() ? 'yes' : 'no（登出后服务会停）'}`);
+}
+
+function watchdogEnabled(): boolean {
+  return spawnSync('systemctl', ['--user', 'is-enabled', WATCHDOG_TIMER_NAME], { stdio: 'pipe' }).status === 0;
+}
+
+function writeWatchdogUnits(opts: AutostartOpts): void {
+  writeFileSync(watchdogServicePath(), watchdogServiceContent(opts));
+  writeFileSync(watchdogTimerPath(), watchdogTimerContent());
+}
+
+function enableWatchdogTimer(): boolean {
+  const en = spawnSync('systemctl', ['--user', 'enable', '--now', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
+  if (en.status !== 0) {
+    // Watchdog is best-effort: the boot unit still works without it. Warn but
+    // do not fail the whole `autostart enable`.
+    console.warn(`⚠️  崩溃守护 timer 启用失败（不影响开机自启）:`);
+    console.warn(en.stderr.toString().trim());
+    return false;
+  }
+  console.log(`✅ 已启用崩溃守护 ${WATCHDOG_TIMER_NAME}（每 ${WATCHDOG_INTERVAL_SEC}s 检查，fleet 挂了自动拉起）`);
+  return true;
+}
+
+function removeWatchdogUnits(): void {
+  const stop = spawnSync('systemctl', ['--user', 'disable', '--now', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
+  void stop; // Non-zero (already disabled) is expected on older installs.
+  if (existsSync(watchdogTimerPath())) unlinkSync(watchdogTimerPath());
+  if (existsSync(watchdogServicePath())) unlinkSync(watchdogServicePath());
 }
 
 // ─── Windows (Task Scheduler / Startup folder) ─────────────────────────────
@@ -659,16 +773,39 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
       return true;
     }
     case 'linux': {
+      let changed = false;
       const path = unitPath();
-      if (!existsSync(path)) return false;
-      const next = unitContent(opts);
-      const prev = readFileSync(path, 'utf-8');
-      if (prev === next) return false;
-      writeFileSync(path, next);
-      if (userSystemdAvailable()) {
+      if (existsSync(path)) {
+        const next = unitContent(opts);
+        const prev = readFileSync(path, 'utf-8');
+        if (prev !== next) {
+          writeFileSync(path, next);
+          changed = true;
+        }
+        // Existing users already opted into autostart. Install the watchdog
+        // during their next manual start instead of requiring another explicit
+        // `autostart enable` after upgrade.
+        const wdService = watchdogServiceContent(opts);
+        const wdTimer = watchdogTimerContent();
+        const prevService = existsSync(watchdogServicePath()) ? readFileSync(watchdogServicePath(), 'utf-8') : '';
+        const prevTimer = existsSync(watchdogTimerPath()) ? readFileSync(watchdogTimerPath(), 'utf-8') : '';
+        if (prevService !== wdService) {
+          writeFileSync(watchdogServicePath(), wdService);
+          changed = true;
+        }
+        if (prevTimer !== wdTimer) {
+          writeFileSync(watchdogTimerPath(), wdTimer);
+          changed = true;
+        }
+      }
+      const systemdAvailable = userSystemdAvailable();
+      if (changed && systemdAvailable) {
         spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
       }
-      return true;
+      if (existsSync(path) && systemdAvailable && !watchdogEnabled()) {
+        changed = enableWatchdogTimer() || changed;
+      }
+      return changed;
     }
     case 'windows': {
       const script = windowsScriptPath();
