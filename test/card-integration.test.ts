@@ -348,7 +348,7 @@ describe('Card integration: full event flow', () => {
       expect(ds.cardPatchInFlight).toBe(true);
 
       // Step 2: while PATCH is in-flight, user clicks toggle
-      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
+      const callbackResult = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
       // Toggle should NOT have sent another PATCH — it should be queued
@@ -356,6 +356,12 @@ describe('Card integration: full event flow', () => {
       expect(ds.displayMode).toBe('screenshot');
       expect(ds.pendingCardJson).toBeTruthy();
       expect(parseCard(ds.pendingCardJson!).expanded).toBe(true);
+      // The callback only acknowledges the click. Returning a raw card here
+      // would let Lark update it synchronously outside scheduleCardPatch and
+      // allow the older in-flight PATCH to overwrite the expanded state.
+      expect(callbackResult).toEqual({
+        toast: { type: 'info', content: '操作已收到，后台处理中' },
+      });
 
       // Step 3: in-flight PATCH completes → queued toggle PATCH flushes
       fakeLark.resolveCall('updateMessage', 0);
@@ -1361,14 +1367,14 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      // Toggle returns the rebuilt card body (see card-handler.ts:337).
       const result = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
       // The handler must propagate adoptMode so the rebuilt card keeps
       // the `⏏ 断开` button — `❌ 关闭会话` would tear down the user's CLI.
-      expect(result).toBeDefined();
-      expect((result as any).adoptMode).toBe(true);
+      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2]).adoptMode).toBe(true);
     });
 
     it('term_action on adopt session returns a card with adoptMode=true', async () => {
