@@ -6810,6 +6810,7 @@ function findAncestorSessionId(): string | null {
 
 interface CurrentSession {
   sessionId: string;
+  turnId?: string;
   chatId: string;
   rootMessageId: string;
   workingDir?: string;
@@ -6905,9 +6906,12 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
   // allowed participant in a shared session must not inherit the owner's user
   // identity. Scheduled child creation passes because its provenance resolves
   // back to the already-verified task creator.
-  if (!s.ownerOpenId || provenance.callerOpenId !== s.ownerOpenId) return null;
+  if (!s.ownerOpenId || provenance.callerOpenId !== s.ownerOpenId) {
+    throw new Error('current turn caller does not match the session owner');
+  }
   return {
     sessionId: s.sessionId,
+    turnId: provenance.turnId,
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
     workingDir: s.workingDir,
@@ -7525,6 +7529,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         const fresh = await detectAuthenticatedCurrentSession();
         if (!fresh
           || fresh.sessionId !== authenticatedCur.sessionId
+          || fresh.turnId !== authenticatedCur.turnId
           || fresh.larkAppId !== authenticatedCur.larkAppId
           || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
           || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
