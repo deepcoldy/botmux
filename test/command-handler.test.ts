@@ -5294,6 +5294,14 @@ describe('handleCommand', () => {
     // exactly what was refused" needs no guessing — and no giant default set
     // that makes every person approve permissions they will never use.
     describe('/login --scope', () => {
+      it('passes an explicit document scope and the requesting user to OAuth', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:readonly'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:readonly'], 'ou_sender',
+        );
+      });
+
       it('builds an authorization URL carrying the requested scopes', async () => {
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:write_only'), deps, LARK_APP_ID);
