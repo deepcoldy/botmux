@@ -15,6 +15,7 @@
  */
 
 import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+import type { ReportTaskLineage } from './report-task-lineage.js';
 
 export { resolveSendTarget };
 
@@ -416,6 +417,85 @@ export function resolveReportRecipient(input: {
     input.ownerOpenId,
     input.quoteTargetSenderOpenId,
   ].find(value => !!value?.trim())?.trim();
+}
+
+export interface ReportRecipientSession {
+  sessionId?: string;
+  larkAppId?: string;
+  chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  status?: string;
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+  createdAt?: string;
+}
+
+export type ReportRecipientSource =
+  | 'task-lineage-chat-creator'
+  | 'session-creator'
+  | 'session-owner'
+  | 'quote-sender'
+  | 'none';
+
+export interface ResolvedReportRecipient {
+  openId?: string;
+  source: ReportRecipientSource;
+  sourceSessionId?: string;
+}
+
+export function resolveReportRecipientForSession(input: {
+  session: ReportRecipientSession;
+  sessions: ReportRecipientSession[];
+  knownPeerBotOpenIds: ReadonlySet<string>;
+  taskLineage?: ReportTaskLineage;
+}): ResolvedReportRecipient {
+  const current = input.session;
+  const currentCreator = current.creatorOpenId?.trim();
+  const currentCreatedAt = Date.parse(current.createdAt ?? '');
+  const taskLineage = input.taskLineage;
+  const canUseChatLineage = (current.scope ?? 'thread') === 'thread'
+    && current.status === 'active'
+    && !!current.sessionId
+    && !!current.larkAppId
+    && !!current.chatId
+    && Number.isFinite(currentCreatedAt)
+    && !!taskLineage
+    && taskLineage.chatId === current.chatId
+    && (!currentCreator || !input.knownPeerBotOpenIds.has(currentCreator));
+
+  if (canUseChatLineage) {
+    // Count structural matches before checking peer identity so a peer+human ambiguity fails closed.
+    const candidates = input.sessions.filter(candidate => {
+      const candidateCreatedAt = Date.parse(candidate.createdAt ?? '');
+      return candidate.sessionId !== current.sessionId
+        && candidate.status === 'active'
+        && candidate.scope === 'chat'
+        && candidate.larkAppId === current.larkAppId
+        && candidate.chatId === current.chatId
+        && candidate.rootMessageId === taskLineage.dispatchRootMessageId
+        && Number.isFinite(candidateCreatedAt)
+        && candidateCreatedAt < currentCreatedAt;
+    });
+    if (candidates.length === 1) {
+      const candidateCreator = candidates[0].creatorOpenId?.trim();
+      if (candidateCreator && input.knownPeerBotOpenIds.has(candidateCreator)) {
+        return {
+          openId: candidateCreator,
+          source: 'task-lineage-chat-creator',
+          sourceSessionId: candidates[0].sessionId,
+        };
+      }
+    }
+  }
+
+  if (currentCreator) return { openId: currentCreator, source: 'session-creator' };
+  const owner = current.ownerOpenId?.trim();
+  if (owner) return { openId: owner, source: 'session-owner' };
+  const quoteSender = current.quoteTargetSenderOpenId?.trim();
+  if (quoteSender) return { openId: quoteSender, source: 'quote-sender' };
+  return { source: 'none' };
 }
 
 /**

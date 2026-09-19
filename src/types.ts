@@ -544,12 +544,7 @@ export interface Session {
   /** Best-effort human-readable chat name. Group sessions use the Lark group
    *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
-  /** open_id of whoever created this session (the first sender), app-scoped to
-   *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
-   *  sessions and is NEVER overwritten by later activity — so it stably points at
-   *  the dispatch orchestrator for `botmux report` even when there is no `/repo`
-   *  prime (foreign-bot auto-create nulls ownerOpenId) and the reply-chain
-   *  quoteTargetSenderOpenId has drifted to a peer reviewer. */
+  /** Immutable first sender, scoped to this bot and session; a user-created thread does not inherit its task's creator. */
   creatorOpenId?: string;
   /** Lark `union_id` of the session owner. Stable across apps within a tenant
    *  (unlike `ownerOpenId`, which is app-scoped: the same Lark user has a

@@ -34,6 +34,7 @@ import {
   recordDispatchInputCommit,
   resolveReportPlacement,
   resolveReportRecipient,
+  resolveReportRecipientForSession,
   resolveReportTarget,
   resolveSendTarget,
   threadRootForReachability,
@@ -672,6 +673,82 @@ describe('resolveReportRecipient', () => {
       ownerOpenId: 'ou_owner',
       quoteTargetSenderOpenId: 'ou_latest_sender',
     })).toBe('ou_owner');
+  });
+});
+
+describe('resolveReportRecipientForSession', () => {
+  const reviewer = 'ou_reviewer';
+  const user = 'ou_user';
+  const source = {
+    sessionId: 'chat', larkAppId: 'cli_worker', chatId: 'oc_task',
+    rootMessageId: 'om_dispatch', scope: 'chat' as const, status: 'active',
+    creatorOpenId: reviewer, createdAt: '2026-08-07T07:30:00Z',
+  };
+  const current = {
+    ...source, sessionId: 'thread', rootMessageId: 'om_thread', scope: 'thread' as const,
+    creatorOpenId: user, ownerOpenId: user, createdAt: '2026-08-07T07:45:00Z',
+  };
+  const input = {
+    session: current, sessions: [source, current], knownPeerBotOpenIds: new Set([reviewer]),
+    taskLineage: { id: 'task', taskRoot: '/task', chatId: 'oc_task', dispatchRootMessageId: 'om_dispatch' },
+  };
+
+  it('inherits the exact task dispatch creator', () => {
+    expect(resolveReportRecipientForSession(input)).toEqual({
+      openId: reviewer, source: 'task-lineage-chat-creator', sourceSessionId: 'chat',
+    });
+  });
+
+  it('inherits the task reviewer for a legacy thread without scope', () => {
+    expect(resolveReportRecipientForSession({ ...input, session: { ...current, scope: undefined } }))
+      .toEqual({ openId: reviewer, source: 'task-lineage-chat-creator', sourceSessionId: 'chat' });
+  });
+
+  it('does not override a peer creator in the current thread', () => {
+    expect(resolveReportRecipientForSession({ ...input, session: { ...current, creatorOpenId: reviewer } }))
+      .toEqual({ openId: reviewer, source: 'session-creator' });
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'thread' as const }, { larkAppId: 'cli_other' },
+    { chatId: 'oc_other' }, { rootMessageId: 'om_other_task' },
+    { createdAt: current.createdAt }, { createdAt: '2026-08-08T00:00:00Z' },
+    { createdAt: 'invalid' }, { creatorOpenId: 'ou_human' },
+  ])('rejects an invalid source: %j', overrides => {
+    expect(resolveReportRecipientForSession({ ...input, sessions: [{ ...source, ...overrides }, current] }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'chat' as const }, { sessionId: undefined },
+    { larkAppId: undefined }, { chatId: undefined }, { createdAt: 'invalid' },
+  ])('rejects an invalid current session: %j', overrides => {
+    expect(resolveReportRecipientForSession({ ...input, session: { ...current, ...overrides } }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it('does not infer task identity from shared session metadata', () => {
+    expect(resolveReportRecipientForSession({ ...input, taskLineage: undefined }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it('rejects a binding for another chat', () => {
+    expect(resolveReportRecipientForSession({ ...input, taskLineage: { ...input.taskLineage, chatId: 'oc_other' } }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it.each([reviewer, 'ou_human'])('rejects structural ambiguity before verifying %s', creatorOpenId => {
+    expect(resolveReportRecipientForSession({ ...input, sessions: [source, { ...source, sessionId: 'other', creatorOpenId }, current] }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it.each([
+    [{ creatorOpenId: ' creator ', ownerOpenId: 'owner' }, { openId: 'creator', source: 'session-creator' }],
+    [{ creatorOpenId: ' ', ownerOpenId: ' owner ' }, { openId: 'owner', source: 'session-owner' }],
+    [{ quoteTargetSenderOpenId: ' quote ' }, { openId: 'quote', source: 'quote-sender' }],
+    [{}, { source: 'none' }],
+  ])('preserves the historical fallback: %j', (session, expected) => {
+    expect(resolveReportRecipientForSession({ ...input, session })).toEqual(expected);
   });
 });
 

@@ -45,7 +45,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -12134,14 +12134,16 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
   }
 
-  // Recipient and visible placement are independent. creatorOpenId remains the
-  // stable Reviewer/orchestrator identity; current-turn routing controls where
-  // an ordinary report appears.
-  const reportRecipient = resolveReportRecipient({
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+  const { resolveReportTaskLineage } = await import('./core/report-task-lineage.js');
+  const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
+  // Only sender-scoped peer identities can verify creators; bots-info contains other apps' open_ids.
+  const recipientResolution = resolveReportRecipientForSession({
+    session: s,
+    sessions: [...sessions.values()],
+    knownPeerBotOpenIds: knownBotOpenIdsFromCrossRef(readPeerCrossRef(resolveDataDir(), s.larkAppId)),
+    taskLineage: resolveReportTaskLineage({ contentFile, chatId: s.chatId }),
   });
+  const reportRecipient = recipientResolution.openId;
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
   const validatedTurnReplyTarget = currentTurnId
     && turnReplyTarget?.turnId === currentTurnId
@@ -12266,7 +12268,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         ? placement.target.chatId
         : placement.target.rootMessageId,
       orchestrator: reportRecipient,
-      recipient: { kind: 'mention', openId: reportRecipient },
+      recipient: { kind: 'mention', ...recipientResolution },
       viaRegistry: false,
       placementSource: placement.source,
       messageTarget,
