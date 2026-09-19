@@ -140,25 +140,94 @@ describe('FleetSupervisor (live, integration)', () => {
     await sup.stopAll();
   });
 
-  it('does NOT restart a child that exits 90 (graceful)', async () => {
+  it('restarts a child that exits 90 WITHOUT a supervisor-initiated stop (unsolicited sentinel self-heals)', async () => {
+    // Regression: 90 is a PRIVATE graceful handshake, not proof that THIS
+    // supervisor requested the stop. A stray signal from outside the
+    // supervision tree (observed twice on this box: `pkill -f index-daemon.js`
+    // run as unrelated probe cleanup retired all 55 production daemons, each
+    // exiting 90 cleanly) must not permanently retire the member — the only
+    // sanctioned graceful stops are stopAll and stop-bot, tested separately.
     const root = tmp();
     const statePath = join(root, 'fleet.json');
-    const GRACEFUL = `console.log('bye'); process.exit(90);`;
+    const beats = join(root, 'launches.txt');
+    const UNSOLICITED_90 = `require('fs').appendFileSync(${JSON.stringify(beats)}, 'x'); process.exit(90);`;
     const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, GRACEFUL), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 10, restartDelayMs: 50 }, log: () => {},
+      statePath, distDir: fakeDist(root, UNSOLICITED_90), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
     });
     sup.start([bots[0]]);
-    // it exits 90 right away → should end up 'stopped', restarts stays 0
-    const stopped = await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped');
-    expect(stopped).toBe(true);
-    await delay(300); // give any (wrong) restart a chance to happen
+    // exits 90 right away with no stop request → relaunched at least once more
+    const relaunched = await waitFor(() =>
+      existsSync(beats) && readFileSync(beats, 'utf-8').length >= 2);
+    expect(relaunched).toBe(true);
+    expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
+
+    await sup.stopAll();
+    await delay(100); // let the tight crash-loop settle before the tmp dir is removed
+  });
+
+  it('relaunches a live daemon that exits 90 after an EXTERNAL SIGTERM (pkill-like)', async () => {
+    // Faithful repro of the recorded incident: an outsider signals the daemon
+    // directly (no stopAll, no stop-bot); the daemon finishes its graceful
+    // SIGTERM handler and exits 90. The supervisor did not request it → the
+    // member must come back, not retire itself.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
+    });
+    sup.start([bots[0]]);
+    let firstPid = 0;
+    const online = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      if (p && p.status === 'online' && p.pid > 1) { firstPid = p.pid; return true; }
+      return false;
+    });
+    expect(online).toBe(true);
+    expect(firstPid).toBeGreaterThan(1);
+
+    process.kill(firstPid, 'SIGTERM'); // exactly what `pkill -f index-daemon.js` does
+
+    // Under node the child's SIGTERM handler exits 90 (the sentinel shape from
+    // the recorded incident); under bun the child may die with signal=SIGTERM.
+    // EITHER shape must self-heal when the supervisor did not request the stop.
+    const healed = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== firstPid && p.pid > 1 && p.restarts >= 1;
+    });
+    expect(healed).toBe(true);
+
+    await sup.stopAll();
+    await delay(100); // let any in-flight crash-loop respawn settle before rmSync
+  });
+
+  it('keeps a stop-bot member stopped even though it exits 90 (the sanctioned graceful path)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
+    });
+    sup.start([bots[0]]);
+    const online = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid > 1;
+    });
+    expect(online).toBe(true);
+    const stoppedPid = readFleetState(statePath)!.procs[0].pid;
+
+    // The supervisor itself requests the stop → the 90 sentinel is honoured.
+    await sup.stopOneBot('botmux-0');
     const p = readFleetState(statePath)!.procs[0];
     expect(p.status).toBe('stopped');
     expect(p.restarts).toBe(0);
-    expect(p.lastExitCode).toBe(90);
-
-    await sup.stopAll();
+    expect(pidAlive(stoppedPid)).toBe(false);
+    await delay(300); // give any (wrong) restart a chance to happen
+    const after = readFleetState(statePath)!.procs[0];
+    expect(after.status).toBe('stopped');
+    expect(after.pid).toBe(0);
+    expect(after.restarts).toBe(0);
   });
 
   it('parks a proc errored after exceeding max_restarts', async () => {
@@ -714,25 +783,6 @@ describe('FleetSupervisor (live, integration)', () => {
     // And the restart tally really moved (not just a coincidental double spawn).
     expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
     killLater(readFleetState(statePath)?.procs[0]?.pid);
-    await sup.stopAll();
-  });
-
-  it('still honours exit 90 as graceful for our OWN members (no leak)', async () => {
-    // The mirror of the spec above: refusing the sentinel must apply ONLY to
-    // external members. A bot daemon exiting 90 is still a clean shutdown and
-    // must NOT be restarted.
-    const root = tmp();
-    const statePath = join(root, 'fleet.json');
-    const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, 'process.exit(90);'), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 3, restartDelayMs: 40 }, log: () => {},
-    });
-    sup.start([{ name: 'botmux-0', appId: 'cli_a', botIndex: 0 }]);
-    expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped')).toBe(true);
-    await delay(300);   // give a (wrong) restart time to show up
-    const p = readFleetState(statePath)!.procs[0];
-    expect(p.status).toBe('stopped');
-    expect(p.restarts).toBe(0);
     await sup.stopAll();
   });
 

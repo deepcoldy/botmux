@@ -12,6 +12,12 @@
  *     DAEMON_GRACEFUL_EXIT_CODE (90) shut down cleanly and must NOT be restarted;
  *     every other exit (including signal death, which surfaces as a non-90 code
  *     or a signal) is a crash and restarts, under a backoff, up to maxRestarts.
+ *     The exit code alone is NOT proof the operator asked for the stop, so the
+ *     live layer honours the sentinel only when IT initiated it (fleet-wide
+ *     stopping flag / per-bot explicitStop set before the exit arrived); a 90
+ *     that arrives without that intent is treated as a crash and restarted, so
+ *     a stray signal from outside the supervision tree cannot permanently
+ *     retire the fleet.
  *  2. max_restarts cap — after maxRestarts crash-restarts a proc is parked
  *     'errored' and left alone (no restart storm).
  *  3. projection identity — the fleet's proc set has unique names and no two
@@ -123,6 +129,31 @@ export type ExitDecision =
   | { action: 'restart'; nextRestarts: number }
   | { action: 'park'; reason: 'max_restarts'; atRestarts: number };
 
+/** A restart/park decision on a path where the graceful sentinel is NOT being
+ *  honoured (an external/plugin member, or our own member's ordinary exit path
+ *  on which a fleet stop / explicit stop-bot was already handled upstream).
+ *  Deliberately excludes 'stop' so a caller that already owned the graceful
+ *  outcome cannot carry a statically-dead branch. */
+export type CrashExitDecision = Extract<ExitDecision, { action: 'restart' } | { action: 'park' }>;
+
+/**
+ * Decide restart-vs-park for a non-graceful exit. The tally depends only on the
+ * current restart count and the cap, not the exit code/signal (the live layer
+ * records/logs those separately):
+ *   • crash & under the cap   → restart (restarts+1)
+ *   • crash & at/over the cap → park errored, stop restarting
+ */
+export function decideCrashExit(
+  proc: Pick<FleetProcState, 'restarts'>,
+  policy: RestartPolicy = DEFAULT_RESTART_POLICY,
+): CrashExitDecision {
+  const nextRestarts = proc.restarts + 1;
+  if (nextRestarts > policy.maxRestarts) {
+    return { action: 'park', reason: 'max_restarts', atRestarts: proc.restarts };
+  }
+  return { action: 'restart', nextRestarts };
+}
+
 /**
  * Decide what to do when a supervised proc exits. Pure: the live layer applies
  * the returned action (schedule respawn / write stopped / write errored).
@@ -130,8 +161,15 @@ export type ExitDecision =
  *   • crash & under the cap         → restart (restarts+1)
  *   • crash & at/over the cap       → park errored, stop restarting
  *
- * `honoursSentinel: false` (an external/plugin member) makes 90 an ordinary crash
- * code — see isGracefulExit for why a third-party program must not be taken at
+ * A caller passes honoursSentinel:true ONLY when it independently knows the
+ * stop was requested through the sanctioned channel (the live supervisor sets
+ * stopping/explicitStop before signaling, and those guards handle the 'stop'
+ * outcome itself); it passes false on the ordinary child-exit path so an
+ * unsolicited 90 self-heals.
+ *
+ * `honoursSentinel: false` (an external/plugin member, or an un-attested exit
+ * of our own member) makes 90 an ordinary crash code — see isGracefulExit for
+ * why a third-party program (or a stray external signal) must not be taken at
  * its word about our private sentinel.
  */
 export function decideOnExit(
@@ -141,11 +179,7 @@ export function decideOnExit(
   honoursSentinel = true,
 ): ExitDecision {
   if (isGracefulExit(exit, honoursSentinel)) return { action: 'stop', reason: 'graceful' };
-  const nextRestarts = proc.restarts + 1;
-  if (nextRestarts > policy.maxRestarts) {
-    return { action: 'park', reason: 'max_restarts', atRestarts: proc.restarts };
-  }
-  return { action: 'restart', nextRestarts };
+  return decideCrashExit(proc, policy);
 }
 
 /**
