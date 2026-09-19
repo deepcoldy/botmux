@@ -50,6 +50,12 @@ export interface ReadonlyTaskContinuationState {
   /** New leases inherit the exact runtime authority of the originating user
    * turn. Missing means a pre-upgrade read-only lease and is never widened. */
   authorizationMode?: 'inherited';
+  /** Automatic leases recover only non-business interruptions on their
+   * original user turn. Explicit leases retain the long-task behavior where a
+   * clean turn boundary may request another synthetic continuation. Missing
+   * is treated as automatic/fail-closed so leases persisted by the affected
+   * rollout cannot keep the false-positive behavior after an upgrade. */
+  startMode?: 'automatic' | 'explicit';
   /** Daemon-authenticated caller/controller frozen when the originating turn
    * opts in. These are replayed on synthetic turns so MCP/current-actor policy
    * sees the same principal after terminal or worker restart. */
@@ -123,6 +129,7 @@ export interface StartReadonlyTaskContinuationInput {
   turnId: string;
   workerGeneration: number;
   authorizationMode: 'inherited';
+  startMode?: 'automatic' | 'explicit';
   trustedCaller: TrustedCaller;
   trustedController?: TrustedCaller;
   ttlMs?: number;
@@ -320,6 +327,26 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
     if (current && (isLiveStatus(current.status)
       || (!!current.pendingWarning && current.warningDispatched !== true))) {
       if (current.currentTurnId === input.turnId && current.logicalTurnId === input.turnId) {
+        if (input.startMode === 'explicit' && current.startMode !== 'explicit') {
+          const ttlMs = Math.min(
+            Math.max(1, input.ttlMs ?? READONLY_TASK_CONTINUATION_DEFAULT_TTL_MS),
+            READONLY_TASK_CONTINUATION_MAX_TTL_MS,
+          );
+          const maxContinuations = Math.min(
+            Math.max(1, input.maxContinuations ?? READONLY_TASK_CONTINUATION_DEFAULT_MAX),
+            READONLY_TASK_CONTINUATION_HARD_MAX,
+          );
+          const promoted = this.commit({
+            ...current,
+            startMode: 'explicit',
+            expiresAt: this.now() + ttlMs,
+            maxContinuations,
+            lastErrorCode: undefined,
+          });
+          if (promoted.status === 'backoff') this.armBackoff();
+          else if (promoted.status === 'active') this.armExpiry();
+          return promoted;
+        }
         return current;
       }
       throw new Error('readonly_continuation_already_active');
@@ -344,6 +371,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       maxContinuations,
       continuationsStarted: 0,
       authorizationMode: input.authorizationMode,
+      startMode: input.startMode ?? 'explicit',
       trustedCaller: { ...input.trustedCaller },
       ...(input.trustedController
         ? { trustedController: { ...input.trustedController } }
@@ -362,6 +390,21 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       || terminal.dispatchAttempt !== current.currentDispatchAttempt
       || terminal.workerGeneration !== current.currentWorkerGeneration
       || current.status !== 'active') return current;
+    // A clean terminal is proof that an ordinary automatically-covered turn
+    // did not suffer a transport/runtime interruption. Do not manufacture a
+    // second turn merely because its visible `botmux send` used the default
+    // progress marker and therefore produced no transcript final_output.
+    // Explicit long-task leases, and every synthetic continuation attempt,
+    // keep the existing completed -> continue semantics.
+    if (terminal.status === 'completed'
+      && current.startMode !== 'explicit'
+      && current.currentTurnId === current.logicalTurnId
+      && current.currentDispatchAttempt === undefined) {
+      return this.completeOriginalBusinessFinal(
+        terminal.turnId,
+        terminal.workerGeneration!,
+      ) ?? current;
+    }
     if (!readonlyTaskContinuationRecoversTerminal(current, terminal)) {
       this.cancelTimer();
       const stopped = {

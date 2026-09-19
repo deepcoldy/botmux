@@ -1508,6 +1508,7 @@ describe('TraeX task continuation', () => {
       turnId: 'om_original',
       workerGeneration: ds.workerGeneration!,
       authorizationMode: 'inherited',
+      startMode: 'explicit',
       trustedCaller,
       ttlMs: 60_000,
       maxContinuations: 2,
@@ -1538,8 +1539,52 @@ describe('TraeX task continuation', () => {
       currentWorkerGeneration: ds.workerGeneration,
       status: 'active',
       authorizationMode: 'inherited',
+      startMode: 'automatic',
       trustedCaller,
     });
+  });
+
+  it('settles an automatically armed normal completion after a default progress reply', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary question', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_original',
+      messageId: 'om_progress_reply',
+      responseKind: 'progress',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      startMode: 'automatic',
+      status: 'completed',
+      continuationsStarted: 0,
+    });
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
   it('automatically arms when turn authority arrives after RPC proof', () => {
@@ -2135,6 +2180,55 @@ describe('TraeX task continuation', () => {
         && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
   });
 
+  it('replaces a crashed tmux worker only after proving its pane is missing', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', backendType: 'tmux' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.workerReady = true;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      startMode: 'automatic',
+    });
+    tmuxProbeMock.mockReturnValue('missing');
+
+    worker.emit('exit', 9, null);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      currentTurnId: 'om_original',
+      continuationsStarted: 0,
+      lastErrorCode: 'cli_exit',
+    });
+    expect(forkMock).toHaveBeenCalledTimes(2);
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    replacement.emit('message', { type: 'ready', port: 3457, token: 'replacement' });
+    replacement.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'replacement-proof',
+      eligible: true,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(vi.mocked(replacement.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+  });
+
   it('recovers a synthetic continuation after its PTY worker crashes without duplicating it', async () => {
     const { ds, worker } = startTraexLease({ backendType: 'pty' });
     worker.emit('message', {
@@ -2188,22 +2282,25 @@ describe('TraeX task continuation', () => {
     });
   });
 
-  it('fails visibly instead of replaying when a crashed worker may leave a persistent backend alive', async () => {
-    const { ds, worker } = startTraexLease({ backendType: 'tmux' });
-    tmuxProbeMock.mockReturnValue('exists');
+  it.each(['exists', 'unknown'] as const)(
+    'fails visibly instead of replaying when a crashed worker leaves the persistent backend %s',
+    async probe => {
+      const { ds, worker } = startTraexLease({ backendType: 'tmux' });
+      tmuxProbeMock.mockReturnValue(probe);
 
-    worker.emit('exit', 9, null);
-    await Promise.resolve();
-    await Promise.resolve();
+      worker.emit('exit', 9, null);
+      await Promise.resolve();
+      await Promise.resolve();
 
-    expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'failed',
-      currentTurnId: 'om_original',
-      continuationsStarted: 0,
-      lastErrorCode: 'continuation_worker_exit_backend_unverified',
-    });
-    expect(forkMock).toHaveBeenCalledTimes(1);
-  });
+      expect(ds.session.readonlyTaskContinuation).toMatchObject({
+        status: 'failed',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        lastErrorCode: 'continuation_worker_exit_backend_unverified',
+      });
+      expect(forkMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('ignores a delayed exit from a replaced worker generation', async () => {
     vi.useFakeTimers();

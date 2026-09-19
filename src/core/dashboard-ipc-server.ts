@@ -2323,6 +2323,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         turnId,
         workerGeneration: generation!,
         authorizationMode: 'inherited',
+        startMode: 'explicit',
         trustedCaller: inheritedAuthority.caller,
         ...(inheritedAuthority.controller
           ? { trustedController: inheritedAuthority.controller }
