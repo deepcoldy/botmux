@@ -177,11 +177,11 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     );
   });
 
-  it('activeTurnBlocks short-circuits to false before consulting the authority', () => {
+  it('activeTurnBlocks bypasses isolation only for inputs without the Oncall FIFO flag', () => {
     const start = workerSource.indexOf('function activeTurnBlocks(input: {');
     expect(start).toBeGreaterThanOrEqual(0);
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const gate = body.indexOf('if (!crossPrincipalIsolationOn()) return false;');
+    const gate = body.indexOf('if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;');
     const consult = body.indexOf('activeTurnAuthority.blocks(');
     expect(gate).toBeGreaterThanOrEqual(0);
     // Order matters: the gate must precede the only call that can reject.
@@ -216,8 +216,11 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     const start = workerSource.indexOf('function adoptActiveTurnWhenIsolationOff(');
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
     const gate = body.indexOf('if (crossPrincipalIsolationOn()) return false;');
+    const fifoGate = body.indexOf('if (identity.queueAfterActiveTurn) return false;');
     const clear = body.indexOf('activeTurnAuthority.clear()');
     expect(gate).toBeGreaterThanOrEqual(0);
+    expect(fifoGate).toBeGreaterThanOrEqual(0);
+    expect(clear).toBeGreaterThan(fifoGate);
     expect(clear).toBeGreaterThan(gate);
   });
 });

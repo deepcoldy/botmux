@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
+  registerHostAsk: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
     chatId,
@@ -29,6 +30,11 @@ const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
   sendMessage: vi.fn(async () => 'om_join_seed'),
+}));
+
+vi.mock('../src/core/ask-broker.js', async () => ({
+  ...await vi.importActual<any>('../src/core/ask-broker.js'),
+  registerHostAsk: mocks.registerHostAsk,
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -102,7 +108,9 @@ async function loadModules() {
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
   sessionStore.init();
-  return { collaborationModeStore, daemon, registry, types };
+  const policy = await import('../src/core/trusted-session-controller.js');
+  const interruptions = await import('../src/core/cross-principal-interruption-store.js');
+  return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore };
 }
 
 beforeAll(async () => {
@@ -138,6 +146,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const ds of modules.daemon.__testOnly_activeSessions.values()) clearTimeout(ds.crossPrincipalWaitTimer);
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
 });
 
@@ -1392,4 +1403,141 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
     expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
+});
+
+// Use the real join, talk gate, delivery envelope and durable interruption driver.
+async function collaborativeSession() {
+  const { daemon, registry, types } = modules;
+  const appId = 'app_collaborative';
+  const chatId = 'oc_collaborative';
+  const workingDir = tempDir('collaborative-repo');
+  mocks.forkWorker.mockImplementation((ds: any) => { ds.worker = { killed: false, send: vi.fn() }; });
+  registry.registerBot({ larkAppId: appId, larkAppSecret: 's', cliId: 'codex',
+    allowedUsers: ['ou_owner', 'ou_other'], autoStartOnGroupJoin: true,
+    autoStartOnGroupJoinPrompt: 'Investigate the shared incident',
+    defaultWorkingDir: workingDir, regularGroupReplyMode: 'shared',
+    oncallChats: [{ chatId, workingDir }] });
+  await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+  const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))!;
+  const owner = { requestUserOpenId: 'ou_owner', requestLarkAppId: appId, senderType: 'user' as const };
+  ds.activeInteractiveTurn = { turnId: 'om_owner_active', caller: owner };
+  return { ds, owner, other: { ...owner, requestUserOpenId: 'ou_other' } };
+}
+
+describe('collaborative Oncall input', () => {
+  it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
+    vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
+    const { ds, other } = await collaborativeSession();
+    for (const [id, text] of [['om_supplement', 'Additional evidence'], ['om_continue', 'Continue investigating']]) {
+      await modules.daemon.__testOnly_handleThreadReply({
+        sender: { sender_id: { open_id: other.requestUserOpenId }, sender_type: 'user' },
+        message: { message_id: id, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+          content: JSON.stringify({ text }), create_time: String(Date.now()) },
+      }, { chatId: ds.chatId, messageId: id, chatType: 'group', scope: 'chat',
+        anchor: ds.chatId, replyRootId: id, larkAppId: ds.larkAppId });
+    }
+    const inputs = vi.mocked(ds.worker!.send).mock.calls.map(c => c[0]).filter((m: any) => m.type === 'message');
+    expect(inputs).toMatchObject([
+      { turnId: 'om_supplement', queueAfterActiveTurn: true, trustedCaller: other },
+      { turnId: 'om_continue', queueAfterActiveTurn: true, trustedCaller: other },
+    ]);
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(mocks.registerHostAsk).not.toHaveBeenCalled();
+  });
+
+  it('limits the policy to authenticated, managed, automatically started Oncall groups', async () => {
+    const { ds, other } = await collaborativeSession();
+    const allows = modules.policy.isCollaborativeOncallInput;
+    expect(ds.session.autoStartedOnGroupJoin).toBe(true);
+    expect(allows(ds, other)).toBe(true);
+    expect(allows(ds)).toBe(false);
+    expect(allows(ds, { ...other, requestLarkAppId: 'foreign' })).toBe(false);
+    expect(allows(ds, { ...other, source: 'schedule_creator', taskId: 'schedule' })).toBe(false);
+    expect(allows({ ...ds, chatType: 'p2p' }, other)).toBe(false);
+    expect(allows({ ...ds, chatId: 'oc_unbound' }, other)).toBe(false);
+    expect(allows({ ...ds, adoptedFrom: 'existing-pane' } as typeof ds, other)).toBe(false);
+    delete ds.session.autoStartedOnGroupJoin;
+    ds.session.turnReplyContexts = {};
+    expect(allows(ds, other)).toBe(false);
+    ds.session.turnReplyContexts = { join_legacy: {} as any };
+    expect(allows(ds, other)).toBe(true);
+    ds.session.autoStartedOnGroupJoin = false;
+    expect(allows(ds, other)).toBe(false);
+  });
+});
+
+describe('confirmation delivery failure', () => {
+  for (const stage of ['classification', 'owner', 'wait'] as const) {
+    it(`retains ${stage} input durably, backs off, and retries with a new ask identity`, async () => {
+      const { ds, owner, other } = await collaborativeSession();
+      const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+        session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+        message: { turnId: 'om_pending', text: 'original evidence', userPrompt: 'original evidence', createdAt: new Date().toISOString() },
+      });
+      if (stage !== 'classification') record.phase = 'awaiting_owner';
+      if (stage === 'owner') ds.activeInteractiveTurn = undefined;
+      if (stage === 'wait') record.ownerWaitDeadlineAt = Date.now() - 1;
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const failure = { kind: 'invalidated', reason: 'card dispatch failed', selected: null, by: null, comment: null, timedOut: false };
+      mocks.registerHostAsk.mockReset().mockResolvedValue(failure);
+      const drive = modules.daemon.__testOnly_driveCrossPrincipalInterruptions;
+      await drive(ds);
+      const firstRequest = mocks.registerHostAsk.mock.calls[0][0].requestId;
+      expect(record.confirmationRetryCount).toBe(1);
+      expect(record.messages[0].text).toBe('original evidence');
+      expect(modules.sessionStore.getSession(ds.session.sessionId)?.crossPrincipalInterruptions?.[0])
+        .toMatchObject({ id: record.id, confirmationRetryCount: 1, confirmationRetryAt: record.confirmationRetryAt });
+      await drive(ds);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(2);
+      expect(mocks.registerHostAsk.mock.calls[1][0].requestId).toBe(`${firstRequest}:retry:1`);
+      expect(ds.session.crossPrincipalInterruptions).toHaveLength(1);
+      expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryCount).toBe(2);
+      const replies = JSON.stringify([...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]);
+      expect(replies).toContain('消息仍保留');
+      expect(replies).not.toContain('未选择处理方式');
+      expect(replies.match(/消息仍保留/g)).toHaveLength(1);
+      // A real delivered-card timeout is still a user decision window expiry.
+      mocks.registerHostAsk.mockResolvedValue({ kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    });
+  }
+});
+
+it('recovers a thrown dispatcher failure and accepts the displayed suggestion label', async () => {
+  const { ds, owner, other } = await collaborativeSession();
+  const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_retry_text', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  mocks.registerHostAsk.mockReset().mockRejectedValueOnce(new Error('dispatcher unavailable'));
+  await modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
+  expect(persisted?.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, confirmationRetryCount: 1 });
+  // Simulate restoring the queue from disk, then let its retry deadline fire.
+  ds.session.crossPrincipalInterruptions = persisted!.crossPrincipalInterruptions;
+  mocks.registerHostAsk.mockResolvedValue({ kind: 'answered', answers: [], by: other.requestUserOpenId,
+    comment: '对当前任务的建议', timedOut: false });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, phase: 'awaiting_owner' });
+  expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryAt).toBeUndefined();
+});
+
+it('does not resurrect a removed input when its outstanding card fails', async () => {
+  const { ds, owner, other } = await collaborativeSession();
+  modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_removed', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  let fail!: (result: any) => void;
+  mocks.registerHostAsk.mockReset().mockImplementation(() => new Promise(resolve => { fail = resolve; }));
+  const pending = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  ds.session.crossPrincipalInterruptions = undefined;
+  fail({ kind: 'invalidated', reason: 'closed', selected: null, by: null, comment: null, timedOut: false });
+  await pending;
+  expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+  expect(ds.crossPrincipalWaitTimer).toBeUndefined();
 });

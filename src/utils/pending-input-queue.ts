@@ -7,6 +7,7 @@ import type {
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface PendingCliInput {
+  queueAfterActiveTurn?: true;
   content: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
@@ -106,7 +107,8 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
+    || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
