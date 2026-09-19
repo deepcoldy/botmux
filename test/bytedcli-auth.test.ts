@@ -105,6 +105,20 @@ describe('login — device code, in two steps', () => {
     expect(mod.pendingBytedcliChallenge(ALICE)).toBe('tok-1');
   });
 
+  it('reuses an unfinished login instead of creating another link', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 0,
+      stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
+    }];
+
+    const first = await mod.beginBytedcliLogin(ALICE);
+    const second = await mod.beginBytedcliLogin(ALICE);
+
+    expect(second).toEqual(first);
+    expect(calls).toHaveLength(1);
+  });
+
   // Every call must carry that person's HOME — this is the entire mechanism by
   // which one person's login stays invisible to everyone else.
   it('runs under the requesting person\'s HOME', async () => {
@@ -164,6 +178,46 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       codeJwt: 'code.jwt.value',
     });
     expect(calls.every(c => c.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
+  });
+
+  it('automatically completes a pending login before minting JWTs', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 0,
+      stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
+    }];
+    await mod.beginBytedcliLogin(ALICE);
+    replies = [
+      { code: 0, stdout: envelope({ status: 'ok' }) },
+      { code: 0, stdout: 'cloud.jwt.value\n' },
+      { code: 0, stdout: 'code.jwt.value\n' },
+    ];
+
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'cloud.jwt.value',
+      codeJwt: 'code.jwt.value',
+    });
+    expect(calls.slice(1).map(call => call.args)).toEqual([
+      ['auth', 'login', '--complete', 'tok-1', '--json'],
+      ['auth', 'get-bytecloud-jwt-token'],
+      ['auth', 'get-codebase-jwt-token'],
+    ]);
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  it('waits for the user to click a pending login before minting JWTs', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 0,
+      stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
+    }];
+    await mod.beginBytedcliLogin(ALICE);
+    replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
+
+    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    expect(calls.slice(1).map(call => call.args)).toEqual([
+      ['auth', 'login', '--complete', 'tok-1', '--json'],
+    ]);
   });
 
   // The whole point: no login means no credentials, NOT the machine's own SSO

@@ -7124,6 +7124,15 @@ dialog.onboarding-dialog::backdrop {
    operator must not skim past "the agent can read other people's tokens". */
 .bd-inline-check { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; font-size: 12px; }
 .bd-inline-check input { margin: 0; }
+/* An inline checkbox label inside a grid .bd-row: the page-wide
+   `.bot-defaults-page .bd-body .bd-row :where(label,…)` (0,3,0) turns any
+   in-row label into a one-cell grid item, which would center the checkbox over
+   the text. Re-assert inline-flex for the tool checkboxes with a selector of
+   EQUAL specificity so the later rule wins, scoped to the bot-defaults page
+   (which is the only place .bd-inline-check lives). */
+.bot-defaults-page .bd-body .bd-row .bd-inline-check {
+  display: inline-flex;
+}
 .bd-section-note[data-trigger-user-auth-token-advisory],
 .bd-section-note[data-trigger-user-auth-mcp-advisory] {
   margin-top: 8px;
