@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
+import {
+  botCoManagerPayload,
+  botDefaultsPayload,
+  botSummaryPayload,
+  brandMapByAppId,
+} from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('maps retired final-only settings to a dynamic reply with the separate status card off', () => {
@@ -519,5 +524,68 @@ describe('dashboard bot payload helpers', () => {
     const empty = brandMapByAppId(() => { throw new Error('bots.json not found'); });
     expect(empty.size).toBe(0);
     expect(empty.get('cli_anything')).toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 协管者投影：/api/bots 在窄门禁身份下只下发「选 agent」需要的那几个字段。
+//
+// 夹具刻意用**真的** botDefaultsPayload 产出的行，而不是手搓一个对象:这条投影
+// 的全部价值就在于「owner 那张表里有什么」,手搓夹具会把我以为的字段集当成事实,
+// 漏掉的恰恰是要防的那些。
+describe('/api/bots 协管者投影 (botCoManagerPayload)', () => {
+  /** 与生产同源:owner 行就是 botDefaultsPayload(descriptor, daemonState)。 */
+  const ownerRow = botDefaultsPayload(
+    {
+      larkAppId: 'cli_x',
+      botName: 'BotX',
+      cliId: 'codex',
+      model: 'gpt-5',
+      // descriptor 侧的两个「路径类」字段,只有 owner 该看见。
+      cliPathOverride: '/root/.local/bin/vendor-codex',
+      cliRuntime: { id: 'vendor-codex', executable: '/root/.local/bin/vendor-codex' },
+    } as never,
+    {
+      // displayName 来自 daemon 态 j,不是 descriptor(踩过:写在 descriptor 上恒为 null)。
+      displayName: 'Bot X',
+      env: 'OPENAI_API_KEY=sk-live-DEADBEEF\nDB_PASSWORD=hunter2',
+      launchShell: '/bin/bash --rcfile /root/.secrets/rc',
+      startupCommands: 'vault login -method=token s.XXXX',
+      customPassthroughCommands: 'deploy-prod',
+      canTalkDaemonCommands: 'shutdown',
+      defaultWorkingDir: '/root/iserver/private-repo',
+    },
+  ) as Record<string, unknown>;
+
+  it('不下发任何「拿到就等于拿到整台机器」的字段', () => {
+    const projected = botCoManagerPayload({ ...ownerRow, online: true });
+    for (const secret of [
+      'env', 'launchShell', 'startupCommands', 'customPassthroughCommands',
+      'canTalkDaemonCommands', 'defaultWorkingDir', 'cliPathOverride', 'cliRuntime',
+    ]) {
+      expect(projected, secret).not.toHaveProperty(secret);
+      // 夹具自检:owner 那边确实有这个字段,否则上面那条断言是空过的。
+      expect(ownerRow, `fixture must carry ${secret}`).toHaveProperty(secret);
+    }
+    expect(JSON.stringify(projected)).not.toContain('sk-live-DEADBEEF');
+  });
+
+  it('白名单而非黑名单:owner 新加的字段默认拿不到', () => {
+    // 模拟「将来某次提交给 owner payload 加了个字段」——黑名单实现会把它漏出去。
+    const projected = botCoManagerPayload({ ...ownerRow, someFutureSecretField: 's3cr3t' });
+    expect(projected).not.toHaveProperty('someFutureSecretField');
+  });
+
+  it('riff 选 agent 真正要读的字段一个不少', () => {
+    expect(botCoManagerPayload({ ...ownerRow, online: true })).toMatchObject({
+      larkAppId: 'cli_x', botName: 'BotX', displayName: 'Bot X', cliId: 'codex', model: 'gpt-5', online: true,
+    });
+  });
+
+  it('online 缺省视为在线,仅显式 false 才是离线（降级 roster 行不带该字段）', () => {
+    expect(botCoManagerPayload({ larkAppId: 'a' }).online).toBe(true);
+    expect(botCoManagerPayload({ larkAppId: 'a', online: false }).online).toBe(false);
+    expect(botCoManagerPayload({ larkAppId: 'a', online: false, error: 'http_503' }))
+      .toMatchObject({ online: false, error: 'http_503' });
   });
 });
