@@ -30,6 +30,10 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'google/gemini-2.5-pro',
   ],
   'opencode2': undefined,
+  'mimocode': [
+    'xiaomi/mimo-v2.5-pro',
+    'xiaomi/mimo-v2.5-pro-ultraspeed',
+  ],
   'antigravity': undefined,
   'mtr': undefined,
   'hermes': undefined,

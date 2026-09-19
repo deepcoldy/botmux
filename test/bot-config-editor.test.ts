@@ -536,6 +536,8 @@ describe('resolveCliId', () => {
     expect(resolveCliId('22')).toBe('grok');
     expect(resolveCliId('23')).toBe('kiro-cli');
     expect(resolveCliId('29')).toBe('ebsd');
+    expect(resolveCliId('30')).toBe('minimax'); // v3.21.0 起已发布，禁止移位
+    expect(resolveCliId('31')).toBe('mimocode');
   });
 
   it('passes through literal cliIds unchanged', () => {

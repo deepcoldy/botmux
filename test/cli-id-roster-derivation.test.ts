@@ -79,6 +79,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // Added by upstream #821; shares ~/.config/opencode/skills with opencode,
       // so the shared-root dedup below covers it.
       opencode2: 'global',
+      mimocode: 'global',
       pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
       // no skill mechanism at all

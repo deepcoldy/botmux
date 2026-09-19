@@ -292,6 +292,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
