@@ -4230,7 +4230,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';

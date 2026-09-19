@@ -73,7 +73,7 @@ export class IdempotencyConflictError extends Error {
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
  *   - `creator*` (audit metadata, not input)
- *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastRunId`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
@@ -372,6 +372,7 @@ function migrate(raw: any): ScheduledTask | null {
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
     lastStatus: raw.lastStatus,
+    lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
@@ -701,7 +702,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
@@ -734,10 +735,13 @@ export function updateTask(
 }
 
 /** Record a skipped check without consuming a run or disabling a one-shot. */
-export function markSkipped(id: string, nextRunAt?: string): void {
+export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
@@ -752,10 +756,19 @@ export function markSkipped(id: string, nextRunAt?: string): void {
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): void {
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;

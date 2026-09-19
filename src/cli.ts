@@ -7375,7 +7375,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   if (sub === 'add') {
     const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -7387,6 +7387,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     const cur = detectCurrentSession();
     let authenticatedCur = await detectAuthenticatedCurrentSession();
+    const explicitTaskId = argValue(rest, '--id');
+    if (rest.includes('--id') && !explicitTaskId) {
+      console.error('--id 需要一个 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
+    if (explicitTaskId !== undefined && !/^[0-9a-f]{8}$/.test(explicitTaskId)) {
+      console.error('--id 只接受 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7500,6 +7509,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         authenticatedCur = fresh;
       }
       task = scheduler.addTask({
+        id: explicitTaskId,
         name,
         schedule: rawSchedule,
         parsed,

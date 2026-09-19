@@ -107,7 +107,11 @@ function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
   if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
 }
 
-function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPreconditionOutcome | void): void {
+function recordDispatchOutcome(
+  task: ScheduledTask,
+  context: ScheduleExecutionContext,
+  outcome: ScheduledTaskPreconditionOutcome | void,
+): void {
   const status = outcome === 'skipped' ? 'skipped' : 'ok';
   if (status === 'skipped') {
     let nextRunAt: string | undefined;
@@ -118,9 +122,9 @@ function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPrecon
       const retryAt = Date.now() + TICK_INTERVAL_MS;
       nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
     }
-    scheduleStore.markSkipped(task.id, nextRunAt);
+    scheduleStore.markSkipped(task.id, nextRunAt, context.runId);
   } else {
-    scheduleStore.markRun(task.id, true);
+    scheduleStore.markRun(task.id, true, undefined, undefined, context.runId);
     cleanupIfTaskWasAutoRemoved(task);
   }
   dashboardEventBus.publish({
@@ -554,15 +558,19 @@ async function tick(): Promise<void> {
     scheduleStore.updateTask(task.id, {
       lastRunAt: executionContext.startedAt,
       nextRunAt: newNext ?? undefined,
+      lastStatus: 'running',
+      lastRunId: executionContext.runId,
+      lastError: undefined,
+      lastDeliveryError: undefined,
     });
 
     if (executeCallback) {
       const taskId = task.id;
       executeCallback(task, executionContext)
-        .then(outcome => recordDispatchOutcome(task, outcome))
+        .then(outcome => recordDispatchOutcome(task, executionContext, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message);
+          scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
           cleanupIfTaskWasAutoRemoved(task);
           dashboardEventBus.publish({
             type: 'schedule.fired',
@@ -575,6 +583,14 @@ async function tick(): Promise<void> {
           });
           emitScheduleFiredHook(task, 'error', err);
         });
+    } else {
+      scheduleStore.markRun(
+        task.id,
+        false,
+        'scheduler execute callback is not initialised',
+        undefined,
+        executionContext.runId,
+      );
     }
   }
 }
@@ -614,6 +630,17 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
+  const startupTasks = scheduleStore.listTasks();
+  for (const task of startupTasks) {
+    if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
+    scheduleStore.markRun(
+      task.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      task.lastRunId,
+    );
+  }
   const tasks = scheduleStore.listTasks();
   const enabled = tasks.filter(t => t.enabled);
   logger.info(`[scheduler] Starting with ${enabled.length}/${tasks.length} enabled tasks (tick every ${TICK_INTERVAL_MS/1000}s)`);
@@ -859,15 +886,19 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   scheduleStore.updateTask(id, {
     lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
+    lastStatus: 'running',
+    lastRunId: executionContext.runId,
+    lastError: undefined,
+    lastDeliveryError: undefined,
   });
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
   void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
-    outcome => recordDispatchOutcome(task, outcome),
+    outcome => recordDispatchOutcome(task, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg);
+      scheduleStore.markRun(task.id, false, msg, undefined, executionContext.runId);
       cleanupIfTaskWasAutoRemoved(task);
       dashboardEventBus.publish({
         type: 'schedule.fired',

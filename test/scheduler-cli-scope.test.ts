@@ -50,4 +50,10 @@ describe('schedule CLI session scope propagation', () => {
     // discovered weeks later at fire time.
     expect(cliSource).toMatch(/executionPosition === 'new-topic'[\s\S]*?模型每次生效[\s\S]*?仅在本任务新建会话的那次执行生效/);
   });
+
+  it('accepts only an explicit 8-hex --id and forwards it to scheduler.addTask', () => {
+    expect(cliSource).toMatch(/const explicitTaskId = argValue\(rest, '--id'\)/);
+    expect(cliSource).toMatch(/explicitTaskId !== undefined && !\/\^\[0-9a-f\]\{8\}\$\/\.test\(explicitTaskId\)/);
+    expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?id: explicitTaskId,[\s\S]*?\bname,/);
+  });
 });

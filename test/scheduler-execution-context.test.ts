@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   getTask: vi.fn<(id: string) => ScheduledTask | undefined>(),
   updateTask: vi.fn(),
   markRun: vi.fn(),
+  markSkipped: vi.fn(),
   removeTask: vi.fn(),
   createTask: vi.fn(),
   getScheduleScope: vi.fn(() => 'cli_app'),
@@ -21,6 +22,7 @@ vi.mock('../src/services/schedule-store.js', () => ({
   getTask: mocks.getTask,
   updateTask: mocks.updateTask,
   markRun: mocks.markRun,
+  markSkipped: mocks.markSkipped,
   removeTask: mocks.removeTask,
   createTask: mocks.createTask,
   getScheduleScope: mocks.getScheduleScope,
@@ -105,6 +107,8 @@ describe('scheduler execution context', () => {
     });
     expect(mocks.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
       lastRunAt: received!.startedAt,
+      lastStatus: 'running',
+      lastRunId: received!.runId,
     }));
     const firedPayload = mocks.emitHook.mock.calls.find(([name]) => name === 'schedule.fired')?.[1];
     expect(firedPayload).not.toHaveProperty('chatIds');
@@ -126,6 +130,10 @@ describe('scheduler execution context', () => {
     expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
       lastRunAt: received!.startedAt,
       nextRunAt: undefined,
+      lastStatus: 'running',
+      lastRunId: received!.runId,
+      lastError: undefined,
+      lastDeliveryError: undefined,
     });
   });
 
@@ -145,8 +153,31 @@ describe('scheduler execution context', () => {
     expect(liveTask).toMatchObject({
       enabled: true,
       lastRunAt: '2026-08-31T00:01:05.000Z',
+      lastStatus: 'running',
+      lastRunId: expect.stringMatching(/^[0-9a-f-]{36}$/),
     });
     expect(liveTask.nextRunAt).toBeUndefined();
+  });
+
+  it('settles a persisted running run as interrupted before startup scheduling', () => {
+    const interrupted: ScheduledTask = {
+      ...task,
+      lastRunAt: '2026-08-31T00:00:30.000Z',
+      nextRunAt: undefined,
+      lastStatus: 'running',
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+    };
+    mocks.listTasks.mockReturnValue([interrupted]);
+
+    startScheduler();
+
+    expect(mocks.markRun).toHaveBeenCalledWith(
+      interrupted.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      interrupted.lastRunId,
+    );
   });
 
   it('keeps chatId as the primary fired-hook target and adds chatIds only for fan-out', async () => {
