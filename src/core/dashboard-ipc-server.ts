@@ -4704,6 +4704,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
     const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
@@ -4723,7 +4736,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
       followActive: followActive || undefined,

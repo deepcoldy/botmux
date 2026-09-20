@@ -42,6 +42,7 @@ import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewRepli
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { setDeploymentOwner } from '../src/services/deployment-identity.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 import {
@@ -5344,6 +5345,90 @@ describe('GET /api/schedules', () => {
       expect(listed).not.toHaveProperty('preconditionScript');
       expect(listed).not.toHaveProperty('preconditionFilePath');
       expect(listed).not.toHaveProperty('preconditionRef');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('POST /api/schedules — creator identity binding', () => {
+  it('persists the deployment owner union_id only after an exact live app mapping', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-owner-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_owner_test';
+    const ownerOpenId = 'ou_owner';
+    const ownerUnionId = 'on_owner';
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      scheduleStore.setScheduleScope(appId);
+      setDeploymentOwner(config.session.dataDir, { unionId: ownerUnionId, name: 'Owner' });
+      const bot = registerBot({
+        larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
+        allowedUsers: [ownerOpenId],
+      });
+      bot.resolvedAllowedUsers = [ownerOpenId];
+      bot.rawAllowedUserResolution.set(ownerUnionId, ownerOpenId);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: '身份绑定测试', schedule: 'every 1h', prompt: '检查', chatId: 'oc_target',
+        }),
+      });
+      expect(response.status).toBe(200);
+      const created = (await response.json()).task;
+      expect(scheduleStore.getTask(created.id, appId)).toMatchObject({
+        ownerOpenId,
+        ownerUnionId,
+      });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not persist a deployment union_id when the live app mapping disagrees', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-owner-mismatch-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_schedule_owner_mismatch_test';
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      scheduleStore.setScheduleScope(appId);
+      setDeploymentOwner(config.session.dataDir, { unionId: 'on_owner', name: 'Owner' });
+      const bot = registerBot({
+        larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
+        allowedUsers: ['ou_owner'],
+      });
+      bot.resolvedAllowedUsers = ['ou_owner'];
+      bot.rawAllowedUserResolution.set('on_owner', 'ou_someone_else');
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: '身份拒绝测试', schedule: 'every 1h', prompt: '检查', chatId: 'oc_target',
+        }),
+      });
+      expect(response.status).toBe(200);
+      const created = (await response.json()).task;
+      expect(scheduleStore.getTask(created.id, appId)).toMatchObject({
+        ownerOpenId: 'ou_owner',
+      });
+      expect(scheduleStore.getTask(created.id, appId)?.ownerUnionId).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;
