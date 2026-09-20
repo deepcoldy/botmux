@@ -2158,7 +2158,7 @@ describe('TraeX task continuation', () => {
       .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
   });
 
-  it('continues the original turn after its CLI exits without a dispatch attempt', async () => {
+  it('awaits user when the original turn CLI exits without a dispatch attempt', async () => {
     const { ds, worker } = startTraexLease();
 
     worker.emit('message', {
@@ -2170,7 +2170,7 @@ describe('TraeX task continuation', () => {
     await Promise.resolve();
 
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'backoff',
+      status: 'awaiting_user',
       currentTurnId: 'om_original',
       continuationsStarted: 0,
       lastErrorCode: 'cli_exit',
@@ -2192,10 +2192,10 @@ describe('TraeX task continuation', () => {
     expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
-  it('replaces a crashed PTY worker and dispatches one continuation', async () => {
+  it('does not replace a crashed PTY worker while awaiting user', async () => {
     const { ds, worker } = startTraexLease({ backendType: 'pty' });
 
     worker.emit('exit', 9, null);
@@ -2203,29 +2203,20 @@ describe('TraeX task continuation', () => {
     await Promise.resolve();
 
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'backoff',
+      status: 'awaiting_user',
       currentTurnId: 'om_original',
       continuationsStarted: 0,
       lastErrorCode: 'cli_exit',
     });
-    expect(forkMock).toHaveBeenCalledTimes(2);
-    const replacement = forkMock.mock.results.at(-1)!.value;
-    replacement.emit('message', { type: 'ready', port: 3457, token: 'replacement' });
-    replacement.emit('message', {
-      type: 'task_continuation_rpc_status',
-      sessionId: ds.session.sessionId,
-      rpcGeneration: 'replacement-proof',
-      eligible: true,
-    });
-
+    expect(forkMock).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(vi.mocked(replacement.send).mock.calls
+    expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
-  it('replaces a crashed tmux worker only after proving its pane is missing', async () => {
+  it('replaces a crashed tmux worker without auto-continuing an ambiguous turn', async () => {
     vi.useFakeTimers();
     process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', backendType: 'tmux' }));
@@ -2252,29 +2243,15 @@ describe('TraeX task continuation', () => {
     await Promise.resolve();
 
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'backoff',
+      status: 'awaiting_user',
       currentTurnId: 'om_original',
       continuationsStarted: 0,
       lastErrorCode: 'cli_exit',
     });
-    expect(forkMock).toHaveBeenCalledTimes(2);
-    const replacement = forkMock.mock.results.at(-1)!.value;
-    replacement.emit('message', { type: 'ready', port: 3457, token: 'replacement' });
-    replacement.emit('message', {
-      type: 'task_continuation_rpc_status',
-      sessionId: ds.session.sessionId,
-      rpcGeneration: 'replacement-proof',
-      eligible: true,
-    });
-    await vi.advanceTimersByTimeAsync(5_000);
-
-    expect(vi.mocked(replacement.send).mock.calls
-      .map(call => call[0])
-      .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
   });
 
-  it('recovers a synthetic continuation after its PTY worker crashes without duplicating it', async () => {
+  it('awaits user after a synthetic continuation ends ambiguously', async () => {
     const { ds, worker } = startTraexLease({ backendType: 'pty' });
     worker.emit('message', {
       type: 'turn_terminal',
@@ -2301,29 +2278,18 @@ describe('TraeX task continuation', () => {
     worker.emit('exit', 9, null);
     await Promise.resolve();
     await Promise.resolve();
-    const replacement = forkMock.mock.results.at(-1)!.value;
-    replacement.emit('message', { type: 'ready', port: 3457, token: 'replacement' });
-    replacement.emit('message', {
-      type: 'task_continuation_rpc_status',
-      sessionId: ds.session.sessionId,
-      rpcGeneration: 'replacement-proof',
-      eligible: true,
-    });
     await vi.advanceTimersByTimeAsync(10_000);
 
     const firstWorkerContinuations = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
         && message?.turnId?.startsWith('bmx-continuation-'));
-    const replacementContinuations = vi.mocked(replacement.send).mock.calls
-      .map(call => call[0])
-      .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(firstWorkerContinuations).toHaveLength(1);
-    expect(replacementContinuations).toHaveLength(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'active',
-      continuationsStarted: 2,
+      status: 'awaiting_user',
+      continuationsStarted: 1,
+      lastErrorCode: 'cli_exit',
     });
   });
 

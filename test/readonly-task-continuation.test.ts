@@ -258,22 +258,32 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
   });
 
   it.each([TASK_CONTINUATION_ENGINE_DEAD_CODE, TASK_CONTINUATION_CLI_EXIT_CODE])(
-    'continues the allowlisted runtime interruption %s',
+    'awaits user for the ambiguous runtime interruption %s',
     errorCode => {
+      const schedule = vi.fn((_delayMs, run) => run);
+      const enqueue = vi.fn(() => 1);
+      const warn = vi.fn();
       const coordinator = new ReadonlyTaskContinuationCoordinator({
-        schedule: (_delayMs, run) => run,
+        schedule,
         cancel: vi.fn(),
         persist: vi.fn(),
-        enqueue: vi.fn(() => 1),
-        warn: vi.fn(),
+        enqueue,
+        warn,
         enabled: () => true,
         now: () => 2_000,
       });
       coordinator.restore(state());
+      schedule.mockClear();
 
       expect(coordinator.onTerminal(state(), {
         turnId: 'om_original', status: 'ambiguous', errorCode, workerGeneration: 1,
-      }).status).toBe('backoff');
+      })).toMatchObject({ status: 'awaiting_user', lastErrorCode: errorCode });
+      expect(schedule).not.toHaveBeenCalled();
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'awaiting_user',
+        lastErrorCode: errorCode,
+      }));
     },
   );
 
@@ -297,8 +307,6 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
   it.each([
     [TASK_CONTINUATION_CONNECTION_CODE, 5_000],
     [TASK_CONTINUATION_UPSTREAM_CODE, 5_000],
-    [TASK_CONTINUATION_ENGINE_DEAD_CODE, 5_000],
-    [TASK_CONTINUATION_CLI_EXIT_CODE, 5_000],
     [TASK_CONTINUATION_RATE_LIMIT_CODE, 15_000],
   ] as const)('uses bounded backoff for %s', (errorCode, expectedDelayMs) => {
     const delays: number[] = [];
@@ -315,8 +323,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     coordinator.restore(state());
     coordinator.onTerminal(state(), {
       turnId: 'om_original',
-      status: errorCode === TASK_CONTINUATION_ENGINE_DEAD_CODE
-        || errorCode === TASK_CONTINUATION_CLI_EXIT_CODE ? 'ambiguous' : 'failed',
+      status: 'failed',
       errorCode,
       workerGeneration: 1,
     });

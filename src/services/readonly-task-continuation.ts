@@ -192,18 +192,23 @@ export function readonlyTaskContinuationRecoversTerminal(
     || terminal.dispatchAttempt !== state.currentDispatchAttempt
     || terminal.workerGeneration !== state.currentWorkerGeneration) return false;
   if (terminal.status === 'completed') return true;
-  if (terminal.status === 'ambiguous') {
-    // Engine death is a transport interruption, not a request replay: the next
-    // turn resumes the same persisted thread and must verify uncertain effects
-    // before doing more work. All other ambiguous terminals stay fail-closed.
-    return terminal.errorCode === TASK_CONTINUATION_ENGINE_DEAD_CODE
-      || terminal.errorCode === TASK_CONTINUATION_CLI_EXIT_CODE;
-  }
+  // An ambiguous terminal cannot prove which external side effects completed.
+  // Never start a write-capable synthetic turn from that state automatically.
+  if (terminal.status === 'ambiguous') return false;
   return terminal.status === 'failed' && [
     READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE,
     TASK_CONTINUATION_RATE_LIMIT_CODE,
     TASK_CONTINUATION_CONNECTION_CODE,
     TASK_CONTINUATION_UPSTREAM_CODE,
+  ].includes(terminal.errorCode ?? '');
+}
+
+function readonlyTaskContinuationAwaitsUserTerminal(
+  terminal: ReadonlyTaskContinuationTerminal,
+): boolean {
+  return terminal.status === 'ambiguous' && [
+    TASK_CONTINUATION_ENGINE_DEAD_CODE,
+    TASK_CONTINUATION_CLI_EXIT_CODE,
   ].includes(terminal.errorCode ?? '');
 }
 
@@ -404,6 +409,17 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         terminal.turnId,
         terminal.workerGeneration!,
       ) ?? current;
+    }
+    if (readonlyTaskContinuationAwaitsUserTerminal(terminal)) {
+      this.cancelTimer();
+      const stopped = {
+        ...current,
+        status: 'awaiting_user' as const,
+        nextAttemptAt: undefined,
+        lastErrorCode: terminal.errorCode,
+      };
+      this.warnOnce(stopped);
+      return this.state ?? stopped;
     }
     if (!readonlyTaskContinuationRecoversTerminal(current, terminal)) {
       this.cancelTimer();
@@ -780,8 +796,6 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
     if ([
       TASK_CONTINUATION_CONNECTION_CODE,
       TASK_CONTINUATION_UPSTREAM_CODE,
-      TASK_CONTINUATION_ENGINE_DEAD_CODE,
-      TASK_CONTINUATION_CLI_EXIT_CODE,
     ].includes(state.lastErrorCode ?? '')) {
       return Math.max(this.delayMs, Math.min(30_000, 5_000 * (2 ** state.continuationsStarted)));
     }
@@ -995,8 +1009,14 @@ export function readonlyTaskContinuationHandlesTerminal(
   session: ReadonlyTaskContinuationSession,
   terminal: ReadonlyTaskContinuationTerminal,
 ): boolean {
-  return attachedContinuations.get(session.sessionId)?.session === session
-    && readonlyTaskContinuationRecoversTerminal(session.readonlyTaskContinuation, terminal);
+  const state = session.readonlyTaskContinuation;
+  if (attachedContinuations.get(session.sessionId)?.session !== session
+    || !state || state.status !== 'active'
+    || terminal.turnId !== state.currentTurnId
+    || terminal.dispatchAttempt !== state.currentDispatchAttempt
+    || terminal.workerGeneration !== state.currentWorkerGeneration) return false;
+  return readonlyTaskContinuationRecoversTerminal(state, terminal)
+    || readonlyTaskContinuationAwaitsUserTerminal(terminal);
 }
 
 export function completeReadonlyTaskContinuation(
