@@ -3,11 +3,31 @@ import type { CotEntry } from '../types.js';
 const THINKING_MAX_CHARS = 2_000;
 const TOOL_ARGS_MAX_CHARS = 600;
 const TOOL_RESULT_MAX_CHARS = 1_200;
+const THINKING_MAX_BYTES = 2_200;
+const TOOL_ARGS_MAX_BYTES = 600;
+const TOOL_RESULT_MAX_BYTES = 1_200;
+const TOOL_NAME_MAX_BYTES = 120;
+const COT_MARKER_PAYLOAD_MAX_BYTES = 3_000;
 const STREAM_CHUNK_TARGET_CHARS = 120;
 
 function bounded(value: unknown, max: number): string {
   const text = typeof value === 'string' ? value.trim() : '';
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function boundedUtf8(value: unknown, maxChars: number, maxBytes: number): string {
+  const text = bounded(value, maxChars);
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const ellipsis = '…';
+  let result = '';
+  let bytes = Buffer.byteLength(ellipsis, 'utf8');
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return `${result}${ellipsis}`;
 }
 
 function appendBounded(current: string, delta: string, max: number): string {
@@ -24,6 +44,10 @@ function json(value: unknown, max: number): string {
   }
 }
 
+function toolJson(value: unknown): string {
+  return boundedUtf8(json(value, TOOL_ARGS_MAX_CHARS), TOOL_ARGS_MAX_CHARS, TOOL_ARGS_MAX_BYTES);
+}
+
 function itemId(item: Record<string, unknown>): string {
   return typeof item.id === 'string' && item.id.length > 0 ? item.id : '';
 }
@@ -33,7 +57,7 @@ function fileChangeArgs(item: Record<string, unknown>): string {
     .map(change => change && typeof change === 'object' ? (change as Record<string, unknown>).path : undefined)
     .filter((path): path is string => typeof path === 'string' && path.length > 0);
   if (paths.length === 0) return '';
-  return json({ path: paths.length === 1 ? paths[0] : `${paths.length} files: ${paths.join(', ')}` }, TOOL_ARGS_MAX_CHARS);
+  return toolJson({ path: paths.length === 1 ? paths[0] : `${paths.length} files: ${paths.join(', ')}` });
 }
 
 function toolCall(item: Record<string, unknown>): CotEntry | undefined {
@@ -41,27 +65,31 @@ function toolCall(item: Record<string, unknown>): CotEntry | undefined {
   if (!id) return undefined;
   switch (item.type) {
     case 'commandExecution':
-      return { kind: 'tool_call', id, name: 'shell', args: json({ command: item.command }, TOOL_ARGS_MAX_CHARS) };
+      return { kind: 'tool_call', id, name: 'shell', args: toolJson({ command: item.command }) };
     case 'fileChange':
       return { kind: 'tool_call', id, name: 'apply_patch', args: fileChangeArgs(item) };
     case 'mcpToolCall':
       return {
         kind: 'tool_call',
         id,
-        name: [item.server, item.tool].filter(value => typeof value === 'string' && value).join('.') || 'mcp_tool',
-        args: json(item.arguments ?? item.args, TOOL_ARGS_MAX_CHARS),
+        name: boundedUtf8(
+          [item.server, item.tool].filter(value => typeof value === 'string' && value).join('.') || 'mcp_tool',
+          120,
+          TOOL_NAME_MAX_BYTES,
+        ),
+        args: toolJson(item.arguments ?? item.args),
       };
     case 'dynamicToolCall':
       return {
         kind: 'tool_call',
         id,
-        name: bounded(item.tool ?? item.name, 120) || 'tool',
-        args: json(item.arguments ?? item.args, TOOL_ARGS_MAX_CHARS),
+        name: boundedUtf8(item.tool ?? item.name, 120, TOOL_NAME_MAX_BYTES) || 'tool',
+        args: toolJson(item.arguments ?? item.args),
       };
     case 'webSearch':
-      return { kind: 'tool_call', id, name: 'web_search', args: json(item.query ?? item.action, TOOL_ARGS_MAX_CHARS) };
+      return { kind: 'tool_call', id, name: 'web_search', args: toolJson(item.query ?? item.action) };
     case 'imageView':
-      return { kind: 'tool_call', id, name: 'image_view', args: json(item.path ?? item, TOOL_ARGS_MAX_CHARS) };
+      return { kind: 'tool_call', id, name: 'image_view', args: toolJson(item.path ?? item) };
     default:
       return undefined;
   }
@@ -87,7 +115,7 @@ function compactToolOutput(value: unknown): string {
     const omitted = lines.length - 9;
     compact = [...lines.slice(0, 6), `… (+${omitted} lines) …`, ...lines.slice(-3)].join('\n');
   }
-  return bounded(compact, TOOL_RESULT_MAX_CHARS);
+  return boundedUtf8(compact, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_MAX_BYTES);
 }
 
 function toolResult(item: Record<string, unknown>): CotEntry | undefined {
@@ -103,7 +131,11 @@ function toolResult(item: Record<string, unknown>): CotEntry | undefined {
   return {
     kind: 'tool_result',
     id,
-    result: bounded(output ? `${status}\n${output}` : status, TOOL_RESULT_MAX_CHARS),
+    result: boundedUtf8(
+      output ? `${status}\n${output}` : status,
+      TOOL_RESULT_MAX_CHARS,
+      TOOL_RESULT_MAX_BYTES,
+    ),
   };
 }
 
@@ -118,7 +150,7 @@ function completedReasoningText(item: Record<string, unknown>): string {
         .filter(Boolean)
         .join('\n\n')
     : '';
-  return bounded(summary || item.text, THINKING_MAX_CHARS);
+  return boundedUtf8(summary || item.text, THINKING_MAX_CHARS, THINKING_MAX_BYTES);
 }
 
 interface TextStreamState {
@@ -154,7 +186,7 @@ export class CodexAppCotCollector {
 
   private appendStream(key: string, delta: string): TextStreamState {
     const state = this.streams.get(key) ?? { full: '', emitted: 0 };
-    state.full = appendBounded(state.full, delta, THINKING_MAX_CHARS);
+    state.full = boundedUtf8(appendBounded(state.full, delta, THINKING_MAX_CHARS), THINKING_MAX_CHARS, THINKING_MAX_BYTES);
     this.streams.set(key, state);
     return state;
   }
@@ -162,9 +194,9 @@ export class CodexAppCotCollector {
   private completeStream(key: string, authoritativeText = ''): CotEntry[] {
     const state = this.streams.get(key) ?? { full: '', emitted: 0 };
     if (authoritativeText && authoritativeText.startsWith(state.full)) {
-      state.full = bounded(authoritativeText, THINKING_MAX_CHARS);
+      state.full = boundedUtf8(authoritativeText, THINKING_MAX_CHARS, THINKING_MAX_BYTES);
     } else if (!state.full) {
-      state.full = bounded(authoritativeText, THINKING_MAX_CHARS);
+      state.full = boundedUtf8(authoritativeText, THINKING_MAX_CHARS, THINKING_MAX_BYTES);
     }
     this.streams.delete(key);
     const text = state.full.slice(state.emitted).trim();
@@ -213,7 +245,12 @@ export class CodexAppCotCollector {
     if (record.type === 'agentMessage') {
       const id = itemId(record);
       this.messagePhases.delete(id);
-      if (record.phase === 'commentary') return this.completeStream(`message:${id}`, bounded(record.text, THINKING_MAX_CHARS));
+      if (record.phase === 'commentary') {
+        return this.completeStream(
+          `message:${id}`,
+          boundedUtf8(record.text, THINKING_MAX_CHARS, THINKING_MAX_BYTES),
+        );
+      }
       this.streams.delete(`message:${id}`);
       return [];
     }
@@ -234,12 +271,14 @@ export function normalizeCodexAppCotMarker(payload: unknown): CodexAppCotMarker 
   if (Object.keys(record).some(key => key !== 'turnId' && key !== 'entries')) return undefined;
   if (typeof record.turnId !== 'string' || record.turnId.length === 0 || record.turnId.length > 512) return undefined;
   if (!Array.isArray(record.entries) || record.entries.length === 0 || record.entries.length > 8) return undefined;
+  if (Buffer.byteLength(JSON.stringify(record), 'utf8') > COT_MARKER_PAYLOAD_MAX_BYTES) return undefined;
   const entries: CotEntry[] = [];
   for (const entry of record.entries) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
     const value = entry as Record<string, unknown>;
     if (value.kind === 'thinking') {
       if (typeof value.text !== 'string' || !value.text || value.text.length > THINKING_MAX_CHARS
+          || Buffer.byteLength(value.text, 'utf8') > THINKING_MAX_BYTES
           || Object.keys(value).some(key => key !== 'kind' && key !== 'text')) return undefined;
       entries.push({ kind: 'thinking', text: value.text });
       continue;
@@ -247,7 +286,9 @@ export function normalizeCodexAppCotMarker(payload: unknown): CodexAppCotMarker 
     if (value.kind === 'tool_call') {
       if (typeof value.id !== 'string' || !value.id || value.id.length > 512
           || typeof value.name !== 'string' || !value.name || value.name.length > 120
+          || Buffer.byteLength(value.name, 'utf8') > TOOL_NAME_MAX_BYTES
           || typeof value.args !== 'string' || value.args.length > TOOL_ARGS_MAX_CHARS
+          || Buffer.byteLength(value.args, 'utf8') > TOOL_ARGS_MAX_BYTES
           || Object.keys(value).some(key => !['kind', 'id', 'name', 'args'].includes(key))) return undefined;
       entries.push({ kind: 'tool_call', id: value.id, name: value.name, args: value.args });
       continue;
@@ -255,6 +296,7 @@ export function normalizeCodexAppCotMarker(payload: unknown): CodexAppCotMarker 
     if (value.kind === 'tool_result') {
       if (typeof value.id !== 'string' || !value.id || value.id.length > 512
           || typeof value.result !== 'string' || !value.result || value.result.length > TOOL_RESULT_MAX_CHARS
+          || Buffer.byteLength(value.result, 'utf8') > TOOL_RESULT_MAX_BYTES
           || Object.keys(value).some(key => !['kind', 'id', 'result'].includes(key))) return undefined;
       entries.push({ kind: 'tool_result', id: value.id, result: value.result });
       continue;

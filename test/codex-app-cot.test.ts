@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { generateKeyPairSync } from 'node:crypto';
 import { CodexAppCotCollector, normalizeCodexAppCotMarker } from '../src/services/codex-app-cot.js';
+import {
+  CodexAppControlLineDecoder,
+  encodeCodexAppSignedControlMarker,
+} from '../src/utils/codex-app-control.js';
 
 describe('CodexAppCotCollector', () => {
   it('publishes public reasoning summaries but ignores raw reasoning deltas', () => {
@@ -71,12 +76,49 @@ describe('CodexAppCotCollector', () => {
 
     expect(entry).toMatchObject({ kind: 'tool_result', id: 'c1' });
     if (entry.kind !== 'tool_result') throw new Error('expected tool_result');
-    expect(entry.result).toHaveLength(1_200);
+    expect(Buffer.byteLength(entry.result, 'utf8')).toBe(1_200);
     expect(entry.result).toMatch(/\u2026$/);
     expect(normalizeCodexAppCotMarker({ turnId: 'om_1', entries: [entry] })).toEqual({
       turnId: 'om_1',
       entries: [entry],
     });
+  });
+
+  it('keeps long CJK thinking inside the signed control-line byte limit', () => {
+    const collector = new CodexAppCotCollector();
+    const entries = collector.observe('item/completed', {
+      item: { id: 'r1', type: 'reasoning', summary: ['思'.repeat(2_000)] },
+    });
+    const payload = { turnId: 'om_1', entries };
+    expect(normalizeCodexAppCotMarker(payload)).toEqual(payload);
+
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const line = encodeCodexAppSignedControlMarker(
+      privateKey,
+      '00000000-0000-4000-8000-000000000000',
+      'g'.repeat(43),
+      'c'.repeat(43),
+      1,
+      'thinking',
+      payload,
+    );
+    const decoded = new CodexAppControlLineDecoder().push(Buffer.from(`${line}\n`));
+    expect(decoded).toEqual({ lines: [line], droppedMalformed: false });
+  });
+
+  it('bounds UTF-8 MCP tool names and arguments before validation', () => {
+    const collector = new CodexAppCotCollector();
+    const entries = collector.observe('item/started', {
+      item: {
+        id: 'm1',
+        type: 'mcpToolCall',
+        server: '服'.repeat(100),
+        tool: '工具'.repeat(100),
+        arguments: { query: '查'.repeat(600) },
+      },
+    });
+    expect(normalizeCodexAppCotMarker({ turnId: 'om_1', entries })).toEqual({ turnId: 'om_1', entries });
+    expect(Buffer.byteLength(entries[0]?.kind === 'tool_call' ? entries[0].name : '', 'utf8')).toBeLessThanOrEqual(120);
   });
 
   it('does not turn the final answer into a thinking node', () => {
