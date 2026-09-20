@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'writableTerminalLinkInCard', 'privateCard',
       'cotEnabled', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',

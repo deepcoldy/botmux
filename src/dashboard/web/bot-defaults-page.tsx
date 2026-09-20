@@ -767,6 +767,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
+    codexBrowser: body.codexBrowser,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     cotEnabled: body.cotEnabled,
@@ -4661,15 +4662,17 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
+  const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | null>(null);
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
+  useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
 
-  async function save(checked: boolean): Promise<void> {
+  async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
     setCleanInput(checked);
-    setBusy(true);
+    setBusy('clean-input');
     setStatus(null);
     try {
       const res = await props.putCardPref({ codexAppCleanInput: checked });
@@ -4683,7 +4686,28 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setCleanInput(previous);
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function saveBrowser(checked: boolean): Promise<void> {
+    const previous = browserEnabled;
+    setBrowserEnabled(checked);
+    setBusy('browser');
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ codexBrowser: checked });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setBrowserEnabled(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setBrowserEnabled(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -4692,13 +4716,23 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
       <ToggleRow
         checked={cleanInput}
-        disabled={busy}
+        disabled={busy !== null}
         dataAction="toggle-codex-app-clean-input"
         title={tr('botDefaults.codexAppCleanInput')}
         help={tr('botDefaults.codexAppCleanInputHelp')}
-        onChange={checked => void save(checked)}
+        onChange={checked => void saveCleanInput(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+      <ToggleRow
+        checked={browserEnabled}
+        disabled={busy !== null}
+        dataAction="toggle-codex-browser"
+        title={tr('botDefaults.codexBrowser')}
+        description={tr('botDefaults.codexBrowserDescription')}
+        help={tr('botDefaults.codexBrowserHelp')}
+        onChange={checked => void saveBrowser(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>

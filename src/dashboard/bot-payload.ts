@@ -143,6 +143,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
+    codexBrowser: j?.codexBrowser === true
+      || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     cotEnabled: j?.cotEnabled !== false,

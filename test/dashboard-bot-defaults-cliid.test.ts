@@ -1870,6 +1870,7 @@ describe('Codex App history switch', () => {
 
     expect(agentRenderer.root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
     expect(displayRenderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
+    expect(displayRenderer.root.findByProps({ 'data-action': 'toggle-codex-browser' }).props.checked).toBe(false);
   });
 
   it('renders a real default-off Codex App history switch and persists the opt-in', async () => {
@@ -1923,6 +1924,32 @@ describe('Codex App history switch', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
       .toContain('write_failed');
+  });
+
+  it('renders and persists the default-off Codex browser bridge switch', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, codexBrowser: true },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex_browser', cliId: 'codex-app' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-codex-browser' });
+    expect(toggle.props.checked).toBe(false);
+    expect(JSON.stringify(renderer.toJSON())).toContain('浏览器桥接');
+
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenCalledWith({ codexBrowser: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-browser' }).props.checked).toBe(true);
   });
 });
 

@@ -63,6 +63,9 @@ export interface BotCardPrefs {
    * legacy full-prompt UserMessage; true moves Botmux metadata to hidden
    * app-server context for newly dispatched turns. */
   codexAppCleanInput: boolean;
+  /** Codex App browser bridge. Default false; the dashboard toggle uses the
+   * default Chrome family. Edge/pluginRoot remain JSON-only advanced options. */
+  codexBrowser: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
@@ -119,6 +122,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
+      codexBrowser: c.codexBrowser?.enabled === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       cotEnabled: c.cotEnabled !== false,
@@ -147,6 +151,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
+      codexBrowser: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       cotEnabled: true,
@@ -262,6 +267,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
+    apply(entry, 'codexBrowser', patch.codexBrowser);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
@@ -289,6 +295,8 @@ async function updateBotCardPrefsInternal(
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
+        codexBrowser: entry.codexBrowser === true
+          || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         cotEnabled: entry.cotEnabled !== false,
@@ -339,6 +347,11 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.codexAppCleanInput !== undefined) {
     bot.config.codexAppCleanInput = patch.codexAppCleanInput || undefined;
+  }
+  if (patch.codexBrowser !== undefined) {
+    bot.config.codexBrowser = patch.codexBrowser
+      ? { enabled: true, family: 'chrome' }
+      : undefined;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
@@ -409,6 +422,7 @@ async function updateBotCardPrefsInternal(
     `pinStreamingCard=${r.result.pinStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
+    `codexBrowser=${r.result.codexBrowser} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
     `senderTag=${r.result.senderTag} ` +

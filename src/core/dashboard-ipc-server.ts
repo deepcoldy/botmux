@@ -6187,6 +6187,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
+    codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
@@ -6320,7 +6321,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -6334,7 +6335,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -6359,6 +6360,18 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
+  if (typeof body.codexBrowser === 'boolean') {
+    if (body.codexBrowser) {
+      const config = getBot(cachedLarkAppId).config;
+      if (config.cliId !== 'codex-app') {
+        return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
+      }
+      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+        return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
+      }
+    }
+    patch.codexBrowser = body.codexBrowser;
+  }
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;

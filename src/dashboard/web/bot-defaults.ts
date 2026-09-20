@@ -120,6 +120,7 @@ export type BotDefaultsRow = {
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
+  codexBrowser?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.

@@ -60,7 +60,7 @@
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
-| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
+| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
 
 `nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
 
