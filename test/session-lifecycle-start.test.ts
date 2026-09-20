@@ -2216,7 +2216,7 @@ describe('TraeX task continuation', () => {
         && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
-  it('replaces a crashed tmux worker without auto-continuing an ambiguous turn', async () => {
+  it('does not replace a crashed tmux worker while awaiting user', async () => {
     vi.useFakeTimers();
     process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', backendType: 'tmux' }));
